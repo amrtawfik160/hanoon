@@ -43,6 +43,21 @@ type TelegramIdentityRow = {
   verified_at: number;
 };
 
+const CANONICAL_POSITIVE_DECIMAL = /^[1-9][0-9]*$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+function assertCanonicalPositiveDecimal(value: string, field: string): void {
+  if (typeof value !== "string" || !CANONICAL_POSITIVE_DECIMAL.test(value)) {
+    throw new TypeError(`${field} must be a canonical positive decimal string`);
+  }
+}
+
+function assertSha256Hex(value: string): void {
+  if (typeof value !== "string" || !SHA256_HEX.test(value)) {
+    throw new TypeError("Pairing code must be a lowercase 64-character SHA-256 hex string");
+  }
+}
+
 export interface TelegramAgentStore {
   createPairingCode(codeHash: string, createdAt: number, expiresAt: number): void;
   pairOwnerWithCode(
@@ -81,6 +96,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     createdAt: number,
     expiresAt: number,
   ): void {
+    assertSha256Hex(codeHash);
     this.db
       .prepare(
         "INSERT INTO pairing_codes (code_hash, created_at, expires_at) VALUES (?, ?, ?)",
@@ -94,6 +110,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     chatId: string,
     now: number,
   ): PairingResult {
+    assertSha256Hex(codeHash);
+    assertCanonicalPositiveDecimal(userId, "userId");
+    assertCanonicalPositiveDecimal(chatId, "chatId");
+    if (userId !== chatId) {
+      throw new TypeError("V1 owner pairing requires userId to equal chatId for a private chat");
+    }
+
     const pair = this.db.transaction((): PairingResult => {
       const code = this.db
         .prepare(
@@ -168,6 +191,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     now: number;
     hasActiveJob: boolean;
   }): "created" | "same" | "changed" | "active_job_conflict" {
+    assertCanonicalPositiveDecimal(input.botId, "botId");
+
     const bind = this.db.transaction((): "created" | "same" | "changed" | "active_job_conflict" => {
       const current = this.db
         .prepare(
@@ -176,6 +201,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .get() as TelegramIdentityRow | undefined;
 
       if (!current) {
+        if (input.hasActiveJob || this.hasActiveJob()) return "active_job_conflict";
         this.db
           .prepare(
             "INSERT INTO telegram_identity (singleton, bot_id, username, verified_at) VALUES (1, ?, ?, ?)",
@@ -193,7 +219,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         return "same";
       }
 
-      if (input.hasActiveJob) return "active_job_conflict";
+      if (input.hasActiveJob || this.hasActiveJob()) return "active_job_conflict";
 
       this.db
         .prepare(
@@ -204,6 +230,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       this.db.prepare("DELETE FROM approvals").run();
       this.db.prepare("DELETE FROM telegram_updates").run();
       this.db.prepare("DELETE FROM callbacks").run();
+      this.db.prepare("DELETE FROM outbox").run();
       this.db
         .prepare("UPDATE telegram_cursor SET next_offset = 0 WHERE singleton = 1")
         .run();
@@ -216,6 +243,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       return "changed";
     });
     return bind();
+  }
+
+  private hasActiveJob(): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM jobs WHERE state NOT IN ('merged', 'cancelled', 'blocked') LIMIT 1",
+        )
+        .get() !== undefined
+    );
   }
 
   public getTelegramIdentity(): TelegramIdentity | null {
