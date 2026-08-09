@@ -55,3 +55,145 @@ export const projectPolicySchema = z
 
 export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
 export type ProjectPolicy = z.infer<typeof projectPolicySchema>;
+
+export type JobState =
+  | "awaiting_project"
+  | "awaiting_confirmation"
+  | "creating_implementation"
+  | "implementing"
+  | "locating_pr"
+  | "resolving_pr_head"
+  | "reviewing"
+  | "remediating"
+  | "validating"
+  | "awaiting_merge_approval"
+  | "merging"
+  | "failed"
+  | "blocked"
+  | "cancelled"
+  | "merged";
+
+export type WorkerKind = "implementation" | "review" | "validation" | "merge";
+export type WorkerResourceKind = "bb_thread" | "bb_terminal";
+export type WorkerLivenessState =
+  | "starting"
+  | "active"
+  | "stopping"
+  | "idle"
+  | "failed"
+  | "unknown"
+  | "stale";
+
+export interface WorkerLiveness {
+  jobId: string;
+  workerKind: WorkerKind;
+  resourceKind: WorkerResourceKind;
+  resourceId: string;
+  generation: number;
+  state: WorkerLivenessState;
+  sourceUpdatedAt: number;
+  observedAt: number;
+  staleNotifiedAt: number | null;
+}
+
+export type BlockedReason =
+  | "review_limit"
+  | "configuration"
+  | "cancellation_unconfirmed"
+  | "permanent_effect_failure"
+  | null;
+
+export interface Job {
+  id: string;
+  sourceUpdateId: number;
+  requestText: string;
+  state: JobState;
+  resumeState: JobState | null;
+  projectId: string | null;
+  policyVersion: number | null;
+  policy: ProjectPolicy | null;
+  environmentId: string | null;
+  implementationThreadId: string | null;
+  reviewThreadId: string | null;
+  prNumber: number | null;
+  prUrl: string | null;
+  prHeadSha: string | null;
+  statusMessageId: number | null;
+  reviewCycle: number;
+  reviewBlockAt: number;
+  cancelRequestedAt: number | null;
+  blockedReason: BlockedReason;
+  lastError: string | null;
+  version: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface JobEffect {
+  idempotencyKey: string;
+  jobId: string;
+  kind:
+    | "render_status"
+    | "spawn_implementation"
+    | "inspect_implementation"
+    | "resolve_pr_head"
+    | "spawn_review"
+    | "send_remediation"
+    | "run_validation"
+    | "issue_approval"
+    | "revoke_approvals"
+    | "merge_pr"
+    | "stop_thread"
+    | "steer_implementation"
+    | "reconcile_job";
+  payload: Record<string, unknown>;
+}
+
+export type EffectStatus = "pending" | "leased" | "done" | "failed" | "dead";
+
+export interface StoredEffect extends JobEffect {
+  status: EffectStatus;
+  attempts: number;
+  leaseOwner: string | null;
+  leaseGeneration: number | null;
+  leaseExpiresAt: number | null;
+  nextAttemptAt: number;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type JobEvent =
+  | {
+      type: "PROJECT_SELECTED";
+      projectId: string;
+      policyVersion: number;
+      policy: ProjectPolicy;
+    }
+  | { type: "CONFIRMED" }
+  | { type: "IMPLEMENTATION_CREATED"; threadId: string; environmentId: string }
+  | { type: "IMPLEMENTATION_IDLE" }
+  | { type: "PR_LOCATED"; number: number; url: string }
+  | { type: "PR_HEAD_RESOLVED"; headSha: string }
+  | { type: "REVIEW_STARTED" }
+  | { type: "REVIEW_PASSED"; headSha: string }
+  | { type: "REVIEW_CHANGES_REQUESTED"; headSha?: string; summary?: string }
+  | {
+      type: "REVIEW_BLOCKED";
+      reason?: "review_limit" | "configuration" | "permanent_effect_failure";
+    }
+  | { type: "PR_MISSING"; reason?: string }
+  | { type: "PR_UNAVAILABLE"; reason?: string }
+  | { type: "REMEDIATION_SENT" }
+  | { type: "VALIDATION_PASSED"; headSha: string }
+  | { type: "VALIDATION_FAILED"; headSha?: string; reason?: string }
+  | { type: "APPROVAL_ACCEPTED"; headSha: string }
+  | { type: "APPROVAL_STALE"; headSha?: string }
+  | { type: "MERGE_SUCCEEDED"; message: string }
+  | { type: "MERGE_FAILED"; reason?: string }
+  | { type: "THREAD_FAILED"; workerKind?: WorkerKind; error?: string }
+  | { type: "FAILED"; error: string }
+  | { type: "RETRY" }
+  | { type: "CANCEL_REQUESTED"; activeWorker?: WorkerLiveness | null }
+  | { type: "CANCEL_CONFIRMED" }
+  | { type: "CONTINUE_REVIEW" };

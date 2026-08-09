@@ -2,8 +2,14 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import {
   projectPolicySchema,
+  type Job,
+  type JobEffect,
+  type JobEvent,
+  type JobState,
   type ProjectPolicy,
+  type StoredEffect,
 } from "../domain/models";
+import { transition } from "../domain/state-machine";
 import { INITIAL_MIGRATIONS } from "./migrations";
 
 type PluginStorage = BbPluginApi["storage"];
@@ -43,6 +49,93 @@ type TelegramIdentityRow = {
   verified_at: number;
 };
 
+type JobRow = {
+  id: string;
+  source_update_id: number;
+  request_text: string;
+  state: string;
+  resume_state: string | null;
+  project_id: string | null;
+  policy_version: number | null;
+  policy_json: string | null;
+  environment_id: string | null;
+  implementation_thread_id: string | null;
+  review_thread_id: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  pr_head_sha: string | null;
+  status_message_id: number | null;
+  review_cycle: number;
+  review_block_at: number;
+  cancel_requested_at: number | null;
+  blocked_reason: Job["blockedReason"];
+  last_error: string | null;
+  version: number;
+  created_at: number;
+  updated_at: number;
+};
+
+type EffectRow = {
+  idempotency_key: string;
+  job_id: string;
+  kind: StoredEffect["kind"];
+  payload_json: string;
+  status: StoredEffect["status"];
+  attempts: number;
+  lease_owner: string | null;
+  lease_generation: number | null;
+  lease_expires_at: number | null;
+  next_attempt_at: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+const JOB_STATES: ReadonlySet<JobState> = new Set([
+  "awaiting_project",
+  "awaiting_confirmation",
+  "creating_implementation",
+  "implementing",
+  "locating_pr",
+  "resolving_pr_head",
+  "reviewing",
+  "remediating",
+  "validating",
+  "awaiting_merge_approval",
+  "merging",
+  "failed",
+  "blocked",
+  "cancelled",
+  "merged",
+]);
+const BLOCKED_REASONS: ReadonlySet<NonNullable<Job["blockedReason"]>> = new Set([
+  "review_limit",
+  "configuration",
+  "cancellation_unconfirmed",
+  "permanent_effect_failure",
+]);
+
+export class VersionConflictError extends Error {
+  public constructor(jobId: string, expectedVersion: number) {
+    super(`Job ${jobId} changed since version ${expectedVersion}`);
+    this.name = "VersionConflictError";
+  }
+}
+
+export class IdempotencyConflictError extends Error {
+  public constructor(sourceUpdateId: number) {
+    super(`Telegram update ${sourceUpdateId} was replayed with different job input`);
+    this.name = "IdempotencyConflictError";
+  }
+}
+
+export class ActiveJobConflictError extends Error {
+  public constructor(jobId: string) {
+    super(`Job ${jobId} cannot continue while another job is active`);
+    this.name = "ActiveJobConflictError";
+  }
+}
+
 const CANONICAL_POSITIVE_DECIMAL = /^[1-9][0-9]*$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
@@ -79,6 +172,24 @@ export interface TelegramAgentStore {
   getProjectPolicy(projectId: string): ProjectPolicyRecord | null;
   getProjectPolicyByAlias(alias: string): ProjectPolicyRecord | null;
   listEnabledProjectPolicies(): ProjectPolicyRecord[];
+  createJob(input: {
+    id: string;
+    sourceUpdateId: number;
+    requestText: string;
+    now: number;
+  }): Job;
+  getJob(jobId: string): Job | null;
+  getActiveJob(): Job | null;
+  findJobByThreadId(threadId: string): Job | null;
+  listJobs(limit: number): Job[];
+  applyJobEvent(jobId: string, expectedVersion: number, event: JobEvent, now: number): Job;
+  listEffectsForJob(jobId: string): StoredEffect[];
+  beginTelegramUpdate(updateId: number, now: number): "process" | "processed";
+  completeTelegramUpdate(updateId: number, outcome: string, now: number): void;
+  failTelegramUpdate(updateId: number, error: string, now: number): void;
+  getNextTelegramOffset(): number;
+  recordCallback(callbackId: string, jobId: string | null, action: string, outcome: string, now: number): boolean;
+  enqueueReconcileForThread(threadId: string, now: number): boolean;
 }
 
 function parsePolicy(row: ProjectPolicyRow): ProjectPolicyRecord {
@@ -87,6 +198,137 @@ function parsePolicy(row: ProjectPolicyRow): ProjectPolicyRecord {
     version: row.version,
   };
 }
+
+function parseJob(row: JobRow): Job {
+  if (!JOB_STATES.has(row.state as JobState)) throw new Error(`Unknown persisted job state: ${row.state}`);
+  if (row.resume_state !== null && !JOB_STATES.has(row.resume_state as JobState)) {
+    throw new Error(`Unknown persisted resume state: ${row.resume_state}`);
+  }
+  if (row.blocked_reason !== null && !BLOCKED_REASONS.has(row.blocked_reason)) {
+    throw new Error(`Unknown persisted blocked reason: ${row.blocked_reason}`);
+  }
+  return {
+    id: row.id,
+    sourceUpdateId: row.source_update_id,
+    requestText: row.request_text,
+    state: row.state as JobState,
+    resumeState: row.resume_state as JobState | null,
+    projectId: row.project_id,
+    policyVersion: row.policy_version,
+    policy: row.policy_json === null
+      ? null
+      : projectPolicySchema.parse(JSON.parse(row.policy_json)),
+    environmentId: row.environment_id,
+    implementationThreadId: row.implementation_thread_id,
+    reviewThreadId: row.review_thread_id,
+    prNumber: row.pr_number,
+    prUrl: row.pr_url,
+    prHeadSha: row.pr_head_sha,
+    statusMessageId: row.status_message_id,
+    reviewCycle: row.review_cycle,
+    reviewBlockAt: row.review_block_at,
+    cancelRequestedAt: row.cancel_requested_at,
+    blockedReason: row.blocked_reason,
+    lastError: row.last_error,
+    version: row.version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function parseEffect(row: EffectRow): StoredEffect {
+  return {
+    idempotencyKey: row.idempotency_key,
+    jobId: row.job_id,
+    kind: row.kind,
+    payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+    status: row.status,
+    attempts: row.attempts,
+    leaseOwner: row.lease_owner,
+    leaseGeneration: row.lease_generation,
+    leaseExpiresAt: row.lease_expires_at,
+    nextAttemptAt: row.next_attempt_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function persistJobTransition(
+  db: SqliteDatabase,
+  jobId: string,
+  expectedVersion: number,
+  transitionedJob: Job,
+): void {
+  const updated = db
+    .prepare(
+      `UPDATE jobs SET
+         request_text = ?, state = ?, resume_state = ?, project_id = ?,
+         policy_version = ?, policy_json = ?, environment_id = ?,
+         implementation_thread_id = ?, review_thread_id = ?, pr_number = ?,
+         pr_url = ?, pr_head_sha = ?, status_message_id = ?, review_cycle = ?,
+         review_block_at = ?, cancel_requested_at = ?, blocked_reason = ?,
+         last_error = ?, version = ?, updated_at = ?
+       WHERE id = ? AND version = ?`,
+    )
+    .run(
+      transitionedJob.requestText,
+      transitionedJob.state,
+      transitionedJob.resumeState,
+      transitionedJob.projectId,
+      transitionedJob.policyVersion,
+      transitionedJob.policy ? JSON.stringify(transitionedJob.policy) : null,
+      transitionedJob.environmentId,
+      transitionedJob.implementationThreadId,
+      transitionedJob.reviewThreadId,
+      transitionedJob.prNumber,
+      transitionedJob.prUrl,
+      transitionedJob.prHeadSha,
+      transitionedJob.statusMessageId,
+      transitionedJob.reviewCycle,
+      transitionedJob.reviewBlockAt,
+      transitionedJob.cancelRequestedAt,
+      transitionedJob.blockedReason,
+      transitionedJob.lastError,
+      transitionedJob.version,
+      transitionedJob.updatedAt,
+      jobId,
+      expectedVersion,
+    );
+  if (updated.changes !== 1) throw new VersionConflictError(jobId, expectedVersion);
+}
+
+function persistPendingEffects(
+  db: SqliteDatabase,
+  effects: JobEffect[],
+  now: number,
+): void {
+  const insertEffect = db.prepare(
+    `INSERT OR IGNORE INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
+  );
+  for (const effect of effects) {
+    insertEffect.run(
+      effect.idempotencyKey,
+      effect.jobId,
+      effect.kind,
+      JSON.stringify(effect.payload),
+      now,
+      now,
+      now,
+    );
+  }
+}
+
+const JOB_SELECT = `
+  SELECT id, source_update_id, request_text, state, resume_state, project_id,
+         policy_version, policy_json, environment_id, implementation_thread_id,
+         review_thread_id, pr_number, pr_url, pr_head_sha, status_message_id,
+         review_cycle, review_block_at, cancel_requested_at, blocked_reason,
+         last_error, version, created_at, updated_at
+    FROM jobs`;
 
 class SqliteTelegramAgentStore implements TelegramAgentStore {
   public constructor(private readonly db: SqliteDatabase) {}
@@ -325,6 +567,215 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       )
       .all() as ProjectPolicyRow[];
     return rows.map(parsePolicy);
+  }
+
+  public createJob(input: {
+    id: string;
+    sourceUpdateId: number;
+    requestText: string;
+    now: number;
+  }): Job {
+    if (!input.id || !input.requestText) throw new TypeError("Job id and request text are required");
+    if (!Number.isInteger(input.sourceUpdateId) || input.sourceUpdateId < 0) {
+      throw new TypeError("sourceUpdateId must be a non-negative integer");
+    }
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO jobs (
+           id, source_update_id, request_text, state, review_cycle,
+           review_block_at, version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'awaiting_project', 0, 3, 1, ?, ?)`,
+      )
+      .run(input.id, input.sourceUpdateId, input.requestText, input.now, input.now);
+
+    const byId = this.readJobById(input.id);
+    const existing = byId ?? this.readJobBySourceUpdate(input.sourceUpdateId);
+    if (!existing) throw new Error("Job was not stored");
+    if (
+      existing.sourceUpdateId !== input.sourceUpdateId ||
+      existing.requestText !== input.requestText
+    ) {
+      throw new IdempotencyConflictError(input.sourceUpdateId);
+    }
+    return existing;
+  }
+
+  public getJob(jobId: string): Job | null {
+    return this.readJobById(jobId);
+  }
+
+  public getActiveJob(): Job | null {
+    const row = this.db
+      .prepare(`${JOB_SELECT} WHERE state NOT IN ('merged', 'cancelled', 'blocked') ORDER BY updated_at DESC, id DESC LIMIT 1`)
+      .get() as JobRow | undefined;
+    return row ? parseJob(row) : null;
+  }
+
+  public findJobByThreadId(threadId: string): Job | null {
+    const row = this.db
+      .prepare(`${JOB_SELECT} WHERE implementation_thread_id = ? OR review_thread_id = ? ORDER BY updated_at DESC LIMIT 1`)
+      .get(threadId, threadId) as JobRow | undefined;
+    return row ? parseJob(row) : null;
+  }
+
+  public listJobs(limit: number): Job[] {
+    if (!Number.isInteger(limit) || limit < 1) throw new TypeError("limit must be a positive integer");
+    const rows = this.db
+      .prepare(`${JOB_SELECT} ORDER BY updated_at DESC, id DESC LIMIT ?`)
+      .all(limit) as JobRow[];
+    return rows.map(parseJob);
+  }
+
+  public applyJobEvent(
+    jobId: string,
+    expectedVersion: number,
+    event: JobEvent,
+    now: number,
+  ): Job {
+    const apply = this.db.transaction((): Job => {
+      const current = this.readJobById(jobId);
+      if (!current) throw new Error(`Job ${jobId} was not found`);
+      if (current.version !== expectedVersion) throw new VersionConflictError(jobId, expectedVersion);
+      if (current.state === "blocked" && event.type === "CONTINUE_REVIEW" && this.hasActiveJobExcluding(jobId)) {
+        throw new ActiveJobConflictError(jobId);
+      }
+
+      const transitioned = transition(current, event, now);
+      persistJobTransition(this.db, jobId, expectedVersion, transitioned.job);
+      persistPendingEffects(this.db, transitioned.effects, now);
+      return transitioned.job;
+    });
+    return apply();
+  }
+
+  public listEffectsForJob(jobId: string): StoredEffect[] {
+    const rows = this.db
+      .prepare("SELECT * FROM effects WHERE job_id = ? ORDER BY created_at ASC, idempotency_key ASC")
+      .all(jobId) as EffectRow[];
+    return rows.map(parseEffect);
+  }
+
+  public beginTelegramUpdate(updateId: number, now: number): "process" | "processed" {
+    if (!Number.isInteger(updateId) || updateId < 0) throw new TypeError("updateId must be a non-negative integer");
+    const begin = this.db.transaction((): "process" | "processed" => {
+      const existing = this.db
+        .prepare("SELECT status FROM telegram_updates WHERE update_id = ?")
+        .get(updateId) as { status: "processing" | "processed" | "failed" } | undefined;
+      if (existing?.status === "processed") return "processed";
+      if (!existing) {
+        this.db
+          .prepare(
+            "INSERT INTO telegram_updates (update_id, status, attempts) VALUES (?, 'processing', 1)",
+          )
+          .run(updateId);
+      } else {
+        this.db
+          .prepare(
+            "UPDATE telegram_updates SET status = 'processing', attempts = attempts + 1, last_error = NULL WHERE update_id = ?",
+          )
+          .run(updateId);
+      }
+      void now;
+      return "process";
+    });
+    return begin();
+  }
+
+  public completeTelegramUpdate(updateId: number, outcome: string, now: number): void {
+    const complete = this.db.transaction(() => {
+      const updated = this.db
+        .prepare(
+          "UPDATE telegram_updates SET status = 'processed', outcome = ?, last_error = NULL, processed_at = ? WHERE update_id = ?",
+        )
+        .run(outcome, now, updateId);
+      if (updated.changes !== 1) throw new Error(`Telegram update ${updateId} was not started`);
+      this.db
+        .prepare(
+          `UPDATE telegram_cursor
+              SET next_offset = CASE WHEN next_offset < ? THEN ? ELSE next_offset END
+            WHERE singleton = 1`,
+        )
+        .run(updateId + 1, updateId + 1);
+    });
+    complete();
+  }
+
+  public failTelegramUpdate(updateId: number, error: string, now: number): void {
+    if (!error) throw new TypeError("error must not be empty");
+    const failed = this.db
+      .prepare(
+        "UPDATE telegram_updates SET status = 'failed', last_error = ?, processed_at = ? WHERE update_id = ?",
+      )
+      .run(error, now, updateId);
+    if (failed.changes !== 1) throw new Error(`Telegram update ${updateId} was not started`);
+  }
+
+  public getNextTelegramOffset(): number {
+    const row = this.db
+      .prepare("SELECT next_offset FROM telegram_cursor WHERE singleton = 1")
+      .get() as { next_offset: number } | undefined;
+    if (!row) throw new Error("Telegram cursor was not initialized");
+    return row.next_offset;
+  }
+
+  public recordCallback(
+    callbackId: string,
+    jobId: string | null,
+    action: string,
+    outcome: string,
+    now: number,
+  ): boolean {
+    if (!callbackId || !action || !outcome) throw new TypeError("Callback identity and outcome are required");
+    const result = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO callbacks (
+           callback_query_id, job_id, action, outcome, processed_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(callbackId, jobId, action, outcome, now);
+    return result.changes === 1;
+  }
+
+  public enqueueReconcileForThread(threadId: string, now: number): boolean {
+    if (!threadId) throw new TypeError("threadId must not be empty");
+    const enqueue = this.db.transaction((): boolean => {
+      const job = this.db
+        .prepare(`${JOB_SELECT} WHERE implementation_thread_id = ? OR review_thread_id = ? ORDER BY updated_at DESC LIMIT 1`)
+        .get(threadId, threadId) as JobRow | undefined;
+      if (!job) return false;
+      const result = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO effects (
+             idempotency_key, job_id, kind, payload_json, status, attempts,
+             next_attempt_at, created_at, updated_at
+           ) VALUES (?, ?, 'reconcile_job', ?, 'pending', 0, ?, ?, ?)`,
+        )
+        .run(`reconcile:${job.id}:${threadId}`, job.id, JSON.stringify({ threadId }), now, now, now);
+      return result.changes === 1;
+    });
+    return enqueue();
+  }
+
+  private readJobById(jobId: string): Job | null {
+    const row = this.db
+      .prepare(`${JOB_SELECT} WHERE id = ?`)
+      .get(jobId) as JobRow | undefined;
+    return row ? parseJob(row) : null;
+  }
+
+  private readJobBySourceUpdate(sourceUpdateId: number): Job | null {
+    const row = this.db
+      .prepare(`${JOB_SELECT} WHERE source_update_id = ?`)
+      .get(sourceUpdateId) as JobRow | undefined;
+    return row ? parseJob(row) : null;
+  }
+
+  private hasActiveJobExcluding(jobId: string): boolean {
+    return this.db
+      .prepare(
+        "SELECT 1 FROM jobs WHERE id <> ? AND state NOT IN ('merged', 'cancelled', 'blocked') LIMIT 1",
+      )
+      .get(jobId) !== undefined;
   }
 }
 
