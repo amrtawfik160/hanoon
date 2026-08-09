@@ -142,6 +142,20 @@ it("reclaims an expired update claim and rejects the old owner", () => {
   otherStore.completeTelegramUpdate(41, "reclaimed", 303_003);
 });
 
+it("does not let a stale same-store handler reclaim and complete a newer generation", () => {
+  const { bb, store } = storeFixture();
+  const recoveringStore = openStore(bb.storage);
+
+  expect(store.beginTelegramUpdate(61, 5_000)).toBe("process");
+  expect(store.beginTelegramUpdate(61, 305_000)).toBe("processed");
+  expect(recoveringStore.beginTelegramUpdate(61, 305_001)).toBe("process");
+
+  expect(() => store.completeTelegramUpdate(61, "stale-generation-1", 305_002)).toThrow(
+    UpdateClaimConflictError,
+  );
+  recoveringStore.completeTelegramUpdate(61, "generation-2", 305_003);
+});
+
 it("bounds and protects durable Telegram failure summaries", () => {
   const { store } = storeFixture();
 

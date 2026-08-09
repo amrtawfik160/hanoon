@@ -713,6 +713,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .get(updateId) as TelegramUpdateRow | undefined;
       if (existing?.status === "processed") return "processed";
 
+      // Sequential ingress keeps this store's claimed handler in flight; tokenless
+      // completion cannot safely distinguish a same-store reclaim from that handler.
+      if (this.claimedUpdates.has(updateId)) return "processed";
+
       if (
         existing?.status === "processing" &&
         existing.claim_expires_at !== null &&
