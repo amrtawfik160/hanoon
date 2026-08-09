@@ -234,6 +234,16 @@ export interface TelegramAgentStore {
   enqueueReconcileForThread(threadId: string, now: number): boolean;
 }
 
+export type TelegramStatusOutboxStore = TelegramAgentStore & {
+  setJobStatusMessageAndOutbox(
+    jobId: string,
+    messageId: number,
+    expectedVersion: number,
+    outbox: OutboxInput,
+    now: number,
+  ): Job;
+};
+
 function parsePolicy(row: ProjectPolicyRow): ProjectPolicyRecord {
   return {
     policy: projectPolicySchema.parse(JSON.parse(row.policy_json)),
@@ -371,6 +381,58 @@ const JOB_SELECT = `
          review_cycle, review_block_at, cancel_requested_at, blocked_reason,
          last_error, version, created_at, updated_at
     FROM jobs`;
+
+function serializeOutbox(item: OutboxInput, now: number): string {
+  if (!item.logicalKey || !item.chatId) throw new TypeError("outbox identity is required");
+  if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
+  let payloadJson: string;
+  try {
+    payloadJson = JSON.stringify(item.payload);
+  } catch {
+    throw new TypeError("outbox payload must be JSON serializable");
+  }
+  if (payloadJson === undefined) throw new TypeError("outbox payload must be JSON serializable");
+  if (
+    item.messageId !== undefined &&
+    item.messageId !== null &&
+    (!Number.isInteger(item.messageId) || item.messageId < 1)
+  ) {
+    throw new TypeError("outbox messageId must be a positive integer");
+  }
+  return payloadJson;
+}
+
+function persistOutbox(
+  db: SqliteDatabase,
+  item: OutboxInput,
+  payloadJson: string,
+  now: number,
+): void {
+  db
+    .prepare(
+      `INSERT INTO outbox (
+         logical_key, chat_id, message_id, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+       ON CONFLICT(logical_key) DO UPDATE SET
+         chat_id = excluded.chat_id,
+         message_id = excluded.message_id,
+         payload_json = excluded.payload_json,
+         status = 'pending',
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = NULL,
+         updated_at = excluded.updated_at`,
+    )
+    .run(
+      item.logicalKey,
+      item.chatId,
+      item.messageId ?? null,
+      payloadJson,
+      now,
+      now,
+      now,
+    );
+}
 
 function advanceTelegramCursor(db: SqliteDatabase): void {
   const cursor = db
@@ -727,6 +789,47 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return stored;
   }
 
+  public setJobStatusMessageAndOutbox(
+    jobId: string,
+    messageId: number,
+    expectedVersion: number,
+    outbox: OutboxInput,
+    now: number,
+  ): Job {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    if (!Number.isInteger(messageId) || messageId < 1) {
+      throw new TypeError("messageId must be a positive integer");
+    }
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+      throw new TypeError("expectedVersion must be a positive integer");
+    }
+    if (outbox.messageId !== messageId) {
+      throw new TypeError("outbox messageId must match status message");
+    }
+    const payloadJson = serializeOutbox(outbox, now);
+
+    const persist = this.db.transaction((): Job => {
+      const current = this.readJobById(jobId);
+      if (!current) throw new Error(`Job ${jobId} was not found`);
+      if (current.version !== expectedVersion) throw new VersionConflictError(jobId, expectedVersion);
+
+      const updated = this.db
+        .prepare(
+          `UPDATE jobs
+              SET status_message_id = ?, version = ?, updated_at = ?
+            WHERE id = ? AND version = ?`,
+        )
+        .run(messageId, expectedVersion + 1, now, jobId, expectedVersion);
+      if (updated.changes !== 1) throw new VersionConflictError(jobId, expectedVersion);
+
+      persistOutbox(this.db, outbox, payloadJson, now);
+      const stored = this.readJobById(jobId);
+      if (!stored) throw new Error(`Job ${jobId} was not found after status-message update`);
+      return stored;
+    });
+    return persist();
+  }
+
   public enqueueSteeringEffect(
     jobId: string,
     updateId: number,
@@ -768,43 +871,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   public enqueueOutbox(item: OutboxInput, now: number): void {
-    if (!item.logicalKey || !item.chatId) throw new TypeError("outbox identity is required");
-    if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
-    let payloadJson: string;
-    try {
-      payloadJson = JSON.stringify(item.payload);
-    } catch {
-      throw new TypeError("outbox payload must be JSON serializable");
-    }
-    if (payloadJson === undefined) throw new TypeError("outbox payload must be JSON serializable");
-    if (item.messageId !== undefined && item.messageId !== null && (!Number.isInteger(item.messageId) || item.messageId < 1)) {
-      throw new TypeError("outbox messageId must be a positive integer");
-    }
-
-    this.db
-      .prepare(
-        `INSERT INTO outbox (
-           logical_key, chat_id, message_id, payload_json, status, attempts,
-           next_attempt_at, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-         ON CONFLICT(logical_key) DO UPDATE SET
-           chat_id = excluded.chat_id,
-           message_id = excluded.message_id,
-           payload_json = excluded.payload_json,
-           status = 'pending',
-           next_attempt_at = excluded.next_attempt_at,
-           last_error = NULL,
-           updated_at = excluded.updated_at`,
-      )
-      .run(
-        item.logicalKey,
-        item.chatId,
-        item.messageId ?? null,
-        payloadJson,
-        now,
-        now,
-        now,
-      );
+    const payloadJson = serializeOutbox(item, now);
+    persistOutbox(this.db, item, payloadJson, now);
   }
 
   public async setLastProject(projectId: string): Promise<void> {

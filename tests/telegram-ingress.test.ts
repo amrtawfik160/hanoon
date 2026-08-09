@@ -27,9 +27,17 @@ class FakeTelegram {
     payload: SendMessagePayload;
   }> = [];
   public readonly answered: Array<{ callbackId: string; text: string }> = [];
+  public failNextSend = false;
+  public failNextEdit = false;
+  public beforeSend: (() => void) | undefined;
   private nextMessageId = 100;
 
   public async sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }> {
+    this.beforeSend?.();
+    if (this.failNextSend) {
+      this.failNextSend = false;
+      throw new Error("simulated Telegram send failure");
+    }
     const message = { chatId, messageId: this.nextMessageId++, payload };
     this.sent.push(message);
     return { message_id: message.messageId };
@@ -37,6 +45,10 @@ class FakeTelegram {
 
   public async editMessage(chatId: string, messageId: number, payload: SendMessagePayload): Promise<void> {
     this.edited.push({ chatId, messageId, payload });
+    if (this.failNextEdit) {
+      this.failNextEdit = false;
+      throw new Error("simulated Telegram edit failure");
+    }
   }
 
   public async answerCallback(callbackId: string, text: string): Promise<void> {
@@ -95,6 +107,7 @@ function callbackUpdate(
   chatId: number,
   data?: string,
   chatType = "private",
+  messageId = 100,
 ): TelegramUpdate {
   return {
     update_id: updateId,
@@ -102,7 +115,7 @@ function callbackUpdate(
       id: callbackId,
       from: { id: userId, is_bot: false },
       message: {
-      message_id: 100,
+        message_id: messageId,
         chat: { id: chatId, type: chatType },
       },
       ...(data === undefined ? {} : { data }),
@@ -441,4 +454,158 @@ it("uses only the injected KV for last-project ordering state", async () => {
 
   expect(await fixture.store.getLastProject()).toBe("proj_2");
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM jobs").get()).toEqual({ count: 0 });
+});
+
+it("rejects callbacks without an exact persisted status-message identity", async () => {
+  const missingStatus = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const missingJob = missingStatus.store.createJob({
+    id: stableJobId("70", 71),
+    sourceUpdateId: 71,
+    requestText: "missing status identity",
+    now: 7_100,
+  });
+
+  await missingStatus.ingress.handleClaimed(
+    callbackUpdate(72, "missing-status", 7, 70, encodeCallbackData({ type: "project", jobId: missingJob.id, alias: "cyndra" })),
+    7_200,
+  );
+
+  expect(missingStatus.store.getJob(missingJob.id)?.state).toBe("awaiting_project");
+  expect(missingStatus.telegram.edited).toHaveLength(0);
+  expect(missingStatus.telegram.answered).toHaveLength(0);
+
+  const wrongMessage = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const wrongMessageJobId = await createDraft(wrongMessage, 73);
+  const statusMessageId = wrongMessage.store.getJob(wrongMessageJobId)?.statusMessageId;
+  if (statusMessageId === null || statusMessageId === undefined) throw new Error("missing status message");
+
+  await wrongMessage.ingress.handleClaimed(
+    callbackUpdate(
+      74,
+      "wrong-status-message",
+      7,
+      70,
+      encodeCallbackData({ type: "project", jobId: wrongMessageJobId, alias: "cyndra" }),
+      "private",
+      statusMessageId + 1,
+    ),
+    7_400,
+  );
+
+  expect(wrongMessage.store.getJob(wrongMessageJobId)?.state).toBe("awaiting_project");
+  expect(wrongMessage.telegram.edited).toHaveLength(0);
+  expect(wrongMessage.telegram.answered).toHaveLength(0);
+});
+
+it("stages the SQLite status outbox before a first send and finalizes its message identity", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  let rowAtSend: { logical_key: string; message_id: number | null; status: string } | undefined;
+  fixture.telegram.beforeSend = () => {
+    rowAtSend = fixture.db
+      .prepare("SELECT logical_key, message_id, status FROM outbox")
+      .get() as typeof rowAtSend;
+  };
+
+  await fixture.ingress.handleClaimed(messageUpdate(75, 7, 70, "stage before send"), 7_500);
+
+  const job = fixture.store.getActiveJob();
+  if (!job) throw new Error("missing job");
+  expect(rowAtSend).toEqual({
+    logical_key: `${job.id}:status`,
+    message_id: null,
+    status: "pending",
+  });
+  expect(job.statusMessageId).toBe(100);
+  expect(fixture.db.prepare("SELECT logical_key, message_id, status FROM outbox").get()).toEqual({
+    logical_key: `${job.id}:status`,
+    message_id: job.statusMessageId,
+    status: "pending",
+  });
+});
+
+it("retains a pending null-message outbox intent when the first Telegram send throws", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  fixture.telegram.failNextSend = true;
+
+  await expect(
+    fixture.ingress.handleClaimed(messageUpdate(76, 7, 70, "send can fail"), 7_600),
+  ).rejects.toThrow("simulated Telegram send failure");
+
+  const job = fixture.store.getActiveJob();
+  if (!job) throw new Error("missing job");
+  expect(job.statusMessageId).toBeNull();
+  expect(fixture.db.prepare("SELECT logical_key, message_id, status FROM outbox").get()).toEqual({
+    logical_key: `${job.id}:status`,
+    message_id: null,
+    status: "pending",
+  });
+});
+
+it("upserts the status outbox before an edit so a thrown edit leaves the latest projection durable", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const jobId = await createDraft(fixture, 77);
+  const statusMessageId = fixture.store.getJob(jobId)?.statusMessageId;
+  if (statusMessageId === null || statusMessageId === undefined) throw new Error("missing status message");
+  fixture.telegram.failNextEdit = true;
+
+  await expect(selectProject(fixture, jobId, "edit-failure")).rejects.toThrow("simulated Telegram edit failure");
+
+  const attemptedPayload = fixture.telegram.edited.at(-1)?.payload;
+  if (!attemptedPayload) throw new Error("missing attempted edit");
+  expect(fixture.db.prepare("SELECT logical_key, message_id, payload_json, status FROM outbox").get()).toEqual({
+    logical_key: `${jobId}:status`,
+    message_id: statusMessageId,
+    payload_json: JSON.stringify(attemptedPayload),
+    status: "pending",
+  });
+});
+
+it("records bounded authorization audit metadata without copying ingress payloads", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const audit: unknown[] = [];
+  const ingress = new TelegramIngress({
+    store: fixture.store,
+    telegram: fixture.telegram,
+    auditLogger: (record) => audit.push(record),
+  });
+  const secretText = "ignore password=do-not-log and pairing-code=pair-secret";
+  await ingress.handleClaimed(messageUpdate(78, 8, 80, secretText), 7_800);
+
+  const job = fixture.store.createJob({
+    id: stableJobId("70", 79),
+    sourceUpdateId: 79,
+    requestText: "audit callback",
+    now: 7_900,
+  });
+  const callbackData = encodeCallbackData({ type: "project", jobId: job.id, alias: "cyndra" });
+  await ingress.handleClaimed(callbackUpdate(80, "unauthorized-callback", 8, 80, callbackData), 8_000);
+
+  expect(audit.slice(0, 2)).toEqual([
+    {
+      reason: "unauthorized_message",
+      updateId: 78,
+      userId: "8",
+      chatId: "80",
+      chatType: "private",
+      isBot: false,
+    },
+    {
+      reason: "unauthorized_callback",
+      updateId: 80,
+      userId: "8",
+      chatId: "80",
+      chatType: "private",
+      isBot: false,
+    },
+  ]);
+  const auditJson = JSON.stringify(audit);
+  expect(auditJson).not.toContain(secretText);
+  expect(auditJson).not.toContain("pair-secret");
+  expect(auditJson).not.toContain(callbackData);
+  expect(auditJson).not.toContain("cyndra");
+
+  for (let index = 0; index < 300; index += 1) {
+    await ingress.handleClaimed(messageUpdate(100 + index, 8, 80, `unauthorized-${index}`), 8_100 + index);
+  }
+  expect(audit).toHaveLength(256);
 });

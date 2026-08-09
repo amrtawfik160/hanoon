@@ -5,6 +5,7 @@ import type {
   OutboxInput,
   ProjectPolicyRecord,
   TelegramAgentStore,
+  TelegramStatusOutboxStore,
 } from "../storage/store";
 import {
   telegramUpdateSchema,
@@ -21,13 +22,35 @@ export type TelegramIngressTransport = {
   answerCallback(callbackQueryId: string, text: string): Promise<void>;
 };
 
+export type TelegramIngressAuditReason =
+  | "unauthorized_message"
+  | "unauthorized_callback"
+  | "missing_callback_message"
+  | "malformed_callback"
+  | "invalid_callback"
+  | "unknown_callback_job"
+  | "callback_message_mismatch";
+
+export type TelegramIngressAuditRecord = Readonly<{
+  reason: TelegramIngressAuditReason;
+  updateId: number;
+  userId: string | null;
+  chatId: string | null;
+  chatType: "private" | "group" | "supergroup" | "channel" | "unknown";
+  isBot: boolean;
+}>;
+
+export type TelegramIngressAuditLogger = (record: TelegramIngressAuditRecord) => void;
+
 export type TelegramIngressOptions = {
   store: TelegramAgentStore;
   telegram: TelegramIngressTransport;
+  auditLogger?: TelegramIngressAuditLogger;
 };
 
 const PRIVATE_ID = /^[1-9][0-9]*$/;
 const MAX_TASK_TEXT = 4_000;
+const MAX_AUDIT_RECORDS = 256;
 const STATUS_LOGICAL_SUFFIX = ":status";
 
 export function stableJobId(chatId: string, updateId: number): string {
@@ -82,7 +105,24 @@ function jobIsTerminal(job: Job): boolean {
 
 function callbackMessageMatches(job: Job, callback: TelegramCallbackQuery): boolean {
   if (!callback.message) return false;
-  return job.statusMessageId === null || job.statusMessageId === callback.message.message_id;
+  return job.statusMessageId !== null && job.statusMessageId === callback.message.message_id;
+}
+
+function safeAuditChatType(value: string | undefined): TelegramIngressAuditRecord["chatType"] {
+  if (value === "private" || value === "group" || value === "supergroup" || value === "channel") {
+    return value;
+  }
+  return "unknown";
+}
+
+function boundedAuditLogger(logger: TelegramIngressAuditLogger | undefined): TelegramIngressAuditLogger {
+  let count = 0;
+  return (record) => {
+    if (count >= MAX_AUDIT_RECORDS) return;
+    count += 1;
+    if (!logger) return;
+    logger({ ...record });
+  };
 }
 
 function orderedProjects(
@@ -104,6 +144,7 @@ function safeOutcome(value: string): string {
 export class TelegramIngress {
   private readonly store: TelegramAgentStore;
   private readonly telegram: TelegramIngressTransport;
+  private readonly auditLogger: TelegramIngressAuditLogger;
 
   public constructor(options: TelegramIngressOptions);
   public constructor(store: TelegramAgentStore, telegram: TelegramIngressTransport);
@@ -114,10 +155,12 @@ export class TelegramIngress {
     if ("store" in optionsOrStore) {
       this.store = optionsOrStore.store;
       this.telegram = optionsOrStore.telegram;
+      this.auditLogger = boundedAuditLogger(optionsOrStore.auditLogger);
     } else {
       if (!telegram) throw new TypeError("Telegram ingress requires a Telegram client");
       this.store = optionsOrStore;
       this.telegram = telegram;
+      this.auditLogger = boundedAuditLogger(undefined);
     }
   }
 
@@ -130,7 +173,7 @@ export class TelegramIngress {
       return;
     }
     if (parsed.data.callback_query) {
-      await this.handleCallback(parsed.data.callback_query, now);
+      await this.handleCallback(parsed.data.callback_query, parsed.data.update_id, now);
     }
   }
 
@@ -141,7 +184,10 @@ export class TelegramIngress {
 
     const pairingCode = this.pairingCode(text);
     if (pairingCode !== null) {
-      if (!identity) return;
+      if (!identity) {
+        this.audit("unauthorized_message", updateId, message.from, message.chat);
+        return;
+      }
       const result = this.store.pairOwnerWithPrivateChatCode(
         hashSecret(pairingCode),
         identity.userId,
@@ -157,7 +203,10 @@ export class TelegramIngress {
       return;
     }
 
-    if (!identity || !ownerMatches(this.store, identity)) return;
+    if (!identity || !ownerMatches(this.store, identity)) {
+      this.audit("unauthorized_message", updateId, message.from, message.chat);
+      return;
+    }
     const normalized = boundedText(text);
     if (normalized === null) return;
 
@@ -215,21 +264,38 @@ export class TelegramIngress {
     return match?.[1] ?? null;
   }
 
-  private async handleCallback(callback: TelegramCallbackQuery, now: number): Promise<void> {
-    if (!callback.message) return;
+  private async handleCallback(callback: TelegramCallbackQuery, updateId: number, now: number): Promise<void> {
+    if (!callback.message) {
+      this.audit("missing_callback_message", updateId, callback.from, undefined);
+      return;
+    }
     const identity = privateHumanIdentity(callback.from, callback.message.chat);
-    if (!identity || !ownerMatches(this.store, identity)) return;
+    if (!identity || !ownerMatches(this.store, identity)) {
+      this.audit("unauthorized_callback", updateId, callback.from, callback.message.chat);
+      return;
+    }
 
     let action: CallbackAction;
     try {
       action = parseCallbackData(callback.data ?? "");
     } catch {
+      this.audit("malformed_callback", updateId, callback.from, callback.message.chat);
       return;
     }
     const jobId = callbackJobId(action);
-    if (jobId === null) return;
+    if (jobId === null) {
+      this.audit("invalid_callback", updateId, callback.from, callback.message.chat);
+      return;
+    }
     const job = this.store.getJob(jobId);
-    if (!job || !callbackMessageMatches(job, callback)) return;
+    if (!job) {
+      this.audit("unknown_callback_job", updateId, callback.from, callback.message.chat);
+      return;
+    }
+    if (!callbackMessageMatches(job, callback)) {
+      this.audit("callback_message_mismatch", updateId, callback.from, callback.message.chat);
+      return;
+    }
 
     switch (action.type) {
       case "project":
@@ -386,6 +452,37 @@ export class TelegramIngress {
     await this.telegram.sendMessage(chatId, { text, disable_web_page_preview: true });
   }
 
+  private setStatusMessageAndOutbox(
+    job: Job,
+    messageId: number,
+    outbox: OutboxInput,
+    now: number,
+  ): Job {
+    const atomicStore = this.store as Partial<TelegramStatusOutboxStore>;
+    if (typeof atomicStore.setJobStatusMessageAndOutbox === "function") {
+      return atomicStore.setJobStatusMessageAndOutbox(job.id, messageId, job.version, outbox, now);
+    }
+    const updated = this.store.setJobStatusMessage(job.id, messageId, job.version, now);
+    this.store.enqueueOutbox(outbox, now);
+    return updated;
+  }
+
+  private audit(
+    reason: TelegramIngressAuditReason,
+    updateId: number,
+    from: { id: number; is_bot: boolean },
+    chat: { id: number; type: string } | undefined,
+  ): void {
+    this.auditLogger({
+      reason,
+      updateId,
+      userId: numericIdentity(from.id),
+      chatId: chat ? numericIdentity(chat.id) : null,
+      chatType: safeAuditChatType(chat?.type),
+      isBot: from.is_bot,
+    });
+  }
+
   private async deliverJobView(
     job: Job,
     payload: SendMessagePayload,
@@ -395,25 +492,32 @@ export class TelegramIngress {
   ): Promise<Job> {
     let current = this.store.getJob(job.id) ?? job;
     let messageId = current.statusMessageId;
+    const logicalKey = `${current.id}${STATUS_LOGICAL_SUFFIX}`;
+    const outbox = (outboxMessageId: number | null): OutboxInput => ({
+      logicalKey,
+      chatId,
+      messageId: outboxMessageId,
+      payload: payload as unknown as Record<string, unknown>,
+    });
     if (messageId !== null) {
+      this.store.enqueueOutbox(outbox(messageId), now);
       await this.telegram.editMessage(chatId, messageId, payload);
     } else if (callbackMessageId !== undefined) {
+      const intent = outbox(callbackMessageId);
+      this.store.enqueueOutbox(intent, now);
       await this.telegram.editMessage(chatId, callbackMessageId, payload);
-      current = this.store.setJobStatusMessage(current.id, callbackMessageId, current.version, now);
-      messageId = callbackMessageId;
+      current = this.setStatusMessageAndOutbox(current, callbackMessageId, intent, now);
     } else {
+      const intent = outbox(null);
+      this.store.enqueueOutbox(intent, now);
       const sent = await this.telegram.sendMessage(chatId, payload);
-      current = this.store.setJobStatusMessage(current.id, sent.message_id, current.version, now);
-      messageId = sent.message_id;
+      current = this.setStatusMessageAndOutbox(
+        current,
+        sent.message_id,
+        { ...intent, messageId: sent.message_id },
+        now,
+      );
     }
-
-    const outbox: OutboxInput = {
-      logicalKey: `${current.id}${STATUS_LOGICAL_SUFFIX}`,
-      chatId,
-      messageId,
-      payload: payload as unknown as Record<string, unknown>,
-    };
-    this.store.enqueueOutbox(outbox, now);
     return current;
   }
 }
