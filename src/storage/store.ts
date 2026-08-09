@@ -15,21 +15,29 @@ import { ALL_MIGRATIONS } from "./migrations";
 
 type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
+type PluginKv = PluginStorage["kv"];
 
-type PairingResult =
+export type PairingResult =
   | { ok: true }
   | {
       ok: false;
       reason: "missing" | "expired" | "consumed" | "already_paired";
     };
 
-type Owner = { userId: string; chatId: string; pairedAt: number };
+export type Owner = { userId: string; chatId: string; pairedAt: number };
 type TelegramIdentity = {
   botId: string;
   username: string;
   verifiedAt: number;
 };
-type ProjectPolicyRecord = { policy: ProjectPolicy; version: number };
+export type ProjectPolicyRecord = { policy: ProjectPolicy; version: number };
+
+export type OutboxInput = {
+  logicalKey: string;
+  chatId: string;
+  messageId?: number | null;
+  payload: Record<string, unknown>;
+};
 
 type PairingCodeRow = {
   consumed_at: number | null;
@@ -150,6 +158,8 @@ export class UpdateClaimConflictError extends Error {
   }
 }
 
+const LAST_PROJECT_KEY = "telegram-agent:last-project";
+
 const CANONICAL_POSITIVE_DECIMAL = /^[1-9][0-9]*$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const TELEGRAM_UPDATE_LEASE_MS = 300_000;
@@ -174,6 +184,12 @@ export interface TelegramAgentStore {
     chatId: string,
     now: number,
   ): PairingResult;
+  pairOwnerWithPrivateChatCode(
+    codeHash: string,
+    userId: string,
+    chatId: string,
+    now: number,
+  ): PairingResult;
   getOwner(): Owner | null;
   revokeOwner(now: number): boolean;
   bindTelegramIdentity(input: {
@@ -193,6 +209,17 @@ export interface TelegramAgentStore {
     requestText: string;
     now: number;
   }): Job;
+  setJobStatusMessage(jobId: string, messageId: number, expectedVersion: number, now: number): Job;
+  enqueueSteeringEffect(
+    jobId: string,
+    updateId: number,
+    threadId: string,
+    text: string,
+    now: number,
+  ): boolean;
+  enqueueOutbox(item: OutboxInput, now: number): void;
+  setLastProject(projectId: string): Promise<void>;
+  getLastProject(): Promise<string | null>;
   getJob(jobId: string): Job | null;
   getActiveJob(): Job | null;
   findJobByThreadId(threadId: string): Job | null;
@@ -379,7 +406,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly claimOwner = randomUUID();
   private readonly claimedUpdates = new Map<number, number>();
 
-  public constructor(private readonly db: SqliteDatabase) {}
+  public constructor(
+    private readonly db: SqliteDatabase,
+    private readonly kv: PluginKv,
+  ) {}
 
   public createPairingCode(
     codeHash: string,
@@ -400,10 +430,29 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     chatId: string,
     now: number,
   ): PairingResult {
+    return this.pairOwnerWithCodeInternal(codeHash, userId, chatId, now, true);
+  }
+
+  public pairOwnerWithPrivateChatCode(
+    codeHash: string,
+    userId: string,
+    chatId: string,
+    now: number,
+  ): PairingResult {
+    return this.pairOwnerWithCodeInternal(codeHash, userId, chatId, now, false);
+  }
+
+  private pairOwnerWithCodeInternal(
+    codeHash: string,
+    userId: string,
+    chatId: string,
+    now: number,
+    requireMatchingIdentity: boolean,
+  ): PairingResult {
     assertSha256Hex(codeHash);
     assertCanonicalPositiveDecimal(userId, "userId");
     assertCanonicalPositiveDecimal(chatId, "chatId");
-    if (userId !== chatId) {
+    if (requireMatchingIdentity && userId !== chatId) {
       throw new TypeError("V1 owner pairing requires userId to equal chatId for a private chat");
     }
 
@@ -648,6 +697,128 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return existing;
   }
 
+  public setJobStatusMessage(
+    jobId: string,
+    messageId: number,
+    expectedVersion: number,
+    now: number,
+  ): Job {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    if (!Number.isInteger(messageId) || messageId < 1) {
+      throw new TypeError("messageId must be a positive integer");
+    }
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+      throw new TypeError("expectedVersion must be a positive integer");
+    }
+    const current = this.readJobById(jobId);
+    if (!current) throw new Error(`Job ${jobId} was not found`);
+    if (current.version !== expectedVersion) throw new VersionConflictError(jobId, expectedVersion);
+
+    const updated = this.db
+      .prepare(
+        `UPDATE jobs
+            SET status_message_id = ?, version = ?, updated_at = ?
+          WHERE id = ? AND version = ?`,
+      )
+      .run(messageId, expectedVersion + 1, now, jobId, expectedVersion);
+    if (updated.changes !== 1) throw new VersionConflictError(jobId, expectedVersion);
+    const stored = this.readJobById(jobId);
+    if (!stored) throw new Error(`Job ${jobId} was not found after status-message update`);
+    return stored;
+  }
+
+  public enqueueSteeringEffect(
+    jobId: string,
+    updateId: number,
+    threadId: string,
+    text: string,
+    now: number,
+  ): boolean {
+    if (!jobId || !threadId) throw new TypeError("jobId and threadId must not be empty");
+    if (!Number.isInteger(updateId) || updateId < 0) {
+      throw new TypeError("updateId must be a non-negative integer");
+    }
+    if (typeof text !== "string" || text.length === 0 || text.length > 4_000) {
+      throw new TypeError("steering text must be between 1 and 4000 characters");
+    }
+
+    const enqueue = this.db.transaction((): boolean => {
+      const job = this.readJobById(jobId);
+      if (!job || job.implementationThreadId !== threadId || ["merged", "cancelled", "blocked"].includes(job.state)) {
+        return false;
+      }
+      const result = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO effects (
+             idempotency_key, job_id, kind, payload_json, status, attempts,
+             next_attempt_at, created_at, updated_at
+           ) VALUES (?, ?, 'steer_implementation', ?, 'pending', 0, ?, ?, ?)`,
+        )
+        .run(
+          `${jobId}:telegram:${updateId}:steer_implementation`,
+          jobId,
+          JSON.stringify({ text, threadId }),
+          now,
+          now,
+          now,
+        );
+      return result.changes === 1;
+    });
+    return enqueue();
+  }
+
+  public enqueueOutbox(item: OutboxInput, now: number): void {
+    if (!item.logicalKey || !item.chatId) throw new TypeError("outbox identity is required");
+    if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
+    let payloadJson: string;
+    try {
+      payloadJson = JSON.stringify(item.payload);
+    } catch {
+      throw new TypeError("outbox payload must be JSON serializable");
+    }
+    if (payloadJson === undefined) throw new TypeError("outbox payload must be JSON serializable");
+    if (item.messageId !== undefined && item.messageId !== null && (!Number.isInteger(item.messageId) || item.messageId < 1)) {
+      throw new TypeError("outbox messageId must be a positive integer");
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO outbox (
+           logical_key, chat_id, message_id, payload_json, status, attempts,
+           next_attempt_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+         ON CONFLICT(logical_key) DO UPDATE SET
+           chat_id = excluded.chat_id,
+           message_id = excluded.message_id,
+           payload_json = excluded.payload_json,
+           status = 'pending',
+           next_attempt_at = excluded.next_attempt_at,
+           last_error = NULL,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        item.logicalKey,
+        item.chatId,
+        item.messageId ?? null,
+        payloadJson,
+        now,
+        now,
+        now,
+      );
+  }
+
+  public async setLastProject(projectId: string): Promise<void> {
+    if (typeof projectId !== "string" || projectId.length === 0 || projectId.length > 200) {
+      throw new TypeError("projectId must be a bounded non-empty string");
+    }
+    await this.kv.set(LAST_PROJECT_KEY, projectId);
+  }
+
+  public async getLastProject(): Promise<string | null> {
+    const value = await this.kv.get<unknown>(LAST_PROJECT_KEY);
+    return typeof value === "string" && value.length > 0 && value.length <= 200 ? value : null;
+  }
+
   public getJob(jobId: string): Job | null {
     return this.readJobById(jobId);
   }
@@ -877,8 +1048,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 }
 
-export function openStore(storage: PluginStorage): TelegramAgentStore {
+export function openStore(storage: PluginStorage, kv: PluginKv = storage.kv): TelegramAgentStore {
   const db = storage.database();
   storage.migrate(db, [...ALL_MIGRATIONS]);
-  return new SqliteTelegramAgentStore(db);
+  return new SqliteTelegramAgentStore(db, kv);
 }
