@@ -55,10 +55,14 @@ Telegram private chat
         v
 BB Telegram Agent plugin
   |- Telegram long-poll service
+  |     `- authenticate, deduplicate, enqueue, and render only
   |- pairing, authorization, and callback validation
   |- durable SQLite job state and Telegram outbox
   |- idempotent orchestration state machine
-  |- BB thread and environment adapter
+  |- single leased execution engine
+  |     |- BB thread and environment adapter
+  |     |- worker liveness mirror
+  |     `- terminal, validation, and merge effects
   |- deterministic validation and merge gates
         |
         |- visible implementation thread
@@ -78,8 +82,9 @@ The package initially declares only `bb.server`. It uses these native BB plugin 
 
 - `bb.settings` for the secret Telegram bot token and simple global settings;
 - `bb.storage.database()` and append-only migrations for durable state;
-- `bb.background.service()` for Telegram ingress and job reconciliation/outbox delivery;
+- `bb.background.service()` for pure Telegram ingress and one leased job executor/reconciler;
 - `bb.sdk.threads` to spawn and steer threads;
+- `bb.sdk.projects.attachments` for immutable work-order and review-packet handoffs outside the repository;
 - BB environment, terminal, file, and pull-request SDK surfaces for deterministic inspection and validation;
 - `bb.events.on()` for immediate thread lifecycle reactions;
 - `bb.cli.register()` for pairing, project policy, job inspection, retry, and cancellation;
@@ -103,15 +108,23 @@ Creates a cryptographically random, single-use pairing code through the CLI. Onl
 
 ### `job-store.ts`
 
-Owns append-only SQLite migrations and transactional persistence for project policies, jobs, attempts, Telegram updates, callbacks, approval nonces, and outbound messages. No growing job data is stored in the 256 KB plugin key-value store.
+Owns append-only SQLite migrations and transactional persistence for project policies, jobs, attempts, Telegram updates, callbacks, approval nonces, durable effects, the global executor lease, the current worker-liveness mirror, and outbound messages. No growing job data is stored in the 256 KB plugin key-value store.
 
 ### `orchestrator.ts`
 
 Implements a pure, idempotent state machine. A transition takes the durable job snapshot plus a typed event and returns a new snapshot and explicit effects. Effects have durable idempotency keys before external execution.
 
+### `effect-executor.ts`
+
+Owns the single global execution lease and is the only module allowed to execute effects that touch BB threads, environments, terminals, project attachments, GitHub, or merge state. It executes effects sequentially and fences every claim with the current lease generation. Telegram ingress and BB lifecycle handlers may only persist input or enqueue a reconciliation nudge; neither may start work directly.
+
 ### `bb-runner.ts`
 
-Creates the implementation worktree/thread, creates review children in the same environment, sends remediation findings back to the implementation thread, reads live thread state, and resolves the environment and pull request. It does not decide whether a merge is safe.
+Creates the implementation worktree/thread, creates review children in the same environment, sends remediation findings back to the implementation thread, reads live thread state, and resolves the environment and pull request. Review uses `threads.spawn`, never `threads.fork`: parenting organizes the work without cloning the implementation provider conversation. This adapter is callable only by the leased effect executor and does not decide whether a merge is safe.
+
+### `handoff-artifacts.ts`
+
+Builds bounded immutable Markdown work orders and JSON review packets. The executor uploads their bytes with `bb.sdk.projects.attachments.upload` and starts the thread with a tiny instruction plus the returned `localFile` input. The artifacts are outside the Git worktree, are content-digested in the attempt record, and therefore preserve executor context without creating untracked repository files. V1 has no separate planner thread; any later planner must hand off through the same artifact boundary rather than its provider transcript.
 
 ### `review-contract.ts`
 
@@ -119,7 +132,7 @@ Validates the reviewer's final response as one strict JSON object. Malformed out
 
 ### `validation-runner.ts`
 
-Runs owner-configured validation commands sequentially on the BB environment's owning host with per-command timeouts. It records the exact command label, exit status, bounded output summary, and commit SHA. It obtains git state through BB's environment-scoped surfaces and GitHub PR/check state through the authenticated `gh` CLI on that same host. Commands are configuration entered by the BB owner, never Telegram text. The implementation must never resolve an environment path with server-local `node:fs`.
+Runs owner-configured validation commands sequentially on the BB environment's owning host with per-command timeouts. It records the exact command label, exit status, bounded output summary, and commit SHA. It obtains local git state through BB's environment-scoped surfaces, resolves the authoritative remote PR head with `git ls-remote --exit-code origin refs/pull/<number>/head`, and obtains non-head PR/check metadata through the authenticated `gh` CLI on that same host. Commands are configuration entered by the BB owner, never Telegram text. The implementation must never resolve an environment path with server-local `node:fs`.
 
 ### `merge-gates.ts`
 
@@ -127,7 +140,7 @@ Evaluates the complete, fresh merge predicate and returns either a typed ready r
 
 ### `project-policy.ts`
 
-Validates enabled-project configuration: BB project id, display alias, base branch, validation commands, required GitHub checks, implementation and review execution settings, maximum review cycles, and merge method.
+Validates enabled-project configuration: BB project id, display alias, base branch, validation commands, required GitHub checks, implementation and review execution settings, worker-liveness watchdog, maximum review cycles, and merge method.
 
 ### `telegram-view.ts`
 
@@ -145,6 +158,9 @@ The initial schema contains the following logical records:
 - `telegram_updates`: Telegram update id and processed outcome for ingress deduplication.
 - `callbacks`: callback-query id, action, job id, outcome, and processed timestamp.
 - `approvals`: nonce hash, job id, bound head SHA, expiry, consumed timestamp, and outcome.
+- `effects`: deterministic idempotency key, job/version payload, lease owner/generation, attempt state, and retry metadata.
+- `executor_lease`: singleton owner id, monotonically increasing generation, heartbeat, and expiry.
+- `worker_liveness`: one current row for the job's active BB thread or terminal resource, including its generation, BB-derived state, source timestamp, and observation time.
 - `outbox`: logical message key, target chat/message, desired payload, attempt state, next-attempt time, and last error.
 
 Every job mutation uses an optimistic version or a transaction that checks the expected current state. External effects are safe to retry because their logical idempotency key is written first.
@@ -173,8 +189,8 @@ Key transition rules:
 1. A plain private-chat message starts a draft only when no job is active.
 2. The project picker lists only enabled standard Git projects. Remembering the last choice only changes ordering; it never skips confirmation.
 3. Start creates one isolated worktree from the configured base branch and one visible implementation thread.
-4. Implementation idle does not imply success. The plugin reconciles the environment and PR before review.
-5. Review always uses a new visible child thread with the implementation environment id and a fresh provider conversation.
+4. Implementation idle does not imply success. The plugin reconciles the environment and PR, then resolves and verifies the Git-native remote PR head before review can start.
+5. Review always uses a new visible `threads.spawn` child with the implementation environment id and a fresh provider conversation; it never forks the implementation provider session.
 6. `changes_requested` returns structured findings to the implementation thread. A later idle transition must produce a new head SHA before another review can pass.
 7. Three unsuccessful review cycles block by default. Continue authorizes another bounded set; Stop cancels the job.
 8. Reviewer `pass` proceeds to independent deterministic validation. It does not itself unlock merge.
@@ -183,6 +199,16 @@ Key transition rules:
 11. A successful merge records the merge commit before Telegram reports completion.
 
 Lifecycle events make normal transitions immediate. On service startup and periodically while work exists, the reconciler reads current thread/environment state so a missed event cannot strand a job.
+
+## Execution ownership and liveness
+
+There is exactly one code path that can begin or steer agent work: the leased effect executor. Its singleton SQLite lease has an opaque owner id, a monotonically increasing generation, a heartbeat, and an expiry. Effect and outbox claims carry that lease owner and generation; a stale executor that loses its lease cannot claim more work. Every external operation still has a deterministic idempotency key because a lease cannot make an already-issued network request transactional.
+
+The Telegram long-poll service performs Bot API I/O, authorization, durable update claiming, state-machine input, and desired-view enqueueing only. It never calls BB thread, environment, file, terminal, project-attachment, GitHub, or merge APIs. BB lifecycle listeners only enqueue reconciliation and return.
+
+BB owns the provider subprocess, so BB's thread `status`, runtime display status, and timestamps are the only source of provider-worker liveness. The plugin stores one current liveness row per active job—worker kind, BB resource id, generation, state, source timestamp, and observation timestamp—and updates it only from BB lifecycle payloads or a fresh `threads.get`. It never infers liveness from Git changes, assistant output, Telegram activity, or several competing timestamps. Terminal-command liveness similarly comes only from the BB terminal session plus its explicit deadline.
+
+BB 0.36 exposes thread/runtime state but not a dedicated provider-process heartbeat. If an active BB thread has no fresh authoritative activity past the configured watchdog, V1 reports `liveness stale`; an unavailable or reconnecting BB source reports `liveness unknown`. Both alert the owner and fail closed: neither declares the worker dead, starts a replacement, or creates a second session. A true subprocess heartbeat would need to be added to BB core and then mirrored here.
 
 ## Telegram interaction model
 
@@ -227,13 +253,13 @@ Buttons are View PR, Open BB when available, Re-run Review, Merge, and Cancel. M
 
 ### Implementation thread
 
-The implementation prompt contains the exact user request, selected project/base branch, scope and safety rules, expected PR workflow, validation policy, and required final report. It asks the agent to investigate, implement the narrow fix, add appropriate regressions, run checks, commit all intended changes, push the branch, and create or update a PR. It must report changed files, tests, PR identity, commit SHA, and blockers.
+The implementation work-order attachment contains the exact user request, selected project/base branch, scope and safety rules, expected PR workflow, validation policy, and required final report. The initial prompt is intentionally small: read the attached immutable work order and follow it. The work order asks the agent to investigate, implement the narrow fix, add appropriate regressions, run checks, commit all intended changes, push the branch, and create or update a PR. It must report changed files, tests, PR identity, commit SHA, and blockers.
 
 The plugin uses the project's configured BB execution settings and never silently widens the machine or project permission policy. If those settings cannot push or create a PR, the job blocks with an operator-facing configuration error.
 
 ### Review thread
 
-The review thread receives the original request, base and head SHAs, PR identity, current diff, project validation policy, and an explicit instruction not to edit source, commit, push, or merge. It inspects the complete diff and runs the requested tests. The plugin compares git state before and after review; reviewer mutation invalidates the attempt.
+The review thread receives an immutable review-packet attachment containing the original request, base and authoritative remote head SHAs, PR identity, complete current diff, project validation policy, and an explicit instruction not to edit source, commit, push, or merge. Its small prompt says to read that packet, inspect the complete diff, run the requested tests, and return the strict result. The plugin compares git state before and after review; reviewer mutation invalidates the attempt. Every review is a fresh `threads.spawn` child in the implementation environment, not a provider-session fork.
 
 The final output must be exactly this semantic shape:
 
@@ -271,7 +297,7 @@ The plugin exposes Merge only when one fresh evaluation proves all of the follow
 
 1. The implementation thread is idle rather than failed or interrupted.
 2. The environment belongs to the selected project and expected worktree.
-3. Repository HEAD equals the PR head SHA.
+3. Repository HEAD equals the single full OID returned by `git ls-remote --exit-code origin refs/pull/<number>/head`; `gh`, BB pull-request metadata, and provider output are never head-SHA authorities.
 4. The PR targets the configured base branch, is open, non-draft, and mergeable.
 5. The worktree has no uncommitted tracked or untracked changes.
 6. The latest schema-valid review is `pass` for the exact head SHA.
@@ -282,7 +308,9 @@ The plugin exposes Merge only when one fresh evaluation proves all of the follow
 
 The approval nonce is random, one-use, stored only as a hash, bound to the job and full head SHA, and expires after fifteen minutes. The callback is accepted only from the paired user and chat. It transactionally consumes the nonce before attempting merge.
 
-At click time, the plugin evaluates all ten gates again. A changed SHA invalidates the receipt and schedules a fresh review. A pending check returns to validation. A closed, conflicting, or non-mergeable PR blocks. The merge request uses BB's core pull-request merge surface, respects repository branch protection, and records the returned merge result. It does not shell out to `git merge` on the default branch.
+Before using that ref, the plugin requires the environment's `origin` remote to normalize to the configured GitHub repository and the PR identity. It fails closed on missing, ambiguous, malformed, or mismatched output. Remote head resolution runs before and after PR/check collection so head movement during validation is detected.
+
+At click time, the plugin evaluates all ten gates again, including a new `git ls-remote` lookup immediately before merge. A changed SHA invalidates the receipt and schedules a fresh review. A pending check returns to validation. A closed, conflicting, or non-mergeable PR blocks. The merge request uses BB's core pull-request merge surface, respects repository branch protection, and records the returned merge result. It does not shell out to `git merge` on the default branch.
 
 ## Security model
 
@@ -305,6 +333,8 @@ At click time, the plugin evaluates all ten gates again. A changed SHA invalidat
 - The update offset advances only after the update has a durable deduplication record.
 - Outbound status is a desired-state projection. Re-sending edits the same message instead of creating progress spam.
 - A plugin reload aborts both services cleanly. On restart, reconciliation resumes every nonterminal job from live BB state.
+- Lease loss stops the old executor from claiming or completing new effects. A successor reconciles external state before retrying any expired claim.
+- An unavailable BB liveness source is `unknown`, and an old authoritative timestamp is `stale`; both block replacement work and never trigger a speculative second thread.
 - Thread failure or interruption records stage, provider error, and available output, then offers Retry or Stop.
 - A missing PR returns the task to the implementation thread with an exact request to create or identify it.
 - Test failure and review findings return structured feedback to implementation.
@@ -337,12 +367,18 @@ Use `@bb/plugin-sdk/testing` with a real temporary SQLite database and mocked BB
 - project allowlist and confirmation;
 - every valid and invalid state transition;
 - implementation creation attribution and environment selection;
+- immutable attachment handoffs with tiny prompts and no worktree artifacts;
+- `threads.spawn` review isolation with no provider-session fork;
+- singleton executor lease races, generation fencing, and sequential effects;
+- BB-owned liveness projection, stale/unknown alerts, and no speculative replacement;
 - lifecycle-event handling plus restart reconciliation;
 - duplicate Telegram updates, duplicate idle events, callback replay, and outbox retry;
 - reviewer JSON validation, wrong SHA, findings, malformed output, and reviewer mutation;
 - validation command success, timeout, nonzero exit, and bounded output;
 - clean and dirty worktrees;
 - missing/draft/closed/conflicting PRs and wrong base branches;
+- GitHub origin normalization plus missing, malformed, multiple, changed, and mismatched `git ls-remote` PR-head results;
+- stale `gh` head metadata that appears to match an old verdict but cannot influence the gate;
 - pending, failed, and changed-head GitHub checks;
 - expired/stale/consumed merge approval;
 - merge failure and success followed by Telegram-delivery failure;
@@ -357,14 +393,15 @@ Use a disposable test repository or disposable branch where merging is safe:
 1. Configure the bot and pair the owner.
 2. Enable exactly the test project.
 3. Submit a small bug-and-regression task from Telegram.
-4. Verify a visible implementation thread and isolated environment appear.
-5. Verify a visible child review thread uses the same environment.
-6. Force one review failure and verify remediation plus a fresh review.
+4. Verify an immutable work-order attachment, tiny prompt, visible implementation thread, and isolated environment appear without dirtying the worktree.
+5. Record `git ls-remote origin refs/pull/<number>/head`; verify an immutable review packet and a freshly spawned visible review child use the same environment without forking provider context.
+6. Force one review failure and verify remediation, a new remote head, and a fresh review child.
 7. Reach Ready to merge and record the approval head SHA.
-8. Push a new commit before clicking Merge and verify stale approval is rejected.
+8. Capture the old `gh` head metadata, push a new commit before clicking Merge, and verify the changed Git-native ref rejects stale approval regardless of that captured value.
 9. Complete fresh review and validation.
-10. Approve Merge in Telegram and verify the remote PR merged at the approved SHA.
-11. Restart the plugin during a separate test job and verify recovery without duplicate threads or messages.
+10. In the controlled service harness, race two executor owners and verify one generation wins; induce stale liveness and verify an alert without a replacement spawn.
+11. Approve Merge in Telegram and verify the remote PR merged at the approved Git-native SHA.
+12. Restart the plugin during a separate test job and verify recovery without duplicate threads or messages.
 
 No production application repository is used for destructive acceptance testing.
 
@@ -372,11 +409,14 @@ No production application repository is used for destructive acceptance testing.
 
 - An unauthorized Telegram identity cannot list projects, start work, steer a thread, approve, cancel, or merge.
 - A paired owner can choose an enabled project and start a confirmed task without opening BB.
-- BB shows a visible implementation thread and a separate visible review child in the same worktree environment.
+- BB shows a visible implementation thread and a separate freshly spawned—not forked—visible review child in the same worktree environment.
+- Implementation and review receive immutable attachment handoffs with tiny prompts; no orchestration artifact dirties the worktree.
+- One generation-fenced executor owns all BB/GitHub/worktree effects; Telegram ingress and lifecycle listeners cannot start work.
+- Worker liveness comes only from BB-owned thread/terminal state; stale or unknown state alerts and blocks replacement without claiming the worker is dead.
 - Review findings return to implementation and a later attempt uses a fresh review thread.
 - Telegram shows one continuously updated status message with accurate stage and evidence.
 - No merge button appears from assistant prose alone or while any deterministic gate is incomplete.
-- A merge approval is one-use, expires, and is invalidated by any head change.
+- A merge approval is one-use, expires, and is invalidated by any Git-native PR-head change even if `gh` or recorded metadata appears to match the old verdict.
 - The plugin merges only through BB's PR merge surface after fresh validation and reports the actual merge result.
 - Restart, duplicated updates, and callback replays do not duplicate implementation threads, review threads, or merges.
 - Automated tests and the disposable live acceptance flow pass.
