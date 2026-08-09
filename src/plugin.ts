@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { parseGlobalConfig } from "./config";
+import { openStore } from "./storage/store";
 
 export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
@@ -11,6 +12,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       default: "30",
     },
   });
+  const store = openStore(bb.storage);
+  void store;
   const config = parseGlobalConfig(await settings.get());
   if (!config.ok) bb.status.needsConfiguration(config.message);
 }
