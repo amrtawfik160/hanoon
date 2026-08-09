@@ -42,7 +42,7 @@ describe("Telegram Bot API client", () => {
     expect(JSON.stringify(fetchMock.calls)).not.toContain("123:secret");
   });
 
-  it("caps transient retries at three requests with bounded exponential delays", async () => {
+  it("allows three transient retries after the initial request", async () => {
     immediateSleep.mockClear();
     const fetchMock = telegramFetch([
       { ok: false, error_code: 500, description: "first" },
@@ -52,10 +52,10 @@ describe("Telegram Bot API client", () => {
     ]);
     const client = new TelegramClient("token", fetchMock, { sleep: immediateSleep });
 
-    await expect(client.sendMessage("1", { text: "hello" })).rejects.toThrow("Telegram API 503");
+    await expect(client.sendMessage("1", { text: "hello" })).resolves.toMatchObject({ message_id: 10 });
 
-    expect(fetchMock.calls).toHaveLength(3);
-    expect(immediateSleep.mock.calls.map(([ms]) => ms)).toEqual([250, 500]);
+    expect(fetchMock.calls).toHaveLength(4);
+    expect(immediateSleep.mock.calls.map(([ms]) => ms)).toEqual([250, 500, 1_000]);
   });
 
   it("aborts a retry delay through the caller signal", async () => {

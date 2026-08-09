@@ -11,6 +11,8 @@ const NONCE_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 const MAX_CALLBACK_BYTES = 64;
 const MAX_TELEGRAM_TEXT_LENGTH = 4_096;
 const MAX_EVIDENCE_LENGTH = 3_500;
+const CREDENTIAL_ASSIGNMENT_PATTERN =
+  /(^|[^A-Za-z0-9])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|auth[_-]?(?:token|key)|session[_-]?token|private[_-]?key|credentials?|password|secret|token|key)["']?\s*[:=]\s*["']?[^\s"'&;,)}\]]+/gi;
 
 export type CallbackAction =
   | { type: "project"; jobId: string; alias: string }
@@ -78,7 +80,7 @@ function redact(value: string): string {
   return value
     .replace(/\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g, "[redacted]")
     .replace(/\bBearer\s+\S+/gi, "[redacted]")
-    .replace(/\b(?:api[_-]?key|password|secret|token)\s*[:=]\s*\S+/gi, "[redacted]")
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, "$1[redacted]")
     .replace(/\b(?:sk|rk)-[A-Za-z0-9_-]{10,}\b/g, "[redacted]");
 }
 
@@ -93,9 +95,65 @@ function html(value: unknown, maxLength: number): string {
   for (const character of source) {
     const escaped = escapeHtml(character);
     if (result.length + escaped.length > maxLength) {
-      return maxLength > 1 ? `${result.slice(0, maxLength - 1)}…` : result.slice(0, maxLength);
+      return result.length + 1 <= maxLength ? `${result}…` : result;
     }
     result += escaped;
+  }
+  return result;
+}
+
+type HtmlToken =
+  | { type: "tag"; raw: string; name: string; closing: boolean }
+  | { type: "entity" | "text"; raw: string };
+
+function readHtmlToken(source: string, index: number): HtmlToken {
+  if (source[index] === "<") {
+    const end = source.indexOf(">", index);
+    if (end >= 0) {
+      const raw = source.slice(index, end + 1);
+      const closing = /^<\/(b|code|a)>$/.exec(raw);
+      if (closing) return { type: "tag", raw, name: closing[1], closing: true };
+      const opening = /^<(b|code|a)(?:\s+[^<>]*)?>$/.exec(raw);
+      if (opening) return { type: "tag", raw, name: opening[1], closing: false };
+    }
+  }
+  if (source[index] === "&") {
+    const entity = /^&(amp|lt|gt|quot|#39);/.exec(source.slice(index));
+    if (entity) return { type: "entity", raw: entity[0] };
+  }
+  const codePoint = source.codePointAt(index);
+  const raw = codePoint === undefined ? "" : String.fromCodePoint(codePoint);
+  return { type: "text", raw };
+}
+
+function truncateHtml(source: string, maxLength: number): string {
+  if (source.length <= maxLength) return source;
+
+  let result = "";
+  let index = 0;
+  const openTags: string[] = [];
+  const closingTags = () => openTags.slice().reverse().map((name) => `</${name}>`).join("");
+  const truncated = () => `${result}…${closingTags()}`;
+
+  while (index < source.length) {
+    const token = readHtmlToken(source, index);
+    const suffixLength = 1 + closingTags().length;
+    if (token.type === "tag" && !token.closing) {
+      const closingTagLength = `</${token.name}>`.length;
+      if (result.length + token.raw.length + suffixLength + closingTagLength > maxLength) {
+        return truncated();
+      }
+      result += token.raw;
+      openTags.push(token.name);
+    } else if (token.type === "tag") {
+      if (result.length + token.raw.length > maxLength) return truncated();
+      result += token.raw;
+      if (openTags[openTags.length - 1] === token.name) openTags.pop();
+    } else {
+      if (result.length + token.raw.length + suffixLength > maxLength) return truncated();
+      result += token.raw;
+    }
+    index += token.raw.length;
   }
   return result;
 }
@@ -329,8 +387,7 @@ export function renderJobStatus(
   if (context.evidence && remainingEvidence > 0) {
     lines.push(`Evidence:\n${html(context.evidence, Math.min(MAX_EVIDENCE_LENGTH, remainingEvidence))}`);
   }
-  let text = lines.join("\n");
-  if (text.length > MAX_TELEGRAM_TEXT_LENGTH) text = `${text.slice(0, MAX_TELEGRAM_TEXT_LENGTH - 1)}…`;
+  const text = truncateHtml(lines.join("\n"), MAX_TELEGRAM_TEXT_LENGTH);
 
   const buttons = statusButtons(job, context, ready);
   return {

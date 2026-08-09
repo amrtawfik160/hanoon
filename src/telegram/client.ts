@@ -9,7 +9,7 @@ import {
 
 const ORDINARY_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_LONG_POLL_TIMEOUT_SECONDS = 50;
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 4;
 const MAX_RETRY_DELAY_MS = 30_000;
 const RETRY_BASE_DELAY_MS = 250;
 const TELEGRAM_API_ROOT = "https://api.telegram.org/bot";

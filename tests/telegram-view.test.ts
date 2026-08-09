@@ -10,6 +10,31 @@ import { jobFixture, policyFixture } from "./helpers";
 const telegramJobId = "abcdefghijklmnopqrstuv";
 const mergeNonce = "N".repeat(32);
 
+function expectWellFormedTelegramHtml(text: string): void {
+  const openTags: string[] = [];
+  const tokenPattern = /<\/(b|code|a)>|<(b|code|a)(?:\s+href="[^"]*")?>|&(amp|lt|gt|quot|#39);/g;
+  let cursor = 0;
+
+  for (const match of text.matchAll(tokenPattern)) {
+    const index = match.index ?? 0;
+    expect(text.slice(cursor, index)).not.toMatch(/[<&]/);
+    const token = match[0];
+    if (token.startsWith("&")) {
+      cursor = index + token.length;
+      continue;
+    }
+    if (token.startsWith("</")) {
+      expect(openTags.pop()).toBe(token.slice(2, -1));
+    } else {
+      openTags.push(token.slice(1).split(/[\s>]/, 1)[0]);
+    }
+    cursor = index + token.length;
+  }
+
+  expect(text.slice(cursor)).not.toMatch(/[<&]/);
+  expect(openTags).toEqual([]);
+}
+
 describe("Telegram callback grammar", () => {
   it("encodes and parses the exact bounded callback forms", () => {
     const actions = [
@@ -159,5 +184,63 @@ describe("deterministic Telegram views", () => {
     expect(buttons.some((button) => button.text === "Open BB")).toBe(false);
     expect(rendered.text).not.toContain("password@example.test");
     expect(rendered.text).not.toContain("token=secret");
+  });
+
+  it.each([
+    ["access_token", "access_token=secret"],
+    ["access-token", "access-token=secret"],
+    ["accessToken", "accessToken=secret"],
+    ["client_secret", "client_secret=secret"],
+    ["clientSecret", "clientSecret=secret"],
+    ["refresh_token", "refresh_token=secret"],
+  ] as const)("redacts %s assignments from every Ready-card text and link path", (_label, assignment) => {
+    const policy = policyFixture({ baseBranch: assignment });
+    const job = jobFixture({
+      id: telegramJobId,
+      state: "awaiting_merge_approval",
+      projectId: policy.projectId,
+      policyVersion: 1,
+      policy,
+      prNumber: 17,
+      prUrl: `https://example.test/pull/17?${assignment}`,
+      requestText: assignment,
+      implementationThreadId: assignment,
+      reviewThreadId: assignment,
+      lastError: assignment,
+    });
+    const rendered = renderJobStatus(job, {
+      bbAppBaseUrl: `https://bb.example/app?${assignment}`,
+      prTitle: assignment,
+      review: { verdict: assignment, summary: assignment },
+      validation: [{ name: assignment, outcome: assignment, summary: assignment }],
+      checks: [{ name: assignment, outcome: assignment, bucket: assignment, summary: assignment }],
+      evidence: assignment,
+      approvalExpiresAt: assignment,
+      mergeNonce,
+    });
+    const buttons = rendered.reply_markup?.inline_keyboard.flat() ?? [];
+
+    expect(rendered.text).not.toContain(assignment);
+    expect(rendered.text).not.toContain("secret");
+    expect(buttons.find((button) => button.text === "View PR")).toBeUndefined();
+    expect(buttons.find((button) => button.text === "Open BB")).toBeUndefined();
+  });
+
+  it("bounds an oversized Ready card without splitting HTML tags or entities", () => {
+    const longBaseUrl = `https://bb.example/app?scope=${"x".repeat(5_000)}&format=html`;
+    const rendered = renderJobStatus(jobFixture({
+      id: telegramJobId,
+      state: "awaiting_merge_approval",
+      projectId: "proj_1",
+      policyVersion: 1,
+      policy: policyFixture(),
+      requestText: "&".repeat(200),
+    }), {
+      bbAppBaseUrl: longBaseUrl,
+      evidence: "<provider evidence> & details".repeat(2_000),
+    });
+
+    expect(rendered.text.length).toBeLessThanOrEqual(4_096);
+    expectWellFormedTelegramHtml(rendered.text);
   });
 });
