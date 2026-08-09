@@ -36,10 +36,9 @@ export type EnvironmentSnapshot = {
   diff: EnvironmentDiff;
 };
 
-function selectedPolicy(job: Job, suppliedPolicy?: ProjectPolicy): ProjectPolicy {
-  const policy = job.policy ?? suppliedPolicy;
-  if (policy === null || policy === undefined) throw new TypeError("Active job has no immutable policy snapshot");
-  return policy;
+function selectedPolicy(job: Job): ProjectPolicy {
+  if (job.policy === null) throw new TypeError("Active job has no immutable policy snapshot");
+  return job.policy;
 }
 
 function projectId(job: Job, policy: ProjectPolicy): string {
@@ -105,9 +104,9 @@ export class BbRunner {
   public async spawnImplementation(
     job: Job,
     attempt: BbAttempt,
-    suppliedPolicy?: ProjectPolicy,
+    _suppliedPolicy?: ProjectPolicy,
   ): Promise<ThreadResult> {
-    const policy = selectedPolicy(job, suppliedPolicy);
+    const policy = selectedPolicy(job);
     const artifact = buildWorkOrder(job, policy);
     const project = projectId(job, policy);
     const uploaded = await this.upload(project, artifact);
@@ -134,16 +133,16 @@ export class BbRunner {
   public async spawnReview(
     job: Job,
     attempt: BbAttempt,
-    suppliedPolicy?: ProjectPolicy,
+    _suppliedPolicy?: ProjectPolicy,
   ): Promise<ThreadResult> {
-    const policy = selectedPolicy(job, suppliedPolicy);
+    const policy = selectedPolicy(job);
     const environmentId = requireEnvironmentId(job);
     const parentThreadId = requireImplementationThreadId(job);
     const snapshot = await this.getEnvironmentSnapshot(environmentId, policy.baseBranch);
     const pullRequest = await this.getPullRequestSnapshot(environmentId);
-    if (pullRequest.outcome === "unavailable") throw new Error(`Pull-request lookup unavailable: ${pullRequest.message}`);
-    const remoteHeadSha = job.prHeadSha ?? checkoutHeadSha(snapshot.status);
-    if (remoteHeadSha === null) throw new Error("Active job has no authoritative review head SHA");
+    requirePullRequestSnapshot(job, pullRequest);
+    if (job.prHeadSha === null) throw new Error("Active job has no authoritative review head SHA");
+    const remoteHeadSha = job.prHeadSha;
     const artifact = buildReviewPacket(job, policy, remoteHeadSha, diffText(snapshot.diff));
     const project = projectId(job, policy);
     const uploaded = await this.upload(project, artifact);
@@ -174,11 +173,17 @@ export class BbRunner {
   }
 
   public async stopWorker(worker: string | WorkerLiveness): Promise<void> {
-    if (typeof worker !== "string" && worker.resourceKind !== "bb_thread") {
-      throw new TypeError("Only BB thread workers can be stopped by BbRunner");
+    if (
+      typeof worker === "string" ||
+      worker === null ||
+      worker.resourceKind !== "bb_thread" ||
+      !STOPPABLE_WORKER_STATES.has(worker.state) ||
+      typeof worker.resourceId !== "string" ||
+      worker.resourceId.length === 0
+    ) {
+      throw new TypeError("Stopping requires starting, active, or stopping BB-thread evidence");
     }
-    const threadId = typeof worker === "string" ? worker : worker.resourceId;
-    await this.sdk.threads.stop({ threadId });
+    await this.sdk.threads.stop({ threadId: worker.resourceId });
   }
 
   public async getThread(threadId: string): Promise<Awaited<ReturnType<BbSdk["threads"]["get"]>>> {
@@ -196,10 +201,21 @@ export class BbRunner {
   }
 }
 
-function checkoutHeadSha(status: EnvironmentStatus): string | null {
-  if (status.outcome !== "available") return null;
-  const checkout = status.workspace.checkout;
-  return "headSha" in checkout ? checkout.headSha : null;
+const STOPPABLE_WORKER_STATES = new Set<WorkerLiveness["state"]>(["starting", "active", "stopping"]);
+
+function requirePullRequestSnapshot(job: Job, snapshot: PullRequestSnapshot): void {
+  if (snapshot.outcome !== "available") {
+    throw new Error("Review requires an available pull-request snapshot");
+  }
+  if (
+    job.prNumber === null ||
+    job.prUrl === null ||
+    job.prUrl.length === 0 ||
+    snapshot.pullRequest.number !== job.prNumber ||
+    snapshot.pullRequest.url !== job.prUrl
+  ) {
+    throw new Error("Pull-request snapshot does not match the active job identity");
+  }
 }
 
 export {

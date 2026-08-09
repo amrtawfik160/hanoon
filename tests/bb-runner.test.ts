@@ -1,7 +1,7 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
 import { BbRunner } from "../src/bb/runner";
-import { jobFixture, policyFixture } from "./helpers";
+import { activeWorkerFixture, jobFixture, policyFixture } from "./helpers";
 
 type SdkCalls = {
   attachments: unknown[];
@@ -15,7 +15,7 @@ type SdkCalls = {
   pullRequests: unknown[];
 };
 
-function runnerFixture() {
+function runnerFixture(options: { pullRequest?: unknown; statusHeadSha?: string } = {}) {
   const calls: SdkCalls = {
     attachments: [],
     spawns: [],
@@ -68,7 +68,10 @@ function runnerFixture() {
     environments: {
       status: vi.fn(async (args: unknown) => {
         calls.statuses.push(args);
-        return { headSha: "a".repeat(40), clean: true };
+        return {
+          outcome: "available",
+          workspace: { checkout: { kind: "detached", headSha: options.statusHeadSha ?? "a".repeat(40) } },
+        };
       }),
       diff: vi.fn(async (args: unknown) => {
         calls.diffs.push(args);
@@ -76,7 +79,10 @@ function runnerFixture() {
       }),
       pullRequest: vi.fn(async (args: unknown) => {
         calls.pullRequests.push(args);
-        return { outcome: "absent" };
+        return options.pullRequest ?? {
+          outcome: "available",
+          pullRequest: { number: 42, url: "https://github.com/acme/cyndra/pull/42" },
+        };
       }),
     },
   } as unknown as BbPluginApi["sdk"];
@@ -124,6 +130,21 @@ it("spawns implementation in a visible managed worktree and records the immutabl
   expect(implementationAttempt.handoffSha256).toMatch(/^[0-9a-f]{64}$/);
 });
 
+it("requires an immutable job policy snapshot even when a caller supplies a policy", async () => {
+  const { calls, runner } = runnerFixture();
+
+  await expect(
+    runner.spawnImplementation(
+      jobFixture({ projectId: "proj_1", policy: null }),
+      attempt("attempt_impl_without_snapshot"),
+      policyFixture(),
+    ),
+  ).rejects.toThrow(/immutable policy snapshot/i);
+
+  expect(calls.attachments).toHaveLength(0);
+  expect(calls.spawns).toHaveLength(0);
+});
+
 it("spawns review as a visible child in the exact implementation environment", async () => {
   const { calls, runner } = runnerFixture();
   const reviewAttempt = attempt("attempt_review_1");
@@ -163,6 +184,42 @@ it("blocks a truncated environment diff before uploading or spawning review", as
   expect(calls.spawns).toHaveLength(0);
 });
 
+it.each([
+  ["absent PR", selectedJob, { outcome: "absent" }],
+  [
+    "wrong PR identity",
+    selectedJob,
+    {
+      outcome: "available",
+      pullRequest: { number: 99, url: "https://github.com/acme/cyndra/pull/99" },
+    },
+  ],
+  [
+    "missing authoritative head",
+    jobFixture({
+        projectId: "proj_1",
+        policy: policyFixture(),
+        environmentId: "env_1",
+        implementationThreadId: "thr_i",
+        prNumber: 42,
+        prUrl: "https://github.com/acme/cyndra/pull/42",
+        prHeadSha: null,
+      }),
+    {
+      outcome: "available",
+      pullRequest: { number: 42, url: "https://github.com/acme/cyndra/pull/42" },
+    },
+  ],
+])("requires a matching available PR and an authoritative job head before review (%s)", async (_caseName, job, pullRequest) => {
+  const { calls, runner } = runnerFixture({ pullRequest, statusHeadSha: "b".repeat(40) });
+
+  await expect(runner.spawnReview(job, attempt("attempt_review_pr"), policyFixture())).rejects.toThrow(
+    /pull-request|authoritative|head|snapshot/i,
+  );
+  expect(calls.attachments).toHaveLength(0);
+  expect(calls.spawns).toHaveLength(0);
+});
+
 it("uses exact send, stop, thread, environment, and pull-request SDK calls", async () => {
   const { calls, runner } = runnerFixture();
 
@@ -170,7 +227,7 @@ it("uses exact send, stop, thread, environment, and pull-request SDK calls", asy
   await runner.sendRemediation(selectedJob, [
     { severity: "high", file: "src/a.ts", line: 1, title: "Fix it", details: "Evidence" },
   ]);
-  await runner.stopWorker("thr_i");
+  await runner.stopWorker(activeWorkerFixture({ resourceId: "thr_i" }));
   await runner.getThread("thr_i");
   await runner.getEnvironmentSnapshot("env_1", "main");
   await runner.getPullRequestSnapshot("env_1");
@@ -184,4 +241,22 @@ it("uses exact send, stop, thread, environment, and pull-request SDK calls", asy
   expect(calls.statuses).toContainEqual({ environmentId: "env_1", mergeBaseBranch: "main" });
   expect(calls.diffs).toContainEqual({ environmentId: "env_1", target: "all", mergeBaseBranch: "main" });
   expect(calls.pullRequests).toEqual([{ environmentId: "env_1" }]);
+});
+
+it.each([
+  ["unproven string", "thr_unproven"],
+  ["idle", activeWorkerFixture({ state: "idle" })],
+  ["failed", activeWorkerFixture({ state: "failed" })],
+  ["unknown", activeWorkerFixture({ state: "unknown" })],
+  ["stale", activeWorkerFixture({ state: "stale" })],
+  [
+    "terminal",
+    { ...activeWorkerFixture(), state: "terminal" } as unknown as ReturnType<typeof activeWorkerFixture>,
+  ],
+])("rejects stop requests without fresh starting, active, or stopping BB-thread evidence (%s)", async (_caseName, worker) => {
+  const { calls, runner } = runnerFixture();
+
+  await expect(runner.stopWorker(worker)).rejects.toThrow(/starting|active|stopping|evidence|BB thread/i);
+
+  expect(calls.stops).toHaveLength(0);
 });
