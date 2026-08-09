@@ -3,6 +3,7 @@ import { expect, it } from "vitest";
 import {
   ActiveJobConflictError,
   IdempotencyConflictError,
+  UpdateClaimConflictError,
   VersionConflictError,
   openStore,
 } from "../src/storage/store";
@@ -100,6 +101,54 @@ it("deduplicates Telegram updates, advances the cursor monotonically, and record
   expect(store.recordCallback("cb_1", null, "cancel", "accepted", 1_700)).toBe(true);
   expect(store.recordCallback("cb_1", null, "cancel", "duplicate", 1_800)).toBe(false);
   expect(db.prepare("SELECT COUNT(*) AS count FROM callbacks").get()).toEqual({ count: 1 });
+});
+
+it("claims an update once and advances the cursor only after lower updates complete", () => {
+  const { store } = storeFixture();
+
+  expect(store.beginTelegramUpdate(21, 2_000)).toBe("process");
+  expect(store.beginTelegramUpdate(21, 2_001)).toBe("processed");
+  expect(store.beginTelegramUpdate(22, 2_002)).toBe("process");
+
+  store.completeTelegramUpdate(22, "out-of-order", 2_003);
+  expect(store.getNextTelegramOffset()).toBe(21);
+
+  store.completeTelegramUpdate(21, "first", 2_004);
+  expect(store.getNextTelegramOffset()).toBe(23);
+});
+
+it("requires the store that claimed an update to complete or fail it", () => {
+  const { bb, store } = storeFixture();
+  const otherStore = openStore(bb.storage);
+
+  expect(store.beginTelegramUpdate(31, 2_000)).toBe("process");
+  expect(otherStore.beginTelegramUpdate(31, 2_001)).toBe("processed");
+  expect(() => otherStore.completeTelegramUpdate(31, "foreign", 2_002)).toThrow(
+    UpdateClaimConflictError,
+  );
+  store.failTelegramUpdate(31, "retry", 2_003);
+});
+
+it("reclaims an expired update claim and rejects the old owner", () => {
+  const { bb, store } = storeFixture();
+  const otherStore = openStore(bb.storage);
+
+  expect(store.beginTelegramUpdate(41, 3_000)).toBe("process");
+  expect(otherStore.beginTelegramUpdate(41, 3_001)).toBe("processed");
+  expect(otherStore.beginTelegramUpdate(41, 303_001)).toBe("process");
+  expect(() => store.completeTelegramUpdate(41, "stale-owner", 303_002)).toThrow(
+    UpdateClaimConflictError,
+  );
+  otherStore.completeTelegramUpdate(41, "reclaimed", 303_003);
+});
+
+it("bounds and protects durable Telegram failure summaries", () => {
+  const { store } = storeFixture();
+
+  expect(store.beginTelegramUpdate(51, 4_000)).toBe("process");
+  expect(() => store.failTelegramUpdate(51, "x".repeat(501), 4_001)).toThrow(TypeError);
+  expect(() => store.failTelegramUpdate(51, "provider failed: api_key=secret-token", 4_002)).toThrow(TypeError);
+  store.failTelegramUpdate(51, "temporary provider failure", 4_003);
 });
 
 it("enqueues one reconcile effect for a known worker thread", () => {

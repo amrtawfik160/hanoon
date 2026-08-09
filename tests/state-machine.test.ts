@@ -229,4 +229,14 @@ describe("job state machine", () => {
     expect(() => transition(untouched, { type: "CONFIRMED" }, 5_200)).toThrow(IllegalTransitionError);
     expect(untouched).toEqual(jobFixture());
   });
+
+  it.each([
+    ["oversized", "x".repeat(501)],
+    ["bearer token", "provider failed: Authorization: Bearer secret-token"],
+    ["named secret", "provider failed: api_key=secret-token"],
+  ] as const)("rejects %s failure text at the state-machine boundary", (_label, error) => {
+    expect(() => transition(stateJob("implementing"), { type: "FAILED", error }, 5_200)).toThrow(
+      TypeError,
+    );
+  });
 });

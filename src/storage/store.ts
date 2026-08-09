@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 import {
   projectPolicySchema,
   type Job,
@@ -9,8 +10,8 @@ import {
   type ProjectPolicy,
   type StoredEffect,
 } from "../domain/models";
-import { transition } from "../domain/state-machine";
-import { INITIAL_MIGRATIONS } from "./migrations";
+import { assertSafeFailureSummary, transition } from "../domain/state-machine";
+import { ALL_MIGRATIONS } from "./migrations";
 
 type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
@@ -90,6 +91,12 @@ type EffectRow = {
   created_at: number;
   updated_at: number;
 };
+type TelegramUpdateRow = {
+  status: "processing" | "processed" | "failed";
+  claim_owner: string | null;
+  claim_generation: number | null;
+  claim_expires_at: number | null;
+};
 
 const JOB_STATES: ReadonlySet<JobState> = new Set([
   "awaiting_project",
@@ -136,8 +143,16 @@ export class ActiveJobConflictError extends Error {
   }
 }
 
+export class UpdateClaimConflictError extends Error {
+  public constructor(updateId: number) {
+    super(`Telegram update ${updateId} is not owned by this store claim`);
+    this.name = "UpdateClaimConflictError";
+  }
+}
+
 const CANONICAL_POSITIVE_DECIMAL = /^[1-9][0-9]*$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+const TELEGRAM_UPDATE_LEASE_MS = 300_000;
 
 function assertCanonicalPositiveDecimal(value: string, field: string): void {
   if (typeof value !== "string" || !CANONICAL_POSITIVE_DECIMAL.test(value)) {
@@ -330,7 +345,40 @@ const JOB_SELECT = `
          last_error, version, created_at, updated_at
     FROM jobs`;
 
+function advanceTelegramCursor(db: SqliteDatabase): void {
+  const cursor = db
+    .prepare("SELECT next_offset FROM telegram_cursor WHERE singleton = 1")
+    .get() as { next_offset: number } | undefined;
+  if (!cursor) throw new Error("Telegram cursor was not initialized");
+
+  const firstUnprocessed = db
+    .prepare(
+      "SELECT MIN(update_id) AS update_id FROM telegram_updates WHERE update_id >= ? AND status <> 'processed'",
+    )
+    .get(cursor.next_offset) as { update_id: number | null };
+  const highest = db
+    .prepare(
+      "SELECT MAX(update_id) AS update_id FROM telegram_updates WHERE update_id >= ? AND status = 'processed'",
+    )
+    .get(cursor.next_offset) as { update_id: number | null };
+
+  const nextOffset =
+    firstUnprocessed.update_id ??
+    (highest.update_id === null ? null : highest.update_id + 1);
+  if (nextOffset === null || nextOffset <= cursor.next_offset) return;
+  db
+    .prepare(
+      `UPDATE telegram_cursor
+          SET next_offset = CASE WHEN next_offset < ? THEN ? ELSE next_offset END
+        WHERE singleton = 1`,
+    )
+    .run(nextOffset, nextOffset);
+}
+
 class SqliteTelegramAgentStore implements TelegramAgentStore {
+  private readonly claimOwner = randomUUID();
+  private readonly claimedUpdates = new Map<number, number>();
+
   public constructor(private readonly db: SqliteDatabase) {}
 
   public createPairingCode(
@@ -659,55 +707,101 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!Number.isInteger(updateId) || updateId < 0) throw new TypeError("updateId must be a non-negative integer");
     const begin = this.db.transaction((): "process" | "processed" => {
       const existing = this.db
-        .prepare("SELECT status FROM telegram_updates WHERE update_id = ?")
-        .get(updateId) as { status: "processing" | "processed" | "failed" } | undefined;
+        .prepare(
+          "SELECT status, claim_owner, claim_generation, claim_expires_at FROM telegram_updates WHERE update_id = ?",
+        )
+        .get(updateId) as TelegramUpdateRow | undefined;
       if (existing?.status === "processed") return "processed";
+
+      if (
+        existing?.status === "processing" &&
+        existing.claim_expires_at !== null &&
+        existing.claim_expires_at > now
+      ) {
+        return "processed";
+      }
+
+      const generation = (existing?.claim_generation ?? 0) + 1;
+      const expiresAt = now + TELEGRAM_UPDATE_LEASE_MS;
       if (!existing) {
         this.db
           .prepare(
-            "INSERT INTO telegram_updates (update_id, status, attempts) VALUES (?, 'processing', 1)",
+            `INSERT INTO telegram_updates (
+               update_id, status, attempts, outcome, last_error, processed_at,
+               claim_owner, claim_generation, claim_expires_at
+             ) VALUES (?, 'processing', 1, NULL, NULL, NULL, ?, ?, ?)`,
           )
-          .run(updateId);
+          .run(updateId, this.claimOwner, generation, expiresAt);
       } else {
         this.db
           .prepare(
-            "UPDATE telegram_updates SET status = 'processing', attempts = attempts + 1, last_error = NULL WHERE update_id = ?",
+            `UPDATE telegram_updates
+                SET status = 'processing', attempts = attempts + 1,
+                    outcome = NULL, last_error = NULL, processed_at = NULL,
+                    claim_owner = ?, claim_generation = ?, claim_expires_at = ?
+              WHERE update_id = ?`,
           )
-          .run(updateId);
+          .run(this.claimOwner, generation, expiresAt, updateId);
       }
-      void now;
+      this.claimedUpdates.set(updateId, generation);
       return "process";
     });
     return begin();
   }
 
   public completeTelegramUpdate(updateId: number, outcome: string, now: number): void {
+    assertSafeFailureSummary(outcome);
+    const claimGeneration = this.claimedUpdates.get(updateId);
+    if (claimGeneration === undefined) throw new UpdateClaimConflictError(updateId);
+
     const complete = this.db.transaction(() => {
       const updated = this.db
         .prepare(
-          "UPDATE telegram_updates SET status = 'processed', outcome = ?, last_error = NULL, processed_at = ? WHERE update_id = ?",
+          `UPDATE telegram_updates
+              SET status = 'processed', outcome = ?, last_error = NULL, processed_at = ?,
+                  claim_owner = NULL, claim_expires_at = NULL
+            WHERE update_id = ?
+              AND status = 'processing'
+              AND claim_owner = ?
+              AND claim_generation = ?
+              AND claim_expires_at > ?`,
         )
-        .run(outcome, now, updateId);
-      if (updated.changes !== 1) throw new Error(`Telegram update ${updateId} was not started`);
-      this.db
-        .prepare(
-          `UPDATE telegram_cursor
-              SET next_offset = CASE WHEN next_offset < ? THEN ? ELSE next_offset END
-            WHERE singleton = 1`,
-        )
-        .run(updateId + 1, updateId + 1);
+        .run(outcome, now, updateId, this.claimOwner, claimGeneration, now);
+      if (updated.changes !== 1) {
+        this.claimedUpdates.delete(updateId);
+        throw new UpdateClaimConflictError(updateId);
+      }
+      advanceTelegramCursor(this.db);
     });
     complete();
+    this.claimedUpdates.delete(updateId);
   }
 
   public failTelegramUpdate(updateId: number, error: string, now: number): void {
-    if (!error) throw new TypeError("error must not be empty");
-    const failed = this.db
-      .prepare(
-        "UPDATE telegram_updates SET status = 'failed', last_error = ?, processed_at = ? WHERE update_id = ?",
-      )
-      .run(error, now, updateId);
-    if (failed.changes !== 1) throw new Error(`Telegram update ${updateId} was not started`);
+    assertSafeFailureSummary(error);
+    const claimGeneration = this.claimedUpdates.get(updateId);
+    if (claimGeneration === undefined) throw new UpdateClaimConflictError(updateId);
+
+    const fail = this.db.transaction(() => {
+      const failed = this.db
+        .prepare(
+          `UPDATE telegram_updates
+              SET status = 'failed', outcome = NULL, last_error = ?, processed_at = ?,
+                  claim_owner = NULL, claim_expires_at = NULL
+            WHERE update_id = ?
+              AND status = 'processing'
+              AND claim_owner = ?
+              AND claim_generation = ?
+              AND claim_expires_at > ?`,
+        )
+        .run(error, now, updateId, this.claimOwner, claimGeneration, now);
+      if (failed.changes !== 1) {
+        this.claimedUpdates.delete(updateId);
+        throw new UpdateClaimConflictError(updateId);
+      }
+    });
+    fail();
+    this.claimedUpdates.delete(updateId);
   }
 
   public getNextTelegramOffset(): number {
@@ -781,6 +875,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
 export function openStore(storage: PluginStorage): TelegramAgentStore {
   const db = storage.database();
-  storage.migrate(db, [...INITIAL_MIGRATIONS]);
+  storage.migrate(db, [...ALL_MIGRATIONS]);
   return new SqliteTelegramAgentStore(db);
 }

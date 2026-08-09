@@ -20,6 +20,13 @@ export class IllegalTransitionError extends Error {
 }
 
 const HEAD_SHA = /^[0-9a-f]{40}$/;
+const MAX_FAILURE_SUMMARY_LENGTH = 500;
+const SENSITIVE_FAILURE_PATTERNS = [
+  /\bbearer\s+\S+/i,
+  /\b(?:api[_-]?key|password|secret|token)\s*[:=]\s*\S+/i,
+  /\b(?:sk|rk)-[A-Za-z0-9_-]{10,}\b/i,
+  /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/,
+];
 const ACTIVE_WORKER_STATES = new Set<WorkerLiveness["state"]>([
   "starting",
   "active",
@@ -38,6 +45,15 @@ function assertNonEmpty(value: string, field: string): void {
 function assertSummary(value: string | undefined, field: string): void {
   if (value !== undefined && (typeof value !== "string" || value.length > 2_000)) {
     throw new TypeError(`${field} must be at most 2000 characters`);
+  }
+}
+
+export function assertSafeFailureSummary(error: string): void {
+  if (typeof error !== "string" || error.length === 0 || error.length > MAX_FAILURE_SUMMARY_LENGTH) {
+    throw new TypeError("error must be a non-empty summary of at most 500 characters");
+  }
+  if (SENSITIVE_FAILURE_PATTERNS.some((pattern) => pattern.test(error))) {
+    throw new TypeError("error must not contain credential-like text");
   }
 }
 
@@ -70,7 +86,7 @@ function failJob(
   effects: JobEffect[],
   error: string,
 ): void {
-  assertNonEmpty(error, "error");
+  assertSafeFailureSummary(error);
   if (job.state === "failed" || job.state === "blocked" || job.state === "cancelled" || job.state === "merged") {
     throw new IllegalTransitionError(job.state, "FAILED");
   }

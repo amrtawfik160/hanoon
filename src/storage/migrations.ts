@@ -147,3 +147,11 @@ CREATE TABLE outbox (
   updated_at INTEGER NOT NULL
 );
 `] as const;
+
+export const TASK_3_MIGRATIONS = [String.raw`
+ALTER TABLE telegram_updates ADD COLUMN claim_owner TEXT;
+ALTER TABLE telegram_updates ADD COLUMN claim_generation INTEGER;
+ALTER TABLE telegram_updates ADD COLUMN claim_expires_at INTEGER;
+`] as const;
+
+export const ALL_MIGRATIONS = [...INITIAL_MIGRATIONS, ...TASK_3_MIGRATIONS] as const;
