@@ -190,6 +190,34 @@ describe("Telegram Bot API client", () => {
     expect(fetchMock.calls[1]?.body).toContain('"callback_query_id":"callback-1"');
   });
 
+  it("sends the native typing chat action with the exact Telegram payload", async () => {
+    const fetchMock = telegramFetch([{ ok: true, result: true }]);
+    const client = new TelegramClient("token", fetchMock);
+
+    await expect(client.sendChatAction("70", "typing")).resolves.toBeUndefined();
+
+    expect(fetchMock.calls).toEqual([{
+      method: "sendChatAction",
+      body: '{"chat_id":"70","action":"typing"}',
+    }]);
+  });
+
+  it("fails a chat action after one attempt and rejects unsupported actions before fetch", async () => {
+    immediateSleep.mockClear();
+    const fetchMock = telegramFetch([
+      { ok: false, error_code: 429, description: "slow", parameters: { retry_after: 30 } },
+    ]);
+    const client = new TelegramClient("token", fetchMock, { sleep: immediateSleep });
+
+    await expect(client.sendChatAction("70", "typing")).rejects.toBeInstanceOf(TelegramApiError);
+    expect(() => client.sendChatAction("70", "upload_photo" as "typing")).toThrow(
+      "Unsupported Telegram chat action",
+    );
+
+    expect(fetchMock.calls).toHaveLength(1);
+    expect(immediateSleep).not.toHaveBeenCalled();
+  });
+
   it("rejects an update that is outside the narrow Telegram schema", async () => {
     const fetchMock = telegramFetch([
       { ok: true, result: [{ update_id: 42, message: { message_id: "not-an-id" } }] },

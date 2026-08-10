@@ -35,6 +35,7 @@ type TelegramRequest<T> = {
   payload: Record<string, unknown>;
   callerSignal?: AbortSignal;
   timeoutMs: number;
+  maxAttempts?: number;
   parseResult: (apiResult: unknown) => T;
   allowNotModified?: boolean;
 };
@@ -173,6 +174,18 @@ export class TelegramClient {
     });
   }
 
+  public sendChatAction(chatId: string, action: "typing", signal?: AbortSignal): Promise<void> {
+    if (action !== "typing") throw new TypeError("Unsupported Telegram chat action");
+    return this.request({
+      method: "sendChatAction",
+      payload: { chat_id: chatId, action },
+      callerSignal: signal,
+      timeoutMs: 5_000,
+      maxAttempts: 1,
+      parseResult: () => undefined,
+    });
+  }
+
   public editMessage(chatId: string, messageId: number, payload: SendMessagePayload, signal?: AbortSignal): Promise<void> {
     if (!Number.isInteger(messageId) || messageId < 1) throw new TypeError("messageId must be a positive integer");
     return this.request({
@@ -206,8 +219,12 @@ export class TelegramClient {
   }
 
   private async request<T>(request: TelegramRequest<T>): Promise<T> {
+    const maxAttempts = request.maxAttempts ?? MAX_ATTEMPTS;
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > MAX_ATTEMPTS) {
+      throw new TypeError("maxAttempts must be an integer from 1 to 4");
+    }
     const serializedPayload = serializePayload(request.payload);
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const attemptResult = await this.performAttempt(request, serializedPayload);
       if (attemptResult.envelope.ok) {
         return parseSuccessfulResult(request.parseResult, attemptResult.envelope.result);
@@ -228,7 +245,7 @@ export class TelegramClient {
         description: apiError.description ?? undefined,
         retryAfterSeconds: apiError.retryAfterSeconds,
       });
-      if (!isRetryable(attemptResult.envelope.error_code) || attempt === MAX_ATTEMPTS - 1) {
+      if (!isRetryable(attemptResult.envelope.error_code) || attempt === maxAttempts - 1) {
         throw apiError;
       }
       await this.waitForRetry(request, attemptResult.envelope, attempt);
