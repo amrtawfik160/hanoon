@@ -49,16 +49,20 @@ function makeHarness({
   reviewOutputs = [output()],
   headSha = EXPECTED_SHA,
   clean = true,
+  attemptState = { threadId: "review-thread-1", headSha: EXPECTED_SHA },
 }: {
   reviewOutputs?: string[];
   headSha?: string;
   clean?: boolean;
+  attemptState?: Record<string, unknown>;
 } = {}) {
   const threads = {
     outputs: [...reviewOutputs],
+    outputCalls: [] as string[],
     sent: [] as Array<{ threadId: string; prompt: string }>,
     created: [] as Array<{ parentThreadId: string; prompt: string }>,
-    async output() {
+    async output(threadId: string) {
+      threads.outputCalls.push(threadId);
       return threads.outputs.shift() ?? "";
     },
     async send(threadId: string, prompt: string) {
@@ -77,7 +81,7 @@ function makeHarness({
   };
 
   const attempts = {
-    values: new Map<string, Record<string, unknown>>(),
+    values: new Map<string, Record<string, unknown>>([["attempt-1", attemptState]]),
     async get(attemptId: string) {
       return attempts.values.get(attemptId) ?? {};
     },
@@ -121,6 +125,19 @@ async function idle(
 }
 
 describe("review remediation loop", () => {
+  it.each([
+    ["unset", {}],
+    ["stale thread", { threadId: "old-review-thread", headSha: EXPECTED_SHA }],
+    ["stale head", { threadId: "review-thread-1", headSha: NEXT_SHA }],
+  ])("fails closed before reading output for an %s persisted attempt", async (_label, attemptState) => {
+    const harness = makeHarness({ attemptState });
+
+    const result = await idle(harness.handler);
+
+    expect(result.outcome).toBe("blocked");
+    expect(harness.threads.outputCalls).toEqual([]);
+  });
+
   it("passes only an exact-head review with no findings and passed checks", async () => {
     const harness = makeHarness({
       reviewOutputs: [
@@ -227,6 +244,45 @@ describe("review remediation loop", () => {
     expect(harness.events.at(-1)?.type).toBe("REVIEW_BLOCKED");
   });
 
+  it("routes schema-invalid JSON through correction and then durable blocking", async () => {
+    const invalidSchemaOutput = JSON.stringify({
+      verdict: "pass",
+      reviewedHeadSha: EXPECTED_SHA,
+      summary: "No actionable findings",
+      findings: [],
+      checks: [],
+      unexpected: true,
+    });
+    const harness = makeHarness({
+      reviewOutputs: [invalidSchemaOutput, invalidSchemaOutput],
+    });
+
+    const first = await idle(harness.handler);
+    const second = await idle(harness.handler);
+
+    expect(first.outcome).toBe("format_correction_sent");
+    expect(second.outcome).toBe("blocked");
+    expect(harness.threads.sent).toHaveLength(1);
+  });
+
+  it("claims format correction before send and stays fail-closed after send failure", async () => {
+    const harness = makeHarness({ reviewOutputs: ["not json", "still not json"] });
+    let sendCalls = 0;
+    harness.threads.send = async () => {
+      sendCalls += 1;
+      expect(harness.attempts.values.get("attempt-1")?.formatCorrectionSent).toBe(true);
+      throw new Error("correction delivery failed");
+    };
+
+    await expect(idle(harness.handler)).rejects.toThrow("correction delivery failed");
+    expect(harness.attempts.values.get("attempt-1")?.formatCorrectionSent).toBe(true);
+
+    const retry = await idle(harness.handler);
+
+    expect(retry.outcome).toBe("blocked");
+    expect(sendCalls).toBe(1);
+  });
+
   it("sends remediation to the original implementation thread", async () => {
     const harness = makeHarness({
       reviewOutputs: [
@@ -244,6 +300,50 @@ describe("review remediation loop", () => {
     );
   });
 
+  it("keeps failed-check reasons in remediation and totally orders tied findings", async () => {
+    const failedCheckHarness = makeHarness({
+      reviewOutputs: [
+        output({
+          checks: [
+            {
+              name: "unit",
+              command: "npm test",
+              outcome: "failed",
+              exitCode: 1,
+              summary: "one assertion failed",
+            },
+          ],
+        }),
+      ],
+    });
+
+    const failedCheckResult = await idle(failedCheckHarness.handler);
+
+    expect(failedCheckResult.outcome).toBe("changes_requested");
+    expect(failedCheckHarness.threads.sent.at(-1)?.prompt).toContain(
+      "check unit failed: one assertion failed",
+    );
+
+    const tiedFindingHarness = makeHarness({
+      reviewOutputs: [
+        output({
+          verdict: "changes_requested",
+          findings: [
+            { ...finding("high", "same title", "src/a.ts", 1), details: "zulu" },
+            { ...finding("high", "same title", "src/a.ts", 1), details: "alpha" },
+          ],
+        }),
+      ],
+    });
+
+    const tiedFindingResult = await idle(tiedFindingHarness.handler);
+
+    expect(tiedFindingResult.findings?.map((item) => item.details)).toEqual([
+      "alpha",
+      "zulu",
+    ]);
+  });
+
   it("requires a new head before a later pass", async () => {
     const harness = makeHarness({
       reviewOutputs: [
@@ -257,12 +357,21 @@ describe("review remediation loop", () => {
 
     await idle(harness.handler);
     const oldHeadPass = await idle(harness.handler);
+    const nextCycle = await harness.handler.startReviewCycle({
+      attemptId: "attempt-2",
+      implementationThreadId: "implementation-thread-1",
+      expectedSha: NEXT_SHA,
+    });
     harness.environment.status = async () => ({
       available: true,
       clean: true,
       headSha: NEXT_SHA,
     });
-    const newHeadPass = await idle(harness.handler, { expectedSha: NEXT_SHA });
+    const newHeadPass = await idle(harness.handler, {
+      attemptId: "attempt-2",
+      reviewThreadId: nextCycle.reviewThreadId,
+      expectedSha: NEXT_SHA,
+    });
 
     expect(oldHeadPass.outcome).toBe("blocked");
     expect(newHeadPass.outcome).toBe("pass");
@@ -272,10 +381,12 @@ describe("review remediation loop", () => {
     const harness = makeHarness();
 
     await harness.handler.startReviewCycle({
+      attemptId: "attempt-1",
       implementationThreadId: "implementation-thread-1",
       expectedSha: EXPECTED_SHA,
     });
     await harness.handler.startReviewCycle({
+      attemptId: "attempt-2",
       implementationThreadId: "implementation-thread-1",
       expectedSha: NEXT_SHA,
     });
@@ -288,5 +399,13 @@ describe("review remediation loop", () => {
       "implementation-thread-1",
     );
     expect(harness.threads.created[0]).not.toEqual(harness.threads.created[1]);
+    expect(harness.attempts.values.get("attempt-1")).toMatchObject({
+      threadId: "review-child-1",
+      headSha: EXPECTED_SHA,
+    });
+    expect(harness.attempts.values.get("attempt-2")).toMatchObject({
+      threadId: "review-child-2",
+      headSha: NEXT_SHA,
+    });
   });
 });

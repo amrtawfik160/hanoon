@@ -39,6 +39,11 @@ export interface ReviewAttemptStore {
     attemptId: string,
     patch: Partial<ReviewAttemptState>,
   ): Promise<void> | void;
+  claimFormatCorrection?(
+    attemptId: string,
+    threadId: string,
+    headSha: string,
+  ): Promise<boolean> | boolean;
 }
 
 export interface ReviewHandlerEvent {
@@ -61,6 +66,7 @@ export interface ReviewThreadIdleInput {
 }
 
 export interface ReviewCycleInput {
+  attemptId: string;
   implementationThreadId: string;
   expectedSha: string;
 }
@@ -95,15 +101,18 @@ function outputText(rawOutput: unknown): string {
   throw new InvalidReviewOutputError("BB thread output does not contain text");
 }
 
-function remediationPrompt(findings: ReviewFinding[]): string {
-  const lines = findings.map((finding) => {
+function remediationPrompt(findings: ReviewFinding[], reasons: string[]): string {
+  const reasonLines = reasons.map((reason) => `- Reason: ${reason}`);
+  const findingLines = findings.map((finding) => {
     const location = finding.file === null ? "(no file)" : `${finding.file}:${finding.line ?? "?"}`;
     return `- [${finding.severity}] ${location} ${finding.title} — ${finding.details}`;
   });
-  return `Address these bounded review findings, then report the changes:\n${lines.join("\n")}`;
+  return `Address these bounded review findings, then report the changes:\n${[...reasonLines, ...findingLines].join("\n")}`;
 }
 
 export class ReviewHandler {
+  private readonly formatCorrectionClaims = new Set<string>();
+
   public constructor(private readonly dependencies: ReviewHandlerDependencies) {}
 
   public async handleThreadIdle(input: ReviewThreadIdleInput): Promise<ReviewHandlerResult> {
@@ -113,8 +122,8 @@ export class ReviewHandler {
     ]);
     const blockedReason = environmentReason(status, input.expectedSha);
     if (blockedReason) return this.block(input, blockedReason);
-    if (attempt.threadId !== undefined && attempt.threadId !== input.reviewThreadId) {
-      return this.block(input, "review attempt thread does not match the idle thread");
+    if (attempt.threadId !== input.reviewThreadId || attempt.headSha !== input.expectedSha) {
+      return this.block(input, "review attempt is not bound to the exact idle thread and expected head");
     }
     if (attempt.requiresNewHead && attempt.headSha === input.expectedSha) {
       return this.block(input, "a new head is required after changes were requested");
@@ -140,33 +149,73 @@ export class ReviewHandler {
   public async startReviewCycle(input: ReviewCycleInput): Promise<{ reviewThreadId: string }> {
     const prompt = `Review the implementation at exact head ${input.expectedSha} and return one strict JSON verdict.`;
     const thread = await this.dependencies.threads.create(input.implementationThreadId, prompt);
+    await this.dependencies.attempts.update(input.attemptId, {
+      threadId: thread.id,
+      headSha: input.expectedSha,
+      formatCorrectionSent: false,
+      requiresNewHead: false,
+      result: null,
+    });
     return { reviewThreadId: thread.id };
+  }
+
+  private async claimFormatCorrection(input: ReviewThreadIdleInput): Promise<boolean> {
+    const claimKey = `${input.attemptId}:${input.reviewThreadId}:${input.expectedSha}`;
+    if (this.formatCorrectionClaims.has(claimKey)) return false;
+    this.formatCorrectionClaims.add(claimKey);
+    try {
+      const latest = await this.dependencies.attempts.get(input.attemptId);
+      if (
+        latest.threadId !== input.reviewThreadId ||
+        latest.headSha !== input.expectedSha ||
+        latest.formatCorrectionSent
+      ) {
+        return false;
+      }
+      if (this.dependencies.attempts.claimFormatCorrection) {
+        return await this.dependencies.attempts.claimFormatCorrection(
+          input.attemptId,
+          input.reviewThreadId,
+          input.expectedSha,
+        );
+      }
+      await this.dependencies.attempts.update(input.attemptId, {
+        threadId: input.reviewThreadId,
+        headSha: input.expectedSha,
+        formatCorrectionSent: true,
+      });
+      return true;
+    } finally {
+      this.formatCorrectionClaims.delete(claimKey);
+    }
   }
 
   private async handleInvalidOutput(
     input: ReviewThreadIdleInput,
     attempt: ReviewAttemptState,
   ): Promise<ReviewHandlerResult> {
-    if (!attempt.formatCorrectionSent) {
-      await this.dependencies.threads.send(
-        input.reviewThreadId,
-        buildReviewFormatCorrectionPrompt(),
-      );
-      const result: ReviewHandlerResult = {
-        outcome: "format_correction_sent",
-        reasons: ["review output did not match the strict JSON contract"],
-        findings: [],
-        reviewedHeadSha: null,
-        formatCorrectionSent: true,
-      };
-      await this.dependencies.attempts.update(input.attemptId, {
-        threadId: input.reviewThreadId,
-        formatCorrectionSent: true,
-        result,
-      });
-      return result;
+    if (attempt.formatCorrectionSent) {
+      return this.block(input, "review output remained invalid after format correction");
     }
-    return this.block(input, "review output remained invalid after format correction");
+    const claimed = await this.claimFormatCorrection(input);
+    if (!claimed) return this.block(input, "review output remained invalid after format correction");
+    const result: ReviewHandlerResult = {
+      outcome: "format_correction_sent",
+      reasons: ["review output did not match the strict JSON contract"],
+      findings: [],
+      reviewedHeadSha: null,
+      formatCorrectionSent: true,
+    };
+    await this.dependencies.threads.send(
+      input.reviewThreadId,
+      buildReviewFormatCorrectionPrompt(),
+    );
+    await this.dependencies.attempts.update(input.attemptId, {
+      threadId: input.reviewThreadId,
+      formatCorrectionSent: true,
+      result,
+    });
+    return result;
   }
 
   private async pass(
@@ -208,7 +257,7 @@ export class ReviewHandler {
     });
     await this.dependencies.threads.send(
       input.implementationThreadId,
-      remediationPrompt(assessment.findings),
+      remediationPrompt(assessment.findings, assessment.reasons),
     );
     this.dependencies.emit({
       type: "REVIEW_CHANGES_REQUESTED",

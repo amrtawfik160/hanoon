@@ -54,10 +54,15 @@ export function parseReviewVerdict(text: string): ReviewVerdict {
   try {
     parsed = JSON.parse(trimmed);
   } catch (error) {
-    if (error instanceof SyntaxError) throw new InvalidReviewOutputError();
-    throw error;
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new InvalidReviewOutputError();
   }
-  return reviewVerdictSchema.parse(parsed) as ReviewVerdict;
+  try {
+    return reviewVerdictSchema.parse(parsed) as ReviewVerdict;
+  } catch (error) {
+    if (!(error instanceof z.ZodError)) throw error;
+    throw new InvalidReviewOutputError();
+  }
 }
 
 const SEVERITY_RANK: Record<ReviewSeverity, number> = {
@@ -71,7 +76,7 @@ function compareNullableText(left: string | null, right: string | null): number 
   if (left === right) return 0;
   if (left === null) return 1;
   if (right === null) return -1;
-  return left.localeCompare(right);
+  return left < right ? -1 : 1;
 }
 
 function compareFindings(left: ReviewFinding, right: ReviewFinding): number {
@@ -82,7 +87,9 @@ function compareFindings(left: ReviewFinding, right: ReviewFinding): number {
   const leftLine = left.line ?? Number.MAX_SAFE_INTEGER;
   const rightLine = right.line ?? Number.MAX_SAFE_INTEGER;
   if (leftLine !== rightLine) return leftLine - rightLine;
-  return left.title.localeCompare(right.title);
+  if (left.title !== right.title) return left.title < right.title ? -1 : 1;
+  if (left.details === right.details) return 0;
+  return left.details < right.details ? -1 : 1;
 }
 
 function sortedFindings(findings: ReviewFinding[]): ReviewFinding[] {
