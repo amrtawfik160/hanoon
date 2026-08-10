@@ -135,6 +135,7 @@ describe("Telegram Bot API client", () => {
 
   it.each([
     ["message is not modified", 400, "not_modified"],
+    ["Bad Request: message is not modified: specified new message content and reply markup are exactly the same", 400, "not_modified"],
     ["Bad Request: query is too old and response timeout expired", 400, "expired_callback"],
     ["Bad Request: message to edit not found", 400, "edit_unavailable"],
     ["Bad Request: can't parse entities", 400, "bad_entities"],
@@ -154,9 +155,13 @@ describe("Telegram Bot API client", () => {
     expect(classifyTelegramError(error)).toBe(expected);
   });
 
-  it("treats the exact not-modified edit response as success", async () => {
+  it("treats Telegram's detailed not-modified edit response as success", async () => {
     const fetchMock = telegramFetch([
-      { ok: false, error_code: 400, description: "Bad Request: message is not modified" },
+      {
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: message is not modified: specified new message content and reply markup are exactly the same",
+      },
     ]);
     const client = new TelegramClient("token", fetchMock);
 

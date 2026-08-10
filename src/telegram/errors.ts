@@ -49,7 +49,7 @@ export class TelegramApiError extends Error {
 export function classifyTelegramError(error: unknown): TelegramErrorKind {
   if (!(error instanceof TelegramApiError)) return "retryable";
   const description = error.description?.toLowerCase() ?? "";
-  if (description === "message is not modified" || description === "bad request: message is not modified") {
+  if (description === "message is not modified" || description.startsWith("bad request: message is not modified")) {
     return "not_modified";
   }
   if (

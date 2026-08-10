@@ -89,7 +89,9 @@ function isRetryable(errorCode: number): boolean {
 }
 
 function isNotModified(description: string | undefined): boolean {
-  return description === "message is not modified" || description === "Bad Request: message is not modified";
+  const normalized = description?.toLowerCase();
+  return normalized === "message is not modified" ||
+    normalized?.startsWith("bad request: message is not modified") === true;
 }
 
 function composeRequestSignal(callerSignal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
