@@ -59,7 +59,7 @@ Return Telegram error `429` with `retry_after` and assert `sendChatAction` makes
 Run:
 
 ```bash
-bunx vitest run tests/telegram-client.test.ts
+npm test -- tests/telegram-client.test.ts
 ```
 
 Expected: FAIL because `sendChatAction` does not exist.
@@ -95,7 +95,7 @@ Avoid double-inserting `chat_id`: unlike `sendMessage`, this method calls the ge
 Run:
 
 ```bash
-bunx vitest run tests/telegram-client.test.ts
+npm test -- tests/telegram-client.test.ts
 ```
 
 Expected: PASS with no retry sleep for chat-action failures.
@@ -172,7 +172,7 @@ Make `sendChatAction` reject with a credential-shaped error, pass a warning reco
 Run:
 
 ```bash
-bunx vitest run tests/telegram-presence.test.ts
+npm test -- tests/telegram-presence.test.ts
 ```
 
 Expected: FAIL because the module does not exist.
@@ -190,7 +190,7 @@ Store only the last attempted `{ key, at }` in memory. In `pulse`, clear that va
 Run:
 
 ```bash
-bunx vitest run tests/telegram-presence.test.ts
+npm test -- tests/telegram-presence.test.ts
 ```
 
 Expected: PASS for the controller matrix, job/liveness matrix, heartbeat, reset, and failure isolation.
@@ -242,7 +242,7 @@ Run the registered job-executor service through the fake plugin host with a subm
 Run:
 
 ```bash
-bunx vitest run tests/job-executor-service.test.ts tests/plugin.test.ts
+npm test -- tests/job-executor-service.test.ts tests/plugin.test.ts
 ```
 
 Expected: FAIL because the executor has no presence dependency and plugin wiring lacks chat actions.
@@ -273,7 +273,7 @@ In `README.md` update the conversation/task flow and recovery guarantees to stat
 Run:
 
 ```bash
-bunx vitest run tests/telegram-client.test.ts tests/telegram-presence.test.ts tests/job-executor-service.test.ts tests/plugin.test.ts
+npm test -- tests/telegram-client.test.ts tests/telegram-presence.test.ts tests/job-executor-service.test.ts tests/plugin.test.ts
 ```
 
 Expected: PASS.
@@ -283,9 +283,9 @@ Expected: PASS.
 Run:
 
 ```bash
-bun run typecheck
-bun test
-bun run build
+npm run typecheck
+npm test
+npm run build
 git diff --check
 ```
 
