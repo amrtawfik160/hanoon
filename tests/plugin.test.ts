@@ -103,8 +103,10 @@ it("shows native Telegram typing while a submitted Luna controller turn is activ
   await harness.behavior.setSettings({ botToken: "123:test-token" });
   const telegramMethods: string[] = [];
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
-    telegramMethods.push(String(input).split("/").at(-1) ?? "");
-    return new Response(JSON.stringify({ ok: true, result: true }), {
+    const method = String(input).split("/").at(-1) ?? "";
+    telegramMethods.push(method);
+    const result = method === "sendMessage" ? { message_id: 902 } : true;
+    return new Response(JSON.stringify({ ok: true, result }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -144,7 +146,11 @@ it("shows native Telegram typing while a submitted Luna controller turn is activ
   const run = harness.behavior.runService("job-executor");
   try {
     await vi.waitFor(() => expect(telegramMethods).toContain("sendChatAction"));
-    expect(store.getOutbox(`controller:${turn.id}:reply`)).toBeNull();
+    await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
+      status: "sent",
+      messageId: 902,
+      payload: { text: "Connecting to Luna Max…" },
+    }));
   } finally {
     run.controller.abort();
     await run.done;

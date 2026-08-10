@@ -2,6 +2,7 @@ import type { TelegramAgentStore } from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
 import type { ControllerAdapter, ControllerLocation, ControllerStatus } from "./bb-controller";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
+import { projectControllerStream } from "./stream";
 
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
@@ -45,7 +46,7 @@ export class LunaControllerService {
         this.fail(turn, fence, "Controller status could not be verified");
         return true;
       }
-      if (status === "missing") {
+      if (status === "missing" || status === "error") {
         if (!this.dependencies.store.resetControllerThread({
           ...fenceAt(fence, this.dependencies.clock.now()),
           controllerKey: controller.controllerKey,
@@ -127,7 +128,31 @@ export class LunaControllerService {
     } catch {
       return false;
     }
-    if (status === "active" || status === "starting" || status === "stopping") return false;
+    let observation: Awaited<ReturnType<ControllerAdapter["events"]>> | null = null;
+    try {
+      observation = await this.dependencies.adapter.events(
+        controller.threadId,
+        submitted.bbEventSeq,
+        signal,
+      );
+      const projected = projectControllerStream(observation, {
+        cursor: submitted.bbEventSeq,
+        text: submitted.streamText,
+        phase: submitted.streamPhase,
+      });
+      if (projected.cursor > submitted.bbEventSeq) {
+        this.dependencies.store.updateControllerStream({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          turnId: submitted.id,
+          cursor: projected.cursor,
+          text: projected.text,
+          phase: projected.phase,
+        });
+      }
+    } catch {
+      observation = null;
+    }
+    if (status === "active" || status === "starting" || status === "stopping") return true;
     if (status === "missing") {
       this.dependencies.store.resetControllerThread({
         ...fenceAt(fence, this.dependencies.clock.now()),
@@ -138,12 +163,18 @@ export class LunaControllerService {
       return true;
     }
     if (status === "error") {
-      try {
-        const observation = await this.dependencies.adapter.events(
-          controller.threadId,
-          submitted.dispatchAfterSeq,
-          signal,
-        );
+      if (observation === null || submitted.bbEventSeq !== submitted.dispatchAfterSeq) {
+        try {
+          observation = await this.dependencies.adapter.events(
+            controller.threadId,
+            submitted.dispatchAfterSeq,
+            signal,
+          );
+        } catch {
+          observation = null;
+        }
+      }
+      if (observation !== null) {
         if (!observation.inputAccepted && submitted.retryCount === 0) {
           if (this.dependencies.store.retryUnacceptedControllerTurn({
             ...fenceAt(fence, this.dependencies.clock.now()),
@@ -152,8 +183,6 @@ export class LunaControllerService {
             expectedThreadId: controller.threadId,
           })) return true;
         }
-      } catch {
-        // Event acceptance is uncertain, so the turn must fail closed below.
       }
       this.dependencies.store.resetControllerThread({
         ...fenceAt(fence, this.dependencies.clock.now()),

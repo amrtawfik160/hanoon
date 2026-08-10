@@ -38,7 +38,7 @@ export type JobExecutorDependencies = {
 
 const LEASE_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
-const ACTIVE_POLL_MS = 5_000;
+const ACTIVE_POLL_MS = 1_000;
 const IDLE_POLL_MS = 60_000;
 const PERMANENT_EFFECT_ERROR_NAMES = new Set([
   "TypeError",

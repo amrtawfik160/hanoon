@@ -1274,6 +1274,12 @@ export interface TelegramAgentStore {
     controllerKey: string;
     expectedThreadId: string;
   }): boolean;
+  updateControllerStream(input: ControllerLeaseFence & {
+    turnId: string;
+    cursor: number;
+    text: string;
+    phase: ControllerTurnRecord["streamPhase"];
+  }): boolean;
   resetControllerThread(input: ControllerLeaseFence & {
     controllerKey: string;
     expectedThreadId: string;
@@ -1773,7 +1779,7 @@ function persistOutbox(
        ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
        ON CONFLICT(logical_key) DO UPDATE SET
          chat_id = excluded.chat_id,
-         message_id = excluded.message_id,
+         message_id = COALESCE(excluded.message_id, outbox.message_id),
          payload_json = excluded.payload_json,
          status = 'pending',
          next_attempt_at = excluded.next_attempt_at,
@@ -2161,7 +2167,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(dispatchAfterSeq, "dispatchAfterSeq");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      return this.db.prepare(
+      const updated = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'submitted', dispatch_after_seq = ?, bb_event_seq = ?,
                 stream_phase = 'connecting', submitted_at = ?, updated_at = ?
@@ -2179,7 +2185,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.turnId,
         input.ownerId,
         input.generation,
-      ).changes === 1;
+      );
+      if (updated.changes !== 1) return false;
+      const row = this.db.prepare(
+        `SELECT turn.id, controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+          WHERE turn.id = ? AND turn.state = 'submitted'`,
+      ).get(input.turnId) as { id: string; telegram_chat_id: string } | undefined;
+      if (!row) throw new Error("Submitted controller turn disappeared before placeholder creation");
+      const outbox: OutboxInput = {
+        logicalKey: `controller:${row.id}:reply`,
+        chatId: row.telegram_chat_id,
+        payload: { text: "Connecting to Luna Max…", disable_web_page_preview: true },
+      };
+      persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
+      return true;
     }).immediate();
   }
 
@@ -2217,6 +2238,46 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE controller_key = ? AND bb_thread_id = ? AND state = 'active'`,
       ).run(input.now, input.controllerKey, input.expectedThreadId);
       if (controller.changes !== 1) throw new Error("Controller generation changed during unaccepted retry");
+      return true;
+    }).immediate();
+  }
+
+  public updateControllerStream(input: ControllerLeaseFence & {
+    turnId: string;
+    cursor: number;
+    text: string;
+    phase: ControllerTurnRecord["streamPhase"];
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertNonNegativeInteger(input.cursor, "cursor");
+    assertControllerText(input.text || "Controller stream is empty", "controller stream");
+    const phases = new Set<ControllerTurnRecord["streamPhase"]>([
+      "queued", "connecting", "thinking", "using_tools", "responding", "complete", "failed",
+    ]);
+    if (!phases.has(input.phase)) throw new TypeError("Unknown controller stream phase");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.*, controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+          WHERE turn.id = ? AND turn.state = 'submitted' AND turn.bb_event_seq < ?`,
+      ).get(input.turnId, input.cursor) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
+      if (!row) return false;
+      const updated = this.db.prepare(
+        `UPDATE controller_turns
+            SET bb_event_seq = ?, stream_text = ?, stream_phase = ?, updated_at = ?
+          WHERE id = ? AND state = 'submitted' AND bb_event_seq < ?`,
+      ).run(input.cursor, input.text, input.phase, input.now, input.turnId, input.cursor);
+      if (updated.changes !== 1) return false;
+      const displayText = input.text || (input.phase === "thinking" ? "Luna Max is thinking…" : "Connecting to Luna Max…");
+      const outbox: OutboxInput = {
+        logicalKey: `controller:${input.turnId}:reply`,
+        chatId: row.telegram_chat_id,
+        messageId: row.telegram_message_id,
+        payload: { text: displayText, disable_web_page_preview: true },
+      };
+      persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
       return true;
     }).immediate();
   }
@@ -2262,10 +2323,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!row) return false;
       const updated = this.db.prepare(
         `UPDATE controller_turns
-            SET state = 'completed', response_text = ?, last_error = NULL,
+            SET state = 'completed', response_text = ?, stream_text = ?,
+                stream_phase = 'complete', last_error = NULL,
                 completed_at = ?, updated_at = ?
           WHERE id = ? AND state = 'submitted'`,
-      ).run(input.responseText, input.now, input.now, input.turnId);
+      ).run(input.responseText, input.responseText, input.now, input.now, input.turnId);
       if (updated.changes !== 1) return false;
       const outbox: OutboxInput = {
         logicalKey: `controller:${input.turnId}:reply`,
@@ -3088,8 +3150,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public completeOutbox(key: string, ownerId: string, generation: number, messageId: number | null, now: number): boolean {
     this.assertLeaseIdentity(key, ownerId, generation, now);
     if (messageId !== null && (!Number.isInteger(messageId) || messageId < 1)) throw new TypeError("messageId must be positive or null");
-    return this.db
-      .prepare(
+    return this.db.transaction((): boolean => {
+      const updated = this.db.prepare(
         `UPDATE outbox SET status = 'sent', message_id = COALESCE(?, message_id),
            lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL,
            last_error = NULL, updated_at = ?
@@ -3097,8 +3159,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            AND lease_generation = ? AND lease_expires_at > ?
            AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
              AND generation = ? AND lease_expires_at > ?)`,
-      )
-      .run(messageId, now, key, ownerId, generation, now, ownerId, generation, now).changes === 1;
+      ).run(messageId, now, key, ownerId, generation, now, ownerId, generation, now);
+      if (updated.changes !== 1) return false;
+      const controllerReply = /^controller:(controller-turn-[^:]+):reply$/.exec(key);
+      if (controllerReply && messageId !== null) {
+        const linked = this.db.prepare(
+          `UPDATE controller_turns SET telegram_message_id = ?, updated_at = ?
+            WHERE id = ? AND (telegram_message_id IS NULL OR telegram_message_id = ?)`,
+        ).run(messageId, now, controllerReply[1], messageId);
+        if (linked.changes !== 1) throw new Error("Controller reply message changed before completion");
+      }
+      return true;
+    }).immediate();
   }
 
   public completeStatusOutbox(

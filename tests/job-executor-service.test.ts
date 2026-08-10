@@ -366,7 +366,60 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(order).toEqual(["reconcile", "dispatch"]);
-    expect(waitForWork).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+    expect(waitForWork).toHaveBeenCalledWith(1_000, expect.any(AbortSignal));
+  });
+
+  it("streams a controller reply by editing the same durable Telegram message", async () => {
+    const { store } = fixture();
+    addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 501 }));
+    const editMessage = vi.fn(async () => undefined);
+    let loop = 0;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (loop === 2) abort.abort();
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage }),
+      controller: {
+        reconcile: vi.fn(async (fence) => {
+          if (loop === 1) {
+            expect(store.updateControllerStream({
+              ownerId: fence.ownerId,
+              generation: fence.generation,
+              now: 2_000,
+              turnId: "controller-turn-900",
+              cursor: 1,
+              text: "Luna is working live",
+              phase: "responding",
+            })).toBe(true);
+          }
+          return true;
+        }),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledWith("7", {
+      text: "Connecting to Luna Max…",
+      disable_web_page_preview: true,
+    });
+    expect(editMessage).toHaveBeenCalledWith("7", 501, {
+      text: "Luna is working live",
+      disable_web_page_preview: true,
+    });
+    expect(store.getOutbox("controller:controller-turn-900:reply")).toMatchObject({
+      status: "sent",
+      messageId: 501,
+      payload: { text: "Luna is working live" },
+    });
   });
 
   it.each(["idle", "active"] as const)("caps the %s executor wait at the active presence deadline", async (mode) => {
@@ -395,7 +448,7 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendChatAction).toHaveBeenCalledWith("7", "typing", expect.any(AbortSignal));
-    expect(waitForWork).toHaveBeenCalledWith(4_000, expect.any(AbortSignal));
+    expect(waitForWork).toHaveBeenCalledWith(1_000, expect.any(AbortSignal));
   });
 
   it("preserves the ordinary wait when presence is inactive", async () => {

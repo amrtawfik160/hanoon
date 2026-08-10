@@ -547,6 +547,21 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       generation: controllerLease.generation,
       now: time,
     })).toBe(true);
+    const controllerPlaceholder = store.leaseOutbox(
+      "controller-setup",
+      controllerLease.generation,
+      time,
+      10,
+      1_000_000,
+    ).find((entry) => entry.logicalKey === `controller:${controllerTurn.id}:reply`);
+    if (!controllerPlaceholder) throw new Error("controller placeholder was not queued");
+    expect(store.completeOutbox(
+      controllerPlaceholder.logicalKey,
+      "controller-setup",
+      controllerLease.generation,
+      899,
+      time,
+    )).toBe(true);
     expect(store.releaseExecutorLease("controller-setup", controllerLease.generation, ++time)).toBe(true);
     let job = store.createConfirmedControllerJob({
       controllerThreadId: "thr_controller",

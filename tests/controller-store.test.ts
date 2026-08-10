@@ -155,6 +155,53 @@ it("requeues one unaccepted controller turn in a fresh generation without losing
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ id: first.id, state: "dispatching", retryCount: 1 });
 });
 
+it("keeps one durable Telegram message id from controller placeholder through live edits", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(381, "stream this"));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_stream",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, dispatchAfterSeq: 7, ...fence })).toBe(true);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
+    messageId: null,
+    status: "pending",
+    payload: { text: "Connecting to Luna Max…" },
+  });
+
+  const leased = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
+  expect(leased).toHaveLength(1);
+  expect(store.completeOutbox(leased[0]!.logicalKey, fence.ownerId, fence.generation, 501, fence.now)).toBe(true);
+  expect(store.listControllerTurns("owner-7-controller", 10)[0]?.telegramMessageId).toBe(501);
+
+  expect(store.updateControllerStream({
+    turnId: turn.id,
+    cursor: 9,
+    text: "Hello",
+    phase: "responding",
+    ...fence,
+  })).toBe(true);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
+    messageId: 501,
+    status: "pending",
+    payload: { text: "Hello" },
+  });
+  const edit = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
+  expect(edit).toHaveLength(1);
+  expect(store.completeOutbox(edit[0]!.logicalKey, fence.ownerId, fence.generation, 501, fence.now)).toBe(true);
+  expect(store.completeControllerTurn({ turnId: turn.id, responseText: "Hello final", ...fence })).toBe(true);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
+    messageId: 501,
+    status: "pending",
+    payload: { text: "Hello final" },
+  });
+});
+
 it("rejects credential-shaped controller failure text", () => {
   const { store } = fixture();
   const turn = store.enqueueControllerTurn(turnInput(401));
