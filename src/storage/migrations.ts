@@ -154,4 +154,10 @@ ALTER TABLE telegram_updates ADD COLUMN claim_generation INTEGER;
 ALTER TABLE telegram_updates ADD COLUMN claim_expires_at INTEGER;
 `] as const;
 
-export const ALL_MIGRATIONS = [...INITIAL_MIGRATIONS, ...TASK_3_MIGRATIONS] as const;
+export const TASK_9_MIGRATIONS = [String.raw`
+ALTER TABLE callbacks ADD COLUMN approval_nonce_hash TEXT;
+ALTER TABLE callbacks ADD COLUMN head_sha TEXT;
+ALTER TABLE callbacks ADD COLUMN effect_idempotency_key TEXT;
+`] as const;
+
+export const ALL_MIGRATIONS = [...INITIAL_MIGRATIONS, ...TASK_3_MIGRATIONS, ...TASK_9_MIGRATIONS] as const;

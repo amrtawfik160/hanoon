@@ -309,7 +309,6 @@ export class TelegramIngress {
         nonce: action.nonce,
         userId: identity.userId,
         chatId: identity.chatId,
-        now,
       });
       await this.telegram.answerCallback(
         callback.id,

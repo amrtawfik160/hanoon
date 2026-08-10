@@ -213,7 +213,11 @@ describe("deterministic Telegram views", () => {
     `https://example.test/redirect?next=m%3A${mergeNonce}`,
     `https://example.test/redirect?next=%6D%3A${mergeNonce}`,
     `https://example.test/%ZZ/%6D%3A${mergeNonce}`,
-  ])("does not render callback-bearing external URL %s as a link", (url) => {
+    "https://example.test/pull/17?%74oken=secret",
+    "https://example.test/pull/17?%2574oken=secret",
+    "https://example.test/pull/17?next=%73ecret",
+    "https://example.test/pull/17?next=%2573ecret",
+  ])("does not render unsafe external URL %s as a link", (url) => {
     const policy = policyFixture();
     const rendered = renderJobStatus(jobFixture({
       id: telegramJobId,

@@ -21,7 +21,8 @@ function approvalFixture(options: { now?: number } = {}) {
   const now = options.now ?? NOW;
   const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
   const db = bb.storage.database();
-  const store = openStore(bb.storage);
+  let currentNow = now;
+  const store = openStore(bb.storage, bb.storage.kv, () => currentNow);
   const policy = policyFixture({ requiredChecks: [] });
 
   store.createPairingCode(hashSecret("pair"), now, now + 60_000);
@@ -46,10 +47,19 @@ function approvalFixture(options: { now?: number } = {}) {
 
   let nonceByte = 1;
   const service = new ApprovalService(store, {
-    now: () => now,
+    now: () => currentNow,
     randomBytes: () => Buffer.alloc(24, nonceByte++),
   });
-  return { db, store, service, now, job: store.getJob("job_1")! };
+  return {
+    db,
+    store,
+    service,
+    now,
+    job: store.getJob("job_1")!,
+    setNow: (value: number) => {
+      currentNow = value;
+    },
+  };
 }
 
 function mergeEffect(
@@ -120,6 +130,7 @@ describe("Telegram merge approvals", () => {
     const fixture = approvalFixture();
     const issued = fixture.service.issue("job_1", HEAD);
 
+    fixture.setNow(NOW + APPROVAL_TTL_MS);
     expect(fixture.service.consume(issued.nonce, NOW + APPROVAL_TTL_MS)).toEqual({ ok: false, reason: "expired" });
     expect(fixture.store.revokeApprovals("job_1", "cancelled", NOW + 1)).toBe(1);
     const replacement = fixture.service.issue("job_1", HEAD, NOW + 2);
@@ -428,5 +439,73 @@ describe("Telegram merge approvals", () => {
     expect(() => fixture.service.issue("job_1", HEAD, NOW + 1)).toThrow(/fresh approval insert failure/);
     expect(fixture.service.lookup(issued.nonce)).toMatchObject({ consumedAt: null, outcome: null });
     expect(fixture.service.consume(issued.nonce, NOW + 2)).toMatchObject({ ok: true, headSha: HEAD });
+  });
+
+  it("persists merge callback completion identity without the raw callback nonce", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
+
+    expect(fixture.store.acceptApprovalAndEnqueueMerge({
+      nonceHash: hashSecret(issued.nonce),
+      expectedJobVersion: fixture.job.version,
+      effect,
+      now: NOW + 1,
+      identity: { userId: "7", chatId: "70" },
+    })).toMatchObject({ ok: true });
+    expect(fixture.store.recordCallback(
+      "callback_identity",
+      "job_1",
+      "merge",
+      "accepted",
+      NOW + 2,
+      {
+        approvalNonceHash: hashSecret(issued.nonce),
+        headSha: HEAD,
+        effectIdempotencyKey: effect.idempotencyKey,
+      },
+    )).toBe(true);
+    expect(fixture.db.prepare(
+      "SELECT approval_nonce_hash, head_sha, effect_idempotency_key FROM callbacks WHERE callback_query_id = ?",
+    ).get("callback_identity")).toEqual({
+      approval_nonce_hash: hashSecret(issued.nonce),
+      head_sha: HEAD,
+      effect_idempotency_key: effect.idempotencyKey,
+    });
+    expect(JSON.stringify(fixture.db.prepare("SELECT * FROM callbacks").all())).not.toContain(issued.nonce);
+  });
+
+  it("rejects every callback-bearing form during stale effect cleanup", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
+    fixture.store.acceptApprovalAndEnqueueMerge({
+      nonceHash: hashSecret(issued.nonce),
+      expectedJobVersion: fixture.job.version,
+      effect,
+      now: NOW + 1,
+    });
+    fixture.db.prepare(
+      `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?, lease_expires_at = ?
+         WHERE job_id = ? AND idempotency_key = ?`,
+    ).run("executor-1", 1, NOW + 60_000, effect.jobId, effect.idempotencyKey);
+
+    const forms = [
+      `m:${issued.nonce}`,
+      `prefixxm:m:${issued.nonce}suffix`,
+      `m%3A${issued.nonce}`,
+      `%256D%253A${issued.nonce}`,
+      `%ZZ%6D%3A${issued.nonce}`,
+    ];
+    for (const form of forms) {
+      expect(() => fixture.store.staleMergeEffect({
+        jobId: effect.jobId,
+        effectIdempotencyKey: effect.idempotencyKey,
+        reason: form,
+        now: NOW + 2,
+        leaseOwner: "executor-1",
+        leaseGeneration: 1,
+      })).toThrow(/callback|nonce/i);
+    }
   });
 });

@@ -19,6 +19,7 @@ import {
   type DurableMergeReceipt,
   type MergeEffectPayload,
   type MergeCallPreparation,
+  type MergeCallbackIdentity,
   type PersistedMergeSuccessResult,
   type TelegramAgentStore,
 } from "../storage/store";
@@ -180,7 +181,6 @@ export type ApprovalCallbackInput = {
   nonce: string;
   userId: string;
   chatId: string;
-  now?: number;
 };
 
 export type MergeCallbackResult =
@@ -253,15 +253,28 @@ export class MergeHandler {
   }
 
   public async handleApprovalCallback(input: ApprovalCallbackInput): Promise<MergeCallbackResult> {
-    const now = input.now ?? this.clock();
-    assertNow(now);
+    const freshNow = (): number => {
+      const now = this.clock();
+      assertNow(now);
+      return now;
+    };
     if (!input.callbackId || !input.nonce) throw new TypeError("approval callback identity is required");
+    const approvalNonceHash = hashSecret(input.nonce);
 
     const previous = this.options.store.getCallback(input.callbackId);
     if (previous) {
       return previous.outcome === "accepted" &&
+        previous.action === "merge" &&
         previous.jobId !== null &&
-        this.hasAcceptedMergeEffect(previous.jobId)
+        previous.approvalNonceHash === approvalNonceHash &&
+        previous.headSha !== null &&
+        previous.effectIdempotencyKey !== null &&
+        this.hasAcceptedMergeEffect(
+          previous.jobId,
+          previous.headSha,
+          approvalNonceHash,
+          previous.effectIdempotencyKey,
+        )
         ? { outcome: "accepted" }
         : { outcome: "rejected" };
     }
@@ -269,29 +282,39 @@ export class MergeHandler {
     const owner = this.options.store.getOwner();
     const identity: ApprovalIdentity = { userId: input.userId, chatId: input.chatId };
     if (!owner || owner.userId !== identity.userId || owner.chatId !== identity.chatId) {
-      this.options.store.recordCallback(input.callbackId, null, "merge", "rejected", now);
+      this.options.store.recordCallback(input.callbackId, null, "merge", "rejected", freshNow());
       return { outcome: "rejected" };
     }
 
-    const approval = this.approvals.get(input.nonce, now);
+    const approval = this.approvals.get(input.nonce, freshNow());
     if (!approval) {
       const consumedApproval = this.approvals.lookup(input.nonce);
+      const acceptedIdentity = consumedApproval
+        ? this.findAcceptedMergeIdentity(consumedApproval.jobId, consumedApproval.headSha, approvalNonceHash)
+        : null;
       if (
         consumedApproval?.outcome === "accepted" &&
         consumedApproval.consumedAt !== null &&
         consumedApproval.ownerUserId === identity.userId &&
         consumedApproval.ownerChatId === identity.chatId &&
-        this.hasAcceptedMergeEffect(consumedApproval.jobId, consumedApproval.headSha)
+        acceptedIdentity !== null
       ) {
-        this.options.store.recordCallback(input.callbackId, consumedApproval.jobId, "merge", "accepted", now);
+        this.options.store.recordCallback(
+          input.callbackId,
+          consumedApproval.jobId,
+          "merge",
+          "accepted",
+          freshNow(),
+          acceptedIdentity,
+        );
         return { outcome: "accepted" };
       }
-      this.options.store.recordCallback(input.callbackId, null, "merge", "rejected", now);
+      this.options.store.recordCallback(input.callbackId, null, "merge", "rejected", freshNow());
       return { outcome: "rejected" };
     }
     const job = this.options.store.getJob(approval.jobId);
     if (!job) {
-      this.options.store.recordCallback(input.callbackId, approval.jobId, "merge", "rejected", now);
+      this.options.store.recordCallback(input.callbackId, approval.jobId, "merge", "rejected", freshNow());
       return { outcome: "rejected" };
     }
 
@@ -300,32 +323,34 @@ export class MergeHandler {
         job,
         phase: "approval",
         receipt: null,
-        now,
+        now: freshNow(),
       });
-      const evaluation = readyEvaluation(collected, now);
+      const evaluation = readyEvaluation(collected, freshNow());
       if (!evaluation.ready || evaluation.receipt.headSha !== approval.headSha || evaluation.receipt.jobId !== approval.jobId) {
         const rejected = this.options.store.rejectApprovalAndRecordCallback({
-          nonceHash: hashSecret(input.nonce),
+          nonceHash: approvalNonceHash,
           callbackId: input.callbackId,
           jobId: approval.jobId,
           headSha: typeof collected.environment.checkout.headSha === "string" && FULL_SHA.test(collected.environment.checkout.headSha)
             ? collected.environment.checkout.headSha
             : undefined,
-          now,
+          now: freshNow(),
         });
         return { outcome: rejected.outcome === "accepted" ? "accepted" : "rejected" };
       }
+      const expiryNow = freshNow();
       if (
         Date.parse(evaluation.receipt.expiresAt) !== approval.expiresAt ||
         approval.jobVersion !== job.version ||
         approval.ownerUserId !== identity.userId ||
-        approval.ownerChatId !== identity.chatId
+        approval.ownerChatId !== identity.chatId ||
+        expiryNow >= approval.expiresAt
       ) {
         const rejected = this.options.store.rejectApprovalAndRecordCallback({
-          nonceHash: hashSecret(input.nonce),
+          nonceHash: approvalNonceHash,
           callbackId: input.callbackId,
           jobId: approval.jobId,
-          now,
+          now: freshNow(),
         });
         return { outcome: rejected.outcome === "accepted" ? "accepted" : "rejected" };
       }
@@ -334,7 +359,7 @@ export class MergeHandler {
       const durableReceipt = parseDurableMergeReceipt({
         ...evaluation.receipt,
         effectIdempotencyKey: idempotencyKey,
-        approvalNonceHash: hashSecret(input.nonce),
+        approvalNonceHash,
         approvalOwnerUserId: identity.userId,
         approvalOwnerChatId: identity.chatId,
         jobVersion: job.version + 1,
@@ -353,26 +378,37 @@ export class MergeHandler {
         input.nonce,
         job.version,
         effect,
-        now,
+        freshNow(),
         identity,
       );
       if (!accepted.ok) {
         const rejected = this.options.store.rejectApprovalAndRecordCallback({
-          nonceHash: hashSecret(input.nonce),
+          nonceHash: approvalNonceHash,
           callbackId: input.callbackId,
           jobId: approval.jobId,
-          now,
+          now: freshNow(),
         });
         return { outcome: rejected.outcome === "accepted" ? "accepted" : "rejected" };
       }
-      this.options.store.recordCallback(input.callbackId, approval.jobId, "merge", "accepted", now);
+      this.options.store.recordCallback(
+        input.callbackId,
+        approval.jobId,
+        "merge",
+        "accepted",
+        freshNow(),
+        {
+          approvalNonceHash,
+          headSha: durableReceipt.headSha,
+          effectIdempotencyKey: durableReceipt.effectIdempotencyKey,
+        },
+      );
       return { outcome: "accepted" };
     } catch (error) {
       const rejected = this.options.store.rejectApprovalAndRecordCallback({
-        nonceHash: hashSecret(input.nonce),
+        nonceHash: approvalNonceHash,
         callbackId: input.callbackId,
         jobId: approval.jobId,
-        now,
+        now: freshNow(),
       });
       return { outcome: rejected.outcome === "accepted" ? "accepted" : "rejected" };
     }
@@ -398,6 +434,22 @@ export class MergeHandler {
           leaseOwner: input.leaseOwner,
           leaseGeneration: input.leaseGeneration,
         });
+      }
+      return { outcome: "failed" };
+    };
+    const preserveUnknownOutcome = (effectKey = input.effect.idempotencyKey): MergeEffectResult => {
+      if (input.leaseOwner !== undefined && input.leaseGeneration !== undefined) {
+        try {
+          this.options.store.preserveUnknownMergeEffect({
+            jobId: input.effect.jobId,
+            effectIdempotencyKey: effectKey,
+            now: freshNow(),
+            leaseOwner: input.leaseOwner,
+            leaseGeneration: input.leaseGeneration,
+          });
+        } catch {
+          // The unknown fence is already durable; a lost lease must not rewrite it.
+        }
       }
       return { outcome: "failed" };
     };
@@ -432,9 +484,15 @@ export class MergeHandler {
     try {
       job = this.options.store.getJob(effect.jobId);
     } catch (error) {
-      return failCurrentLease(error);
+      return storedPayload.mergeCallStartedAt === undefined
+        ? failCurrentLease(error)
+        : preserveUnknownOutcome();
     }
-    if (!job || job.state !== "merging") return failCurrentLease("Merge effect job is not an active merge");
+    if (!job || job.state !== "merging") {
+      return storedPayload.mergeCallStartedAt === undefined
+        ? failCurrentLease("Merge effect job is not an active merge")
+        : preserveUnknownOutcome();
+    }
 
     if (storedPayload.mergeCallStartedAt !== undefined) {
       let prepared: MergeCallPreparation;
@@ -447,10 +505,10 @@ export class MergeHandler {
           now: freshNow(),
         });
       } catch (error) {
-        return failCurrentLease(error);
+        return preserveUnknownOutcome();
       }
-      if (!prepared.ok) return failCurrentLease(prepared.reason);
-      return this.finishProviderAttempt(prepared, input, freshNow, failCurrentLease);
+      if (!prepared.ok) return preserveUnknownOutcome();
+      return this.finishProviderAttempt(prepared, input, freshNow, failCurrentLease, preserveUnknownOutcome);
     }
 
     let collected: GateInput;
@@ -496,7 +554,7 @@ export class MergeHandler {
       return failCurrentLease(error);
     }
     if (!prepared.ok) return failCurrentLease(prepared.reason);
-    return this.finishProviderAttempt(prepared, input, freshNow, failCurrentLease);
+    return this.finishProviderAttempt(prepared, input, freshNow, failCurrentLease, preserveUnknownOutcome);
   }
 
   public async runMergeEffect(
@@ -510,6 +568,7 @@ export class MergeHandler {
     input: ExecuteMergeEffectInput,
     freshNow: () => number,
     failCurrentLease: (reason: unknown, effectKey?: string) => MergeEffectResult,
+    preserveUnknownOutcome: (effectKey?: string) => MergeEffectResult,
   ): Promise<MergeEffectResult> {
     const { effect, job, receipt } = prepared;
     let sdkFence: MergeCallPreparation;
@@ -522,10 +581,10 @@ export class MergeHandler {
         now: freshNow(),
       });
     } catch (error) {
-      return failCurrentLease(error, effect.idempotencyKey);
+      return preserveUnknownOutcome(effect.idempotencyKey);
     }
     if (!sdkFence.ok) {
-      return failCurrentLease(sdkFence.reason, effect.idempotencyKey);
+      return preserveUnknownOutcome(effect.idempotencyKey);
     }
     if (prepared.shouldCallProvider) {
       let providerFence: MergeCallPreparation;
@@ -538,16 +597,16 @@ export class MergeHandler {
           now: freshNow(),
         });
       } catch (error) {
-        return failCurrentLease(error, effect.idempotencyKey);
+        return preserveUnknownOutcome(effect.idempotencyKey);
       }
-      if (!providerFence.ok) return failCurrentLease(providerFence.reason, effect.idempotencyKey);
+      if (!providerFence.ok) return preserveUnknownOutcome(effect.idempotencyKey);
       try {
         await this.options.bb.sdk.environments.mergePullRequest({
           environmentId: receipt.environmentId,
           method: receipt.mergeMethod,
         });
       } catch (error) {
-        return failCurrentLease(error, effect.idempotencyKey);
+        return preserveUnknownOutcome(effect.idempotencyKey);
       }
     }
 
@@ -561,10 +620,10 @@ export class MergeHandler {
         now: freshNow(),
       });
     } catch (error) {
-      return failCurrentLease(error, effect.idempotencyKey);
+      return preserveUnknownOutcome(effect.idempotencyKey);
     }
     if (!completionFence.ok) {
-      return failCurrentLease(completionFence.reason, effect.idempotencyKey);
+      return preserveUnknownOutcome(effect.idempotencyKey);
     }
 
     let confirmed: { ok: true; result: PersistedMergeSuccessResult } | { ok: false; reason: string };
@@ -591,7 +650,7 @@ export class MergeHandler {
       confirmed = { ok: false, reason: safeFailureReason(error, "post-merge provider truth is unavailable") };
     }
     if (!confirmed.ok) {
-      return failCurrentLease(confirmed.reason, effect.idempotencyKey);
+      return preserveUnknownOutcome(effect.idempotencyKey);
     }
 
     let completed: boolean;
@@ -611,10 +670,10 @@ export class MergeHandler {
         leaseGeneration: input.leaseGeneration!,
       });
     } catch (error) {
-      return failCurrentLease(error, effect.idempotencyKey);
+      return preserveUnknownOutcome(effect.idempotencyKey);
     }
     if (completed) return { outcome: "merged" };
-    return failCurrentLease("Merge completion fence rejected the changed job state", effect.idempotencyKey);
+    return preserveUnknownOutcome(effect.idempotencyKey);
   }
 
   private isValidCompletedEffect(effect: StoredEffect): boolean {
@@ -625,10 +684,21 @@ export class MergeHandler {
       const result = parsePersistedMergeSuccessResult(persisted.mergeResult);
       const job = this.options.store.getJob(effect.jobId);
       if (!job) return false;
+      const attempt = this.options.store.getAttempt(payload.receipt.reviewAttemptId);
+      if (
+        !attempt ||
+        attempt.jobId !== effect.jobId ||
+        attempt.kind !== "review" ||
+        attempt.headSha !== payload.receipt.headSha ||
+        attempt.resultJson === null
+      ) return false;
+      const attemptResult = parsePersistedMergeSuccessResult(JSON.parse(attempt.resultJson));
       const approval = this.options.store.getApproval(payload.receipt.approvalNonceHash);
       const receipt = payload.receipt;
       return result.jobId === effect.jobId &&
         result.effectIdempotencyKey === effect.idempotencyKey &&
+        receipt.effectIdempotencyKey === effect.idempotencyKey &&
+        JSON.stringify(attemptResult) === JSON.stringify(result) &&
         result.approvalNonceHash === receipt.approvalNonceHash &&
         result.environmentId === receipt.environmentId &&
         result.prNumber === receipt.prNumber &&
@@ -637,7 +707,7 @@ export class MergeHandler {
         result.pullRequest.state === "MERGED" &&
         job.id === receipt.jobId &&
         job.state === "merged" &&
-        job.version === receipt.jobVersion + 1 &&
+        job.version >= receipt.jobVersion + 1 &&
         job.projectId === receipt.projectId &&
         job.environmentId === receipt.environmentId &&
         job.prNumber === receipt.prNumber &&
@@ -660,31 +730,80 @@ export class MergeHandler {
     }
   }
 
-  private hasAcceptedMergeEffect(jobId: string, headSha?: string): boolean {
+  private findAcceptedMergeIdentity(
+    jobId: string,
+    headSha: string,
+    approvalNonceHash: string,
+  ): MergeCallbackIdentity | null {
     let effects: StoredEffect[];
     try {
       effects = this.options.store.listEffectsForJob(jobId);
     } catch {
-      return false;
+      return null;
     }
-    return effects.some((effect) => {
-      if (effect.kind !== "merge_pr" || effect.status === "failed" || effect.status === "dead") return false;
-      if (effect.status === "done") {
-        return this.isValidCompletedEffect(effect) && (headSha === undefined || (() => {
-          try {
-            return parsePersistedMergeSuccessResult((effect.payload as Record<string, unknown>).mergeResult).authoritativeHeadSha === headSha;
-          } catch {
-            return false;
-          }
-        })());
-      }
+    let job: Job | null;
+    let approval: ReturnType<TelegramAgentStore["getApproval"]>;
+    try {
+      job = this.options.store.getJob(jobId);
+      approval = this.options.store.getApproval(approvalNonceHash);
+    } catch {
+      return null;
+    }
+    for (const effect of effects) {
+      if (effect.kind !== "merge_pr" || effect.status === "failed" || effect.status === "dead") continue;
       try {
         const payload = parsePersistedMergeEffectPayload(effect.payload, effect.status);
-        return payload.mergeOutcome !== "stale" && (headSha === undefined || payload.headSha === headSha);
+        const receipt = payload.receipt;
+        if (
+          payload.mergeOutcome === "stale" ||
+          receipt.jobId !== jobId ||
+          receipt.headSha !== headSha ||
+          receipt.approvalNonceHash !== approvalNonceHash ||
+          receipt.effectIdempotencyKey !== effect.idempotencyKey
+        ) continue;
+        if (effect.status === "done") {
+          if (this.isValidCompletedEffect(effect)) {
+            return { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
+          }
+          continue;
+        }
+        if (
+          !job ||
+          !approval ||
+          job.state !== "merging" ||
+          job.version !== receipt.jobVersion ||
+          job.prHeadSha !== receipt.headSha ||
+          job.projectId !== receipt.projectId ||
+          job.environmentId !== receipt.environmentId ||
+          job.prNumber !== receipt.prNumber ||
+          job.policy === null ||
+          job.policy.baseBranch !== receipt.baseBranch ||
+          job.policy.mergeMethod !== receipt.mergeMethod ||
+          JSON.stringify([...job.policy.requiredChecks].sort()) !== JSON.stringify(receipt.requiredCheckNames) ||
+          approval.jobId !== jobId ||
+          approval.headSha !== headSha ||
+          approval.consumedAt === null ||
+          approval.outcome !== "accepted" ||
+          approval.jobVersion !== receipt.approvalJobVersion ||
+          approval.ownerUserId !== receipt.approvalOwnerUserId ||
+          approval.ownerChatId !== receipt.approvalOwnerChatId ||
+          approval.expiresAt !== Date.parse(receipt.expiresAt)
+        ) continue;
+        return { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
       } catch {
-        return false;
+        continue;
       }
-    });
+    }
+    return null;
+  }
+
+  private hasAcceptedMergeEffect(
+    jobId: string,
+    headSha: string,
+    approvalNonceHash: string,
+    effectIdempotencyKey: string,
+  ): boolean {
+    return this.findAcceptedMergeIdentity(jobId, headSha, approvalNonceHash)?.effectIdempotencyKey === effectIdempotencyKey;
   }
 
   private async confirmPostMerge(

@@ -1,5 +1,6 @@
 import { projectPolicySchema, type Job, type ProjectPolicy } from "../domain/models";
 import { hashSecret } from "../crypto";
+import { assertSafeExternalHttpsUrl } from "../storage/store";
 import type {
   InlineKeyboardButton,
   InlineKeyboardMarkup,
@@ -12,7 +13,6 @@ const NONCE_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 const MAX_CALLBACK_BYTES = 64;
 const MAX_TELEGRAM_TEXT_LENGTH = 4_096;
 const MAX_EVIDENCE_LENGTH = 3_500;
-const MAX_EXTERNAL_URL_LENGTH = 500;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const RAW_MERGE_CALLBACK_PATTERN = /m:[A-Za-z0-9_-]{32}/;
 const ENCODED_MERGE_CALLBACK_PATTERN = /(?:m|%6d)%3a[A-Za-z0-9_-]{32}/i;
@@ -371,19 +371,8 @@ function mergeContexts(values: readonly unknown[]): JobStatusContext {
 
 function safeHttpUrl(value: string | null | undefined): string | null {
   if (!value) return null;
-  if (value.length > MAX_EXTERNAL_URL_LENGTH) return null;
   try {
-    const url = new URL(value);
-    if (
-      url.protocol !== "https:" ||
-      url.hostname.length === 0 ||
-      url.username ||
-      url.password ||
-      containsForbiddenCallbackMaterial(value) ||
-      containsForbiddenCallbackMaterial(url.href) ||
-      redact(value) !== value
-    ) return null;
-    return value;
+    return assertSafeExternalHttpsUrl(value);
   } catch {
     return null;
   }
