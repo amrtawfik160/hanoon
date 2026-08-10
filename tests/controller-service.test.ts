@@ -218,6 +218,7 @@ it("adopts only one exact plugin-origin hidden spawn candidate", async () => {
     id: "thr_candidate",
     projectId: "proj_personal",
     providerId: "codex",
+    status: "idle",
     title: "Telegram Luna controller owner-7-controller",
     visibility: "hidden",
     originPluginId: "telegram-agent",
@@ -233,6 +234,23 @@ it("adopts only one exact plugin-origin hidden spawn candidate", async () => {
 
   const ambiguous = sdkFixture({ threads: [candidate, { ...candidate, id: "thr_other" }] });
   await expect(ambiguous.adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).rejects.toThrow(/multiple|ambiguous/i);
+});
+
+it("does not re-adopt the errored production controller during recovery", async () => {
+  const poisoned = {
+    id: "thr_n2uyc2p445",
+    projectId: "proj_personal",
+    providerId: "codex",
+    status: "error",
+    title: "Telegram Luna controller owner-7-controller",
+    visibility: "hidden",
+    originPluginId: "telegram-agent",
+    archivedAt: null,
+    deletedAt: null,
+  };
+  const { adapter } = sdkFixture({ threads: [poisoned] });
+
+  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toBeNull();
 });
 
 let serviceFixtureNumber = 0;

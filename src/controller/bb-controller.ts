@@ -142,6 +142,7 @@ export class BbControllerAdapter implements ControllerAdapter {
       thread.title === title &&
       thread.projectId === personal.projectId &&
       thread.providerId === CONTROLLER_PROVIDER &&
+      thread.status !== "error" && thread.status !== "stopping" &&
       thread.visibility === "hidden" &&
       thread.originPluginId === this.dependencies.pluginId &&
       thread.archivedAt === null &&
