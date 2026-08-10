@@ -39,6 +39,62 @@ export type OutboxInput = {
   payload: Record<string, unknown>;
 };
 
+export type ApprovalIdentity = { userId: string; chatId: string };
+export type ApprovalRecord = {
+  jobId: string;
+  headSha: string;
+  expiresAt: number;
+  jobVersion: number | null;
+  ownerUserId: string | null;
+  ownerChatId: string | null;
+};
+export type ApprovalState = ApprovalRecord & {
+  consumedAt: number | null;
+  outcome: string | null;
+};
+export type ApprovalConsumeResult =
+  | { ok: true; jobId: string; headSha: string; expiresAt: number }
+  | { ok: false; reason: "missing" | "expired" | "consumed" | "revoked" };
+export type ApprovalAcceptResult =
+  | { ok: true; jobId: string; headSha: string }
+  | { ok: false; reason: "missing" | "expired" | "consumed" | "revoked" | "version_conflict" };
+export type CallbackRecord = {
+  callbackId: string;
+  jobId: string | null;
+  action: string;
+  outcome: string;
+  processedAt: number;
+};
+
+export type MergeSuccessInput = {
+  jobId: string;
+  effectIdempotencyKey: string;
+  message: string;
+  result: Record<string, unknown>;
+  outbox?: OutboxInput;
+  now: number;
+  leaseOwner?: string;
+  leaseGeneration?: number;
+};
+
+export type MergeFailureInput = {
+  jobId: string;
+  effectIdempotencyKey: string;
+  reason: string;
+  now: number;
+  leaseOwner?: string;
+  leaseGeneration?: number;
+};
+
+export type MergeStaleInput = {
+  jobId: string;
+  effectIdempotencyKey: string;
+  reason: string;
+  now: number;
+  leaseOwner?: string;
+  leaseGeneration?: number;
+};
+
 type PairingCodeRow = {
   consumed_at: number | null;
   expires_at: number;
@@ -56,6 +112,24 @@ type TelegramIdentityRow = {
   bot_id: string;
   username: string;
   verified_at: number;
+};
+type ApprovalRow = {
+  nonce_hash: string;
+  job_id: string;
+  head_sha: string;
+  expires_at: number;
+  consumed_at: number | null;
+  outcome: string | null;
+  owner_user_id: string | null;
+  owner_chat_id: string | null;
+  job_version: number | null;
+};
+type CallbackRow = {
+  callback_query_id: string;
+  job_id: string | null;
+  action: string;
+  outcome: string;
+  processed_at: number;
 };
 
 type JobRow = {
@@ -162,6 +236,7 @@ const LAST_PROJECT_KEY = "telegram-agent:last-project";
 
 const CANONICAL_POSITIVE_DECIMAL = /^[1-9][0-9]*$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+const FULL_SHA = /^[0-9a-f]{40}$/;
 const TELEGRAM_UPDATE_LEASE_MS = 300_000;
 
 function assertCanonicalPositiveDecimal(value: string, field: string): void {
@@ -174,6 +249,25 @@ function assertSha256Hex(value: string): void {
   if (typeof value !== "string" || !SHA256_HEX.test(value)) {
     throw new TypeError("Pairing code must be a lowercase 64-character SHA-256 hex string");
   }
+}
+
+function assertFullSha(value: string, field: string): void {
+  if (typeof value !== "string" || !FULL_SHA.test(value)) {
+    throw new TypeError(`${field} must be a 40-character lowercase SHA`);
+  }
+}
+
+function assertNonNegativeInteger(value: number, field: string): void {
+  if (!Number.isInteger(value) || value < 0) throw new TypeError(`${field} must be a non-negative integer`);
+}
+
+function ensureTask9ApprovalColumns(db: SqliteDatabase): void {
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info(approvals)").all() as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (!columns.has("owner_user_id")) db.exec("ALTER TABLE approvals ADD COLUMN owner_user_id TEXT");
+  if (!columns.has("owner_chat_id")) db.exec("ALTER TABLE approvals ADD COLUMN owner_chat_id TEXT");
+  if (!columns.has("job_version")) db.exec("ALTER TABLE approvals ADD COLUMN job_version INTEGER");
 }
 
 export interface TelegramAgentStore {
@@ -226,11 +320,41 @@ export interface TelegramAgentStore {
   listJobs(limit: number): Job[];
   applyJobEvent(jobId: string, expectedVersion: number, event: JobEvent, now: number): Job;
   listEffectsForJob(jobId: string): StoredEffect[];
+  getEffect(jobId: string, idempotencyKey: string): StoredEffect | null;
+  createApproval(input: {
+    nonceHash: string;
+    jobId: string;
+    headSha: string;
+    expiresAt: number;
+    now: number;
+    ownerUserId?: string | null;
+    ownerChatId?: string | null;
+    jobVersion?: number | null;
+  }): void;
+  getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null;
+  getApproval(nonceHash: string): ApprovalState | null;
+  consumeApproval(input: {
+    nonceHash: string;
+    now: number;
+    identity?: ApprovalIdentity;
+  }): ApprovalConsumeResult;
+  acceptApprovalAndEnqueueMerge(input: {
+    nonceHash: string;
+    expectedJobVersion: number;
+    effect: JobEffect;
+    now: number;
+    identity?: ApprovalIdentity;
+  }): ApprovalAcceptResult;
+  revokeApprovals(jobId: string, reason: string, now: number): number;
   beginTelegramUpdate(updateId: number, now: number): "process" | "processed";
   completeTelegramUpdate(updateId: number, outcome: string, now: number): void;
   failTelegramUpdate(updateId: number, error: string, now: number): void;
   getNextTelegramOffset(): number;
   recordCallback(callbackId: string, jobId: string | null, action: string, outcome: string, now: number): boolean;
+  getCallback(callbackId: string): CallbackRecord | null;
+  completeMergeSuccess(input: MergeSuccessInput): boolean;
+  failMergeEffect(input: MergeFailureInput): boolean;
+  staleMergeEffect(input: MergeStaleInput): boolean;
   enqueueReconcileForThread(threadId: string, now: number): boolean;
 }
 
@@ -942,6 +1066,378 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return rows.map(parseEffect);
   }
 
+  public getEffect(jobId: string, idempotencyKey: string): StoredEffect | null {
+    const row = this.db
+      .prepare("SELECT * FROM effects WHERE job_id = ? AND idempotency_key = ?")
+      .get(jobId, idempotencyKey) as EffectRow | undefined;
+    return row ? parseEffect(row) : null;
+  }
+
+  public createApproval(input: {
+    nonceHash: string;
+    jobId: string;
+    headSha: string;
+    expiresAt: number;
+    now: number;
+    ownerUserId?: string | null;
+    ownerChatId?: string | null;
+    jobVersion?: number | null;
+  }): void {
+    assertSha256Hex(input.nonceHash);
+    assertFullSha(input.headSha, "headSha");
+    assertNonNegativeInteger(input.now, "now");
+    assertNonNegativeInteger(input.expiresAt, "expiresAt");
+    if (input.expiresAt <= input.now) throw new TypeError("expiresAt must be after now");
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    if (input.jobVersion !== null && input.jobVersion !== undefined) {
+      if (!Number.isInteger(input.jobVersion) || input.jobVersion < 1) {
+        throw new TypeError("jobVersion must be a positive integer");
+      }
+    }
+
+    const create = this.db.transaction(() => {
+      const job = this.readJobById(input.jobId);
+      if (!job) throw new Error(`Job ${input.jobId} was not found`);
+      if (job.prHeadSha !== input.headSha) throw new VersionConflictError(input.jobId, job.version);
+
+      const owner = this.getOwner();
+      const ownerUserId = input.ownerUserId ?? owner?.userId ?? null;
+      const ownerChatId = input.ownerChatId ?? owner?.chatId ?? null;
+      if ((ownerUserId === null) !== (ownerChatId === null)) {
+        throw new TypeError("Approval owner identity must include both user and chat ids");
+      }
+      if (ownerUserId !== null) assertCanonicalPositiveDecimal(ownerUserId, "ownerUserId");
+      if (ownerChatId !== null) assertCanonicalPositiveDecimal(ownerChatId, "ownerChatId");
+
+      this.db
+        .prepare(
+          `UPDATE approvals
+              SET consumed_at = ?, outcome = 'superseded'
+            WHERE job_id = ? AND consumed_at IS NULL`,
+        )
+        .run(input.now, input.jobId);
+      this.db
+        .prepare(
+          `INSERT INTO approvals (
+             nonce_hash, job_id, head_sha, expires_at, consumed_at, outcome,
+             owner_user_id, owner_chat_id, job_version
+           ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+        )
+        .run(
+          input.nonceHash,
+          input.jobId,
+          input.headSha,
+          input.expiresAt,
+          ownerUserId,
+          ownerChatId,
+          input.jobVersion ?? job.version,
+        );
+    });
+    create();
+  }
+
+  public getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null {
+    assertSha256Hex(nonceHash);
+    assertNonNegativeInteger(now, "now");
+    const usable = this.db.transaction((): ApprovalRecord | null => {
+      const row = this.readApproval(nonceHash);
+      if (!row || row.consumed_at !== null || now >= row.expires_at) return null;
+      if (!this.approvalIsCurrent(row, undefined)) {
+        this.db
+          .prepare(
+            `UPDATE approvals SET consumed_at = ?, outcome = 'revoked'
+               WHERE nonce_hash = ? AND consumed_at IS NULL`,
+          )
+          .run(now, nonceHash);
+        return null;
+      }
+      return {
+        jobId: row.job_id,
+        headSha: row.head_sha,
+        expiresAt: row.expires_at,
+        jobVersion: row.job_version,
+        ownerUserId: row.owner_user_id,
+        ownerChatId: row.owner_chat_id,
+      };
+    });
+    return usable();
+  }
+
+  public getApproval(nonceHash: string): ApprovalState | null {
+    assertSha256Hex(nonceHash);
+    const row = this.readApproval(nonceHash);
+    return row
+      ? {
+          jobId: row.job_id,
+          headSha: row.head_sha,
+          expiresAt: row.expires_at,
+          jobVersion: row.job_version,
+          ownerUserId: row.owner_user_id,
+          ownerChatId: row.owner_chat_id,
+          consumedAt: row.consumed_at,
+          outcome: row.outcome,
+        }
+      : null;
+  }
+
+  public consumeApproval(input: {
+    nonceHash: string;
+    now: number;
+    identity?: ApprovalIdentity;
+  }): ApprovalConsumeResult {
+    assertSha256Hex(input.nonceHash);
+    assertNonNegativeInteger(input.now, "now");
+    const consume = this.db.transaction((): ApprovalConsumeResult => {
+      const row = this.readApproval(input.nonceHash);
+      if (!row) return { ok: false, reason: "missing" };
+      if (row.consumed_at !== null) {
+        return row.outcome !== null && row.outcome !== "consumed" && row.outcome !== "accepted"
+          ? { ok: false, reason: "revoked" }
+          : { ok: false, reason: "consumed" };
+      }
+      if (input.now >= row.expires_at) return { ok: false, reason: "expired" };
+      if (!this.approvalIsCurrent(row, input.identity)) {
+        this.db
+          .prepare(
+            `UPDATE approvals SET consumed_at = ?, outcome = 'revoked'
+               WHERE nonce_hash = ? AND consumed_at IS NULL`,
+          )
+          .run(input.now, input.nonceHash);
+        return { ok: false, reason: "revoked" };
+      }
+
+      const updated = this.db
+        .prepare(
+          `UPDATE approvals
+              SET consumed_at = ?, outcome = 'consumed'
+            WHERE nonce_hash = ? AND consumed_at IS NULL AND expires_at > ?`,
+        )
+        .run(input.now, input.nonceHash, input.now);
+      if (updated.changes !== 1) {
+        const current = this.readApproval(input.nonceHash);
+        return current?.consumed_at !== null
+          ? { ok: false, reason: "consumed" }
+          : { ok: false, reason: "expired" };
+      }
+      return { ok: true, jobId: row.job_id, headSha: row.head_sha, expiresAt: row.expires_at };
+    });
+    return consume();
+  }
+
+  public acceptApprovalAndEnqueueMerge(input: {
+    nonceHash: string;
+    expectedJobVersion: number;
+    effect: JobEffect;
+    now: number;
+    identity?: ApprovalIdentity;
+  }): ApprovalAcceptResult {
+    assertSha256Hex(input.nonceHash);
+    if (!Number.isInteger(input.expectedJobVersion) || input.expectedJobVersion < 1) {
+      throw new TypeError("expectedJobVersion must be a positive integer");
+    }
+    assertNonNegativeInteger(input.now, "now");
+      if (
+        input.effect.kind !== "merge_pr" ||
+        input.effect.jobId.length === 0 ||
+        input.effect.idempotencyKey.length === 0
+      ) {
+        throw new TypeError("approval acceptance requires one merge_pr effect");
+      }
+
+    const accept = this.db.transaction((): ApprovalAcceptResult => {
+      const row = this.readApproval(input.nonceHash);
+      if (!row) return { ok: false, reason: "missing" };
+      if (row.consumed_at !== null) {
+        if (row.outcome === "accepted" && this.hasMergeEffect(row.job_id, row.head_sha)) {
+          return { ok: true, jobId: row.job_id, headSha: row.head_sha };
+        }
+        return row.outcome !== null && row.outcome !== "consumed"
+          ? { ok: false, reason: "revoked" }
+          : { ok: false, reason: "consumed" };
+      }
+      if (input.now >= row.expires_at) return { ok: false, reason: "expired" };
+      const current = this.readJobById(row.job_id);
+      if (!current || current.version !== input.expectedJobVersion || row.job_version !== null && row.job_version !== input.expectedJobVersion) {
+        return { ok: false, reason: "version_conflict" };
+      }
+      if (!this.approvalIsCurrent(row, input.identity)) {
+        this.db
+          .prepare(
+            `UPDATE approvals SET consumed_at = ?, outcome = 'revoked'
+               WHERE nonce_hash = ? AND consumed_at IS NULL`,
+          )
+          .run(input.now, input.nonceHash);
+        return { ok: false, reason: "revoked" };
+      }
+      if (current.state !== "awaiting_merge_approval" || input.effect.jobId !== row.job_id) {
+        return { ok: false, reason: "version_conflict" };
+      }
+      const payload = input.effect.payload;
+      if (payload.headSha !== undefined && payload.headSha !== row.head_sha) {
+        return { ok: false, reason: "version_conflict" };
+      }
+
+      const transitioned = transition(
+        current,
+        { type: "APPROVAL_ACCEPTED", headSha: row.head_sha },
+        input.now,
+      );
+      const effects = transitioned.effects.map((effect) =>
+        effect.kind === "merge_pr" ? input.effect : effect,
+      );
+      const consumed = this.db
+        .prepare(
+          `UPDATE approvals
+              SET consumed_at = ?, outcome = 'accepted'
+            WHERE nonce_hash = ? AND consumed_at IS NULL AND expires_at > ?`,
+        )
+        .run(input.now, input.nonceHash, input.now);
+      if (consumed.changes !== 1) return { ok: false, reason: "consumed" };
+
+      persistJobTransition(this.db, current.id, input.expectedJobVersion, transitioned.job);
+      persistPendingEffects(this.db, effects, input.now);
+      return { ok: true, jobId: row.job_id, headSha: row.head_sha };
+    });
+    return accept();
+  }
+
+  public revokeApprovals(jobId: string, reason: string, now: number): number {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    assertSafeFailureSummary(reason);
+    assertNonNegativeInteger(now, "now");
+    return this.db
+      .prepare(
+        `UPDATE approvals
+            SET consumed_at = ?, outcome = ?
+          WHERE job_id = ? AND consumed_at IS NULL`,
+      )
+      .run(now, reason, jobId).changes;
+  }
+
+  public completeMergeSuccess(input: MergeSuccessInput): boolean {
+    assertSafeFailureSummary(input.message);
+    assertNonNegativeInteger(input.now, "now");
+    const resultJson = JSON.stringify(input.result);
+    if (resultJson === undefined || resultJson.length > 64_000) {
+      throw new TypeError("merge result must be bounded JSON");
+    }
+    const complete = this.db.transaction((): boolean => {
+      const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
+      if (!effect) return false;
+      if (effect.status === "done") {
+        if (input.outbox) persistOutbox(this.db, input.outbox, serializeOutbox(input.outbox, input.now), input.now);
+        return true;
+      }
+      if (!this.effectLeaseMatches(effect, input.leaseOwner, input.leaseGeneration)) return false;
+      const current = this.readJobById(input.jobId);
+      if (!current || current.state !== "merging") return false;
+
+      const transitioned = transition(current, {
+        type: "MERGE_SUCCEEDED",
+        message: input.message,
+      }, input.now);
+      const storedPayload = JSON.parse(effect.payload_json) as Record<string, unknown>;
+      const payloadJson = JSON.stringify({
+        ...storedPayload,
+        mergeResult: JSON.parse(resultJson) as Record<string, unknown>,
+      });
+      if (payloadJson.length > 64_000) throw new TypeError("merge effect result must be bounded");
+
+      persistJobTransition(this.db, input.jobId, current.version, transitioned.job);
+      const updated = this.db
+        .prepare(
+          `UPDATE effects SET payload_json = ?, status = 'done', lease_owner = NULL,
+             lease_generation = NULL, lease_expires_at = NULL, last_error = NULL,
+             updated_at = ? WHERE job_id = ? AND idempotency_key = ?`,
+        )
+        .run(payloadJson, input.now, input.jobId, input.effectIdempotencyKey);
+      if (updated.changes !== 1) throw new Error("Merge effect completion lost its durable row");
+      if (input.outbox) persistOutbox(this.db, input.outbox, serializeOutbox(input.outbox, input.now), input.now);
+      persistPendingEffects(this.db, transitioned.effects, input.now);
+      return true;
+    });
+    return complete();
+  }
+
+  public failMergeEffect(input: MergeFailureInput): boolean {
+    assertSafeFailureSummary(input.reason);
+    assertNonNegativeInteger(input.now, "now");
+    const fail = this.db.transaction((): boolean => {
+      const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
+      if (!effect || effect.status === "done") return false;
+      if (!this.effectLeaseMatches(effect, input.leaseOwner, input.leaseGeneration)) return false;
+      const current = this.readJobById(input.jobId);
+      if (!current || current.state !== "merging") return false;
+      const transitioned = transition(current, {
+        type: "MERGE_FAILED",
+        reason: input.reason,
+      }, input.now);
+      persistJobTransition(this.db, input.jobId, current.version, transitioned.job);
+      const updated = this.db
+        .prepare(
+          `UPDATE effects SET status = 'failed', lease_owner = NULL,
+             lease_generation = NULL, lease_expires_at = NULL, last_error = ?,
+             next_attempt_at = ?, updated_at = ?
+           WHERE job_id = ? AND idempotency_key = ?`,
+        )
+        .run(input.reason, input.now, input.now, input.jobId, input.effectIdempotencyKey);
+      if (updated.changes !== 1) throw new Error("Merge effect failure lost its durable row");
+      persistPendingEffects(this.db, transitioned.effects, input.now);
+      return true;
+    });
+    return fail();
+  }
+
+  public staleMergeEffect(input: MergeStaleInput): boolean {
+    assertSafeFailureSummary(input.reason);
+    assertNonNegativeInteger(input.now, "now");
+    const stale = this.db.transaction((): boolean => {
+      const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
+      if (!effect || effect.status === "done") return false;
+      if (!this.effectLeaseMatches(effect, input.leaseOwner, input.leaseGeneration)) return false;
+      const current = this.readJobById(input.jobId);
+      if (!current || current.state !== "merging") return false;
+      if (current.prNumber === null) return false;
+
+      const next = structuredClone(current);
+      next.prHeadSha = null;
+      next.state = "resolving_pr_head";
+      next.lastError = input.reason;
+      next.version += 1;
+      next.updatedAt = input.now;
+      persistJobTransition(this.db, input.jobId, current.version, next);
+      this.db
+        .prepare(
+          `UPDATE approvals SET consumed_at = ?, outcome = 'revoked'
+             WHERE job_id = ? AND consumed_at IS NULL`,
+        )
+        .run(input.now, input.jobId);
+      const resolveEffect: JobEffect = {
+        idempotencyKey: `${input.jobId}:${next.version}:resolve_pr_head`,
+        jobId: input.jobId,
+        kind: "resolve_pr_head",
+        payload: { number: current.prNumber, url: current.prUrl },
+      };
+      const renderEffect: JobEffect = {
+        idempotencyKey: `${input.jobId}:${next.version}:render_status`,
+        jobId: input.jobId,
+        kind: "render_status",
+        payload: {},
+      };
+      persistPendingEffects(this.db, [resolveEffect, renderEffect], input.now);
+      const updated = this.db
+        .prepare(
+          `UPDATE effects SET status = 'done', lease_owner = NULL,
+             lease_generation = NULL, lease_expires_at = NULL, last_error = ?,
+             updated_at = ? WHERE job_id = ? AND idempotency_key = ?`,
+        )
+        .run(input.reason, input.now, input.jobId, input.effectIdempotencyKey);
+      if (updated.changes !== 1) throw new Error("Stale merge effect lost its durable row");
+      return true;
+    });
+    return stale();
+  }
+
   public beginTelegramUpdate(updateId: number, now: number): "process" | "processed" {
     if (!Number.isInteger(updateId) || updateId < 0) throw new TypeError("updateId must be a non-negative integer");
     const begin = this.db.transaction((): "process" | "processed" => {
@@ -1073,6 +1569,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return result.changes === 1;
   }
 
+  public getCallback(callbackId: string): CallbackRecord | null {
+    if (!callbackId) throw new TypeError("callbackId must not be empty");
+    const row = this.db
+      .prepare(
+        `SELECT callback_query_id, job_id, action, outcome, processed_at
+           FROM callbacks WHERE callback_query_id = ?`,
+      )
+      .get(callbackId) as CallbackRow | undefined;
+    return row
+      ? {
+          callbackId: row.callback_query_id,
+          jobId: row.job_id,
+          action: row.action,
+          outcome: row.outcome,
+          processedAt: row.processed_at,
+        }
+      : null;
+  }
+
   public enqueueReconcileForThread(threadId: string, now: number): boolean {
     if (!threadId) throw new TypeError("threadId must not be empty");
     const enqueue = this.db.transaction((): boolean => {
@@ -1100,6 +1615,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return row ? parseJob(row) : null;
   }
 
+  private readApproval(nonceHash: string): ApprovalRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT nonce_hash, job_id, head_sha, expires_at, consumed_at, outcome,
+                owner_user_id, owner_chat_id, job_version
+           FROM approvals WHERE nonce_hash = ?`,
+      )
+      .get(nonceHash) as ApprovalRow | undefined;
+  }
+
+  private readEffect(jobId: string, idempotencyKey: string): EffectRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM effects WHERE job_id = ? AND idempotency_key = ?")
+      .get(jobId, idempotencyKey) as EffectRow | undefined;
+  }
+
+  private hasMergeEffect(jobId: string, headSha: string): boolean {
+    const rows = this.db
+      .prepare("SELECT payload_json FROM effects WHERE job_id = ? AND kind = 'merge_pr'")
+      .all(jobId) as Array<{ payload_json: string }>;
+    return rows.some((row) => {
+      try {
+        const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+        return payload.headSha === headSha;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private approvalIsCurrent(
+    row: ApprovalRow,
+    identity: ApprovalIdentity | undefined,
+  ): boolean {
+    const job = this.readJobById(row.job_id);
+    if (!job || job.state !== "awaiting_merge_approval" || job.cancelRequestedAt !== null) return false;
+    if (job.prHeadSha !== row.head_sha) return false;
+    if (row.job_version !== null && job.version !== row.job_version) return false;
+
+    const owner = this.getOwner();
+    const expectedUserId = row.owner_user_id ?? identity?.userId ?? null;
+    const expectedChatId = row.owner_chat_id ?? identity?.chatId ?? null;
+    if (row.owner_user_id === null && row.owner_chat_id === null && identity === undefined) return true;
+    if (!owner || expectedUserId === null || expectedChatId === null) return false;
+    if (owner.userId !== expectedUserId || owner.chatId !== expectedChatId) return false;
+    if (identity && (identity.userId !== expectedUserId || identity.chatId !== expectedChatId)) return false;
+    return true;
+  }
+
+  private effectLeaseMatches(
+    effect: EffectRow,
+    leaseOwner: string | undefined,
+    leaseGeneration: number | undefined,
+  ): boolean {
+    if (leaseOwner === undefined && leaseGeneration === undefined) return true;
+    return effect.status === "leased" &&
+      effect.lease_owner === leaseOwner &&
+      effect.lease_generation === leaseGeneration;
+  }
+
   private readJobBySourceUpdate(sourceUpdateId: number): Job | null {
     const row = this.db
       .prepare(`${JOB_SELECT} WHERE source_update_id = ?`)
@@ -1119,5 +1694,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 export function openStore(storage: PluginStorage, kv: PluginKv = storage.kv): TelegramAgentStore {
   const db = storage.database();
   storage.migrate(db, [...ALL_MIGRATIONS]);
+  ensureTask9ApprovalColumns(db);
   return new SqliteTelegramAgentStore(db, kv);
 }

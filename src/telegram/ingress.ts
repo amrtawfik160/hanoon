@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { hashSecret } from "../crypto";
 import type { Job } from "../domain/models";
+import type { MergeHandler } from "../services/merge-handler";
 import type {
   OutboxInput,
   ProjectPolicyRecord,
@@ -46,6 +47,7 @@ export type TelegramIngressOptions = {
   store: TelegramAgentStore;
   telegram: TelegramIngressTransport;
   auditLogger?: TelegramIngressAuditLogger;
+  mergeHandler?: Pick<MergeHandler, "handleApprovalCallback">;
 };
 
 const PRIVATE_ID = /^[1-9][0-9]*$/;
@@ -145,6 +147,7 @@ export class TelegramIngress {
   private readonly store: TelegramAgentStore;
   private readonly telegram: TelegramIngressTransport;
   private readonly auditLogger: TelegramIngressAuditLogger;
+  private readonly mergeHandler: Pick<MergeHandler, "handleApprovalCallback"> | null;
 
   public constructor(options: TelegramIngressOptions);
   public constructor(store: TelegramAgentStore, telegram: TelegramIngressTransport);
@@ -156,11 +159,13 @@ export class TelegramIngress {
       this.store = optionsOrStore.store;
       this.telegram = optionsOrStore.telegram;
       this.auditLogger = boundedAuditLogger(optionsOrStore.auditLogger);
+      this.mergeHandler = optionsOrStore.mergeHandler ?? null;
     } else {
       if (!telegram) throw new TypeError("Telegram ingress requires a Telegram client");
       this.store = optionsOrStore;
       this.telegram = telegram;
       this.auditLogger = boundedAuditLogger(undefined);
+      this.mergeHandler = null;
     }
   }
 
@@ -282,6 +287,29 @@ export class TelegramIngress {
       this.audit("malformed_callback", updateId, callback.from, callback.message.chat);
       return;
     }
+    if (action.type === "merge") {
+      if (!this.mergeHandler) {
+        this.audit("invalid_callback", updateId, callback.from, callback.message.chat);
+        return;
+      }
+      const identity = privateHumanIdentity(callback.from, callback.message.chat);
+      if (!identity) {
+        this.audit("unauthorized_callback", updateId, callback.from, callback.message.chat);
+        return;
+      }
+      const result = await this.mergeHandler.handleApprovalCallback({
+        callbackId: callback.id,
+        nonce: action.nonce,
+        userId: identity.userId,
+        chatId: identity.chatId,
+        now,
+      });
+      await this.telegram.answerCallback(
+        callback.id,
+        result.outcome === "accepted" ? "Merge queued." : "Approval is stale or no longer valid.",
+      );
+      return;
+    }
     const jobId = callbackJobId(action);
     if (jobId === null) {
       this.audit("invalid_callback", updateId, callback.from, callback.message.chat);
@@ -312,8 +340,6 @@ export class TelegramIngress {
         return;
       case "review":
         await this.reviewJob(job, identity.chatId, callback.message.message_id, now, callback);
-        return;
-      case "merge":
         return;
     }
   }
