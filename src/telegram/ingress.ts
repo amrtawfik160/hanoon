@@ -315,6 +315,33 @@ export class TelegramIngress {
       );
       return;
     }
+    if (action.type === "operation") {
+      const result = this.store.confirmThreadOperation({
+        nonceHash: hashSecret(action.nonce),
+        userId: identity.userId,
+        chatId: identity.chatId,
+        messageId: callback.message.message_id,
+        now,
+      });
+      const outcome = result.ok ? "accepted" : result.reason;
+      const recorded = this.store.recordCallback(
+        callback.id,
+        null,
+        "thread_operation",
+        outcome,
+        now,
+      );
+      if (recorded) {
+        this.enqueueCallbackAnswer(
+          callback.id,
+          identity.chatId,
+          result.ok ? "Thread operation queued." : "Confirmation is stale or no longer valid.",
+          now,
+        );
+      }
+      if (result.ok && recorded) this.onWorkAvailable();
+      return;
+    }
     const jobId = callbackJobId(action);
     if (jobId === null) {
       this.audit("invalid_callback", updateId, callback.from, callback.message.chat);

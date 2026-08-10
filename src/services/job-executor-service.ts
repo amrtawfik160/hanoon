@@ -29,6 +29,9 @@ export type JobExecutorDependencies = {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
     reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
+  operations?: {
+    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
+  };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
     reset(): void;
@@ -186,6 +189,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         if (deps.controller) {
           didWork = await deps.controller.reconcile(effectFence, workAbort.signal) || didWork;
           didWork = await deps.controller.processOne(effectFence, workAbort.signal) || didWork;
+        }
+        if (deps.operations) {
+          didWork = await deps.operations.processOne(effectFence, workAbort.signal) || didWork;
         }
         const jobs = deps.store.listJobs(1_000);
         for (const job of jobs) {

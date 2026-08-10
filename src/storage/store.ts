@@ -41,6 +41,39 @@ type TelegramIdentity = {
 };
 export type ProjectPolicyRecord = { policy: ProjectPolicy; version: number };
 
+export type ThreadOperationKind = "steer_thread" | "stop_thread" | "retry_thread";
+export type ThreadOperationState =
+  | "confirmation_sending"
+  | "awaiting_confirmation"
+  | "confirmed"
+  | "executing"
+  | "completed"
+  | "failed"
+  | "expired";
+export type ThreadOperation = {
+  id: string;
+  nonceHash: string;
+  ownerUserId: string;
+  ownerChatId: string;
+  kind: ThreadOperationKind;
+  threadId: string;
+  text: string | null;
+  state: ThreadOperationState;
+  confirmationMessageId: number | null;
+  expiresAt: number;
+  confirmedAt: number | null;
+  leaseOwner: string | null;
+  leaseGeneration: number | null;
+  leaseExpiresAt: number | null;
+  result: string | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+export type ThreadOperationConfirmResult =
+  | { ok: true; operation: ThreadOperation }
+  | { ok: false; reason: "missing" | "expired" | "consumed" };
+
 export type OutboxInput = {
   logicalKey: string;
   chatId: string;
@@ -385,6 +418,26 @@ type ControllerTurnRow = {
   created_at: number;
   updated_at: number;
 };
+type ThreadOperationRow = {
+  id: string;
+  nonce_hash: string;
+  owner_user_id: string;
+  owner_chat_id: string;
+  kind: ThreadOperationKind;
+  thread_id: string;
+  operation_text: string | null;
+  state: ThreadOperationState;
+  confirmation_message_id: number | null;
+  expires_at: number;
+  confirmed_at: number | null;
+  lease_owner: string | null;
+  lease_generation: number | null;
+  lease_expires_at: number | null;
+  result: string | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
 type TelegramUpdateRow = {
   status: "processing" | "processed" | "failed";
   claim_owner: string | null;
@@ -414,6 +467,11 @@ const BLOCKED_REASONS: ReadonlySet<NonNullable<Job["blockedReason"]>> = new Set(
   "configuration",
   "cancellation_unconfirmed",
   "permanent_effect_failure",
+]);
+const THREAD_OPERATION_KINDS: ReadonlySet<ThreadOperationKind> = new Set([
+  "steer_thread",
+  "stop_thread",
+  "retry_thread",
 ]);
 
 export class VersionConflictError extends Error {
@@ -1295,6 +1353,31 @@ export interface TelegramAgentStore {
     leaseMs?: number;
   }): boolean;
   listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[];
+  createThreadOperation(input: {
+    id: string;
+    nonceHash: string;
+    ownerUserId: string;
+    ownerChatId: string;
+    kind: ThreadOperationKind;
+    threadId: string;
+    text: string | null;
+    expiresAt: number;
+    now: number;
+  }): ThreadOperation;
+  markThreadOperationConfirmationSent(id: string, messageId: number, now: number): ThreadOperation;
+  failThreadOperationConfirmation(id: string, now: number): boolean;
+  confirmThreadOperation(input: {
+    nonceHash: string;
+    userId: string;
+    chatId: string;
+    messageId: number;
+    now: number;
+  }): ThreadOperationConfirmResult;
+  getThreadOperation(id: string): ThreadOperation | null;
+  failStaleThreadOperations(fence: ControllerLeaseFence): boolean;
+  claimNextThreadOperation(fence: ControllerLeaseFence & { leaseMs?: number }): ThreadOperation | null;
+  completeThreadOperation(input: ControllerLeaseFence & { id: string; result: string }): boolean;
+  failThreadOperation(input: ControllerLeaseFence & { id: string; error: string }): boolean;
   bindTelegramIdentity(input: {
     botId: string;
     username: string;
@@ -1532,6 +1615,29 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     lastError: row.last_error,
     submittedAt: row.submitted_at,
     completedAt: row.completed_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function parseThreadOperation(row: ThreadOperationRow): ThreadOperation {
+  return {
+    id: row.id,
+    nonceHash: row.nonce_hash,
+    ownerUserId: row.owner_user_id,
+    ownerChatId: row.owner_chat_id,
+    kind: row.kind,
+    threadId: row.thread_id,
+    text: row.operation_text,
+    state: row.state,
+    confirmationMessageId: row.confirmation_message_id,
+    expiresAt: row.expires_at,
+    confirmedAt: row.confirmed_at,
+    leaseOwner: row.lease_owner,
+    leaseGeneration: row.lease_generation,
+    leaseExpiresAt: row.lease_expires_at,
+    result: row.result,
+    lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2385,6 +2491,221 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return rows.map(parseControllerTurn);
   }
 
+  public createThreadOperation(input: {
+    id: string;
+    nonceHash: string;
+    ownerUserId: string;
+    ownerChatId: string;
+    kind: ThreadOperationKind;
+    threadId: string;
+    text: string | null;
+    expiresAt: number;
+    now: number;
+  }): ThreadOperation {
+    assertControllerIdentifier(input.id, "operation id");
+    if (!SHA256_HEX.test(input.nonceHash)) throw new TypeError("operation nonce hash must be SHA-256 hex");
+    assertCanonicalPositiveDecimal(input.ownerUserId, "ownerUserId");
+    assertCanonicalPositiveDecimal(input.ownerChatId, "ownerChatId");
+    if (!THREAD_OPERATION_KINDS.has(input.kind)) throw new TypeError("thread operation kind is invalid");
+    assertControllerIdentifier(input.threadId, "threadId");
+    if (input.kind === "steer_thread") assertControllerText(input.text ?? "", "operation text");
+    if (input.kind !== "steer_thread" && input.text !== null) throw new TypeError("only steer operations accept text");
+    assertNonNegativeInteger(input.now, "now");
+    if (!Number.isInteger(input.expiresAt) || input.expiresAt <= input.now) {
+      throw new TypeError("operation expiry must be after creation");
+    }
+    const inserted = this.db.prepare(
+      `INSERT INTO thread_operations (
+         id, nonce_hash, owner_user_id, owner_chat_id, kind, thread_id, operation_text,
+         state, expires_at, created_at, updated_at
+       )
+       SELECT ?, ?, ?, ?, ?, ?, ?, 'confirmation_sending', ?, ?, ?
+         FROM owners
+        WHERE singleton = 1 AND revoked_at IS NULL
+          AND telegram_user_id = ? AND telegram_chat_id = ?`,
+    ).run(
+      input.id,
+      input.nonceHash,
+      input.ownerUserId,
+      input.ownerChatId,
+      input.kind,
+      input.threadId,
+      input.text,
+      input.expiresAt,
+      input.now,
+      input.now,
+      input.ownerUserId,
+      input.ownerChatId,
+    );
+    if (inserted.changes !== 1) throw new Error("Thread operation requires the current paired owner");
+    return this.getThreadOperation(input.id)!;
+  }
+
+  public markThreadOperationConfirmationSent(id: string, messageId: number, now: number): ThreadOperation {
+    assertControllerIdentifier(id, "operation id");
+    assertPositiveInteger(messageId, "messageId");
+    assertNonNegativeInteger(now, "now");
+    const updated = this.db.prepare(
+      `UPDATE thread_operations
+          SET state = 'awaiting_confirmation', confirmation_message_id = ?, updated_at = ?
+        WHERE id = ? AND state = 'confirmation_sending' AND expires_at > ?`,
+    ).run(messageId, now, id, now);
+    if (updated.changes !== 1) throw new Error("Thread operation confirmation changed before delivery was recorded");
+    return this.getThreadOperation(id)!;
+  }
+
+  public failThreadOperationConfirmation(id: string, now: number): boolean {
+    assertControllerIdentifier(id, "operation id");
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      `UPDATE thread_operations
+          SET state = 'failed', last_error = 'Confirmation delivery outcome is uncertain', updated_at = ?
+        WHERE id = ? AND state = 'confirmation_sending'`,
+    ).run(now, id).changes === 1;
+  }
+
+  public confirmThreadOperation(input: {
+    nonceHash: string;
+    userId: string;
+    chatId: string;
+    messageId: number;
+    now: number;
+  }): ThreadOperationConfirmResult {
+    if (!SHA256_HEX.test(input.nonceHash)) throw new TypeError("operation nonce hash must be SHA-256 hex");
+    assertCanonicalPositiveDecimal(input.userId, "userId");
+    assertCanonicalPositiveDecimal(input.chatId, "chatId");
+    assertPositiveInteger(input.messageId, "messageId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ThreadOperationConfirmResult => {
+      const owner = this.db.prepare(
+        `SELECT 1 FROM owners WHERE singleton = 1 AND revoked_at IS NULL
+          AND telegram_user_id = ? AND telegram_chat_id = ?`,
+      ).get(input.userId, input.chatId);
+      if (!owner) return { ok: false, reason: "missing" };
+      const row = this.db.prepare("SELECT * FROM thread_operations WHERE nonce_hash = ?")
+        .get(input.nonceHash) as ThreadOperationRow | undefined;
+      if (!row || row.owner_user_id !== input.userId || row.owner_chat_id !== input.chatId ||
+        row.confirmation_message_id !== input.messageId) return { ok: false, reason: "missing" };
+      if (row.state !== "awaiting_confirmation") return { ok: false, reason: "consumed" };
+      if (row.expires_at <= input.now) {
+        this.db.prepare(
+          "UPDATE thread_operations SET state = 'expired', updated_at = ? WHERE id = ? AND state = 'awaiting_confirmation'",
+        ).run(input.now, row.id);
+        return { ok: false, reason: "expired" };
+      }
+      const updated = this.db.prepare(
+        `UPDATE thread_operations SET state = 'confirmed', confirmed_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'awaiting_confirmation'`,
+      ).run(input.now, input.now, row.id);
+      if (updated.changes !== 1) return { ok: false, reason: "consumed" };
+      return { ok: true, operation: this.getThreadOperation(row.id)! };
+    }).immediate();
+  }
+
+  public getThreadOperation(id: string): ThreadOperation | null {
+    assertControllerIdentifier(id, "operation id");
+    const row = this.db.prepare("SELECT * FROM thread_operations WHERE id = ?")
+      .get(id) as ThreadOperationRow | undefined;
+    return row ? parseThreadOperation(row) : null;
+  }
+
+  public failStaleThreadOperations(fence: ControllerLeaseFence): boolean {
+    if (!fence.ownerId) throw new TypeError("ownerId must not be empty");
+    assertPositiveInteger(fence.generation, "generation");
+    assertNonNegativeInteger(fence.now, "now");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(fence.ownerId, fence.generation, fence.now)) return false;
+      const expired = this.db.prepare(
+        `UPDATE thread_operations SET state = 'expired', updated_at = ?
+          WHERE state IN ('awaiting_confirmation', 'confirmed') AND expires_at <= ?`,
+      ).run(fence.now, fence.now).changes;
+      const uncertain = this.db.prepare(
+        `UPDATE thread_operations
+            SET state = 'failed', last_error = 'Thread operation outcome is uncertain',
+                lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL, updated_at = ?
+          WHERE state = 'executing' AND lease_expires_at <= ?`,
+      ).run(fence.now, fence.now).changes;
+      return expired + uncertain > 0;
+    }).immediate();
+  }
+
+  public claimNextThreadOperation(
+    fence: ControllerLeaseFence & { leaseMs?: number },
+  ): ThreadOperation | null {
+    const leaseMs = fence.leaseMs ?? 30_000;
+    if (!fence.ownerId) throw new TypeError("ownerId must not be empty");
+    assertPositiveInteger(fence.generation, "generation");
+    assertNonNegativeInteger(fence.now, "now");
+    if (!Number.isInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 300_000) {
+      throw new TypeError("leaseMs must be between 1000 and 300000");
+    }
+    return this.db.transaction((): ThreadOperation | null => {
+      if (!this.executorLeaseIsCurrent(fence.ownerId, fence.generation, fence.now)) return null;
+      const candidate = this.db.prepare(
+        `SELECT * FROM thread_operations
+          WHERE state = 'confirmed' AND expires_at > ? ORDER BY created_at, id LIMIT 1`,
+      ).get(fence.now) as ThreadOperationRow | undefined;
+      if (!candidate) return null;
+      const updated = this.db.prepare(
+        `UPDATE thread_operations
+            SET state = 'executing', lease_owner = ?, lease_generation = ?, lease_expires_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'confirmed'`,
+      ).run(fence.ownerId, fence.generation, fence.now + leaseMs, fence.now, candidate.id);
+      if (updated.changes !== 1) return null;
+      return this.getThreadOperation(candidate.id);
+    }).immediate();
+  }
+
+  public completeThreadOperation(input: ControllerLeaseFence & { id: string; result: string }): boolean {
+    assertControllerIdentifier(input.id, "operation id");
+    assertControllerText(input.result, "operation result");
+    return this.finishThreadOperation(input, "completed", input.result);
+  }
+
+  public failThreadOperation(input: ControllerLeaseFence & { id: string; error: string }): boolean {
+    assertControllerIdentifier(input.id, "operation id");
+    assertSafeFailureSummary(input.error);
+    return this.finishThreadOperation(input, "failed", input.error);
+  }
+
+  private finishThreadOperation(
+    input: ControllerLeaseFence & { id: string },
+    state: "completed" | "failed",
+    summary: string,
+  ): boolean {
+    if (!input.ownerId) throw new TypeError("ownerId must not be empty");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    const resultColumn = state === "completed" ? "result" : "last_error";
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const updated = this.db.prepare(
+        `UPDATE thread_operations
+            SET state = ?, ${resultColumn} = ?, lease_owner = NULL, lease_generation = NULL,
+                lease_expires_at = NULL, updated_at = ?
+          WHERE id = ? AND state = 'executing' AND lease_owner = ? AND lease_generation = ?
+            AND lease_expires_at > ?`,
+      ).run(state, summary, input.now, input.id, input.ownerId, input.generation, input.now);
+      if (updated.changes !== 1) return false;
+      const operation = this.getThreadOperation(input.id);
+      if (!operation?.confirmationMessageId) {
+        throw new Error("Completed thread operation has no confirmation message");
+      }
+      const outbox: OutboxInput = {
+        logicalKey: `thread-operation:${operation.id}:status`,
+        chatId: operation.ownerChatId,
+        messageId: operation.confirmationMessageId,
+        payload: {
+          text: state === "completed" ? `Thread operation completed: ${summary}.` : "Thread operation failed safely.",
+          disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: [] },
+        },
+      };
+      persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
+      return true;
+    }).immediate();
+  }
+
   public bindTelegramIdentity(input: {
     botId: string;
     username: string;
@@ -2469,6 +2790,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
               state = 'revoked', pending_spawn_token = NULL,
               last_error = 'Controller owner was revoked', updated_at = ?
         WHERE state <> 'revoked'`,
+    ).run(now);
+    this.db.prepare(
+      `UPDATE thread_operations
+          SET state = 'failed', last_error = 'Controller owner was revoked',
+              lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL,
+              updated_at = ?
+        WHERE state IN ('confirmation_sending', 'awaiting_confirmation', 'confirmed', 'executing')`,
     ).run(now);
   }
 

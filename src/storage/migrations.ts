@@ -205,10 +205,39 @@ ALTER TABLE controller_turns ADD COLUMN telegram_message_id INTEGER;
 ALTER TABLE controller_turns ADD COLUMN stream_phase TEXT NOT NULL DEFAULT 'queued';
 `] as const;
 
+export const THREAD_OPERATION_MIGRATIONS = [String.raw`
+CREATE TABLE thread_operations (
+  id TEXT PRIMARY KEY,
+  nonce_hash TEXT NOT NULL UNIQUE,
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('steer_thread', 'stop_thread', 'retry_thread')),
+  thread_id TEXT NOT NULL,
+  operation_text TEXT,
+  state TEXT NOT NULL CHECK (state IN (
+    'confirmation_sending', 'awaiting_confirmation', 'confirmed', 'executing',
+    'completed', 'failed', 'expired'
+  )),
+  confirmation_message_id INTEGER,
+  expires_at INTEGER NOT NULL,
+  confirmed_at INTEGER,
+  lease_owner TEXT,
+  lease_generation INTEGER,
+  lease_expires_at INTEGER,
+  result TEXT,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX thread_operations_pending
+  ON thread_operations(state, created_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
   ...TASK_9_MIGRATIONS,
   ...CONTROLLER_MIGRATIONS,
   ...CONTROLLER_STREAM_MIGRATIONS,
+  ...THREAD_OPERATION_MIGRATIONS,
 ] as const;

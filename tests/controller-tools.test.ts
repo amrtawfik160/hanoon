@@ -145,6 +145,13 @@ it("rejects unmapped controllers, disabled projects, and a second active job wit
 it("registers the exact controller tools and keeps them off unrelated sessions", async () => {
   const { bb, harness, store } = fixture();
   const notify = vi.fn();
+  const requestThreadOperation = vi.fn(async () => ({
+    id: "operation_1",
+    kind: "stop_thread" as const,
+    threadId: "thr_active",
+    state: "awaiting_confirmation" as const,
+    expiresAt: 20_000,
+  }));
   harness.sdk.stub("projects.list", async () => [{
     id: "proj_1",
     kind: "software",
@@ -165,7 +172,13 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
       : {}),
     canSpawnChild: true,
   }));
-  registerControllerTools(bb, { store, sdk: bb.sdk, notify, now: () => 10_000 });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: requestThreadOperation },
+    notify,
+    now: () => 10_000,
+  });
 
   expect(harness.registrations.agentTools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
   const context = {
@@ -238,6 +251,13 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     { threadId: "thr_hidden" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   )).rejects.toThrow(/not visible/i);
+
+  const operation = await harness.behavior.callAgentTool(
+    "telegram_agent_request_thread_operation",
+    { kind: "stop_thread", threadId: "thr_active" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  );
+  expect(operation).toContain("awaiting_confirmation");
 
   const started = await harness.behavior.callAgentTool(
     "telegram_agent_start_job",

@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Job } from "../domain/models";
 import type { TelegramAgentStore } from "../storage/store";
 import { CONTROLLER_INSTRUCTIONS } from "./instructions";
+import type { ThreadOperationService } from "./operations";
 import { listVisibleThreads, visibleThreadStatus } from "./thread-observer";
 
 export const CONTROLLER_TOOL_NAMES = [
@@ -13,11 +14,13 @@ export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_cancel_job",
   "telegram_agent_list_threads",
   "telegram_agent_thread_status",
+  "telegram_agent_request_thread_operation",
 ] as const;
 
 type ToolDependencies = {
   store: TelegramAgentStore;
   sdk: BbPluginApi["sdk"];
+  threadOperations: Pick<ThreadOperationService, "request">;
   notify(): void;
   now(): number;
 };
@@ -180,6 +183,27 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         threadId: params.threadId,
         signal: context.signal,
       }));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[7],
+    description: "Request a steer, stop, or eligible provider retry for one visible BB thread. No action runs until the paired owner accepts an expiring one-use Telegram confirmation.",
+    experimental_statusLabels: { pending: "Preparing confirmation", completed: "Confirmation sent" },
+    parameters: z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("steer_thread"),
+        threadId: z.string().min(1).max(256),
+        text: z.string().trim().min(1).max(4_000),
+      }).strict(),
+      z.object({
+        kind: z.enum(["stop_thread", "retry_thread"]),
+        threadId: z.string().min(1).max(256),
+      }).strict(),
+    ]),
+    execute: async (params, context) => {
+      authorizedController(dependencies.store, context);
+      return json(await dependencies.threadOperations.request({ ...params, signal: context.signal }));
     },
   });
 

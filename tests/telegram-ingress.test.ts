@@ -355,6 +355,47 @@ it("deduplicates replayed update ids and callback ids without advancing the curs
   expect(fixture.store.getNextTelegramOffset()).toBe(0);
 });
 
+it("confirms one owner-bound thread operation callback and rejects its replay", async () => {
+  let nudges = 0;
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => { nudges += 1; },
+  });
+  const nonce = "A".repeat(32);
+  const operation = fixture.store.createThreadOperation({
+    id: "B".repeat(22),
+    nonceHash: hashSecret(nonce),
+    ownerUserId: "7",
+    ownerChatId: "70",
+    kind: "stop_thread",
+    threadId: "thr_target",
+    text: null,
+    expiresAt: 20_000,
+    now: 1_000,
+  });
+  fixture.store.markThreadOperationConfirmationSent(operation.id, 701, 1_001);
+  const callback = callbackUpdate(
+    35,
+    "operation-confirm",
+    7,
+    70,
+    encodeCallbackData({ type: "operation", nonce }),
+    "private",
+    701,
+  );
+
+  await fixture.ingress.handleClaimed(callback, 1_100);
+  await fixture.ingress.handleClaimed(callback, 1_101);
+
+  expect(fixture.store.getThreadOperation(operation.id)).toMatchObject({ state: "confirmed" });
+  expect(fixture.store.getCallback("operation-confirm")).toMatchObject({
+    action: "thread_operation",
+    outcome: "accepted",
+  });
+  expect(fixture.store.getOutbox("callback:operation-confirm")?.payload.text).toBe("Thread operation queued.");
+  expect(nudges).toBe(1);
+});
+
 it("routes standalone text to Luna while a job is active and steers only a status-message reply", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const jobId = await createDraft(fixture, 40);

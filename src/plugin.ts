@@ -25,6 +25,7 @@ import { registerControllerTools } from "./controller/tools";
 import { BbControllerAdapter } from "./controller/bb-controller";
 import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
+import { ThreadOperationService } from "./controller/operations";
 
 function clock(): number {
   return Date.now();
@@ -42,7 +43,6 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const store = openStore(bb.storage);
   const executorNudge = new ExecutorNudge();
-  registerControllerTools(bb, { store, sdk: bb.sdk, notify: () => executorNudge.notify(), now: clock });
   let config = parseGlobalConfig(await settings.get());
   if (!config.ok) bb.status.needsConfiguration(config.message);
 
@@ -67,6 +67,20 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       return telegramForToken(config.value.botToken).answerCallback(callbackQueryId, text);
     },
   };
+  const threadOperations = new ThreadOperationService({
+    store,
+    sdk: bb.sdk,
+    telegram: telegramTransport,
+    pluginId: bb.pluginId,
+    clock: { now: clock },
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations,
+    notify: () => executorNudge.notify(),
+    now: clock,
+  });
 
   const terminal = new TerminalCommandRunner(bb.sdk);
   bb.cli.register({
@@ -460,6 +474,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       },
       releaseOnShutdown: true,
       controller,
+      operations: threadOperations,
       presence,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),
     }, signal),
