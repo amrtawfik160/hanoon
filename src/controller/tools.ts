@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Job } from "../domain/models";
 import type { TelegramAgentStore } from "../storage/store";
 import { CONTROLLER_INSTRUCTIONS } from "./instructions";
+import { listVisibleThreads, visibleThreadStatus } from "./thread-observer";
 
 export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_list_projects",
@@ -10,10 +11,13 @@ export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_job_status",
   "telegram_agent_retry_job",
   "telegram_agent_cancel_job",
+  "telegram_agent_list_threads",
+  "telegram_agent_thread_status",
 ] as const;
 
 type ToolDependencies = {
   store: TelegramAgentStore;
+  sdk: BbPluginApi["sdk"];
   notify(): void;
   now(): number;
 };
@@ -138,6 +142,44 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       }, dependencies.now());
       dependencies.notify();
       return json(jobProjection(updated));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[5],
+    description: "List current visible BB threads with project, runtime, environment, branch, elapsed time, and last activity. Completion ETA is reported as unavailable rather than guessed.",
+    experimental_statusLabels: { pending: "Checking BB threads", completed: "Checked BB threads" },
+    parameters: z.object({
+      projectId: z.string().min(1).max(256).optional(),
+      status: z.enum(["active", "idle", "error", "all"]).default("active"),
+      limit: z.number().int().min(1).max(10).default(10),
+    }).strict(),
+    execute: async (params, context) => {
+      authorizedController(dependencies.store, context);
+      return json(await listVisibleThreads({
+        sdk: dependencies.sdk,
+        now: dependencies.now(),
+        projectId: params.projectId,
+        status: params.status,
+        limit: params.limit,
+        signal: context.signal,
+      }));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[6],
+    description: "Read the current status and truthful progress signals for one visible BB thread. BB does not provide a reliable completion ETA.",
+    experimental_statusLabels: { pending: "Checking thread", completed: "Checked thread" },
+    parameters: z.object({ threadId: z.string().min(1).max(256) }).strict(),
+    execute: async (params, context) => {
+      authorizedController(dependencies.store, context);
+      return json(await visibleThreadStatus({
+        sdk: dependencies.sdk,
+        now: dependencies.now(),
+        threadId: params.threadId,
+        signal: context.signal,
+      }));
     },
   });
 

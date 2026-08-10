@@ -5,6 +5,54 @@ import { policyFixture } from "./helpers";
 import { ActiveJobConflictError, openStore } from "../src/storage/store";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../src/controller/tools";
 
+type ThreadListEntry = Awaited<ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["sdk"]["threads"]["list"]>>[number];
+
+function visibleThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntry {
+  return {
+    id: "thr_active",
+    projectId: "proj_1",
+    environmentId: "env_cyndra",
+    providerId: "codex",
+    title: "Fix Cyndra billing",
+    titleFallback: null,
+    sectionId: null,
+    status: "active",
+    parentThreadId: null,
+    sourceThreadId: null,
+    originKind: null,
+    childOrigin: null,
+    originPluginId: null,
+    visibility: "visible",
+    archivedAt: null,
+    pinnedAt: null,
+    deletedAt: null,
+    lastReadAt: null,
+    latestAttentionAt: 9_500,
+    createdAt: 1_000,
+    updatedAt: 9_500,
+    runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+    activity: {
+      activeWorkflowCount: 1,
+      activeBackgroundAgentCount: 2,
+      activeBackgroundCommandCount: 0,
+      activePlanModeCount: 0,
+      activeGoalCount: 1,
+    },
+    pinSortKey: null,
+    hasPendingInteraction: false,
+    environmentHostId: "host_cyndra",
+    environmentName: "Cyndra worktree",
+    environmentBranchName: "feature/billing",
+    environmentWorkspaceDisplayKind: "managed-worktree",
+    ...overrides,
+  };
+}
+
+function parseToolJson(value: unknown): unknown {
+  if (typeof value !== "string") throw new Error("controller tool did not return JSON text");
+  return JSON.parse(value);
+}
+
 let fixtureNumber = 0;
 function fixture() {
   const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-tools-${fixtureNumber++}` });
@@ -94,10 +142,30 @@ it("rejects unmapped controllers, disabled projects, and a second active job wit
   expect(bb.storage.database().prepare("SELECT COUNT(*) AS count FROM effects").get()).toEqual({ count: 0 });
 });
 
-it("registers five exact-controller tools and keeps them off unrelated sessions", async () => {
+it("registers the exact controller tools and keeps them off unrelated sessions", async () => {
   const { bb, harness, store } = fixture();
   const notify = vi.fn();
-  registerControllerTools(bb, { store, notify, now: () => 10_000 });
+  harness.sdk.stub("projects.list", async () => [{
+    id: "proj_1",
+    kind: "software",
+    name: "cyndra-saas",
+    gitRemoteUrl: "git@github.com:acme/cyndra.git",
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [],
+  }]);
+  harness.sdk.stub("threads.list", async () => [
+    visibleThread(),
+    visibleThread({ id: "thr_idle", title: "Old task", status: "idle", runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null } }),
+    visibleThread({ id: "thr_hidden", title: "Private controller", visibility: "hidden" }),
+  ]);
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread(threadId === "thr_hidden"
+      ? { id: "thr_hidden", title: "Private controller", visibility: "hidden" }
+      : {}),
+    canSpawnChild: true,
+  }));
+  registerControllerTools(bb, { store, sdk: bb.sdk, notify, now: () => 10_000 });
 
   expect(harness.registrations.agentTools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
   const context = {
@@ -131,6 +199,45 @@ it("registers five exact-controller tools and keeps them off unrelated sessions"
   );
   expect(projects).toContain("cyndra");
   expect(projects).not.toContain("/private/path");
+
+  const activeThreads = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_list_threads",
+    {},
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  ));
+  expect(activeThreads).toMatchObject({
+    truncated: false,
+    threads: [{
+      id: "thr_active",
+      project: { id: "proj_1", name: "cyndra-saas" },
+      status: "active",
+      runtimeStatus: "active",
+      environment: { id: "env_cyndra", branch: "feature/billing", workspace: "managed-worktree" },
+      progress: { threadAgeMs: 9_000, lastActivityAgoMs: 500, etaMs: null },
+    }],
+  });
+  expect(JSON.stringify(activeThreads)).not.toContain("thr_hidden");
+
+  const threadStatus = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_thread_status",
+    { threadId: "thr_active" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  ));
+  expect(threadStatus).toMatchObject({ thread: {
+    id: "thr_active",
+    title: "Fix Cyndra billing",
+    parentThreadId: null,
+    hasPendingInteraction: false,
+    progress: {
+      etaMs: null,
+      etaReason: "BB does not expose a reliable completion estimate for provider turns",
+    },
+  } });
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_thread_status",
+    { threadId: "thr_hidden" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  )).rejects.toThrow(/not visible/i);
 
   const started = await harness.behavior.callAgentTool(
     "telegram_agent_start_job",

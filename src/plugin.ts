@@ -42,7 +42,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const store = openStore(bb.storage);
   const executorNudge = new ExecutorNudge();
-  registerControllerTools(bb, { store, notify: () => executorNudge.notify(), now: clock });
+  registerControllerTools(bb, { store, sdk: bb.sdk, notify: () => executorNudge.notify(), now: clock });
   let config = parseGlobalConfig(await settings.get());
   if (!config.ok) bb.status.needsConfiguration(config.message);
 
