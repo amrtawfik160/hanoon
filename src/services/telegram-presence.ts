@@ -27,10 +27,11 @@ const JOB_WORKER_KIND: Partial<Record<JobState, WorkerKind>> = {
 type PresenceStore = {
   getOwner(): { userId: string; chatId: string } | null;
   getControllerForOwner(userId: string, chatId: string): { controllerKey: string } | null;
-  listControllerTurns(
-    controllerKey: string,
-    limit: number,
-  ): readonly { id: string; state: ControllerTurnState }[];
+  getPendingControllerTurn(controllerKey: string): {
+    id: string;
+    state: ControllerTurnState;
+    awaitingInteractionId?: string | null;
+  } | null;
   getActiveJob(): { id: string; state: JobState } | null;
   getWorkerLiveness(jobId: string): WorkerLiveness | null;
 };
@@ -49,10 +50,12 @@ type PresenceOwner = NonNullable<ReturnType<PresenceStore["getOwner"]>>;
 function controllerPresenceTarget(store: PresenceStore, owner: PresenceOwner): TelegramPresenceTarget | null {
   const controller = store.getControllerForOwner(owner.userId, owner.chatId);
   if (!controller) return null;
-  const turn = store
-    .listControllerTurns(controller.controllerKey, 1_000)
-    .find((candidate) => CONTROLLER_PRESENCE_STATES.has(candidate.state));
-  return turn ? { key: `controller:${turn.id}`, chatId: owner.chatId } : null;
+  const turn = store.getPendingControllerTurn(controller.controllerKey);
+  if (!turn || !CONTROLLER_PRESENCE_STATES.has(turn.state)) return null;
+  // Typing while the ball is in the owner's court is a lie: the turn is waiting
+  // on their answer, not composing one.
+  if (turn.awaitingInteractionId) return null;
+  return { key: `controller:${turn.id}`, chatId: owner.chatId };
 }
 
 function workerPresenceTarget(store: PresenceStore, owner: PresenceOwner): TelegramPresenceTarget | null {

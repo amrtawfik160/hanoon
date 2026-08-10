@@ -2,24 +2,34 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { buildInitialControllerPrompt } from "./instructions";
 import {
-  DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  controllerExecutionArguments,
+  controllerProviderFor,
   type ControllerExecutionProfile,
 } from "./execution-profile";
-
-export const CONTROLLER_PROVIDER = "codex";
-export const CONTROLLER_MODEL = DEFAULT_CONTROLLER_EXECUTION_PROFILE.model;
-export const CONTROLLER_REASONING = DEFAULT_CONTROLLER_EXECUTION_PROFILE.reasoningLevel;
-export const CONTROLLER_SERVICE_TIER = DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier;
-export const CONTROLLER_PERMISSION = DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode;
+import {
+  parsePendingQuestion,
+  type ControllerPendingQuestion,
+  type ControllerQuestionAnswers,
+} from "./questions";
 
 export type ControllerLocation = { threadId: string; projectId: string; hostId: string };
-export type ControllerStatus = "idle" | "active" | "starting" | "stopping" | "error" | "missing";
+export type ControllerStatus =
+  | "idle"
+  | "active"
+  | "starting"
+  | "stopping"
+  | "error"
+  | "missing"
+  /** The live thread runs a different provider than the configured model needs. */
+  | "incompatible";
 export type ControllerEventObservation = {
   latestSeq: number;
   inputAccepted: boolean;
   assistantDelta: string;
   completed: boolean;
   error: string | null;
+  /** Set while the thread is blocked on a question only the owner can answer. */
+  pendingQuestion: ControllerPendingQuestion | null;
 };
 
 export type ControllerAdapter = {
@@ -29,11 +39,23 @@ export type ControllerAdapter = {
     signal: AbortSignal,
   ): Promise<ControllerLocation>;
   send(threadId: string, text: string, signal: AbortSignal): Promise<void>;
+  /** Redirects a thread that is already working, rather than queueing behind it. */
+  steer(threadId: string, text: string, signal: AbortSignal): Promise<void>;
+  answerQuestion(
+    threadId: string,
+    interactionId: string,
+    answers: ControllerQuestionAnswers,
+    signal: AbortSignal,
+  ): Promise<void>;
   status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
   output(threadId: string, signal: AbortSignal): Promise<string>;
+  latestSeq(threadId: string, signal: AbortSignal): Promise<number>;
   events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventObservation>;
   findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null>;
 };
+
+const EVENT_PAGE_LIMIT = 100;
+const MAX_EVENT_PAGES = 50;
 
 type BbSdk = BbPluginApi["sdk"];
 
@@ -70,18 +92,7 @@ export class BbControllerAdapter implements ControllerAdapter {
         hostId: personal.hostId,
         workspace: { type: "personal" },
       },
-      providerId: CONTROLLER_PROVIDER,
-      model: execution.model,
-      reasoningLevel: execution.reasoningLevel,
-      serviceTier: execution.serviceTier,
-      permissionMode: execution.permissionMode,
-      executionInputSources: {
-        providerId: "explicit",
-        model: "explicit",
-        reasoningLevel: "explicit",
-        serviceTier: "explicit",
-        permissionMode: "explicit",
-      },
+      ...controllerExecutionArguments(execution, { includeProvider: true }),
     });
     return { threadId: thread.id, ...personal };
   }
@@ -91,23 +102,42 @@ export class BbControllerAdapter implements ControllerAdapter {
     await this.dependencies.sdk.threads.send({
       threadId,
       mode: "start",
-      model: execution.model,
-      reasoningLevel: execution.reasoningLevel,
-      serviceTier: execution.serviceTier,
-      permissionMode: execution.permissionMode,
-      executionInputSources: {
-        model: "explicit",
-        reasoningLevel: "explicit",
-        serviceTier: "explicit",
-        permissionMode: "explicit",
-      },
+      ...controllerExecutionArguments(execution, { includeProvider: false }),
       input: [{ type: "text", text, mentions: [] }],
+    });
+  }
+
+  // "auto" lets BB fold the message into the running turn instead of starting a
+  // second one, so a correction the owner sends mid-answer still lands.
+  public async steer(threadId: string, text: string, signal: AbortSignal): Promise<void> {
+    await this.dependencies.sdk.threads.send({
+      threadId,
+      mode: "auto",
+      input: [{ type: "text", text, mentions: [] }],
+    });
+  }
+
+  public async answerQuestion(
+    threadId: string,
+    interactionId: string,
+    answers: ControllerQuestionAnswers,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.dependencies.sdk.threads.interactions.resolve({
+      threadId,
+      interactionId,
+      resolution: { kind: "user_answer", answers },
     });
   }
 
   public async status(threadId: string, signal: AbortSignal): Promise<ControllerStatus> {
     const thread = await this.dependencies.sdk.threads.get({ threadId, signal });
     if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
+    // Switching the configured model can move the conversation to another
+    // provider; the old thread cannot run the new model, so it is retired.
+    if (thread.providerId !== controllerProviderFor(this.dependencies.executionProfile().model)) {
+      return "incompatible";
+    }
     return thread.status;
   }
 
@@ -116,32 +146,55 @@ export class BbControllerAdapter implements ControllerAdapter {
     return result.output ?? "";
   }
 
+  // The high-water sequence, so a new turn's baseline cannot land inside the
+  // thread's history and replay older answers into the live reply.
+  public async latestSeq(threadId: string, signal: AbortSignal): Promise<number> {
+    const timeline = await this.dependencies.sdk.threads.timeline({
+      threadId,
+      summaryOnly: "true",
+      signal,
+    });
+    return timeline.maxSeq;
+  }
+
   public async events(
     threadId: string,
     afterSeq: number,
     signal: AbortSignal,
   ): Promise<ControllerEventObservation> {
-    const rows = await this.dependencies.sdk.threads.events.list({
-      threadId,
-      afterSeq: String(afterSeq),
-      limit: "100",
-      signal,
-    });
     let latestSeq = afterSeq;
     let inputAccepted = false;
     let assistantDelta = "";
     let completed = false;
     let error: string | null = null;
-    for (const row of rows) {
-      latestSeq = Math.max(latestSeq, row.seq);
-      if (row.type === "turn/input/accepted") inputAccepted = true;
-      if (row.type === "item/agentMessage/delta") assistantDelta += row.data.delta;
-      if (row.type === "turn/completed") completed = true;
-      if (row.type === "system/error" || row.type === "provider/error") {
-        error = "Controller provider turn failed";
+    let pendingQuestion: ControllerPendingQuestion | null = null;
+    for (let page = 0; page < MAX_EVENT_PAGES; page += 1) {
+      const rows = await this.dependencies.sdk.threads.events.list({
+        threadId,
+        afterSeq: String(latestSeq),
+        limit: String(EVENT_PAGE_LIMIT),
+        signal,
+      });
+      for (const row of rows) {
+        latestSeq = Math.max(latestSeq, row.seq);
+        if (row.type === "turn/input/accepted") inputAccepted = true;
+        if (row.type === "item/agentMessage/delta") assistantDelta += row.data.delta;
+        if (row.type === "turn/completed") completed = true;
+        if (row.type === "system/error" || row.type === "provider/error") {
+          error = "Controller provider turn failed";
+        }
+        // The same interaction reports every step of its life on this stream, so
+        // the last word about it wins: a later "resolved" retires the question.
+        if (row.type === "system/userQuestion/lifecycle") {
+          const data = row.data as { interactionId?: unknown; status?: unknown; payload?: unknown };
+          pendingQuestion = data.status === "pending"
+            ? parsePendingQuestion(data.interactionId, data.payload)
+            : null;
+        }
       }
+      if (rows.length < EVENT_PAGE_LIMIT) break;
     }
-    return { latestSeq, inputAccepted, assistantDelta, completed, error };
+    return { latestSeq, inputAccepted, assistantDelta, completed, error, pendingQuestion };
   }
 
   public async findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null> {
@@ -155,7 +208,7 @@ export class BbControllerAdapter implements ControllerAdapter {
     const candidates = threads.filter((thread) =>
       isControllerThreadTitle(thread.title, controllerKey) &&
       thread.projectId === personal.projectId &&
-      thread.providerId === CONTROLLER_PROVIDER &&
+      thread.providerId === controllerProviderFor(this.dependencies.executionProfile().model) &&
       thread.status !== "error" && thread.status !== "stopping" &&
       thread.visibility === "hidden" &&
       thread.originPluginId === this.dependencies.pluginId &&

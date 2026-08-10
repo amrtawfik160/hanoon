@@ -366,6 +366,113 @@ DROP TABLE worker_liveness;
 ALTER TABLE worker_liveness_v4 RENAME TO worker_liveness;
 `] as const;
 
+export const MEMORY_MIGRATIONS = [String.raw`
+CREATE TABLE memories (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('preference', 'fact', 'decision', 'correction')),
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  importance REAL NOT NULL CHECK (importance >= 0 AND importance <= 1),
+  confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+  source TEXT NOT NULL CHECK (source IN ('owner', 'agent')),
+  source_turn_id TEXT,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  last_used_at INTEGER,
+  superseded_by TEXT REFERENCES memories(id) DEFERRABLE INITIALLY DEFERRED,
+  forgotten_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX memories_live ON memories (scope, forgotten_at, superseded_by);
+CREATE UNIQUE INDEX memories_live_subject
+  ON memories (scope, subject)
+  WHERE forgotten_at IS NULL AND superseded_by IS NULL;
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+  subject, body, content='memories', content_rowid='rowid', tokenize='porter unicode61'
+);
+CREATE TRIGGER memories_fts_insert AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts (rowid, subject, body) VALUES (new.rowid, new.subject, new.body);
+END;
+CREATE TRIGGER memories_fts_delete AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts (memories_fts, rowid, subject, body)
+    VALUES ('delete', old.rowid, old.subject, old.body);
+END;
+CREATE TRIGGER memories_fts_update AFTER UPDATE ON memories BEGIN
+  INSERT INTO memories_fts (memories_fts, rowid, subject, body)
+    VALUES ('delete', old.rowid, old.subject, old.body);
+  INSERT INTO memories_fts (rowid, subject, body) VALUES (new.rowid, new.subject, new.body);
+END;
+CREATE TABLE controller_digest (
+  controller_key TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  owner_text TEXT NOT NULL,
+  agent_text TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (controller_key, ordinal)
+);
+`] as const;
+
+export const MONITOR_MIGRATIONS = [String.raw`
+CREATE TABLE monitors (
+  id TEXT PRIMARY KEY,
+  controller_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('thread_idle', 'schedule')),
+  thread_id TEXT,
+  cron TEXT,
+  instruction TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('armed', 'cancelled', 'done', 'failed')),
+  due_at INTEGER,
+  fire_count INTEGER NOT NULL DEFAULT 0,
+  last_fired_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK ((kind = 'thread_idle' AND thread_id IS NOT NULL) OR (kind = 'schedule' AND cron IS NOT NULL))
+);
+CREATE INDEX monitors_armed ON monitors (state, due_at);
+`] as const;
+
+export const CONTINUITY_MIGRATIONS = [String.raw`
+CREATE TABLE tool_receipts (
+  turn_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  args_sha256 TEXT NOT NULL,
+  controller_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'failed')),
+  result_text TEXT,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (turn_id, tool_name, args_sha256)
+);
+CREATE INDEX tool_receipts_turn ON tool_receipts (controller_key, turn_id);
+CREATE TABLE controller_generations (
+  id TEXT PRIMARY KEY,
+  controller_key TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  end_reason TEXT
+);
+CREATE INDEX controller_generations_key ON controller_generations (controller_key, started_at);
+`] as const;
+
+export const CONTROLLER_QUESTION_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN awaiting_interaction_id TEXT;
+CREATE TABLE controller_questions (
+  interaction_id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  questions_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answers_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER
+);
+CREATE INDEX controller_questions_pending ON controller_questions (controller_key, state, asked_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -376,4 +483,8 @@ export const ALL_MIGRATIONS = [
   ...PIPELINE_MIGRATIONS,
   ...PIPELINE_FINAL_REVIEW_MIGRATIONS,
   ...PRODUCTION_PIPELINE_MIGRATIONS,
+  ...MEMORY_MIGRATIONS,
+  ...MONITOR_MIGRATIONS,
+  ...CONTINUITY_MIGRATIONS,
+  ...CONTROLLER_QUESTION_MIGRATIONS,
 ] as const;

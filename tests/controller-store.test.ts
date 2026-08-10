@@ -31,17 +31,26 @@ function acquire(store: ReturnType<typeof openStore>) {
   return { ownerId: "executor", generation: lease.generation, now: 2_000, leaseMs: 30_000 };
 }
 
-it("keeps controller and operation migrations before the appended pipeline migration", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(9);
-  expect(ALL_MIGRATIONS.at(-6)).toContain("CREATE TABLE controller_threads");
-  expect(ALL_MIGRATIONS.at(-6)).toContain("CREATE TABLE controller_turns");
-  expect(ALL_MIGRATIONS.at(-5)).toContain("dispatch_after_seq");
-  expect(ALL_MIGRATIONS.at(-5)).toContain("telegram_message_id");
-  expect(ALL_MIGRATIONS.at(-4)).toContain("CREATE TABLE thread_operations");
-  expect(ALL_MIGRATIONS.at(-3)).toContain("CREATE TABLE pipeline_stage_attempts");
-  expect(ALL_MIGRATIONS.at(-2)).toContain("documentation_thread_id");
-  expect(ALL_MIGRATIONS.at(-1)).toContain("merge_commit_sha");
-  expect(ALL_MIGRATIONS.at(-1)).toContain("production_failed");
+// Applied migrations are immutable history: each release appends, so these are
+// indexed from the start and a new migration only ever extends the tail.
+it("keeps every shipped migration at its original position and appends new ones", () => {
+  expect(ALL_MIGRATIONS).toHaveLength(13);
+  expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
+  expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
+  expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
+  expect(ALL_MIGRATIONS[4]).toContain("telegram_message_id");
+  expect(ALL_MIGRATIONS[5]).toContain("CREATE TABLE thread_operations");
+  expect(ALL_MIGRATIONS[6]).toContain("CREATE TABLE pipeline_stage_attempts");
+  expect(ALL_MIGRATIONS[7]).toContain("documentation_thread_id");
+  expect(ALL_MIGRATIONS[8]).toContain("merge_commit_sha");
+  expect(ALL_MIGRATIONS[8]).toContain("production_failed");
+  expect(ALL_MIGRATIONS[9]).toContain("CREATE TABLE memories");
+  expect(ALL_MIGRATIONS[9]).toContain("CREATE VIRTUAL TABLE memories_fts");
+  expect(ALL_MIGRATIONS[10]).toContain("CREATE TABLE monitors");
+  expect(ALL_MIGRATIONS[11]).toContain("CREATE TABLE tool_receipts");
+  expect(ALL_MIGRATIONS[11]).toContain("CREATE TABLE controller_generations");
+  expect(ALL_MIGRATIONS[12]).toContain("awaiting_interaction_id");
+  expect(ALL_MIGRATIONS[12]).toContain("CREATE TABLE controller_questions");
 });
 
 it("enqueues Telegram controller turns idempotently and rejects changed replay input", () => {
@@ -268,6 +277,62 @@ it("rejects credential-shaped controller failure text", () => {
     error: "token=do-not-persist",
   })).toThrow(/credential/i);
   expect(store.listControllerTurns("owner-7-controller", 10)[0]?.state).toBe("dispatching");
+});
+
+it("sends a controller answer as Telegram HTML so its formatting renders", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(701));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_formatting",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
+
+  expect(store.completeControllerTurn({
+    turnId: turn.id,
+    ...fence,
+    responseText: "**Reduce complexity** — active\n- one item",
+  })).toBe(true);
+
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
+    text: "<b>Reduce complexity</b> — active\n• one item",
+    parse_mode: "HTML",
+  });
+});
+
+it("finds the in-flight controller turn after a long conversation history", () => {
+  const { bb, store } = fixture();
+  const history = store.enqueueControllerTurn(turnInput(601));
+  const db = bb.storage.database();
+  const insert = db.prepare(
+    `INSERT INTO controller_turns (id, telegram_update_id, controller_key, ordinal, input_text, state, created_at, updated_at)
+     VALUES (?, ?, 'owner-7-controller', ?, 'older question', 'completed', 1, 1)`,
+  );
+  db.transaction(() => {
+    db.prepare("UPDATE controller_turns SET state = 'completed' WHERE id = ?").run(history.id);
+    for (let ordinal = 2; ordinal <= 1_100; ordinal += 1) {
+      insert.run(`controller-turn-history-${ordinal}`, 700 + ordinal, ordinal);
+    }
+  })();
+  const turn = store.enqueueControllerTurn(turnInput(9_001, "the newest question"));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+
+  expect(store.listControllerTurns("owner-7-controller", 1_000).some((row) => row.id === turn.id)).toBe(false);
+  expect(store.getPendingControllerTurn("owner-7-controller")).toMatchObject({
+    id: turn.id,
+    state: "dispatching",
+  });
+
+  expect(store.requeueControllerTurn({ turnId: turn.id, ...fence })).toBe(true);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", leaseOwner: null });
+  expect(store.getPendingControllerTurn("owner-7-controller")).toBeNull();
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
 });
 
 it("does not expose a controller mapping after its paired owner is revoked", () => {

@@ -2,12 +2,16 @@ import { createHash } from "node:crypto";
 import { hashSecret } from "../crypto";
 import type { Job } from "../domain/models";
 import type { MergeHandler } from "../services/merge-handler";
-import type {
-  OutboxInput,
-  ProjectPolicyRecord,
-  TelegramAgentStore,
-  TelegramStatusOutboxStore,
+import {
+  OWNER_MEMORY_SCOPE,
+  type OutboxInput,
+  type ProjectPolicyRecord,
+  type TelegramAgentStore,
+  type TelegramStatusOutboxStore,
 } from "../storage/store";
+import { detectStandingInstruction } from "../controller/context";
+import { containsCredentialLikeText } from "../domain/state-machine";
+import type { HealthReport } from "../services/health-report";
 import {
   telegramUpdateSchema,
   type SendMessagePayload,
@@ -57,6 +61,7 @@ export type TelegramIngressOptions = {
   auditLogger?: TelegramIngressAuditLogger;
   mergeHandler?: Pick<MergeHandler, "handleApprovalCallback">;
   onWorkAvailable?: () => void;
+  health?: (now: number) => HealthReport;
 };
 
 const PRIVATE_ID = /^[1-9][0-9]*$/;
@@ -156,6 +161,7 @@ export class TelegramIngress {
   private readonly auditLogger: TelegramIngressAuditLogger;
   private readonly mergeHandler: Pick<MergeHandler, "handleApprovalCallback"> | null;
   private readonly onWorkAvailable: () => void;
+  private readonly health: ((now: number) => HealthReport) | null;
 
   public constructor(options: TelegramIngressOptions);
   public constructor(store: TelegramAgentStore, telegram: TelegramIngressTransport);
@@ -169,6 +175,7 @@ export class TelegramIngress {
       this.auditLogger = boundedAuditLogger(optionsOrStore.auditLogger);
       this.mergeHandler = optionsOrStore.mergeHandler ?? null;
       this.onWorkAvailable = optionsOrStore.onWorkAvailable ?? (() => undefined);
+      this.health = optionsOrStore.health ?? null;
     } else {
       if (!telegram) throw new TypeError("Telegram ingress requires a Telegram client");
       this.store = optionsOrStore;
@@ -176,6 +183,7 @@ export class TelegramIngress {
       this.auditLogger = boundedAuditLogger(undefined);
       this.mergeHandler = null;
       this.onWorkAvailable = () => undefined;
+      this.health = null;
     }
   }
 
@@ -227,11 +235,15 @@ export class TelegramIngress {
 
     const command = /^\/(\w+)(?:\s|$)/.exec(normalized)?.[1]?.toLowerCase();
     if (command === "help") {
-      await this.sendPlain(identity.chatId, "Talk naturally with Luna. Reply to the active status message to steer implementation, or use /status, /projects, /retry, and /cancel for recovery.");
+      await this.sendPlain(identity.chatId, "Talk naturally. Reply to the active status message to steer implementation, or use /status, /projects, /health, /retry, and /cancel for recovery.");
       return;
     }
     if (command === "projects") {
       await this.sendProjects(identity.chatId);
+      return;
+    }
+    if (command === "health") {
+      await this.sendPlain(identity.chatId, this.healthSummary(now));
       return;
     }
 
@@ -257,15 +269,48 @@ export class TelegramIngress {
       return;
     }
 
-    this.store.enqueueControllerTurn({
-      controllerKey: stableControllerKey(identity.userId, identity.chatId),
+    const controllerKey = stableControllerKey(identity.userId, identity.chatId);
+    // The agent asked something and is blocked on it. A reply now is the answer,
+    // not a new request to line up behind the answer it is waiting to give.
+    if (this.store.getPendingControllerQuestion(controllerKey)) {
+      const answered = this.store.answerControllerQuestionWithText({ controllerKey, text: normalized, now });
+      if (answered.ok) {
+        this.rememberStandingInstruction(normalized, answered.turnId, now);
+        this.onWorkAvailable();
+        return;
+      }
+    }
+
+    const turn = this.store.enqueueControllerTurn({
+      controllerKey,
       telegramUserId: identity.userId,
       telegramChatId: identity.chatId,
       updateId,
       inputText: normalized,
       now,
     });
+    this.rememberStandingInstruction(normalized, turn.id, now);
     this.onWorkAvailable();
+  }
+
+  // "Always ship on Fridays" is an instruction, not chatter. Capturing it at
+  // intake means it outlives the turn even if the answer itself fails.
+  private rememberStandingInstruction(text: string, turnId: string, now: number): void {
+    const instruction = detectStandingInstruction(text);
+    // Silently declining a secret keeps the message flowing; refusing the whole
+    // update would cost the owner their answer as well.
+    if (!instruction || containsCredentialLikeText(instruction.body)) return;
+    this.store.rememberMemory({
+      scope: OWNER_MEMORY_SCOPE,
+      kind: instruction.kind,
+      subject: instruction.subject,
+      body: instruction.body,
+      importance: 0.9,
+      confidence: 0.9,
+      source: "owner",
+      sourceTurnId: turnId,
+      now,
+    });
   }
 
   private pairingCode(text: string): string | null {
@@ -313,6 +358,31 @@ export class TelegramIngress {
         result.outcome === "accepted" ? "Merge queued." : "Approval is stale or no longer valid.",
         now,
       );
+      return;
+    }
+    if (action.type === "question") {
+      const answered = this.store.answerControllerQuestion({
+        token: action.token,
+        userId: identity.userId,
+        chatId: identity.chatId,
+        now,
+      });
+      const recorded = this.store.recordCallback(
+        callback.id,
+        null,
+        "controller_question",
+        answered.ok ? "accepted" : answered.reason,
+        now,
+      );
+      if (recorded) {
+        this.enqueueCallbackAnswer(
+          callback.id,
+          identity.chatId,
+          answered.ok ? "Got it." : "That question is no longer open.",
+          now,
+        );
+      }
+      if (answered.ok && recorded) this.onWorkAvailable();
       return;
     }
     if (action.type === "operation") {
@@ -511,6 +581,26 @@ export class TelegramIngress {
       chatId,
       payload: { text: answer },
     }, now);
+  }
+
+  // Answered from durable state rather than from the agent, so it still works
+  // when the agent itself is the thing that is stuck.
+  private healthSummary(now: number): string {
+    if (!this.health) return "Health reporting is unavailable.";
+    const report = this.health(now);
+    if (report.ok) {
+      return [
+        "All good.",
+        `Executor: running (generation ${report.executor.generation ?? "none"})`,
+        `Queue: ${report.work.pendingEffects} job step(s), ${report.delivery.pendingOutbox} message(s) waiting`,
+        `Watching: ${report.monitors.armed} monitor(s)`,
+        `Memory: ${report.memory.live} kept`,
+      ].join("\n");
+    }
+    return [`Problems:\n${report.problems.map((problem) => `- ${problem}`).join("\n")}`,
+      `Executor: ${report.executor.current ? "running" : "not running"}`,
+      `Queue: ${report.work.pendingEffects} job step(s), ${report.delivery.pendingOutbox} message(s) waiting`,
+    ].join("\n");
   }
 
   private async sendProjects(chatId: string): Promise<void> {

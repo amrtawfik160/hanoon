@@ -12,7 +12,9 @@ import {
   type WorkerLiveness,
 } from "../domain/models";
 import { reviewVerdictSchema } from "../domain/review";
-import { assertSafeFailureSummary, transition } from "../domain/state-machine";
+import { formattedMessage } from "../telegram/markdown";
+import { ftsQuery, memoryScore } from "./memory-ranking";
+import { assertSafeFailureSummary, containsCredentialLikeText, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
 import type {
   ControllerLeaseFence,
@@ -21,6 +23,13 @@ import type {
   ControllerTurnRecord,
   ControllerTurnState,
 } from "../controller/models";
+import {
+  nextUnansweredQuestion,
+  questionOptionToken,
+  renderQuestion,
+  type ControllerQuestion,
+  type ControllerQuestionAnswers,
+} from "../controller/questions";
 
 type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
@@ -127,6 +136,83 @@ export type MergeCallbackIdentity = {
   approvalNonceHash: string;
   headSha: string;
   effectIdempotencyKey: string;
+};
+
+export type ToolReceiptKey = {
+  turnId: string;
+  toolName: string;
+  argsSha256: string;
+};
+
+/**
+ * `fresh` means nothing ran before. `completed` replays the previous result
+ * instead of repeating the mutation. `interrupted` means an earlier attempt
+ * started and never reported — the outcome is unknown and must be checked,
+ * never blindly retried.
+ */
+export type ToolReceiptClaim =
+  | { outcome: "fresh" }
+  | { outcome: "completed"; result: string }
+  | { outcome: "interrupted" };
+
+export type ControllerGeneration = {
+  id: string;
+  controllerKey: string;
+  threadId: string;
+  startedAt: number;
+  endedAt: number | null;
+  endReason: string | null;
+};
+
+export type MonitorKind = "thread_idle" | "schedule";
+export type MonitorState = "armed" | "cancelled" | "done" | "failed";
+
+export type MonitorRecord = {
+  id: string;
+  controllerKey: string;
+  kind: MonitorKind;
+  threadId: string | null;
+  cron: string | null;
+  instruction: string;
+  state: MonitorState;
+  dueAt: number | null;
+  fireCount: number;
+  lastFiredAt: number | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type MemoryKind = "preference" | "fact" | "decision" | "correction";
+
+export type MemoryRecord = {
+  id: string;
+  scope: string;
+  kind: MemoryKind;
+  subject: string;
+  body: string;
+  importance: number;
+  confidence: number;
+  source: "owner" | "agent";
+  sourceTurnId: string | null;
+  useCount: number;
+  lastUsedAt: number | null;
+  supersededBy: string | null;
+  forgottenAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type MemoryInput = {
+  scope: string;
+  kind: MemoryKind;
+  subject: string;
+  body: string;
+  importance?: number;
+  confidence?: number;
+  source: "owner" | "agent";
+  sourceTurnId?: string;
+  now: number;
 };
 
 export type AttemptRecord = {
@@ -458,9 +544,38 @@ type ControllerTurnRow = {
   last_error: string | null;
   submitted_at: number | null;
   completed_at: number | null;
+  awaiting_interaction_id: string | null;
   created_at: number;
   updated_at: number;
 };
+type ControllerQuestionRow = {
+  interaction_id: string;
+  turn_id: string;
+  controller_key: string;
+  questions_json: string;
+  state: "pending" | "answered";
+  answers_json: string;
+  asked_at: number;
+  answered_at: number | null;
+};
+export type ControllerQuestionRecord = {
+  interactionId: string;
+  turnId: string;
+  controllerKey: string;
+  questions: ControllerQuestion[];
+  answers: ControllerQuestionAnswers;
+  askedAt: number;
+};
+export type ControllerQuestionAnswer =
+  | {
+    ok: true;
+    /** False while the same interaction still has questions the owner has not settled. */
+    complete: boolean;
+    turnId: string;
+    interactionId: string;
+    answers: ControllerQuestionAnswers;
+  }
+  | { ok: false; reason: "stale" };
 type ThreadOperationRow = {
   id: string;
   nonce_hash: string;
@@ -588,6 +703,20 @@ const FULL_SHA = /^[0-9a-f]{40}$/;
 const RAW_MERGE_CALLBACK = /m:[A-Za-z0-9_-]{32}/;
 const ENCODED_MERGE_CALLBACK = /(?:m|%6d)%3a[A-Za-z0-9_-]{32}/i;
 const TELEGRAM_UPDATE_LEASE_MS = 300_000;
+/** Claims one update may cost before ingress gives up and moves the cursor on. */
+export const MAX_TELEGRAM_UPDATE_ATTEMPTS = 3;
+export const OWNER_MEMORY_SCOPE = "owner";
+const MEMORY_KINDS = new Set<MemoryKind>(["preference", "fact", "decision", "correction"]);
+const MAX_MEMORY_SUBJECT = 120;
+const MAX_MEMORY_BODY = 1_000;
+const MAX_LIVE_MEMORIES_PER_SCOPE = 10;
+const DEFAULT_MEMORY_IMPORTANCE = 0.6;
+const DEFAULT_MEMORY_CONFIDENCE = 0.7;
+const MAX_DIGEST_TURNS = 12;
+const MAX_DIGEST_TEXT = 600;
+const MAX_MONITOR_INSTRUCTION = 1_000;
+const MAX_ARMED_MONITORS = 20;
+const MAX_RECEIPT_RESULT = 4_000;
 const MAX_RECEIPT_STRING = 512;
 const MAX_EFFECT_KEY = 256;
 const MAX_MERGE_RESULT_JSON = 64_000;
@@ -1411,6 +1540,7 @@ export interface TelegramAgentStore {
   getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null;
   getControllerTurn(turnId: string): ControllerTurnRecord | null;
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
+  requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
   failStaleControllerDispatches(fence: ControllerLeaseFence): boolean;
   markControllerSpawned(input: ControllerLeaseFence & {
     turnId: string;
@@ -1439,9 +1569,32 @@ export interface TelegramAgentStore {
     turnId: string;
     sentBefore: number;
   }): boolean;
+  recordControllerQuestion(input: ControllerLeaseFence & {
+    turnId: string;
+    interactionId: string;
+    questions: readonly ControllerQuestion[];
+  }): boolean;
+  answerControllerQuestion(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerQuestionAnswer;
+  answerControllerQuestionWithText(input: {
+    controllerKey: string;
+    text: string;
+    now: number;
+  }): ControllerQuestionAnswer;
+  getPendingControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
+  getAnsweredControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
+  markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string }): boolean;
+  getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null;
+  recordControllerSteerFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
+  foldControllerTurnIntoRunning(input: ControllerLeaseFence & { turnId: string }): boolean;
   resetControllerThread(input: ControllerLeaseFence & {
     controllerKey: string;
     expectedThreadId: string;
+    reason?: string;
   }): boolean;
   completeControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
@@ -1451,9 +1604,43 @@ export interface TelegramAgentStore {
   failControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     error: string;
+    ownerMessage?: string;
     leaseMs?: number;
   }): boolean;
   listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[];
+  getPendingControllerTurn(controllerKey: string): ControllerTurnRecord | null;
+  claimToolReceipt(input: ToolReceiptKey & { controllerKey: string; now: number }): ToolReceiptClaim;
+  completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void;
+  failToolReceipt(input: ToolReceiptKey & { error: string; now: number }): void;
+  listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[];
+  listControllerGenerations(controllerKey: string, limit: number): ControllerGeneration[];
+  createMonitor(input: {
+    controllerKey: string;
+    kind: MonitorKind;
+    threadId?: string;
+    cron?: string;
+    instruction: string;
+    dueAt: number | null;
+    now: number;
+  }): MonitorRecord;
+  listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[];
+  listArmedMonitors(limit: number): MonitorRecord[];
+  cancelMonitor(id: string, now: number): boolean;
+  recordMonitorFired(input: { id: string; nextDueAt: number | null; now: number }): boolean;
+  failMonitor(input: { id: string; error: string; now: number }): boolean;
+  rememberMemory(input: MemoryInput): MemoryRecord;
+  recallMemories(input: { scope: string; query?: string; limit: number; now: number }): MemoryRecord[];
+  getMemory(id: string): MemoryRecord | null;
+  forgetMemory(input: { id: string; now: number }): boolean;
+  countMemories(scope: string): number;
+  appendControllerDigest(input: {
+    controllerKey: string;
+    ordinal: number;
+    ownerText: string;
+    agentText: string;
+    now: number;
+  }): void;
+  readControllerDigest(controllerKey: string, limit: number): { ownerText: string; agentText: string }[];
   createThreadOperation(input: {
     id: string;
     nonceHash: string;
@@ -1673,6 +1860,9 @@ export interface TelegramAgentStore {
   beginTelegramUpdate(updateId: number, now: number): "process" | "processed";
   completeTelegramUpdate(updateId: number, outcome: string, now: number): void;
   failTelegramUpdate(updateId: number, error: string, now: number): void;
+  abandonTelegramUpdate(updateId: number, error: string, now: number): void;
+  getTelegramUpdateAttempts(updateId: number): number;
+  reconcileTelegramCursor(): void;
   getNextTelegramOffset(): number;
   recordCallback(
     callbackId: string,
@@ -1750,6 +1940,7 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     lastError: row.last_error,
     submittedAt: row.submitted_at,
     completedAt: row.completed_at,
+    awaitingInteractionId: row.awaiting_interaction_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1778,12 +1969,115 @@ function parseThreadOperation(row: ThreadOperationRow): ThreadOperation {
   };
 }
 
-function controllerFailureOutbox(turnId: string, chatId: string): OutboxInput {
+type MonitorRow = {
+  id: string;
+  controller_key: string;
+  kind: string;
+  thread_id: string | null;
+  cron: string | null;
+  instruction: string;
+  state: string;
+  due_at: number | null;
+  fire_count: number;
+  last_fired_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+function parseMonitor(row: MonitorRow): MonitorRecord {
+  if (row.kind !== "thread_idle" && row.kind !== "schedule") {
+    throw new Error(`Unknown persisted monitor kind: ${row.kind}`);
+  }
+  if (!["armed", "cancelled", "done", "failed"].includes(row.state)) {
+    throw new Error(`Unknown persisted monitor state: ${row.state}`);
+  }
+  return {
+    id: row.id,
+    controllerKey: row.controller_key,
+    kind: row.kind,
+    threadId: row.thread_id,
+    cron: row.cron,
+    instruction: row.instruction,
+    state: row.state as MonitorState,
+    dueAt: row.due_at,
+    fireCount: row.fire_count,
+    lastFiredAt: row.last_fired_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+type MemoryRow = {
+  id: string;
+  scope: string;
+  kind: string;
+  subject: string;
+  body: string;
+  importance: number;
+  confidence: number;
+  source: string;
+  source_turn_id: string | null;
+  use_count: number;
+  last_used_at: number | null;
+  superseded_by: string | null;
+  forgotten_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+function assertMemoryScope(value: string): void {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+    throw new TypeError("memory scope must be between 1 and 256 characters");
+  }
+}
+
+function assertMemoryText(value: string, limit: number, field: string): string {
+  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (text.length === 0 || text.length > limit) {
+    throw new TypeError(`${field} must be between 1 and ${limit} characters`);
+  }
+  return text;
+}
+
+function assertUnitInterval(value: number, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new TypeError(`${field} must be between 0 and 1`);
+  }
+  return value;
+}
+
+function parseMemory(row: MemoryRow): MemoryRecord {
+  if (!MEMORY_KINDS.has(row.kind as MemoryKind)) throw new Error(`Unknown persisted memory kind: ${row.kind}`);
+  if (row.source !== "owner" && row.source !== "agent") {
+    throw new Error(`Unknown persisted memory source: ${row.source}`);
+  }
+  return {
+    id: row.id,
+    scope: row.scope,
+    kind: row.kind as MemoryKind,
+    subject: row.subject,
+    body: row.body,
+    importance: row.importance,
+    confidence: row.confidence,
+    source: row.source,
+    sourceTurnId: row.source_turn_id,
+    useCount: row.use_count,
+    lastUsedAt: row.last_used_at,
+    supersededBy: row.superseded_by,
+    forgottenAt: row.forgotten_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function controllerFailureOutbox(turnId: string, chatId: string, ownerMessage?: string): OutboxInput {
   return {
     logicalKey: `controller:${turnId}:reply`,
     chatId,
     payload: {
-      text: "I couldn't complete that controller turn safely. Please resend your request.",
+      text: ownerMessage ?? "I couldn't complete that controller turn safely. Please resend your request.",
       disable_web_page_preview: true,
     },
   };
@@ -2093,11 +2387,14 @@ function advanceTelegramCursor(db: SqliteDatabase): void {
     .get() as { next_offset: number } | undefined;
   if (!cursor) throw new Error("Telegram cursor was not initialized");
 
+  // An update that has burned its retry budget no longer holds the cursor: one
+  // undeliverable update must not stall every later update behind it forever.
   const firstUnprocessed = db
     .prepare(
-      "SELECT MIN(update_id) AS update_id FROM telegram_updates WHERE update_id >= ? AND status <> 'processed'",
+      `SELECT MIN(update_id) AS update_id FROM telegram_updates
+        WHERE update_id >= ? AND status <> 'processed' AND attempts < ?`,
     )
-    .get(cursor.next_offset) as { update_id: number | null };
+    .get(cursor.next_offset, MAX_TELEGRAM_UPDATE_ATTEMPTS) as { update_id: number | null };
   const highest = db
     .prepare(
       "SELECT MAX(update_id) AS update_id FROM telegram_updates WHERE update_id >= ? AND status = 'processed'",
@@ -2392,6 +2689,27 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  // A claim taken while the BB thread is still answering is returned to the
+  // queue rather than failed, so the message is still delivered a moment later.
+  public requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const requeued = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'queued', lease_owner = NULL, lease_generation = NULL, updated_at = ?
+          WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?`,
+      ).run(input.now, input.turnId, input.ownerId, input.generation);
+      if (requeued.changes !== 1) return false;
+      this.db.prepare(
+        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+          WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
+            AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
+      ).run(input.now, input.turnId, input.turnId);
+      return true;
+    }).immediate();
+  }
+
   public failStaleControllerDispatches(fence: ControllerLeaseFence): boolean {
     this.assertLeaseIdentity("controller-turn", fence.ownerId, fence.generation, fence.now);
     return this.db.transaction((): boolean => {
@@ -2442,12 +2760,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         !turn || turn.state !== "dispatching" ||
         turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation
       ) return false;
-      return this.db.prepare(
+      const spawned = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = ?, host_id = ?, bb_thread_id = ?, state = 'active',
                 pending_spawn_token = NULL, last_error = NULL, updated_at = ?
           WHERE controller_key = ?`,
       ).run(input.projectId, input.hostId, input.threadId, input.now, turn.controller_key).changes === 1;
+      if (spawned) {
+        this.db.prepare(
+          `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+           VALUES (?, ?, ?, ?, NULL, NULL)`,
+        ).run(`gen-${randomUUID()}`, turn.controller_key, input.threadId, input.now);
+      }
+      return spawned;
     }).immediate();
   }
 
@@ -2571,11 +2896,287 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         logicalKey: `controller:${input.turnId}:reply`,
         chatId: row.telegram_chat_id,
         messageId: row.telegram_message_id,
-        payload: { text: displayText, disable_web_page_preview: true },
+        payload: { ...formattedMessage(displayText), disable_web_page_preview: true },
       };
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();
+  }
+
+  /**
+   * Parks a submitted turn on a question only the owner can settle and asks it
+   * in Telegram. The turn stays submitted because the BB turn really is still
+   * open — it is waiting on a person, not on the model.
+   */
+  public recordControllerQuestion(input: ControllerLeaseFence & {
+    turnId: string;
+    interactionId: string;
+    questions: readonly ControllerQuestion[];
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    if (input.questions.length === 0) throw new TypeError("a controller question must have questions");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.*, controller.telegram_chat_id FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+          WHERE turn.id = ? AND turn.state = 'submitted'`,
+      ).get(input.turnId) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
+      if (!row) return false;
+      // Seeing the same question again on a later poll must not re-ask it.
+      const known = this.db.prepare("SELECT 1 FROM controller_questions WHERE interaction_id = ?")
+        .get(input.interactionId);
+      if (known) return false;
+      this.db.prepare(
+        `INSERT INTO controller_questions
+           (interaction_id, turn_id, controller_key, questions_json, state, answers_json, asked_at, answered_at)
+         VALUES (?, ?, ?, ?, 'pending', '{}', ?, NULL)`,
+      ).run(
+        input.interactionId,
+        row.id,
+        row.controller_key,
+        JSON.stringify(input.questions),
+        input.now,
+      );
+      this.db.prepare(
+        `UPDATE controller_turns SET awaiting_interaction_id = ?, updated_at = ?
+          WHERE id = ? AND state = 'submitted'`,
+      ).run(input.interactionId, input.now, input.turnId);
+      this.askControllerQuestion(input.interactionId, row.telegram_chat_id, input.questions, {}, input.now);
+      return true;
+    }).immediate();
+  }
+
+  private askControllerQuestion(
+    interactionId: string,
+    chatId: string,
+    questions: readonly ControllerQuestion[],
+    answers: ControllerQuestionAnswers,
+    now: number,
+  ): void {
+    const next = nextUnansweredQuestion(questions, answers);
+    if (!next) return;
+    const rendered = renderQuestion(interactionId, next.question);
+    persistControllerOutbox(this.db, {
+      logicalKey: `controller-question:${interactionId}:${next.index}`,
+      chatId,
+      payload: {
+        ...formattedMessage(rendered.text),
+        reply_markup: rendered.reply_markup,
+        disable_web_page_preview: true,
+      },
+    }, now);
+  }
+
+  private settleControllerQuestion(
+    row: ControllerQuestionRow,
+    questionId: string,
+    answer: { selected: string[]; freeText?: string },
+    now: number,
+  ): ControllerQuestionAnswer {
+    const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
+    const answers = { ...JSON.parse(row.answers_json) as ControllerQuestionAnswers, [questionId]: answer };
+    const complete = nextUnansweredQuestion(questions, answers) === null;
+    const updated = this.db.prepare(
+      `UPDATE controller_questions
+          SET answers_json = ?, state = ?, answered_at = ?
+        WHERE interaction_id = ? AND state = 'pending'`,
+    ).run(
+      JSON.stringify(answers),
+      complete ? "answered" : "pending",
+      complete ? now : null,
+      row.interaction_id,
+    );
+    if (updated.changes !== 1) return { ok: false, reason: "stale" };
+    if (complete) {
+      this.db.prepare(
+        `UPDATE controller_turns SET awaiting_interaction_id = NULL, updated_at = ?
+          WHERE id = ? AND awaiting_interaction_id = ?`,
+      ).run(now, row.turn_id, row.interaction_id);
+    } else {
+      const chatId = this.db.prepare(
+        "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
+      ).get(row.controller_key) as { telegram_chat_id: string } | undefined;
+      if (chatId) this.askControllerQuestion(row.interaction_id, chatId.telegram_chat_id, questions, answers, now);
+    }
+    return {
+      ok: true,
+      complete,
+      turnId: row.turn_id,
+      interactionId: row.interaction_id,
+      answers,
+    };
+  }
+
+  /** Answers whichever question a tapped button stands for. */
+  public answerControllerQuestion(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerQuestionAnswer {
+    assertCanonicalPositiveDecimal(input.userId, "userId");
+    assertCanonicalPositiveDecimal(input.chatId, "chatId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ControllerQuestionAnswer => {
+      const row = this.db.prepare(
+        `SELECT question.* FROM controller_questions AS question
+           JOIN controller_threads AS controller ON controller.controller_key = question.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+           JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
+          WHERE question.state = 'pending'
+            AND controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
+          ORDER BY question.asked_at DESC LIMIT 1`,
+      ).get(input.userId, input.chatId) as ControllerQuestionRow | undefined;
+      if (!row) return { ok: false, reason: "stale" };
+      const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
+      const answers = JSON.parse(row.answers_json) as ControllerQuestionAnswers;
+      for (const question of questions) {
+        if (question.id in answers) continue;
+        for (const option of question.options) {
+          if (questionOptionToken(row.interaction_id, question.id, option.value) !== input.token) continue;
+          return this.settleControllerQuestion(row, question.id, { selected: [option.value] }, input.now);
+        }
+      }
+      return { ok: false, reason: "stale" };
+    }).immediate();
+  }
+
+  /**
+   * A plain reply answers the open question. The owner is having a conversation,
+   * not filling in a form, so "in review i mean not in progress" is an answer.
+   */
+  public answerControllerQuestionWithText(input: {
+    controllerKey: string;
+    text: string;
+    now: number;
+  }): ControllerQuestionAnswer {
+    assertControllerKey(input.controllerKey);
+    assertControllerText(input.text, "controller question answer");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ControllerQuestionAnswer => {
+      const row = this.db.prepare(
+        `SELECT question.* FROM controller_questions AS question
+           JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
+          WHERE question.controller_key = ? AND question.state = 'pending'
+          ORDER BY question.asked_at DESC LIMIT 1`,
+      ).get(input.controllerKey) as ControllerQuestionRow | undefined;
+      if (!row) return { ok: false, reason: "stale" };
+      const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
+      const answers = JSON.parse(row.answers_json) as ControllerQuestionAnswers;
+      const next = nextUnansweredQuestion(questions, answers);
+      if (!next) return { ok: false, reason: "stale" };
+      return this.settleControllerQuestion(row, next.question.id, { selected: [], freeText: input.text }, input.now);
+    }).immediate();
+  }
+
+  /**
+   * Counts a steer BB would not take. The reconcile loop runs at draft speed
+   * while an answer streams, so an unbounded retry here would be a hot loop
+   * against BB rather than a recovery.
+   */
+  public recordControllerSteerFailure(input: ControllerLeaseFence & { turnId: string }): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        `UPDATE controller_turns SET retry_count = retry_count + 1, updated_at = ?
+          WHERE id = ? AND state = 'queued'`,
+      ).run(input.now, input.turnId).changes === 1;
+    }).immediate();
+  }
+
+  /** The oldest message still waiting behind an answer that is being written. */
+  public getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT * FROM controller_turns WHERE controller_key = ? AND state = 'queued'
+        ORDER BY created_at ASC, ordinal ASC LIMIT 1`,
+    ).get(controllerKey) as ControllerTurnRow | undefined;
+    return row ? parseControllerTurn(row) : null;
+  }
+
+  /**
+   * Retires a queued message that was handed to the turn already running. It
+   * gets no reply of its own because the answer in flight now covers it —
+   * a correction like "I meant in review" wants the first answer fixed, not a
+   * second answer written.
+   */
+  public foldControllerTurnIntoRunning(input: ControllerLeaseFence & { turnId: string }): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        "SELECT * FROM controller_turns WHERE id = ? AND state = 'queued'",
+      ).get(input.turnId) as ControllerTurnRow | undefined;
+      if (!row) return false;
+      const folded = "(sent to the answer already in progress)";
+      const updated = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'completed', response_text = ?, stream_phase = 'complete',
+                completed_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'queued'`,
+      ).run(folded, input.now, input.now, input.turnId);
+      if (updated.changes !== 1) return false;
+      this.appendControllerDigestRow({
+        controllerKey: row.controller_key,
+        ordinal: row.ordinal,
+        ownerText: row.input_text,
+        agentText: folded,
+        now: input.now,
+      });
+      return true;
+    }).immediate();
+  }
+
+  /** An answer the owner has given that BB has not been told about yet. */
+  public getAnsweredControllerQuestion(controllerKey: string): ControllerQuestionRecord | null {
+    return this.readControllerQuestion(controllerKey, "answered");
+  }
+
+  public getPendingControllerQuestion(controllerKey: string): ControllerQuestionRecord | null {
+    return this.readControllerQuestion(controllerKey, "pending");
+  }
+
+  // Delivery is recorded separately from the answer so a crash between the two
+  // re-sends the answer rather than losing it.
+  public markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string }): boolean {
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    this.assertLeaseIdentity("controller-question", input.ownerId, input.generation, input.now);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        "UPDATE controller_questions SET state = 'delivered' WHERE interaction_id = ? AND state = 'answered'",
+      ).run(input.interactionId).changes === 1;
+    }).immediate();
+  }
+
+  // A question outlives its turn only on paper. Once that turn is gone the
+  // answer has nowhere to land, and reading the owner's next message as an
+  // answer to it would swallow the message outright.
+  private readControllerQuestion(
+    controllerKey: string,
+    state: ControllerQuestionRow["state"],
+  ): ControllerQuestionRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT question.* FROM controller_questions AS question
+         JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
+        WHERE question.controller_key = ? AND question.state = ?
+        ORDER BY question.asked_at DESC LIMIT 1`,
+    ).get(controllerKey, state) as ControllerQuestionRow | undefined;
+    if (!row) return null;
+    return {
+      interactionId: row.interaction_id,
+      turnId: row.turn_id,
+      controllerKey: row.controller_key,
+      questions: JSON.parse(row.questions_json) as ControllerQuestion[],
+      answers: JSON.parse(row.answers_json) as ControllerQuestionAnswers,
+      askedAt: row.asked_at,
+    };
   }
 
   public refreshControllerDraft(input: ControllerLeaseFence & {
@@ -2605,9 +3206,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  /**
+   * Retires the live thread. The thread id is kept as a closed generation
+   * rather than erased, so a failure that cost the owner a conversation stays
+   * answerable afterwards.
+   */
   public resetControllerThread(input: ControllerLeaseFence & {
     controllerKey: string;
     expectedThreadId: string;
+    reason?: string;
   }): boolean {
     assertControllerKey(input.controllerKey);
     assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
@@ -2616,13 +3223,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      return this.db.prepare(
+      const retired = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
                 state = 'pending_spawn', pending_spawn_token = NULL,
                 last_error = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id = ?`,
       ).run(input.now, input.controllerKey, input.expectedThreadId).changes === 1;
+      if (retired) {
+        this.db.prepare(
+          `UPDATE controller_generations SET ended_at = ?, end_reason = ?
+            WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL`,
+        ).run(input.now, (input.reason ?? "retired").slice(0, 200), input.controllerKey, input.expectedThreadId);
+      }
+      return retired;
     }).immediate();
   }
 
@@ -2652,10 +3266,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE id = ? AND state = 'submitted'`,
       ).run(input.responseText, input.responseText, input.now, input.now, input.turnId);
       if (updated.changes !== 1) return false;
+      // The digest commits with the turn, so a crash can never leave a delivered
+      // answer that the next thread has no record of.
+      this.appendControllerDigestRow({
+        controllerKey: row.controller_key,
+        ordinal: row.ordinal,
+        ownerText: row.input_text,
+        agentText: input.responseText,
+        now: input.now,
+      });
       const outbox: OutboxInput = {
         logicalKey: `controller:${input.turnId}:reply`,
         chatId: row.telegram_chat_id,
-        payload: { text: input.responseText, disable_web_page_preview: true },
+        payload: { ...formattedMessage(input.responseText), disable_web_page_preview: true },
       };
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
@@ -2665,11 +3288,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public failControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     error: string;
+    ownerMessage?: string;
     leaseMs?: number;
   }): boolean {
     this.assertControllerMutation(input);
     assertSafeFailureSummary(input.error);
     assertNoRawMergeCallback(input.error, "controller error");
+    if (input.ownerMessage !== undefined) {
+      assertControllerText(input.ownerMessage, "controller failure message");
+      assertNoRawMergeCallback(input.ownerMessage, "controller failure message");
+    }
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       const row = this.db.prepare(
@@ -2691,7 +3319,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
-      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id);
+      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.ownerMessage);
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();
@@ -2706,6 +3334,421 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       "SELECT * FROM controller_turns WHERE controller_key = ? ORDER BY ordinal ASC LIMIT ?",
     ).all(controllerKey, limit) as ControllerTurnRow[];
     return rows.map(parseControllerTurn);
+  }
+
+  // The in-flight turn is looked up directly: scanning a bounded prefix of the
+  // conversation loses it once the history outgrows that bound.
+  public getPendingControllerTurn(controllerKey: string): ControllerTurnRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT * FROM controller_turns
+        WHERE controller_key = ? AND state IN ('dispatching', 'submitted')
+        ORDER BY ordinal ASC LIMIT 1`,
+    ).get(controllerKey) as ControllerTurnRow | undefined;
+    return row ? parseControllerTurn(row) : null;
+  }
+
+  // Reserving before the call is what makes replay safe: a crash mid-tool leaves
+  // a 'started' receipt, which is reported as uncertain rather than repeated.
+  public claimToolReceipt(input: ToolReceiptKey & { controllerKey: string; now: number }): ToolReceiptClaim {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerIdentifier(input.toolName, "toolName");
+    assertSha256Hex(input.argsSha256);
+    assertNonNegativeInteger(input.now, "now");
+
+    return this.db.transaction((): ToolReceiptClaim => {
+      const existing = this.db.prepare(
+        "SELECT state, result_text FROM tool_receipts WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?",
+      ).get(input.turnId, input.toolName, input.argsSha256) as
+        { state: string; result_text: string | null } | undefined;
+      if (existing?.state === "completed") {
+        return { outcome: "completed", result: existing.result_text ?? "" };
+      }
+      if (existing?.state === "started") return { outcome: "interrupted" };
+      if (existing) {
+        this.db.prepare(
+          `UPDATE tool_receipts SET state = 'started', last_error = NULL, updated_at = ?
+            WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?`,
+        ).run(input.now, input.turnId, input.toolName, input.argsSha256);
+        return { outcome: "fresh" };
+      }
+      this.db.prepare(
+        `INSERT INTO tool_receipts (
+           turn_id, tool_name, args_sha256, controller_key, state, result_text, last_error, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'started', NULL, NULL, ?, ?)`,
+      ).run(input.turnId, input.toolName, input.argsSha256, input.controllerKey, input.now, input.now);
+      return { outcome: "fresh" };
+    }).immediate();
+  }
+
+  public completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void {
+    assertNonNegativeInteger(input.now, "now");
+    this.db.prepare(
+      `UPDATE tool_receipts SET state = 'completed', result_text = ?, last_error = NULL, updated_at = ?
+        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'`,
+    ).run(input.result.slice(0, MAX_RECEIPT_RESULT), input.now, input.turnId, input.toolName, input.argsSha256);
+  }
+
+  public failToolReceipt(input: ToolReceiptKey & { error: string; now: number }): void {
+    assertNonNegativeInteger(input.now, "now");
+    this.db.prepare(
+      `UPDATE tool_receipts SET state = 'failed', last_error = ?, updated_at = ?
+        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'`,
+    ).run(input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256);
+  }
+
+  public listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[] {
+    assertControllerIdentifier(turnId, "turnId");
+    return this.db.prepare(
+      `SELECT tool_name AS toolName, state, result_text AS result FROM tool_receipts
+        WHERE turn_id = ? ORDER BY created_at ASC LIMIT 50`,
+    ).all(turnId) as { toolName: string; state: string; result: string | null }[];
+  }
+
+  public listControllerGenerations(controllerKey: string, limit: number): ControllerGeneration[] {
+    assertControllerKey(controllerKey);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      `SELECT id, controller_key, thread_id, started_at, ended_at, end_reason
+         FROM controller_generations WHERE controller_key = ? ORDER BY started_at DESC LIMIT ?`,
+    ).all(controllerKey, limit) as {
+      id: string;
+      controller_key: string;
+      thread_id: string;
+      started_at: number;
+      ended_at: number | null;
+      end_reason: string | null;
+    }[];
+    return rows.map((row) => ({
+      id: row.id,
+      controllerKey: row.controller_key,
+      threadId: row.thread_id,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      endReason: row.end_reason,
+    }));
+  }
+
+  public createMonitor(input: {
+    controllerKey: string;
+    kind: MonitorKind;
+    threadId?: string;
+    cron?: string;
+    instruction: string;
+    dueAt: number | null;
+    now: number;
+  }): MonitorRecord {
+    assertControllerKey(input.controllerKey);
+    if (input.kind !== "thread_idle" && input.kind !== "schedule") throw new TypeError("monitor kind is invalid");
+    if (input.kind === "thread_idle") assertControllerIdentifier(input.threadId ?? "", "threadId");
+    if (input.kind === "schedule" && !input.cron) throw new TypeError("a scheduled monitor requires a cron expression");
+    const instruction = assertMemoryText(input.instruction, MAX_MONITOR_INSTRUCTION, "monitor instruction");
+    if (input.dueAt !== null) assertNonNegativeInteger(input.dueAt, "dueAt");
+    assertNonNegativeInteger(input.now, "now");
+    if (this.countArmedMonitors(input.controllerKey) >= MAX_ARMED_MONITORS) {
+      throw new TypeError(`at most ${MAX_ARMED_MONITORS} monitors can be armed at once`);
+    }
+
+    const id = `mon-${randomUUID()}`;
+    this.db.prepare(
+      `INSERT INTO monitors (
+         id, controller_key, kind, thread_id, cron, instruction, state, due_at,
+         fire_count, last_fired_at, last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'armed', ?, 0, NULL, NULL, ?, ?)`,
+    ).run(
+      id,
+      input.controllerKey,
+      input.kind,
+      input.threadId ?? null,
+      input.cron ?? null,
+      instruction,
+      input.dueAt,
+      input.now,
+      input.now,
+    );
+    return this.requireMonitor(id);
+  }
+
+  public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {
+    assertControllerKey(controllerKey);
+    const rows = this.db.prepare(
+      `SELECT * FROM monitors
+        WHERE controller_key = ? AND (? = 1 OR state = 'armed')
+        ORDER BY created_at DESC LIMIT ?`,
+    ).all(controllerKey, includeFinished ? 1 : 0, MAX_ARMED_MONITORS * 4) as MonitorRow[];
+    return rows.map(parseMonitor);
+  }
+
+  public listArmedMonitors(limit: number): MonitorRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      "SELECT * FROM monitors WHERE state = 'armed' ORDER BY created_at ASC LIMIT ?",
+    ).all(limit) as MonitorRow[];
+    return rows.map(parseMonitor);
+  }
+
+  public cancelMonitor(id: string, now: number): boolean {
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      "UPDATE monitors SET state = 'cancelled', updated_at = ? WHERE id = ? AND state = 'armed'",
+    ).run(now, id).changes === 1;
+  }
+
+  // A one-shot watch retires when it fires; a schedule re-arms for its next due
+  // time, so a restart never loses or double-books a recurring job.
+  public recordMonitorFired(input: { id: string; nextDueAt: number | null; now: number }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    if (input.nextDueAt !== null) assertNonNegativeInteger(input.nextDueAt, "nextDueAt");
+    return this.db.prepare(
+      `UPDATE monitors
+          SET state = CASE WHEN ? IS NULL THEN 'done' ELSE 'armed' END,
+              due_at = ?, fire_count = fire_count + 1, last_fired_at = ?, updated_at = ?
+        WHERE id = ? AND state = 'armed'`,
+    ).run(input.nextDueAt, input.nextDueAt, input.now, input.now, input.id).changes === 1;
+  }
+
+  public failMonitor(input: { id: string; error: string; now: number }): boolean {
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE monitors SET state = 'failed', last_error = ?, updated_at = ? WHERE id = ? AND state = 'armed'",
+    ).run(input.error, input.now, input.id).changes === 1;
+  }
+
+  private countArmedMonitors(controllerKey: string): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM monitors WHERE controller_key = ? AND state = 'armed'",
+    ).get(controllerKey) as { count: number };
+    return row.count;
+  }
+
+  private requireMonitor(id: string): MonitorRecord {
+    const row = this.db.prepare("SELECT * FROM monitors WHERE id = ?").get(id) as MonitorRow | undefined;
+    if (!row) throw new Error("stored monitor disappeared before it could be read");
+    return parseMonitor(row);
+  }
+
+  public rememberMemory(input: MemoryInput): MemoryRecord {
+    assertMemoryScope(input.scope);
+    if (!MEMORY_KINDS.has(input.kind)) throw new TypeError("memory kind is invalid");
+    const subject = assertMemoryText(input.subject, MAX_MEMORY_SUBJECT, "memory subject");
+    const body = assertMemoryText(input.body, MAX_MEMORY_BODY, "memory body");
+    // A memory is long-lived, searchable, and replayed into later conversations,
+    // so a pasted secret would outlive the message that carried it.
+    if (containsCredentialLikeText(subject) || containsCredentialLikeText(body)) {
+      throw new TypeError("memory must not contain credential-like text");
+    }
+    const importance = assertUnitInterval(input.importance ?? DEFAULT_MEMORY_IMPORTANCE, "importance");
+    const confidence = assertUnitInterval(input.confidence ?? DEFAULT_MEMORY_CONFIDENCE, "confidence");
+    if (input.source !== "owner" && input.source !== "agent") throw new TypeError("memory source is invalid");
+    assertNonNegativeInteger(input.now, "now");
+
+    return this.db.transaction((): MemoryRecord => {
+      const id = `mem-${randomUUID()}`;
+      // A restated subject replaces its predecessor, so a correction reads as one
+      // current belief while the superseded row stays as history.
+      const previous = this.db.prepare(
+        `SELECT id FROM memories
+          WHERE scope = ? AND subject = ? AND forgotten_at IS NULL AND superseded_by IS NULL`,
+      ).get(input.scope, subject) as { id: string } | undefined;
+      if (previous) {
+        this.db.prepare("UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?")
+          .run(id, input.now, previous.id);
+      }
+      this.db.prepare(
+        `INSERT INTO memories (
+           id, scope, kind, subject, body, importance, confidence, source, source_turn_id,
+           use_count, last_used_at, superseded_by, forgotten_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?)`,
+      ).run(
+        id,
+        input.scope,
+        input.kind,
+        subject,
+        body,
+        importance,
+        confidence,
+        input.source,
+        input.sourceTurnId ?? null,
+        input.now,
+        input.now,
+      );
+      this.evictWeakestMemories(input.scope, input.now);
+      return this.requireMemory(id);
+    }).immediate();
+  }
+
+  public recallMemories(input: {
+    scope: string;
+    query?: string;
+    limit: number;
+    now: number;
+  }): MemoryRecord[] {
+    assertMemoryScope(input.scope);
+    if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
+      throw new TypeError("limit must be between 1 and 100");
+    }
+    assertNonNegativeInteger(input.now, "now");
+
+    return this.db.transaction((): MemoryRecord[] => {
+      // Owner-scoped memories are always in play; project memories only inside
+      // their own project, so one project's conventions cannot leak into another.
+      const scopes = input.scope === OWNER_MEMORY_SCOPE ? [OWNER_MEMORY_SCOPE] : [OWNER_MEMORY_SCOPE, input.scope];
+      const placeholders = scopes.map(() => "?").join(", ");
+      const live = this.db.prepare(
+        `SELECT * FROM memories
+          WHERE scope IN (${placeholders}) AND forgotten_at IS NULL AND superseded_by IS NULL`,
+      ).all(...scopes) as MemoryRow[];
+      if (live.length === 0) return [];
+
+      const lexicalRanks = new Map<string, number>();
+      const match = input.query === undefined ? null : ftsQuery(input.query);
+      if (match !== null) {
+        const matched = this.db.prepare(
+          `SELECT memories.id AS id FROM memories_fts
+             JOIN memories ON memories.rowid = memories_fts.rowid
+            WHERE memories_fts MATCH ?
+              AND memories.scope IN (${placeholders})
+              AND memories.forgotten_at IS NULL AND memories.superseded_by IS NULL
+            ORDER BY bm25(memories_fts, 2.0, 1.0)
+            LIMIT 100`,
+        ).all(match, ...scopes) as { id: string }[];
+        matched.forEach((row, index) => lexicalRanks.set(row.id, index));
+      }
+
+      const ranked = live
+        .map((row) => ({
+          row,
+          score: memoryScore({
+            lexicalRank: lexicalRanks.get(row.id) ?? null,
+            importance: row.importance,
+            confidence: row.confidence,
+            ageMs: input.now - row.created_at,
+          }),
+        }))
+        // An explicit question only surfaces memories that actually mention it;
+        // an empty question falls back to the strongest standing memories.
+        .filter((candidate) => match === null || lexicalRanks.has(candidate.row.id))
+        .sort((left, right) => right.score - left.score || right.row.created_at - left.row.created_at)
+        .slice(0, input.limit);
+
+      const use = this.db.prepare(
+        "UPDATE memories SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
+      );
+      for (const candidate of ranked) use.run(input.now, candidate.row.id);
+      return ranked.map((candidate) => this.requireMemory(candidate.row.id));
+    }).immediate();
+  }
+
+  public getMemory(id: string): MemoryRecord | null {
+    const row = this.db.prepare("SELECT * FROM memories WHERE id = ?").get(id) as MemoryRow | undefined;
+    return row ? parseMemory(row) : null;
+  }
+
+  public forgetMemory(input: { id: string; now: number }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE memories SET forgotten_at = ?, updated_at = ? WHERE id = ? AND forgotten_at IS NULL",
+    ).run(input.now, input.now, input.id).changes === 1;
+  }
+
+  public countMemories(scope: string): number {
+    assertMemoryScope(scope);
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM memories
+        WHERE scope = ? AND forgotten_at IS NULL AND superseded_by IS NULL`,
+    ).get(scope) as { count: number };
+    return row.count;
+  }
+
+  private evictWeakestMemories(scope: string, now: number): void {
+    const live = this.db.prepare(
+      `SELECT id, importance, confidence, created_at FROM memories
+        WHERE scope = ? AND forgotten_at IS NULL AND superseded_by IS NULL`,
+    ).all(scope) as Pick<MemoryRow, "id" | "importance" | "confidence" | "created_at">[];
+    if (live.length <= MAX_LIVE_MEMORIES_PER_SCOPE) return;
+    const weakest = live
+      .map((row) => ({
+        id: row.id,
+        score: memoryScore({
+          lexicalRank: null,
+          importance: row.importance,
+          confidence: row.confidence,
+          ageMs: now - row.created_at,
+        }),
+      }))
+      .sort((left, right) => left.score - right.score)
+      .slice(0, live.length - MAX_LIVE_MEMORIES_PER_SCOPE);
+    const forget = this.db.prepare("UPDATE memories SET forgotten_at = ?, updated_at = ? WHERE id = ?");
+    for (const candidate of weakest) forget.run(now, now, candidate.id);
+  }
+
+  private requireMemory(id: string): MemoryRecord {
+    const memory = this.getMemory(id);
+    if (!memory) throw new Error("stored memory disappeared before it could be read");
+    return memory;
+  }
+
+  // The conversation outlives the BB thread that hosted it: a provider failure
+  // retires the thread, and this digest is what re-seeds its replacement.
+  public appendControllerDigest(input: {
+    controllerKey: string;
+    ordinal: number;
+    ownerText: string;
+    agentText: string;
+    now: number;
+  }): void {
+    assertControllerKey(input.controllerKey);
+    assertNonNegativeInteger(input.ordinal, "ordinal");
+    assertNonNegativeInteger(input.now, "now");
+    this.db.transaction(() => this.appendControllerDigestRow(input)).immediate();
+  }
+
+  private appendControllerDigestRow(input: {
+    controllerKey: string;
+    ordinal: number;
+    ownerText: string;
+    agentText: string;
+    now: number;
+  }): void {
+    {
+      this.db.prepare(
+        `INSERT INTO controller_digest (controller_key, ordinal, owner_text, agent_text, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (controller_key, ordinal) DO UPDATE
+           SET owner_text = excluded.owner_text, agent_text = excluded.agent_text`,
+      ).run(
+        input.controllerKey,
+        input.ordinal,
+        input.ownerText.slice(0, MAX_DIGEST_TEXT),
+        input.agentText.slice(0, MAX_DIGEST_TEXT),
+        input.now,
+      );
+      this.db.prepare(
+        `DELETE FROM controller_digest
+          WHERE controller_key = ? AND ordinal <= (
+            SELECT MAX(ordinal) - ? FROM controller_digest WHERE controller_key = ?
+          )`,
+      ).run(input.controllerKey, MAX_DIGEST_TURNS, input.controllerKey);
+    }
+  }
+
+  public readControllerDigest(
+    controllerKey: string,
+    limit: number,
+  ): { ownerText: string; agentText: string }[] {
+    assertControllerKey(controllerKey);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_DIGEST_TURNS) {
+      throw new TypeError(`limit must be between 1 and ${MAX_DIGEST_TURNS}`);
+    }
+    const rows = this.db.prepare(
+      `SELECT owner_text, agent_text FROM controller_digest
+        WHERE controller_key = ? ORDER BY ordinal DESC LIMIT ?`,
+    ).all(controllerKey, limit) as { owner_text: string; agent_text: string }[];
+    return rows
+      .reverse()
+      .map((row) => ({ ownerText: row.owner_text, agentText: row.agent_text }));
   }
 
   public createThreadOperation(input: {
@@ -5317,6 +6360,51 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     });
     fail();
     this.claimedUpdates.delete(updateId);
+  }
+
+  // A durably failed update pins the cursor, so an update that cannot ever be
+  // handled must be retired: the failure stays readable, but polling moves on.
+  public abandonTelegramUpdate(updateId: number, error: string, now: number): void {
+    assertSafeFailureSummary(error);
+    assertNoRawMergeCallback(error, "Telegram update error");
+    const claimGeneration = this.claimedUpdates.get(updateId);
+    if (claimGeneration === undefined) throw new UpdateClaimConflictError(updateId);
+
+    const abandon = this.db.transaction(() => {
+      const abandoned = this.db
+        .prepare(
+          `UPDATE telegram_updates
+              SET status = 'processed', outcome = 'abandoned', last_error = ?, processed_at = ?,
+                  claim_owner = NULL, claim_expires_at = NULL
+            WHERE update_id = ?
+              AND status = 'processing'
+              AND claim_owner = ?
+              AND claim_generation = ?
+              AND claim_expires_at > ?`,
+        )
+        .run(error, now, updateId, this.claimOwner, claimGeneration, now);
+      if (abandoned.changes !== 1) {
+        this.claimedUpdates.delete(updateId);
+        throw new UpdateClaimConflictError(updateId);
+      }
+      advanceTelegramCursor(this.db);
+    });
+    abandon();
+    this.claimedUpdates.delete(updateId);
+  }
+
+  public getTelegramUpdateAttempts(updateId: number): number {
+    if (!Number.isInteger(updateId) || updateId < 0) throw new TypeError("updateId must be a non-negative integer");
+    const row = this.db
+      .prepare("SELECT attempts FROM telegram_updates WHERE update_id = ?")
+      .get(updateId) as { attempts: number } | undefined;
+    return row?.attempts ?? 0;
+  }
+
+  // Recovers a cursor left pinned by an update that failed under an earlier
+  // build, so polling stops replaying a backlog it has already handled.
+  public reconcileTelegramCursor(): void {
+    this.db.transaction(() => advanceTelegramCursor(this.db)).immediate();
   }
 
   public getNextTelegramOffset(): number {
