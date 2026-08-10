@@ -20,6 +20,8 @@ import {
   workerRegistrationGeneration,
 } from "./services/worker-liveness";
 import { runTelegramAgentCli } from "./cli";
+import { ExecutorNudge } from "./services/executor-nudge";
+import { registerControllerTools } from "./controller/tools";
 
 function clock(): number {
   return Date.now();
@@ -36,6 +38,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     },
   });
   const store = openStore(bb.storage);
+  const executorNudge = new ExecutorNudge();
+  registerControllerTools(bb, { store, notify: () => executorNudge.notify(), now: clock });
   let config = parseGlobalConfig(await settings.get());
   if (!config.ok) bb.status.needsConfiguration(config.message);
 

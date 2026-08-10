@@ -1,0 +1,159 @@
+import type { BbPluginApi } from "@bb/plugin-sdk";
+import { z } from "zod";
+import type { Job } from "../domain/models";
+import type { TelegramAgentStore } from "../storage/store";
+import { CONTROLLER_INSTRUCTIONS } from "./instructions";
+
+export const CONTROLLER_TOOL_NAMES = [
+  "telegram_agent_list_projects",
+  "telegram_agent_start_job",
+  "telegram_agent_job_status",
+  "telegram_agent_retry_job",
+  "telegram_agent_cancel_job",
+] as const;
+
+type ToolDependencies = {
+  store: TelegramAgentStore;
+  notify(): void;
+  now(): number;
+};
+
+function authorizedController(
+  store: TelegramAgentStore,
+  context: { threadId: string; projectId: string },
+) {
+  const controller = store.getControllerByThreadId(context.threadId);
+  if (!controller || controller.projectId !== context.projectId || controller.state !== "active") {
+    throw new Error("This tool call is not authorized for the durable Telegram controller");
+  }
+  return controller;
+}
+
+function jobProjection(job: Job | null) {
+  if (!job) return { job: null };
+  return {
+    job: {
+      id: job.id,
+      state: job.state,
+      projectId: job.projectId,
+      implementationThreadId: job.implementationThreadId,
+      reviewThreadId: job.reviewThreadId,
+      prNumber: job.prNumber,
+      prUrl: job.prUrl,
+      prHead: job.prHeadSha?.slice(0, 12) ?? null,
+      reviewCycle: job.reviewCycle,
+      cancelRequested: job.cancelRequestedAt !== null,
+      blocker: job.blockedReason,
+      error: job.lastError,
+      updatedAt: job.updatedAt,
+    },
+  };
+}
+
+function json(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  if (serialized.length > 8_000) throw new Error("Telegram Agent tool result exceeded its safe bound");
+  return serialized;
+}
+
+export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDependencies): void {
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[0],
+    description: "List the software projects enabled for guarded Telegram Agent jobs.",
+    parameters: z.object({}).strict(),
+    execute: (_params, context) => {
+      authorizedController(dependencies.store, context);
+      return json({
+        projects: dependencies.store.listEnabledProjectPolicies().map(({ policy }) => ({
+          id: policy.projectId,
+          alias: policy.alias,
+          baseBranch: policy.baseBranch,
+          implementationModel: policy.implementation.model ?? null,
+          reviewModel: policy.review.model ?? null,
+        })),
+      });
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[1],
+    description: "Create one guarded implementation job for an enabled project. This commits durable intent only.",
+    parameters: z.object({
+      projectId: z.string().min(1).max(256),
+      task: z.string().trim().min(1).max(4_000),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const job = dependencies.store.createConfirmedControllerJob({
+        controllerThreadId: context.threadId,
+        projectId: params.projectId,
+        task: params.task,
+        now: dependencies.now(),
+      });
+      dependencies.notify();
+      return json(jobProjection(job));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[2],
+    description: "Read a bounded durable status projection for the active, recent, or requested Telegram Agent job.",
+    parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const job = params.jobId
+        ? dependencies.store.getJob(params.jobId)
+        : dependencies.store.getActiveJob() ?? dependencies.store.listJobs(1)[0] ?? null;
+      return json(jobProjection(job));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[3],
+    description: "Retry a recoverable failed Telegram Agent job through its durable state machine.",
+    parameters: z.object({ jobId: z.string().min(1).max(256) }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const job = dependencies.store.getJob(params.jobId);
+      if (!job || job.state !== "failed") throw new Error("The requested job is not retryable");
+      const updated = dependencies.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, dependencies.now());
+      dependencies.notify();
+      return json(jobProjection(updated));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[4],
+    description: "Request cancellation of a nonterminal Telegram Agent job. Completion remains executor-fenced.",
+    parameters: z.object({ jobId: z.string().min(1).max(256) }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const job = dependencies.store.getJob(params.jobId);
+      if (!job || ["merged", "cancelled", "blocked"].includes(job.state)) {
+        throw new Error("The requested job cannot be cancelled");
+      }
+      const updated = dependencies.store.applyJobEvent(job.id, job.version, {
+        type: "CANCEL_REQUESTED",
+        activeWorker: dependencies.store.getWorkerLiveness(job.id),
+      }, dependencies.now());
+      dependencies.notify();
+      return json(jobProjection(updated));
+    },
+  });
+
+  bb.agents.configure((context) => {
+    const controller = dependencies.store.getControllerByThreadId(context.thread.id);
+    const candidate = controller !== null &&
+      controller.projectId === context.project.id &&
+      controller.hostId === context.host.id &&
+      context.origin.kind === null &&
+      context.origin.pluginId === bb.pluginId &&
+      context.provider.id === "codex" &&
+      context.project.kind === "personal" &&
+      context.environment.workspaceProvisionType === "personal" &&
+      context.thread.title === `Telegram Luna controller ${controller.controllerKey}`;
+    return candidate
+      ? { tools: [...CONTROLLER_TOOL_NAMES], skills: [], instructions: CONTROLLER_INSTRUCTIONS }
+      : { tools: [], skills: [] };
+  });
+}

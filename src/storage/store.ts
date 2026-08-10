@@ -1,6 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   projectPolicySchema,
   type Job,
@@ -1284,6 +1284,12 @@ export interface TelegramAgentStore {
   getProjectPolicy(projectId: string): ProjectPolicyRecord | null;
   getProjectPolicyByAlias(alias: string): ProjectPolicyRecord | null;
   listEnabledProjectPolicies(): ProjectPolicyRecord[];
+  createConfirmedControllerJob(input: {
+    controllerThreadId: string;
+    projectId: string;
+    task: string;
+    now: number;
+  }): Job;
   createJob(input: {
     id: string;
     sourceUpdateId: number;
@@ -2335,6 +2341,72 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       )
       .all() as ProjectPolicyRow[];
     return rows.map(parsePolicy);
+  }
+
+  public createConfirmedControllerJob(input: {
+    controllerThreadId: string;
+    projectId: string;
+    task: string;
+    now: number;
+  }): Job {
+    assertControllerIdentifier(input.controllerThreadId, "controllerThreadId");
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertControllerText(input.task, "task");
+    assertNonNegativeInteger(input.now, "now");
+
+    return this.db.transaction((): Job => {
+      const turn = this.db.prepare(
+        `SELECT turn.* FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE controller.bb_thread_id = ? AND controller.state = 'active'
+            AND turn.state = 'submitted'
+          ORDER BY turn.ordinal ASC LIMIT 1`,
+      ).get(input.controllerThreadId) as ControllerTurnRow | undefined;
+      if (!turn) throw new TypeError("Controller thread has no authorized submitted turn");
+
+      const existing = this.readJobBySourceUpdate(turn.telegram_update_id);
+      if (existing) {
+        if (existing.requestText !== input.task || existing.projectId !== input.projectId) {
+          throw new IdempotencyConflictError(turn.telegram_update_id);
+        }
+        return existing;
+      }
+
+      const policyRecord = this.getProjectPolicy(input.projectId);
+      if (!policyRecord?.policy.enabled) throw new TypeError("Selected project is not enabled");
+      const active = this.getActiveJob();
+      if (active) throw new ActiveJobConflictError(active.id);
+
+      const jobId = createHash("sha256")
+        .update(`controller-job:${turn.controller_key}:${turn.telegram_update_id}`, "utf8")
+        .digest("base64url")
+        .slice(0, 22);
+      this.db.prepare(
+        `INSERT INTO jobs (
+           id, source_update_id, request_text, state, review_cycle,
+           review_block_at, version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'awaiting_project', 0, 3, 1, ?, ?)`,
+      ).run(jobId, turn.telegram_update_id, input.task, input.now, input.now);
+      const created = this.readJobById(jobId);
+      if (!created) throw new Error("Controller job was not stored");
+
+      const selected = transition(created, {
+        type: "PROJECT_SELECTED",
+        projectId: policyRecord.policy.projectId,
+        policyVersion: policyRecord.version,
+        policy: policyRecord.policy,
+      }, input.now);
+      persistJobTransition(this.db, jobId, created.version, selected.job);
+      persistPendingEffects(this.db, selected.effects, input.now);
+
+      const confirmed = transition(selected.job, { type: "CONFIRMED" }, input.now);
+      persistJobTransition(this.db, jobId, selected.job.version, confirmed.job);
+      persistPendingEffects(this.db, confirmed.effects, input.now);
+      return confirmed.job;
+    }).immediate();
   }
 
   public createJob(input: {
