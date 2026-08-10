@@ -334,4 +334,55 @@ describe("runValidation", () => {
     expect(result).toMatchObject({ event: "PR_HEAD_RESOLUTION_FAILED" });
     expect(result).toHaveProperty("code");
   });
+
+  describe("Task 8 round 1: owner command redaction", () => {
+    test("executes the raw owner command but never persists or titles it", async () => {
+      const rawCommand = "npm run verify -- --owner-secret=command-secret";
+      const { input, runner } = makeValidationHarness({
+        policyCommands: [rawCommand],
+        policyResults: [{ output: "verification passed", exitCode: 0 }],
+      });
+
+      const snapshot = await runValidation(input as never);
+      const policyCall = runner.run.mock.calls.find(([call]) => call.command === rawCommand)?.[0] as
+        | { command: string; title?: string }
+        | undefined;
+      const persisted = JSON.stringify(snapshot.commandReceipts);
+
+      expect(policyCall?.command).toBe(rawCommand);
+      expect(policyCall?.title).not.toContain(rawCommand);
+      expect(persisted).not.toContain(rawCommand);
+      expect(persisted).not.toContain("command-secret");
+      expect(persisted).toContain("[REDACTED]");
+    });
+
+    test.each(["error", "timeout", "abort"] as const)(
+      "redacts the raw owner command from a %s message",
+      async (outcome) => {
+        const rawCommand = `npm run verify -- --owner-secret=${outcome}-secret`;
+        const { input, runner } = makeValidationHarness({ policyCommands: [rawCommand] });
+        const baseRun = runner.run.getMockImplementation();
+        runner.run.mockImplementation(
+          (async ({ command }: { command: string }) => {
+            if (command === rawCommand) {
+              if (outcome === "error") throw new Error(`validation failed: ${rawCommand}`);
+              return { outcome: outcome === "timeout" ? "timed_out" : "aborted" } as never;
+            }
+            if (!baseRun) throw new Error("missing validation harness");
+            return baseRun({ command });
+          }) as never,
+        );
+
+        const error = await runValidation(input as never).then(
+          () => new Error("expected validation to reject"),
+          (value: unknown) => value as Error,
+        );
+
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).not.toContain(rawCommand);
+        expect(error.message).not.toContain(`${outcome}-secret`);
+        expect(error.message).toContain("[REDACTED]");
+      },
+    );
+  });
 });

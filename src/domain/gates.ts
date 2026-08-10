@@ -19,9 +19,11 @@ export type GateReasonCode =
   | "pr_draft"
   | "pr_closed"
   | "pr_base_mismatch"
+  | "pr_number_mismatch"
   | "merge_conflict"
   | "merge_blocked"
   | "mergeability_unknown"
+  | "merge_state_unknown"
   | "reviewer_mutated"
   | "review_sha_mismatch"
   | "review_findings"
@@ -33,6 +35,8 @@ export type GateReasonCode =
   | "required_check_failed"
   | "required_check_cancelled"
   | "receipt_binding_mismatch"
+  | "receipt_time_invalid"
+  | "receipt_expiry_invalid"
   | "job_version_stale"
   | "receipt_expired";
 
@@ -122,10 +126,11 @@ function reason(code: GateReasonCode, message: string): GateReason {
   return { code, message };
 }
 
-function dateValue(value: string | number | Date): number {
+function dateValue(value: unknown): number {
   if (value instanceof Date) return value.getTime();
   if (typeof value === "number") return value;
-  return Date.parse(value);
+  if (typeof value === "string") return Date.parse(value);
+  return Number.NaN;
 }
 
 function remoteRows(
@@ -149,22 +154,34 @@ function requiredCheckReason(
   required: string,
   checks: Array<Pick<RequiredCheck, "name" | "bucket"> & Partial<Omit<RequiredCheck, "name" | "bucket">>>,
 ): GateReason | null {
-  const check = checks.find((candidate) => candidate.name === required);
-  if (!check) return reason("required_check_missing", `Required check ${required} is missing`);
-  switch (check.bucket.toLowerCase()) {
-    case "pass":
-      return null;
-    case "pending":
-      return reason("required_check_pending", `Required check ${required} is pending`);
-    case "fail":
-    case "failure":
-      return reason("required_check_failed", `Required check ${required} is failing`);
-    case "cancel":
-    case "cancelled":
-      return reason("required_check_cancelled", `Required check ${required} was cancelled`);
-    default:
-      return reason("required_check_unknown", `Required check ${required} has an unknown outcome`);
-  }
+  const matching = checks.filter((candidate) => candidate.name === required);
+  if (matching.length === 0) return reason("required_check_missing", `Required check ${required} is missing`);
+  const reasons = matching
+    .map((check) => {
+      switch (typeof check.bucket === "string" ? check.bucket.toLowerCase() : "") {
+        case "pass":
+          return null;
+        case "pending":
+          return reason("required_check_pending", `Required check ${required} is pending`);
+        case "fail":
+        case "failure":
+          return reason("required_check_failed", `Required check ${required} is failing`);
+        case "cancel":
+        case "cancelled":
+          return reason("required_check_cancelled", `Required check ${required} was cancelled`);
+        default:
+          return reason("required_check_unknown", `Required check ${required} has an unknown outcome`);
+      }
+    })
+    .filter((checkReason): checkReason is GateReason => checkReason !== null);
+  if (reasons.length === 0) return null;
+  const priority: Record<GateReasonCode, number> = {
+    required_check_unknown: 0,
+    required_check_failed: 1,
+    required_check_cancelled: 2,
+    required_check_pending: 3,
+  } as Record<GateReasonCode, number>;
+  return [...reasons].sort((left, right) => priority[left.code] - priority[right.code])[0];
 }
 
 function receiptBindingReasons(input: GateInput, headSha: string, requiredCheckNames: string[]): GateReason[] {
@@ -179,6 +196,7 @@ function receiptBindingReasons(input: GateInput, headSha: string, requiredCheckN
     reviewAttemptId: input.review.attemptId,
     validationCompletedAt: input.validation.completedAt,
     mergeMethod: input.job.policy.mergeMethod,
+    expiresAt: input.receipt.expiresAt,
   };
   if (requiredCheckNames.length > 0) expected.requiredCheckNames = requiredCheckNames;
   const mismatched = Object.entries(expected).some(([key, value]) => {
@@ -226,15 +244,21 @@ export function evaluateMergeGates(input: GateInput): GateEvaluation {
   }
 
   const pullRequest = input.pullRequest;
+  if (pullRequest.number !== input.job.prNumber || input.githubPr.number !== input.job.prNumber) {
+    reasons.push(reason("pr_number_mismatch", "Pull-request metadata numbers do not match the job"));
+  }
   if (!pullRequest.available) reasons.push(reason("pr_unavailable", "The pull request is unavailable"));
   else {
     if (pullRequest.isDraft) reasons.push(reason("pr_draft", "The pull request is still a draft"));
     if (!["OPEN", "open"].includes(pullRequest.state)) reasons.push(reason("pr_closed", "The pull request is not open"));
     if (pullRequest.baseRefName !== policy.baseBranch) reasons.push(reason("pr_base_mismatch", "The pull request targets the wrong base branch"));
     if (pullRequest.mergeable === "CONFLICTING") reasons.push(reason("merge_conflict", "The pull request has merge conflicts"));
-    if (pullRequest.mergeStateStatus === "BLOCKED") reasons.push(reason("merge_blocked", "The pull request is blocked from merging"));
-    if (pullRequest.mergeable === "UNKNOWN" || pullRequest.mergeable === null) {
+    else if (pullRequest.mergeable !== "MERGEABLE") {
       reasons.push(reason("mergeability_unknown", "The pull request mergeability is unknown"));
+    }
+    if (pullRequest.mergeStateStatus === "BLOCKED") reasons.push(reason("merge_blocked", "The pull request is blocked from merging"));
+    else if (pullRequest.mergeStateStatus !== "CLEAN") {
+      reasons.push(reason("merge_state_unknown", "The pull request merge state is not explicitly safe"));
     }
   }
 
@@ -262,10 +286,14 @@ export function evaluateMergeGates(input: GateInput): GateEvaluation {
   }
 
   if (input.job.version !== input.receipt.jobVersion) reasons.push(reason("job_version_stale", "The ready receipt was created for an older job version"));
-  if (dateValue(input.receipt.expiresAt) <= dateValue(input.now)) reasons.push(reason("receipt_expired", "The ready receipt has expired"));
+  const now = dateValue(input.now);
+  const expiresAt = dateValue(input.receipt.expiresAt);
+  if (!Number.isFinite(now)) reasons.push(reason("receipt_time_invalid", "The gate evaluation time is invalid"));
+  if (!Number.isFinite(expiresAt)) reasons.push(reason("receipt_expiry_invalid", "The ready receipt expiry is invalid"));
+  else if (Number.isFinite(now) && expiresAt <= now) reasons.push(reason("receipt_expired", "The ready receipt has expired"));
 
   const headForReceipt = remoteHead ?? localHead ?? "";
-  if (reasons.length === 0) reasons.push(...receiptBindingReasons(input, headForReceipt, requiredNames));
+  reasons.push(...receiptBindingReasons(input, headForReceipt, requiredNames));
 
   if (reasons.length > 0) return { ready: false, reasons };
   return {

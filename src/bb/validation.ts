@@ -249,7 +249,7 @@ function receiptFor(
   result: CommandResult,
 ): void {
   collector.receipts.push({
-    command,
+    command: collector.redactor(command),
     outcome:
       result.outcome === "exited" ? (result.exitCode === 0 ? "pass" : "fail") : result.outcome,
     exitCode: result.outcome === "exited" ? result.exitCode : null,
@@ -265,16 +265,24 @@ async function runCommand(
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<Extract<CommandResult, { outcome: "exited" }>> {
-  const result = await runner.run({
-    scope: { kind: "environment", environmentId: scopeEnvironmentId },
-    title: `Telegram validation: ${command.slice(0, 80)}`,
-    command,
-    timeoutMs,
-    signal,
-  });
+  const redactedCommand = collector.redactor(command);
+  let result: CommandResult;
+  try {
+    result = await runner.run({
+      scope: { kind: "environment", environmentId: scopeEnvironmentId },
+      title: `Telegram validation: ${redactedCommand.slice(0, 80)}`,
+      command,
+      timeoutMs,
+      signal,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const redactedMessage = collector.redactor(message.split(command).join(redactedCommand));
+    fail("command_failed", `Command failed: ${redactedMessage}`);
+  }
   receiptFor(collector, command, result);
-  if (result.outcome === "timed_out") fail("command_timeout", `Command timed out: ${command}`);
-  if (result.outcome === "aborted") fail("command_aborted", `Command was aborted: ${command}`);
+  if (result.outcome === "timed_out") fail("command_timeout", `Command timed out: ${redactedCommand}`);
+  if (result.outcome === "aborted") fail("command_aborted", `Command was aborted: ${redactedCommand}`);
   return result;
 }
 

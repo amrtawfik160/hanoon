@@ -118,4 +118,95 @@ describe("TerminalCommandRunner", () => {
     expect(sdk.terminals.create).not.toHaveBeenCalled();
     expect(result).toEqual({ outcome: "aborted" });
   });
+
+  describe("Task 8 round 1: shared lifecycle deadlines", () => {
+    test.each(["create", "get", "output"] as const)(
+      "bounds a %s SDK promise that ignores abort and closes known sessions without waiting",
+      async (blockedStage) => {
+        vi.useFakeTimers();
+        const never = () => new Promise<never>(() => undefined);
+        const create =
+          blockedStage === "create"
+            ? vi.fn().mockImplementation(never)
+            : vi.fn().mockResolvedValue({ id: "terminal-1" });
+        const get =
+          blockedStage === "get"
+            ? vi.fn().mockImplementation(never)
+            : vi.fn().mockResolvedValue({ status: "exited", exitCode: 0 });
+        const output =
+          blockedStage === "output"
+            ? vi.fn().mockImplementation(never)
+            : vi.fn().mockResolvedValue({ chunks: [] });
+        const close = vi.fn().mockImplementation(never);
+        const sdk = makeSdk({ create, get, output, close });
+        const runner = new TerminalCommandRunner(sdk as never);
+        const timeoutMs = 100;
+        const pending = runner.run({
+          scope: { kind: "environment", environmentId: "env-1" },
+          title: "bounded",
+          command: "ignored-signal-command",
+          timeoutMs,
+        });
+        const guard = new Promise<"guard">((resolve) => {
+          setTimeout(() => resolve("guard"), timeoutMs * 2);
+        });
+
+        await vi.advanceTimersByTimeAsync(timeoutMs * 2);
+        const result = await Promise.race([pending, guard]);
+
+        expect(result).not.toBe("guard");
+        expect(result).toEqual({ outcome: "timed_out" });
+        if (blockedStage !== "create") expect(close).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    test("returns aborted for an in-flight ignored SDK promise and closes once", async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      const get = vi.fn().mockImplementation(() => new Promise<never>(() => undefined));
+      const close = vi.fn().mockImplementation(() => new Promise<never>(() => undefined));
+      const sdk = makeSdk({ get, close });
+      const runner = new TerminalCommandRunner(sdk as never);
+      const pending = runner.run({
+        scope: { kind: "environment", environmentId: "env-1" },
+        title: "aborted",
+        command: "ignored-abort-command",
+        timeoutMs: 1_000,
+        signal: controller.signal,
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      controller.abort();
+      const guard = new Promise<"guard">((resolve) => {
+        setTimeout(() => resolve("guard"), 100);
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await Promise.race([pending, guard]);
+
+      expect(result).not.toBe("guard");
+      expect(result).toEqual({ outcome: "aborted" });
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    test("closes a normally exited session after collecting bounded output", async () => {
+      const close = vi.fn().mockResolvedValue(undefined);
+      const sdk = makeSdk({
+        get: vi.fn().mockResolvedValue({ status: "exited", exitCode: 0 }),
+        output: vi.fn().mockResolvedValue({ chunks: [{ sequence: 1, data: encoded("done") }] }),
+        close,
+      });
+      const runner = new TerminalCommandRunner(sdk as never);
+
+      const result = await runner.run({
+        scope: { kind: "environment", environmentId: "env-1" },
+        title: "normal-exit",
+        command: "echo done",
+        timeoutMs: 1_000,
+      });
+
+      expect(result).toEqual({ outcome: "exited", exitCode: 0, output: "done" });
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+  });
 });

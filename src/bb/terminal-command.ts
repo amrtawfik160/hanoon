@@ -34,6 +34,11 @@ type TerminalClient = {
 
 type BbSdk = BbPluginApi["sdk"];
 
+type BoundedResult<T> =
+  | { outcome: "value"; value: T }
+  | { outcome: "timed_out" }
+  | { outcome: "aborted" };
+
 const POLL_INTERVAL_MS = 250;
 const TAIL_BYTES = 65_536;
 
@@ -79,11 +84,11 @@ export class TerminalCommandRunner {
     return this.sdk.terminals as unknown as TerminalClient;
   }
 
-  private async closeForcefully(terminalId: string): Promise<void> {
+  private closeWithoutWaiting(terminalId: string): void {
     try {
-      await this.terminals().close({ terminalId, mode: "force" });
+      void Promise.resolve(this.terminals().close({ terminalId, mode: "force" })).catch(() => undefined);
     } catch {
-      // The caller already has a bounded outcome; a close race must not turn it into success.
+      // A close invocation can fail synchronously after the terminal outcome is fixed.
     }
   }
 
@@ -102,38 +107,123 @@ export class TerminalCommandRunner {
     });
   }
 
+  private bounded<T>(
+    operation: () => Promise<T>,
+    deadline: number,
+    signal?: AbortSignal,
+    onLateValue?: (value: T) => void,
+  ): Promise<BoundedResult<T>> {
+    if (signal?.aborted) return Promise.resolve({ outcome: "aborted" });
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return Promise.resolve({ outcome: "timed_out" });
+    return new Promise<BoundedResult<T>>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const finish = (result: BoundedResult<T>) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+      const onAbort = () => finish({ outcome: "aborted" });
+      timer = setTimeout(() => finish({ outcome: "timed_out" }), remaining);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      void operation().then(
+        (value) => {
+          if (settled) {
+            onLateValue?.(value);
+            return;
+          }
+          finish({ outcome: "value", value });
+        },
+        (error: unknown) => {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(error);
+          }
+        },
+      );
+    });
+  }
+
   private async waitForExit(
     terminalId: string,
-    timeoutMs: number,
-    signal?: AbortSignal,
+    deadline: number,
+    signal: AbortSignal | undefined,
+    closeOnce: () => void,
   ): Promise<CommandResult> {
-    const deadline = Date.now() + timeoutMs;
-
     while (true) {
       if (signal?.aborted) {
-        await this.closeForcefully(terminalId);
+        closeOnce();
         return { outcome: "aborted" };
       }
-
-      const status = await this.terminals().get({ terminalId, signal });
-      if (status.status === "exited") {
-        return {
-          outcome: "exited",
-          exitCode: status.exitCode ?? 1,
-          output: await this.collect(terminalId, signal),
-        };
-      }
-
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        await this.closeForcefully(terminalId);
+      if (deadline <= Date.now()) {
+        closeOnce();
         return { outcome: "timed_out" };
       }
 
+      const statusResult = await this.bounded(
+        () => this.terminals().get({ terminalId, signal }),
+        deadline,
+        signal,
+      );
+      if (statusResult.outcome === "aborted") {
+        closeOnce();
+        return { outcome: "aborted" };
+      }
+      if (statusResult.outcome === "timed_out") {
+        closeOnce();
+        return { outcome: "timed_out" };
+      }
+      const status = statusResult.value;
+      if (status.status === "exited") {
+        const outputResult = await this.bounded(() => this.collect(terminalId, signal), deadline, signal);
+        if (outputResult.outcome === "aborted") {
+          closeOnce();
+          return { outcome: "aborted" };
+        }
+        if (outputResult.outcome === "timed_out") {
+          closeOnce();
+          return { outcome: "timed_out" };
+        }
+        if (signal?.aborted) {
+          closeOnce();
+          return { outcome: "aborted" };
+        }
+        if (deadline <= Date.now()) {
+          closeOnce();
+          return { outcome: "timed_out" };
+        }
+        closeOnce();
+        return {
+          outcome: "exited",
+          exitCode: status.exitCode ?? 1,
+          output: outputResult.value,
+        };
+      }
+
       try {
-        await abortableDelay(Math.min(POLL_INTERVAL_MS, remaining), signal);
+        const remaining = deadline - Date.now();
+        const delayResult = await this.bounded(
+          () => abortableDelay(Math.min(POLL_INTERVAL_MS, remaining), signal),
+          deadline,
+          signal,
+        );
+        if (delayResult.outcome === "aborted") {
+          closeOnce();
+          return { outcome: "aborted" };
+        }
+        if (delayResult.outcome === "timed_out") {
+          closeOnce();
+          return { outcome: "timed_out" };
+        }
       } catch {
-        await this.closeForcefully(terminalId);
+        closeOnce();
         return { outcome: "aborted" };
       }
     }
@@ -144,7 +234,26 @@ export class TerminalCommandRunner {
     if (!Number.isFinite(input.timeoutMs) || input.timeoutMs < 0) {
       throw new TypeError("timeoutMs must be a finite non-negative number");
     }
-    const session = await this.start(input);
-    return this.waitForExit(session.id, input.timeoutMs, input.signal);
+    const deadline = Date.now() + input.timeoutMs;
+    let terminalId: string | null = null;
+    let closed = false;
+    const closeOnce = () => {
+      if (!terminalId || closed) return;
+      closed = true;
+      this.closeWithoutWaiting(terminalId);
+    };
+    const startResult = await this.bounded(
+      () => this.start(input),
+      deadline,
+      input.signal,
+      (lateSession) => {
+        terminalId = lateSession.id;
+        closeOnce();
+      },
+    );
+    if (startResult.outcome === "aborted") return { outcome: "aborted" };
+    if (startResult.outcome === "timed_out") return { outcome: "timed_out" };
+    terminalId = startResult.value.id;
+    return this.waitForExit(terminalId, deadline, input.signal, closeOnce);
   }
 }

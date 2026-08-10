@@ -222,6 +222,90 @@ describe("evaluateMergeGates", () => {
       "worktree_dirty",
       "review_findings",
       "validation_failed",
+      "receipt_binding_mismatch",
     ]);
+  });
+
+  describe("Task 8 round 1: PR identity and merge-state safety", () => {
+    test.each([
+      ["pull request number mismatch", (input: any) => (input.pullRequest.number = prNumber + 1)],
+      ["GitHub PR number mismatch", (input: any) => (input.githubPr.number = prNumber + 1)],
+      ["missing pull request number", (input: any) => delete input.pullRequest.number],
+      ["missing GitHub PR number", (input: any) => delete input.githubPr.number],
+    ])("blocks when %s", (_name, mutate) => {
+      const input = readyInput();
+      mutate(input);
+      expectBlocked(input, "pr_number_mismatch");
+    });
+
+    test.each([
+      ["mergeable is missing", (input: any) => delete input.pullRequest.mergeable],
+      ["mergeable is unrecognized", (input: any) => (input.pullRequest.mergeable = "MAYBE")],
+      ["merge state is missing", (input: any) => delete input.pullRequest.mergeStateStatus],
+      ["merge state is unrecognized", (input: any) => (input.pullRequest.mergeStateStatus = "MAYBE")],
+    ])("fails closed when %s", (_name, mutate) => {
+      const input = readyInput();
+      mutate(input);
+      const result = evaluate(input);
+
+      expect(result.ready).toBe(false);
+      if (result.ready) throw new Error("expected blocked gate evaluation");
+      expect(result.reasons).not.toHaveLength(0);
+    });
+  });
+
+  describe("Task 8 round 1: receipt binding and time validity", () => {
+    test.each([
+      ["invalid now", (input: any) => (input.now = "not-a-date"), "receipt_time_invalid"],
+      ["non-finite now", (input: any) => (input.now = Number.NaN), "receipt_time_invalid"],
+      ["missing expiry", (input: any) => delete input.receipt.expiresAt, "receipt_expiry_invalid"],
+      ["malformed expiry", (input: any) => (input.receipt.expiresAt = "not-a-date"), "receipt_expiry_invalid"],
+      ["non-finite expiry", (input: any) => (input.receipt.expiresAt = Number.POSITIVE_INFINITY), "receipt_expiry_invalid"],
+    ])("blocks on %s", (_name, mutate, reason) => {
+      const input = readyInput();
+      mutate(input);
+      expectBlocked(input, reason);
+    });
+
+    test("aggregates receipt binding failures even when another gate already fails", () => {
+      const input = readyInput();
+      input.projectId = "project-2";
+      input.receipt.projectId = "project-3";
+
+      const result = evaluate(input);
+
+      expect(result.ready).toBe(false);
+      if (result.ready) throw new Error("expected blocked gate evaluation");
+      expect(result.reasons.map(({ code }: { code: string }) => code)).toEqual(
+        expect.arrayContaining(["project_mismatch", "receipt_binding_mismatch"]),
+      );
+    });
+  });
+
+  describe("Task 8 round 1: duplicate required checks", () => {
+    test.each([
+      ["later failure", { name: "lint", bucket: "fail" }],
+      ["later pending", { name: "lint", bucket: "pending" }],
+      ["later unknown", { name: "lint", bucket: "unknown" }],
+      ["later cancellation", { name: "lint", bucket: "cancel" }],
+    ])("never lets an earlier pass mask a %s", (_name, laterCheck) => {
+      const input = readyInput();
+      input.job.policy.requiredChecks = ["lint"];
+      input.receipt.requiredCheckNames = ["lint"];
+      input.validation.requiredChecks = [
+        { name: "lint", bucket: "pass" },
+        laterCheck,
+      ];
+
+      const result = evaluate(input);
+
+      expect(result.ready).toBe(false);
+      if (result.ready) throw new Error("expected blocked gate evaluation");
+      expect(result.reasons).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ code: expect.stringMatching(/^required_check_/) }),
+        ]),
+      );
+    });
   });
 });
