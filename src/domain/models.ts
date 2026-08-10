@@ -118,6 +118,8 @@ export interface ReviewAttempt {
 export type JobState =
   | "awaiting_project"
   | "awaiting_confirmation"
+  | "planning"
+  | "critiquing"
   | "creating_implementation"
   | "implementing"
   | "locating_pr"
@@ -132,7 +134,7 @@ export type JobState =
   | "cancelled"
   | "merged";
 
-export type WorkerKind = "implementation" | "review" | "validation" | "merge";
+export type WorkerKind = "plan" | "critique" | "implementation" | "review" | "validation" | "merge";
 export type WorkerResourceKind = "bb_thread" | "bb_terminal";
 export type WorkerLivenessState =
   | "starting"
@@ -178,6 +180,7 @@ export interface Job {
   prUrl: string | null;
   prHeadSha: string | null;
   statusMessageId: number | null;
+  planCycle: number;
   reviewCycle: number;
   reviewBlockAt: number;
   cancelRequestedAt: number | null;
@@ -193,6 +196,8 @@ export interface JobEffect {
   jobId: string;
   kind:
     | "render_status"
+    | "spawn_plan"
+    | "spawn_critique"
     | "spawn_implementation"
     | "inspect_implementation"
     | "resolve_pr_head"
@@ -230,6 +235,10 @@ export type JobEvent =
       policy: ProjectPolicy;
     }
   | { type: "CONFIRMED" }
+  | { type: "PLAN_CREATED"; attemptId: string; threadId: string; environmentId: string }
+  | { type: "PLAN_READY"; attemptId: string }
+  | { type: "CRITIQUE_PASSED"; attemptId: string }
+  | { type: "CRITIQUE_NEEDS_REVISION"; attemptId: string; summary: string }
   | { type: "IMPLEMENTATION_CREATED"; threadId: string; environmentId: string }
   | { type: "IMPLEMENTATION_IDLE" }
   | { type: "PR_LOCATED"; number: number; url: string }

@@ -458,7 +458,9 @@ it("shows, retries, cancels, and rejects illegal job state transitions through t
     policy: policyFixture(),
   }, 2);
   const confirmed = store.applyJobEvent(selected.id, selected.version, { type: "CONFIRMED" }, 3);
-  const implementing = store.applyJobEvent(confirmed.id, confirmed.version, {
+  const planned = store.applyJobEvent(confirmed.id, confirmed.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 3);
+  const critiqued = store.applyJobEvent(planned.id, planned.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 3);
+  const implementing = store.applyJobEvent(critiqued.id, critiqued.version, {
     type: "IMPLEMENTATION_CREATED",
     threadId: "thr_retry",
     environmentId: "env_retry",

@@ -233,6 +233,52 @@ CREATE INDEX thread_operations_pending
   ON thread_operations(state, created_at);
 `] as const;
 
+export const PIPELINE_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN plan_cycle INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE pipeline_stage_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  role TEXT NOT NULL CHECK (role IN ('PLAN', 'CRITIQUE')),
+  ordinal INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('spawning', 'running', 'completed', 'failed')),
+  thread_id TEXT UNIQUE,
+  environment_id TEXT,
+  input_sha256 TEXT NOT NULL,
+  output_text TEXT,
+  output_sha256 TEXT,
+  outcome_json TEXT,
+  start_sha TEXT,
+  end_sha TEXT,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(job_id, role, ordinal)
+);
+CREATE INDEX pipeline_stage_attempts_job_role
+  ON pipeline_stage_attempts(job_id, role, ordinal DESC);
+CREATE TABLE worker_liveness_v2 (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  worker_kind TEXT NOT NULL CHECK (worker_kind IN ('plan', 'critique', 'implementation', 'review', 'validation', 'merge')),
+  resource_kind TEXT NOT NULL CHECK (resource_kind IN ('bb_thread', 'bb_terminal')),
+  resource_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('starting', 'active', 'stopping', 'idle', 'failed', 'unknown', 'stale')),
+  source_updated_at INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL,
+  stale_notified_at INTEGER
+);
+INSERT INTO worker_liveness_v2 (
+  job_id, worker_kind, resource_kind, resource_id, generation, state,
+  source_updated_at, observed_at, stale_notified_at
+) SELECT
+  job_id, worker_kind, resource_kind, resource_id, generation, state,
+  source_updated_at, observed_at, stale_notified_at
+FROM worker_liveness;
+DROP TABLE worker_liveness;
+ALTER TABLE worker_liveness_v2 RENAME TO worker_liveness;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -240,4 +286,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_MIGRATIONS,
   ...CONTROLLER_STREAM_MIGRATIONS,
   ...THREAD_OPERATION_MIGRATIONS,
+  ...PIPELINE_MIGRATIONS,
 ] as const;

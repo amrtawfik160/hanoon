@@ -100,6 +100,7 @@ export function jobFixture(overrides: Partial<Job> = {}): Job {
     prUrl: null,
     prHeadSha: null,
     statusMessageId: null,
+    planCycle: 0,
     reviewCycle: 0,
     reviewBlockAt: 3,
     cancelRequestedAt: null,

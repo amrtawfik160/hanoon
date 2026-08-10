@@ -72,8 +72,10 @@ it("finds active and thread-owned jobs and returns bounded newest jobs", () => {
   const { db, store } = storeFixture();
   const first = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "first", now: 1_000 });
   store.applyJobEvent(first.id, first.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
-  store.applyJobEvent(first.id, 2, { type: "CONFIRMED" }, 1_200);
-  const creating = store.applyJobEvent(first.id, 3, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
+  const planning = store.applyJobEvent(first.id, 2, { type: "CONFIRMED" }, 1_200);
+  const critiquing = store.applyJobEvent(first.id, planning.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_250);
+  const creating = store.applyJobEvent(first.id, critiquing.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_275);
+  const implementing = store.applyJobEvent(first.id, creating.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
   db.prepare("UPDATE jobs SET state = 'blocked', blocked_reason = 'configuration' WHERE id = ?").run(first.id);
   const second = store.createJob({ id: "job_2", sourceUpdateId: 102, requestText: "second", now: 1_400 });
 
@@ -81,7 +83,7 @@ it("finds active and thread-owned jobs and returns bounded newest jobs", () => {
   expect(store.findJobByThreadId("thr_i")?.id).toBe(first.id);
   expect(store.findJobByThreadId("missing")).toBeNull();
   expect(store.listJobs(1).map((item) => item.id)).toEqual([second.id]);
-  expect(creating.implementationThreadId).toBe("thr_i");
+  expect(implementing.implementationThreadId).toBe("thr_i");
 });
 
 it("deduplicates Telegram updates, advances the cursor monotonically, and records callbacks once", () => {
@@ -169,8 +171,10 @@ it("enqueues one reconcile effect for a known worker thread", () => {
   const { store } = storeFixture();
   const job = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "do it", now: 1_000 });
   store.applyJobEvent(job.id, job.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
-  store.applyJobEvent(job.id, 2, { type: "CONFIRMED" }, 1_200);
-  store.applyJobEvent(job.id, 3, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
+  const planning = store.applyJobEvent(job.id, 2, { type: "CONFIRMED" }, 1_200);
+  const critiquing = store.applyJobEvent(job.id, planning.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_250);
+  const creating = store.applyJobEvent(job.id, critiquing.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_275);
+  store.applyJobEvent(job.id, creating.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
 
   expect(store.enqueueReconcileForThread("thr_i", 2_000)).toBe(true);
   expect(store.enqueueReconcileForThread("thr_i", 2_001)).toBe(false);
@@ -197,7 +201,9 @@ it("keeps head receipts guarded by the pure transition before persisting validat
   const job = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "do it", now: 1_000 });
   const selected = store.applyJobEvent(job.id, job.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
   const confirmed = store.applyJobEvent(job.id, selected.version, { type: "CONFIRMED" }, 1_200);
-  const created = store.applyJobEvent(job.id, confirmed.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
+  const planned = store.applyJobEvent(job.id, confirmed.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_225);
+  const critiqued = store.applyJobEvent(job.id, planned.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_250);
+  const created = store.applyJobEvent(job.id, critiqued.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
   const implementing = store.applyJobEvent(job.id, created.version, { type: "IMPLEMENTATION_IDLE" }, 1_400);
   const locating = store.applyJobEvent(job.id, implementing.version, { type: "PR_LOCATED", number: 7, url: "https://github.test/pr/7" }, 1_500);
   const resolving = store.applyJobEvent(job.id, locating.version, { type: "PR_HEAD_RESOLVED", headSha: sha() }, 1_600);
@@ -206,6 +212,8 @@ it("keeps head receipts guarded by the pure transition before persisting validat
   expect(resolving.prHeadSha).toBe(sha());
   expect(store.listEffectsForJob(job.id).map((effect) => effect.kind)).toEqual([
     "render_status",
+    "spawn_plan",
+    "spawn_critique",
     "spawn_implementation",
     "render_status",
     "inspect_implementation",

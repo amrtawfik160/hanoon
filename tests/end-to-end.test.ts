@@ -6,6 +6,7 @@ import type { GateInput } from "../src/domain/gates";
 import type { Job, StoredEffect } from "../src/domain/models";
 import { resolvePrHead, runValidation, type ValidationSnapshot } from "../src/bb/validation";
 import { BbRunner } from "../src/bb/runner";
+import { buildCritiqueArtifact, buildPlanArtifact } from "../src/bb/pipeline-handoffs";
 import { TerminalCommandRunner } from "../src/bb/terminal-command";
 import { encodeCallbackData } from "../src/telegram/view";
 import type { TelegramUpdate } from "../src/telegram/types";
@@ -289,8 +290,12 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     harness.sdk.stub("threads.spawn", async (input: SpawnCall) => {
       spawns.push(input);
       threadNumber += 1;
+      const role = input.title.includes("review") ? "review"
+        : input.title.includes("critique") ? "critique"
+        : input.title.includes(" plan ") ? "plan"
+        : "implementation";
       return {
-        id: `thr_${input.title.includes("review") ? "review" : "implementation"}_${threadNumber}`,
+        id: `thr_${role}_${threadNumber}`,
         environmentId: "env_telegram_worktree",
       };
     });
@@ -484,6 +489,9 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       now,
       approvals,
       bb: {
+        spawnPlanner: (job, attempt, previousCritique) => runner.spawnPlanner(job, attempt, previousCritique),
+        spawnCritic: (job, attempt, plan) => runner.spawnCritic(job, attempt, plan),
+        spawnBuilderFromPlan: (job, attempt, plan) => runner.spawnBuilderFromPlan(job, attempt, plan),
         spawnImplementation: (job, attempt) => runner.spawnImplementation(job, attempt),
         spawnReview: (job, attempt) => runner.spawnReview(job, attempt),
         sendRemediation: (job, findings) => runner.sendRemediation(job, findings),
@@ -572,9 +580,47 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     const status = await telegram.sendMessage("70", { text: "Job started." });
     job = store.setJobStatusMessage(job.id, status.message_id, job.version, ++time);
     const statusMessageId = status.message_id;
-    expect(job.state).toBe("creating_implementation");
+    expect(job.state).toBe("planning");
 
     await drainEffects(store, makeRunner, now, "initial-executor");
+    let stage = store.getLatestPipelineStageAttempt(job.id, "PLAN");
+    if (!stage) throw new Error("planner stage was not created");
+    const planArtifact = buildPlanArtifact("# Plan\n\n1. Implement the bounded change.\n2. Run the configured checks.\n");
+    let stageLease = store.acquireExecutorLease("plan-completer", ++time, 1_000_000);
+    if (!stageLease.acquired) throw new Error("plan completion lease missing");
+    expect(store.completePipelineStageAttempt({
+      id: stage.id,
+      outputText: new TextDecoder().decode(planArtifact.bytes),
+      outputSha256: planArtifact.sha256,
+      outcome: { verdict: "success" },
+      ownerId: "plan-completer",
+      generation: stageLease.generation,
+      now: time,
+    })).toBe(true);
+    job = store.getJob(job.id)!;
+    store.applyJobEvent(job.id, job.version, { type: "PLAN_READY", attemptId: stage.id }, ++time);
+    store.releaseExecutorLease("plan-completer", stageLease.generation, ++time);
+
+    await drainEffects(store, makeRunner, now, "critique-executor");
+    stage = store.getLatestPipelineStageAttempt(job.id, "CRITIQUE");
+    if (!stage) throw new Error("critique stage was not created");
+    const critiqueArtifact = buildCritiqueArtifact({ verdict: "pass", summary: "The plan is complete and testable" });
+    stageLease = store.acquireExecutorLease("critique-completer", ++time, 1_000_000);
+    if (!stageLease.acquired) throw new Error("critique completion lease missing");
+    expect(store.completePipelineStageAttempt({
+      id: stage.id,
+      outputText: new TextDecoder().decode(critiqueArtifact.bytes),
+      outputSha256: critiqueArtifact.sha256,
+      outcome: { verdict: "pass", summary: "The plan is complete and testable" },
+      ownerId: "critique-completer",
+      generation: stageLease.generation,
+      now: time,
+    })).toBe(true);
+    job = store.getJob(job.id)!;
+    store.applyJobEvent(job.id, job.version, { type: "CRITIQUE_PASSED", attemptId: stage.id }, ++time);
+    store.releaseExecutorLease("critique-completer", stageLease.generation, ++time);
+
+    await drainEffects(store, makeRunner, now, "builder-executor");
     job = store.getJob(job.id)!;
     expect(job.state).toBe("implementing");
     expect(job.environmentId).toBe("env_telegram_worktree");
@@ -726,9 +772,14 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     expect(attempts.map((attempt) => attempt.head_sha)).toEqual([HEAD_ONE, HEAD_TWO, HEAD_THREE]);
     expect(new Set(attempts.map((attempt) => attempt.thread_id)).size).toBe(3);
     expect(attempts.every((attempt) => /^[0-9a-f]{64}$/.test(attempt.handoff_sha256))).toBe(true);
-    expect(attachments).toHaveLength(4);
+    expect(attachments).toHaveLength(9);
     expect(attachments.map((item) => item.filename)).toEqual([
       "work-order.md",
+      "work-order.md",
+      "plan.md",
+      "critique-packet.json",
+      "work-order.md",
+      "plan.md",
       "review-packet.json",
       "review-packet.json",
       "review-packet.json",

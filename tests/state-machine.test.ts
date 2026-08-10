@@ -9,7 +9,9 @@ import { activeWorkerFixture, jobFixture, policyFixture, sha, stateJob } from ".
 describe("job state machine", () => {
   it.each([
     ["awaiting_project", { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, "awaiting_confirmation", "render_status"],
-    ["awaiting_confirmation", { type: "CONFIRMED" }, "creating_implementation", "spawn_implementation"],
+    ["awaiting_confirmation", { type: "CONFIRMED" }, "planning", "spawn_plan"],
+    ["planning", { type: "PLAN_READY", attemptId: "stage_plan_1" }, "critiquing", "spawn_critique"],
+    ["critiquing", { type: "CRITIQUE_PASSED", attemptId: "stage_critique_1" }, "creating_implementation", "spawn_implementation"],
     ["creating_implementation", { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, "implementing", "render_status"],
     ["implementing", { type: "IMPLEMENTATION_IDLE" }, "locating_pr", "inspect_implementation"],
     ["locating_pr", { type: "PR_LOCATED", number: 7, url: "https://github.test/pr/7" }, "resolving_pr_head", "resolve_pr_head"],
@@ -31,6 +33,31 @@ describe("job state machine", () => {
 
     expect(result.job.state).toBe(to);
     expect(result.effects.map((item) => item.kind)).toContain(effect);
+  });
+
+  it("routes one critique revision back through a fresh plan and blocks the second", () => {
+    const first = transition(
+      stateJob("critiquing", { planCycle: 0 }),
+      { type: "CRITIQUE_NEEDS_REVISION", attemptId: "stage_critique_1", summary: "Add rollback details" },
+      2_000,
+    );
+
+    expect(first.job).toMatchObject({ state: "planning", planCycle: 1 });
+    expect(first.effects.map((effect) => effect.kind)).toEqual(["spawn_plan"]);
+
+    const second = transition(
+      stateJob("critiquing", { planCycle: 1 }),
+      { type: "CRITIQUE_NEEDS_REVISION", attemptId: "stage_critique_2", summary: "Still incomplete" },
+      2_100,
+    );
+
+    expect(second.job).toMatchObject({
+      state: "blocked",
+      planCycle: 2,
+      blockedReason: "review_limit",
+      lastError: "Plan critique limit reached",
+    });
+    expect(second.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
   });
 
   it("does not stop historical worker identifiers during cancellation", () => {
@@ -193,6 +220,8 @@ describe("job state machine", () => {
   });
 
   it.each([
+    ["planning", "spawn_plan"],
+    ["critiquing", "spawn_critique"],
     ["creating_implementation", "spawn_implementation"],
     ["implementing", "inspect_implementation"],
     ["locating_pr", "inspect_implementation"],

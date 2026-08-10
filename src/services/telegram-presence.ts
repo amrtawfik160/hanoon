@@ -10,6 +10,8 @@ const HEARTBEAT_MS = 4_000;
 const CONTROLLER_PRESENCE_STATES = new Set<ControllerTurnState>(["dispatching", "submitted"]);
 const WORKER_PRESENCE_STATES = new Set<WorkerLiveness["state"]>(["starting", "active"]);
 const JOB_WORKER_KIND: Partial<Record<JobState, WorkerKind>> = {
+  planning: "plan",
+  critiquing: "critique",
   creating_implementation: "implementation",
   implementing: "implementation",
   remediating: "implementation",

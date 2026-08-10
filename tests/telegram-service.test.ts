@@ -163,7 +163,7 @@ describe("Telegram ingress service", () => {
     );
     await promise;
 
-    expect(store.listEffectsForJob(draft.id).filter((effect) => effect.kind === "spawn_implementation")).toHaveLength(1);
+    expect(store.listEffectsForJob(draft.id).filter((effect) => effect.kind === "spawn_plan")).toHaveLength(1);
     expect(client).toHaveBeenCalledTimes(1);
   });
 

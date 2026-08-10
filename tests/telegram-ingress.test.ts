@@ -297,10 +297,10 @@ it("starts only the selected confirmed job with one deterministic effect", async
 
   const job = fixture.store.getJob(jobId);
   const effects = fixture.store.listEffectsForJob(jobId);
-  expect(job?.state).toBe("creating_implementation");
-  expect(effects.filter((effect) => effect.kind === "spawn_implementation")).toHaveLength(1);
-  expect(effects.find((effect) => effect.kind === "spawn_implementation")?.idempotencyKey).toBe(
-    `${jobId}:4:spawn_implementation`,
+  expect(job?.state).toBe("planning");
+  expect(effects.filter((effect) => effect.kind === "spawn_plan")).toHaveLength(1);
+  expect(effects.find((effect) => effect.kind === "spawn_plan")?.idempotencyKey).toBe(
+    `${jobId}:4:spawn_plan`,
   );
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM callbacks").get()).toEqual({ count: 2 });
 });
@@ -332,8 +332,8 @@ it("replays a Start callback after a crash before callback recording without dup
   await ingress.handleClaimed(update, 2_201);
 
   const effects = base.store.listEffectsForJob(jobId);
-  expect(base.store.getJob(jobId)?.state).toBe("creating_implementation");
-  expect(effects.filter((effect) => effect.kind === "spawn_implementation")).toHaveLength(1);
+  expect(base.store.getJob(jobId)?.state).toBe("planning");
+  expect(effects.filter((effect) => effect.kind === "spawn_plan")).toHaveLength(1);
   expect(base.db.prepare("SELECT COUNT(*) AS count FROM callbacks").get()).toEqual({ count: 2 });
 });
 
@@ -420,11 +420,23 @@ it("routes standalone text to Luna while a job is active and steers only a statu
     4_200,
   );
   const confirmed = fixture.store.applyJobEvent(jobId, selected.version, { type: "CONFIRMED" }, 4_201);
-  const implementing = fixture.store.applyJobEvent(
+  const planned = fixture.store.applyJobEvent(
     jobId,
     confirmed.version,
-    { type: "IMPLEMENTATION_CREATED", threadId: "thr_implementation", environmentId: "env_1" },
+    { type: "PLAN_READY", attemptId: "stage_plan" },
     4_202,
+  );
+  const critiqued = fixture.store.applyJobEvent(
+    jobId,
+    planned.version,
+    { type: "CRITIQUE_PASSED", attemptId: "stage_critique" },
+    4_203,
+  );
+  const implementing = fixture.store.applyJobEvent(
+    jobId,
+    critiqued.version,
+    { type: "IMPLEMENTATION_CREATED", threadId: "thr_implementation", environmentId: "env_1" },
+    4_204,
   );
   expect(implementing.state).toBe("implementing");
 

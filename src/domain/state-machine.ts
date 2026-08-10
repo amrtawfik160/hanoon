@@ -127,6 +127,8 @@ function headMatches(job: Job, headSha: string | undefined): boolean {
 
 function retryEffect(job: Job, effects: JobEffect[], resumeState: JobState): void {
   const effectByState: Partial<Record<JobState, JobEffect["kind"]>> = {
+    planning: "spawn_plan",
+    critiquing: "spawn_critique",
     creating_implementation: "spawn_implementation",
     implementing: "inspect_implementation",
     locating_pr: "inspect_implementation",
@@ -205,11 +207,58 @@ function transitionAwaitingProject(job: Job, event: JobEvent, effects: JobEffect
 
 function transitionAwaitingConfirmation(job: Job, event: JobEvent, effects: JobEffect[]): void {
   if (event.type !== "CONFIRMED") illegal(job, event);
-  job.state = "creating_implementation";
-  emitEffect(job, effects, "spawn_implementation", {
+  job.state = "planning";
+  emitEffect(job, effects, "spawn_plan", {
     policyVersion: job.policyVersion,
     projectId: job.projectId,
   });
+}
+
+function transitionPlanning(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "PLAN_CREATED") {
+    assertNonEmpty(event.attemptId, "attemptId");
+    assertNonEmpty(event.threadId, "threadId");
+    assertNonEmpty(event.environmentId, "environmentId");
+    job.environmentId = event.environmentId;
+    emitEffect(job, effects, "render_status");
+    return;
+  }
+  if (event.type === "PLAN_READY") {
+    assertNonEmpty(event.attemptId, "attemptId");
+    job.state = "critiquing";
+    emitEffect(job, effects, "spawn_critique", { planAttemptId: event.attemptId });
+    return;
+  }
+  illegal(job, event);
+}
+
+function transitionCritiquing(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "CRITIQUE_PASSED") {
+    assertNonEmpty(event.attemptId, "attemptId");
+    job.state = "creating_implementation";
+    emitEffect(job, effects, "spawn_implementation", { critiqueAttemptId: event.attemptId });
+    return;
+  }
+  if (event.type === "CRITIQUE_NEEDS_REVISION") {
+    assertNonEmpty(event.attemptId, "attemptId");
+    assertSummary(event.summary, "summary");
+    assertNonEmpty(event.summary, "summary");
+    job.planCycle += 1;
+    if (job.planCycle >= 2) {
+      job.state = "blocked";
+      job.blockedReason = "review_limit";
+      job.lastError = "Plan critique limit reached";
+      emitEffect(job, effects, "render_status");
+      return;
+    }
+    job.state = "planning";
+    emitEffect(job, effects, "spawn_plan", {
+      critiqueAttemptId: event.attemptId,
+      summary: event.summary,
+    });
+    return;
+  }
+  illegal(job, event);
 }
 
 function transitionCreatingImplementation(job: Job, event: JobEvent, effects: JobEffect[]): void {
@@ -414,6 +463,8 @@ function transitionTerminal(job: Job, event: JobEvent): void {
 const STATE_HANDLERS: Record<JobState, StateTransitionHandler> = {
   awaiting_project: transitionAwaitingProject,
   awaiting_confirmation: transitionAwaitingConfirmation,
+  planning: transitionPlanning,
+  critiquing: transitionCritiquing,
   creating_implementation: transitionCreatingImplementation,
   implementing: transitionImplementing,
   locating_pr: transitionLocatingPr,

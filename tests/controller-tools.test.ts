@@ -100,10 +100,10 @@ it("atomically creates one confirmed controller job through the existing state m
     now: 10_000,
   });
 
-  expect(job).toMatchObject({ state: "creating_implementation", projectId: "proj_1", policyVersion: 1 });
+  expect(job).toMatchObject({ state: "planning", projectId: "proj_1", policyVersion: 1 });
   expect(store.listEffectsForJob(job.id).map((effect) => effect.kind)).toEqual([
     "render_status",
-    "spawn_implementation",
+    "spawn_plan",
   ]);
   expect(store.createConfirmedControllerJob({
     controllerThreadId: "thr_controller",
@@ -264,6 +264,6 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     { projectId: "proj_1", task: "Fix the redirect and add a regression test" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   );
-  expect(started).toContain("creating_implementation");
+  expect(started).toContain("planning");
   expect(notify).toHaveBeenCalledOnce();
 });

@@ -105,34 +105,39 @@ describe("leased effect execution", () => {
     expect(store.getJob("job_1")?.blockedReason).toBe("permanent_effect_failure");
   });
 
-  it("dispatches Start work only through the injected BB runner after a live fence check", async () => {
+  it("dispatches Start to a planner only through the injected BB runner after a live fence check", async () => {
     const { store, db } = storeFixture();
     const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
     const selected = store.applyJobEvent(job.id, job.version, {
       type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture(),
     }, 1_001);
     store.applyJobEvent(job.id, selected.version, { type: "CONFIRMED" }, 1_002);
-    const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "spawn_implementation");
+    const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "spawn_plan");
     if (!effect) throw new Error("spawn effect missing");
     const lease = store.acquireExecutorLease("owner-a", 1_003, 30_000);
     if (!lease.acquired) throw new Error("lease missing");
     const claimed = store.leaseEffects("owner-a", lease.generation, 1_003, 10, 30_000)
       .find((item) => item.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("spawn effect was not leased");
-    const spawnImplementation = vi.fn(async () => ({ id: "thr_impl", environmentId: "env_1" }));
+    const spawnPlanner = vi.fn(async () => ({ id: "thr_plan", environmentId: "env_1" }));
     const deps = {
       store,
       fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
-      bb: { spawnImplementation },
+      bb: { spawnPlanner },
       now: () => 1_004,
     } satisfies EffectRunnerDependencies;
 
     const runner = new EffectRunner(deps);
     await runner.run(claimed);
 
-    expect(spawnImplementation).toHaveBeenCalledTimes(1);
-    expect(store.getJob(job.id)?.implementationThreadId).toBe("thr_impl");
-    expect(db.prepare("SELECT COUNT(*) AS count FROM effects WHERE kind = 'spawn_implementation'").get()).toEqual({ count: 1 });
+    expect(spawnPlanner).toHaveBeenCalledTimes(1);
+    expect(store.getJob(job.id)).toMatchObject({ state: "planning", environmentId: "env_1" });
+    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
+      state: "running",
+      threadId: "thr_plan",
+      environmentId: "env_1",
+    });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM effects WHERE kind = 'spawn_plan'").get()).toEqual({ count: 1 });
   });
 
   it("does not invoke BB after the executor fence is lost", async () => {
@@ -142,7 +147,7 @@ describe("leased effect execution", () => {
       type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture(),
     }, 1_001);
     store.applyJobEvent(job.id, selected.version, { type: "CONFIRMED" }, 1_002);
-    const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "spawn_implementation");
+    const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "spawn_plan");
     if (!effect) throw new Error("spawn effect missing");
     const first = store.acquireExecutorLease("owner-a", 1_003, 100);
     if (!first.acquired) throw new Error("lease missing");
@@ -150,16 +155,16 @@ describe("leased effect execution", () => {
       .find((item) => item.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("spawn effect was not leased");
     expect(store.acquireExecutorLease("owner-b", 1_104, 100)).toEqual({ acquired: true, generation: 2 });
-    const spawnImplementation = vi.fn(async () => ({ id: "thr_impl", environmentId: "env_1" }));
+    const spawnPlanner = vi.fn(async () => ({ id: "thr_plan", environmentId: "env_1" }));
 
     await expect(new EffectRunner({
       store,
       fence: { ownerId: "owner-a", generation: first.generation, signal: new AbortController().signal },
-      bb: { spawnImplementation },
+      bb: { spawnPlanner },
       now: () => 1_105,
     }).run(claimed)).rejects.toThrow("executor lease was lost");
 
-    expect(spawnImplementation).not.toHaveBeenCalled();
+    expect(spawnPlanner).not.toHaveBeenCalled();
     expect(db.prepare("SELECT status, lease_owner, lease_generation FROM effects WHERE idempotency_key = ?").get(effect.idempotencyKey)).toEqual({
       status: "leased",
       lease_owner: "owner-a",

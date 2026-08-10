@@ -421,7 +421,7 @@ export class TelegramIngress {
     let started = job;
     if (job.state === "awaiting_confirmation") {
       started = this.store.applyJobEvent(job.id, job.version, { type: "CONFIRMED" }, now);
-    } else if (!this.hasSpawnEffect(job)) {
+    } else if (!this.hasStartEffect(job)) {
       await this.finishCallback(callback.id, job.id, chatId, "start", "rejected", now, "Start is no longer available.");
       return;
     }
@@ -430,8 +430,9 @@ export class TelegramIngress {
     await this.finishCallback(callback.id, started.id, chatId, "start", "accepted", now, "Job started.");
   }
 
-  private hasSpawnEffect(job: Job): boolean {
-    return this.store.listEffectsForJob(job.id).some((effect) => effect.kind === "spawn_implementation");
+  private hasStartEffect(job: Job): boolean {
+    return this.store.listEffectsForJob(job.id).some((effect) =>
+      effect.kind === "spawn_plan" || effect.kind === "spawn_implementation");
   }
 
   private async cancelJob(

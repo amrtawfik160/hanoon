@@ -1,6 +1,19 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { Job, ProjectPolicy, WorkerLiveness } from "../domain/models";
+import {
+  CONTROLLER_MODEL,
+  CONTROLLER_PERMISSION,
+  CONTROLLER_PROVIDER,
+  CONTROLLER_REASONING,
+  CONTROLLER_SERVICE_TIER,
+} from "../controller/bb-controller";
 import { buildReviewPacket, buildWorkOrder, type HandoffArtifact } from "./handoffs";
+import {
+  buildCritiqueArtifact,
+  buildCritiquePacket,
+  buildPlanArtifact,
+  parseCritiqueResult,
+} from "./pipeline-handoffs";
 import {
   buildImplementationInstruction,
   buildRemediationPrompt,
@@ -29,6 +42,15 @@ export type BbAttempt = {
   threadId?: string | null;
   handoffPath?: string | null;
   handoffSha256?: string | null;
+};
+
+export type PipelineThreadAttempt = {
+  id: string;
+  role: "PLAN" | "CRITIQUE";
+  ordinal: number;
+  threadId?: string | null;
+  environmentId?: string | null;
+  outputText?: string | null;
 };
 
 export type EnvironmentSnapshot = {
@@ -61,6 +83,21 @@ function executionArgs(policy: ProjectPolicy["implementation"]): Record<string, 
   if (Object.keys(sources).length > 0) args.executionInputSources = sources;
   return args;
 }
+
+const LUNA_MAX_EXECUTION = {
+  providerId: CONTROLLER_PROVIDER,
+  model: CONTROLLER_MODEL,
+  reasoningLevel: CONTROLLER_REASONING,
+  serviceTier: CONTROLLER_SERVICE_TIER,
+  permissionMode: CONTROLLER_PERMISSION,
+  executionInputSources: {
+    providerId: "explicit",
+    model: "explicit",
+    reasoningLevel: "explicit",
+    serviceTier: "explicit",
+    permissionMode: "explicit",
+  },
+} as const;
 
 function recordHandoff(attempt: BbAttempt, artifact: HandoffArtifact, uploaded: { path: string }): void {
   attempt.handoffPath = uploaded.path;
@@ -143,6 +180,135 @@ export class BbRunner {
     const thread = await this.sdk.threads.spawn(request);
     attempt.threadId = thread.id;
     return thread;
+  }
+
+  public async spawnPlanner(
+    job: Job,
+    attempt: PipelineThreadAttempt,
+    previousCritique?: string | null,
+  ): Promise<ThreadResult> {
+    const policy = selectedPolicy(job);
+    const project = projectId(job, policy);
+    const workOrder = buildWorkOrder(job, policy);
+    const revisionText = previousCritique?.trim();
+    const critique = revisionText ? buildCritiqueArtifact(parseCritiqueResult(revisionText)) : null;
+    const uploadedWorkOrder = await this.upload(project, workOrder);
+    const uploadedCritique = critique ? await this.upload(project, critique) : null;
+    const prompt = revisionText
+      ? "Read the attached immutable work order and critique artifact. Return only the complete replacement plan as Markdown. Do not edit files, commit, push, merge, or deploy."
+      : "Read the attached immutable work order and produce a concrete, bounded implementation and verification plan as Markdown. Do not edit files, commit, push, merge, or deploy.";
+    const environment = job.environmentId
+      ? { type: "reuse", environmentId: job.environmentId }
+      : {
+          type: "host",
+          hostId: await this.resolveProjectHost(project),
+          workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: policy.baseBranch } },
+        };
+    const thread = await this.sdk.threads.spawn(spawnRequest({
+      projectId: project,
+      title: `Telegram ${job.id} plan ${attempt.id}`,
+      visibility: "visible",
+      input: [
+        { type: "text", text: prompt, mentions: [] },
+        uploadedWorkOrder,
+        ...(uploadedCritique ? [uploadedCritique] : []),
+      ],
+      environment,
+      ...LUNA_MAX_EXECUTION,
+    }));
+    attempt.threadId = thread.id;
+    attempt.environmentId = thread.environmentId;
+    return thread;
+  }
+
+  public async spawnCritic(
+    job: Job,
+    attempt: PipelineThreadAttempt,
+    planAttempt: PipelineThreadAttempt,
+  ): Promise<ThreadResult> {
+    const policy = selectedPolicy(job);
+    const project = projectId(job, policy);
+    const environmentId = planAttempt.environmentId ?? job.environmentId;
+    if (!environmentId) throw new TypeError("Critique requires the planning environment");
+    if (planAttempt.environmentId && job.environmentId && planAttempt.environmentId !== job.environmentId) {
+      throw new TypeError("Critique plan environment does not match the active job");
+    }
+    if (!planAttempt.threadId) throw new TypeError("Critique requires the planner thread identity");
+    if (!planAttempt.outputText) throw new TypeError("Critique requires completed planner output");
+    const workOrder = buildWorkOrder(job, policy);
+    const plan = buildPlanArtifact(planAttempt.outputText);
+    const packet = buildCritiquePacket(job, plan);
+    const uploadedWorkOrder = await this.upload(project, workOrder);
+    const uploadedPlan = await this.upload(project, plan);
+    const uploadedPacket = await this.upload(project, packet);
+    const thread = await this.sdk.threads.spawn(spawnRequest({
+      projectId: project,
+      parentThreadId: planAttempt.threadId,
+      title: `Telegram ${job.id} critique ${attempt.id}`,
+      visibility: "visible",
+      input: [
+        {
+          type: "text",
+          text: "Read the attached immutable work order, plan, and critique contract. Assess the plan independently and return strict JSON only. Do not inspect the planner conversation or edit files.",
+          mentions: [],
+        },
+        uploadedWorkOrder,
+        uploadedPlan,
+        uploadedPacket,
+      ],
+      environment: { type: "reuse", environmentId },
+      ...LUNA_MAX_EXECUTION,
+    }));
+    attempt.threadId = thread.id;
+    attempt.environmentId = thread.environmentId ?? environmentId;
+    return thread;
+  }
+
+  public async spawnBuilderFromPlan(
+    job: Job,
+    attempt: BbAttempt,
+    planAttempt: PipelineThreadAttempt,
+  ): Promise<ThreadResult> {
+    const policy = selectedPolicy(job);
+    const project = projectId(job, policy);
+    const environmentId = planAttempt.environmentId ?? job.environmentId;
+    if (!environmentId) throw new TypeError("Builder requires the planning environment");
+    if (planAttempt.environmentId && job.environmentId && planAttempt.environmentId !== job.environmentId) {
+      throw new TypeError("Builder plan environment does not match the active job");
+    }
+    if (!planAttempt.threadId || !planAttempt.outputText) {
+      throw new TypeError("Builder requires a completed plan attempt");
+    }
+    const workOrder = buildWorkOrder(job, policy);
+    const plan = buildPlanArtifact(planAttempt.outputText);
+    const uploadedWorkOrder = await this.upload(project, workOrder);
+    const uploadedPlan = await this.upload(project, plan);
+    recordHandoff(attempt, workOrder, uploadedWorkOrder);
+    const thread = await this.sdk.threads.spawn(spawnRequest({
+      projectId: project,
+      parentThreadId: planAttempt.threadId,
+      title: `Telegram ${job.id} implementation ${attempt.id}`,
+      visibility: "visible",
+      input: [
+        {
+          type: "text",
+          text: `Read the attached immutable work order ${workOrder.filename} and plan ${plan.filename}. Follow both files, implement the requested change, verify it, and report the required outcome.`,
+          mentions: [],
+        },
+        uploadedWorkOrder,
+        uploadedPlan,
+      ],
+      environment: { type: "reuse", environmentId },
+      ...executionArgs(policy.implementation),
+    }));
+    attempt.threadId = thread.id;
+    return thread;
+  }
+
+  public async getThreadOutput(threadId: string): Promise<string> {
+    if (!threadId) throw new TypeError("threadId must not be empty");
+    const result = await this.sdk.threads.output({ threadId });
+    return result.output ?? "";
   }
 
   public async spawnReview(

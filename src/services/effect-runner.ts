@@ -1,12 +1,17 @@
+import { createHash } from "node:crypto";
 import type { Job, JobEffect, ReviewFinding, StoredEffect, WorkerLiveness } from "../domain/models";
 import { ApprovalService } from "./approval-service";
-import type { BbAttempt, EnvironmentSnapshot } from "../bb/runner";
+import { buildWorkOrder } from "../bb/handoffs";
+import { buildPlanArtifact } from "../bb/pipeline-handoffs";
+import type { BbAttempt, EnvironmentSnapshot, PipelineThreadAttempt } from "../bb/runner";
 import type { TerminalCommandRunner } from "../bb/terminal-command";
 import { ValidationError, type ValidationSnapshot } from "../bb/validation";
 import { persistableJobStatusPayload, renderJobStatus } from "../telegram/view";
 import type {
   AttemptRecord,
   OutboxInput,
+  PipelineStageAttempt,
+  PipelineStageRole,
   TelegramAgentStore,
 } from "../storage/store";
 import { projectUnknownWorker, projectWorkerLiveness } from "./worker-liveness";
@@ -38,6 +43,9 @@ type BbThread = {
 type ThreadListResult = BbThread[] | { threads: BbThread[]; total?: number };
 
 type BbEffectAdapter = {
+  spawnPlanner?(job: Job, attempt: PipelineThreadAttempt, previousCritique?: string | null): Promise<{ id: string; environmentId?: string | null }>;
+  spawnCritic?(job: Job, attempt: PipelineThreadAttempt, plan: PipelineThreadAttempt): Promise<{ id: string; environmentId?: string | null }>;
+  spawnBuilderFromPlan?(job: Job, attempt: BbAttempt, plan: PipelineThreadAttempt): Promise<{ id: string; environmentId?: string | null }>;
   spawnImplementation?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
   spawnReview?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
   sendRemediation?(job: Job, findings: ReviewFinding[]): Promise<void>;
@@ -122,6 +130,8 @@ function fullSha(value: unknown): value is string {
 function expectedStates(kind: JobEffect["kind"]): readonly string[] {
   switch (kind) {
     case "render_status": return [];
+    case "spawn_plan": return ["planning"];
+    case "spawn_critique": return ["critiquing"];
     case "spawn_implementation": return ["creating_implementation"];
     case "inspect_implementation": return ["implementing", "locating_pr"];
     case "resolve_pr_head": return ["resolving_pr_head"];
@@ -143,6 +153,8 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
 
 const KNOWN_EFFECT_KINDS = new Set<string>([
   "render_status",
+  "spawn_plan",
+  "spawn_critique",
   "spawn_implementation",
   "inspect_implementation",
   "resolve_pr_head",
@@ -191,6 +203,23 @@ function listThreadsAdapter(bb: BbEffectAdapter): BbEffectAdapter["listThreads"]
   if (bb.threads?.list) return bb.threads.list.bind(bb.threads);
   if (bb.sdk?.threads?.list) return bb.sdk.threads.list.bind(bb.sdk.threads);
   return undefined;
+}
+
+function stageInputSha(...shaValues: string[]): string {
+  const hash = createHash("sha256");
+  for (const value of shaValues) hash.update(value, "utf8").update("\0", "utf8");
+  return hash.digest("hex");
+}
+
+function pipelineAttemptForRunner(attempt: PipelineStageAttempt): PipelineThreadAttempt {
+  return {
+    id: attempt.id,
+    role: attempt.role,
+    ordinal: attempt.ordinal,
+    threadId: attempt.threadId,
+    environmentId: attempt.environmentId,
+    outputText: attempt.outputText,
+  };
 }
 
 export class EffectRunner {
@@ -284,7 +313,16 @@ export class EffectRunner {
         return { threadId: candidate.id, environmentId };
       }
     }
-    const spawn = kind === "implementation" ? bb.spawnImplementation : bb.spawnReview;
+    const plan = kind === "implementation"
+      ? this.dependencies.store.getLatestPipelineStageAttempt(job.id, "PLAN")
+      : null;
+    const spawn = kind === "implementation" && plan?.state === "completed" && bb.spawnBuilderFromPlan
+      ? (candidateJob: Job, candidateAttempt: BbAttempt) => bb.spawnBuilderFromPlan!(
+          candidateJob,
+          candidateAttempt,
+          pipelineAttemptForRunner(plan),
+        )
+      : kind === "implementation" ? bb.spawnImplementation : bb.spawnReview;
     if (!spawn) throw new PermanentEffectError(`BB ${kind} runner is not configured`);
     this.assertFence();
     const created = await spawn(job, attempt);
@@ -297,6 +335,146 @@ export class EffectRunner {
       handoffSha256: attempt.handoffSha256 ?? null,
     });
     return { threadId, environmentId };
+  }
+
+  private async findPipelineStageCandidate(
+    bb: BbEffectAdapter,
+    job: Job,
+    attempt: PipelineStageAttempt,
+  ): Promise<{ threadId: string; environmentId: string } | null> {
+    const list = listThreadsAdapter(bb);
+    if (!list || !job.projectId) return null;
+    const expectedTitle = `Telegram ${job.id} ${attempt.role === "PLAN" ? "plan" : "critique"} ${attempt.id}`;
+    const candidates: BbThread[] = [];
+    for (let offset = 0; offset < 1_000; offset += 100) {
+      this.assertFence();
+      const page = await list({
+        projectId: job.projectId,
+        originPluginId: "telegram-agent",
+        includeHidden: true,
+        limit: 100,
+        offset,
+      });
+      const threads = Array.isArray(page) ? page : page.threads;
+      candidates.push(...threads.filter((thread) => thread.title === expectedTitle));
+      if (threads.length < 100) break;
+    }
+    if (candidates.length > 1) throw new PermanentEffectError("multiple matching pipeline threads indicate split-brain execution");
+    const candidate = candidates[0];
+    if (!candidate) return null;
+    if (candidate.projectId !== job.projectId) throw new PermanentEffectError("pipeline thread project ownership is invalid");
+    if (attempt.role === "CRITIQUE") {
+      const plan = this.dependencies.store.getLatestPipelineStageAttempt(job.id, "PLAN");
+      if (!plan?.threadId || candidate.parentThreadId !== plan.threadId) {
+        throw new PermanentEffectError("critique thread parent ownership is invalid");
+      }
+    } else if (candidate.parentThreadId !== null) {
+      throw new PermanentEffectError("planner thread parent ownership is invalid");
+    }
+    const environmentId = candidate.environmentId ?? job.environmentId;
+    if (!environmentId) throw new PermanentEffectError("pipeline thread has no environment id");
+    if (job.environmentId && environmentId !== job.environmentId) {
+      throw new PermanentEffectError("pipeline thread environment ownership is invalid");
+    }
+    return { threadId: candidate.id, environmentId };
+  }
+
+  private createPipelineAttempt(
+    effect: StoredEffect,
+    job: Job,
+    role: PipelineStageRole,
+    inputSha256: string,
+  ): PipelineStageAttempt {
+    const id = `stage:${effect.idempotencyKey}`;
+    const existing = this.dependencies.store.getPipelineStageAttempt(id);
+    return this.dependencies.store.createPipelineStageAttempt({
+      id,
+      jobId: job.id,
+      role,
+      ordinal: existing?.ordinal ?? this.dependencies.store.nextPipelineStageOrdinal(job.id, role),
+      inputSha256,
+      ownerId: this.dependencies.fence.ownerId,
+      generation: this.dependencies.fence.generation,
+      now: this.now(),
+    });
+  }
+
+  private bindPipelineAttempt(attempt: PipelineStageAttempt, threadId: string, environmentId: string): void {
+    const bound = this.dependencies.store.bindPipelineStageThread({
+      id: attempt.id,
+      threadId,
+      environmentId,
+      ownerId: this.dependencies.fence.ownerId,
+      generation: this.dependencies.fence.generation,
+      now: this.now(),
+    });
+    if (!bound) throw new Error("pipeline stage binding lost its executor fence");
+  }
+
+  private async spawnPlan(effect: StoredEffect, job: Job): Promise<void> {
+    const bb = this.dependencies.bb;
+    if (!bb?.spawnPlanner || !job.policy) throw new PermanentEffectError("BB planner runner is not configured");
+    const previousCritique = this.dependencies.store.getLatestPipelineStageAttempt(job.id, "CRITIQUE");
+    const workOrder = buildWorkOrder(job, job.policy);
+    const inputSha256 = previousCritique?.outputSha256
+      ? stageInputSha(workOrder.sha256, previousCritique.outputSha256)
+      : stageInputSha(workOrder.sha256);
+    const attempt = this.createPipelineAttempt(effect, job, "PLAN", inputSha256);
+    let created = attempt.threadId && attempt.environmentId
+      ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
+      : await this.findPipelineStageCandidate(bb, job, attempt);
+    if (!created) {
+      this.assertFence();
+      const result = await bb.spawnPlanner(job, pipelineAttemptForRunner(attempt), previousCritique?.outputText);
+      this.assertFence();
+      created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
+    }
+    this.bindPipelineAttempt(attempt, created.threadId, created.environmentId);
+    this.assertFence();
+    const current = this.dependencies.store.getJob(job.id);
+    if (current?.state === "planning" && current.environmentId === null) {
+      this.dependencies.store.applyJobEvent(job.id, current.version, {
+        type: "PLAN_CREATED",
+        attemptId: attempt.id,
+        threadId: created.threadId,
+        environmentId: created.environmentId,
+      }, this.now());
+    }
+  }
+
+  private async spawnCritique(effect: StoredEffect, job: Job): Promise<void> {
+    const bb = this.dependencies.bb;
+    if (!bb?.spawnCritic || !job.policy) throw new PermanentEffectError("BB critique runner is not configured");
+    const planAttemptId = textPayload(effect, "planAttemptId");
+    const plan = this.dependencies.store.getPipelineStageAttempt(planAttemptId);
+    if (!plan || plan.state !== "completed" || !plan.outputText || !plan.outputSha256 || !plan.threadId || !plan.environmentId) {
+      throw new PermanentEffectError("Critique requires a completed durable plan artifact");
+    }
+    if (plan.jobId !== job.id || plan.role !== "PLAN") {
+      throw new PermanentEffectError("Critique plan artifact does not belong to the active job");
+    }
+    const workOrder = buildWorkOrder(job, job.policy);
+    const planArtifact = buildPlanArtifact(plan.outputText);
+    if (planArtifact.sha256 !== plan.outputSha256) throw new PermanentEffectError("Durable plan artifact hash does not match its output");
+    const attempt = this.createPipelineAttempt(
+      effect,
+      job,
+      "CRITIQUE",
+      stageInputSha(workOrder.sha256, plan.outputSha256),
+    );
+    let created = attempt.threadId && attempt.environmentId
+      ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
+      : await this.findPipelineStageCandidate(bb, job, attempt);
+    if (!created) {
+      this.assertFence();
+      const result = await bb.spawnCritic(job, pipelineAttemptForRunner(attempt), pipelineAttemptForRunner(plan));
+      this.assertFence();
+      created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
+    }
+    if (created.environmentId !== plan.environmentId) {
+      throw new PermanentEffectError("Critique did not reuse the planning environment");
+    }
+    this.bindPipelineAttempt(attempt, created.threadId, created.environmentId);
   }
 
   private async spawnImplementation(effect: StoredEffect, job: Job): Promise<void> {
@@ -561,6 +739,12 @@ export class EffectRunner {
     switch (effect.kind) {
       case "render_status":
         this.enqueueStatus(job);
+        return;
+      case "spawn_plan":
+        await this.spawnPlan(effect, job);
+        return;
+      case "spawn_critique":
+        await this.spawnCritique(effect, job);
         return;
       case "spawn_implementation":
         await this.spawnImplementation(effect, job);

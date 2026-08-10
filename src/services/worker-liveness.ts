@@ -19,7 +19,12 @@ export type BbTerminalObservation = {
 type ThreadLike = BbThreadObservation;
 
 export function workerRegistrationGeneration(job: Job, workerKind: WorkerLiveness["workerKind"]): number {
-  const role = workerKind === "implementation" ? 1 : workerKind === "review" ? 2 : workerKind === "validation" ? 3 : 4;
+  const role = workerKind === "plan" ? 1
+    : workerKind === "critique" ? 2
+    : workerKind === "implementation" ? 3
+    : workerKind === "review" ? 4
+    : workerKind === "validation" ? 5
+    : 6;
   return job.version * 10 + role;
 }
 

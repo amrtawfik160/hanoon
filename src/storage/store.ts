@@ -142,6 +142,28 @@ export type AttemptRecord = {
   completedAt: number | null;
 };
 
+export type PipelineStageRole = "PLAN" | "CRITIQUE";
+export type PipelineStageAttemptState = "spawning" | "running" | "completed" | "failed";
+export type PipelineStageAttempt = {
+  id: string;
+  jobId: string;
+  role: PipelineStageRole;
+  ordinal: number;
+  state: PipelineStageAttemptState;
+  threadId: string | null;
+  environmentId: string | null;
+  inputSha256: string;
+  outputText: string | null;
+  outputSha256: string | null;
+  outcome: Record<string, unknown> | null;
+  startSha: string | null;
+  endSha: string | null;
+  lastError: string | null;
+  createdAt: number;
+  completedAt: number | null;
+  updatedAt: number;
+};
+
 export type MergeSuccessInput = {
   jobId: string;
   effectIdempotencyKey: string;
@@ -343,6 +365,7 @@ type JobRow = {
   pr_url: string | null;
   pr_head_sha: string | null;
   status_message_id: number | null;
+  plan_cycle: number;
   review_cycle: number;
   review_block_at: number;
   cancel_requested_at: number | null;
@@ -438,6 +461,25 @@ type ThreadOperationRow = {
   created_at: number;
   updated_at: number;
 };
+type PipelineStageAttemptRow = {
+  id: string;
+  job_id: string;
+  role: PipelineStageRole;
+  ordinal: number;
+  state: PipelineStageAttemptState;
+  thread_id: string | null;
+  environment_id: string | null;
+  input_sha256: string;
+  output_text: string | null;
+  output_sha256: string | null;
+  outcome_json: string | null;
+  start_sha: string | null;
+  end_sha: string | null;
+  last_error: string | null;
+  created_at: number;
+  completed_at: number | null;
+  updated_at: number;
+};
 type TelegramUpdateRow = {
   status: "processing" | "processed" | "failed";
   claim_owner: string | null;
@@ -448,6 +490,8 @@ type TelegramUpdateRow = {
 const JOB_STATES: ReadonlySet<JobState> = new Set([
   "awaiting_project",
   "awaiting_confirmation",
+  "planning",
+  "critiquing",
   "creating_implementation",
   "implementing",
   "locating_pr",
@@ -515,6 +559,7 @@ const MAX_EFFECT_KEY = 256;
 const MAX_MERGE_RESULT_JSON = 64_000;
 const MAX_EXTERNAL_URL_LENGTH = 500;
 const MAX_QUERY_DEPTH = 4;
+const MAX_PIPELINE_OUTPUT_BYTES = 65_536;
 const SAFE_MERGE_FAILURE_REASON = "Merge effect failed safely";
 const UNKNOWN_MERGE_OUTCOME_REASON = "Merge outcome is unknown; provider truth requires reconciliation";
 const SAFE_FAILED_MERGE_PAYLOAD = JSON.stringify({ mergeCleanup: "failed" });
@@ -546,6 +591,12 @@ function assertCanonicalPositiveDecimal(value: string, field: string): void {
 function assertSha256Hex(value: string): void {
   if (typeof value !== "string" || !SHA256_HEX.test(value)) {
     throw new TypeError("Pairing code must be a lowercase 64-character SHA-256 hex string");
+  }
+}
+
+function assertContentSha256(value: string, field: string): void {
+  if (typeof value !== "string" || !SHA256_HEX.test(value)) {
+    throw new TypeError(`${field} must be a lowercase 64-character SHA-256 hex string`);
   }
 }
 
@@ -1430,6 +1481,34 @@ export interface TelegramAgentStore {
     headSha?: string | null;
     now: number;
   }): AttemptRecord;
+  createPipelineStageAttempt(input: ControllerLeaseFence & {
+    id: string;
+    jobId: string;
+    role: PipelineStageRole;
+    ordinal: number;
+    inputSha256: string;
+  }): PipelineStageAttempt;
+  bindPipelineStageThread(input: ControllerLeaseFence & {
+    id: string;
+    threadId: string;
+    environmentId: string;
+  }): boolean;
+  completePipelineStageAttempt(input: ControllerLeaseFence & {
+    id: string;
+    outputText: string;
+    outputSha256: string;
+    outcome: Record<string, unknown>;
+    startSha?: string | null;
+    endSha?: string | null;
+  }): boolean;
+  failPipelineStageAttempt(input: ControllerLeaseFence & {
+    id: string;
+    error: string;
+  }): boolean;
+  getPipelineStageAttempt(id: string): PipelineStageAttempt | null;
+  getPipelineStageAttemptByThreadId(threadId: string): PipelineStageAttempt | null;
+  getLatestPipelineStageAttempt(jobId: string, role: PipelineStageRole): PipelineStageAttempt | null;
+  nextPipelineStageOrdinal(jobId: string, role: PipelineStageRole): number;
   updateAttempt(attemptId: string, patch: {
     threadId?: string | null;
     headSha?: string | null;
@@ -1680,6 +1759,7 @@ function parseJob(row: JobRow): Job {
     prUrl: row.pr_url,
     prHeadSha: row.pr_head_sha,
     statusMessageId: row.status_message_id,
+    planCycle: row.plan_cycle,
     reviewCycle: row.review_cycle,
     reviewBlockAt: row.review_block_at,
     cancelRequestedAt: row.cancel_requested_at,
@@ -1687,6 +1767,28 @@ function parseJob(row: JobRow): Job {
     lastError: row.last_error,
     version: row.version,
     createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function parsePipelineStageAttempt(row: PipelineStageAttemptRow): PipelineStageAttempt {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    role: row.role,
+    ordinal: row.ordinal,
+    state: row.state,
+    threadId: row.thread_id,
+    environmentId: row.environment_id,
+    inputSha256: row.input_sha256,
+    outputText: row.output_text,
+    outputSha256: row.output_sha256,
+    outcome: row.outcome_json === null ? null : JSON.parse(row.outcome_json) as Record<string, unknown>,
+    startSha: row.start_sha,
+    endSha: row.end_sha,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    completedAt: row.completed_at,
     updatedAt: row.updated_at,
   };
 }
@@ -1769,7 +1871,7 @@ function persistJobTransition(
          request_text = ?, state = ?, resume_state = ?, project_id = ?,
          policy_version = ?, policy_json = ?, environment_id = ?,
          implementation_thread_id = ?, review_thread_id = ?, pr_number = ?,
-         pr_url = ?, pr_head_sha = ?, status_message_id = ?, review_cycle = ?,
+         pr_url = ?, pr_head_sha = ?, status_message_id = ?, plan_cycle = ?, review_cycle = ?,
          review_block_at = ?, cancel_requested_at = ?, blocked_reason = ?,
          last_error = ?, version = ?, updated_at = ?
        WHERE id = ? AND version = ?`,
@@ -1788,6 +1890,7 @@ function persistJobTransition(
       transitionedJob.prUrl,
       transitionedJob.prHeadSha,
       transitionedJob.statusMessageId,
+      transitionedJob.planCycle,
       transitionedJob.reviewCycle,
       transitionedJob.reviewBlockAt,
       transitionedJob.cancelRequestedAt,
@@ -1830,7 +1933,7 @@ const JOB_SELECT = `
   SELECT id, source_update_id, request_text, state, resume_state, project_id,
          policy_version, policy_json, environment_id, implementation_thread_id,
          review_thread_id, pr_number, pr_url, pr_head_sha, status_message_id,
-         review_cycle, review_block_at, cancel_requested_at, blocked_reason,
+         plan_cycle, review_cycle, review_block_at, cancel_requested_at, blocked_reason,
          last_error, version, created_at, updated_at
     FROM jobs`;
 
@@ -3111,8 +3214,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public findJobByThreadId(threadId: string): Job | null {
     const row = this.db
-      .prepare(`${JOB_SELECT} WHERE implementation_thread_id = ? OR review_thread_id = ? ORDER BY updated_at DESC LIMIT 1`)
-      .get(threadId, threadId) as JobRow | undefined;
+      .prepare(`${JOB_SELECT} WHERE implementation_thread_id = ? OR review_thread_id = ?
+        OR id IN (SELECT job_id FROM pipeline_stage_attempts WHERE thread_id = ?)
+        ORDER BY updated_at DESC LIMIT 1`)
+      .get(threadId, threadId, threadId) as JobRow | undefined;
     return row ? parseJob(row) : null;
   }
 
@@ -3295,6 +3400,175 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const stored = this.getAttempt(attemptId);
     if (!stored) throw new Error(`Attempt ${attemptId} was not found`);
     return stored;
+  }
+
+  public createPipelineStageAttempt(input: ControllerLeaseFence & {
+    id: string;
+    jobId: string;
+    role: PipelineStageRole;
+    ordinal: number;
+    inputSha256: string;
+  }): PipelineStageAttempt {
+    if (!input.id || !input.jobId) throw new TypeError("pipeline stage identity is required");
+    if (input.role !== "PLAN" && input.role !== "CRITIQUE") throw new TypeError("pipeline stage role is invalid");
+    assertPositiveInteger(input.ordinal, "ordinal");
+    assertContentSha256(input.inputSha256, "inputSha256");
+    assertNonNegativeInteger(input.now, "now");
+    if (!input.ownerId || !Number.isInteger(input.generation) || input.generation < 1) {
+      throw new TypeError("executor fence is invalid");
+    }
+    return this.db.transaction((): PipelineStageAttempt => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) {
+        throw new Error("executor lease was lost");
+      }
+      this.db.prepare(
+        `INSERT OR IGNORE INTO pipeline_stage_attempts (
+           id, job_id, role, ordinal, state, input_sha256, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'spawning', ?, ?, ?)`,
+      ).run(input.id, input.jobId, input.role, input.ordinal, input.inputSha256, input.now, input.now);
+      const stored = this.getPipelineStageAttempt(input.id);
+      if (!stored) throw new Error("Pipeline stage attempt was not stored");
+      if (
+        stored.jobId !== input.jobId || stored.role !== input.role ||
+        stored.ordinal !== input.ordinal || stored.inputSha256 !== input.inputSha256
+      ) throw new Error("Pipeline stage attempt idempotency conflict");
+      return stored;
+    }).immediate();
+  }
+
+  public bindPipelineStageThread(input: ControllerLeaseFence & {
+    id: string;
+    threadId: string;
+    environmentId: string;
+  }): boolean {
+    if (!input.id || !input.threadId || !input.environmentId) throw new TypeError("pipeline thread identity is required");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const current = this.getPipelineStageAttempt(input.id);
+      if (!current) return false;
+      if (current.threadId !== null || current.environmentId !== null) {
+        return current.threadId === input.threadId && current.environmentId === input.environmentId &&
+          (current.state === "running" || current.state === "completed");
+      }
+      return this.db.prepare(
+        `UPDATE pipeline_stage_attempts
+           SET thread_id = ?, environment_id = ?, state = 'running', updated_at = ?
+         WHERE id = ? AND state = 'spawning'
+           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+      ).run(
+        input.threadId,
+        input.environmentId,
+        input.now,
+        input.id,
+        input.ownerId,
+        input.generation,
+        input.now,
+      ).changes === 1;
+    }).immediate();
+  }
+
+  public completePipelineStageAttempt(input: ControllerLeaseFence & {
+    id: string;
+    outputText: string;
+    outputSha256: string;
+    outcome: Record<string, unknown>;
+    startSha?: string | null;
+    endSha?: string | null;
+  }): boolean {
+    if (!input.id) throw new TypeError("pipeline stage id is required");
+    if (
+      typeof input.outputText !== "string" || input.outputText.length === 0 ||
+      new TextEncoder().encode(input.outputText).byteLength > MAX_PIPELINE_OUTPUT_BYTES
+    ) {
+      throw new TypeError("pipeline stage output must be bounded to 65536 bytes");
+    }
+    assertContentSha256(input.outputSha256, "outputSha256");
+    if (input.startSha !== undefined && input.startSha !== null) assertFullSha(input.startSha, "startSha");
+    if (input.endSha !== undefined && input.endSha !== null) assertFullSha(input.endSha, "endSha");
+    assertNonNegativeInteger(input.now, "now");
+    const outcomeJson = serializeBoundedJson(input.outcome, "pipeline stage outcome", MAX_MERGE_RESULT_JSON);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const current = this.getPipelineStageAttempt(input.id);
+      if (!current) return false;
+      if (current.state === "completed") {
+        return current.outputText === input.outputText && current.outputSha256 === input.outputSha256 &&
+          JSON.stringify(current.outcome) === outcomeJson;
+      }
+      return this.db.prepare(
+        `UPDATE pipeline_stage_attempts
+           SET state = 'completed', output_text = ?, output_sha256 = ?, outcome_json = ?,
+               start_sha = ?, end_sha = ?, last_error = NULL, completed_at = ?, updated_at = ?
+         WHERE id = ? AND state = 'running'
+           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+      ).run(
+        input.outputText,
+        input.outputSha256,
+        outcomeJson,
+        input.startSha ?? null,
+        input.endSha ?? null,
+        input.now,
+        input.now,
+        input.id,
+        input.ownerId,
+        input.generation,
+        input.now,
+      ).changes === 1;
+    }).immediate();
+  }
+
+  public failPipelineStageAttempt(input: ControllerLeaseFence & { id: string; error: string }): boolean {
+    if (!input.id) throw new TypeError("pipeline stage id is required");
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE pipeline_stage_attempts
+         SET state = 'failed', last_error = ?, completed_at = ?, updated_at = ?
+       WHERE id = ? AND state IN ('spawning', 'running')
+         AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+           AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+    ).run(
+      input.error,
+      input.now,
+      input.now,
+      input.id,
+      input.ownerId,
+      input.generation,
+      input.now,
+    ).changes === 1;
+  }
+
+  public getPipelineStageAttempt(id: string): PipelineStageAttempt | null {
+    if (!id) return null;
+    const row = this.db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?").get(id) as PipelineStageAttemptRow | undefined;
+    return row ? parsePipelineStageAttempt(row) : null;
+  }
+
+  public getPipelineStageAttemptByThreadId(threadId: string): PipelineStageAttempt | null {
+    if (!threadId) return null;
+    const row = this.db.prepare("SELECT * FROM pipeline_stage_attempts WHERE thread_id = ?").get(threadId) as PipelineStageAttemptRow | undefined;
+    return row ? parsePipelineStageAttempt(row) : null;
+  }
+
+  public getLatestPipelineStageAttempt(jobId: string, role: PipelineStageRole): PipelineStageAttempt | null {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    if (role !== "PLAN" && role !== "CRITIQUE") throw new TypeError("pipeline stage role is invalid");
+    const row = this.db.prepare(
+      "SELECT * FROM pipeline_stage_attempts WHERE job_id = ? AND role = ? ORDER BY ordinal DESC LIMIT 1",
+    ).get(jobId, role) as PipelineStageAttemptRow | undefined;
+    return row ? parsePipelineStageAttempt(row) : null;
+  }
+
+  public nextPipelineStageOrdinal(jobId: string, role: PipelineStageRole): number {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    if (role !== "PLAN" && role !== "CRITIQUE") throw new TypeError("pipeline stage role is invalid");
+    const row = this.db.prepare(
+      "SELECT COALESCE(MAX(ordinal), 0) AS max_ordinal FROM pipeline_stage_attempts WHERE job_id = ? AND role = ?",
+    ).get(jobId, role) as { max_ordinal: number };
+    return row.max_ordinal + 1;
   }
 
   public claimReviewFormatCorrection(attemptId: string, threadId: string, headSha: string): boolean {
@@ -4953,8 +5227,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!threadId) throw new TypeError("threadId must not be empty");
     const enqueue = this.db.transaction((): boolean => {
       const job = this.db
-        .prepare(`${JOB_SELECT} WHERE implementation_thread_id = ? OR review_thread_id = ? ORDER BY updated_at DESC LIMIT 1`)
-        .get(threadId, threadId) as JobRow | undefined;
+        .prepare(`${JOB_SELECT} WHERE implementation_thread_id = ? OR review_thread_id = ?
+          OR id IN (SELECT job_id FROM pipeline_stage_attempts WHERE thread_id = ?)
+          ORDER BY updated_at DESC LIMIT 1`)
+        .get(threadId, threadId, threadId) as JobRow | undefined;
       if (!job) return false;
       const result = this.db
         .prepare(

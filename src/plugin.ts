@@ -26,6 +26,7 @@ import { BbControllerAdapter } from "./controller/bb-controller";
 import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { ThreadOperationService } from "./controller/operations";
+import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
 
 function clock(): number {
   return Date.now();
@@ -316,6 +317,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
 
   const bbEffectAdapter = {
+    spawnPlanner: (job: Parameters<BbRunner["spawnPlanner"]>[0], attempt: Parameters<BbRunner["spawnPlanner"]>[1], previousCritique?: string | null) => bbRunner.spawnPlanner(job, attempt, previousCritique),
+    spawnCritic: (job: Parameters<BbRunner["spawnCritic"]>[0], attempt: Parameters<BbRunner["spawnCritic"]>[1], plan: Parameters<BbRunner["spawnCritic"]>[2]) => bbRunner.spawnCritic(job, attempt, plan),
+    spawnBuilderFromPlan: (job: Parameters<BbRunner["spawnBuilderFromPlan"]>[0], attempt: Parameters<BbRunner["spawnBuilderFromPlan"]>[1], plan: Parameters<BbRunner["spawnBuilderFromPlan"]>[2]) => bbRunner.spawnBuilderFromPlan(job, attempt, plan),
     spawnImplementation: (job: Parameters<BbRunner["spawnImplementation"]>[0], attempt: Parameters<BbRunner["spawnImplementation"]>[1]) => bbRunner.spawnImplementation(job, attempt),
     spawnReview: (job: Parameters<BbRunner["spawnReview"]>[0], attempt: Parameters<BbRunner["spawnReview"]>[1]) => bbRunner.spawnReview(job, attempt),
     sendRemediation: (job: Parameters<BbRunner["sendRemediation"]>[0], findings: Parameters<BbRunner["sendRemediation"]>[1]) => bbRunner.sendRemediation(job, findings),
@@ -335,11 +339,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock());
     if (!fenceCurrent()) return;
 
+    const pipelineRole = job.state === "planning" ? "PLAN" as const : job.state === "critiquing" ? "CRITIQUE" as const : null;
+    const pipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
     const reviewStage = job.state === "reviewing";
     const implementationStage = ["creating_implementation", "implementing", "locating_pr", "resolving_pr_head", "remediating"].includes(job.state);
-    const resourceId = reviewStage ? job.reviewThreadId : implementationStage ? job.implementationThreadId : null;
+    const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? job.reviewThreadId : implementationStage ? job.implementationThreadId : null);
     if (!resourceId) return;
-    const workerKind = reviewStage ? "review" as const : "implementation" as const;
+    const workerKind = pipelineRole === "PLAN" ? "plan" as const : pipelineRole === "CRITIQUE" ? "critique" as const : reviewStage ? "review" as const : "implementation" as const;
     const generation = workerRegistrationGeneration(job, workerKind);
     let thread: Awaited<ReturnType<BbRunner["getThread"]>>;
     try {
@@ -352,12 +358,23 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     }
     if (!fenceCurrent()) return;
     const current = store.getJob(job.id);
-    if (!current || current.state !== job.state || (reviewStage ? current.reviewThreadId : current.implementationThreadId) !== resourceId) return;
+    const currentPipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
+    const currentResourceId = currentPipelineAttempt?.threadId ?? (reviewStage ? current?.reviewThreadId : current?.implementationThreadId);
+    if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
     const projected = projectWorkerLiveness(store, current, thread, clock(), workerKind, generation);
     const failed = thread.status === "error" || thread.runtime.displayStatus === "error";
     if (failed) {
       if (!fenceCurrent()) return;
+      if (currentPipelineAttempt) {
+        store.failPipelineStageAttempt({
+          id: currentPipelineAttempt.id,
+          error: `${workerKind} worker thread failed`,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: clock(),
+        });
+      }
       const latest = store.getJob(job.id);
       if (latest && latest.cancelRequestedAt === null) {
         store.applyJobEvent(job.id, latest.version, { type: "THREAD_FAILED", workerKind, error: `${workerKind} worker thread failed` }, clock());
@@ -365,6 +382,37 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       return;
     }
     if (projected.state !== "idle") return;
+
+    if (pipelineRole && currentPipelineAttempt) {
+      let output: string;
+      try {
+        output = await bbRunner.getThreadOutput(resourceId);
+      } catch {
+        if (!fenceCurrent()) return;
+        store.failPipelineStageAttempt({
+          id: currentPipelineAttempt.id,
+          error: `${workerKind} output is unavailable`,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: clock(),
+        });
+        const latest = store.getJob(job.id);
+        if (latest?.state === job.state) {
+          store.applyJobEvent(job.id, latest.version, { type: "FAILED", error: `${workerKind} output is unavailable` }, clock());
+        }
+        return;
+      }
+      if (!fenceCurrent()) return;
+      settlePipelineStageOutput({
+        store,
+        job: current,
+        attempt: currentPipelineAttempt,
+        output,
+        fence: { ownerId: fence.ownerId, generation: fence.generation },
+        now: clock(),
+      });
+      return;
+    }
 
     if (!reviewStage) {
       if (!fenceCurrent()) return;
