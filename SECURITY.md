@@ -14,7 +14,8 @@ If a credential may have been exposed, rotate it with its provider first. For a 
 
 - One Telegram user and one private chat are paired as the owner. Pairing that chat grants the holder of it operator-level control of this BB installation.
 - The plugin itself is trusted server-side code; installation is not a sandbox boundary.
-- The conversational agent runs in a hidden personal workspace with the plugin's guarded tools **and** BB's ordinary agent capabilities. It defaults to the `full` permission mode, so it may use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without a per-action prompt. Set `auto` or `accept-edits` if you want execution approved in the BB app instead.
+- The conversational agent runs in a hidden personal workspace with the plugin's guarded tools **and** BB's ordinary agent capabilities. It defaults to the `full` permission mode, so it may use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without a per-action prompt. Set `auto` or `accept-edits` if you want execution approved in the BB app instead. Those prompts are answered in the BB app only: the plugin bridges the agent's *questions* to Telegram, not its permission prompts.
+- Approval prompts raised by visible top-level worker threads are bridged to Telegram, so an owner's tap there authorizes a command or file write in that thread. This moves where the decision is made, not who may make it — the paired chat already holds operator-level control. Approvals the plugin cannot represent faithfully are reported without buttons rather than resolved by guess.
 - Enabled project policies are trusted operator input. Their validation, deployment, and canary commands execute on the selected project host.
 - BB controls provider conversations, permissions, environments, worktrees, and merge execution.
 - GitHub authentication, repository rules, and branch protection remain external security boundaries.
@@ -28,7 +29,8 @@ The plugin can:
 - run configured validation, deployment, and canary commands;
 - send bounded remediation to an implementation worker;
 - request a pull-request merge after review, validation, and owner approval;
-- read and update its durable job, memory, monitor, approval, liveness, and Telegram outbox state.
+- read and update its durable job, memory, monitor, approval, liveness, and Telegram outbox state;
+- resolve pending BB interactions on visible top-level threads from the owner's Telegram tap, including *Allow once* and *Allow all session* on a command or file-change approval.
 
 Merge approval is one-use, expiring, and bound to the current full pull-request head. Deployment and canary run only after the merge is confirmed and the worktree is verified at the merge commit. The plugin does not automatically run rollback.
 

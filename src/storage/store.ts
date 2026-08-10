@@ -23,6 +23,16 @@ import type {
   ControllerTurnRecord,
   ControllerTurnState,
 } from "../controller/models";
+import {
+  nextUnansweredQuestion,
+  questionOptionToken,
+  renderQuestion,
+  renderThreadInteraction,
+  threadDecisionToken,
+  type ControllerQuestion,
+  type ControllerQuestionAnswers,
+  type ThreadInteraction,
+} from "../controller/questions";
 
 type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
@@ -537,9 +547,67 @@ type ControllerTurnRow = {
   last_error: string | null;
   submitted_at: number | null;
   completed_at: number | null;
+  awaiting_interaction_id: string | null;
   created_at: number;
   updated_at: number;
 };
+type ControllerQuestionRow = {
+  interaction_id: string;
+  turn_id: string;
+  controller_key: string;
+  questions_json: string;
+  state: "pending" | "answered";
+  answers_json: string;
+  asked_at: number;
+  answered_at: number | null;
+};
+export type ControllerQuestionRecord = {
+  interactionId: string;
+  turnId: string;
+  controllerKey: string;
+  questions: ControllerQuestion[];
+  answers: ControllerQuestionAnswers;
+  askedAt: number;
+};
+type ObservedThreadRow = {
+  thread_id: string;
+  title: string;
+  last_status: string;
+  notified_status: string | null;
+  notified_at: number | null;
+  first_seen_at: number;
+  updated_at: number;
+};
+type ThreadInteractionRow = {
+  interaction_id: string;
+  thread_id: string;
+  title: string;
+  kind: ThreadInteraction["kind"];
+  payload_json: string;
+  state: "pending" | "answered" | "delivered";
+  answer_json: string | null;
+  asked_at: number;
+  answered_at: number | null;
+};
+export type ThreadInteractionAnswer =
+  | { ok: true; interactionId: string; threadId: string; title: string; label: string }
+  | { ok: false; reason: "stale" };
+export type ThreadInteractionDelivery = {
+  interactionId: string;
+  threadId: string;
+  title: string;
+  resolution: Record<string, unknown>;
+};
+export type ControllerQuestionAnswer =
+  | {
+    ok: true;
+    /** False while the same interaction still has questions the owner has not settled. */
+    complete: boolean;
+    turnId: string;
+    interactionId: string;
+    answers: ControllerQuestionAnswers;
+  }
+  | { ok: false; reason: "stale" };
 type ThreadOperationRow = {
   id: string;
   nonce_hash: string;
@@ -1533,6 +1601,52 @@ export interface TelegramAgentStore {
     turnId: string;
     sentBefore: number;
   }): boolean;
+  recordControllerQuestion(input: ControllerLeaseFence & {
+    turnId: string;
+    interactionId: string;
+    questions: readonly ControllerQuestion[];
+  }): boolean;
+  answerControllerQuestion(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerQuestionAnswer;
+  answerControllerQuestionWithText(input: {
+    controllerKey: string;
+    text: string;
+    now: number;
+  }): ControllerQuestionAnswer;
+  observeThread(input: {
+    threadId: string;
+    title: string;
+    status: string;
+    chatId: string;
+    now: number;
+  }): "finished" | "failed" | null;
+  recordThreadInteraction(input: {
+    interactionId: string;
+    threadId: string;
+    title: string;
+    interaction: ThreadInteraction;
+    chatId: string;
+    now: number;
+  }): boolean;
+  answerThreadInteraction(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ThreadInteractionAnswer;
+  getAnsweredThreadInteraction(): ThreadInteractionDelivery | null;
+  markThreadInteractionDelivered(interactionId: string, now: number): boolean;
+  discardThreadInteractions(threadId: string, keep: readonly string[]): number;
+  getPendingControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
+  getAnsweredControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
+  markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string }): boolean;
+  getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null;
+  recordControllerSteerFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
+  foldControllerTurnIntoRunning(input: ControllerLeaseFence & { turnId: string }): boolean;
   resetControllerThread(input: ControllerLeaseFence & {
     controllerKey: string;
     expectedThreadId: string;
@@ -1546,6 +1660,7 @@ export interface TelegramAgentStore {
   failControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     error: string;
+    ownerMessage?: string;
     leaseMs?: number;
   }): boolean;
   listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[];
@@ -1881,6 +1996,7 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     lastError: row.last_error,
     submittedAt: row.submitted_at,
     completedAt: row.completed_at,
+    awaitingInteractionId: row.awaiting_interaction_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2012,12 +2128,50 @@ function parseMemory(row: MemoryRow): MemoryRecord {
   };
 }
 
-function controllerFailureOutbox(turnId: string, chatId: string): OutboxInput {
+/**
+ * Recovers which button was tapped. Callback data carries only a digest, so the
+ * candidates are re-derived from the stored interaction and compared.
+ */
+// Statuses a thread can stop working *from*. Reaching idle or error from
+// anything else is bookkeeping, not news.
+const WORKING_THREAD_STATUSES = new Set(["active", "starting", "stopping"]);
+const NOTICE_COOLDOWN_MS = 10 * 60_000;
+
+function matchThreadInteractionToken(
+  interaction: ThreadInteraction,
+  token: string,
+): { label: string; resolution: Record<string, unknown> } | null {
+  if (interaction.kind === "unsupported") return null;
+  if (interaction.kind === "approval") {
+    for (const decision of interaction.decisions) {
+      if (threadDecisionToken(interaction.interactionId, decision) !== token) continue;
+      return {
+        label: decision === "deny" ? "Denied" : "Allowed",
+        resolution: decision === "deny"
+          ? { decision }
+          : { decision, grantedPermissions: null },
+      };
+    }
+    return null;
+  }
+  for (const question of interaction.questions) {
+    for (const option of question.options) {
+      if (questionOptionToken(interaction.interactionId, question.id, option.value) !== token) continue;
+      return {
+        label: option.label,
+        resolution: { kind: "user_answer", answers: { [question.id]: { selected: [option.value] } } },
+      };
+    }
+  }
+  return null;
+}
+
+function controllerFailureOutbox(turnId: string, chatId: string, ownerMessage?: string): OutboxInput {
   return {
     logicalKey: `controller:${turnId}:reply`,
     chatId,
     payload: {
-      text: "I couldn't complete that controller turn safely. Please resend your request.",
+      text: ownerMessage ?? "I couldn't complete that controller turn safely. Please resend your request.",
       disable_web_page_preview: true,
     },
   };
@@ -2843,6 +2997,449 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  /**
+   * Parks a submitted turn on a question only the owner can settle and asks it
+   * in Telegram. The turn stays submitted because the BB turn really is still
+   * open — it is waiting on a person, not on the model.
+   */
+  public recordControllerQuestion(input: ControllerLeaseFence & {
+    turnId: string;
+    interactionId: string;
+    questions: readonly ControllerQuestion[];
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    if (input.questions.length === 0) throw new TypeError("a controller question must have questions");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.*, controller.telegram_chat_id FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+          WHERE turn.id = ? AND turn.state = 'submitted'`,
+      ).get(input.turnId) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
+      if (!row) return false;
+      // Seeing the same question again on a later poll must not re-ask it.
+      const known = this.db.prepare("SELECT 1 FROM controller_questions WHERE interaction_id = ?")
+        .get(input.interactionId);
+      if (known) return false;
+      this.db.prepare(
+        `INSERT INTO controller_questions
+           (interaction_id, turn_id, controller_key, questions_json, state, answers_json, asked_at, answered_at)
+         VALUES (?, ?, ?, ?, 'pending', '{}', ?, NULL)`,
+      ).run(
+        input.interactionId,
+        row.id,
+        row.controller_key,
+        JSON.stringify(input.questions),
+        input.now,
+      );
+      this.db.prepare(
+        `UPDATE controller_turns SET awaiting_interaction_id = ?, updated_at = ?
+          WHERE id = ? AND state = 'submitted'`,
+      ).run(input.interactionId, input.now, input.turnId);
+      this.askControllerQuestion(input.interactionId, row.telegram_chat_id, input.questions, {}, input.now);
+      return true;
+    }).immediate();
+  }
+
+  private askControllerQuestion(
+    interactionId: string,
+    chatId: string,
+    questions: readonly ControllerQuestion[],
+    answers: ControllerQuestionAnswers,
+    now: number,
+  ): void {
+    const next = nextUnansweredQuestion(questions, answers);
+    if (!next) return;
+    const rendered = renderQuestion(interactionId, next.question);
+    persistControllerOutbox(this.db, {
+      logicalKey: `controller-question:${interactionId}:${next.index}`,
+      chatId,
+      payload: {
+        ...formattedMessage(rendered.text),
+        reply_markup: rendered.reply_markup,
+        disable_web_page_preview: true,
+      },
+    }, now);
+  }
+
+  private settleControllerQuestion(
+    row: ControllerQuestionRow,
+    questionId: string,
+    answer: { selected: string[]; freeText?: string },
+    now: number,
+  ): ControllerQuestionAnswer {
+    const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
+    const answers = { ...JSON.parse(row.answers_json) as ControllerQuestionAnswers, [questionId]: answer };
+    const complete = nextUnansweredQuestion(questions, answers) === null;
+    const updated = this.db.prepare(
+      `UPDATE controller_questions
+          SET answers_json = ?, state = ?, answered_at = ?
+        WHERE interaction_id = ? AND state = 'pending'`,
+    ).run(
+      JSON.stringify(answers),
+      complete ? "answered" : "pending",
+      complete ? now : null,
+      row.interaction_id,
+    );
+    if (updated.changes !== 1) return { ok: false, reason: "stale" };
+    if (complete) {
+      this.db.prepare(
+        `UPDATE controller_turns SET awaiting_interaction_id = NULL, updated_at = ?
+          WHERE id = ? AND awaiting_interaction_id = ?`,
+      ).run(now, row.turn_id, row.interaction_id);
+    } else {
+      const chatId = this.db.prepare(
+        "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
+      ).get(row.controller_key) as { telegram_chat_id: string } | undefined;
+      if (chatId) this.askControllerQuestion(row.interaction_id, chatId.telegram_chat_id, questions, answers, now);
+    }
+    return {
+      ok: true,
+      complete,
+      turnId: row.turn_id,
+      interactionId: row.interaction_id,
+      answers,
+    };
+  }
+
+  /** Answers whichever question a tapped button stands for. */
+  public answerControllerQuestion(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerQuestionAnswer {
+    assertCanonicalPositiveDecimal(input.userId, "userId");
+    assertCanonicalPositiveDecimal(input.chatId, "chatId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ControllerQuestionAnswer => {
+      const row = this.db.prepare(
+        `SELECT question.* FROM controller_questions AS question
+           JOIN controller_threads AS controller ON controller.controller_key = question.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+           JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
+          WHERE question.state = 'pending'
+            AND controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
+          ORDER BY question.asked_at DESC LIMIT 1`,
+      ).get(input.userId, input.chatId) as ControllerQuestionRow | undefined;
+      if (!row) return { ok: false, reason: "stale" };
+      const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
+      const answers = JSON.parse(row.answers_json) as ControllerQuestionAnswers;
+      for (const question of questions) {
+        if (question.id in answers) continue;
+        for (const option of question.options) {
+          if (questionOptionToken(row.interaction_id, question.id, option.value) !== input.token) continue;
+          return this.settleControllerQuestion(row, question.id, { selected: [option.value] }, input.now);
+        }
+      }
+      return { ok: false, reason: "stale" };
+    }).immediate();
+  }
+
+  /**
+   * A plain reply answers the open question. The owner is having a conversation,
+   * not filling in a form, so "in review i mean not in progress" is an answer.
+   */
+  public answerControllerQuestionWithText(input: {
+    controllerKey: string;
+    text: string;
+    now: number;
+  }): ControllerQuestionAnswer {
+    assertControllerKey(input.controllerKey);
+    assertControllerText(input.text, "controller question answer");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ControllerQuestionAnswer => {
+      const row = this.db.prepare(
+        `SELECT question.* FROM controller_questions AS question
+           JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
+          WHERE question.controller_key = ? AND question.state = 'pending'
+          ORDER BY question.asked_at DESC LIMIT 1`,
+      ).get(input.controllerKey) as ControllerQuestionRow | undefined;
+      if (!row) return { ok: false, reason: "stale" };
+      const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
+      const answers = JSON.parse(row.answers_json) as ControllerQuestionAnswers;
+      const next = nextUnansweredQuestion(questions, answers);
+      if (!next) return { ok: false, reason: "stale" };
+      return this.settleControllerQuestion(row, next.question.id, { selected: [], freeText: input.text }, input.now);
+    }).immediate();
+  }
+
+  /**
+   * Counts a steer BB would not take. The reconcile loop runs at draft speed
+   * while an answer streams, so an unbounded retry here would be a hot loop
+   * against BB rather than a recovery.
+   */
+  public recordControllerSteerFailure(input: ControllerLeaseFence & { turnId: string }): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        `UPDATE controller_turns SET retry_count = retry_count + 1, updated_at = ?
+          WHERE id = ? AND state = 'queued'`,
+      ).run(input.now, input.turnId).changes === 1;
+    }).immediate();
+  }
+
+  /** The oldest message still waiting behind an answer that is being written. */
+  public getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT * FROM controller_turns WHERE controller_key = ? AND state = 'queued'
+        ORDER BY created_at ASC, ordinal ASC LIMIT 1`,
+    ).get(controllerKey) as ControllerTurnRow | undefined;
+    return row ? parseControllerTurn(row) : null;
+  }
+
+  /**
+   * Retires a queued message that was handed to the turn already running. It
+   * gets no reply of its own because the answer in flight now covers it —
+   * a correction like "I meant in review" wants the first answer fixed, not a
+   * second answer written.
+   */
+  public foldControllerTurnIntoRunning(input: ControllerLeaseFence & { turnId: string }): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        "SELECT * FROM controller_turns WHERE id = ? AND state = 'queued'",
+      ).get(input.turnId) as ControllerTurnRow | undefined;
+      if (!row) return false;
+      const folded = "(sent to the answer already in progress)";
+      const updated = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'completed', response_text = ?, stream_phase = 'complete',
+                completed_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'queued'`,
+      ).run(folded, input.now, input.now, input.turnId);
+      if (updated.changes !== 1) return false;
+      this.appendControllerDigestRow({
+        controllerKey: row.controller_key,
+        ordinal: row.ordinal,
+        ownerText: row.input_text,
+        agentText: folded,
+        now: input.now,
+      });
+      return true;
+    }).immediate();
+  }
+
+  /**
+   * Records where a watched thread stands and returns the notice the owner is
+   * owed, if any. A thread first seen already finished is recorded silently:
+   * the owner wants to hear about threads that finish while they are watching,
+   * not a backlog of every thread that ever ran.
+   */
+  public observeThread(input: {
+    threadId: string;
+    title: string;
+    status: string;
+    chatId: string;
+    now: number;
+  }): "finished" | "failed" | null {
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertControllerText(input.title, "thread title");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): "finished" | "failed" | null => {
+      const known = this.db.prepare("SELECT * FROM observed_threads WHERE thread_id = ?")
+        .get(input.threadId) as ObservedThreadRow | undefined;
+      if (!known) {
+        this.db.prepare(
+          `INSERT INTO observed_threads
+             (thread_id, title, last_status, notified_status, first_seen_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(input.threadId, input.title, input.status, input.status, input.now, input.now);
+        return null;
+      }
+      this.db.prepare(
+        "UPDATE observed_threads SET title = ?, last_status = ?, updated_at = ? WHERE thread_id = ?",
+      ).run(input.title, input.status, input.now, input.threadId);
+      if (input.status === known.last_status) return null;
+      const notice = input.status === "idle" ? "finished" : input.status === "error" ? "failed" : null;
+      if (notice === null) return null;
+      // Only a thread that was working can stop working. A thread that finished
+      // and is marked failed afterwards has already had its say, and repeating
+      // it as a failure would contradict what the owner just read.
+      if (!WORKING_THREAD_STATUSES.has(known.last_status)) return null;
+      // A thread being steered turn by turn would otherwise narrate every reply.
+      if (known.notified_at !== null && input.now - known.notified_at < NOTICE_COOLDOWN_MS) return null;
+      this.db.prepare("UPDATE observed_threads SET notified_status = ?, notified_at = ? WHERE thread_id = ?")
+        .run(input.status, input.now, input.threadId);
+      persistControllerOutbox(this.db, {
+        logicalKey: `thread:${input.threadId}:${input.status}`,
+        chatId: input.chatId,
+        payload: {
+          ...formattedMessage(`*${input.title}* ${notice}.`),
+          disable_web_page_preview: true,
+        },
+      }, input.now);
+      return notice;
+    }).immediate();
+  }
+
+  /** Asks the owner to unblock a thread that is waiting on a decision. */
+  public recordThreadInteraction(input: {
+    interactionId: string;
+    threadId: string;
+    title: string;
+    interaction: ThreadInteraction;
+    chatId: string;
+    now: number;
+  }): boolean {
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertControllerText(input.title, "thread title");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      const known = this.db.prepare("SELECT 1 FROM thread_interactions WHERE interaction_id = ?")
+        .get(input.interactionId);
+      if (known) return false;
+      this.db.prepare(
+        `INSERT INTO thread_interactions
+           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)`,
+      ).run(
+        input.interactionId,
+        input.threadId,
+        input.title,
+        input.interaction.kind,
+        JSON.stringify(input.interaction),
+        input.now,
+      );
+      const rendered = renderThreadInteraction(input.title, input.interaction);
+      persistControllerOutbox(this.db, {
+        logicalKey: `thread-interaction:${input.interactionId}`,
+        chatId: input.chatId,
+        payload: {
+          ...formattedMessage(rendered.text),
+          ...("reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
+          disable_web_page_preview: true,
+        },
+      }, input.now);
+      return true;
+    }).immediate();
+  }
+
+  /** Resolves a watched thread's block from a tapped button. */
+  public answerThreadInteraction(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ThreadInteractionAnswer {
+    assertCanonicalPositiveDecimal(input.userId, "userId");
+    assertCanonicalPositiveDecimal(input.chatId, "chatId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ThreadInteractionAnswer => {
+      const owner = this.db.prepare(
+        `SELECT 1 FROM owners WHERE singleton = 1 AND revoked_at IS NULL
+          AND telegram_user_id = ? AND telegram_chat_id = ?`,
+      ).get(input.userId, input.chatId);
+      if (!owner) return { ok: false, reason: "stale" };
+      const rows = this.db.prepare(
+        "SELECT * FROM thread_interactions WHERE state = 'pending' ORDER BY asked_at DESC LIMIT 20",
+      ).all() as ThreadInteractionRow[];
+      for (const row of rows) {
+        const interaction = JSON.parse(row.payload_json) as ThreadInteraction;
+        const matched = matchThreadInteractionToken(interaction, input.token);
+        if (!matched) continue;
+        const updated = this.db.prepare(
+          `UPDATE thread_interactions SET state = 'answered', answer_json = ?, answered_at = ?
+            WHERE interaction_id = ? AND state = 'pending'`,
+        ).run(JSON.stringify(matched.resolution), input.now, row.interaction_id);
+        if (updated.changes !== 1) return { ok: false, reason: "stale" };
+        return {
+          ok: true,
+          interactionId: row.interaction_id,
+          threadId: row.thread_id,
+          title: row.title,
+          label: matched.label,
+        };
+      }
+      return { ok: false, reason: "stale" };
+    }).immediate();
+  }
+
+  public getAnsweredThreadInteraction(): ThreadInteractionDelivery | null {
+    const row = this.db.prepare(
+      "SELECT * FROM thread_interactions WHERE state = 'answered' ORDER BY answered_at ASC LIMIT 1",
+    ).get() as ThreadInteractionRow | undefined;
+    if (!row || row.answer_json === null) return null;
+    return {
+      interactionId: row.interaction_id,
+      threadId: row.thread_id,
+      title: row.title,
+      resolution: JSON.parse(row.answer_json) as Record<string, unknown>,
+    };
+  }
+
+  public markThreadInteractionDelivered(interactionId: string, now: number): boolean {
+    assertControllerIdentifier(interactionId, "interactionId");
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      "UPDATE thread_interactions SET state = 'delivered' WHERE interaction_id = ? AND state = 'answered'",
+    ).run(interactionId).changes === 1;
+  }
+
+  /** Forgets a block the thread resolved without the owner, so it stops being offered. */
+  public discardThreadInteractions(threadId: string, keep: readonly string[]): number {
+    assertControllerIdentifier(threadId, "threadId");
+    const placeholders = keep.map(() => "?").join(", ");
+    const sql = keep.length === 0
+      ? "DELETE FROM thread_interactions WHERE thread_id = ? AND state = 'pending'"
+      : `DELETE FROM thread_interactions WHERE thread_id = ? AND state = 'pending' AND interaction_id NOT IN (${placeholders})`;
+    return this.db.prepare(sql).run(threadId, ...keep).changes;
+  }
+
+  /** An answer the owner has given that BB has not been told about yet. */
+  public getAnsweredControllerQuestion(controllerKey: string): ControllerQuestionRecord | null {
+    return this.readControllerQuestion(controllerKey, "answered");
+  }
+
+  public getPendingControllerQuestion(controllerKey: string): ControllerQuestionRecord | null {
+    return this.readControllerQuestion(controllerKey, "pending");
+  }
+
+  // Delivery is recorded separately from the answer so a crash between the two
+  // re-sends the answer rather than losing it.
+  public markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string }): boolean {
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    this.assertLeaseIdentity("controller-question", input.ownerId, input.generation, input.now);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        "UPDATE controller_questions SET state = 'delivered' WHERE interaction_id = ? AND state = 'answered'",
+      ).run(input.interactionId).changes === 1;
+    }).immediate();
+  }
+
+  // A question outlives its turn only on paper. Once that turn is gone the
+  // answer has nowhere to land, and reading the owner's next message as an
+  // answer to it would swallow the message outright.
+  private readControllerQuestion(
+    controllerKey: string,
+    state: ControllerQuestionRow["state"],
+  ): ControllerQuestionRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT question.* FROM controller_questions AS question
+         JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
+        WHERE question.controller_key = ? AND question.state = ?
+        ORDER BY question.asked_at DESC LIMIT 1`,
+    ).get(controllerKey, state) as ControllerQuestionRow | undefined;
+    if (!row) return null;
+    return {
+      interactionId: row.interaction_id,
+      turnId: row.turn_id,
+      controllerKey: row.controller_key,
+      questions: JSON.parse(row.questions_json) as ControllerQuestion[],
+      answers: JSON.parse(row.answers_json) as ControllerQuestionAnswers,
+      askedAt: row.asked_at,
+    };
+  }
+
   public refreshControllerDraft(input: ControllerLeaseFence & {
     turnId: string;
     sentBefore: number;
@@ -2952,11 +3549,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public failControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     error: string;
+    ownerMessage?: string;
     leaseMs?: number;
   }): boolean {
     this.assertControllerMutation(input);
     assertSafeFailureSummary(input.error);
     assertNoRawMergeCallback(input.error, "controller error");
+    if (input.ownerMessage !== undefined) {
+      assertControllerText(input.ownerMessage, "controller failure message");
+      assertNoRawMergeCallback(input.ownerMessage, "controller failure message");
+    }
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       const row = this.db.prepare(
@@ -2978,7 +3580,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
-      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id);
+      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.ownerMessage);
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();

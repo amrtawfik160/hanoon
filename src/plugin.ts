@@ -34,6 +34,7 @@ import {
 import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { MonitorService } from "./services/monitor-service";
+import { ThreadNoticeService } from "./services/thread-notice-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -366,6 +367,39 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
+  const threadNotices = new ThreadNoticeService({
+    store,
+    threads: {
+      listWatchable: async () => {
+        const threads = await bb.sdk.threads.list({ includeHidden: false, archived: false, limit: 100 });
+        return threads
+          .filter((thread) => thread.visibility === "visible" && thread.archivedAt === null && thread.deletedAt === null)
+          .map((thread) => ({
+            id: thread.id,
+            title: thread.title ?? thread.titleFallback ?? "Untitled thread",
+            status: thread.status,
+            parentThreadId: thread.parentThreadId,
+          }));
+      },
+      interactions: async (threadId) => {
+        const pending = await bb.sdk.threads.interactions.list({ threadId });
+        return pending.map((interaction) => ({
+          id: interaction.id,
+          status: interaction.status,
+          payload: interaction.payload,
+        }));
+      },
+      resolve: async (threadId, interactionId, resolution) => {
+        await bb.sdk.threads.interactions.resolve({
+          threadId,
+          interactionId,
+          resolution: resolution as Parameters<typeof bb.sdk.threads.interactions.resolve>[0]["resolution"],
+        });
+      },
+    },
+    clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
+  });
   const presence = new TelegramPresenceCoordinator({
     store,
     telegram: {
@@ -618,6 +652,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       controller,
       operations: threadOperations,
       monitors,
+      threadNotices,
       presence,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),
     }, signal),

@@ -458,6 +458,66 @@ CREATE TABLE controller_generations (
 CREATE INDEX controller_generations_key ON controller_generations (controller_key, started_at);
 `] as const;
 
+export const CONTROLLER_QUESTION_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN awaiting_interaction_id TEXT;
+CREATE TABLE controller_questions (
+  interaction_id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  questions_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answers_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER
+);
+CREATE INDEX controller_questions_pending ON controller_questions (controller_key, state, asked_at);
+`] as const;
+
+export const THREAD_NOTICE_MIGRATIONS = [String.raw`
+CREATE TABLE observed_threads (
+  thread_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  last_status TEXT NOT NULL,
+  notified_status TEXT,
+  first_seen_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE thread_interactions (
+  interaction_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user_question', 'approval')),
+  payload_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answer_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER
+);
+CREATE INDEX thread_interactions_state ON thread_interactions (state, asked_at);
+`] as const;
+
+export const UNSUPPORTED_INTERACTION_MIGRATIONS = [String.raw`
+CREATE TABLE thread_interactions_v2 (
+  interaction_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user_question', 'approval', 'unsupported')),
+  payload_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answer_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER
+);
+INSERT INTO thread_interactions_v2 SELECT * FROM thread_interactions;
+DROP TABLE thread_interactions;
+ALTER TABLE thread_interactions_v2 RENAME TO thread_interactions;
+CREATE INDEX thread_interactions_state_v2 ON thread_interactions (state, asked_at);
+`] as const;
+
+export const NOTICE_COOLDOWN_MIGRATIONS = [String.raw`
+ALTER TABLE observed_threads ADD COLUMN notified_at INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -471,4 +531,8 @@ export const ALL_MIGRATIONS = [
   ...MEMORY_MIGRATIONS,
   ...MONITOR_MIGRATIONS,
   ...CONTINUITY_MIGRATIONS,
+  ...CONTROLLER_QUESTION_MIGRATIONS,
+  ...THREAD_NOTICE_MIGRATIONS,
+  ...UNSUPPORTED_INTERACTION_MIGRATIONS,
+  ...NOTICE_COOLDOWN_MIGRATIONS,
 ] as const;

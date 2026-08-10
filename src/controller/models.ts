@@ -42,6 +42,8 @@ export type ControllerTurnRecord = {
   lastError: string | null;
   submittedAt: number | null;
   completedAt: number | null;
+  /** Set while the answer is blocked on a question the owner has to settle. */
+  awaitingInteractionId: string | null;
   createdAt: number;
   updatedAt: number;
 };

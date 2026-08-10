@@ -9,6 +9,7 @@ describe("controller stream projection", () => {
       assistantDelta: "Hello world",
       completed: false,
       error: null,
+      pendingQuestion: null,
     }, {
       cursor: 10,
       text: "",
@@ -29,6 +30,7 @@ describe("controller stream projection", () => {
       assistantDelta: " duplicate",
       completed: false,
       error: null,
+      pendingQuestion: null,
     }, {
       cursor: 13,
       text: "Hello world",
@@ -49,6 +51,7 @@ describe("controller stream projection", () => {
       assistantDelta: `${"a".repeat(3_900)}🙂tail`,
       completed: false,
       error: null,
+      pendingQuestion: null,
     }, {
       cursor: 0,
       text: "",
