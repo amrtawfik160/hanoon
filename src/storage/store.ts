@@ -574,6 +574,7 @@ type ObservedThreadRow = {
   title: string;
   last_status: string;
   notified_status: string | null;
+  notified_at: number | null;
   first_seen_at: number;
   updated_at: number;
 };
@@ -2131,6 +2132,11 @@ function parseMemory(row: MemoryRow): MemoryRecord {
  * Recovers which button was tapped. Callback data carries only a digest, so the
  * candidates are re-derived from the stored interaction and compared.
  */
+// Statuses a thread can stop working *from*. Reaching idle or error from
+// anything else is bookkeeping, not news.
+const WORKING_THREAD_STATUSES = new Set(["active", "starting", "stopping"]);
+const NOTICE_COOLDOWN_MS = 10 * 60_000;
+
 function matchThreadInteractionToken(
   interaction: ThreadInteraction,
   token: string,
@@ -3250,11 +3256,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       this.db.prepare(
         "UPDATE observed_threads SET title = ?, last_status = ?, updated_at = ? WHERE thread_id = ?",
       ).run(input.title, input.status, input.now, input.threadId);
-      if (input.status === known.notified_status) return null;
-      this.db.prepare("UPDATE observed_threads SET notified_status = ? WHERE thread_id = ?")
-        .run(input.status, input.threadId);
+      if (input.status === known.last_status) return null;
       const notice = input.status === "idle" ? "finished" : input.status === "error" ? "failed" : null;
       if (notice === null) return null;
+      // Only a thread that was working can stop working. A thread that finished
+      // and is marked failed afterwards has already had its say, and repeating
+      // it as a failure would contradict what the owner just read.
+      if (!WORKING_THREAD_STATUSES.has(known.last_status)) return null;
+      // A thread being steered turn by turn would otherwise narrate every reply.
+      if (known.notified_at !== null && input.now - known.notified_at < NOTICE_COOLDOWN_MS) return null;
+      this.db.prepare("UPDATE observed_threads SET notified_status = ?, notified_at = ? WHERE thread_id = ?")
+        .run(input.status, input.now, input.threadId);
       persistControllerOutbox(this.db, {
         logicalKey: `thread:${input.threadId}:${input.status}`,
         chatId: input.chatId,

@@ -12,7 +12,7 @@ Controller settings never override a job's stored project policy.
 - BB `0.36` or newer.
 - npm for installing the repository dependencies.
 - A Telegram bot created with [BotFather](https://core.telegram.org/bots#botfather).
-- Codex access for the controller and any providers/models selected by project policies.
+- Claude Code or Codex access for the conversational agent, plus any providers/models selected by project policies.
 - A standard BB project backed by a GitHub repository.
 - A reachable local or cloned BB project source with a named base branch.
 - GitHub CLI (`gh`) authenticated on every source host used by an enabled project.
@@ -64,14 +64,30 @@ The same plugin settings page controls subsequent turns in the hidden conversati
 
 | Setting | Options | Default |
 | --- | --- | --- |
-| Controller model | `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `gpt-5.6-luna` |
-| Reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `max` |
-| Service tier | `fast`, `default` | `fast` |
-| Permission mode | `auto`, `accept-edits`, `full` | `auto` |
+| Controller model | `claude-opus-5[1m]`, `claude-opus-4-8[1m]`, `claude-sonnet-5`, `claude-fable-5`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `claude-opus-5[1m]` |
+| Reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` |
+| Service tier | `fast`, `default` | `default` |
+| Permission mode | `auto`, `accept-edits`, `full` | `full` |
+
+The model selects its provider: `claude-*` models run on Claude Code, `gpt-*` models on Codex. Service tier is a Codex-only input and is not sent for Claude models.
+
+Changing the model to one owned by the other provider retires the live BB conversation thread, because a thread cannot switch providers. The next message opens a replacement seeded with the recent conversation, so the change costs a pause rather than the conversation.
 
 Saved values apply when the next controller turn starts, including later turns in the existing durable conversation. They do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode.
 
-The provider stays fixed to `codex`. Planner, critic, and documentation stages use the pipeline's fixed profile; implementation and review workers use the enabled project's immutable policy snapshot.
+### Why the default is `full`
+
+The owner works from Telegram and is not watching the BB app, so an approval prompt rendered there stalls the agent with nobody to answer it. `full` lets it use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without that dead end.
+
+The limits that remain are the ones the owner can actually see and answer:
+
+- merging a pull request and promoting to production run through the job pipeline and need a one-use Telegram approval;
+- destructive or irreversible actions outside a worktree are asked about in the chat first;
+- credential-shaped text is refused before it can be stored as a memory.
+
+Set `auto` or `accept-edits` if you would rather approve execution in the BB app, and expect the agent to stop and wait when it hits one.
+
+Planner, critic, and documentation stages pin their own execution tuple and are unaffected by this setting; implementation and review workers use the enabled project's immutable policy snapshot.
 
 ## Enable a project
 

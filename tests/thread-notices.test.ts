@@ -309,3 +309,47 @@ it("still reports a block it cannot render, instead of leaving the thread silent
   expect(asked?.payload.text).toContain("Fix the login bug");
   expect(asked?.payload.reply_markup).toBeUndefined();
 });
+
+it("does not contradict a finish it already reported when the thread errors later", async () => {
+  const store = fixture();
+  await service(store, { threads: [watched({ status: "active" })] }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+  expect(store.getOutbox("thread:thr_work:idle")?.payload.text).toContain("finished");
+
+  // A thread that has already finished can still be marked failed afterwards.
+  // Its work is done; saying "failed" now would contradict what the owner read.
+  const later = service(store, { threads: [watched({ status: "error" })], now: () => 5_000 });
+  await expect(later.service.processDue()).resolves.toBe(false);
+
+  expect(store.getOutbox("thread:thr_work:error")).toBeNull();
+});
+
+it("does not narrate every turn of a thread that keeps being given more work", async () => {
+  const store = fixture();
+  let clock = 3_000;
+  const tick = (status: string) => {
+    clock += 30_000;
+    return service(store, { threads: [watched({ status })], now: () => clock });
+  };
+  await tick("active").service.processDue();
+  await tick("idle").service.processDue();
+  expect(store.getOutbox("thread:thr_work:idle")?.status).toBe("pending");
+
+  await tick("active").service.processDue();
+  const second = tick("idle");
+  await expect(second.service.processDue()).resolves.toBe(false);
+});
+
+it("reports a later finish once the quiet period has passed", async () => {
+  const store = fixture();
+  let clock = 3_000;
+  const tick = (status: string, jump = 30_000) => {
+    clock += jump;
+    return service(store, { threads: [watched({ status })], now: () => clock });
+  };
+  await tick("active").service.processDue();
+  await tick("idle").service.processDue();
+
+  await tick("active", 20 * 60_000).service.processDue();
+  await expect(tick("idle").service.processDue()).resolves.toBe(true);
+});

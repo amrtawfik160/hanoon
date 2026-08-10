@@ -514,6 +514,10 @@ ALTER TABLE thread_interactions_v2 RENAME TO thread_interactions;
 CREATE INDEX thread_interactions_state_v2 ON thread_interactions (state, asked_at);
 `] as const;
 
+export const NOTICE_COOLDOWN_MIGRATIONS = [String.raw`
+ALTER TABLE observed_threads ADD COLUMN notified_at INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -530,4 +534,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_QUESTION_MIGRATIONS,
   ...THREAD_NOTICE_MIGRATIONS,
   ...UNSUPPORTED_INTERACTION_MIGRATIONS,
+  ...NOTICE_COOLDOWN_MIGRATIONS,
 ] as const;
