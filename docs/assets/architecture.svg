@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 940" role="img" aria-labelledby="title description">
+  <title id="title">Telegram Agent architecture</title>
+  <desc id="description">A paired Telegram owner communicates through an input and output bridge. Messages and delivery state are stored in SQLite. A single leased executor dispatches a hidden controller thread and fresh pipeline threads in BB. Pipeline threads use a managed Git worktree as the code and filesystem boundary.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="720" height="940" rx="24" fill="#ffffff"/>
+
+  <g font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <rect x="80" y="28" width="560" height="94" rx="16" fill="#e0f2fe" stroke="#0284c7" stroke-width="2" filter="url(#shadow)"/>
+    <circle cx="136" cy="75" r="27" fill="#0284c7"/>
+    <path d="M 122 75 L 151 62 L 143 88 L 135 81 L 130 87 L 130 78 Z" fill="#ffffff"/>
+    <text x="178" y="67" font-size="24" font-weight="700" fill="#0f172a">Telegram private chat</text>
+    <text x="178" y="94" font-size="14" fill="#475569">one paired owner · messages · approvals · live status</text>
+
+    <line x1="360" y1="128" x2="360" y2="166" stroke="#64748b" stroke-width="2" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+
+    <rect x="80" y="172" width="560" height="108" rx="16" fill="#dbeafe" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+    <text x="360" y="212" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">Telegram I/O bridge</text>
+    <text x="360" y="239" text-anchor="middle" font-size="14" fill="#475569">poll · authenticate owner · record input · deliver output</text>
+    <text x="360" y="262" text-anchor="middle" font-size="13" font-weight="600" fill="#1d4ed8">I/O only — never starts a BB session</text>
+
+    <line x1="360" y1="286" x2="360" y2="326" stroke="#64748b" stroke-width="2" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="374" y="310" font-size="12" fill="#64748b">durable input / outbox</text>
+
+    <rect x="80" y="332" width="560" height="122" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" filter="url(#shadow)"/>
+    <text x="360" y="372" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">Durable control plane</text>
+    <text x="360" y="400" text-anchor="middle" font-size="14" fill="#475569">SQLite · owner · turns · jobs · effects · approvals</text>
+    <text x="360" y="425" text-anchor="middle" font-size="14" fill="#475569">attempts · liveness · delivery receipts · outbox</text>
+    <text x="360" y="445" text-anchor="middle" font-size="12" font-weight="600" fill="#6d28d9">authoritative recovery state</text>
+
+    <line x1="360" y1="460" x2="360" y2="504" stroke="#64748b" stroke-width="2" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="374" y="486" font-size="12" fill="#64748b">leased work / receipts</text>
+
+    <rect x="80" y="510" width="560" height="108" rx="16" fill="#fef3c7" stroke="#d97706" stroke-width="2" filter="url(#shadow)"/>
+    <text x="360" y="551" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">Single leased executor</text>
+    <text x="360" y="579" text-anchor="middle" font-size="14" fill="#475569">sole controller dispatcher · sole pipeline effect runner</text>
+    <text x="360" y="601" text-anchor="middle" font-size="12" font-weight="600" fill="#b45309">generation-fenced ownership and heartbeat</text>
+
+    <line x1="360" y1="624" x2="360" y2="668" stroke="#64748b" stroke-width="2" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="374" y="650" font-size="12" fill="#64748b">spawn · steer · reconcile</text>
+
+    <rect x="34" y="674" width="652" height="238" rx="20" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#shadow)"/>
+    <text x="360" y="710" text-anchor="middle" font-size="24" font-weight="700" fill="#0f172a">BB execution</text>
+    <text x="360" y="731" text-anchor="middle" font-size="12" fill="#6366f1">durable thread identity · history · status · permissions</text>
+
+    <rect x="66" y="750" width="274" height="90" rx="13" fill="#ffffff" stroke="#818cf8" stroke-width="1.8"/>
+    <text x="203" y="783" text-anchor="middle" font-size="18" font-weight="700" fill="#0f172a">Controller thread</text>
+    <text x="203" y="807" text-anchor="middle" font-size="12" fill="#475569">hidden personal conversation</text>
+    <text x="203" y="826" text-anchor="middle" font-size="11" font-weight="600" fill="#4f46e5">no implementation checkout</text>
+
+    <rect x="380" y="750" width="274" height="90" rx="13" fill="#ffffff" stroke="#818cf8" stroke-width="1.8"/>
+    <text x="517" y="783" text-anchor="middle" font-size="18" font-weight="700" fill="#0f172a">Pipeline threads</text>
+    <text x="517" y="807" text-anchor="middle" font-size="12" fill="#475569">plan · build · fresh review</text>
+    <text x="517" y="826" text-anchor="middle" font-size="11" font-weight="600" fill="#4f46e5">isolated provider conversations</text>
+
+    <line x1="517" y1="842" x2="517" y2="858" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+
+    <rect x="194" y="862" width="332" height="38" rx="10" fill="#ffffff" stroke="#334155" stroke-width="1.8"/>
+    <text x="360" y="878" text-anchor="middle" font-size="14" font-weight="700" fill="#0f172a">Managed Git worktree</text>
+    <text x="360" y="893" text-anchor="middle" font-size="10.5" fill="#475569">branch · checkout · code and filesystem boundary</text>
+  </g>
+</svg>
