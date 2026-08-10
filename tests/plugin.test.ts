@@ -56,6 +56,48 @@ it("registers both background services and all enqueue-only thread lifecycle han
   expect(store.listEffectsForJob(job.id).map((effect) => effect.kind)).toEqual(["reconcile_job"]);
 });
 
+it("wires submitted controller turns through the leased job executor", async () => {
+  const { bb, harness } = await loadPlugin();
+  await harness.behavior.setSettings({ botToken: "123:test-token" });
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { message_id: 901 } }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+  const store = openStore(bb.storage);
+  store.createPairingCode(hashSecret("controller-pair"), 1_000, Date.now() + 60_000);
+  expect(store.pairOwnerWithCode(hashSecret("controller-pair"), "7", "7", Date.now())).toEqual({ ok: true });
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 800,
+    inputText: "hello",
+    now: Date.now(),
+  });
+  const lease = store.acquireExecutorLease("setup", Date.now(), 30_000);
+  if (!lease.acquired) throw new Error("missing setup lease");
+  expect(store.claimNextControllerTurn({ ownerId: "setup", generation: lease.generation, now: Date.now() })?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: "setup",
+    generation: lease.generation,
+    now: Date.now(),
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_controller",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: "setup", generation: lease.generation, now: Date.now() })).toBe(true);
+  expect(store.releaseExecutorLease("setup", lease.generation, Date.now())).toBe(true);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_controller", projectId: "proj_personal", status: "idle" }));
+  harness.sdk.stub("threads.output", async () => ({ output: "Hello from Luna." }));
+
+  const run = harness.behavior.runService("job-executor");
+  await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe("Hello from Luna."));
+  run.controller.abort();
+  await run.done;
+  vi.unstubAllGlobals();
+});
+
 it("reconciles an authoritative implementation idle observation into the job state", async () => {
   const { bb, harness } = await loadPlugin();
   const store = openStore(bb.storage);

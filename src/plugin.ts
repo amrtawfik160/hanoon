@@ -22,6 +22,8 @@ import {
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
 import { registerControllerTools } from "./controller/tools";
+import { BbControllerAdapter } from "./controller/bb-controller";
+import { LunaControllerService } from "./controller/service";
 
 function clock(): number {
   return Date.now();
@@ -280,6 +282,12 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     store,
     telegram: telegramTransport,
     mergeHandler,
+    onWorkAvailable: () => executorNudge.notify(),
+  });
+  const controller = new LunaControllerService({
+    store,
+    adapter: new BbControllerAdapter({ sdk: bb.sdk, pluginId: bb.pluginId }),
+    clock: { now: clock },
   });
 
   const bbEffectAdapter = {
@@ -440,11 +448,14 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         };
       },
       releaseOnShutdown: true,
+      controller,
+      waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),
     }, signal),
   });
 
   const queueThreadReconcile = (threadId: string): void => {
-    store.enqueueReconcileForThread(threadId, clock());
+    const jobQueued = store.enqueueReconcileForThread(threadId, clock());
+    if (jobQueued || store.getControllerByThreadId(threadId) !== null) executorNudge.notify();
   };
   bb.events.on("thread.created", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.active", ({ thread }) => queueThreadReconcile(thread.id));

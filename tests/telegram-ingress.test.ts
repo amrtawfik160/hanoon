@@ -10,7 +10,7 @@ import type {
   SendMessagePayload,
   TelegramUpdate,
 } from "../src/telegram/types";
-import { encodeCallbackData } from "../src/telegram/view";
+import { encodeCallbackData, persistableJobStatusPayload, renderProjectPicker } from "../src/telegram/view";
 import { VersionConflictError, openStore, type TelegramAgentStore } from "../src/storage/store";
 import { policyFixture } from "./helpers";
 
@@ -144,6 +144,7 @@ function ingressFixture(options: {
   owner?: { userId: string; chatId: string };
   policies?: ProjectPolicy[];
   pairingCode?: string;
+  onWorkAvailable?: () => void;
 } = {}): {
   ingress: TelegramIngress;
   store: TelegramAgentStore;
@@ -166,14 +167,26 @@ function ingressFixture(options: {
     store.createPairingCode(hashSecret(options.pairingCode), 1_000, 11_000);
   }
   const telegram = new FakeTelegram();
-  return { ingress: new TelegramIngress({ store, telegram }), store, telegram, db };
+  return { ingress: new TelegramIngress({ store, telegram, onWorkAvailable: options.onWorkAvailable }), store, telegram, db };
 }
 
 async function createDraft(fixture: ReturnType<typeof ingressFixture>, updateId = 10): Promise<string> {
-  await fixture.ingress.handleClaimed(messageUpdate(updateId, 7, 70, "Fix the redirect loop"), 2_000);
-  const job = fixture.store.getActiveJob();
-  if (!job) throw new Error("draft was not created");
-  return job.id;
+  const job = fixture.store.createJob({
+    id: stableJobId("70", updateId),
+    sourceUpdateId: updateId,
+    requestText: "Fix the redirect loop",
+    now: 2_000,
+  });
+  const payload = renderProjectPicker(job, fixture.store.listEnabledProjectPolicies());
+  const sent = await fixture.telegram.sendMessage("70", payload);
+  const current = fixture.store.setJobStatusMessage(job.id, sent.message_id, job.version, 2_000);
+  fixture.store.enqueueOutbox({
+    logicalKey: `job:${job.id}:status`,
+    chatId: "70",
+    messageId: sent.message_id,
+    payload: persistableJobStatusPayload(payload),
+  }, 2_000);
+  return current.id;
 }
 
 async function selectProject(
@@ -196,6 +209,21 @@ it("reveals no project information to an unauthorized chat", async () => {
   expect(fixture.store.getActiveJob()).toBeNull();
 });
 
+it("queues authorized standalone text for Luna without creating a software job", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+
+  await fixture.ingress.handleClaimed(messageUpdate(9, 7, 70, "What projects can you work on?"), 1_900);
+
+  expect(fixture.store.getActiveJob()).toBeNull();
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  expect(controller).not.toBeNull();
+  expect(fixture.store.listControllerTurns(controller!.controllerKey, 10)).toMatchObject([{
+    updateId: 9,
+    state: "queued",
+    inputText: "What projects can you work on?",
+  }]);
+});
+
 it("pairs only a valid unconsumed code in a private chat", async () => {
   const fixture = ingressFixture({ pairingCode: "pair-code" });
 
@@ -213,37 +241,27 @@ it("pairs only a valid unconsumed code in a private chat", async () => {
   expect(groupFixture.store.getOwner()).toBeNull();
 });
 
-it("creates a deterministic awaiting-project draft and renders only enabled aliases", async () => {
+it("keeps /projects deterministic and out of the Luna controller queue", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
 
-  await fixture.ingress.handleClaimed(messageUpdate(10, 7, 70, "Fix the redirect loop"), 2_000);
+  await fixture.ingress.handleClaimed(messageUpdate(10, 7, 70, "/projects"), 2_000);
 
-  const job = fixture.store.getActiveJob();
-  expect(job).toMatchObject({
-    id: stableJobId("70", 10),
-    sourceUpdateId: 10,
-    requestText: "Fix the redirect loop",
-    state: "awaiting_project",
-    projectId: null,
-  });
+  expect(fixture.store.getActiveJob()).toBeNull();
+  expect(fixture.store.getControllerForOwner("7", "70")).toBeNull();
   expect(fixture.telegram.sent).toHaveLength(1);
-  const pickerButtons = fixture.telegram.sent[0]?.payload.reply_markup?.inline_keyboard.flat() ?? [];
-  expect(pickerButtons.map((button) => button.text)).toEqual(["cyndra", "other-project", "Cancel"]);
-  expect(pickerButtons.map((button) => button.text)).not.toContain("disabled");
+  expect(fixture.telegram.sent[0]?.payload.text).toBe("Enabled projects:\ncyndra\nother-project");
+  expect(fixture.telegram.sent[0]?.payload.text).not.toContain("disabled");
   expect(fixture.store.getNextTelegramOffset()).toBe(0);
 });
 
-it("uses last project only for picker ordering and never skips selection or confirmation", async () => {
+it("uses last project only for deterministic /projects ordering", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   await fixture.store.setLastProject("proj_2");
 
-  await fixture.ingress.handleClaimed(messageUpdate(11, 7, 70, "Do the work"), 2_000);
+  await fixture.ingress.handleClaimed(messageUpdate(11, 7, 70, "/projects"), 2_000);
 
-  const job = fixture.store.getActiveJob();
-  expect(job?.state).toBe("awaiting_project");
-  expect(job?.projectId).toBeNull();
-  const buttons = fixture.telegram.sent[0]?.payload.reply_markup?.inline_keyboard.flat() ?? [];
-  expect(buttons.map((button) => button.text)).toEqual(["other-project", "cyndra", "Cancel"]);
+  expect(fixture.store.getActiveJob()).toBeNull();
+  expect(fixture.telegram.sent[0]?.payload.text).toBe("Enabled projects:\nother-project\ncyndra");
 });
 
 it("binds the selected policy version and renders Start and Cancel without spawning", async () => {
@@ -324,18 +342,19 @@ it("deduplicates replayed update ids and callback ids without advancing the curs
 
   await fixture.ingress.handleClaimed(draft, 3_000);
   await fixture.ingress.handleClaimed(draft, 3_001);
-  expect(fixture.store.listJobs(10)).toHaveLength(1);
-  expect(fixture.store.listJobs(10)[0]?.id).toBe(stableJobId("70", 30));
+  expect(fixture.store.listJobs(10)).toHaveLength(0);
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  if (!controller) throw new Error("missing controller");
+  expect(fixture.store.listControllerTurns(controller.controllerKey, 10)).toHaveLength(1);
 
-  const jobId = fixture.store.getActiveJob()?.id;
-  if (!jobId) throw new Error("missing draft");
+  const jobId = await createDraft(fixture, 31);
   await selectProject(fixture, jobId, "same-project-callback");
   await selectProject(fixture, jobId, "same-project-callback");
   expect(fixture.store.listEffectsForJob(jobId).filter((effect) => effect.kind === "render_status")).toHaveLength(1);
   expect(fixture.store.getNextTelegramOffset()).toBe(0);
 });
 
-it("rejects standalone text while a job is active and steers only a status-message reply", async () => {
+it("routes standalone text to Luna while a job is active and steers only a status-message reply", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const jobId = await createDraft(fixture, 40);
   const statusMessageId = fixture.store.getJob(jobId)?.statusMessageId;
@@ -343,7 +362,13 @@ it("rejects standalone text while a job is active and steers only a status-messa
 
   await fixture.ingress.handleClaimed(messageUpdate(41, 7, 70, "a second task"), 4_100);
   expect(fixture.store.listJobs(10)).toHaveLength(1);
-  expect(fixture.telegram.sent.at(-1)?.payload.text).toMatch(/reply/i);
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  if (!controller) throw new Error("missing controller turn");
+  expect(fixture.store.listControllerTurns(controller.controllerKey, 10)).toMatchObject([{
+    updateId: 41,
+    inputText: "a second task",
+    state: "queued",
+  }]);
   expect(fixture.store.listEffectsForJob(jobId).some((effect) => effect.kind === "steer_implementation")).toBe(false);
 
   const selected = fixture.store.applyJobEvent(
@@ -521,48 +546,35 @@ it("rejects callbacks without an exact persisted status-message identity", async
   expect(wrongMessage.telegram.answered).toHaveLength(0);
 });
 
-it("stages the SQLite status outbox before a first send and finalizes its message identity", async () => {
-  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
-  let rowAtSend: { logical_key: string; message_id: number | null; status: string } | undefined;
-  fixture.telegram.beforeSend = () => {
-    rowAtSend = fixture.db
-      .prepare("SELECT logical_key, message_id, status FROM outbox")
-      .get() as typeof rowAtSend;
-  };
-
-  await fixture.ingress.handleClaimed(messageUpdate(75, 7, 70, "stage before send"), 7_500);
-
-  const job = fixture.store.getActiveJob();
-  if (!job) throw new Error("missing job");
-  expect(rowAtSend).toEqual({
-    logical_key: `job:${job.id}:status`,
-    message_id: null,
-    status: "pending",
+it("persists the controller turn before nudging the executor", async () => {
+  let durableAtNotify = false;
+  let fixture: ReturnType<typeof ingressFixture>;
+  fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => {
+      const controller = fixture.store.getControllerForOwner("7", "70");
+      durableAtNotify = controller !== null && fixture.store.listControllerTurns(controller.controllerKey, 10).length === 1;
+    },
   });
-  expect(job.statusMessageId).toBe(100);
-  expect(fixture.db.prepare("SELECT logical_key, message_id, status FROM outbox").get()).toEqual({
-    logical_key: `job:${job.id}:status`,
-    message_id: job.statusMessageId,
-    status: "pending",
-  });
+
+  await fixture.ingress.handleClaimed(messageUpdate(75, 7, 70, "stage before nudge"), 7_500);
+
+  expect(durableAtNotify).toBe(true);
 });
 
-it("retains a pending null-message outbox intent when the first Telegram send throws", async () => {
-  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
-  fixture.telegram.failNextSend = true;
+it("retains a queued controller turn if the injected nudge throws", async () => {
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => { throw new Error("simulated nudge failure"); },
+  });
 
   await expect(
-    fixture.ingress.handleClaimed(messageUpdate(76, 7, 70, "send can fail"), 7_600),
-  ).rejects.toThrow("simulated Telegram send failure");
+    fixture.ingress.handleClaimed(messageUpdate(76, 7, 70, "nudge can fail"), 7_600),
+  ).rejects.toThrow("simulated nudge failure");
 
-  const job = fixture.store.getActiveJob();
-  if (!job) throw new Error("missing job");
-  expect(job.statusMessageId).toBeNull();
-  expect(fixture.db.prepare("SELECT logical_key, message_id, status FROM outbox").get()).toEqual({
-    logical_key: `job:${job.id}:status`,
-    message_id: null,
-    status: "pending",
-  });
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  if (!controller) throw new Error("missing controller");
+  expect(fixture.store.listControllerTurns(controller.controllerKey, 10)).toMatchObject([{ state: "queued" }]);
 });
 
 it("upserts the status outbox before an edit so a thrown edit leaves the latest projection durable", async () => {

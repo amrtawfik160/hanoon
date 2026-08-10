@@ -268,6 +268,24 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
         mimeType: input.mimeType,
       };
     });
+    harness.sdk.stub("projects.list", async () => [{
+      id: "proj_1",
+      kind: "standard",
+      name: "Cyndra",
+      gitRemoteUrl: "https://github.com/acme/cyndra.git",
+      createdAt: 1,
+      updatedAt: 1,
+      sources: [{
+        id: "source_1",
+        projectId: "proj_1",
+        isDefault: true,
+        createdAt: 1,
+        updatedAt: 1,
+        type: "local_path",
+        hostId: "host_project",
+        path: "/projects/cyndra",
+      }],
+    }]);
     harness.sdk.stub("threads.spawn", async (input: SpawnCall) => {
       spawns.push(input);
       threadNumber += 1;
@@ -504,16 +522,42 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
 
     store.upsertProjectPolicy(policy, ++time);
     await ingress.handleClaimed({ update_id: 2, message: privateMessage("Implement the bounded Telegram task") } as TelegramUpdate, ++time);
-    let job = store.getActiveJob();
-    if (!job || job.statusMessageId === null) throw new Error("task did not create a status message");
-    const statusMessageId = job.statusMessageId;
-    expect(job.state).toBe("awaiting_project");
-
-    await ingress.handleClaimed(callbackUpdate(3, statusMessageId, encodeCallbackData({ type: "project", jobId: job.id, alias: "cyndra" })), ++time);
-    job = store.getJob(job.id)!;
-    expect(job.state).toBe("awaiting_confirmation");
-    await ingress.handleClaimed(callbackUpdate(4, statusMessageId, encodeCallbackData({ type: "start", jobId: job.id })), ++time);
-    expect(store.getJob(job.id)?.state).toBe("creating_implementation");
+    const controller = store.getControllerForOwner("7", "70");
+    if (!controller) throw new Error("task did not create a controller mapping");
+    const controllerLease = store.acquireExecutorLease("controller-setup", ++time, 1_000_000);
+    if (!controllerLease.acquired) throw new Error("controller setup lease was not acquired");
+    const controllerTurn = store.claimNextControllerTurn({
+      ownerId: "controller-setup",
+      generation: controllerLease.generation,
+      now: time,
+    });
+    if (!controllerTurn) throw new Error("controller turn was not claimable");
+    expect(store.markControllerSpawned({
+      turnId: controllerTurn.id,
+      ownerId: "controller-setup",
+      generation: controllerLease.generation,
+      now: time,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      threadId: "thr_controller",
+    })).toBe(true);
+    expect(store.markControllerTurnSubmitted({
+      turnId: controllerTurn.id,
+      ownerId: "controller-setup",
+      generation: controllerLease.generation,
+      now: time,
+    })).toBe(true);
+    expect(store.releaseExecutorLease("controller-setup", controllerLease.generation, ++time)).toBe(true);
+    let job = store.createConfirmedControllerJob({
+      controllerThreadId: "thr_controller",
+      projectId: "proj_1",
+      task: "Implement the bounded Telegram task",
+      now: ++time,
+    });
+    const status = await telegram.sendMessage("70", { text: "Job started." });
+    job = store.setJobStatusMessage(job.id, status.message_id, job.version, ++time);
+    const statusMessageId = status.message_id;
+    expect(job.state).toBe("creating_implementation");
 
     await drainEffects(store, makeRunner, now, "initial-executor");
     job = store.getJob(job.id)!;

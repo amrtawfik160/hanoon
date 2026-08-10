@@ -57,6 +57,7 @@ export type TelegramIngressOptions = {
   telegram: TelegramIngressTransport;
   auditLogger?: TelegramIngressAuditLogger;
   mergeHandler?: Pick<MergeHandler, "handleApprovalCallback">;
+  onWorkAvailable?: () => void;
 };
 
 const PRIVATE_ID = /^[1-9][0-9]*$/;
@@ -75,6 +76,13 @@ export function stableJobId(chatId: string, updateId: number): string {
     .update(`telegram-job:${chatId}:${updateId}`, "utf8")
     .digest("base64url")
     .slice(0, 22);
+}
+
+function stableControllerKey(userId: string, chatId: string): string {
+  return createHash("sha256")
+    .update(`telegram-controller:${userId}:${chatId}`, "utf8")
+    .digest("base64url")
+    .slice(0, 32);
 }
 
 function numericIdentity(value: number): string | null {
@@ -161,6 +169,7 @@ export class TelegramIngress {
   private readonly telegram: TelegramIngressTransport;
   private readonly auditLogger: TelegramIngressAuditLogger;
   private readonly mergeHandler: Pick<MergeHandler, "handleApprovalCallback"> | null;
+  private readonly onWorkAvailable: () => void;
 
   public constructor(options: TelegramIngressOptions);
   public constructor(store: TelegramAgentStore, telegram: TelegramIngressTransport);
@@ -173,12 +182,14 @@ export class TelegramIngress {
       this.telegram = optionsOrStore.telegram;
       this.auditLogger = boundedAuditLogger(optionsOrStore.auditLogger);
       this.mergeHandler = optionsOrStore.mergeHandler ?? null;
+      this.onWorkAvailable = optionsOrStore.onWorkAvailable ?? (() => undefined);
     } else {
       if (!telegram) throw new TypeError("Telegram ingress requires a Telegram client");
       this.store = optionsOrStore;
       this.telegram = telegram;
       this.auditLogger = boundedAuditLogger(undefined);
       this.mergeHandler = null;
+      this.onWorkAvailable = () => undefined;
     }
   }
 
@@ -214,7 +225,7 @@ export class TelegramIngress {
       );
       if (result.ok) {
         await this.telegram.sendMessage(identity.chatId, {
-          text: "Telegram Agent paired. Send a task to begin.",
+          text: "Telegram Agent paired. Talk naturally with Luna, or use /help for recovery controls.",
           disable_web_page_preview: true,
         });
       }
@@ -230,7 +241,7 @@ export class TelegramIngress {
 
     const command = /^\/(\w+)(?:\s|$)/.exec(normalized)?.[1]?.toLowerCase();
     if (command === "help") {
-      await this.sendPlain(identity.chatId, "Send a task, reply to the active status message to steer it, or use /status, /projects, and /cancel.");
+      await this.sendPlain(identity.chatId, "Talk naturally with Luna. Reply to the active status message to steer implementation, or use /status, /projects, /retry, and /cancel for recovery.");
       return;
     }
     if (command === "projects") {
@@ -255,26 +266,20 @@ export class TelegramIngress {
       return;
     }
 
-    if (active) {
-      if (message.reply_to_message?.message_id === active.statusMessageId) {
-        this.steer(active, normalized, updateId, now);
-      } else {
-        await this.sendPlain(identity.chatId, "Reply to the current job status message to steer it, or use its buttons.");
-      }
+    if (active && message.reply_to_message?.message_id === active.statusMessageId) {
+      this.steer(active, normalized, updateId, now);
       return;
     }
 
-    const job = this.store.createJob({
-      id: stableJobId(identity.chatId, updateId),
-      sourceUpdateId: updateId,
-      requestText: normalized,
+    this.store.enqueueControllerTurn({
+      controllerKey: stableControllerKey(identity.userId, identity.chatId),
+      telegramUserId: identity.userId,
+      telegramChatId: identity.chatId,
+      updateId,
+      inputText: normalized,
       now,
     });
-    const lastProject = await this.store.getLastProject();
-    const projects = orderedProjects(this.store.listEnabledProjectPolicies(), lastProject);
-    if (job.statusMessageId === null) {
-      await this.deliverJobView(job, renderProjectPicker(job, projects), identity.chatId, undefined, now);
-    }
+    this.onWorkAvailable();
   }
 
   private pairingCode(text: string): string | null {
