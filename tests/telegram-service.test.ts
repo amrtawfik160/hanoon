@@ -174,10 +174,13 @@ describe("Telegram ingress service", () => {
     const client = realClientFactory([
       { ok: true, result: { id: 123, username: "bot" } },
       { ok: true, result: [{ update_id: 10 }] },
-    ]);
+      { ok: true, result: [] },
+    ], (pollNumber) => {
+      if (pollNumber === 2) abort.abort();
+    });
     const ingress = { handleClaimed: vi.fn(async () => { throw error; }) };
 
-    const promise = runTelegramService(
+    await runTelegramService(
       serviceDeps(
         store,
         client,
@@ -186,13 +189,113 @@ describe("Telegram ingress service", () => {
       ),
       abort.signal,
     );
-    await expect(promise).rejects.toThrow("boom");
 
     expect(store.getNextTelegramOffset()).toBe(0);
     expect(db.prepare("SELECT status, last_error FROM telegram_updates WHERE update_id = 10").get()).toEqual({
       status: "failed",
       last_error: "boom",
     });
+  });
+
+  it("keeps polling after a failed update instead of crashing the ingress service", async () => {
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const seen: number[] = [];
+    const client = realClientFactory([
+      { ok: true, result: { id: 123, username: "bot" } },
+      { ok: true, result: [{ update_id: 10 }, { update_id: 11 }] },
+      { ok: true, result: [] },
+    ], (pollNumber) => {
+      if (pollNumber === 2) abort.abort();
+    });
+    const ingress = {
+      handleClaimed: vi.fn(async (update: TelegramUpdate) => {
+        seen.push(update.update_id);
+        if (update.update_id === 10) throw new Error("Telegram API 400");
+      }),
+    };
+
+    await runTelegramService(
+      serviceDeps(
+        store,
+        client,
+        ingress,
+        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+      ),
+      abort.signal,
+    );
+
+    expect(seen).toEqual([10, 11]);
+  });
+
+  it("abandons an update that keeps failing so the cursor can advance past it", async () => {
+    const { store, db } = storeFixture();
+    const abort = new AbortController();
+    const client = realClientFactory([
+      { ok: true, result: { id: 123, username: "bot" } },
+      { ok: true, result: [{ update_id: 10 }, { update_id: 11 }] },
+      { ok: true, result: [{ update_id: 10 }, { update_id: 11 }] },
+      { ok: true, result: [{ update_id: 10 }, { update_id: 11 }] },
+      { ok: true, result: [] },
+    ], (pollNumber) => {
+      if (pollNumber === 4) abort.abort();
+    });
+    const ingress = {
+      handleClaimed: vi.fn(async (update: TelegramUpdate) => {
+        if (update.update_id === 10) throw new Error("Telegram API 400");
+      }),
+    };
+
+    await runTelegramService(
+      serviceDeps(
+        store,
+        client,
+        ingress,
+        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+      ),
+      abort.signal,
+    );
+
+    expect(db.prepare("SELECT status, outcome, last_error FROM telegram_updates WHERE update_id = 10").get()).toEqual({
+      status: "processed",
+      outcome: "abandoned",
+      last_error: "Telegram API 400",
+    });
+    expect(store.getNextTelegramOffset()).toBe(12);
+  });
+
+  it("retries a stalled long poll instead of crashing the ingress service", async () => {
+    vi.useFakeTimers();
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const warnings: string[] = [];
+    let poll = 0;
+    const client = vi.fn(() => ({
+      getMe: vi.fn(async () => ({ id: 123, username: "bot" })),
+      getUpdates: vi.fn(async () => {
+        poll += 1;
+        if (poll === 1) throw new Error("Telegram request aborted");
+        abort.abort();
+        return [];
+      }),
+    })) as TelegramServiceDeps["client"];
+
+    const promise = runTelegramService(
+      {
+        ...serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+          ok: true,
+          value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 },
+        })),
+        warn: (message: string) => warnings.push(message),
+      },
+      abort.signal,
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    await promise;
+
+    expect(poll).toBe(2);
+    expect(warnings[0]).toContain("Telegram request aborted");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("binds identity once per token and stops on a polling conflict", async () => {
@@ -222,9 +325,12 @@ describe("Telegram ingress service", () => {
     const client = realClientFactory([
       { ok: true, result: { id: 123, username: "bot" } },
       { ok: true, result: [{ update_id: 10 }] },
-    ]);
+      { ok: true, result: [] },
+    ], (pollNumber) => {
+      if (pollNumber === 2) abort.abort();
+    });
 
-    await expect(runTelegramService(
+    await runTelegramService(
       serviceDeps(
         store,
         client,
@@ -232,7 +338,7 @@ describe("Telegram ingress service", () => {
         () => ({ ok: true, value: { botToken: "123:abcdefghijklmnopqrstuvwxyzABCDE", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
       ),
       abort.signal,
-    )).rejects.toThrow("failed bot123:abcdefghijklmnopqrstuvwxyzABCDE");
+    );
     expect(db.prepare("SELECT status, last_error FROM telegram_updates WHERE update_id = 10").get()).toEqual({
       status: "failed",
       last_error: "failed bot[redacted]",

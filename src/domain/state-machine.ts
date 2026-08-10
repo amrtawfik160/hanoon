@@ -49,11 +49,15 @@ function assertSummary(value: string | undefined, field: string): void {
   }
 }
 
+export function containsCredentialLikeText(value: string): boolean {
+  return SENSITIVE_FAILURE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
 export function assertSafeFailureSummary(error: string): void {
   if (typeof error !== "string" || error.length === 0 || error.length > MAX_FAILURE_SUMMARY_LENGTH) {
     throw new TypeError("error must be a non-empty summary of at most 500 characters");
   }
-  if (SENSITIVE_FAILURE_PATTERNS.some((pattern) => pattern.test(error))) {
+  if (containsCredentialLikeText(error)) {
     throw new TypeError("error must not contain credential-like text");
   }
 }

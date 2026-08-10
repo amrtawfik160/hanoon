@@ -37,7 +37,7 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
 | Monitors | "Tell me when this finishes and open a PR", or "every weekday at 9, summarise the overnight runs." |
-| Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. You never open the BB app to unblock work. |
+| Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. A block it cannot render is still reported, so nothing waits on you in silence. |
 | Reviewed delivery | A guarded job takes a change from plan to merge; merging and production still ask you in Telegram. |
 | Self-diagnosis | `/health` reports the executor, queued work, undelivered messages, monitors, memory, and database integrity — even when the agent is the stuck part. |
 

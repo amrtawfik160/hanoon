@@ -31,23 +31,31 @@ it("registers configurable controller execution settings with safe defaults", as
   expect(harness.registrations.settingsDescriptors).toMatchObject({
     controllerModel: {
       type: "select",
-      options: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
-      default: "gpt-5.6-luna",
+      options: [
+        "claude-opus-5[1m]",
+        "claude-opus-4-8[1m]",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+      ],
+      default: "claude-opus-5[1m]",
     },
     controllerReasoningLevel: {
       type: "select",
       options: ["low", "medium", "high", "xhigh", "max"],
-      default: "max",
+      default: "xhigh",
     },
     controllerServiceTier: {
       type: "select",
       options: ["fast", "default"],
-      default: "fast",
+      default: "default",
     },
     controllerPermissionMode: {
       type: "select",
       options: ["auto", "accept-edits", "full"],
-      default: "auto",
+      default: "full",
     },
   });
 });
@@ -115,7 +123,12 @@ it("wires submitted controller turns through the leased job executor", async () 
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: "setup", generation: lease.generation, now: Date.now() })).toBe(true);
   expect(store.releaseExecutorLease("setup", lease.generation, Date.now())).toBe(true);
-  harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_controller", projectId: "proj_personal", status: "idle" }));
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({
+    id: "thr_controller",
+    projectId: "proj_personal",
+    status: "idle",
+    providerId: "claude-code",
+  }));
   harness.sdk.stub("threads.output", async () => ({ output: "Hello from Luna." }));
 
   const run = harness.behavior.runService("job-executor");
@@ -167,6 +180,7 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
     id: "thr_presence_controller",
     projectId: "proj_personal",
     status: "active",
+    providerId: "claude-code",
     runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
   }));
 

@@ -97,6 +97,126 @@ export async function listVisibleThreads(input: {
   };
 }
 
+const MAX_ACTIVITY_ITEMS = 8;
+const MAX_TRANSCRIPT_CHARS = 1_500;
+
+function tail(value: string | null | undefined, limit: number): string | null {
+  const text = value?.trim();
+  if (!text) return null;
+  return text.length <= limit ? text : `…${text.slice(text.length - limit)}`;
+}
+
+/**
+ * What the thread is doing right now — its current step, running commands, and
+ * latest message. Thread metadata alone cannot answer "why is this slow".
+ */
+export async function readThreadActivity(input: {
+  sdk: BbSdk;
+  now: number;
+  threadId: string;
+  signal: AbortSignal;
+}) {
+  const thread = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
+  if (thread.visibility !== "visible" || thread.archivedAt !== null || thread.deletedAt !== null) {
+    throw new Error("The requested BB thread is not visible");
+  }
+  const [timeline, output, interactions] = await Promise.all([
+    input.sdk.threads.timeline({ threadId: input.threadId, summaryOnly: "true", signal: input.signal }),
+    input.sdk.threads.output({ threadId: input.threadId, signal: input.signal }),
+    input.sdk.threads.interactions.list({ threadId: input.threadId, signal: input.signal }),
+  ]);
+  const thinking = timeline.activeThinking;
+  return {
+    observedAt: input.now,
+    thread: {
+      id: thread.id,
+      title: thread.title ?? thread.titleFallback ?? "Untitled thread",
+      status: thread.status,
+      runtimeStatus: thread.runtime.displayStatus,
+      ageMs: elapsed(input.now, thread.createdAt),
+      lastActivityAgoMs: elapsed(input.now, thread.updatedAt),
+      waitingOnOwner: interactions.some((interaction) => interaction.status === "pending"),
+    },
+    currentStep: thinking === null ? null : {
+      text: tail(thinking.text, 300),
+      runningForMs: elapsed(input.now, thinking.startedAt),
+      idleForMs: elapsed(input.now, thinking.updatedAt),
+    },
+    goal: timeline.goal === null ? null : {
+      objective: tail(timeline.goal.objective, 300),
+      status: timeline.goal.status,
+    },
+    todos: (timeline.pendingTodos?.items ?? []).slice(0, MAX_ACTIVITY_ITEMS).map((todo) => ({
+      text: tail(todo.text, 120),
+      status: todo.status,
+    })),
+    runningCommands: timeline.activeBackgroundCommands.slice(0, MAX_ACTIVITY_ITEMS).map((command) => ({
+      description: tail(command.description, 160),
+      taskStatus: command.taskStatus,
+      runningForMs: elapsed(input.now, command.startedAt),
+    })),
+    runningWorkflows: timeline.activeWorkflows.slice(0, MAX_ACTIVITY_ITEMS).map((workflow) => ({
+      name: workflow.workflowName ?? workflow.taskType,
+      taskStatus: workflow.taskStatus,
+      runningForMs: elapsed(input.now, workflow.startedAt),
+    })),
+    latestMessage: tail(output.output, MAX_TRANSCRIPT_CHARS),
+    etaReason: ETA_REASON,
+  };
+}
+
+async function projectHostId(sdk: BbSdk, projectId: string, signal: AbortSignal): Promise<string> {
+  const projects = await sdk.projects.list({ includePersonal: true, signal });
+  const project = projects.find((candidate) => candidate.id === projectId);
+  if (!project) throw new Error("That BB project is unavailable");
+  const source = project.sources.find((candidate) => candidate.isDefault) ??
+    (project.sources.length === 1 ? project.sources[0] : undefined);
+  if (!source?.hostId) throw new Error("That BB project has no unambiguous workspace source");
+  return source.hostId;
+}
+
+/** Opens a working thread the owner can watch in BB, on its own worktree. */
+export async function createProjectThread(input: {
+  sdk: BbSdk;
+  projectId: string;
+  title: string;
+  prompt: string;
+  signal: AbortSignal;
+}) {
+  const hostId = await projectHostId(input.sdk, input.projectId, input.signal);
+  const thread = await input.sdk.threads.spawn({
+    projectId: input.projectId,
+    title: input.title,
+    visibility: "visible",
+    input: [{ type: "text", text: input.prompt, mentions: [] }],
+    environment: {
+      type: "host",
+      hostId,
+      workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+    },
+  });
+  return { thread: { id: thread.id, title: input.title, projectId: input.projectId } };
+}
+
+/** Continues a thread the owner can see; hidden threads stay off limits. */
+export async function sendToVisibleThread(input: {
+  sdk: BbSdk;
+  threadId: string;
+  text: string;
+  signal: AbortSignal;
+}) {
+  const thread = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
+  if (thread.visibility !== "visible" || thread.archivedAt !== null || thread.deletedAt !== null) {
+    throw new Error("The requested BB thread is not visible");
+  }
+  await input.sdk.threads.send({
+    threadId: input.threadId,
+    mode: "auto",
+    input: [{ type: "text", text: input.text, mentions: [] }],
+  });
+  return { sent: { threadId: input.threadId, status: thread.status } };
+}
+
 export async function visibleThreadStatus(input: {
   sdk: BbSdk;
   now: number;

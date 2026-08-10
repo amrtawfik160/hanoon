@@ -7,16 +7,16 @@ const telegramSettings = {
   pollTimeoutSeconds: "30",
 };
 
-it("defaults controller execution to Luna Max on the fast tier", () => {
+it("defaults controller execution to Opus 5 at xhigh with full permissions", () => {
   const parsed = parseGlobalConfig(telegramSettings);
 
   expect(parsed.ok).toBe(true);
   if (!parsed.ok) throw new Error(parsed.message);
   expect(parsed.value).toMatchObject({
-    controllerModel: "gpt-5.6-luna",
-    controllerReasoningLevel: "max",
-    controllerServiceTier: "fast",
-    controllerPermissionMode: "auto",
+    controllerModel: "claude-opus-5[1m]",
+    controllerReasoningLevel: "xhigh",
+    controllerServiceTier: "default",
+    controllerPermissionMode: "full",
   });
 });
 

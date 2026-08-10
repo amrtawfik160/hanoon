@@ -1,12 +1,5 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { Job, ProjectPolicy, WorkerLiveness } from "../domain/models";
-import {
-  CONTROLLER_MODEL,
-  CONTROLLER_PERMISSION,
-  CONTROLLER_PROVIDER,
-  CONTROLLER_REASONING,
-  CONTROLLER_SERVICE_TIER,
-} from "../controller/bb-controller";
 import { buildReviewPacket, buildWorkOrder, type HandoffArtifact } from "./handoffs";
 import {
   buildCritiqueArtifact,
@@ -85,12 +78,15 @@ function executionArgs(policy: ProjectPolicy["implementation"]): Record<string, 
   return args;
 }
 
+// Pipeline workers pin their own execution tuple. Retuning the conversational
+// controller must never silently change how plans, critiques, and docs are
+// produced; a worker is bound by its work order and reviewed before any merge.
 const LUNA_MAX_EXECUTION = {
-  providerId: CONTROLLER_PROVIDER,
-  model: CONTROLLER_MODEL,
-  reasoningLevel: CONTROLLER_REASONING,
-  serviceTier: CONTROLLER_SERVICE_TIER,
-  permissionMode: CONTROLLER_PERMISSION,
+  providerId: "codex",
+  model: "gpt-5.6-luna",
+  reasoningLevel: "max",
+  serviceTier: "fast",
+  permissionMode: "auto",
   executionInputSources: {
     providerId: "explicit",
     model: "explicit",

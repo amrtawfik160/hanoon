@@ -41,7 +41,7 @@ function jobPresenceStore(
   return {
     getOwner: () => ({ userId: "7", chatId: "70" }),
     getControllerForOwner: () => null,
-    listControllerTurns: () => [],
+    getPendingControllerTurn: () => null,
     getActiveJob: () => job,
     getWorkerLiveness: () => worker,
   };
@@ -141,7 +141,7 @@ describe("Telegram presence heartbeat", () => {
     const store = {
       getOwner: () => ({ userId: "7", chatId: "70" }),
       getControllerForOwner: () => null,
-      listControllerTurns: () => [],
+      getPendingControllerTurn: () => null,
       getActiveJob: () => active ? jobFixture({ state: "implementing" }) : null,
       getWorkerLiveness: () => worker,
     };

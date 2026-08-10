@@ -48,6 +48,27 @@ function visibleThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntr
   };
 }
 
+function backgroundCommand() {
+  return {
+    id: "cmd_1",
+    threadId: "thr_active",
+    turnId: null,
+    sourceSeqStart: 1,
+    sourceSeqEnd: 2,
+    startedAt: 7_000,
+    createdAt: 7_000,
+    kind: "work" as const,
+    status: "pending" as const,
+    workKind: "workflow" as const,
+    itemId: "item_1",
+    taskType: "command",
+    workflowName: null,
+    description: "npm test",
+    taskStatus: "running" as const,
+    workflow: null,
+  };
+}
+
 function parseToolJson(value: unknown): unknown {
   if (typeof value !== "string") throw new Error("controller tool did not return JSON text");
   return JSON.parse(value);
@@ -176,6 +197,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     store,
     sdk: bb.sdk,
     threadOperations: { request: requestThreadOperation },
+    health: () => ({ ok: true }),
     notify,
     now: () => 10_000,
   });
@@ -199,9 +221,14 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     ...context,
     thread: { ...context.thread, id: "thr_unrelated" },
   })).tools).toEqual([]);
+  // Either controller provider may host the conversation; anything else may not.
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
-    provider: { id: "claude-code", model: "claude" },
+    provider: { id: "claude-code", model: "claude-opus-5[1m]" },
+  })).tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  expect((await harness.behavior.resolveAgentConfiguration({
+    ...context,
+    provider: { id: "acp-grok", model: "grok" },
   })).tools).toEqual([]);
 
   await expect(harness.behavior.callAgentTool(
@@ -270,4 +297,136 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   );
   expect(started).toContain("planning");
   expect(notify).toHaveBeenCalledOnce();
+});
+
+it("reads what a thread is doing so slowness can be explained rather than deflected", async () => {
+  const { bb, harness, store } = fixture();
+  harness.sdk.stub("threads.get", async () => ({ ...visibleThread(), canSpawnChild: true }));
+  harness.sdk.stub("threads.timeline", async () => ({
+    rows: [],
+    activePromptMode: null,
+    activeThinking: { id: "think_1", text: "Rewriting the invoice mapper", startedAt: 8_000, updatedAt: 9_800 },
+    activeWorkflows: [],
+    activeBackgroundCommands: [{
+      ...backgroundCommand(),
+      description: "npm test -- --runInBand",
+      taskStatus: "running" as const,
+      startedAt: 7_000,
+    }],
+    pendingTodos: {
+      sourceSeq: 4,
+      updatedAt: 9_000,
+      items: [
+        { id: "todo_1", text: "Map legacy invoices", status: "completed" as const },
+        { id: "todo_2", text: "Backfill the report", status: "in_progress" as const },
+      ],
+    },
+    goal: {
+      sourceSeq: 1,
+      updatedAt: 9_000,
+      objective: "Ship the billing fix",
+      status: "active" as const,
+      tokenBudget: null,
+      tokensUsed: 10,
+      timeUsedSeconds: 30,
+    },
+    modelFallback: null,
+    timelinePage: { hasMore: false, oldestSeq: 1, newestSeq: 9 },
+    maxSeq: 9,
+  }));
+  harness.sdk.stub("threads.output", async () => ({ output: "Running the suite now." }));
+  harness.sdk.stub("threads.interactions.list", async () => []);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+
+  const activity = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_read_thread",
+    { threadId: "thr_active" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  ));
+
+  expect(activity).toMatchObject({
+    thread: { id: "thr_active", lastActivityAgoMs: 500, waitingOnOwner: false },
+    currentStep: { text: "Rewriting the invoice mapper", runningForMs: 2_000, idleForMs: 200 },
+    goal: { objective: "Ship the billing fix", status: "active" },
+    todos: [
+      { text: "Map legacy invoices", status: "completed" },
+      { text: "Backfill the report", status: "in_progress" },
+    ],
+    runningCommands: [{ description: "npm test -- --runInBand", taskStatus: "running", runningForMs: 3_000 }],
+    latestMessage: "Running the suite now.",
+  });
+});
+
+it("opens and messages visible threads, and refuses hidden ones", async () => {
+  const { bb, harness, store } = fixture();
+  const spawn = vi.fn(async () => ({ id: "thr_new", environmentId: "env_new" }));
+  const send = vi.fn(async () => ({ ok: true }));
+  harness.sdk.stub("projects.list", async () => [{
+    id: "proj_1",
+    kind: "software",
+    name: "cyndra-saas",
+    gitRemoteUrl: "git@github.com:acme/cyndra.git",
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [{
+      id: "src_1",
+      projectId: "proj_1",
+      isDefault: true,
+      createdAt: 1,
+      updatedAt: 1,
+      type: "local_path",
+      hostId: "host_cyndra",
+      path: "/repo",
+    }],
+  }]);
+  harness.sdk.stub("threads.spawn", spawn);
+  harness.sdk.stub("threads.send", send);
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread(threadId === "thr_hidden" ? { id: "thr_hidden", visibility: "hidden" } : {}),
+    canSpawnChild: true,
+  }));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+
+  const created = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_create_thread",
+    { projectId: "proj_1", title: "Look into the billing spike", prompt: "Investigate the invoice spike" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  ));
+  expect(created).toMatchObject({ thread: { id: "thr_new", projectId: "proj_1" } });
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
+    projectId: "proj_1",
+    visibility: "visible",
+    environment: expect.objectContaining({ type: "host", hostId: "host_cyndra" }),
+  }));
+
+  const sent = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_send_to_thread",
+    { threadId: "thr_active", text: "Use the staging database" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  ));
+  expect(sent).toMatchObject({ sent: { threadId: "thr_active" } });
+  expect(send).toHaveBeenCalledWith(expect.objectContaining({
+    threadId: "thr_active",
+    input: [{ type: "text", text: "Use the staging database", mentions: [] }],
+  }));
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_send_to_thread",
+    { threadId: "thr_hidden", text: "leak" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  )).rejects.toThrow(/not visible/i);
 });

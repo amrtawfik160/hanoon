@@ -496,6 +496,24 @@ CREATE TABLE thread_interactions (
 CREATE INDEX thread_interactions_state ON thread_interactions (state, asked_at);
 `] as const;
 
+export const UNSUPPORTED_INTERACTION_MIGRATIONS = [String.raw`
+CREATE TABLE thread_interactions_v2 (
+  interaction_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user_question', 'approval', 'unsupported')),
+  payload_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answer_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER
+);
+INSERT INTO thread_interactions_v2 SELECT * FROM thread_interactions;
+DROP TABLE thread_interactions;
+ALTER TABLE thread_interactions_v2 RENAME TO thread_interactions;
+CREATE INDEX thread_interactions_state_v2 ON thread_interactions (state, asked_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -511,4 +529,5 @@ export const ALL_MIGRATIONS = [
   ...CONTINUITY_MIGRATIONS,
   ...CONTROLLER_QUESTION_MIGRATIONS,
   ...THREAD_NOTICE_MIGRATIONS,
+  ...UNSUPPORTED_INTERACTION_MIGRATIONS,
 ] as const;

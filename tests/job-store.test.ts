@@ -119,6 +119,55 @@ it("claims an update once and advances the cursor only after lower updates compl
   expect(store.getNextTelegramOffset()).toBe(23);
 });
 
+it("abandons an exhausted update so it stops pinning the polling cursor", () => {
+  const { store, db } = storeFixture();
+
+  expect(store.beginTelegramUpdate(41, 3_000)).toBe("process");
+  store.failTelegramUpdate(41, "Telegram API 400", 3_001);
+  expect(store.beginTelegramUpdate(41, 3_002)).toBe("process");
+  store.failTelegramUpdate(41, "Telegram API 400", 3_003);
+  expect(store.beginTelegramUpdate(41, 3_004)).toBe("process");
+  store.abandonTelegramUpdate(41, "Telegram API 400", 3_005);
+
+  expect(db.prepare("SELECT status, outcome FROM telegram_updates WHERE update_id = 41").get()).toEqual({
+    status: "processed",
+    outcome: "abandoned",
+  });
+  expect(store.getNextTelegramOffset()).toBe(42);
+});
+
+it("stops letting an already exhausted failure pin the cursor once newer updates land", () => {
+  const { store } = storeFixture();
+
+  for (const now of [4_000, 4_002, 4_004]) {
+    expect(store.beginTelegramUpdate(51, now)).toBe("process");
+    store.failTelegramUpdate(51, "Telegram API 400", now + 1);
+  }
+  expect(store.getTelegramUpdateAttempts(51)).toBe(3);
+  expect(store.getNextTelegramOffset()).toBe(0);
+
+  expect(store.beginTelegramUpdate(52, 4_006)).toBe("process");
+  store.completeTelegramUpdate(52, "processed", 4_007);
+
+  expect(store.getNextTelegramOffset()).toBe(53);
+});
+
+it("reconciles a cursor left pinned by an exhausted update before polling resumes", () => {
+  const { store, db } = storeFixture();
+
+  db.prepare(
+    `INSERT INTO telegram_updates (update_id, status, attempts, outcome, last_error, processed_at)
+     VALUES (61, 'failed', 8, NULL, 'Telegram API 400', 5_000)`,
+  ).run();
+  expect(store.beginTelegramUpdate(62, 5_001)).toBe("process");
+  store.completeTelegramUpdate(62, "processed", 5_002);
+  db.prepare("UPDATE telegram_cursor SET next_offset = 61 WHERE singleton = 1").run();
+
+  store.reconcileTelegramCursor();
+
+  expect(store.getNextTelegramOffset()).toBe(63);
+});
+
 it("requires the store that claimed an update to complete or fail it", () => {
   const { bb, store } = storeFixture();
   const otherStore = openStore(bb.storage);

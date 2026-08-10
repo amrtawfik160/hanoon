@@ -60,6 +60,26 @@ function addSubmittedControllerTurn(store: TelegramAgentStore): string {
   return turn.id;
 }
 
+function submitAnotherControllerTurn(
+  store: TelegramAgentStore,
+  fence: { ownerId: string; generation: number },
+  updateId: number,
+  now: number,
+): string {
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "executor-presence-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId,
+    inputText: "next question",
+    now,
+  });
+  const claim = { ownerId: fence.ownerId, generation: fence.generation, now };
+  expect(store.claimNextControllerTurn(claim)?.id).toBe(turn.id);
+  expect(store.markControllerTurnSubmitted({ ...claim, turnId: turn.id })).toBe(true);
+  return turn.id;
+}
+
 describe("singleton job executor", () => {
   it("delivers one status message and edits the same message on the next desired state", async () => {
     const { store, db } = fixture();
@@ -473,6 +493,72 @@ describe("singleton job executor", () => {
       messageId: 777,
       payload: { text: "Final answer" },
     });
+  });
+
+  it("reuses one Telegram draft id per chat so a stale preview cannot linger beside the next answer", async () => {
+    const { store } = fixture();
+    const firstTurnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 811 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, _text: string) => undefined);
+    let loop = 0;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (loop === 2) abort.abort();
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async (fence) => {
+          // The owner reads the answer and immediately asks the next question,
+          // while Telegram still shows the previous 30-second preview.
+          if (loop === 1) {
+            expect(store.completeControllerTurn({
+              ownerId: fence.ownerId,
+              generation: fence.generation,
+              now: 2_000,
+              turnId: firstTurnId,
+              responseText: "First answer",
+            })).toBe(true);
+            submitAnotherControllerTurn(store, fence, 901, 2_000);
+          }
+          return true;
+        }),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessageDraft).toHaveBeenCalledTimes(2);
+    expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
+  });
+
+  it("polls fast while a controller answer streams so the draft animates instead of jumping", async () => {
+    const { store } = fixture();
+    const abort = new AbortController();
+    const waitForWork = vi.fn(async () => abort.abort());
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      controller: {
+        reconcile: vi.fn(async () => true),
+        processOne: vi.fn(async () => false),
+        isStreaming: () => true,
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(waitForWork).toHaveBeenCalledWith(250, expect.any(AbortSignal));
   });
 
   it.each(["idle", "active"] as const)("caps the %s executor wait at the active presence deadline", async (mode) => {

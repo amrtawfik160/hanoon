@@ -295,3 +295,17 @@ it("delivers a tapped answer without waiting for the next sweep", async () => {
 
   expect(resolve).toHaveBeenCalledWith("thr_work", APPROVAL_ID, { decision: "deny" });
 });
+
+it("still reports a block it cannot render, instead of leaving the thread silent", async () => {
+  const store = fixture();
+  const { service: notices } = service(store, {
+    threads: [watched()],
+    interactions: [{ id: "pint_plugin1", status: "pending", payload: { kind: "plugin", detail: "something new" } }],
+  });
+
+  await expect(notices.processDue()).resolves.toBe(true);
+
+  const asked = store.getOutbox("thread-interaction:pint_plugin1");
+  expect(asked?.payload.text).toContain("Fix the login bug");
+  expect(asked?.payload.reply_markup).toBeUndefined();
+});

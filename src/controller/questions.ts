@@ -137,7 +137,9 @@ export function renderQuestion(
 export type ThreadApprovalDecision = "allow_once" | "allow_for_session" | "deny";
 export type ThreadInteraction =
   | { kind: "user_question"; interactionId: string; questions: ControllerQuestion[] }
-  | { kind: "approval"; interactionId: string; summary: string; decisions: ThreadApprovalDecision[] };
+  | { kind: "approval"; interactionId: string; summary: string; decisions: ThreadApprovalDecision[] }
+  /** A block the plugin can name but not answer, so the owner still hears about it. */
+  | { kind: "unsupported"; interactionId: string };
 
 const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
   allow_once: "Allow once",
@@ -161,8 +163,9 @@ function approvalSummary(subject: Record<string, unknown>): string | null {
 
 /**
  * Reads whatever a thread is waiting on into something answerable from a phone.
- * An interaction the plugin cannot represent returns null: the owner is told the
- * thread is blocked rather than shown buttons that would resolve it wrongly.
+ * A block the plugin cannot represent still comes back as `unsupported` rather
+ * than null: guessing at buttons would resolve it wrongly, but saying nothing
+ * leaves the thread waiting on an owner who was never told.
  */
 export function parseThreadInteraction(interactionId: unknown, payload: unknown): ThreadInteraction | null {
   if (typeof interactionId !== "string" || interactionId.length === 0) return null;
@@ -170,17 +173,19 @@ export function parseThreadInteraction(interactionId: unknown, payload: unknown)
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind === "user_question") {
     const question = parsePendingQuestion(interactionId, payload);
-    return question ? { kind: "user_question", interactionId, questions: question.questions } : null;
+    return question
+      ? { kind: "user_question", interactionId, questions: question.questions }
+      : { kind: "unsupported", interactionId };
   }
-  if (candidate.kind !== "approval") return null;
+  if (candidate.kind !== "approval") return { kind: "unsupported", interactionId };
   const subject = candidate.subject;
-  if (typeof subject !== "object" || subject === null) return null;
-  const summary = approvalSummary(subject as Record<string, unknown>);
-  if (!summary) return null;
+  const summary = typeof subject === "object" && subject !== null
+    ? approvalSummary(subject as Record<string, unknown>)
+    : null;
   const offered = Array.isArray(candidate.decisions) ? candidate.decisions : Object.keys(APPROVAL_LABELS);
   const decisions = (Object.keys(APPROVAL_LABELS) as ThreadApprovalDecision[])
     .filter((decision) => offered.includes(decision));
-  if (decisions.length === 0) return null;
+  if (!summary || decisions.length === 0) return { kind: "unsupported", interactionId };
   return { kind: "approval", interactionId, summary, decisions };
 }
 
@@ -192,7 +197,13 @@ export function threadDecisionToken(interactionId: string, decision: string): st
 }
 
 /** The message that asks the owner to unblock a thread, with its buttons. */
-export function renderThreadInteraction(title: string, interaction: ThreadInteraction): RenderedQuestion {
+export function renderThreadInteraction(
+  title: string,
+  interaction: ThreadInteraction,
+): RenderedQuestion | { text: string } {
+  if (interaction.kind === "unsupported") {
+    return { text: `*${title}* is waiting on something I can't answer from here. It needs you in BB.` };
+  }
   if (interaction.kind === "user_question") {
     const first = interaction.questions[0];
     if (!first) throw new TypeError("a thread question must have a question");

@@ -2135,6 +2135,7 @@ function matchThreadInteractionToken(
   interaction: ThreadInteraction,
   token: string,
 ): { label: string; resolution: Record<string, unknown> } | null {
+  if (interaction.kind === "unsupported") return null;
   if (interaction.kind === "approval") {
     for (const decision of interaction.decisions) {
       if (threadDecisionToken(interaction.interactionId, decision) !== token) continue;
@@ -3301,7 +3302,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         chatId: input.chatId,
         payload: {
           ...formattedMessage(rendered.text),
-          reply_markup: rendered.reply_markup,
+          ...("reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
           disable_web_page_preview: true,
         },
       }, input.now);
