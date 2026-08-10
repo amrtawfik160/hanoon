@@ -318,4 +318,26 @@ describe("singleton job executor", () => {
       lastError: expect.stringContaining("chat not found"),
     });
   });
+
+  it("runs controller reconciliation and one dispatch before waiting through the nudge hook", async () => {
+    const { store } = fixture();
+    const abort = new AbortController();
+    const order: string[] = [];
+    const waitForWork = vi.fn(async () => abort.abort());
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      controller: {
+        reconcile: vi.fn(async () => { order.push("reconcile"); return true; }),
+        processOne: vi.fn(async () => { order.push("dispatch"); return true; }),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(order).toEqual(["reconcile", "dispatch"]);
+    expect(waitForWork).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+  });
 });

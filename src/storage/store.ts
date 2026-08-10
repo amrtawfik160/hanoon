@@ -1258,6 +1258,10 @@ export interface TelegramAgentStore {
     leaseMs?: number;
   }): boolean;
   markControllerTurnSubmitted(input: ControllerLeaseFence & { turnId: string; leaseMs?: number }): boolean;
+  resetControllerThread(input: ControllerLeaseFence & {
+    controllerKey: string;
+    expectedThreadId: string;
+  }): boolean;
   completeControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     responseText: string;
@@ -2079,6 +2083,27 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                  AND state = 'active' AND bb_thread_id IS NOT NULL
             )`,
       ).run(input.now, input.now, input.turnId, input.ownerId, input.generation).changes === 1;
+    }).immediate();
+  }
+
+  public resetControllerThread(input: ControllerLeaseFence & {
+    controllerKey: string;
+    expectedThreadId: string;
+  }): boolean {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    if (!input.ownerId) throw new TypeError("ownerId must not be empty");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        `UPDATE controller_threads
+            SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+                state = 'pending_spawn', pending_spawn_token = NULL,
+                last_error = NULL, updated_at = ?
+          WHERE controller_key = ? AND bb_thread_id = ?`,
+      ).run(input.now, input.controllerKey, input.expectedThreadId).changes === 1;
     }).immediate();
   }
 

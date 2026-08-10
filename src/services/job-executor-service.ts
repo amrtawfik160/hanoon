@@ -25,6 +25,11 @@ export type JobExecutorDependencies = {
   jitter?: () => number;
   leaseMs?: number;
   releaseOnShutdown?: boolean;
+  controller?: {
+    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
+    reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
+  };
+  waitForWork?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
 const LEASE_MS = 30_000;
@@ -172,6 +177,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
 
         let didWork = false;
+        const effectFence = { ownerId, generation: lease.generation, signal: workAbort.signal };
+        if (deps.controller) {
+          didWork = await deps.controller.reconcile(effectFence, workAbort.signal) || didWork;
+          didWork = await deps.controller.processOne(effectFence, workAbort.signal) || didWork;
+        }
         const jobs = deps.store.listJobs(1_000);
         for (const job of jobs) {
           if (isTerminal(job)) continue;
@@ -352,7 +362,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           break;
         }
         try {
-          await sleep(didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS, workAbort.signal);
+          await (deps.waitForWork ?? sleep)(didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS, workAbort.signal);
         } catch {
           if (leaseLost) continueAcquiring = true;
           break;
