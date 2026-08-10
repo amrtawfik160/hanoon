@@ -228,6 +228,20 @@ function fenceUnknown(
     .run(JSON.stringify({ ...effect.payload, mergeCallStartedAt: NOW + 2, mergeCallOutcome: "unknown" }), effect.jobId, effect.idempotencyKey);
 }
 
+function insertCompetingMergeEffect(
+  fixture: ReturnType<typeof mergeFixture>,
+  idempotencyKey: string,
+  payloadJson: string,
+  status: "pending" | "done" = "pending",
+): void {
+  fixture.db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, ?, 'merge_pr', ?, ?, 0, ?, ?, ?)`,
+  ).run(idempotencyKey, "job_1", payloadJson, status, NOW, NOW, NOW);
+}
+
 describe("fresh Telegram merge execution", () => {
   it("uses the concrete Task 8 validation receipt for callback and merge-handler head truth", async () => {
     const fixture = mergeFixture();
@@ -366,6 +380,189 @@ describe("fresh Telegram merge execution", () => {
     expect(first).toEqual(second);
     expect(fixture.collectGateInput).toHaveBeenCalledTimes(1);
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM callbacks").get()).toEqual({ count: 1 });
+  });
+
+  it.each([
+    ["same callback id", "callback_1"],
+    ["consumed approval replay", "callback_cancelled_replay"],
+  ] as const)("rejects %s after cancellation is requested after acceptance", async (_label, callbackId) => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    fixture.db.prepare("UPDATE jobs SET cancel_requested_at = ? WHERE id = 'job_1'").run(NOW + 2);
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId,
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+    })).resolves.toEqual({ outcome: "rejected" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    expect(fixture.store.getEffect("job_1", mergeEffect(fixture.store).idempotencyKey)).toMatchObject({
+      status: "pending",
+    });
+  });
+
+  it("rejects a same-callback replay after the paired owner is re-paired", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    expect(fixture.store.revokeOwner(NOW + 2)).toBe(true);
+    fixture.store.createPairingCode(hashSecret("replacement-pair"), NOW + 2, NOW + 60_000);
+    expect(fixture.store.pairOwnerWithPrivateChatCode(
+      hashSecret("replacement-pair"),
+      "8",
+      "80",
+      NOW + 3,
+    )).toEqual({ ok: true });
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: "callback_1",
+      nonce: fixture.issued.nonce,
+      userId: "8",
+      chatId: "80",
+    })).resolves.toEqual({ outcome: "rejected" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["JSON-valid schema-invalid", (effect: StoredEffect) => JSON.stringify({ headSha: HEAD, receipt: {} })],
+    ["malformed JSON", () => "{malformed"],
+    ["mismatched receipt binding", (effect: StoredEffect) => {
+      const payload = structuredClone(effect.payload) as { receipt: Record<string, unknown> };
+      payload.receipt.approvalOwnerUserId = "8";
+      return JSON.stringify(payload);
+    }],
+  ] as const)("fails closed in store replay reconstruction when a competing row is %s", async (_label, payloadFor) => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = mergeEffect(fixture.store);
+    insertCompetingMergeEffect(fixture, `${effect.idempotencyKey}:corrupt`, payloadFor(effect));
+
+    const storeReplay = fixture.store.rejectApprovalAndRecordCallback({
+      nonceHash: hashSecret(fixture.issued.nonce),
+      callbackId: `store_replay_${_label.replaceAll(" ", "_")}`,
+      jobId: "job_1",
+      now: NOW + 3,
+    });
+    expect(storeReplay.outcome).toBe("rejected");
+    expect(fixture.store.getCallback(`store_replay_${_label.replaceAll(" ", "_")}`)?.outcome).toBe("rejected");
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM effects WHERE job_id = 'job_1' AND kind = 'merge_pr'").get())
+      .toEqual({ count: 2 });
+  });
+
+  it.each([
+    ["JSON-valid schema-invalid", (effect: StoredEffect) => JSON.stringify({ headSha: HEAD, receipt: {} })],
+    ["mismatched receipt binding", (effect: StoredEffect) => {
+      const payload = structuredClone(effect.payload) as { receipt: Record<string, unknown> };
+      payload.receipt.approvalOwnerUserId = "8";
+      return JSON.stringify(payload);
+    }],
+  ] as const)("rejects handler replay when a competing row is %s", async (_label, payloadFor) => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = mergeEffect(fixture.store);
+    insertCompetingMergeEffect(fixture, `${effect.idempotencyKey}:handler-corrupt`, payloadFor(effect));
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: `handler_replay_${_label.replaceAll(" ", "_")}`,
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+    })).resolves.toEqual({ outcome: "rejected" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("rejects handler replay when a competing row contains malformed JSON", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = mergeEffect(fixture.store);
+    insertCompetingMergeEffect(fixture, `${effect.idempotencyKey}:handler-malformed`, "{malformed");
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: "handler_replay_malformed",
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+    })).resolves.toEqual({ outcome: "rejected" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("rejects handler replay when a competing completed row has a mismatched result", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
+    const completed = fixture.store.getEffect("job_1", effect.idempotencyKey);
+    if (!completed) throw new Error("completed merge effect was not durable");
+    const payload = structuredClone(completed.payload) as {
+      receipt: Record<string, unknown>;
+      mergeResult: Record<string, unknown>;
+    };
+    const competingKey = `${effect.idempotencyKey}:result-corrupt`;
+    payload.receipt.effectIdempotencyKey = competingKey;
+    payload.mergeResult.effectIdempotencyKey = competingKey;
+    payload.mergeResult.authoritativeHeadSha = MOVED;
+    insertCompetingMergeEffect(fixture, competingKey, JSON.stringify(payload), "done");
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: "handler_replay_result_mismatch",
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+    })).resolves.toEqual({ outcome: "rejected" });
+    expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["JSON-valid schema-invalid", (effect: StoredEffect) => JSON.stringify({ headSha: HEAD, receipt: {} })],
+    ["malformed JSON", () => "{malformed"],
+    ["mismatched receipt binding", (effect: StoredEffect) => {
+      const payload = structuredClone(effect.payload) as { receipt: Record<string, unknown> };
+      payload.receipt.approvalOwnerUserId = "8";
+      return JSON.stringify(payload);
+    }],
+  ] as const)("fails closed in legacy callback reconstruction when a competing row is %s", async (_label, payloadFor) => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = mergeEffect(fixture.store);
+    fixture.db.prepare(
+      "UPDATE callbacks SET approval_nonce_hash = NULL, head_sha = NULL, effect_idempotency_key = NULL WHERE callback_query_id = 'callback_1'",
+    ).run();
+    insertCompetingMergeEffect(fixture, `${effect.idempotencyKey}:legacy-corrupt`, payloadFor(effect));
+
+    expect(fixture.store.getCallback("callback_1")).toMatchObject({
+      outcome: "accepted",
+      approvalNonceHash: null,
+      headSha: null,
+      effectIdempotencyKey: null,
+    });
+  });
+
+  it("fails closed in legacy callback reconstruction when a competing completed row has a mismatched result", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
+    const completed = fixture.store.getEffect("job_1", effect.idempotencyKey);
+    if (!completed) throw new Error("completed merge effect was not durable");
+    const payload = structuredClone(completed.payload) as {
+      receipt: Record<string, unknown>;
+      mergeResult: Record<string, unknown>;
+    };
+    const competingKey = `${effect.idempotencyKey}:legacy-result-corrupt`;
+    payload.receipt.effectIdempotencyKey = competingKey;
+    payload.mergeResult.effectIdempotencyKey = competingKey;
+    payload.mergeResult.authoritativeHeadSha = MOVED;
+    fixture.db.prepare(
+      "UPDATE callbacks SET approval_nonce_hash = NULL, head_sha = NULL, effect_idempotency_key = NULL WHERE callback_query_id = 'callback_1'",
+    ).run();
+    insertCompetingMergeEffect(fixture, competingKey, JSON.stringify(payload), "done");
+
+    expect(fixture.store.getCallback("callback_1")).toMatchObject({
+      outcome: "accepted",
+      approvalNonceHash: null,
+      headSha: null,
+      effectIdempotencyKey: null,
+    });
   });
 
   it("rejects a replay of an accepted callback when its supplied nonce differs", async () => {

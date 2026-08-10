@@ -2839,32 +2839,48 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     let candidate: MergeCallbackIdentity | null = null;
     const job = this.readJobById(jobId);
     if (!job) return null;
+    const owner = this.getOwner();
     for (const row of rows) {
       if (row.status === "failed" || row.status === "dead") continue;
+      let persistedPayload: Record<string, unknown>;
+      let parsed: MergeEffectPayload;
       try {
-        const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
-        const parsed = parsePersistedMergeEffectPayload(payload, row.status);
-        const receipt = parsed.receipt;
-        const approval = this.readApproval(receipt.approvalNonceHash);
-        const valid = row.status === "done"
-          ? (() => {
-              const result = parsePersistedMergeSuccessResult(payload.mergeResult);
-              return mergeSuccessResultMatchesDurable(result, row, parsed, job, approval, "merged") &&
-                this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, result);
-            })()
-          : this.acceptedMergeReceiptBindingError(row, parsed, job, approval) === null &&
-            isCompletedReviewAttempt(this.getAttempt(receipt.reviewAttemptId), jobId, receipt.headSha);
-        if (!valid) continue;
-        const identity = {
-          approvalNonceHash: receipt.approvalNonceHash,
-          headSha: receipt.headSha,
-          effectIdempotencyKey: row.idempotency_key,
-        };
-        if (candidate !== null) return null;
-        candidate = identity;
+        persistedPayload = JSON.parse(row.payload_json) as Record<string, unknown>;
+        parsed = parsePersistedMergeEffectPayload(persistedPayload, row.status);
       } catch {
-        continue;
+        return null;
       }
+      const receipt = parsed.receipt;
+      if (parsed.mergeOutcome === "stale") continue;
+      if (receipt.jobId !== jobId) return null;
+      const approval = this.readApproval(receipt.approvalNonceHash);
+      if (row.status === "done") {
+        let result: PersistedMergeSuccessResult;
+        try {
+          result = parsePersistedMergeSuccessResult(persistedPayload.mergeResult);
+        } catch {
+          return null;
+        }
+        if (
+          !mergeSuccessResultMatchesDurable(result, row, parsed, job, approval, "merged") ||
+          !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, result) ||
+          owner === null ||
+          owner.userId !== receipt.approvalOwnerUserId ||
+          owner.chatId !== receipt.approvalOwnerChatId
+        ) return null;
+      } else if (
+        this.acceptedMergeReceiptBindingError(row, parsed, job, approval) !== null ||
+        !isCompletedReviewAttempt(this.getAttempt(receipt.reviewAttemptId), jobId, receipt.headSha)
+      ) {
+        return null;
+      }
+      const identity = {
+        approvalNonceHash: receipt.approvalNonceHash,
+        headSha: receipt.headSha,
+        effectIdempotencyKey: row.idempotency_key,
+      };
+      if (candidate !== null) return null;
+      candidate = identity;
     }
     return candidate;
   }
@@ -2878,58 +2894,65 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       .prepare("SELECT * FROM effects WHERE job_id = ? AND kind = 'merge_pr'")
       .all(jobId) as EffectRow[];
     let candidate: MergeCallbackIdentity | null = null;
+    const job = this.readJobById(jobId);
+    if (!job) return null;
+    const owner = this.getOwner();
     for (const row of rows) {
       if (row.status === "failed" || row.status === "dead") continue;
+      let persistedPayload: Record<string, unknown>;
+      let parsed: MergeEffectPayload;
       try {
-        const payload = JSON.parse(row.payload_json) as Record<string, unknown> & { mergeOutcome?: unknown };
-        if (payload.mergeOutcome === "stale") continue;
-        const parsed = parsePersistedMergeEffectPayload(payload, row.status);
+        persistedPayload = JSON.parse(row.payload_json) as Record<string, unknown>;
+        parsed = parsePersistedMergeEffectPayload(persistedPayload, row.status);
+      } catch {
+        return null;
+      }
+      const receipt = parsed.receipt;
+      if (parsed.mergeOutcome === "stale") continue;
+      if (receipt.jobId !== jobId) return null;
+      if (receipt.headSha !== headSha || receipt.approvalNonceHash !== approvalNonceHash) continue;
+      if (receipt.effectIdempotencyKey !== row.idempotency_key) return null;
+      if (row.status === "done") {
+        let result: PersistedMergeSuccessResult;
+        try {
+          result = parsePersistedMergeSuccessResult(persistedPayload.mergeResult);
+        } catch {
+          return null;
+        }
         if (
-          parsed.receipt.headSha !== headSha ||
-          parsed.receipt.approvalNonceHash !== approvalNonceHash ||
-          parsed.receipt.effectIdempotencyKey !== row.idempotency_key
-        ) continue;
-        const job = this.readJobById(jobId);
-        if (!job) continue;
-        if (row.status === "done") {
-          const result = parsePersistedMergeSuccessResult(payload.mergeResult);
-          if (!mergeSuccessResultMatchesDurable(
+          !mergeSuccessResultMatchesDurable(
             result,
             row,
             parsed,
             job,
-            this.readApproval(parsed.receipt.approvalNonceHash),
+            this.readApproval(receipt.approvalNonceHash),
             "merged",
-          ) || !this.attemptResultMatches(
-            parsed.receipt.reviewAttemptId,
-            jobId,
-            parsed.receipt.headSha,
-            result,
-          )) continue;
-        } else if (this.acceptedMergeReceiptBindingError(
+          ) || !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, result) ||
+          owner === null ||
+          owner.userId !== receipt.approvalOwnerUserId ||
+          owner.chatId !== receipt.approvalOwnerChatId
+        ) return null;
+      } else if (
+        this.acceptedMergeReceiptBindingError(
           row,
           parsed,
           job,
-          this.readApproval(parsed.receipt.approvalNonceHash),
-        )) {
-          continue;
-        } else if (!isCompletedReviewAttempt(
-          this.getAttempt(parsed.receipt.reviewAttemptId),
+          this.readApproval(receipt.approvalNonceHash),
+        ) !== null || !isCompletedReviewAttempt(
+          this.getAttempt(receipt.reviewAttemptId),
           jobId,
-          parsed.receipt.headSha,
-        )) {
-          continue;
-        }
-        const identity = {
-          approvalNonceHash,
-          headSha,
-          effectIdempotencyKey: row.idempotency_key,
-        };
-        if (candidate !== null) return null;
-        candidate = identity;
-      } catch {
-        continue;
+          receipt.headSha,
+        )
+      ) {
+        return null;
       }
+      const identity = {
+        approvalNonceHash,
+        headSha,
+        effectIdempotencyKey: row.idempotency_key,
+      };
+      if (candidate !== null) return null;
+      candidate = identity;
     }
     return candidate;
   }

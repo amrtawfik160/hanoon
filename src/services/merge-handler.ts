@@ -757,60 +757,60 @@ export class MergeHandler {
     } catch {
       return null;
     }
+    const currentOwner = this.options.store.getOwner();
     let candidate: MergeCallbackIdentity | null = null;
     for (const effect of effects) {
       if (effect.kind !== "merge_pr" || effect.status === "failed" || effect.status === "dead") continue;
+      if (effect.jobId !== jobId) continue;
+      let payload: MergeEffectPayload;
       try {
-        const payload = parsePersistedMergeEffectPayload(effect.payload, effect.status);
-        const receipt = payload.receipt;
-        if (
-          payload.mergeOutcome === "stale" ||
-          receipt.jobId !== jobId ||
-          receipt.headSha !== headSha ||
-          receipt.approvalNonceHash !== approvalNonceHash ||
-          receipt.effectIdempotencyKey !== effect.idempotencyKey
-        ) continue;
-        if (effect.status === "done") {
-          if (this.isValidCompletedEffect(effect)) {
-            const identity = { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
-            if (candidate !== null) return null;
-            candidate = identity;
-          }
-          continue;
-        }
-        if (
-          !job ||
-          !approval ||
-          job.state !== "merging" ||
-          job.version !== receipt.jobVersion ||
-          job.prHeadSha !== receipt.headSha ||
-          job.projectId !== receipt.projectId ||
-          job.environmentId !== receipt.environmentId ||
-          job.prNumber !== receipt.prNumber ||
-          job.policy === null ||
-          job.policy.baseBranch !== receipt.baseBranch ||
-          job.policy.mergeMethod !== receipt.mergeMethod ||
-          JSON.stringify([...job.policy.requiredChecks].sort()) !== JSON.stringify(receipt.requiredCheckNames) ||
-          approval.jobId !== jobId ||
-          approval.headSha !== headSha ||
-          approval.consumedAt === null ||
-          approval.outcome !== "accepted" ||
-          approval.jobVersion !== receipt.approvalJobVersion ||
-          approval.ownerUserId !== receipt.approvalOwnerUserId ||
-          approval.ownerChatId !== receipt.approvalOwnerChatId ||
-          approval.expiresAt !== Date.parse(receipt.expiresAt)
-        ) continue;
-        if (!isCompletedReviewAttempt(
-          this.options.store.getAttempt(receipt.reviewAttemptId),
-          jobId,
-          receipt.headSha,
-        )) continue;
-        const identity = { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
-        if (candidate !== null) return null;
-        candidate = identity;
+        payload = parsePersistedMergeEffectPayload(effect.payload, effect.status);
       } catch {
-        continue;
+        return null;
       }
+      const receipt = payload.receipt;
+      if (payload.mergeOutcome === "stale") continue;
+      if (receipt.jobId !== jobId) return null;
+      if (receipt.headSha !== headSha || receipt.approvalNonceHash !== approvalNonceHash) continue;
+      if (receipt.effectIdempotencyKey !== effect.idempotencyKey) return null;
+      if (effect.status === "done") {
+        if (!this.isValidCompletedEffect(effect)) return null;
+      } else if (
+        !job ||
+        !approval ||
+        job.state !== "merging" ||
+        job.cancelRequestedAt !== null ||
+        job.version !== receipt.jobVersion ||
+        job.prHeadSha !== receipt.headSha ||
+        job.projectId !== receipt.projectId ||
+        job.environmentId !== receipt.environmentId ||
+        job.prNumber !== receipt.prNumber ||
+        job.policy === null ||
+        job.policy.baseBranch !== receipt.baseBranch ||
+        job.policy.mergeMethod !== receipt.mergeMethod ||
+        JSON.stringify([...job.policy.requiredChecks].sort()) !== JSON.stringify(receipt.requiredCheckNames) ||
+        approval.jobId !== jobId ||
+        approval.headSha !== headSha ||
+        approval.consumedAt === null ||
+        approval.outcome !== "accepted" ||
+        approval.jobVersion !== receipt.approvalJobVersion ||
+        approval.ownerUserId !== receipt.approvalOwnerUserId ||
+        approval.ownerChatId !== receipt.approvalOwnerChatId ||
+        approval.expiresAt !== Date.parse(receipt.expiresAt) ||
+        currentOwner?.userId !== receipt.approvalOwnerUserId ||
+        currentOwner?.chatId !== receipt.approvalOwnerChatId
+      ) {
+        return null;
+      } else if (!isCompletedReviewAttempt(
+        this.options.store.getAttempt(receipt.reviewAttemptId),
+        jobId,
+        receipt.headSha,
+      )) {
+        return null;
+      }
+      const identity = { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
+      if (candidate !== null) return null;
+      candidate = identity;
     }
     return candidate;
   }
