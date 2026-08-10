@@ -19,6 +19,7 @@ import {
   projectWorkerLiveness,
   workerRegistrationGeneration,
 } from "./services/worker-liveness";
+import { runTelegramAgentCli } from "./cli";
 
 function clock(): number {
   return Date.now();
@@ -61,6 +62,40 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   };
 
   const terminal = new TerminalCommandRunner(bb.sdk);
+  bb.cli.register({
+    name: "telegram-agent",
+    summary: "Pair Telegram and manage reviewed BB implementation jobs",
+    commands: [
+      { name: "pair", summary: "Create a one-use Telegram pairing link", usage: "bb telegram-agent pair [--json]" },
+      { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--json]" },
+      { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ..." },
+      { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
+      { name: "doctor", summary: "Check Telegram, BB, host, provider, and GitHub readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
+    ],
+    run: (argv, context) => runTelegramAgentCli({
+      store,
+      sdk: bb.sdk,
+      terminal,
+      now: clock,
+      getBotToken: () => config.ok ? config.value.botToken : undefined,
+      createTelegramClient: (token) => telegramForToken(token),
+      revokeAllApprovals: (now) => {
+        const db = bb.storage.database();
+        const revoke = db.transaction(() => {
+          const result = db
+            .prepare(
+              `UPDATE approvals
+                  SET consumed_at = COALESCE(consumed_at, ?), outcome = 'revoked'
+                WHERE outcome IS NULL OR outcome = 'accepted'`,
+            )
+            .run(now);
+          db.prepare("DELETE FROM pairing_codes").run();
+          return result.changes;
+        });
+        return revoke();
+      },
+    }, argv, context),
+  });
   const bbRunner = new BbRunner(bb.sdk);
   let reviewStatusJob: NonNullable<ReturnType<typeof store.getJob>> | null = null;
   let reviewEvent: ReviewHandlerEvent | null = null;
