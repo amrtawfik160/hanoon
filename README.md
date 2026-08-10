@@ -2,6 +2,8 @@
 
 Telegram Agent gives one paired private Telegram owner a durable Luna Max conversation for controlling reviewed BB delivery jobs. Ordinary messages go to one hidden BB controller thread. Guarded controller tools commit job intent to durable plugin storage; the single leased executor runs fresh-context planning, critique, implementation, review, documentation, validation, merge, deployment, and canary stages around one managed worktree.
 
+This project is inspired by [Valor](https://github.com/tomcounsell/ai).
+
 ## Prerequisites
 
 - BB 0.36 or newer.
@@ -136,10 +138,10 @@ bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/po
 9. After review passes, a fresh Luna Max documentation thread uses Docs Guard and BB CLI instructions, updates only necessary docs, commits and pushes, and reports a bounded artifact. Final validation then runs before a separate fresh final review.
 10. The final gate produces a one-use, expiring Telegram **Merge + deploy &lt;SHA&gt;** approval only when deployment and canary are configured. The merge executor re-checks the exact receipt immediately before the BB merge SDK call. Stale or unknown evidence fails closed and requires fresh review and validation.
 11. After GitHub reports the merge, Git fetches the base branch, requires its head to equal GitHub's merge commit, verifies that every path changed by the approved head has the approved Git object, and detaches the managed worktree at that exact commit. Deploy and canary each re-check the checkout before their configured commands run. Merge, deploy, and canary each have a separate durable receipt. Only canary success reaches `complete`. A post-merge failure reaches `production_failed`, preserves the successful merge fact, alerts the owner, and never attempts automatic rollback.
-12. While a controller turn or authoritative plan, critique, implementation, review, documentation, validation, deploy, or canary worker is active, the leased executor refreshes Telegram's native `typing...` action every four seconds. This signal is best-effort and ephemeral; it is never written to the durable outbox and cannot fail the job.
-13. Job and controller replies are durable before Telegram delivery. A failed Telegram send is retried after restart without issuing a second merge, deployment, or canary.
+12. During a controller turn, the executor uses Telegram's native `sendMessageDraft` stream: an ephemeral `Thinking…` preview appears first, then the same stable draft animates bounded Luna output about once per second. An unchanged draft is refreshed every 20 seconds so Telegram's 30-second preview does not expire during a long tool call. The executor also refreshes Telegram's `typing...` action while any authoritative worker is active.
+13. On controller completion, the executor switches the same logical outbox item to a normal persistent response; the draft remains only a temporary preview. Final delivery retains the plugin's bounded retry behavior. Durable job/controller state survives restart without issuing a second merge, deployment, or canary.
 
-One status message is durably edited at job milestones and exposes the current job state, review findings, validation evidence, pull request identity, merge fact, deployment/canary outcome, worker liveness, and approval expiry without storing the raw merge callback nonce. Luna controller replies are live-edited from bounded output deltas; background job agents report through durable milestone status rather than forwarding private provider transcripts.
+One status message is durably edited at job milestones and exposes the current job state, review findings, validation evidence, pull request identity, merge fact, deployment/canary outcome, worker liveness, and approval expiry without storing the raw merge callback nonce. Luna controller replies use native animated Telegram drafts derived from bounded output deltas, followed by normal persistent final delivery; background job agents report through durable milestone status rather than forwarding private provider transcripts.
 
 Natural messages continue going to Luna while a job runs. Reply to the exact current status message to steer its implementation thread. `/status`, `/projects`, `/retry`, `/cancel`, and merge buttons remain deterministic recovery paths and do not become controller turns.
 
@@ -163,7 +165,7 @@ bb plugin logs telegram-agent -n 50
 - `unpair` revokes the owner, pairing codes, and outstanding approvals. Pair again only after the owner intentionally reconfigures access.
 - Restarting BB or the plugin services resumes durable effects, outbox delivery, and worker reconciliation. It does not create speculative replacement workers when BB liveness is stale or unknown.
 - `production_failed` means the pull request is already merged. Inspect the redacted `DEPLOY` or `CANARY` receipt and use the approved operator procedure. The plugin does not automatically retry deployment or run the configured rollback command.
-- Native typing presence resumes from durable controller/job state after executor failover and expires naturally when work stops. Presence delivery failures are logged and isolated from durable work.
+- Native draft streaming resumes from the durable controller cursor/text with the same derived draft id after executor failover. Typing presence expires naturally when work stops; draft/presence delivery failures remain isolated from durable BB work.
 - A Telegram `message is not modified` response is treated as success. Expired callback answers complete without replay; an uneditable status is replaced with a new durable message id; malformed HTML is retried once without `parse_mode`; permanent Telegram 4xx responses are dead-lettered; and 429/5xx responses retain bounded retry behavior.
 - If a controller send outcome is uncertain after executor loss, that turn fails closed and asks the owner to resend. Revoking and re-pairing starts a fresh controller conversation instead of reviving the old mapping.
 - Remove the plugin from **Extensions → Plugins** after stopping active work. Uninstalling does not replace GitHub protection or erase project-side work; inspect the job and worktree before removal.
@@ -173,7 +175,7 @@ bb plugin logs telegram-agent -n 50
 - There is one paired private-chat owner and one active job.
 - The executor has one generation-fenced owner. A second executor instance cannot mutate leased effects or issue a duplicate merge.
 - Telegram ingress only records intent and nudges the executor; it never touches a worktree or calls BB thread APIs.
-- The leased executor is the only execution engine. It owns controller spawn/send, job effects, Telegram outbox delivery, native typing presence, and its authoritative lease heartbeat. Ingress and BB lifecycle handlers never own presence timers.
+- The leased executor is the only execution engine. It owns controller spawn/send, job effects, Telegram draft/final delivery, native typing presence, and its authoritative lease heartbeat. Ingress and BB lifecycle handlers never own streaming or presence timers.
 - The Luna controller has durable BB thread identity, provider conversation/history/status/interactions, explicit execution settings and permissions, hidden visibility, plugin origin, and owner-bound tool authorization. It uses a personal workspace and has no implementation files.
 - Implementation work happens in a visible managed-worktree thread. Reviewers are visible spawned children, never provider-session forks, and reuse the implementation environment.
 - BB threads do not replace worktrees. Threads isolate provider conversations, durable histories, statuses, interactions, permissions, visibility, and parent-child coordination. Managed worktrees remain the branch, checkout, uncommitted-file, artifact, and filesystem-mutation boundary; threads that reuse one environment see the same files.

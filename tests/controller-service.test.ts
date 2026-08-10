@@ -410,6 +410,57 @@ it("projects active Luna assistant deltas into the durable controller reply", as
   });
 });
 
+it("refreshes an unchanged active Luna draft before Telegram expires it", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 37, inputText: "keep thinking" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_thinking",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+  })).toBe(true);
+  const [draft] = store.leaseOutbox(fence.ownerId, fence.generation, 2_000, 1, 30_000);
+  expect(store.completeOutbox(draft!.logicalKey, fence.ownerId, fence.generation, null, 2_000)).toBe(true);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantDelta: "",
+      completed: false,
+      error: null,
+    })),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 22_000 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
+    status: "pending",
+    messageId: null,
+  });
+});
+
 it("retires an errored controller so a later queued message can start a fresh generation", async () => {
   const { store, fence } = serviceFixture();
   const failed = store.enqueueControllerTurn({

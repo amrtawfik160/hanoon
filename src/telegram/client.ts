@@ -186,6 +186,25 @@ export class TelegramClient {
     });
   }
 
+  public sendMessageDraft(
+    chatId: string,
+    draftId: number,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(draftId) || draftId === 0) {
+      throw new TypeError("draftId must be a non-zero safe integer");
+    }
+    return this.request({
+      method: "sendMessageDraft",
+      payload: { chat_id: chatId, draft_id: draftId, text },
+      callerSignal: signal,
+      timeoutMs: 5_000,
+      maxAttempts: 1,
+      parseResult: () => undefined,
+    });
+  }
+
   public editMessage(chatId: string, messageId: number, payload: SendMessagePayload, signal?: AbortSignal): Promise<void> {
     if (!Number.isInteger(messageId) || messageId < 1) throw new TypeError("messageId must be a positive integer");
     return this.request({

@@ -207,6 +207,55 @@ it("keeps one durable Telegram message id from controller placeholder through li
   });
 });
 
+it("refreshes an unchanged ephemeral controller draft before Telegram expires it", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(391, "think for a while"));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_slow",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
+  const leased = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
+  expect(store.completeOutbox(leased[0]!.logicalKey, fence.ownerId, fence.generation, null, fence.now)).toBe(true);
+
+  expect(store.refreshControllerDraft({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 21_999,
+    sentBefore: 1_999,
+  })).toBe(false);
+  expect(store.refreshControllerDraft({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 22_000,
+    sentBefore: 2_000,
+  })).toBe(true);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
+    status: "pending",
+    messageId: null,
+  });
+  const refreshed = store.leaseOutbox(fence.ownerId, fence.generation, 22_000, 10, 30_000);
+  expect(refreshed[0]?.attempts).toBe(1);
+  expect(store.completeOutbox(refreshed[0]!.logicalKey, fence.ownerId, fence.generation, null, 22_000)).toBe(true);
+  expect(store.updateControllerStream({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 23_000,
+    cursor: 1,
+    text: "Still working",
+    phase: "responding",
+  })).toBe(true);
+  expect(store.leaseOutbox(fence.ownerId, fence.generation, 23_000, 10, 30_000)[0]?.attempts).toBe(1);
+});
+
 it("rejects credential-shaped controller failure text", () => {
   const { store } = fixture();
   const turn = store.enqueueControllerTurn(turnInput(401));

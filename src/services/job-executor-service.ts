@@ -8,6 +8,7 @@ type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
 export type JobExecutorTelegram = {
   sendMessage(chatId: string, payload: Record<string, unknown>): Promise<{ message_id: number }>;
+  sendMessageDraft?(chatId: string, draftId: number, text: string): Promise<void>;
   editMessage(chatId: string, messageId: number, payload: Record<string, unknown>): Promise<void>;
   answerCallback?(callbackQueryId: string, text: string): Promise<void>;
 };
@@ -99,6 +100,19 @@ function statusJobId(logicalKey: string): string | null {
 function callbackId(logicalKey: string): string | null {
   const match = /^callback:(.+)$/.exec(logicalKey);
   return match?.[1] ?? null;
+}
+
+function controllerTurnId(logicalKey: string): string | null {
+  const match = /^controller:(controller-turn-[^:]+):reply$/.exec(logicalKey);
+  return match?.[1] ?? null;
+}
+
+function stableControllerDraftId(turnId: string): number {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < turnId.length; index += 1) {
+    hash = Math.imul(hash ^ turnId.charCodeAt(index), 16_777_619);
+  }
+  return ((hash >>> 0) & 0x7fff_ffff) || 1;
 }
 
 function payloadText(item: StoredOutbox): string {
@@ -260,8 +274,21 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             const knownMessageId = item.messageId ?? job?.statusMessageId ?? null;
             let deliveredMessageId = knownMessageId;
             const callback = callbackId(item.logicalKey);
+            const turnId = controllerTurnId(item.logicalKey);
+            const controllerTurn = turnId ? deps.store.getControllerTurn(turnId) : null;
             if (callback && telegram.answerCallback) {
               await telegram.answerCallback(callback, payloadText(item));
+            } else if (
+              turnId !== null &&
+              controllerTurn?.state === "submitted" &&
+              knownMessageId === null &&
+              telegram.sendMessageDraft
+            ) {
+              await telegram.sendMessageDraft(
+                item.chatId,
+                stableControllerDraftId(turnId),
+                controllerTurn.streamText,
+              );
             } else if (knownMessageId !== null) {
               await telegram.editMessage(item.chatId, knownMessageId, item.payload);
             } else {

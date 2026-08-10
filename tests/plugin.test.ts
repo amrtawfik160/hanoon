@@ -98,7 +98,7 @@ it("wires submitted controller turns through the leased job executor", async () 
   vi.unstubAllGlobals();
 });
 
-it("shows native Telegram typing while a submitted Luna controller turn is active", async () => {
+it("shows native Telegram draft streaming and typing while a Luna controller turn is active", async () => {
   const { bb, harness } = await loadPlugin();
   await harness.behavior.setSettings({ botToken: "123:test-token" });
   const telegramMethods: string[] = [];
@@ -146,9 +146,10 @@ it("shows native Telegram typing while a submitted Luna controller turn is activ
   const run = harness.behavior.runService("job-executor");
   try {
     await vi.waitFor(() => expect(telegramMethods).toContain("sendChatAction"));
+    await vi.waitFor(() => expect(telegramMethods).toContain("sendMessageDraft"));
     await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
       status: "sent",
-      messageId: 902,
+      messageId: null,
       payload: { text: "Connecting to Luna Max…" },
     }));
   } finally {

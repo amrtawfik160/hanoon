@@ -10,7 +10,7 @@ Plugin id: `telegram-agent`
 
 ## Outcome
 
-Turn the existing Telegram Agent into a responsive Luna Max BB operator and a complete, guarded software-delivery pipeline. The owner can talk naturally, inspect every visible BB project and active thread, start work in enabled projects, watch agent output arrive through one live-edited Telegram message, approve consequential controls, and receive a final production-verification report.
+Turn the existing Telegram Agent into a responsive Luna Max BB operator and a complete, guarded software-delivery pipeline. The owner can talk naturally, inspect every visible BB project and active thread, start work in enabled projects, watch agent output arrive through Telegram's native animated draft stream, approve consequential controls, and receive a final production-verification report.
 
 The design takes the durable graph, bounded correction loops, bridge/worker separation, disk handoffs, fresh review context, and explicit liveness lessons from [Valor](https://github.com/tomcounsell/ai), while using BB threads, environments, interactions, and managed worktrees instead of reproducing Valor's Claude/Redis runtime. Valor's current [pipeline graph](https://github.com/tomcounsell/ai/blob/main/docs/features/pipeline-graph.md) and [bridge/worker boundary](https://github.com/tomcounsell/ai/blob/main/docs/features/bridge-worker-architecture.md) are reference inputs, not dependencies.
 
@@ -79,15 +79,15 @@ The controller has a personal workspace and never receives the job worktree. Pla
 
 ## Realtime Telegram conversation
 
-Telegram has no token-streaming API. Realtime behavior is implemented as durable message editing:
+The current Telegram Bot API supports ephemeral `sendMessageDraft` streaming in private chats. Realtime behavior uses that native presentation without weakening durable controller state:
 
-1. Within one executor cycle of a queued turn, send a durable placeholder such as `Connecting to Luna Max…`.
+1. Within one executor cycle of a submitted turn, call `sendMessageDraft` with empty text so Telegram renders its native `Thinking…` placeholder. Derive one stable non-zero `draft_id` from the durable controller-turn identity and reuse it for the whole response.
 2. Dispatch the turn with explicit Luna Max, fast service tier, and auto permission settings.
-3. Read BB thread events from the persisted sequence cursor. Consume `turn/input/accepted`, safe whitelisted tool progress, `item/agentMessage/delta`, `turn/completed`, and errors. Never expose reasoning deltas, raw tool arguments, command output, tokens, or secrets.
-4. Accumulate a bounded plain-text preview and edit the same Telegram message no more than once per second. Continue Telegram `typing` presence as a fallback.
-5. On completion, replace the preview with the durable final response. Restarting the plugin resumes from the persisted cursor, text, Telegram message id, and edit hash without sending a duplicate response.
+3. Read BB thread events from the persisted sequence cursor. Consume only `turn/input/accepted`, `item/agentMessage/delta`, `turn/completed`, `system/error`, and `provider/error`. Never expose reasoning deltas, raw tool arguments, command output, tokens, or secrets.
+4. Accumulate a bounded plain-text preview and refresh the same draft at most once per executor tick. When no output changes, requeue the draft after 20 seconds so Telegram's 30-second preview stays visible. Continue Telegram `typing` presence as a fallback. A runtime without draft support falls back to the existing one-message edit path.
+5. On completion, switch the logical outbox item to normal `sendMessage` delivery with the durable final response. Telegram then clears the ephemeral preview. Final delivery uses the existing bounded retry policy. Restarting the plugin resumes from the persisted cursor and text and regenerates the same draft id; it never treats an ephemeral draft as the final delivery.
 
-Each controller turn stores `bb_event_seq`, `stream_text`, `telegram_message_id`, `stream_phase`, `last_edit_hash`, `input_accepted_at`, `first_output_at`, and `last_observed_at`. The executor lease fences every update.
+Each controller turn stores `bb_event_seq`, `stream_text`, `stream_phase`, the final/fallback `telegram_message_id`, and lifecycle timestamps. The executor lease fences every update. Draft previews are intentionally ephemeral; only their reconstructible source state is durable.
 
 ## Controller latency and recovery
 
@@ -205,7 +205,7 @@ After merge, the executor verifies the merged base branch contains the approved 
 Implementation follows red-green TDD in independently shippable slices:
 
 1. controller recovery and fast-tier dispatch;
-2. durable event cursor and same-message Telegram streaming;
+2. durable event cursor and native Telegram draft streaming;
 3. visible BB thread status projection and confirmed control operations;
 4. PLAN/CRITIQUE artifact loop;
 5. TEST/REVIEW/PATCH cycles and exact-SHA invalidation;
@@ -214,9 +214,8 @@ Implementation follows red-green TDD in independently shippable slices:
 
 Each slice runs focused tests, the full Vitest suite, TypeScript typecheck, plugin build, generated SDK type check, and tracked-diff review. The plugin is then reloaded and tested from the paired Telegram chat. Live acceptance must prove:
 
-- an immediate placeholder and at least one same-message live edit before the final Luna response;
+- an immediate native `Thinking…` draft, at least one animated draft update, and successful persistent final Luna delivery;
 - recovery from the currently poisoned controller without manual database repair;
 - accurate active-thread status for `cyndra-saas` without a fabricated ETA;
 - a disposable repository run with separate plan, critic, builder, reviewer, docs, and final-review conversations;
 - exact-SHA approval, merge, configured production deployment, and post-deploy verification reported as distinct outcomes.
-

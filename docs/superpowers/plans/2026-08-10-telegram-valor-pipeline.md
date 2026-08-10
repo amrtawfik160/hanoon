@@ -110,20 +110,20 @@ Commit: `fix: recover failed Luna controller generations`
 
 ---
 
-### Task 2: Durable same-message Telegram streaming
+### Task 2: Durable native Telegram draft streaming
 
 **Files:**
 - Create: `src/controller/stream.ts`
 - Modify: `src/controller/service.ts`
 - Modify: `src/services/job-executor-service.ts`
-- Modify: `src/storage/migrations.ts`
 - Modify: `src/storage/store.ts`
+- Modify: `src/telegram/client.ts`
 - Test: `tests/controller-stream.test.ts`
 - Test: `tests/job-executor-service.test.ts`
 - Test: `tests/plugin.test.ts`
 
 **Interfaces:**
-- Produces: `projectControllerStream(events, prior)`, controller placeholder outbox, durable `telegramMessageId`, cursor/text/edit hash, and final edit of the same Telegram message.
+- Produces: `projectControllerStream(events, prior)`, durable cursor/text state, a stable derived Telegram draft id, 20-second draft keepalive, and normal final outbox delivery.
 - Consumes: Task 1 event observations and the existing outbox lease/delivery path.
 
 - [ ] **Step 1: Write projector tests that catch leaked reasoning and duplicate deltas**
@@ -148,17 +148,18 @@ Expected: FAIL because `src/controller/stream.ts` does not exist.
 
 - [ ] **Step 3: Implement the pure bounded projector**
 
-The projector caps Telegram text at 3,900 Unicode characters, maps safe phases (`connecting`, `thinking`, `using_tools`, `responding`, `complete`, `failed`), and produces a stable SHA-256 edit hash.
+The projector caps Telegram text at 3,900 Unicode characters and maps safe phases (`connecting`, `thinking`, `responding`, `complete`, `failed`) without forwarding reasoning or tool payloads.
 
-- [ ] **Step 4: Write failing executor integration for placeholder, edit, restart, and final reuse**
+- [ ] **Step 4: Write failing executor integration for native draft, keepalive, restart, and final delivery**
 
 ```ts
-it("sends one controller placeholder then edits that message through delta and completion", async () => {
+it("streams one stable draft and then sends the persistent final response", async () => {
   const fixture = realtimeControllerExecutorFixture();
   await fixture.runUntilIdle();
+  expect(fixture.telegram.sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "");
+  expect(fixture.telegram.sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "Hello");
   expect(fixture.telegram.sendMessage).toHaveBeenCalledTimes(1);
-  expect(fixture.telegram.editMessage).toHaveBeenCalledWith("7", 501, { text: "Hello" });
-  expect(fixture.telegram.editMessage).toHaveBeenLastCalledWith("7", 501, { text: "Hello from Luna." });
+  expect(fixture.telegram.sendMessage).toHaveBeenCalledWith("7", { text: "Hello from Luna." });
 });
 ```
 
@@ -168,9 +169,9 @@ Run: `npm test -- tests/job-executor-service.test.ts tests/plugin.test.ts`
 
 Expected: FAIL because controller responses create only a final outbox send.
 
-- [ ] **Step 6: Add stream persistence and outbox edit semantics**
+- [ ] **Step 6: Add stream persistence, draft keepalive, and final-delivery semantics**
 
-Create the placeholder with a stable logical key, atomically retain the returned message id, update the same logical outbox row without clearing its known id, rate-limit edits to one per second, and make final completion reuse that id. A plugin restart resumes from cursor/text/id without a duplicate send.
+Create the placeholder with a stable logical key, derive one non-zero `draft_id` from the turn id, stream empty/native-thinking and bounded delta text through `sendMessageDraft`, and refresh unchanged drafts every 20 seconds. Keep only cursor/text durable. On completion, switch the logical outbox item to normal `sendMessage` delivery with bounded retries. A plugin restart reconstructs the same draft from cursor/text/id.
 
 - [ ] **Step 7: Run focused tests and commit**
 
@@ -459,7 +460,7 @@ Run: `bb plugin reload telegram-agent`
 
 Run: `bb plugin list --json`
 
-From the paired chat, verify the immediate placeholder, same-message delta edit, poisoned-controller replacement, `/threads`-equivalent natural-language status, and one disposable full job through production verification. Record exact thread ids, stage receipts, PR SHA, merge result, deploy result, and canary result in `docs/acceptance-test.md`.
+From the paired chat, verify the immediate native `Thinking…` draft, animated delta updates, persistent final delivery, poisoned-controller replacement, `/threads`-equivalent natural-language status, and one disposable full job through production verification. Record exact thread ids, stage receipts, PR SHA, merge result, deploy result, and canary result in `docs/acceptance-test.md`.
 
 - [ ] **Step 8: Commit**
 

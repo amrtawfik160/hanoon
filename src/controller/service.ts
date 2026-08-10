@@ -10,6 +10,8 @@ export type LunaControllerServiceDependencies = {
   clock: { now(): number };
 };
 
+const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
+
 function boundedResponse(value: string): string | null {
   const text = value.trim();
   if (text.length === 0) return null;
@@ -165,6 +167,12 @@ export class LunaControllerService {
     } catch {
       observation = null;
     }
+    const refreshedAt = this.dependencies.clock.now();
+    this.dependencies.store.refreshControllerDraft({
+      ...fenceAt(fence, refreshedAt),
+      turnId: submitted.id,
+      sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
+    });
     if (status === "active" || status === "starting" || status === "stopping") return true;
     if (status === "missing") {
       this.dependencies.store.resetControllerThread({

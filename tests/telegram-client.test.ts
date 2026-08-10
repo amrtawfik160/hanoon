@@ -202,6 +202,38 @@ describe("Telegram Bot API client", () => {
     }]);
   });
 
+  it("streams an ephemeral Telegram draft with one stable non-zero draft id", async () => {
+    const fetchMock = telegramFetch([
+      { ok: true, result: true },
+      { ok: true, result: true },
+    ]);
+    const client = new TelegramClient("token", fetchMock);
+
+    await expect(client.sendMessageDraft("70", 91, "")).resolves.toBeUndefined();
+    await expect(client.sendMessageDraft("70", 91, "Partial answer")).resolves.toBeUndefined();
+
+    expect(fetchMock.calls).toEqual([
+      {
+        method: "sendMessageDraft",
+        body: '{"chat_id":"70","draft_id":91,"text":""}',
+      },
+      {
+        method: "sendMessageDraft",
+        body: '{"chat_id":"70","draft_id":91,"text":"Partial answer"}',
+      },
+    ]);
+  });
+
+  it("rejects an invalid Telegram draft id before making a request", () => {
+    const fetchMock = telegramFetch([]);
+    const client = new TelegramClient("token", fetchMock);
+
+    expect(() => client.sendMessageDraft("70", 0, "Partial answer")).toThrow(
+      "draftId must be a non-zero safe integer",
+    );
+    expect(fetchMock.calls).toHaveLength(0);
+  });
+
   it("fails a chat action after one attempt and rejects unsupported actions before fetch", async () => {
     immediateSleep.mockClear();
     const fetchMock = telegramFetch([

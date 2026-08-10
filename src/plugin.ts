@@ -549,6 +549,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         const client = telegramForToken(config.value.botToken);
         return {
           sendMessage: (chatId: string, payload: Record<string, unknown>) => client.sendMessage(chatId, payload as Parameters<TelegramClient["sendMessage"]>[1]),
+          sendMessageDraft: (chatId: string, draftId: number, text: string) => client.sendMessageDraft(chatId, draftId, text),
           editMessage: (chatId: string, messageId: number, payload: Record<string, unknown>) => client.editMessage(chatId, messageId, payload as Parameters<TelegramClient["editMessage"]>[2]),
           answerCallback: (callbackQueryId: string, text: string) => client.answerCallback(callbackQueryId, text),
         };

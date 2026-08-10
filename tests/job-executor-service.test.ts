@@ -33,7 +33,7 @@ function insertJobAndOutbox(store: TelegramAgentStore, db: Database.Database): v
   db.prepare("UPDATE jobs SET status_message_id = NULL WHERE id = ?").run(job.id);
 }
 
-function addSubmittedControllerTurn(store: TelegramAgentStore): void {
+function addSubmittedControllerTurn(store: TelegramAgentStore): string {
   store.createPairingCode(hashSecret("presence-pair"), 1_000, 60_000);
   expect(store.pairOwnerWithCode(hashSecret("presence-pair"), "7", "7", 1_000)).toEqual({ ok: true });
   const turn = store.enqueueControllerTurn({
@@ -57,6 +57,7 @@ function addSubmittedControllerTurn(store: TelegramAgentStore): void {
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
   expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 1_000)).toBe(true);
+  return turn.id;
 }
 
 describe("singleton job executor", () => {
@@ -369,12 +370,13 @@ describe("singleton job executor", () => {
     expect(waitForWork).toHaveBeenCalledWith(1_000, expect.any(AbortSignal));
   });
 
-  it("streams a controller reply by editing the same durable Telegram message", async () => {
+  it("streams a submitted controller turn through one ephemeral Telegram draft", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);
     const abort = new AbortController();
     const sendMessage = vi.fn(async () => ({ message_id: 501 }));
     const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, _text: string) => undefined);
     let loop = 0;
     const waitForWork = vi.fn(async () => {
       loop += 1;
@@ -386,7 +388,7 @@ describe("singleton job executor", () => {
       clock: { now: () => 1_000 + loop * 1_000 },
       sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
       waitForWork,
-      telegram: () => ({ sendMessage, editMessage }),
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
       controller: {
         reconcile: vi.fn(async (fence) => {
           if (loop === 1) {
@@ -407,18 +409,69 @@ describe("singleton job executor", () => {
       effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
     }, abort.signal);
 
-    expect(sendMessage).toHaveBeenCalledWith("7", {
-      text: "Connecting to Luna Max…",
-      disable_web_page_preview: true,
-    });
-    expect(editMessage).toHaveBeenCalledWith("7", 501, {
-      text: "Luna is working live",
-      disable_web_page_preview: true,
-    });
+    expect(sendMessageDraft).toHaveBeenCalledTimes(2);
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), "");
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), "Luna is working live");
+    expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
+    expect(sendMessageDraft.mock.calls[0]?.[1]).toBeGreaterThan(0);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(editMessage).not.toHaveBeenCalled();
     expect(store.getOutbox("controller:controller-turn-900:reply")).toMatchObject({
       status: "sent",
-      messageId: 501,
+      messageId: null,
       payload: { text: "Luna is working live" },
+    });
+  });
+
+  it("persists exactly one final controller message after ephemeral draft streaming", async () => {
+    const { store } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 777 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, _text: string) => undefined);
+    let loop = 0;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (loop === 2) abort.abort();
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async (fence) => {
+          if (loop === 1) {
+            expect(store.completeControllerTurn({
+              ownerId: fence.ownerId,
+              generation: fence.generation,
+              now: 2_000,
+              turnId,
+              responseText: "Final answer",
+            })).toBe(true);
+          }
+          return true;
+        }),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessageDraft).toHaveBeenCalledOnce();
+    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "");
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledWith("7", {
+      text: "Final answer",
+      disable_web_page_preview: true,
+    });
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({
+      status: "sent",
+      messageId: 777,
+      payload: { text: "Final answer" },
     });
   });
 

@@ -1409,6 +1409,7 @@ export interface TelegramAgentStore {
   }): ControllerTurnRecord;
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
   getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null;
+  getControllerTurn(turnId: string): ControllerTurnRecord | null;
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
   failStaleControllerDispatches(fence: ControllerLeaseFence): boolean;
   markControllerSpawned(input: ControllerLeaseFence & {
@@ -1433,6 +1434,10 @@ export interface TelegramAgentStore {
     cursor: number;
     text: string;
     phase: ControllerTurnRecord["streamPhase"];
+  }): boolean;
+  refreshControllerDraft(input: ControllerLeaseFence & {
+    turnId: string;
+    sentBefore: number;
   }): boolean;
   resetControllerThread(input: ControllerLeaseFence & {
     controllerKey: string;
@@ -2073,6 +2078,15 @@ function persistOutbox(
     );
 }
 
+function persistControllerOutbox(
+  db: SqliteDatabase,
+  item: OutboxInput,
+  now: number,
+): void {
+  persistOutbox(db, item, serializeOutbox(item, now), now);
+  db.prepare("UPDATE outbox SET attempts = 0 WHERE logical_key = ?").run(item.logicalKey);
+}
+
 function advanceTelegramCursor(db: SqliteDatabase): void {
   const cursor = db
     .prepare("SELECT next_offset FROM telegram_cursor WHERE singleton = 1")
@@ -2334,6 +2348,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return row ? parseControllerThread(row) : null;
   }
 
+  public getControllerTurn(turnId: string): ControllerTurnRecord | null {
+    assertControllerIdentifier(turnId, "turnId");
+    const row = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(turnId) as ControllerTurnRow | undefined;
+    return row ? parseControllerTurn(row) : null;
+  }
+
   public claimNextControllerTurn(
     fence: ControllerLeaseFence & { leaseMs?: number },
   ): ControllerTurnRecord | null {
@@ -2399,7 +2419,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(fence.now, stale.controller_key, stale.id);
       const outbox = controllerFailureOutbox(stale.id, stale.telegram_chat_id);
-      persistOutbox(this.db, outbox, serializeOutbox(outbox, fence.now), fence.now);
+      persistControllerOutbox(this.db, outbox, fence.now);
       return true;
     }).immediate();
   }
@@ -2475,7 +2495,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         chatId: row.telegram_chat_id,
         payload: { text: "Connecting to Luna Max…", disable_web_page_preview: true },
       };
-      persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
+      persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();
   }
@@ -2553,8 +2573,35 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         messageId: row.telegram_message_id,
         payload: { text: displayText, disable_web_page_preview: true },
       };
-      persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
+      persistControllerOutbox(this.db, outbox, input.now);
       return true;
+    }).immediate();
+  }
+
+  public refreshControllerDraft(input: ControllerLeaseFence & {
+    turnId: string;
+    sentBefore: number;
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertNonNegativeInteger(input.sentBefore, "sentBefore");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        `UPDATE outbox
+            SET status = 'pending', attempts = 0, next_attempt_at = ?, last_error = NULL, updated_at = ?
+          WHERE logical_key = ? AND status = 'sent' AND message_id IS NULL
+            AND updated_at <= ?
+            AND EXISTS (
+              SELECT 1 FROM controller_turns
+               WHERE id = ? AND state = 'submitted' AND telegram_message_id IS NULL
+            )`,
+      ).run(
+        input.now,
+        input.now,
+        `controller:${input.turnId}:reply`,
+        input.sentBefore,
+        input.turnId,
+      ).changes === 1;
     }).immediate();
   }
 
@@ -2610,7 +2657,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         chatId: row.telegram_chat_id,
         payload: { text: input.responseText, disable_web_page_preview: true },
       };
-      persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
+      persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();
   }
@@ -2645,7 +2692,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
       const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id);
-      persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
+      persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();
   }
