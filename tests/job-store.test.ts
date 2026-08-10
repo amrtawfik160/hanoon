@@ -208,7 +208,7 @@ it("keeps head receipts guarded by the pure transition before persisting validat
   const locating = store.applyJobEvent(job.id, implementing.version, { type: "PR_LOCATED", number: 7, url: "https://github.test/pr/7" }, 1_500);
   const resolving = store.applyJobEvent(job.id, locating.version, { type: "PR_HEAD_RESOLVED", headSha: sha() }, 1_600);
 
-  expect(resolving.state).toBe("reviewing");
+  expect(resolving.state).toBe("validating");
   expect(resolving.prHeadSha).toBe(sha());
   expect(store.listEffectsForJob(job.id).map((effect) => effect.kind)).toEqual([
     "render_status",
@@ -219,6 +219,6 @@ it("keeps head receipts guarded by the pure transition before persisting validat
     "inspect_implementation",
     "revoke_approvals",
     "resolve_pr_head",
-    "spawn_review",
+    "run_validation",
   ]);
 });

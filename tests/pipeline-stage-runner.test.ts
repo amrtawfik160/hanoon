@@ -36,6 +36,20 @@ function pipelineSdk() {
       }),
       output: vi.fn(async () => ({ output: "# Plan\n\n1. Add the regression.\n" })),
     },
+    environments: {
+      status: vi.fn(async () => ({
+        outcome: "available",
+        workspace: { checkout: { kind: "branch", branchName: "feature/test", headSha: "a".repeat(40) } },
+      })),
+      diff: vi.fn(async () => ({
+        outcome: "available",
+        diff: { diff: "diff --git a/src/a.ts b/src/a.ts\n+change", truncated: false },
+      })),
+      pullRequest: vi.fn(async () => ({
+        outcome: "available",
+        pullRequest: { number: 42, url: "https://github.com/acme/cyndra/pull/42" },
+      })),
+    },
   } as unknown as BbPluginApi["sdk"];
   return { runner: new BbRunner(sdk), spawns, uploads };
 }
@@ -138,6 +152,51 @@ describe("fresh planner, critic, and builder conversations", () => {
       "critique-packet.json",
       "work-order.md",
       "plan.md",
+    ]);
+  });
+
+  it("spawns docs with Luna Max and a post-docs reviewer as a fresh conversation", async () => {
+    const { runner, spawns, uploads } = pipelineSdk();
+    const job = {
+      ...plannedJob,
+      state: "documenting" as const,
+      environmentId: "env_plan",
+      implementationThreadId: "thr_builder",
+      prNumber: 42,
+      prUrl: "https://github.com/acme/cyndra/pull/42",
+      prHeadSha: "a".repeat(40),
+    };
+
+    await runner.spawnDocs(job, { id: "stage_docs_1", role: "DOCS", ordinal: 1 });
+    await runner.spawnFinalReview(
+      { ...job, state: "final_reviewing" },
+      { id: "attempt_final_review_1" },
+    );
+
+    expect(spawns[0]).toMatchObject({
+      parentThreadId: "thr_builder",
+      environment: { type: "reuse", environmentId: "env_plan" },
+      providerId: "codex",
+      model: "gpt-5.6-luna",
+      reasoningLevel: "max",
+      serviceTier: "fast",
+      permissionMode: "auto",
+      input: [
+        { type: "text", text: expect.stringMatching(/Docs Guard.*BB CLI/i) },
+        { type: "localFile", path: "attachments/work-order.md" },
+        { type: "localFile", path: "attachments/docs-packet.json" },
+      ],
+    });
+    expect(spawns[1]).toMatchObject({
+      parentThreadId: "thr_builder",
+      title: "Telegram job_1 final-review attempt_final_review_1",
+      environment: { type: "reuse", environmentId: "env_plan" },
+    });
+    expect(spawns[1]).not.toHaveProperty("sourceThreadId");
+    expect(uploads.map((upload) => upload.filename)).toEqual([
+      "work-order.md",
+      "docs-packet.json",
+      "review-packet.json",
     ]);
   });
 
@@ -260,5 +319,54 @@ describe("fresh planner, critic, and builder conversations", () => {
       now: 1_009,
     })).toEqual({ outcome: "advanced", nextState: "creating_implementation" });
     expect(store.getJob(job.id)?.state).toBe("creating_implementation");
+
+    job = store.getJob(job.id)!;
+    job = store.applyJobEvent(job.id, job.version, {
+      type: "IMPLEMENTATION_CREATED",
+      threadId: "thr_builder",
+      environmentId: "env_plan",
+    }, 1_010);
+    job = store.applyJobEvent(job.id, job.version, { type: "IMPLEMENTATION_IDLE" }, 1_011);
+    job = store.applyJobEvent(job.id, job.version, {
+      type: "PR_LOCATED",
+      number: 42,
+      url: "https://github.com/acme/cyndra/pull/42",
+    }, 1_012);
+    job = store.applyJobEvent(job.id, job.version, { type: "PR_HEAD_RESOLVED", headSha: "c".repeat(40) }, 1_013);
+    job = store.applyJobEvent(job.id, job.version, { type: "VALIDATION_PASSED", headSha: "c".repeat(40) }, 1_014);
+    job = store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: "c".repeat(40) }, 1_015);
+    let docs = store.createPipelineStageAttempt({
+      id: "stage_docs_1",
+      jobId: job.id,
+      role: "DOCS",
+      ordinal: 1,
+      inputSha256: "d".repeat(64),
+      ...fence,
+      now: 1_016,
+    });
+    expect(store.bindPipelineStageThread({
+      id: docs.id,
+      threadId: "thr_docs",
+      environmentId: "env_plan",
+      ...fence,
+      now: 1_017,
+    })).toBe(true);
+    job = store.applyJobEvent(job.id, job.version, {
+      type: "DOCS_CREATED",
+      attemptId: docs.id,
+      threadId: "thr_docs",
+      environmentId: "env_plan",
+    }, 1_017);
+    docs = store.getPipelineStageAttempt(docs.id)!;
+
+    expect(settlePipelineStageOutput({
+      store,
+      job,
+      attempt: docs,
+      output: "# Docs gate\n\nREADME remains accurate; docs checks passed.\n",
+      fence,
+      now: 1_018,
+    })).toEqual({ outcome: "advanced", nextState: "resolving_docs_head" });
+    expect(store.getJob(job.id)).toMatchObject({ state: "resolving_docs_head", prHeadSha: null });
   });
 });

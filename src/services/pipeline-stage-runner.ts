@@ -1,4 +1,9 @@
-import { buildCritiqueArtifact, buildPlanArtifact, parseCritiqueResult } from "../bb/pipeline-handoffs";
+import {
+  buildCritiqueArtifact,
+  buildDocsReportArtifact,
+  buildPlanArtifact,
+  parseCritiqueResult,
+} from "../bb/pipeline-handoffs";
 import type { Job } from "../domain/models";
 import type { PipelineStageAttempt, TelegramAgentStore } from "../storage/store";
 
@@ -8,7 +13,7 @@ export type PipelineStageFence = {
 };
 
 export type PipelineStageSettlement =
-  | { outcome: "advanced"; nextState: "critiquing" | "creating_implementation" | "planning" | "blocked" }
+  | { outcome: "advanced"; nextState: "critiquing" | "creating_implementation" | "planning" | "blocked" | "resolving_docs_head" }
   | { outcome: "ignored" }
   | { outcome: "invalid"; error: string };
 
@@ -19,10 +24,11 @@ function invalidStageOutput(
   fence: PipelineStageFence,
   now: number,
 ): PipelineStageSettlement {
-  const error = `${attempt.role === "PLAN" ? "plan" : "critique"} returned invalid bounded output`;
+  const label = attempt.role === "PLAN" ? "plan" : attempt.role === "CRITIQUE" ? "critique" : "docs";
+  const error = `${label} returned invalid bounded output`;
   store.failPipelineStageAttempt({ id: attempt.id, error, ...fence, now });
   const latest = store.getJob(job.id);
-  const expectedState = attempt.role === "PLAN" ? "planning" : "critiquing";
+  const expectedState = attempt.role === "PLAN" ? "planning" : attempt.role === "CRITIQUE" ? "critiquing" : "documenting";
   if (latest?.state === expectedState && latest.cancelRequestedAt === null) {
     store.applyJobEvent(job.id, latest.version, { type: "FAILED", error }, now);
   }
@@ -38,7 +44,10 @@ export function settlePipelineStageOutput(input: {
   now: number;
 }): PipelineStageSettlement {
   const { store, job, attempt, output, fence, now } = input;
-  const expectedRole = job.state === "planning" ? "PLAN" : job.state === "critiquing" ? "CRITIQUE" : null;
+  const expectedRole = job.state === "planning" ? "PLAN"
+    : job.state === "critiquing" ? "CRITIQUE"
+    : job.state === "documenting" ? "DOCS"
+    : null;
   if (expectedRole === null || attempt.jobId !== job.id || attempt.role !== expectedRole) return { outcome: "ignored" };
 
   if (attempt.role === "PLAN") {
@@ -61,6 +70,28 @@ export function settlePipelineStageOutput(input: {
     if (!latest || latest.state !== "planning" || latest.cancelRequestedAt !== null) return { outcome: "ignored" };
     const advanced = store.applyJobEvent(job.id, latest.version, { type: "PLAN_READY", attemptId: attempt.id }, now);
     return { outcome: "advanced", nextState: advanced.state as "critiquing" };
+  }
+
+  if (attempt.role === "DOCS") {
+    let artifact;
+    try {
+      artifact = buildDocsReportArtifact(output);
+    } catch {
+      return invalidStageOutput(store, job, attempt, fence, now);
+    }
+    const completed = store.completePipelineStageAttempt({
+      id: attempt.id,
+      outputText: new TextDecoder().decode(artifact.bytes),
+      outputSha256: artifact.sha256,
+      outcome: { verdict: "success" },
+      ...fence,
+      now,
+    });
+    if (!completed) return { outcome: "ignored" };
+    const latest = store.getJob(job.id);
+    if (!latest || latest.state !== "documenting" || latest.cancelRequestedAt !== null) return { outcome: "ignored" };
+    const advanced = store.applyJobEvent(job.id, latest.version, { type: "DOCS_IDLE" }, now);
+    return { outcome: "advanced", nextState: advanced.state as "resolving_docs_head" };
   }
 
   let verdict;

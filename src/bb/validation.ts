@@ -81,6 +81,7 @@ export interface ValidationSnapshot {
   validationOutcome: "pass" | "fail";
   completedAt: string;
   reviewAttemptId?: string;
+  terminalIds?: string[];
 }
 
 type CommandRunner = {
@@ -431,6 +432,11 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
   const policy = input.job.policy;
   const redactor = buildRedactor(policy.outputRedactionPatterns);
   const collector: ReceiptCollector = { receipts: [], redactor };
+  const terminalIds = new Set<string>();
+  const observeTerminal = (observation: TerminalObservation): void => {
+    terminalIds.add(observation.id);
+    input.onTerminalObservation?.(observation);
+  };
   const head = await collectHeadTruth({
     runner: input.runner,
     environments: input.environments,
@@ -441,7 +447,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     signal: input.signal,
     collector,
     requireSecondLookup: false,
-    onTerminalObservation: input.onTerminalObservation,
+    onTerminalObservation: observeTerminal,
   });
 
   for (const validation of validationCommands(policy)) {
@@ -452,7 +458,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
       validation.command,
       validation.timeoutMs,
       input.signal,
-      input.onTerminalObservation,
+      observeTerminal,
     );
     if (result.exitCode !== 0) {
       return {
@@ -463,6 +469,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
         validationOutcome: "fail",
         completedAt: new Date().toISOString(),
         reviewAttemptId: input.currentReviewAttempt?.id,
+        terminalIds: [...terminalIds],
       };
     }
   }
@@ -474,7 +481,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     PR_VIEW_COMMAND(input.job.prNumber),
     120_000,
     input.signal,
-    input.onTerminalObservation,
+    observeTerminal,
   );
   if (pr.exitCode !== 0) fail("command_failed", "GitHub pull-request metadata lookup failed");
   const githubPr = parseJson(pr.output, githubPrSchema, "GitHub pull-request metadata") as GitHubPrSnapshot;
@@ -486,7 +493,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     PR_CHECKS_COMMAND(input.job.prNumber),
     120_000,
     input.signal,
-    input.onTerminalObservation,
+    observeTerminal,
   );
   if (![0, 1, 8].includes(checks.exitCode)) fail("invalid_checks_exit", "GitHub checks lookup returned an infrastructure failure");
   const requiredChecks = parseJson(checks.output, checksSchema(), "GitHub required checks");
@@ -498,7 +505,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     PR_HEAD_COMMAND(input.job.prNumber),
     60_000,
     input.signal,
-    input.onTerminalObservation,
+    observeTerminal,
   );
   if (second.exitCode !== 0) fail("command_failed", "Unable to re-read the pull-request head from git");
   const secondSha = parseLsRemoteHead(second.output, input.job.prNumber);
@@ -515,6 +522,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     validationOutcome: "pass",
     completedAt: new Date().toISOString(),
     reviewAttemptId: input.currentReviewAttempt?.id,
+    terminalIds: [...terminalIds],
   };
 }
 

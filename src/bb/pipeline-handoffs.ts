@@ -91,6 +91,46 @@ export function buildCritiquePacket(job: Job, plan: HandoffArtifact): HandoffArt
   );
 }
 
+export function buildDocsPacket(job: Job): HandoffArtifact {
+  if (
+    job.projectId === null || job.policy === null || job.projectId !== job.policy.projectId ||
+    job.environmentId === null || job.implementationThreadId === null ||
+    job.prNumber === null || job.prUrl === null || job.prHeadSha === null
+  ) throw new TypeError("Docs packet requires a complete reviewed pull-request identity");
+  const packet = {
+    schemaVersion: 1,
+    kind: "telegram-docs-gate",
+    jobId: job.id,
+    projectId: job.projectId,
+    baseBranch: job.policy.baseBranch,
+    prNumber: job.prNumber,
+    prUrl: job.prUrl,
+    reviewedHeadSha: job.prHeadSha,
+    requiredSkills: ["Docs Guard", "BB CLI"],
+    rules: {
+      inspectChangedBehavior: true,
+      updateNecessaryDocumentationOnly: true,
+      runDocumentationChecks: true,
+      commitAndPushChanges: true,
+      merge: false,
+      deploy: false,
+      noOpRequiresEvidence: true,
+    },
+    outputContract: {
+      format: "markdown",
+      required: ["files changed or no-op evidence", "checks", "commit and push outcome", "blockers"],
+    },
+  };
+  return artifact("docs-packet.json", "application/json", `${JSON.stringify(packet, null, 2)}\n`, MAX_CRITIQUE_BYTES);
+}
+
+export function buildDocsReportArtifact(output: string): HandoffArtifact {
+  if (typeof output !== "string") throw new TypeError("Docs output must be text");
+  const trimmed = output.trim();
+  if (trimmed.length === 0) throw new TypeError("docs-report.md must be non-empty and bounded");
+  return artifact("docs-report.md", "text/markdown", `${trimmed}\n`, MAX_PLAN_BYTES);
+}
+
 export function parseCritiqueResult(raw: string): CritiqueResult {
   if (typeof raw !== "string" || raw.length === 0 || encoder.encode(raw).byteLength > MAX_CRITIQUE_BYTES) {
     throw new TypeError("Critique output must be bounded strict JSON");

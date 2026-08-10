@@ -11,6 +11,7 @@ import { buildReviewPacket, buildWorkOrder, type HandoffArtifact } from "./hando
 import {
   buildCritiqueArtifact,
   buildCritiquePacket,
+  buildDocsPacket,
   buildPlanArtifact,
   parseCritiqueResult,
 } from "./pipeline-handoffs";
@@ -46,7 +47,7 @@ export type BbAttempt = {
 
 export type PipelineThreadAttempt = {
   id: string;
-  role: "PLAN" | "CRITIQUE";
+  role: "PLAN" | "CRITIQUE" | "DOCS";
   ordinal: number;
   threadId?: string | null;
   environmentId?: string | null;
@@ -311,10 +312,53 @@ export class BbRunner {
     return result.output ?? "";
   }
 
+  public async spawnDocs(job: Job, attempt: PipelineThreadAttempt): Promise<ThreadResult> {
+    const policy = selectedPolicy(job);
+    const project = projectId(job, policy);
+    const environmentId = requireEnvironmentId(job);
+    const parentThreadId = requireImplementationThreadId(job);
+    const workOrder = buildWorkOrder(job, policy);
+    const packet = buildDocsPacket(job);
+    const uploadedWorkOrder = await this.upload(project, workOrder);
+    const uploadedPacket = await this.upload(project, packet);
+    const thread = await this.sdk.threads.spawn(spawnRequest({
+      projectId: project,
+      parentThreadId,
+      title: `Telegram ${job.id} docs ${attempt.id}`,
+      visibility: "visible",
+      input: [
+        {
+          type: "text",
+          text: "Read the attached work order and docs packet. Use the Docs Guard and BB CLI skills exactly as required, update only necessary documentation, verify it, commit and push, then report bounded evidence.",
+          mentions: [],
+        },
+        uploadedWorkOrder,
+        uploadedPacket,
+      ],
+      environment: { type: "reuse", environmentId },
+      ...LUNA_MAX_EXECUTION,
+    }));
+    attempt.threadId = thread.id;
+    attempt.environmentId = thread.environmentId ?? environmentId;
+    return thread;
+  }
+
   public async spawnReview(
     job: Job,
     attempt: BbAttempt,
     _suppliedPolicy?: ProjectPolicy,
+  ): Promise<ThreadResult> {
+    return this.spawnReviewRole(job, attempt, "review");
+  }
+
+  public async spawnFinalReview(job: Job, attempt: BbAttempt): Promise<ThreadResult> {
+    return this.spawnReviewRole(job, attempt, "final-review");
+  }
+
+  private async spawnReviewRole(
+    job: Job,
+    attempt: BbAttempt,
+    role: "review" | "final-review",
   ): Promise<ThreadResult> {
     const policy = selectedPolicy(job);
     const environmentId = requireEnvironmentId(job);
@@ -331,7 +375,7 @@ export class BbRunner {
     const request = spawnRequest({
       projectId: project,
       parentThreadId,
-      title: `Telegram ${job.id} review ${attempt.id}`,
+      title: `Telegram ${job.id} ${role} ${attempt.id}`,
       visibility: "visible",
       input: [
         { type: "text", text: buildReviewInstruction(artifact), mentions: [] },
@@ -345,8 +389,8 @@ export class BbRunner {
     return thread;
   }
 
-  public async sendRemediation(job: Job, findings: ReviewFinding[]): Promise<void> {
-    await this.sendSteering(requireImplementationThreadId(job), buildRemediationPrompt(job, findings));
+  public async sendRemediation(job: Job, findings: ReviewFinding[], reasons: string[] = []): Promise<void> {
+    await this.sendSteering(requireImplementationThreadId(job), buildRemediationPrompt(job, findings, reasons));
   }
 
   public async sendSteering(threadId: string, text: string): Promise<void> {

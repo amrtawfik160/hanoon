@@ -46,9 +46,11 @@ type BbEffectAdapter = {
   spawnPlanner?(job: Job, attempt: PipelineThreadAttempt, previousCritique?: string | null): Promise<{ id: string; environmentId?: string | null }>;
   spawnCritic?(job: Job, attempt: PipelineThreadAttempt, plan: PipelineThreadAttempt): Promise<{ id: string; environmentId?: string | null }>;
   spawnBuilderFromPlan?(job: Job, attempt: BbAttempt, plan: PipelineThreadAttempt): Promise<{ id: string; environmentId?: string | null }>;
+  spawnDocs?(job: Job, attempt: PipelineThreadAttempt): Promise<{ id: string; environmentId?: string | null }>;
   spawnImplementation?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
   spawnReview?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
-  sendRemediation?(job: Job, findings: ReviewFinding[]): Promise<void>;
+  spawnFinalReview?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
+  sendRemediation?(job: Job, findings: ReviewFinding[], reasons?: string[]): Promise<void>;
   sendSteering?(threadId: string, text: string): Promise<void>;
   stopWorker?(worker: string | WorkerLiveness): Promise<void>;
   getThread?(threadId: string): Promise<BbThread>;
@@ -134,10 +136,13 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "spawn_critique": return ["critiquing"];
     case "spawn_implementation": return ["creating_implementation"];
     case "inspect_implementation": return ["implementing", "locating_pr"];
-    case "resolve_pr_head": return ["resolving_pr_head"];
+    case "resolve_pr_head": return ["resolving_pr_head", "resolving_docs_head"];
     case "spawn_review": return ["reviewing"];
     case "send_remediation": return ["remediating"];
     case "run_validation": return ["validating"];
+    case "spawn_docs": return ["documenting"];
+    case "run_final_validation": return ["final_validating"];
+    case "spawn_final_review": return ["final_reviewing"];
     case "issue_approval": return ["awaiting_merge_approval"];
     case "revoke_approvals": return [];
     case "merge_pr": return ["merging"];
@@ -161,6 +166,9 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
   "spawn_review",
   "send_remediation",
   "run_validation",
+  "spawn_docs",
+  "run_final_validation",
+  "spawn_final_review",
   "issue_approval",
   "revoke_approvals",
   "merge_pr",
@@ -211,7 +219,32 @@ function stageInputSha(...shaValues: string[]): string {
   return hash.digest("hex");
 }
 
+function validationStageEvidence(result: ValidationSnapshot): Record<string, unknown> {
+  return {
+    validationOutcome: result.validationOutcome,
+    headSha: result.headSha,
+    originRepository: result.originRepository,
+    terminalIds: (result.terminalIds ?? []).slice(0, 100),
+    commandReceipts: result.commandReceipts.slice(0, 50).map((receipt) => ({
+      command: receipt.command.slice(0, 500),
+      outcome: receipt.outcome,
+      exitCode: receipt.exitCode,
+      output: receipt.output.slice(0, 1_000),
+    })),
+    requiredChecks: result.requiredChecks.slice(0, 50).map((check) => ({
+      name: check.name.slice(0, 200),
+      bucket: check.bucket.slice(0, 80),
+      state: check.state.slice(0, 80),
+      link: check.link?.slice(0, 500) ?? null,
+    })),
+    completedAt: result.completedAt,
+  };
+}
+
 function pipelineAttemptForRunner(attempt: PipelineStageAttempt): PipelineThreadAttempt {
+  if (attempt.role !== "PLAN" && attempt.role !== "CRITIQUE" && attempt.role !== "DOCS") {
+    throw new PermanentEffectError("pipeline thread attempt role is not model-backed");
+  }
   return {
     id: attempt.id,
     role: attempt.role,
@@ -264,6 +297,7 @@ export class EffectRunner {
     effect: StoredEffect,
     job: Job,
     kind: "implementation" | "review",
+    finalReview = false,
   ): Promise<{ threadId: string; environmentId: string }> {
     const bb = this.dependencies.bb;
     if (!bb) throw new PermanentEffectError("BB runner is not configured");
@@ -281,7 +315,8 @@ export class EffectRunner {
       headSha: attemptInput.headSha,
       now: this.now(),
     });
-    const expectedTitle = `Telegram ${job.id} ${kind} ${attempt.id}`;
+    const titleRole = finalReview ? "final-review" : kind;
+    const expectedTitle = `Telegram ${job.id} ${titleRole} ${attempt.id}`;
     const list = listThreadsAdapter(bb);
     if (list && job.projectId) {
       const candidates: BbThread[] = [];
@@ -322,7 +357,7 @@ export class EffectRunner {
           candidateAttempt,
           pipelineAttemptForRunner(plan),
         )
-      : kind === "implementation" ? bb.spawnImplementation : bb.spawnReview;
+      : kind === "implementation" ? bb.spawnImplementation : finalReview ? bb.spawnFinalReview : bb.spawnReview;
     if (!spawn) throw new PermanentEffectError(`BB ${kind} runner is not configured`);
     this.assertFence();
     const created = await spawn(job, attempt);
@@ -344,7 +379,8 @@ export class EffectRunner {
   ): Promise<{ threadId: string; environmentId: string } | null> {
     const list = listThreadsAdapter(bb);
     if (!list || !job.projectId) return null;
-    const expectedTitle = `Telegram ${job.id} ${attempt.role === "PLAN" ? "plan" : "critique"} ${attempt.id}`;
+    const roleLabel = attempt.role === "PLAN" ? "plan" : attempt.role === "CRITIQUE" ? "critique" : "docs";
+    const expectedTitle = `Telegram ${job.id} ${roleLabel} ${attempt.id}`;
     const candidates: BbThread[] = [];
     for (let offset = 0; offset < 1_000; offset += 100) {
       this.assertFence();
@@ -367,6 +403,10 @@ export class EffectRunner {
       const plan = this.dependencies.store.getLatestPipelineStageAttempt(job.id, "PLAN");
       if (!plan?.threadId || candidate.parentThreadId !== plan.threadId) {
         throw new PermanentEffectError("critique thread parent ownership is invalid");
+      }
+    } else if (attempt.role === "DOCS") {
+      if (!job.implementationThreadId || candidate.parentThreadId !== job.implementationThreadId) {
+        throw new PermanentEffectError("docs thread parent ownership is invalid");
       }
     } else if (candidate.parentThreadId !== null) {
       throw new PermanentEffectError("planner thread parent ownership is invalid");
@@ -477,6 +517,43 @@ export class EffectRunner {
     this.bindPipelineAttempt(attempt, created.threadId, created.environmentId);
   }
 
+  private async spawnDocs(effect: StoredEffect, job: Job): Promise<void> {
+    const bb = this.dependencies.bb;
+    if (!bb?.spawnDocs || !job.policy || !job.prHeadSha || !job.environmentId) {
+      throw new PermanentEffectError("BB docs runner requires reviewed job context");
+    }
+    const workOrder = buildWorkOrder(job, job.policy);
+    const attempt = this.createPipelineAttempt(
+      effect,
+      job,
+      "DOCS",
+      stageInputSha(workOrder.sha256, job.prHeadSha),
+    );
+    let created = attempt.threadId && attempt.environmentId
+      ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
+      : await this.findPipelineStageCandidate(bb, job, attempt);
+    if (!created) {
+      this.assertFence();
+      const result = await bb.spawnDocs(job, pipelineAttemptForRunner(attempt));
+      this.assertFence();
+      created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
+    }
+    if (created.environmentId !== job.environmentId) {
+      throw new PermanentEffectError("Docs did not reuse the implementation environment");
+    }
+    this.bindPipelineAttempt(attempt, created.threadId, created.environmentId);
+    this.assertFence();
+    const current = this.dependencies.store.getJob(job.id);
+    if (current?.state === "documenting" && current.documentationThreadId === null) {
+      this.dependencies.store.applyJobEvent(job.id, current.version, {
+        type: "DOCS_CREATED",
+        attemptId: attempt.id,
+        threadId: created.threadId,
+        environmentId: created.environmentId,
+      }, this.now());
+    }
+  }
+
   private async spawnImplementation(effect: StoredEffect, job: Job): Promise<void> {
     if (job.state !== "creating_implementation") return;
     const created = await this.adoptOrSpawn(effect, job, "implementation");
@@ -497,6 +574,16 @@ export class EffectRunner {
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "reviewing") return;
+    const started = this.dependencies.store.applyJobEvent(job.id, current.version, { type: "REVIEW_STARTED" }, this.now());
+    this.dependencies.store.registerReviewThread(job.id, started.version, created.threadId, this.now());
+  }
+
+  private async spawnFinalReview(effect: StoredEffect, job: Job): Promise<void> {
+    if (job.state !== "final_reviewing") return;
+    const created = await this.adoptOrSpawn(effect, job, "review", true);
+    this.assertFence();
+    const current = this.dependencies.store.getJob(job.id);
+    if (!current || current.state !== "final_reviewing") return;
     const started = this.dependencies.store.applyJobEvent(job.id, current.version, { type: "REVIEW_STARTED" }, this.now());
     this.dependencies.store.registerReviewThread(job.id, started.version, created.threadId, this.now());
   }
@@ -553,7 +640,7 @@ export class EffectRunner {
     const result = await this.dependencies.resolvePrHead(job, effect, this.dependencies.fence.signal);
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
-    if (!current || current.state !== "resolving_pr_head") return;
+    if (!current || (current.state !== "resolving_pr_head" && current.state !== "resolving_docs_head")) return;
     if (result.event === "PR_HEAD_RESOLVED" && fullSha(result.headSha)) {
       this.dependencies.store.applyJobEvent(job.id, current.version, { type: "PR_HEAD_RESOLVED", headSha: result.headSha }, this.now());
     } else {
@@ -565,7 +652,10 @@ export class EffectRunner {
     const findings = Array.isArray(recordPayload(effect).findings)
       ? recordPayload(effect).findings as ReviewFinding[]
       : [];
-    if (this.dependencies.bb?.sendRemediation) await this.dependencies.bb.sendRemediation(job, findings);
+    const reasons = Array.isArray(recordPayload(effect).reasons)
+      ? (recordPayload(effect).reasons as unknown[]).filter((reason): reason is string => typeof reason === "string").slice(0, 20)
+      : [];
+    if (this.dependencies.bb?.sendRemediation) await this.dependencies.bb.sendRemediation(job, findings, reasons);
     else if (this.dependencies.bb?.sendSteering && job.implementationThreadId) {
       await this.dependencies.bb.sendSteering(job.implementationThreadId, textPayload(effect, "summary"));
     } else throw new PermanentEffectError("remediation runner is not configured");
@@ -574,27 +664,92 @@ export class EffectRunner {
     if (current?.state === "remediating") this.dependencies.store.applyJobEvent(job.id, current.version, { type: "REMEDIATION_SENT" }, this.now());
   }
 
-  private async runValidation(effect: StoredEffect, job: Job): Promise<void> {
+  private async runValidation(effect: StoredEffect, job: Job, final = false): Promise<void> {
     if (!this.dependencies.runValidation) throw new PermanentEffectError("validation runner is not configured");
+    if (!job.policy || !job.prHeadSha || !job.environmentId) {
+      throw new PermanentEffectError("validation requires immutable policy, environment, and head context");
+    }
+    const role = final ? "FINAL_TEST" as const : "TEST" as const;
+    const workOrder = buildWorkOrder(job, job.policy);
+    const attempt = this.createPipelineAttempt(
+      effect,
+      job,
+      role,
+      stageInputSha(
+        workOrder.sha256,
+        job.prHeadSha,
+        JSON.stringify(job.policy.validationCommands),
+        JSON.stringify(job.policy.requiredChecks),
+      ),
+    );
+    if (attempt.state === "completed") {
+      const outcome = attempt.outcome;
+      const headSha = outcome?.headSha;
+      const validationOutcome = outcome?.validationOutcome;
+      if (!fullSha(headSha) || (validationOutcome !== "pass" && validationOutcome !== "fail")) {
+        throw new PermanentEffectError("completed validation stage has invalid durable evidence");
+      }
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.state !== (final ? "final_validating" : "validating")) return;
+      this.dependencies.store.applyJobEvent(job.id, current.version, validationOutcome === "pass"
+        ? { type: "VALIDATION_PASSED", headSha }
+        : { type: "VALIDATION_FAILED", headSha, reason: "Validation did not pass" }, this.now());
+      return;
+    }
     let result: ValidationSnapshot;
     try {
       result = await this.dependencies.runValidation(job, effect, this.dependencies.fence.signal);
     } catch (error) {
       if (!(error instanceof ValidationError)) throw error;
       this.assertFence();
+      this.dependencies.store.failPipelineStageAttempt({
+        id: attempt.id,
+        error: "Validation infrastructure failed",
+        ownerId: this.dependencies.fence.ownerId,
+        generation: this.dependencies.fence.generation,
+        now: this.now(),
+      });
       const current = this.dependencies.store.getJob(job.id);
-      if (current?.state === "validating") {
+      if (current?.state === (final ? "final_validating" : "validating")) {
         this.dependencies.store.applyJobEvent(job.id, current.version, {
-          type: "VALIDATION_FAILED",
-          headSha: current.prHeadSha ?? undefined,
-          reason: error.message,
+          type: "FAILED",
+          error: "Validation infrastructure failed",
         }, this.now());
       }
       return;
     }
     this.assertFence();
+    const terminalId = result.terminalIds?.at(-1);
+    if (terminalId) {
+      const bound = this.dependencies.store.bindPipelineStageResource({
+        id: attempt.id,
+        resourceKind: "bb_terminal",
+        resourceId: terminalId,
+        environmentId: job.environmentId,
+        ownerId: this.dependencies.fence.ownerId,
+        generation: this.dependencies.fence.generation,
+        now: this.now(),
+      });
+      if (!bound) throw new Error("validation stage resource binding lost its executor fence");
+    }
+    const evidence = validationStageEvidence(result);
+    const outputText = JSON.stringify(evidence);
+    const outputSha256 = createHash("sha256").update(outputText, "utf8").digest("hex");
+    const completed = this.dependencies.store.completePipelineStageAttempt({
+      id: attempt.id,
+      outputText,
+      outputSha256,
+      outcome: evidence,
+      startSha: job.prHeadSha,
+      endSha: fullSha(result.headSha) ? result.headSha : null,
+      ownerId: this.dependencies.fence.ownerId,
+      generation: this.dependencies.fence.generation,
+      now: this.now(),
+    });
+    if (!completed) throw new Error("validation stage completion lost its executor fence");
+    this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
-    if (!current || current.state !== "validating") return;
+    if (!current || current.state !== (final ? "final_validating" : "validating")) return;
     if (result.validationOutcome === "pass" && fullSha(result.headSha)) {
       this.dependencies.store.applyJobEvent(job.id, current.version, { type: "VALIDATION_PASSED", headSha: result.headSha }, this.now());
     } else {
@@ -763,6 +918,15 @@ export class EffectRunner {
         return;
       case "run_validation":
         await this.runValidation(effect, job);
+        return;
+      case "spawn_docs":
+        await this.spawnDocs(effect, job);
+        return;
+      case "run_final_validation":
+        await this.runValidation(effect, job, true);
+        return;
+      case "spawn_final_review":
+        await this.spawnFinalReview(effect, job);
         return;
       case "issue_approval":
         this.issueApproval(job);

@@ -142,7 +142,18 @@ export type AttemptRecord = {
   completedAt: number | null;
 };
 
-export type PipelineStageRole = "PLAN" | "CRITIQUE";
+export type PipelineStageRole =
+  | "PLAN"
+  | "CRITIQUE"
+  | "BUILD"
+  | "TEST"
+  | "REVIEW"
+  | "PATCH"
+  | "DOCS"
+  | "FINAL_TEST"
+  | "FINAL_REVIEW"
+  | "DEPLOY"
+  | "CANARY";
 export type PipelineStageAttemptState = "spawning" | "running" | "completed" | "failed";
 export type PipelineStageAttempt = {
   id: string;
@@ -152,6 +163,8 @@ export type PipelineStageAttempt = {
   state: PipelineStageAttemptState;
   threadId: string | null;
   environmentId: string | null;
+  resourceKind: "bb_thread" | "bb_terminal" | null;
+  resourceId: string | null;
   inputSha256: string;
   outputText: string | null;
   outputSha256: string | null;
@@ -361,6 +374,7 @@ type JobRow = {
   environment_id: string | null;
   implementation_thread_id: string | null;
   review_thread_id: string | null;
+  documentation_thread_id: string | null;
   pr_number: number | null;
   pr_url: string | null;
   pr_head_sha: string | null;
@@ -469,6 +483,8 @@ type PipelineStageAttemptRow = {
   state: PipelineStageAttemptState;
   thread_id: string | null;
   environment_id: string | null;
+  resource_kind: "bb_thread" | "bb_terminal" | null;
+  resource_id: string | null;
   input_sha256: string;
   output_text: string | null;
   output_sha256: string | null;
@@ -499,6 +515,10 @@ const JOB_STATES: ReadonlySet<JobState> = new Set([
   "reviewing",
   "remediating",
   "validating",
+  "documenting",
+  "resolving_docs_head",
+  "final_validating",
+  "final_reviewing",
   "awaiting_merge_approval",
   "merging",
   "failed",
@@ -516,6 +536,10 @@ const THREAD_OPERATION_KINDS: ReadonlySet<ThreadOperationKind> = new Set([
   "steer_thread",
   "stop_thread",
   "retry_thread",
+]);
+const PIPELINE_STAGE_ROLES: ReadonlySet<PipelineStageRole> = new Set([
+  "PLAN", "CRITIQUE", "BUILD", "TEST", "REVIEW", "PATCH", "DOCS",
+  "FINAL_TEST", "FINAL_REVIEW", "DEPLOY", "CANARY",
 ]);
 
 export class VersionConflictError extends Error {
@@ -1493,6 +1517,12 @@ export interface TelegramAgentStore {
     threadId: string;
     environmentId: string;
   }): boolean;
+  bindPipelineStageResource(input: ControllerLeaseFence & {
+    id: string;
+    resourceKind: "bb_thread" | "bb_terminal";
+    resourceId: string;
+    environmentId: string;
+  }): boolean;
   completePipelineStageAttempt(input: ControllerLeaseFence & {
     id: string;
     outputText: string;
@@ -1755,6 +1785,7 @@ function parseJob(row: JobRow): Job {
     environmentId: row.environment_id,
     implementationThreadId: row.implementation_thread_id,
     reviewThreadId: row.review_thread_id,
+    documentationThreadId: row.documentation_thread_id,
     prNumber: row.pr_number,
     prUrl: row.pr_url,
     prHeadSha: row.pr_head_sha,
@@ -1780,6 +1811,8 @@ function parsePipelineStageAttempt(row: PipelineStageAttemptRow): PipelineStageA
     state: row.state,
     threadId: row.thread_id,
     environmentId: row.environment_id,
+    resourceKind: row.resource_kind,
+    resourceId: row.resource_id,
     inputSha256: row.input_sha256,
     outputText: row.output_text,
     outputSha256: row.output_sha256,
@@ -1870,7 +1903,7 @@ function persistJobTransition(
       `UPDATE jobs SET
          request_text = ?, state = ?, resume_state = ?, project_id = ?,
          policy_version = ?, policy_json = ?, environment_id = ?,
-         implementation_thread_id = ?, review_thread_id = ?, pr_number = ?,
+         implementation_thread_id = ?, review_thread_id = ?, documentation_thread_id = ?, pr_number = ?,
          pr_url = ?, pr_head_sha = ?, status_message_id = ?, plan_cycle = ?, review_cycle = ?,
          review_block_at = ?, cancel_requested_at = ?, blocked_reason = ?,
          last_error = ?, version = ?, updated_at = ?
@@ -1886,6 +1919,7 @@ function persistJobTransition(
       transitionedJob.environmentId,
       transitionedJob.implementationThreadId,
       transitionedJob.reviewThreadId,
+      transitionedJob.documentationThreadId,
       transitionedJob.prNumber,
       transitionedJob.prUrl,
       transitionedJob.prHeadSha,
@@ -1932,7 +1966,7 @@ function persistPendingEffects(
 const JOB_SELECT = `
   SELECT id, source_update_id, request_text, state, resume_state, project_id,
          policy_version, policy_json, environment_id, implementation_thread_id,
-         review_thread_id, pr_number, pr_url, pr_head_sha, status_message_id,
+         review_thread_id, documentation_thread_id, pr_number, pr_url, pr_head_sha, status_message_id,
          plan_cycle, review_cycle, review_block_at, cancel_requested_at, blocked_reason,
          last_error, version, created_at, updated_at
     FROM jobs`;
@@ -3410,7 +3444,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     inputSha256: string;
   }): PipelineStageAttempt {
     if (!input.id || !input.jobId) throw new TypeError("pipeline stage identity is required");
-    if (input.role !== "PLAN" && input.role !== "CRITIQUE") throw new TypeError("pipeline stage role is invalid");
+    if (!PIPELINE_STAGE_ROLES.has(input.role)) throw new TypeError("pipeline stage role is invalid");
     assertPositiveInteger(input.ordinal, "ordinal");
     assertContentSha256(input.inputSha256, "inputSha256");
     assertNonNegativeInteger(input.now, "now");
@@ -3453,12 +3487,52 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }
       return this.db.prepare(
         `UPDATE pipeline_stage_attempts
-           SET thread_id = ?, environment_id = ?, state = 'running', updated_at = ?
+           SET thread_id = ?, environment_id = ?, resource_kind = 'bb_thread', resource_id = ?,
+               state = 'running', updated_at = ?
          WHERE id = ? AND state = 'spawning'
            AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
              AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
       ).run(
         input.threadId,
+        input.environmentId,
+        input.threadId,
+        input.now,
+        input.id,
+        input.ownerId,
+        input.generation,
+        input.now,
+      ).changes === 1;
+    }).immediate();
+  }
+
+  public bindPipelineStageResource(input: ControllerLeaseFence & {
+    id: string;
+    resourceKind: "bb_thread" | "bb_terminal";
+    resourceId: string;
+    environmentId: string;
+  }): boolean {
+    if (!input.id || !input.resourceId || !input.environmentId) throw new TypeError("pipeline resource identity is required");
+    if (input.resourceKind !== "bb_thread" && input.resourceKind !== "bb_terminal") {
+      throw new TypeError("pipeline resource kind is invalid");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const current = this.getPipelineStageAttempt(input.id);
+      if (!current) return false;
+      if (current.resourceKind !== null || current.resourceId !== null) {
+        return current.resourceKind === input.resourceKind && current.resourceId === input.resourceId &&
+          current.environmentId === input.environmentId && (current.state === "running" || current.state === "completed");
+      }
+      return this.db.prepare(
+        `UPDATE pipeline_stage_attempts
+           SET resource_kind = ?, resource_id = ?, environment_id = ?, state = 'running', updated_at = ?
+         WHERE id = ? AND state = 'spawning'
+           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+      ).run(
+        input.resourceKind,
+        input.resourceId,
         input.environmentId,
         input.now,
         input.id,
@@ -3501,7 +3575,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE pipeline_stage_attempts
            SET state = 'completed', output_text = ?, output_sha256 = ?, outcome_json = ?,
                start_sha = ?, end_sha = ?, last_error = NULL, completed_at = ?, updated_at = ?
-         WHERE id = ? AND state = 'running'
+         WHERE id = ? AND state IN ('spawning', 'running')
            AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
              AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
       ).run(
@@ -3555,7 +3629,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getLatestPipelineStageAttempt(jobId: string, role: PipelineStageRole): PipelineStageAttempt | null {
     if (!jobId) throw new TypeError("jobId must not be empty");
-    if (role !== "PLAN" && role !== "CRITIQUE") throw new TypeError("pipeline stage role is invalid");
+    if (!PIPELINE_STAGE_ROLES.has(role)) throw new TypeError("pipeline stage role is invalid");
     const row = this.db.prepare(
       "SELECT * FROM pipeline_stage_attempts WHERE job_id = ? AND role = ? ORDER BY ordinal DESC LIMIT 1",
     ).get(jobId, role) as PipelineStageAttemptRow | undefined;
@@ -3564,7 +3638,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public nextPipelineStageOrdinal(jobId: string, role: PipelineStageRole): number {
     if (!jobId) throw new TypeError("jobId must not be empty");
-    if (role !== "PLAN" && role !== "CRITIQUE") throw new TypeError("pipeline stage role is invalid");
+    if (!PIPELINE_STAGE_ROLES.has(role)) throw new TypeError("pipeline stage role is invalid");
     const row = this.db.prepare(
       "SELECT COALESCE(MAX(ordinal), 0) AS max_ordinal FROM pipeline_stage_attempts WHERE job_id = ? AND role = ?",
     ).get(jobId, role) as { max_ordinal: number };

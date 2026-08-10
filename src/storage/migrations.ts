@@ -279,6 +279,65 @@ DROP TABLE worker_liveness;
 ALTER TABLE worker_liveness_v2 RENAME TO worker_liveness;
 `] as const;
 
+export const PIPELINE_FINAL_REVIEW_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN documentation_thread_id TEXT;
+ALTER TABLE pipeline_stage_attempts RENAME TO pipeline_stage_attempts_v1;
+DROP INDEX pipeline_stage_attempts_job_role;
+CREATE TABLE pipeline_stage_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  role TEXT NOT NULL CHECK (role IN (
+    'PLAN', 'CRITIQUE', 'BUILD', 'TEST', 'REVIEW', 'PATCH', 'DOCS',
+    'FINAL_TEST', 'FINAL_REVIEW', 'DEPLOY', 'CANARY'
+  )),
+  ordinal INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('spawning', 'running', 'completed', 'failed')),
+  thread_id TEXT UNIQUE,
+  environment_id TEXT,
+  resource_kind TEXT CHECK (resource_kind IN ('bb_thread', 'bb_terminal')),
+  resource_id TEXT,
+  input_sha256 TEXT NOT NULL,
+  output_text TEXT,
+  output_sha256 TEXT,
+  outcome_json TEXT,
+  start_sha TEXT,
+  end_sha TEXT,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(job_id, role, ordinal)
+);
+INSERT INTO pipeline_stage_attempts (
+  id, job_id, role, ordinal, state, thread_id, environment_id,
+  resource_kind, resource_id,
+  input_sha256, output_text, output_sha256, outcome_json, start_sha, end_sha,
+  last_error, created_at, completed_at, updated_at
+) SELECT
+  id, job_id, role, ordinal, state, thread_id, environment_id,
+  CASE WHEN thread_id IS NULL THEN NULL ELSE 'bb_thread' END, thread_id,
+  input_sha256, output_text, output_sha256, outcome_json, start_sha, end_sha,
+  last_error, created_at, completed_at, updated_at
+FROM pipeline_stage_attempts_v1;
+DROP TABLE pipeline_stage_attempts_v1;
+CREATE INDEX pipeline_stage_attempts_job_role
+  ON pipeline_stage_attempts(job_id, role, ordinal DESC);
+CREATE TABLE worker_liveness_v3 (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  worker_kind TEXT NOT NULL CHECK (worker_kind IN ('plan', 'critique', 'implementation', 'review', 'validation', 'docs', 'merge')),
+  resource_kind TEXT NOT NULL CHECK (resource_kind IN ('bb_thread', 'bb_terminal')),
+  resource_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('starting', 'active', 'stopping', 'idle', 'failed', 'unknown', 'stale')),
+  source_updated_at INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL,
+  stale_notified_at INTEGER
+);
+INSERT INTO worker_liveness_v3 SELECT * FROM worker_liveness;
+DROP TABLE worker_liveness;
+ALTER TABLE worker_liveness_v3 RENAME TO worker_liveness;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -287,4 +346,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_STREAM_MIGRATIONS,
   ...THREAD_OPERATION_MIGRATIONS,
   ...PIPELINE_MIGRATIONS,
+  ...PIPELINE_FINAL_REVIEW_MIGRATIONS,
 ] as const;

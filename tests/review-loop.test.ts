@@ -366,7 +366,7 @@ describe("review remediation loop", () => {
     expect(harness.threads.sent).toHaveLength(1);
   });
 
-  it("sends remediation to the original implementation thread", async () => {
+  it("emits bounded findings for the single leased remediation effect", async () => {
     const harness = makeHarness({
       reviewOutputs: [
         output({
@@ -378,9 +378,11 @@ describe("review remediation loop", () => {
 
     await idle(harness.handler);
 
-    expect(harness.threads.sent.at(-1)?.threadId).toBe(
-      "implementation-thread-1",
-    );
+    expect(harness.threads.sent).toEqual([]);
+    expect(harness.events.at(-1)).toMatchObject({
+      type: "REVIEW_CHANGES_REQUESTED",
+      payload: { findings: [expect.objectContaining({ title: "fix this" })] },
+    });
   });
 
   it("keeps failed-check reasons in remediation and totally orders tied findings", async () => {
@@ -403,7 +405,7 @@ describe("review remediation loop", () => {
     const failedCheckResult = await idle(failedCheckHarness.handler);
 
     expect(failedCheckResult.outcome).toBe("changes_requested");
-    expect(failedCheckHarness.threads.sent.at(-1)?.prompt).toContain(
+    expect(failedCheckHarness.events.at(-1)?.payload.reasons).toContain(
       "check unit failed: one assertion failed",
     );
 

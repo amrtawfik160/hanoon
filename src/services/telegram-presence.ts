@@ -17,6 +17,9 @@ const JOB_WORKER_KIND: Partial<Record<JobState, WorkerKind>> = {
   remediating: "implementation",
   reviewing: "review",
   validating: "validation",
+  documenting: "docs",
+  final_validating: "validation",
+  final_reviewing: "review",
 };
 
 type PresenceStore = {

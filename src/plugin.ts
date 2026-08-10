@@ -11,6 +11,7 @@ import type { EffectFence } from "./services/effect-runner";
 import { runJobExecutorService } from "./services/job-executor-service";
 import { createTask9FreshGateCollector, MergeHandler } from "./services/merge-handler";
 import type { GateInput } from "./domain/gates";
+import type { ReviewFinding } from "./domain/models";
 import { ReviewHandler, type ReviewHandlerEvent } from "./services/review-handler";
 import { runTelegramService } from "./services/telegram-service";
 import {
@@ -320,9 +321,15 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     spawnPlanner: (job: Parameters<BbRunner["spawnPlanner"]>[0], attempt: Parameters<BbRunner["spawnPlanner"]>[1], previousCritique?: string | null) => bbRunner.spawnPlanner(job, attempt, previousCritique),
     spawnCritic: (job: Parameters<BbRunner["spawnCritic"]>[0], attempt: Parameters<BbRunner["spawnCritic"]>[1], plan: Parameters<BbRunner["spawnCritic"]>[2]) => bbRunner.spawnCritic(job, attempt, plan),
     spawnBuilderFromPlan: (job: Parameters<BbRunner["spawnBuilderFromPlan"]>[0], attempt: Parameters<BbRunner["spawnBuilderFromPlan"]>[1], plan: Parameters<BbRunner["spawnBuilderFromPlan"]>[2]) => bbRunner.spawnBuilderFromPlan(job, attempt, plan),
+    spawnDocs: (job: Parameters<BbRunner["spawnDocs"]>[0], attempt: Parameters<BbRunner["spawnDocs"]>[1]) => bbRunner.spawnDocs(job, attempt),
     spawnImplementation: (job: Parameters<BbRunner["spawnImplementation"]>[0], attempt: Parameters<BbRunner["spawnImplementation"]>[1]) => bbRunner.spawnImplementation(job, attempt),
     spawnReview: (job: Parameters<BbRunner["spawnReview"]>[0], attempt: Parameters<BbRunner["spawnReview"]>[1]) => bbRunner.spawnReview(job, attempt),
-    sendRemediation: (job: Parameters<BbRunner["sendRemediation"]>[0], findings: Parameters<BbRunner["sendRemediation"]>[1]) => bbRunner.sendRemediation(job, findings),
+    spawnFinalReview: (job: Parameters<BbRunner["spawnFinalReview"]>[0], attempt: Parameters<BbRunner["spawnFinalReview"]>[1]) => bbRunner.spawnFinalReview(job, attempt),
+    sendRemediation: (
+      job: Parameters<BbRunner["sendRemediation"]>[0],
+      findings: Parameters<BbRunner["sendRemediation"]>[1],
+      reasons?: Parameters<BbRunner["sendRemediation"]>[2],
+    ) => bbRunner.sendRemediation(job, findings, reasons),
     sendSteering: (threadId: string, text: string) => bbRunner.sendSteering(threadId, text),
     stopWorker: (worker: Parameters<BbRunner["stopWorker"]>[0]) => bbRunner.stopWorker(worker),
     getThread: (threadId: string) => bbRunner.getThread(threadId),
@@ -339,13 +346,20 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock());
     if (!fenceCurrent()) return;
 
-    const pipelineRole = job.state === "planning" ? "PLAN" as const : job.state === "critiquing" ? "CRITIQUE" as const : null;
+    const pipelineRole = job.state === "planning" ? "PLAN" as const
+      : job.state === "critiquing" ? "CRITIQUE" as const
+      : job.state === "documenting" ? "DOCS" as const
+      : null;
     const pipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
-    const reviewStage = job.state === "reviewing";
+    const reviewStage = job.state === "reviewing" || job.state === "final_reviewing";
     const implementationStage = ["creating_implementation", "implementing", "locating_pr", "resolving_pr_head", "remediating"].includes(job.state);
     const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? job.reviewThreadId : implementationStage ? job.implementationThreadId : null);
     if (!resourceId) return;
-    const workerKind = pipelineRole === "PLAN" ? "plan" as const : pipelineRole === "CRITIQUE" ? "critique" as const : reviewStage ? "review" as const : "implementation" as const;
+    const workerKind = pipelineRole === "PLAN" ? "plan" as const
+      : pipelineRole === "CRITIQUE" ? "critique" as const
+      : pipelineRole === "DOCS" ? "docs" as const
+      : reviewStage ? "review" as const
+      : "implementation" as const;
     const generation = workerRegistrationGeneration(job, workerKind);
     let thread: Awaited<ReturnType<BbRunner["getThread"]>>;
     try {
@@ -442,7 +456,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     reviewStatusJob = null;
     if (!event || !fenceCurrent()) return;
     const latest = store.getJob(job.id);
-    if (!latest || latest.state !== "reviewing" || !fenceCurrent()) return;
+    if (!latest || (latest.state !== "reviewing" && latest.state !== "final_reviewing") || !fenceCurrent()) return;
     if (event.type === "REVIEW_PASSED") {
       store.applyJobEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: String(event.payload.headSha) }, clock());
     } else if (event.type === "REVIEW_CHANGES_REQUESTED") {
@@ -450,6 +464,10 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         type: "REVIEW_CHANGES_REQUESTED",
         headSha: typeof event.payload.headSha === "string" ? event.payload.headSha : undefined,
         summary: typeof event.payload.summary === "string" ? event.payload.summary : undefined,
+        findings: Array.isArray(event.payload.findings) ? event.payload.findings as ReviewFinding[] : undefined,
+        reasons: Array.isArray(event.payload.reasons)
+          ? event.payload.reasons.filter((reason): reason is string => typeof reason === "string")
+          : undefined,
       }, clock());
     } else {
       store.applyJobEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" }, clock());

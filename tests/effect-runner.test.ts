@@ -191,6 +191,59 @@ describe("leased effect execution", () => {
     }).run(claimed)).rejects.toBeInstanceOf(PermanentEffectError);
   });
 
+  it.each([
+    ["validating", "run_validation", "TEST", "reviewing"],
+    ["final_validating", "run_final_validation", "FINAL_TEST", "final_reviewing"],
+  ] as const)("persists terminal-bound %s receipts before advancing", async (state, kind, role, nextState) => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = ?, project_id = 'proj_1', policy_version = 1, policy_json = ?,
+         environment_id = 'env_1', pr_number = 7, pr_url = 'https://github.com/acme/cyndra/pull/7',
+         pr_head_sha = ?, version = 2 WHERE id = ?`,
+    ).run(state, JSON.stringify(policyFixture()), "a".repeat(40), job.id);
+    const effect: JobEffect = {
+      idempotencyKey: `job_1:3:${kind}`,
+      jobId: job.id,
+      kind,
+      payload: { headSha: "a".repeat(40) },
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const claimed = store.leaseEffects("owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("validation effect missing");
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      runValidation: vi.fn(async () => ({
+        headSha: "a".repeat(40),
+        originRepository: "acme/cyndra",
+        commandReceipts: [{ command: "npm test", outcome: "pass" as const, exitCode: 0, output: "42 passed" }],
+        requiredChecks: [{ name: "test", bucket: "pass", state: "SUCCESS", link: null }],
+        validationOutcome: "pass" as const,
+        completedAt: "2026-08-10T00:00:00.000Z",
+        terminalIds: ["term_unit", "term_checks"],
+      })),
+    }).run(claimed);
+
+    expect(store.getJob(job.id)?.state).toBe(nextState);
+    expect(store.getLatestPipelineStageAttempt(job.id, role)).toMatchObject({
+      state: "completed",
+      resourceKind: "bb_terminal",
+      resourceId: "term_checks",
+      startSha: "a".repeat(40),
+      endSha: "a".repeat(40),
+      outcome: expect.objectContaining({ validationOutcome: "pass", headSha: "a".repeat(40) }),
+    });
+  });
+
   it("blocks cancellation when the stopped BB worker never reaches a terminal state", async () => {
     const { store, db } = storeFixture();
     const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });

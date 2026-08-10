@@ -24,7 +24,8 @@ export function workerRegistrationGeneration(job: Job, workerKind: WorkerLivenes
     : workerKind === "implementation" ? 3
     : workerKind === "review" ? 4
     : workerKind === "validation" ? 5
-    : 6;
+    : workerKind === "docs" ? 6
+    : 7;
   return job.version * 10 + role;
 }
 

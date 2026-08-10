@@ -127,6 +127,10 @@ export type JobState =
   | "reviewing"
   | "remediating"
   | "validating"
+  | "documenting"
+  | "resolving_docs_head"
+  | "final_validating"
+  | "final_reviewing"
   | "awaiting_merge_approval"
   | "merging"
   | "failed"
@@ -134,7 +138,7 @@ export type JobState =
   | "cancelled"
   | "merged";
 
-export type WorkerKind = "plan" | "critique" | "implementation" | "review" | "validation" | "merge";
+export type WorkerKind = "plan" | "critique" | "implementation" | "review" | "validation" | "docs" | "merge";
 export type WorkerResourceKind = "bb_thread" | "bb_terminal";
 export type WorkerLivenessState =
   | "starting"
@@ -176,6 +180,7 @@ export interface Job {
   environmentId: string | null;
   implementationThreadId: string | null;
   reviewThreadId: string | null;
+  documentationThreadId: string | null;
   prNumber: number | null;
   prUrl: string | null;
   prHeadSha: string | null;
@@ -204,6 +209,9 @@ export interface JobEffect {
     | "spawn_review"
     | "send_remediation"
     | "run_validation"
+    | "spawn_docs"
+    | "run_final_validation"
+    | "spawn_final_review"
     | "issue_approval"
     | "revoke_approvals"
     | "merge_pr"
@@ -245,7 +253,13 @@ export type JobEvent =
   | { type: "PR_HEAD_RESOLVED"; headSha: string }
   | { type: "REVIEW_STARTED" }
   | { type: "REVIEW_PASSED"; headSha: string }
-  | { type: "REVIEW_CHANGES_REQUESTED"; headSha?: string; summary?: string }
+  | {
+      type: "REVIEW_CHANGES_REQUESTED";
+      headSha?: string;
+      summary?: string;
+      findings?: ReviewFinding[];
+      reasons?: string[];
+    }
   | {
       type: "REVIEW_BLOCKED";
       reason?: "review_limit" | "configuration" | "permanent_effect_failure";
@@ -255,6 +269,8 @@ export type JobEvent =
   | { type: "REMEDIATION_SENT" }
   | { type: "VALIDATION_PASSED"; headSha: string }
   | { type: "VALIDATION_FAILED"; headSha?: string; reason?: string }
+  | { type: "DOCS_CREATED"; attemptId: string; threadId: string; environmentId: string }
+  | { type: "DOCS_IDLE" }
   | { type: "APPROVAL_ACCEPTED"; headSha: string }
   | { type: "APPROVAL_STALE"; headSha?: string }
   | { type: "MERGE_SUCCEEDED"; message: string }

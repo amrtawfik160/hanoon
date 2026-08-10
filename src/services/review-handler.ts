@@ -101,15 +101,6 @@ function outputText(rawOutput: unknown): string {
   throw new InvalidReviewOutputError("BB thread output does not contain text");
 }
 
-function remediationPrompt(findings: ReviewFinding[], reasons: string[]): string {
-  const reasonLines = reasons.map((reason) => `- Reason: ${reason}`);
-  const findingLines = findings.map((finding) => {
-    const location = finding.file === null ? "(no file)" : `${finding.file}:${finding.line ?? "?"}`;
-    return `- [${finding.severity}] ${location} ${finding.title} — ${finding.details}`;
-  });
-  return `Address these bounded review findings, then report the changes:\n${[...reasonLines, ...findingLines].join("\n")}`;
-}
-
 export class ReviewHandler {
   public constructor(private readonly dependencies: ReviewHandlerDependencies) {}
 
@@ -229,16 +220,13 @@ export class ReviewHandler {
       requiresNewHead: true,
       result,
     });
-    await this.dependencies.threads.send(
-      input.implementationThreadId,
-      remediationPrompt(assessment.findings, assessment.reasons),
-    );
     this.dependencies.emit({
       type: "REVIEW_CHANGES_REQUESTED",
       payload: {
         headSha: input.expectedSha,
         summary: verdict.summary,
         findings: assessment.findings,
+        reasons: assessment.reasons,
       },
     });
     return result;

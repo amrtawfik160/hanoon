@@ -15,9 +15,13 @@ describe("job state machine", () => {
     ["creating_implementation", { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, "implementing", "render_status"],
     ["implementing", { type: "IMPLEMENTATION_IDLE" }, "locating_pr", "inspect_implementation"],
     ["locating_pr", { type: "PR_LOCATED", number: 7, url: "https://github.test/pr/7" }, "resolving_pr_head", "resolve_pr_head"],
-    ["resolving_pr_head", { type: "PR_HEAD_RESOLVED", headSha: sha() }, "reviewing", "spawn_review"],
-    ["reviewing", { type: "REVIEW_PASSED", headSha: sha() }, "validating", "run_validation"],
-    ["validating", { type: "VALIDATION_PASSED", headSha: sha() }, "awaiting_merge_approval", "issue_approval"],
+    ["resolving_pr_head", { type: "PR_HEAD_RESOLVED", headSha: sha() }, "validating", "run_validation"],
+    ["validating", { type: "VALIDATION_PASSED", headSha: sha() }, "reviewing", "spawn_review"],
+    ["reviewing", { type: "REVIEW_PASSED", headSha: sha() }, "documenting", "spawn_docs"],
+    ["documenting", { type: "DOCS_IDLE" }, "resolving_docs_head", "resolve_pr_head"],
+    ["resolving_docs_head", { type: "PR_HEAD_RESOLVED", headSha: sha() }, "final_validating", "run_final_validation"],
+    ["final_validating", { type: "VALIDATION_PASSED", headSha: sha() }, "final_reviewing", "spawn_final_review"],
+    ["final_reviewing", { type: "REVIEW_PASSED", headSha: sha() }, "awaiting_merge_approval", "issue_approval"],
     ["awaiting_merge_approval", { type: "APPROVAL_ACCEPTED", headSha: sha() }, "merging", "merge_pr"],
     ["merging", { type: "MERGE_SUCCEEDED", message: "merged" }, "merged", "render_status"],
   ] as const)("moves %s to %s", (from, event, to, effect) => {
@@ -25,7 +29,7 @@ describe("job state machine", () => {
       projectId: "proj_1",
       policyVersion: 1,
       policy: policyFixture(),
-      prHeadSha: ["reviewing", "validating", "awaiting_merge_approval"].includes(from)
+      prHeadSha: ["reviewing", "validating", "documenting", "final_validating", "final_reviewing", "awaiting_merge_approval"].includes(from)
         ? sha()
         : null,
     });
@@ -58,6 +62,17 @@ describe("job state machine", () => {
       lastError: "Plan critique limit reached",
     });
     expect(second.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+  });
+
+  it("routes final-review changes through the bounded patch loop", () => {
+    const result = transition(
+      stateJob("final_reviewing", { prHeadSha: sha(), reviewCycle: 0 }),
+      { type: "REVIEW_CHANGES_REQUESTED", headSha: sha(), summary: "Update the migration note" },
+      2_200,
+    );
+
+    expect(result.job).toMatchObject({ state: "remediating", reviewCycle: 1 });
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["send_remediation"]);
   });
 
   it("does not stop historical worker identifiers during cancellation", () => {
@@ -186,7 +201,9 @@ describe("job state machine", () => {
   it("invalidates drifted review, validation, and approval receipts fail-closed", () => {
     const cases = [
       ["reviewing", { type: "REVIEW_PASSED", headSha: sha("b") }],
+      ["final_reviewing", { type: "REVIEW_PASSED", headSha: sha("b") }],
       ["validating", { type: "VALIDATION_PASSED", headSha: sha("b") }],
+      ["final_validating", { type: "VALIDATION_PASSED", headSha: sha("b") }],
       ["awaiting_merge_approval", { type: "APPROVAL_ACCEPTED", headSha: sha("b") }],
     ] as const;
 
@@ -216,7 +233,7 @@ describe("job state machine", () => {
 
     expect(located.prHeadSha).toBeNull();
     expect(resolved.job.prHeadSha).toBe(sha("c"));
-    expect(resolved.effects.map((item) => item.kind)).toEqual(["spawn_review"]);
+    expect(resolved.effects.map((item) => item.kind)).toEqual(["run_validation"]);
   });
 
   it.each([
@@ -229,6 +246,10 @@ describe("job state machine", () => {
     ["reviewing", "spawn_review"],
     ["remediating", "send_remediation"],
     ["validating", "run_validation"],
+    ["documenting", "spawn_docs"],
+    ["resolving_docs_head", "resolve_pr_head"],
+    ["final_validating", "run_final_validation"],
+    ["final_reviewing", "spawn_final_review"],
     ["awaiting_merge_approval", "issue_approval"],
     ["merging", "merge_pr"],
   ] as const)("retry restores %s and emits one stage effect", (resumeState, effect) => {

@@ -96,6 +96,7 @@ export function jobFixture(overrides: Partial<Job> = {}): Job {
     environmentId: null,
     implementationThreadId: null,
     reviewThreadId: null,
+    documentationThreadId: null,
     prNumber: null,
     prUrl: null,
     prHeadSha: null,

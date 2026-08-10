@@ -4,6 +4,7 @@ import {
   type JobEffect,
   type JobEvent,
   type JobState,
+  type ReviewFinding,
   type WorkerLiveness,
 } from "./models";
 
@@ -136,6 +137,10 @@ function retryEffect(job: Job, effects: JobEffect[], resumeState: JobState): voi
     reviewing: "spawn_review",
     remediating: "send_remediation",
     validating: "run_validation",
+    documenting: "spawn_docs",
+    resolving_docs_head: "resolve_pr_head",
+    final_validating: "run_final_validation",
+    final_reviewing: "spawn_final_review",
     awaiting_merge_approval: "issue_approval",
     merging: "merge_pr",
   };
@@ -301,8 +306,8 @@ function transitionResolvingPrHead(job: Job, event: JobEvent, effects: JobEffect
   if (event.type !== "PR_HEAD_RESOLVED") illegal(job, event);
   assertHeadSha(event.headSha);
   job.prHeadSha = event.headSha;
-  job.state = "reviewing";
-  emitEffect(job, effects, "spawn_review", { headSha: event.headSha });
+  job.state = "validating";
+  emitEffect(job, effects, "run_validation", { headSha: event.headSha });
 }
 
 function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[]): void {
@@ -312,8 +317,31 @@ function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[])
     invalidateDriftedHead(job, effects);
     return;
   }
-  job.state = "validating";
-  emitEffect(job, effects, "run_validation", { headSha: event.headSha });
+  job.state = "documenting";
+  emitEffect(job, effects, "spawn_docs", { headSha: event.headSha });
+}
+
+function enterPatch(
+  job: Job,
+  effects: JobEffect[],
+  summary: string,
+  evidence: { findings?: ReviewFinding[]; reasons?: string[] } = {},
+): void {
+  assertSummary(summary, "summary");
+  job.reviewCycle += 1;
+  if (job.reviewCycle >= job.reviewBlockAt) {
+    job.state = "blocked";
+    job.blockedReason = "review_limit";
+    job.lastError = "Patch, test, and review limit reached";
+    emitEffect(job, effects, "render_status");
+    return;
+  }
+  job.state = "remediating";
+  emitEffect(job, effects, "send_remediation", {
+    summary,
+    findings: evidence.findings?.slice(0, 20) ?? [],
+    reasons: evidence.reasons?.slice(0, 20) ?? [],
+  });
 }
 
 function transitionReviewChanges(job: Job, event: JobEvent, effects: JobEffect[]): void {
@@ -323,15 +351,10 @@ function transitionReviewChanges(job: Job, event: JobEvent, effects: JobEffect[]
     invalidateDriftedHead(job, effects);
     return;
   }
-  job.reviewCycle += 1;
-  if (job.reviewCycle >= job.reviewBlockAt) {
-    job.state = "blocked";
-    job.blockedReason = "review_limit";
-    emitEffect(job, effects, "render_status");
-    return;
-  }
-  job.state = "remediating";
-  emitEffect(job, effects, "send_remediation", { summary: event.summary ?? "" });
+  enterPatch(job, effects, event.summary ?? "Review requested changes", {
+    findings: event.findings,
+    reasons: event.reasons,
+  });
 }
 
 function transitionReviewing(job: Job, event: JobEvent, effects: JobEffect[]): void {
@@ -372,8 +395,8 @@ function transitionValidationPassed(job: Job, event: JobEvent, effects: JobEffec
     invalidateDriftedHead(job, effects);
     return;
   }
-  job.state = "awaiting_merge_approval";
-  emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
+  job.state = "reviewing";
+  emitEffect(job, effects, "spawn_review", { headSha: event.headSha });
 }
 
 function transitionValidationFailed(job: Job, event: JobEvent, effects: JobEffect[]): void {
@@ -385,7 +408,7 @@ function transitionValidationFailed(job: Job, event: JobEvent, effects: JobEffec
       return;
     }
   }
-  failJob(job, effects, event.reason ?? "Validation failed");
+  enterPatch(job, effects, event.reason ?? "Validation failed");
 }
 
 function transitionValidating(job: Job, event: JobEvent, effects: JobEffect[]): void {
@@ -395,6 +418,80 @@ function transitionValidating(job: Job, event: JobEvent, effects: JobEffect[]): 
   }
   if (event.type === "VALIDATION_FAILED") {
     transitionValidationFailed(job, event, effects);
+    return;
+  }
+  illegal(job, event);
+}
+
+function transitionDocumenting(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "DOCS_CREATED") {
+    assertNonEmpty(event.attemptId, "attemptId");
+    assertNonEmpty(event.threadId, "threadId");
+    assertNonEmpty(event.environmentId, "environmentId");
+    if (job.environmentId !== event.environmentId) throw new TypeError("Docs must reuse the implementation environment");
+    job.documentationThreadId = event.threadId;
+    emitEffect(job, effects, "render_status");
+    return;
+  }
+  if (event.type === "DOCS_IDLE") {
+    clearHeadAndReceipts(job, effects);
+    job.state = "resolving_docs_head";
+    emitEffect(job, effects, "resolve_pr_head", job.prNumber ? { number: job.prNumber } : {});
+    return;
+  }
+  illegal(job, event);
+}
+
+function transitionResolvingDocsHead(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "PR_MISSING" || event.type === "PR_UNAVAILABLE") {
+    failJob(job, effects, event.reason ?? event.type);
+    return;
+  }
+  if (event.type !== "PR_HEAD_RESOLVED") illegal(job, event);
+  assertHeadSha(event.headSha);
+  job.prHeadSha = event.headSha;
+  job.state = "final_validating";
+  emitEffect(job, effects, "run_final_validation", { headSha: event.headSha });
+}
+
+function transitionFinalValidating(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "VALIDATION_PASSED") {
+    assertHeadSha(event.headSha);
+    if (!headMatches(job, event.headSha)) {
+      invalidateDriftedHead(job, effects);
+      return;
+    }
+    job.state = "final_reviewing";
+    emitEffect(job, effects, "spawn_final_review", { headSha: event.headSha });
+    return;
+  }
+  if (event.type === "VALIDATION_FAILED") {
+    transitionValidationFailed(job, event, effects);
+    return;
+  }
+  illegal(job, event);
+}
+
+function transitionFinalReviewing(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "REVIEW_STARTED") return;
+  if (event.type === "REVIEW_PASSED") {
+    assertHeadSha(event.headSha);
+    if (!headMatches(job, event.headSha)) {
+      invalidateDriftedHead(job, effects);
+      return;
+    }
+    job.state = "awaiting_merge_approval";
+    emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
+    return;
+  }
+  if (event.type === "REVIEW_CHANGES_REQUESTED") {
+    transitionReviewChanges(job, event, effects);
+    return;
+  }
+  if (event.type === "REVIEW_BLOCKED") {
+    job.state = "blocked";
+    job.blockedReason = event.reason ?? "configuration";
+    emitEffect(job, effects, "render_status");
     return;
   }
   illegal(job, event);
@@ -472,6 +569,10 @@ const STATE_HANDLERS: Record<JobState, StateTransitionHandler> = {
   reviewing: transitionReviewing,
   remediating: transitionRemediating,
   validating: transitionValidating,
+  documenting: transitionDocumenting,
+  resolving_docs_head: transitionResolvingDocsHead,
+  final_validating: transitionFinalValidating,
+  final_reviewing: transitionFinalReviewing,
   awaiting_merge_approval: transitionAwaitingMergeApproval,
   merging: transitionMerging,
   failed: transitionFailed,

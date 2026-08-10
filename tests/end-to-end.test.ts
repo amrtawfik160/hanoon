@@ -6,7 +6,7 @@ import type { GateInput } from "../src/domain/gates";
 import type { Job, StoredEffect } from "../src/domain/models";
 import { resolvePrHead, runValidation, type ValidationSnapshot } from "../src/bb/validation";
 import { BbRunner } from "../src/bb/runner";
-import { buildCritiqueArtifact, buildPlanArtifact } from "../src/bb/pipeline-handoffs";
+import { buildCritiqueArtifact, buildDocsReportArtifact, buildPlanArtifact } from "../src/bb/pipeline-handoffs";
 import { TerminalCommandRunner } from "../src/bb/terminal-command";
 import { encodeCallbackData } from "../src/telegram/view";
 import type { TelegramUpdate } from "../src/telegram/types";
@@ -242,6 +242,8 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     const threadOutputs = [
       reviewOutput("changes_requested", HEAD_ONE),
       reviewOutput("pass", HEAD_TWO),
+      reviewOutput("pass", HEAD_TWO),
+      reviewOutput("pass", HEAD_THREE),
       reviewOutput("pass", HEAD_THREE),
     ];
     const mergeCalls: unknown[] = [];
@@ -492,8 +494,10 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
         spawnPlanner: (job, attempt, previousCritique) => runner.spawnPlanner(job, attempt, previousCritique),
         spawnCritic: (job, attempt, plan) => runner.spawnCritic(job, attempt, plan),
         spawnBuilderFromPlan: (job, attempt, plan) => runner.spawnBuilderFromPlan(job, attempt, plan),
+        spawnDocs: (job, attempt) => runner.spawnDocs(job, attempt),
         spawnImplementation: (job, attempt) => runner.spawnImplementation(job, attempt),
         spawnReview: (job, attempt) => runner.spawnReview(job, attempt),
+        spawnFinalReview: (job, attempt) => runner.spawnFinalReview(job, attempt),
         sendRemediation: (job, findings) => runner.sendRemediation(job, findings),
         sendSteering: (threadId, text) => runner.sendSteering(threadId, text),
         getEnvironmentSnapshot: (environmentId, baseBranch) => runner.getEnvironmentSnapshot(environmentId, baseBranch),
@@ -524,6 +528,25 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
 
     const policy = policyFixture({ projectId: "proj_1", alias: "cyndra", githubRepository: "acme/cyndra" });
+    const completeDocs = (jobId: string, ownerId: string): void => {
+      const current = store.getJob(jobId);
+      const docsAttempt = store.getLatestPipelineStageAttempt(jobId, "DOCS");
+      if (!current || current.state !== "documenting" || !docsAttempt) throw new Error("docs stage was not ready");
+      const report = buildDocsReportArtifact("# Documentation gate\n\nNo documentation change was necessary; existing docs remain accurate. Checks passed.\n");
+      const lease = store.acquireExecutorLease(ownerId, ++time, 1_000_000);
+      if (!lease.acquired) throw new Error("docs completion lease missing");
+      expect(store.completePipelineStageAttempt({
+        id: docsAttempt.id,
+        outputText: new TextDecoder().decode(report.bytes),
+        outputSha256: report.sha256,
+        outcome: { verdict: "success" },
+        ownerId,
+        generation: lease.generation,
+        now: time,
+      })).toBe(true);
+      store.applyJobEvent(jobId, current.version, { type: "DOCS_IDLE" }, ++time);
+      store.releaseExecutorLease(ownerId, lease.generation, ++time);
+    };
     store.createPairingCode(hashSecret("one-use-pairing-code"), time, time + 600_000);
     await ingress.handleClaimed({ update_id: 1, message: privateMessage("/start one-use-pairing-code") } as TelegramUpdate, ++time);
     expect(store.getOwner()).toMatchObject({ userId: "7", chatId: "70" });
@@ -674,7 +697,23 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
     expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
     store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_TWO }, ++time);
-    await drainEffects(store, makeRunner, now, "validation-executor");
+    await drainEffects(store, makeRunner, now, "docs-executor");
+    completeDocs(job.id, "docs-completer-one");
+    await drainEffects(store, makeRunner, now, "final-verification-executor");
+    job = store.getJob(job.id)!;
+    expect(job.state).toBe("final_reviewing");
+    const firstFinalReviewThread = job.reviewThreadId!;
+    const firstFinalAttempt = store.getAttemptByThreadId(firstFinalReviewThread)!;
+    reviewEvent = null;
+    await reviewHandler.handleThreadIdle({
+      attemptId: firstFinalAttempt.id,
+      reviewThreadId: firstFinalReviewThread,
+      implementationThreadId: job.implementationThreadId!,
+      expectedSha: HEAD_TWO,
+    });
+    expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
+    store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_TWO }, ++time);
+    await drainEffects(store, makeRunner, now, "approval-executor");
     job = store.getJob(job.id)!;
     expect(job.state).toBe("awaiting_merge_approval");
     expect(approvalIssue).toHaveBeenCalledTimes(1);
@@ -707,7 +746,23 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
     expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
     store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_THREE }, ++time);
-    await drainEffects(store, makeRunner, now, "fresh-validation-executor");
+    await drainEffects(store, makeRunner, now, "fresh-docs-executor");
+    completeDocs(job.id, "docs-completer-two");
+    await drainEffects(store, makeRunner, now, "fresh-final-verification-executor");
+    job = store.getJob(job.id)!;
+    expect(job.state).toBe("final_reviewing");
+    const secondFinalReviewThread = job.reviewThreadId!;
+    const secondFinalAttempt = store.getAttemptByThreadId(secondFinalReviewThread)!;
+    reviewEvent = null;
+    await reviewHandler.handleThreadIdle({
+      attemptId: secondFinalAttempt.id,
+      reviewThreadId: secondFinalReviewThread,
+      implementationThreadId: job.implementationThreadId!,
+      expectedSha: HEAD_THREE,
+    });
+    expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
+    store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_THREE }, ++time);
+    await drainEffects(store, makeRunner, now, "fresh-approval-executor");
     job = store.getJob(job.id)!;
     expect(job.state).toBe("awaiting_merge_approval");
     expect(approvalIssue).toHaveBeenCalledTimes(2);
@@ -768,11 +823,11 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     const attempts = bb.storage.database().prepare(
       "SELECT id, ordinal, thread_id, head_sha, handoff_sha256 FROM attempts WHERE job_id = ? AND kind = 'review' ORDER BY created_at, id",
     ).all(job.id) as Array<{ id: string; ordinal: number; thread_id: string; head_sha: string; handoff_sha256: string }>;
-    expect(attempts).toHaveLength(3);
-    expect(attempts.map((attempt) => attempt.head_sha)).toEqual([HEAD_ONE, HEAD_TWO, HEAD_THREE]);
-    expect(new Set(attempts.map((attempt) => attempt.thread_id)).size).toBe(3);
+    expect(attempts).toHaveLength(5);
+    expect(attempts.map((attempt) => attempt.head_sha)).toEqual([HEAD_ONE, HEAD_TWO, HEAD_TWO, HEAD_THREE, HEAD_THREE]);
+    expect(new Set(attempts.map((attempt) => attempt.thread_id)).size).toBe(5);
     expect(attempts.every((attempt) => /^[0-9a-f]{64}$/.test(attempt.handoff_sha256))).toBe(true);
-    expect(attachments).toHaveLength(9);
+    expect(attachments).toHaveLength(15);
     expect(attachments.map((item) => item.filename)).toEqual([
       "work-order.md",
       "work-order.md",
@@ -782,6 +837,12 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       "plan.md",
       "review-packet.json",
       "review-packet.json",
+      "work-order.md",
+      "docs-packet.json",
+      "review-packet.json",
+      "review-packet.json",
+      "work-order.md",
+      "docs-packet.json",
       "review-packet.json",
     ]);
     expect(attachments.every((item) => item.projectId === "proj_1")).toBe(true);

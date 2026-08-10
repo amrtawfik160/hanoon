@@ -458,6 +458,7 @@ export function renderJobStatus(
   }
   if (job.implementationThreadId) lines.push(`Implementation thread: <code>${html(job.implementationThreadId, 120)}</code>`);
   if (job.reviewThreadId) lines.push(`Review thread: <code>${html(job.reviewThreadId, 120)}</code>`);
+  if (job.documentationThreadId) lines.push(`Docs thread: <code>${html(job.documentationThreadId, 120)}</code>`);
   if (context.workerLiveness) {
     const worker = context.workerLiveness;
     const now = context.now ?? worker.observedAt;
