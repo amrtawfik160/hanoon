@@ -1264,6 +1264,15 @@ export interface TelegramAgentStore {
     messageId: number,
     now: number,
   ): boolean;
+  replaceStatusOutboxMessage(
+    key: string,
+    ownerId: string,
+    generation: number,
+    jobId: string,
+    expectedVersion: number,
+    messageId: number,
+    now: number,
+  ): boolean;
   failEffect(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean;
   failOutbox(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean;
   deadLetterEffect(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
@@ -2510,6 +2519,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (updatedOutbox.changes !== 1) throw new Error("status outbox lease changed before atomic completion");
       return true;
     }).immediate();
+  }
+
+  public replaceStatusOutboxMessage(
+    key: string,
+    ownerId: string,
+    generation: number,
+    jobId: string,
+    expectedVersion: number,
+    messageId: number,
+    now: number,
+  ): boolean {
+    return this.completeStatusOutbox(key, ownerId, generation, jobId, expectedVersion, messageId, now);
   }
 
   public failEffect(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean {

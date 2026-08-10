@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { StoredOutbox, TelegramAgentStore } from "../storage/store";
 import { redactError } from "../errors";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
+import { classifyTelegramError } from "../telegram/errors";
 
 type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
@@ -264,8 +265,74 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               continueAcquiring = true;
               break;
             }
-            const failure = safeFailure(error);
-            if (item.attempts >= 20) {
+            let deliveryError = error;
+            let classification = classifyTelegramError(deliveryError);
+            const token = deps.telegramToken?.();
+            const telegram = deps.getTelegramClient?.(token) ?? deps.telegram?.(token);
+            const jobId = statusJobId(item.logicalKey);
+            const job = jobId ? deps.store.getJob(jobId) : null;
+            const knownMessageId = item.messageId ?? job?.statusMessageId ?? null;
+
+            if (classification === "not_modified" || classification === "expired_callback") {
+              deps.store.completeOutbox(item.logicalKey, ownerId, lease.generation, knownMessageId, deps.clock.now());
+              continue;
+            }
+
+            if (classification === "edit_unavailable" && telegram && jobId && job) {
+              try {
+                const replacement = await telegram.sendMessage(item.chatId, item.payload);
+                const replaced = deps.store.replaceStatusOutboxMessage(
+                  item.logicalKey,
+                  ownerId,
+                  lease.generation,
+                  jobId,
+                  job.version,
+                  replacement.message_id,
+                  deps.clock.now(),
+                );
+                if (!replaced) throw new Error("Status message changed before replacement was recorded");
+                continue;
+              } catch (recoveryError) {
+                deliveryError = recoveryError;
+                classification = classifyTelegramError(recoveryError);
+              }
+            }
+
+            if (classification === "bad_entities" && telegram && Object.hasOwn(item.payload, "parse_mode")) {
+              const { parse_mode: _parseMode, ...plainPayload } = item.payload;
+              try {
+                let deliveredMessageId = knownMessageId;
+                const callback = callbackId(item.logicalKey);
+                if (callback && telegram.answerCallback) {
+                  await telegram.answerCallback(callback, payloadText({ ...item, payload: plainPayload }));
+                } else if (knownMessageId !== null) {
+                  await telegram.editMessage(item.chatId, knownMessageId, plainPayload);
+                } else {
+                  deliveredMessageId = (await telegram.sendMessage(item.chatId, plainPayload)).message_id;
+                }
+                if (jobId && job && deliveredMessageId !== null && job.statusMessageId === null) {
+                  const completed = deps.store.completeStatusOutbox(
+                    item.logicalKey,
+                    ownerId,
+                    lease.generation,
+                    jobId,
+                    job.version,
+                    deliveredMessageId,
+                    deps.clock.now(),
+                  );
+                  if (!completed) throw new Error("Status message changed before plain-text delivery was recorded");
+                } else {
+                  deps.store.completeOutbox(item.logicalKey, ownerId, lease.generation, deliveredMessageId, deps.clock.now());
+                }
+                continue;
+              } catch (recoveryError) {
+                deliveryError = recoveryError;
+                classification = classifyTelegramError(recoveryError);
+              }
+            }
+
+            const failure = safeFailure(deliveryError);
+            if (classification === "authentication" || classification === "permanent" || item.attempts >= 20) {
               deps.store.deadLetterOutbox(item.logicalKey, ownerId, lease.generation, failure, deps.clock.now());
             } else {
               deps.store.failOutbox(

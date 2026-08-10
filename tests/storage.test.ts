@@ -194,6 +194,35 @@ it("revokes an owner once and reports no change after revocation", () => {
   expect(store.revokeOwner(4_000)).toBe(false);
 });
 
+it("atomically replaces a job status identity while completing its leased outbox row", () => {
+  const { bb } = createFakePluginHost({ pluginId: "telegram-agent-status-replacement" });
+  const store = openStore(bb.storage);
+  const created = store.createJob({ id: "job_replace", sourceUpdateId: 901, requestText: "work", now: 1_000 });
+  const job = store.setJobStatusMessage(created.id, 101, created.version, 1_001);
+  store.enqueueOutbox({
+    logicalKey: `job:${job.id}:status`,
+    chatId: "70",
+    messageId: 101,
+    payload: { text: "updated" },
+  }, 1_002);
+  const lease = store.acquireExecutorLease("executor", 2_000, 30_000);
+  if (!lease.acquired) throw new Error("missing executor lease");
+  expect(store.leaseOutbox("executor", lease.generation, 2_000, 1, 30_000)).toHaveLength(1);
+
+  expect(store.replaceStatusOutboxMessage(
+    `job:${job.id}:status`,
+    "executor",
+    lease.generation,
+    job.id,
+    job.version,
+    202,
+    2_001,
+  )).toBe(true);
+
+  expect(store.getJob(job.id)?.statusMessageId).toBe(202);
+  expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", messageId: 202 });
+});
+
 it.each([
   "http://github.com/acme/cyndra/pull/17",
   "https://user:password@github.com/acme/cyndra/pull/17",

@@ -3,6 +3,7 @@ import {
   TelegramClient,
   TelegramConflictError,
 } from "../src/telegram/client";
+import { classifyTelegramError, TelegramApiError } from "../src/telegram/errors";
 import { abortableSleep } from "../src/async";
 import {
   immediateSleep,
@@ -112,6 +113,44 @@ describe("Telegram Bot API client", () => {
     expect(error).toBeInstanceOf(TelegramConflictError);
     expect(fetchMock.calls).toHaveLength(1);
     expect(immediateSleep).not.toHaveBeenCalled();
+  });
+
+  it("preserves sanitized Telegram metadata without exposing the bot token", async () => {
+    const fetchMock = telegramFetch([
+      { ok: false, error_code: 400, description: "Bad Request: query is too old and response timeout expired" },
+    ]);
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    const error = await client.answerCallback("callback-1", "Done").catch((value: unknown) => value);
+
+    expect(error).toMatchObject({
+      name: "TelegramApiError",
+      httpStatus: 400,
+      errorCode: 400,
+      description: "Bad Request: query is too old and response timeout expired",
+      retryAfterSeconds: null,
+    });
+    expect(String(error)).not.toContain("123:secret");
+  });
+
+  it.each([
+    ["message is not modified", 400, "not_modified"],
+    ["Bad Request: query is too old and response timeout expired", 400, "expired_callback"],
+    ["Bad Request: message to edit not found", 400, "edit_unavailable"],
+    ["Bad Request: can't parse entities", 400, "bad_entities"],
+    ["Unauthorized", 401, "authentication"],
+    ["Too Many Requests", 429, "retryable"],
+    ["Internal Server Error", 500, "retryable"],
+    ["Bad Request: chat not found", 400, "permanent"],
+  ])("classifies %s", (description, errorCode, expected) => {
+    const error = new TelegramApiError({
+      httpStatus: errorCode,
+      errorCode,
+      description,
+      retryAfterSeconds: errorCode === 429 ? 2 : null,
+    });
+
+    expect(classifyTelegramError(error)).toBe(expected);
   });
 
   it("treats the exact not-modified edit response as success", async () => {

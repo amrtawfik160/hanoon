@@ -6,6 +6,9 @@ import {
   type SendMessagePayload,
   type TelegramUpdate,
 } from "./types";
+import { TelegramApiError } from "./errors";
+
+export { TelegramApiError } from "./errors";
 
 const ORDINARY_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_LONG_POLL_TIMEOUT_SECONDS = 50;
@@ -38,22 +41,13 @@ type TelegramRequest<T> = {
 
 type AttemptResult = {
   envelope: ApiEnvelope;
+  httpStatus: number;
   requestSignal: AbortSignal;
 };
 
-export class TelegramApiError extends Error {
-  public readonly errorCode: number;
-
-  public constructor(errorCode: number) {
-    super(`Telegram API ${errorCode}`);
-    this.name = "TelegramApiError";
-    this.errorCode = errorCode;
-  }
-}
-
 export class TelegramConflictError extends TelegramApiError {
-  public constructor() {
-    super(409);
+  public constructor(input: ConstructorParameters<typeof TelegramApiError>[0]) {
+    super(input);
     this.name = "TelegramConflictError";
   }
 }
@@ -219,9 +213,21 @@ export class TelegramClient {
       if (request.allowNotModified && attemptResult.envelope.error_code === 400 && isNotModified(attemptResult.envelope.description)) {
         return undefined as T;
       }
-      if (attemptResult.envelope.error_code === 409) throw new TelegramConflictError();
+      const apiError = new TelegramApiError({
+        httpStatus: attemptResult.httpStatus,
+        errorCode: attemptResult.envelope.error_code,
+        description: attemptResult.envelope.description,
+        retryAfterSeconds: attemptResult.envelope.parameters?.retry_after ?? null,
+        redact: [this.token],
+      });
+      if (attemptResult.envelope.error_code === 409) throw new TelegramConflictError({
+        httpStatus: apiError.httpStatus,
+        errorCode: apiError.errorCode,
+        description: apiError.description ?? undefined,
+        retryAfterSeconds: apiError.retryAfterSeconds,
+      });
       if (!isRetryable(attemptResult.envelope.error_code) || attempt === MAX_ATTEMPTS - 1) {
-        throw new TelegramApiError(attemptResult.envelope.error_code);
+        throw apiError;
       }
       await this.waitForRetry(request, attemptResult.envelope, attempt);
     }
@@ -243,7 +249,7 @@ export class TelegramClient {
       throw safeRequestError(requestSignal, request.callerSignal);
     }
     if (requestSignal.aborted) throw safeRequestError(requestSignal, request.callerSignal);
-    return { envelope: await this.readEnvelope(response), requestSignal };
+    return { envelope: await this.readEnvelope(response), httpStatus: response.status, requestSignal };
   }
 
   private async waitForRetry(

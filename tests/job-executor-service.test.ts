@@ -8,6 +8,7 @@ import {
   runJobExecutorService,
   type JobExecutorDependencies,
 } from "../src/services/job-executor-service";
+import { TelegramApiError } from "../src/telegram/errors";
 
 let fixtureNumber = 0;
 
@@ -188,5 +189,133 @@ describe("singleton job executor", () => {
     };
     await runJobExecutorService(deps, abort.signal);
     expect(store.acquireExecutorLease("other", 1_000, 30_000)).toEqual({ acquired: true, generation: 2 });
+  });
+
+  it("completes an expired callback answer without retrying or crashing", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({ logicalKey: "callback:expired", chatId: "70", payload: { text: "Done" } }, 1_000);
+    const abort = new AbortController();
+    const answerCallback = vi.fn(async () => {
+      throw new TelegramApiError({
+        httpStatus: 400,
+        errorCode: 400,
+        description: "Bad Request: query is too old and response timeout expired",
+        retryAfterSeconds: null,
+      });
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+      telegram: () => ({
+        sendMessage: vi.fn(async () => ({ message_id: 1 })),
+        editMessage: vi.fn(async () => undefined),
+        answerCallback,
+      }),
+    }, abort.signal);
+
+    expect(answerCallback).toHaveBeenCalledOnce();
+    expect(store.getOutbox("callback:expired")).toMatchObject({ status: "sent", attempts: 1 });
+  });
+
+  it("replaces an unavailable status message and its durable identity atomically", async () => {
+    const { store } = fixture();
+    const created = store.createJob({ id: "job_replace", sourceUpdateId: 11, requestText: "work", now: 1_000 });
+    const job = store.setJobStatusMessage(created.id, 101, created.version, 1_001);
+    store.enqueueOutbox({
+      logicalKey: `job:${job.id}:status`,
+      chatId: "70",
+      messageId: 101,
+      payload: { text: "updated" },
+    }, 1_002);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 202 }));
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 2_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 2_000 }),
+      telegram: () => ({
+        sendMessage,
+        editMessage: vi.fn(async () => {
+          throw new TelegramApiError({
+            httpStatus: 400,
+            errorCode: 400,
+            description: "Bad Request: message to edit not found",
+            retryAfterSeconds: null,
+          });
+        }),
+      }),
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledWith("70", { text: "updated" });
+    expect(store.getJob(job.id)?.statusMessageId).toBe(202);
+    expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", messageId: 202 });
+  });
+
+  it("retries malformed entities once without parse_mode", async () => {
+    const { store } = fixture();
+    const created = store.createJob({ id: "job_entities", sourceUpdateId: 12, requestText: "work", now: 1_000 });
+    const job = store.setJobStatusMessage(created.id, 303, created.version, 1_001);
+    store.enqueueOutbox({
+      logicalKey: `job:${job.id}:status`,
+      chatId: "70",
+      messageId: 303,
+      payload: { text: "<b>broken", parse_mode: "HTML" },
+    }, 1_002);
+    const abort = new AbortController();
+    const editMessage = vi.fn()
+      .mockRejectedValueOnce(new TelegramApiError({
+        httpStatus: 400,
+        errorCode: 400,
+        description: "Bad Request: can't parse entities",
+        retryAfterSeconds: null,
+      }))
+      .mockResolvedValueOnce(undefined);
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 2_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 2_000 }),
+      telegram: () => ({ sendMessage: vi.fn(async () => ({ message_id: 1 })), editMessage }),
+    }, abort.signal);
+
+    expect(editMessage).toHaveBeenNthCalledWith(1, "70", 303, { text: "<b>broken", parse_mode: "HTML" });
+    expect(editMessage).toHaveBeenNthCalledWith(2, "70", 303, { text: "<b>broken" });
+    expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", attempts: 1 });
+  });
+
+  it("dead-letters a permanent Telegram 400 immediately", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({ logicalKey: "notice:permanent", chatId: "70", payload: { text: "hello" } }, 1_000);
+    const abort = new AbortController();
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+      telegram: () => ({
+        sendMessage: vi.fn(async () => {
+          throw new TelegramApiError({
+            httpStatus: 400,
+            errorCode: 400,
+            description: "Bad Request: chat not found",
+            retryAfterSeconds: null,
+          });
+        }),
+        editMessage: vi.fn(async () => undefined),
+      }),
+    }, abort.signal);
+
+    expect(store.getOutbox("notice:permanent")).toMatchObject({
+      status: "dead",
+      attempts: 1,
+      lastError: expect.stringContaining("chat not found"),
+    });
   });
 });

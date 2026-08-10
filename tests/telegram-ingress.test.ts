@@ -4,6 +4,7 @@ import { expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
 import type { ProjectPolicy } from "../src/domain/models";
 import { TelegramIngress, stableJobId } from "../src/telegram/ingress";
+import { TelegramApiError } from "../src/telegram/errors";
 import type {
   InlineKeyboardMarkup,
   SendMessagePayload,
@@ -29,6 +30,7 @@ class FakeTelegram {
   public readonly answered: Array<{ callbackId: string; text: string }> = [];
   public failNextSend = false;
   public failNextEdit = false;
+  public nextEditError: Error | null = null;
   public beforeSend: (() => void) | undefined;
   private nextMessageId = 100;
 
@@ -45,6 +47,11 @@ class FakeTelegram {
 
   public async editMessage(chatId: string, messageId: number, payload: SendMessagePayload): Promise<void> {
     this.edited.push({ chatId, messageId, payload });
+    if (this.nextEditError) {
+      const error = this.nextEditError;
+      this.nextEditError = null;
+      throw error;
+    }
     if (this.failNextEdit) {
       this.failNextEdit = false;
       throw new Error("simulated Telegram edit failure");
@@ -573,6 +580,27 @@ it("upserts the status outbox before an edit so a thrown edit leaves the latest 
     logical_key: `job:${jobId}:status`,
     message_id: statusMessageId,
     payload_json: JSON.stringify(attemptedPayload),
+    status: "pending",
+  });
+});
+
+it("does not replay an update after a typed Telegram edit failure leaves durable outbox intent", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const jobId = await createDraft(fixture, 771);
+  const statusMessageId = fixture.store.getJob(jobId)?.statusMessageId;
+  if (statusMessageId === null || statusMessageId === undefined) throw new Error("missing status message");
+  fixture.telegram.nextEditError = new TelegramApiError({
+    httpStatus: 400,
+    errorCode: 400,
+    description: "Bad Request: message to edit not found",
+    retryAfterSeconds: null,
+  });
+
+  await expect(selectProject(fixture, jobId, "typed-edit-failure")).resolves.toBeUndefined();
+
+  expect(fixture.store.getJob(jobId)?.state).toBe("awaiting_confirmation");
+  expect(fixture.db.prepare("SELECT message_id, status FROM outbox WHERE logical_key = ?").get(`job:${jobId}:status`)).toEqual({
+    message_id: statusMessageId,
     status: "pending",
   });
 });

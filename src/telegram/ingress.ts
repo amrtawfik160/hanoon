@@ -23,6 +23,8 @@ import {
   renderProjectPicker,
   type CallbackAction,
 } from "./view";
+import { TelegramRequestError } from "./client";
+import { TelegramApiError } from "./errors";
 
 export type TelegramIngressTransport = {
   sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }>;
@@ -148,6 +150,10 @@ function orderedProjects(
 
 function safeOutcome(value: string): string {
   return value.length <= 500 ? value : value.slice(0, 499) + "…";
+}
+
+function isTypedTelegramDeliveryError(error: unknown): boolean {
+  return error instanceof TelegramApiError || error instanceof TelegramRequestError;
 }
 
 export class TelegramIngress {
@@ -551,16 +557,31 @@ export class TelegramIngress {
     });
     if (messageId !== null) {
       this.store.enqueueOutbox(outbox(messageId), now);
-      await this.telegram.editMessage(chatId, messageId, ephemeralTelegramPayload(payload));
+      try {
+        await this.telegram.editMessage(chatId, messageId, ephemeralTelegramPayload(payload));
+      } catch (error) {
+        if (!isTypedTelegramDeliveryError(error)) throw error;
+      }
     } else if (callbackMessageId !== undefined) {
       const intent = outbox(callbackMessageId);
       this.store.enqueueOutbox(intent, now);
-      await this.telegram.editMessage(chatId, callbackMessageId, ephemeralTelegramPayload(payload));
+      try {
+        await this.telegram.editMessage(chatId, callbackMessageId, ephemeralTelegramPayload(payload));
+      } catch (error) {
+        if (!isTypedTelegramDeliveryError(error)) throw error;
+        return current;
+      }
       current = this.setStatusMessageAndOutbox(current, callbackMessageId, intent, now);
     } else {
       const intent = outbox(null);
       this.store.enqueueOutbox(intent, now);
-      const sent = await this.telegram.sendMessage(chatId, ephemeralTelegramPayload(payload));
+      let sent: { message_id: number };
+      try {
+        sent = await this.telegram.sendMessage(chatId, ephemeralTelegramPayload(payload));
+      } catch (error) {
+        if (!isTypedTelegramDeliveryError(error)) throw error;
+        return current;
+      }
       current = this.setStatusMessageAndOutbox(
         current,
         sent.message_id,
