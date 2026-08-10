@@ -5,6 +5,7 @@ import { activeWorkerFixture, jobFixture, policyFixture } from "./helpers";
 
 type SdkCalls = {
   attachments: unknown[];
+  projectLists: unknown[];
   spawns: unknown[];
   forks: unknown[];
   sends: unknown[];
@@ -15,9 +16,38 @@ type SdkCalls = {
   pullRequests: unknown[];
 };
 
-function runnerFixture(options: { pullRequest?: unknown; statusHeadSha?: string } = {}) {
+function projectSnapshot(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "proj_1",
+    kind: "standard",
+    name: "Project One",
+    gitRemoteUrl: "https://github.com/acme/cyndra.git",
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [
+      {
+        id: "src_1",
+        projectId: "proj_1",
+        isDefault: true,
+        createdAt: 1,
+        updatedAt: 1,
+        type: "local_path",
+        hostId: "host_project",
+        path: "/projects/one",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function runnerFixture(options: {
+  projects?: unknown[];
+  pullRequest?: unknown;
+  statusHeadSha?: string;
+} = {}) {
   const calls: SdkCalls = {
     attachments: [],
+    projectLists: [],
     spawns: [],
     forks: [],
     sends: [],
@@ -29,6 +59,10 @@ function runnerFixture(options: { pullRequest?: unknown; statusHeadSha?: string 
   };
   const sdk = {
     projects: {
+      list: vi.fn(async (args?: unknown) => {
+        calls.projectLists.push(args);
+        return options.projects ?? [projectSnapshot()];
+      }),
       attachments: {
         upload: vi.fn(async (args: unknown) => {
           calls.attachments.push(args);
@@ -115,6 +149,7 @@ it("spawns implementation in a visible managed worktree and records the immutabl
     visibility: "visible",
     environment: {
       type: "host",
+      hostId: "host_project",
       workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "main" } },
     },
     input: [
@@ -128,6 +163,39 @@ it("spawns implementation in a visible managed worktree and records the immutabl
   expect(calls.forks).toHaveLength(0);
   expect(implementationAttempt.handoffPath).toBe("attachments/work-order.md");
   expect(implementationAttempt.handoffSha256).toMatch(/^[0-9a-f]{64}$/);
+});
+
+it.each([
+  ["missing project", []],
+  ["personal project", [projectSnapshot({ kind: "personal", sources: [] })]],
+  [
+    "missing source host",
+    [
+      projectSnapshot({
+        sources: [
+          {
+            id: "src_1",
+            projectId: "proj_1",
+            isDefault: true,
+            createdAt: 1,
+            updatedAt: 1,
+            type: "local_path",
+            hostId: "",
+            path: "/projects/one",
+          },
+        ],
+      }),
+    ],
+  ],
+])("fails before upload when implementation project routing has a %s", async (_caseName, projects) => {
+  const { calls, runner } = runnerFixture({ projects });
+
+  await expect(
+    runner.spawnImplementation(selectedJob, attempt("attempt_impl_invalid_host")),
+  ).rejects.toThrow(/project|source|host/i);
+
+  expect(calls.attachments).toHaveLength(0);
+  expect(calls.spawns).toHaveLength(0);
 });
 
 it("requires an immutable job policy snapshot even when a caller supplies a policy", async () => {

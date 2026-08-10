@@ -90,6 +90,19 @@ function spawnRequest(request: Record<string, unknown>): SpawnArgs {
 export class BbRunner {
   public constructor(public readonly sdk: BbSdk) {}
 
+  private async resolveProjectHost(projectId: string): Promise<string> {
+    const projects = await this.sdk.projects.list();
+    const project = projects.find((candidate) => candidate.id === projectId);
+    if (project === undefined) throw new Error("Selected BB project is unavailable");
+    if (project.kind !== "standard") throw new Error("Implementation requires a standard BB project");
+
+    const defaultSource = project.sources.find((source) => source.isDefault);
+    const source = defaultSource ?? (project.sources.length === 1 ? project.sources[0] : undefined);
+    if (source === undefined) throw new Error("Selected BB project has no unambiguous workspace source");
+    if (source.hostId.trim().length === 0) throw new Error("Selected BB project source has no host");
+    return source.hostId;
+  }
+
   private async upload(project: string, artifact: HandoffArtifact): Promise<UploadedLocalFile> {
     const uploaded = await this.sdk.projects.attachments.upload({
       projectId: project,
@@ -109,6 +122,7 @@ export class BbRunner {
     const policy = selectedPolicy(job);
     const artifact = buildWorkOrder(job, policy);
     const project = projectId(job, policy);
+    const hostId = await this.resolveProjectHost(project);
     const uploaded = await this.upload(project, artifact);
     recordHandoff(attempt, artifact, uploaded);
     const request = spawnRequest({
@@ -121,6 +135,7 @@ export class BbRunner {
       ],
       environment: {
         type: "host",
+        hostId,
         workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: policy.baseBranch } },
       },
       ...executionArgs(policy.implementation),
