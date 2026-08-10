@@ -194,11 +194,9 @@ function leaseMergeEffect(fixture: ReturnType<typeof mergeFixture>, expiresAt = 
 function executeLeased(
   fixture: ReturnType<typeof mergeFixture>,
   effect: StoredEffect,
-  now?: number,
 ) {
   return fixture.handler.executeMergeEffect({
     effect,
-    ...(now === undefined ? {} : { now }),
     leaseOwner: LEASE_OWNER,
     leaseGeneration: LEASE_GENERATION,
   });
@@ -286,7 +284,6 @@ describe("fresh Telegram merge execution", () => {
     const effect = leaseMergeEffect(fixture);
     await expect(handler.executeMergeEffect({
       effect,
-      now: NOW + 2,
       leaseOwner: LEASE_OWNER,
       leaseGeneration: LEASE_GENERATION,
     })).resolves.toMatchObject({ outcome: "merged" });
@@ -336,7 +333,7 @@ describe("fresh Telegram merge execution", () => {
     })] });
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
 
-    await expect(executeLeased(fixture, leaseMergeEffect(fixture), NOW + 2)).resolves.toMatchObject({ outcome: "stale" });
+    await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "stale" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
   });
 
@@ -345,10 +342,9 @@ describe("fresh Telegram merge execution", () => {
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const effect = leaseMergeEffect(fixture);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     await expect(fixture.handler.executeMergeEffect({
       effect: { ...effect, status: "done" },
-      now: NOW + 3,
       leaseOwner: LEASE_OWNER,
       leaseGeneration: LEASE_GENERATION,
     })).resolves.toMatchObject({ outcome: "already_done" });
@@ -359,7 +355,7 @@ describe("fresh Telegram merge execution", () => {
   it("confirms Git-native head and strict gh merged state before persisting success", async () => {
     const fixture = mergeFixture();
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
-    const result = await executeLeased(fixture, leaseMergeEffect(fixture), NOW + 2);
+    const result = await executeLeased(fixture, leaseMergeEffect(fixture));
 
     expect(result).toMatchObject({ outcome: "merged" });
     expect(fixture.store.getJob("job_1")?.state).toBe("merged");
@@ -378,13 +374,12 @@ describe("fresh Telegram merge execution", () => {
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const effect = leaseMergeEffect(fixture);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "merged" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
     expect(fixture.store.getJob("job_1")?.state).toBe("merged");
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
 
     await expect(fixture.handler.executeMergeEffect({
       effect: { ...effect, status: "done" },
-      now: NOW + 3,
       leaseOwner: LEASE_OWNER,
       leaseGeneration: LEASE_GENERATION,
     })).resolves.toMatchObject({ outcome: "already_done" });
@@ -396,7 +391,7 @@ describe("fresh Telegram merge execution", () => {
     const first = await acceptApproval(fixture);
     const effect = leaseMergeEffect(fixture);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "merged" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
     const completed = fixture.store.getEffect("job_1", effect.idempotencyKey);
     expect(completed?.status).toBe("done");
     expect(completed?.payload).toHaveProperty("mergeResult");
@@ -414,29 +409,60 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.commandRunner.run).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    ["empty result", () => ({})],
+    ["wrong head binding", (result: Record<string, unknown>) => ({ ...result, authoritativeHeadSha: MOVED })],
+    ["malformed URL", (result: Record<string, unknown>) => ({
+      ...result,
+      pullRequest: { ...(result.pullRequest as Record<string, unknown>), url: "http://example.test/pull/17" },
+    })],
+    ["unexpected key", (result: Record<string, unknown>) => ({ ...result, unexpected: true })],
+  ] as const)("rejects a completed callback when its persisted result has %s", async (_label, mutate) => {
+    const fixture = mergeFixture();
+    const first = await acceptApproval(fixture);
+    const effect = leaseMergeEffect(fixture);
+
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
+    const completed = fixture.store.getEffect("job_1", effect.idempotencyKey);
+    if (!completed) throw new Error("completed merge effect was not durable");
+    const payload = structuredClone(completed.payload) as { mergeResult: Record<string, unknown> };
+    payload.mergeResult = mutate(payload.mergeResult);
+    fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ?")
+      .run(JSON.stringify(payload), effect.jobId, effect.idempotencyKey);
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: `callback_corrupt_${_label.replaceAll(" ", "_")}`,
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+      now: NOW + 3,
+    })).resolves.toEqual({ outcome: "rejected" });
+    expect(first).toEqual({ outcome: "accepted" });
+    expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects a caller-supplied fallback effect without calling the merge SDK", async () => {
     const fixture = mergeFixture();
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const durable = mergeEffect(fixture.store);
     const fallback = { ...durable, idempotencyKey: "job_1:999:merge_pr", status: "leased" as const };
 
-    await expect(executeLeased(fixture, fallback, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, fallback)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
   });
 
   it("requires a non-expired durable effect lease before calling the merge SDK", async () => {
-    const fixture = mergeFixture();
+    const fixture = mergeFixture({ clock: () => NOW + 2 });
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const effect = mergeEffect(fixture.store);
 
     await expect(fixture.handler.executeMergeEffect({
       effect,
-      now: NOW + 2,
     })).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
 
     const expired = leaseMergeEffect(fixture, NOW + 1);
-    await expect(executeLeased(fixture, expired, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, expired)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
   });
 
@@ -449,7 +475,7 @@ describe("fresh Telegram merge execution", () => {
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const effect = leaseMergeEffect(fixture);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
   });
 
@@ -478,7 +504,7 @@ describe("fresh Telegram merge execution", () => {
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const effect = leaseMergeEffect(fixture);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
     expect(fixture.store.getJob("job_1")?.state).toBe("cancelled");
     expect(fixture.store.getEffect("job_1", effect.idempotencyKey)).toMatchObject({
@@ -497,7 +523,7 @@ describe("fresh Telegram merge execution", () => {
     fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ?")
       .run(JSON.stringify(payload), effect.jobId, effect.idempotencyKey);
 
-    await expect(executeLeased(fixture, effect, NOW + 3)).resolves.toMatchObject({ outcome: "merged" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
     expect(fixture.store.getJob("job_1")?.state).toBe("merged");
   });
@@ -511,7 +537,7 @@ describe("fresh Telegram merge execution", () => {
     fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ?")
       .run(JSON.stringify(payload), effect.jobId, effect.idempotencyKey);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
     expect(fixture.commandRunner.run).not.toHaveBeenCalled();
   });
@@ -530,7 +556,7 @@ describe("fresh Telegram merge execution", () => {
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const effect = leaseMergeEffect(fixture);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
     expect(fixture.store.getJob("job_1")?.state).toBe("failed");
     expect(fixture.store.getEffect("job_1", effect.idempotencyKey)).toMatchObject({
@@ -549,7 +575,7 @@ describe("fresh Telegram merge execution", () => {
       "UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ? AND lease_owner = ? AND lease_generation = ?",
     ).run("{malformed", effect.jobId, effect.idempotencyKey, LEASE_OWNER, LEASE_GENERATION);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
     expect(fixture.commandRunner.run).not.toHaveBeenCalled();
     expect(fixture.db.prepare(
@@ -572,7 +598,7 @@ describe("fresh Telegram merge execution", () => {
     fixture.db.prepare("UPDATE jobs SET cancel_requested_at = ? WHERE id = ?")
       .run(NOW + 2, effect.jobId);
 
-    await expect(executeLeased(fixture, effect, NOW + 3)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
     expect(fixture.commandRunner.run).not.toHaveBeenCalled();
     expect(fixture.db.prepare(
@@ -586,6 +612,54 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.store.getJob(effect.jobId)?.state).toBe("cancelled");
   });
 
+  it("cleans a leased effect without parsing callback-bearing payload or job JSON", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    const rawCallback = `xm:m:${fixture.issued.nonce}suffix`;
+    fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ?")
+      .run(JSON.stringify({ nested: { callback: rawCallback } }), effect.jobId, effect.idempotencyKey);
+    fixture.db.prepare("UPDATE jobs SET policy_json = ? WHERE id = ?")
+      .run("{malformed", effect.jobId);
+
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    expect(fixture.db.prepare(
+      "SELECT status, lease_owner, lease_generation, lease_expires_at, last_error, payload_json FROM effects WHERE job_id = ? AND idempotency_key = ?",
+    ).get(effect.jobId, effect.idempotencyKey)).toEqual(expect.objectContaining({
+      status: "failed",
+      lease_owner: null,
+      lease_generation: null,
+      lease_expires_at: null,
+    }));
+    expect(fixture.db.prepare("SELECT outcome FROM approvals WHERE job_id = ?").get(effect.jobId)).toEqual({ outcome: "revoked" });
+    const persisted = JSON.stringify({
+      effect: fixture.db.prepare("SELECT payload_json, last_error FROM effects").all(),
+      approval: fixture.db.prepare("SELECT outcome FROM approvals").all(),
+      job: fixture.db.prepare("SELECT last_error FROM jobs").all(),
+    });
+    expect(persisted).not.toContain(rawCallback);
+    expect(persisted).not.toContain(fixture.issued.nonce);
+  });
+
+  it("uses the handler clock again after the awaited provider call before completion", async () => {
+    let currentNow = NOW + 2;
+    const fixture = mergeFixture({
+      clock: () => currentNow,
+    });
+    fixture.mergePullRequest.mockImplementationOnce(async () => {
+      currentNow = NOW + 20_000;
+      return { ok: true };
+    });
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture, NOW + 10_000);
+
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getJob("job_1")).toMatchObject({ state: "merging" });
+    expect(fixture.commandRunner.run).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["invalid timestamp", { mergedAt: "not-a-timestamp" }],
     ["malformed merge commit", { mergeCommit: { oid: "short" } }],
@@ -595,14 +669,13 @@ describe("fresh Telegram merge execution", () => {
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
     const effect = leaseMergeEffect(fixture);
 
-    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.store.getJob("job_1")?.state).toBe("failed");
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
     const failedEffect = fixture.store.getEffect("job_1", effect.idempotencyKey);
     if (!failedEffect) throw new Error("failed merge effect was not durable");
     await expect(fixture.handler.executeMergeEffect({
       effect: failedEffect,
-      now: NOW + 3,
       leaseOwner: LEASE_OWNER,
       leaseGeneration: LEASE_GENERATION + 1,
     })).resolves.toMatchObject({ outcome: "already_done" });

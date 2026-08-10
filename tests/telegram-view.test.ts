@@ -209,6 +209,27 @@ describe("deterministic Telegram views", () => {
   });
 
   it.each([
+    `https://example.test/xm:m:${mergeNonce}suffix`,
+    `https://example.test/redirect?next=m%3A${mergeNonce}`,
+    `https://example.test/redirect?next=%6D%3A${mergeNonce}`,
+    `https://example.test/%ZZ/%6D%3A${mergeNonce}`,
+  ])("does not render callback-bearing external URL %s as a link", (url) => {
+    const policy = policyFixture();
+    const rendered = renderJobStatus(jobFixture({
+      id: telegramJobId,
+      state: "awaiting_merge_approval",
+      projectId: policy.projectId,
+      policy,
+      prNumber: 17,
+      prUrl: url,
+    }));
+    const buttons = rendered.reply_markup?.inline_keyboard.flat() ?? [];
+
+    expect(buttons.find((button) => button.text === "View PR")).toBeUndefined();
+    expect(rendered.text).not.toContain(url);
+  });
+
+  it.each([
     ["access_token", "access_token=secret"],
     ["access-token", "access-token=secret"],
     ["accessToken", "accessToken=secret"],

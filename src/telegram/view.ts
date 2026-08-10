@@ -14,7 +14,8 @@ const MAX_TELEGRAM_TEXT_LENGTH = 4_096;
 const MAX_EVIDENCE_LENGTH = 3_500;
 const MAX_EXTERNAL_URL_LENGTH = 500;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const RAW_MERGE_CALLBACK_PATTERN = /^m:[A-Za-z0-9_-]{32}$/;
+const RAW_MERGE_CALLBACK_PATTERN = /m:[A-Za-z0-9_-]{32}/;
+const ENCODED_MERGE_CALLBACK_PATTERN = /(?:m|%6d)%3a[A-Za-z0-9_-]{32}/i;
 const CREDENTIAL_ASSIGNMENT_PATTERN =
   /(^|[^A-Za-z0-9])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|auth[_-]?(?:token|key)|session[_-]?token|private[_-]?key|credentials?|password|secret|token|key)["']?\s*[:=]\s*["']?[^\s"'&;,)}\]]+/gi;
 
@@ -70,6 +71,34 @@ export type JobStatusContext = {
   ready?: boolean;
 };
 
+function containsForbiddenCallbackMaterial(value: string): boolean {
+  let candidate = value;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (RAW_MERGE_CALLBACK_PATTERN.test(candidate) || ENCODED_MERGE_CALLBACK_PATTERN.test(candidate)) return true;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(candidate);
+    } catch {
+      return true;
+    }
+    if (decoded === candidate) return false;
+    candidate = decoded;
+  }
+  return RAW_MERGE_CALLBACK_PATTERN.test(candidate) || ENCODED_MERGE_CALLBACK_PATTERN.test(candidate);
+}
+
+function sanitizePersistedValue(value: unknown): unknown {
+  if (typeof value === "string") return containsForbiddenCallbackMaterial(value) ? "[redacted]" : value;
+  if (Array.isArray(value)) return value.map(sanitizePersistedValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+      containsForbiddenCallbackMaterial(key) ? "[redacted-key]" : key,
+      sanitizePersistedValue(entry),
+    ]));
+  }
+  return value;
+}
+
 type ApprovalDeliveryMetadata = {
   nonceHash: string;
   jobId: string;
@@ -93,6 +122,7 @@ export function escapeHtml(value: string): string {
 }
 
 function redact(value: string): string {
+  if (containsForbiddenCallbackMaterial(value)) return "[redacted]";
   return value
     .replace(/\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g, "[redacted]")
     .replace(/\bBearer\s+\S+/gi, "[redacted]")
@@ -277,18 +307,18 @@ export function ephemeralTelegramPayload(payload: SendMessagePayload): SendMessa
 export function persistableJobStatusPayload(payload: SendMessagePayload): Record<string, unknown> {
   const rendered = payload as RenderedStatusPayload;
   const { __approval_metadata: _metadata, reply_markup: markup, ...rest } = rendered;
-  const persisted: Record<string, unknown> = { ...rest };
+  const persisted: Record<string, unknown> = sanitizePersistedValue({ ...rest }) as Record<string, unknown>;
   if (markup) {
     persisted.reply_markup = {
       inline_keyboard: markup.inline_keyboard
         .map((row) => row.filter((button) =>
-          !(typeof button.callback_data === "string" && RAW_MERGE_CALLBACK_PATTERN.test(button.callback_data))))
+          !(typeof button.callback_data === "string" && containsForbiddenCallbackMaterial(button.callback_data))))
         .filter((row) => row.length > 0),
     } satisfies InlineKeyboardMarkup;
   }
   const metadata = approvalMetadata(rendered);
   if (metadata) persisted.approval_metadata = metadata;
-  return persisted;
+  return sanitizePersistedValue(persisted) as Record<string, unknown>;
 }
 
 function keyboard(buttons: InlineKeyboardButton[]): InlineKeyboardMarkup {
@@ -344,8 +374,15 @@ function safeHttpUrl(value: string | null | undefined): string | null {
   if (value.length > MAX_EXTERNAL_URL_LENGTH) return null;
   try {
     const url = new URL(value);
-    if (url.protocol !== "https:") return null;
-    if (url.username || url.password || redact(value) !== value) return null;
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.length === 0 ||
+      url.username ||
+      url.password ||
+      containsForbiddenCallbackMaterial(value) ||
+      containsForbiddenCallbackMaterial(url.href) ||
+      redact(value) !== value
+    ) return null;
     return value;
   } catch {
     return null;

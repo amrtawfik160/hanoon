@@ -261,6 +261,24 @@ describe("Telegram merge approvals", () => {
     expect(persisted).not.toContain(rawCallback);
   });
 
+  it("rejects callback material embedded in recursive outbox keys and values", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const embedded = `prefixxm:m:${issued.nonce}suffix`;
+    const malformedEncoded = `prefix%ZZ/%6D%3A${issued.nonce}`;
+
+    expect(() => fixture.store.enqueueOutbox({
+      logicalKey: "job_1:embedded-callback",
+      chatId: "70",
+      payload: { nested: { [embedded]: { value: embedded } } },
+    }, NOW + 1)).toThrow(/raw|nonce|callback/i);
+    expect(() => fixture.store.enqueueOutbox({
+      logicalKey: "job_1:malformed-encoded-callback",
+      chatId: "70",
+      payload: { nested: { value: malformedEncoded } },
+    }, NOW + 1)).toThrow(/raw|nonce|callback/i);
+  });
+
   it("rejects raw merge callbacks recursively in completed results", () => {
     const fixture = approvalFixture();
     const issued = fixture.service.issue("job_1", HEAD);
@@ -394,5 +412,21 @@ describe("Telegram merge approvals", () => {
     expect(first).toEqual({ ok: true, jobId: "job_1", headSha: HEAD });
     expect(second).toEqual(first);
     expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(1);
+  });
+
+  it("rolls back approval revocation when atomic fresh reissue insertion fails", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD, NOW);
+    fixture.db.exec(`
+      CREATE TRIGGER reject_fresh_approval
+      BEFORE INSERT ON approvals
+      BEGIN
+        SELECT RAISE(ABORT, 'forced fresh approval insert failure');
+      END
+    `);
+
+    expect(() => fixture.service.issue("job_1", HEAD, NOW + 1)).toThrow(/fresh approval insert failure/);
+    expect(fixture.service.lookup(issued.nonce)).toMatchObject({ consumedAt: null, outcome: null });
+    expect(fixture.service.consume(issued.nonce, NOW + 2)).toMatchObject({ ok: true, headSha: HEAD });
   });
 });

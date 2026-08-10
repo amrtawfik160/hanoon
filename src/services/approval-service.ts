@@ -67,7 +67,6 @@ export class ApprovalService {
 
     const value = nonce(this.randomBytes);
     const expiresAt = now + APPROVAL_TTL_MS;
-    this.store.revokeApprovals(jobId, "superseded", now);
     this.store.createApproval({
       nonceHash: hashSecret(value),
       jobId,
