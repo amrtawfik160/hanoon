@@ -24,6 +24,7 @@ import { ExecutorNudge } from "./services/executor-nudge";
 import { registerControllerTools } from "./controller/tools";
 import { BbControllerAdapter } from "./controller/bb-controller";
 import { LunaControllerService } from "./controller/service";
+import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 
 function clock(): number {
   return Date.now();
@@ -289,6 +290,16 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     adapter: new BbControllerAdapter({ sdk: bb.sdk, pluginId: bb.pluginId }),
     clock: { now: clock },
   });
+  const presence = new TelegramPresenceCoordinator({
+    store,
+    telegram: {
+      sendChatAction: (chatId, action, signal) => {
+        if (!config.ok) throw new Error(config.message);
+        return telegramForToken(config.value.botToken).sendChatAction(chatId, action, signal);
+      },
+    },
+    warn: (message) => bb.log.warn(message),
+  });
 
   const bbEffectAdapter = {
     spawnImplementation: (job: Parameters<BbRunner["spawnImplementation"]>[0], attempt: Parameters<BbRunner["spawnImplementation"]>[1]) => bbRunner.spawnImplementation(job, attempt),
@@ -449,6 +460,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       },
       releaseOnShutdown: true,
       controller,
+      presence,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),
     }, signal),
   });

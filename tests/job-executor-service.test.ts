@@ -1,6 +1,7 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
+import { hashSecret } from "../src/crypto";
 import type { JobEffect, StoredEffect } from "../src/domain/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { EffectRunner } from "../src/services/effect-runner";
@@ -9,6 +10,7 @@ import {
   type JobExecutorDependencies,
 } from "../src/services/job-executor-service";
 import { TelegramApiError } from "../src/telegram/errors";
+import { TelegramPresenceCoordinator } from "../src/services/telegram-presence";
 
 let fixtureNumber = 0;
 
@@ -29,6 +31,32 @@ function insertJobAndOutbox(store: TelegramAgentStore, db: Database.Database): v
   const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
   store.enqueueOutbox({ logicalKey: `job:${job.id}:status`, chatId: "70", payload: { text: "initial" } }, 1_000);
   db.prepare("UPDATE jobs SET status_message_id = NULL WHERE id = ?").run(job.id);
+}
+
+function addSubmittedControllerTurn(store: TelegramAgentStore): void {
+  store.createPairingCode(hashSecret("presence-pair"), 1_000, 60_000);
+  expect(store.pairOwnerWithCode(hashSecret("presence-pair"), "7", "7", 1_000)).toEqual({ ok: true });
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "executor-presence-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 900,
+    inputText: "work",
+    now: 1_000,
+  });
+  const lease = store.acquireExecutorLease("presence-setup", 1_000, 30_000);
+  if (!lease.acquired) throw new Error("missing presence setup lease");
+  const fence = { ownerId: "presence-setup", generation: lease.generation, now: 1_000 };
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_presence",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
+  expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 1_000)).toBe(true);
 }
 
 describe("singleton job executor", () => {
@@ -339,5 +367,110 @@ describe("singleton job executor", () => {
 
     expect(order).toEqual(["reconcile", "dispatch"]);
     expect(waitForWork).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+  });
+
+  it.each(["idle", "active"] as const)("caps the %s executor wait at the active presence deadline", async (mode) => {
+    const { store } = fixture();
+    addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    const waitForWork = vi.fn(async () => abort.abort());
+    const sendChatAction = vi.fn(async () => undefined);
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: { sendChatAction },
+      warn: vi.fn(),
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      controller: mode === "active" ? {
+        reconcile: vi.fn(async () => true),
+        processOne: vi.fn(async () => false),
+      } : undefined,
+      presence,
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(sendChatAction).toHaveBeenCalledWith("7", "typing", expect.any(AbortSignal));
+    expect(waitForWork).toHaveBeenCalledWith(4_000, expect.any(AbortSignal));
+  });
+
+  it("preserves the ordinary wait when presence is inactive", async () => {
+    const { store } = fixture();
+    const abort = new AbortController();
+    const waitForWork = vi.fn(async () => abort.abort());
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: { sendChatAction: vi.fn(async () => undefined) },
+      warn: vi.fn(),
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      presence,
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(waitForWork).toHaveBeenCalledWith(60_000, expect.any(AbortSignal));
+  });
+
+  it("stops pulsing after lease loss and resets the stale lease state", async () => {
+    const { store } = fixture();
+    addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    let now = 1_000;
+    const sendChatAction = vi.fn(async () => undefined);
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: { sendChatAction },
+      warn: vi.fn(),
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      sleep: vi.fn(async () => abort.abort()),
+      waitForWork: vi.fn(async () => {
+        now = 31_001;
+        expect(store.acquireExecutorLease("successor", now, 30_000)).toEqual({ acquired: true, generation: 2 });
+      }),
+      presence,
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+    }, abort.signal);
+
+    expect(sendChatAction).toHaveBeenCalledTimes(1);
+    await presence.pulse(now, new AbortController().signal);
+    expect(sendChatAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops cleanly when shutdown aborts an in-flight presence request", async () => {
+    const { store } = fixture();
+    addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: {
+        sendChatAction: vi.fn(async (_chatId, _action, signal) => {
+          abort.abort(new Error("executor stopped"));
+          throw signal?.reason ?? new Error("presence request was aborted");
+        }),
+      },
+      warn: vi.fn(),
+    });
+
+    await expect(runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => undefined),
+      waitForWork: vi.fn(async () => undefined),
+      presence,
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal)).resolves.toBeUndefined();
   });
 });

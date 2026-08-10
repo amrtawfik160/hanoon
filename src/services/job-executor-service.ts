@@ -29,6 +29,10 @@ export type JobExecutorDependencies = {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
     reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
+  presence?: {
+    pulse(now: number, signal: AbortSignal): Promise<number | null>;
+    reset(): void;
+  };
   waitForWork?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
@@ -144,6 +148,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       continue;
     }
     acquiredGeneration = lease.generation;
+    deps.presence?.reset();
     const workAbort = new AbortController();
     let leaseLost = false;
     const onStop = () => workAbort.abort(signal.reason ?? new Error("executor stopped"));
@@ -361,8 +366,26 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           if (leaseLost) continueAcquiring = true;
           break;
         }
+        if (!deps.store.isExecutorLeaseCurrent(ownerId, lease.generation, deps.clock.now())) {
+          continueAcquiring = true;
+          break;
+        }
+        let presenceWaitMs: number | null;
         try {
-          await (deps.waitForWork ?? sleep)(didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS, workAbort.signal);
+          presenceWaitMs = deps.presence
+            ? await deps.presence.pulse(deps.clock.now(), workAbort.signal)
+            : null;
+        } catch (error) {
+          if (!workAbort.signal.aborted) throw error;
+          if (leaseLost) continueAcquiring = true;
+          break;
+        }
+        const ordinaryWaitMs = didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+        const waitMs = presenceWaitMs === null
+          ? ordinaryWaitMs
+          : Math.min(ordinaryWaitMs, Math.max(1, presenceWaitMs));
+        try {
+          await (deps.waitForWork ?? sleep)(waitMs, workAbort.signal);
         } catch {
           if (leaseLost) continueAcquiring = true;
           break;
@@ -372,6 +395,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       signal.removeEventListener("abort", onStop);
       workAbort.abort();
       await heartbeat;
+      deps.presence?.reset();
       if (deps.releaseOnShutdown && !continueAcquiring && signal.aborted) {
         deps.store.releaseExecutorLease(ownerId, lease.generation, deps.clock.now());
       }

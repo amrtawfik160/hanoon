@@ -98,6 +98,60 @@ it("wires submitted controller turns through the leased job executor", async () 
   vi.unstubAllGlobals();
 });
 
+it("shows native Telegram typing while a submitted Luna controller turn is active", async () => {
+  const { bb, harness } = await loadPlugin();
+  await harness.behavior.setSettings({ botToken: "123:test-token" });
+  const telegramMethods: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    telegramMethods.push(String(input).split("/").at(-1) ?? "");
+    return new Response(JSON.stringify({ ok: true, result: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }));
+  const store = openStore(bb.storage);
+  const now = Date.now();
+  store.createPairingCode(hashSecret("presence-pair"), now, now + 60_000);
+  expect(store.pairOwnerWithCode(hashSecret("presence-pair"), "7", "7", now)).toEqual({ ok: true });
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "owner-presence-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 801,
+    inputText: "explain this",
+    now,
+  });
+  const lease = store.acquireExecutorLease("presence-setup", now, 30_000);
+  if (!lease.acquired) throw new Error("missing setup lease");
+  const fence = { ownerId: "presence-setup", generation: lease.generation, now };
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_presence_controller",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
+  expect(store.releaseExecutorLease(fence.ownerId, fence.generation, now)).toBe(true);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({
+    id: "thr_presence_controller",
+    projectId: "proj_personal",
+    status: "active",
+    runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+  }));
+
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(telegramMethods).toContain("sendChatAction"));
+    expect(store.getOutbox(`controller:${turn.id}:reply`)).toBeNull();
+  } finally {
+    run.controller.abort();
+    await run.done;
+    vi.unstubAllGlobals();
+  }
+});
+
 it("reconciles an authoritative implementation idle observation into the job state", async () => {
   const { bb, harness } = await loadPlugin();
   const store = openStore(bb.storage);

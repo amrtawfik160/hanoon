@@ -32,38 +32,39 @@ type PresenceTransport = {
   sendChatAction(chatId: string, action: "typing", signal?: AbortSignal): Promise<void>;
 };
 
-export type TelegramPresenceTarget = Readonly<{
+type TelegramPresenceTarget = Readonly<{
   key: string;
   chatId: string;
 }>;
 
-export function resolveTelegramPresenceTarget(store: PresenceStore): TelegramPresenceTarget | null {
-  const owner = store.getOwner();
-  if (!owner) return null;
+type PresenceOwner = NonNullable<ReturnType<PresenceStore["getOwner"]>>;
 
+function controllerPresenceTarget(store: PresenceStore, owner: PresenceOwner): TelegramPresenceTarget | null {
   const controller = store.getControllerForOwner(owner.userId, owner.chatId);
-  if (controller) {
-    const turn = store
-      .listControllerTurns(controller.controllerKey, 1_000)
-      .find((candidate) => CONTROLLER_PRESENCE_STATES.has(candidate.state));
-    if (turn) return { key: `controller:${turn.id}`, chatId: owner.chatId };
-  }
+  if (!controller) return null;
+  const turn = store
+    .listControllerTurns(controller.controllerKey, 1_000)
+    .find((candidate) => CONTROLLER_PRESENCE_STATES.has(candidate.state));
+  return turn ? { key: `controller:${turn.id}`, chatId: owner.chatId } : null;
+}
 
+function workerPresenceTarget(store: PresenceStore, owner: PresenceOwner): TelegramPresenceTarget | null {
   const job = store.getActiveJob();
   if (!job) return null;
   const expectedWorkerKind = JOB_WORKER_KIND[job.state];
-  if (!expectedWorkerKind) return null;
   const worker = store.getWorkerLiveness(job.id);
-  if (
-    !worker ||
-    worker.jobId !== job.id ||
-    worker.workerKind !== expectedWorkerKind ||
-    !WORKER_PRESENCE_STATES.has(worker.state)
-  ) return null;
+  if (!expectedWorkerKind || !worker || worker.jobId !== job.id) return null;
+  if (worker.workerKind !== expectedWorkerKind || !WORKER_PRESENCE_STATES.has(worker.state)) return null;
   return {
     key: `job:${job.id}:${worker.workerKind}:${worker.generation}:${worker.resourceId}`,
     chatId: owner.chatId,
   };
+}
+
+export function resolveTelegramPresenceTarget(store: PresenceStore): TelegramPresenceTarget | null {
+  const owner = store.getOwner();
+  if (!owner) return null;
+  return controllerPresenceTarget(store, owner) ?? workerPresenceTarget(store, owner);
 }
 
 export class TelegramPresenceCoordinator {
@@ -72,7 +73,7 @@ export class TelegramPresenceCoordinator {
   public constructor(private readonly dependencies: {
     store: PresenceStore;
     telegram: PresenceTransport;
-    warn?: (message: string) => void;
+    warn: (message: string) => void;
   }) {}
 
   public reset(): void {
@@ -98,7 +99,7 @@ export class TelegramPresenceCoordinator {
     } catch (error) {
       if (signal.aborted) throw signal.reason ?? error;
       const warning = `Telegram presence failed: ${redactError(error)}`;
-      this.dependencies.warn?.(warning.slice(0, 500));
+      this.dependencies.warn(warning.slice(0, 500));
     }
     return HEARTBEAT_MS;
   }
