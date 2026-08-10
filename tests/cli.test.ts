@@ -5,7 +5,7 @@ import plugin from "../server";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import type { ProjectPolicy } from "../src/domain/models";
-import { policyFixture } from "./helpers";
+import { activeWorkerFixture, policyFixture } from "./helpers";
 
 let pluginNumber = 0;
 
@@ -482,6 +482,28 @@ it("shows, retries, cancels, and rejects illegal job state transitions through t
   const illegal = await harness.behavior.runCli(["job", "retry", active.id]);
   expect(illegal.exitCode).toBe(1);
   expect(store.getJob(active.id)?.state).toBe("merged");
+});
+
+it("cancels through the CLI with an active worker and queues its stop effect", async () => {
+  const { harness, store } = await loadPlugin();
+  const active = store.createJob({ id: "job_cancel_worker", sourceUpdateId: 3, requestText: "cancel worker", now: 3 });
+  store.upsertWorkerLiveness(activeWorkerFixture({
+    jobId: active.id,
+    resourceId: "thr_cli_active",
+    generation: 2,
+  }));
+
+  const cancel = await harness.behavior.runCli(["job", "cancel", active.id, "--json"]);
+
+  expect(cancel.exitCode).toBe(0);
+  expect(store.getJob(active.id)?.cancelRequestedAt).not.toBeNull();
+  expect(store.listEffectsForJob(active.id).filter((effect) => effect.kind === "stop_thread")).toHaveLength(1);
+  expect(store.listEffectsForJob(active.id).find((effect) => effect.kind === "stop_thread")?.payload).toEqual({
+    generation: 2,
+    resourceId: "thr_cli_active",
+    resourceKind: "bb_thread",
+    workerKind: "implementation",
+  });
 });
 
 it("emits strict JSON for machine output and never serializes secret-bearing job fields", async () => {

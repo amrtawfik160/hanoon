@@ -579,7 +579,7 @@ function jobCancel(
   const next = deps.store.applyJobEvent(
     jobId,
     current.version,
-    { type: "CANCEL_REQUESTED", activeWorker: null },
+    { type: "CANCEL_REQUESTED", activeWorker: deps.store.getWorkerLiveness(jobId) },
     deps.now(),
   );
   const output = { ...safeJob(next), cancelRequested: next.cancelRequestedAt !== null };
