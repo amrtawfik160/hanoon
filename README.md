@@ -1,198 +1,128 @@
-# Telegram Agent BB plugin
+# Telegram Agent
 
-Telegram Agent gives one paired private Telegram owner a durable, configurable Codex conversation for controlling reviewed BB delivery jobs. Luna Max remains the default. Ordinary messages go to one hidden BB controller thread. Guarded controller tools commit job intent to durable plugin storage; the single leased executor runs fresh-context planning, critique, implementation, review, documentation, validation, merge, deployment, and canary stages around one managed worktree.
+A BB plugin that lets one private Telegram owner talk to a Codex controller and run a reviewed software-delivery pipeline from planning through merge, deployment, and canary verification.
 
-This project is inspired by [Valor](https://github.com/tomcounsell/ai).
+Inspired by [Valor](https://github.com/tomcounsell/ai) and adapted to BB's native projects, threads, environments, worktrees, permissions, and merge API.
 
-## Prerequisites
+## Why Telegram Agent?
 
-- BB 0.36 or newer.
-- GitHub CLI (`gh`) authenticated on every host that owns an enabled project source.
-- A standard BB project backed by a GitHub repository, with a reachable local or cloned source and a named base branch.
-- A source host for BB's personal project, or exactly one connected BB host when that project has no source binding. The hidden controller runs there in a personal workspace and never receives an implementation worktree.
-- Codex access to the selected controller model. The default is `gpt-5.6-luna` with `max` reasoning.
-- A Telegram bot created through [BotFather](https://core.telegram.org/bots#botfather).
+- **Work from Telegram.** Ask questions, inspect BB threads, start a bounded change, receive live drafts, and follow one durable status message without opening another dashboard.
+- **Keep the controller durable.** Ordinary messages stay in one hidden BB conversation. Controller identity, FIFO turns, streaming cursors, jobs, approvals, and delivery state survive plugin restarts.
+- **Separate implementation from review.** Planning, critique, implementation, deterministic tests, fresh-context review, documentation, and final review are distinct stages with immutable handoffs.
+- **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, approval is one-use and expiring, and GitHub repository rules still apply.
+- **Use BB's isolation model.** Threads isolate provider conversations and coordination; managed worktrees isolate branches, checkouts, and filesystem mutation.
 
-Installation is full-trust code: review the plugin source and every BB project policy before installing it. The plugin can start agent threads, run owner-authored commands, request a BB-managed pull-request merge, deploy production, and verify a canary. GitHub branch protection and repository rules still apply to the merge.
+## How it works
 
-## Install and build
+Telegram Agent has three layers:
 
-From this repository:
+| Layer | Responsibility |
+| --- | --- |
+| Telegram I/O | Poll the paired private chat, durably record input, and deliver drafts, status updates, confirmations, and final replies. |
+| Durable control | Store owner pairing, project policies, controller turns, jobs, effects, attempts, approvals, liveness, and the outbox in plugin SQLite. |
+| BB execution | Run the hidden controller and visible planning, implementation, review, documentation, validation, merge, deployment, and canary work. |
+
+Ingress never starts a BB session. One generation-fenced executor owns controller dispatch, pipeline effects, and Telegram delivery. Reviewers are newly spawned BB threads with fresh provider conversations; they reuse the implementation environment only to inspect the same worktree.
+
+Read the [architecture guide](docs/architecture.md) for diagrams, state ownership, and the exact BB thread/worktree boundary.
+
+## Pipeline
+
+```text
+Intake → Plan → Critique → Build → Test → Review → Docs
+      → Final test → Final review → Owner approval
+      → Merge → Deploy → Canary → Complete
+```
+
+Critique can request one replacement plan. Test or review failures return to a bounded patch/test/review cycle. Invalid evidence, stale pull-request heads, exhausted limits, unknown liveness, and expired approvals block instead of silently advancing.
+
+The project policy chooses implementation/review providers and commands. The conversational controller is configurable independently and defaults to Codex Luna with maximum reasoning on the fast tier.
+
+> [!WARNING]
+> This is a full-trust BB plugin. An enabled project policy may run owner-authored validation, deployment, and canary commands and may request a BB-managed pull-request merge. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
+
+## Quick start
+
+### 1. Install from a checkout
+
+Requirements: BB `0.36` or newer, npm, an authenticated GitHub CLI on each project source host, a standard BB GitHub project, Codex access, and a Telegram bot from [BotFather](https://core.telegram.org/bots#botfather).
 
 ```bash
-npm install
+npm ci
 npm run check
 bb plugin install . --yes
 bb plugin enable telegram-agent
 bb plugin reload telegram-agent
 ```
 
-The check runs TypeScript validation, the full Vitest suite, and the BB plugin build. The local install registers the plugin id `telegram-agent`.
+### 2. Configure and pair
 
-## Configure the bot and pair the owner
-
-Enter the bot token only in **Extensions → Plugins → Telegram Agent**. The setting is secret-backed. Do not put the token in a shell command, policy file, README, issue, log, or chat message.
-
-The same page configures subsequent conversational-controller turns:
-
-| Setting | Options | Default |
-| --- | --- | --- |
-| Controller model | `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `gpt-5.6-luna` |
-| Controller reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `max` |
-| Controller service tier | `fast`, `default` | `fast` |
-| Controller permission mode | `auto`, `accept-edits`, `full` | `auto` |
-
-Saving a profile affects the next controller turn, including later turns in the existing durable conversation. It does not rewrite a running turn or any implementation/review job. Implementation and review execution stays in each project's immutable policy. BB and the execution machine may reduce a requested permission mode; use `auto` unless the controller has a specific need for a different mode.
-
-After the token is configured, create a one-use pairing link:
+In **Extensions → Plugins → Telegram Agent**, enter the Telegram bot token in the secret setting. Choose the controller model, reasoning level, service tier, and permission mode on the same page.
 
 ```bash
 bb telegram-agent pair
+bb telegram-agent doctor
 ```
 
-Open the returned link from the owner’s Telegram account and complete pairing in the bot’s private chat. Pairing accepts only a private human chat and binds one Telegram user/chat identity. The link is sensitive and expires after ten minutes; do not copy it into logs or tickets.
+Open the sensitive, ten-minute pairing link from the intended owner's private Telegram chat.
 
-Useful configuration checks:
+### 3. Enable a project
+
+Create a reviewed project policy, then enable and validate it:
 
 ```bash
-bb telegram-agent doctor
+bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json
 bb telegram-agent doctor <project-id>
 ```
 
-The project form checks token presence, owner pairing, the standard Git project/source, default execution options, required providers, source-host connectivity, `gh auth status`, repository access, and merge-SDK availability.
+The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. See [Configuration](docs/configuration.md) for the complete verified schema and examples.
 
-## Enable a project
+### 4. Talk to the controller
 
-`project enable` stores an immutable policy snapshot after BB verifies the live project, canonical GitHub remote, source, and base branch. Use either `--policy-json`, an absolute `--policy-file`, or the individual policy flags; do not mix input modes.
+Send a normal private message to the bot. The controller can answer conversationally, list enabled projects, report truthful BB thread progress, or create one guarded implementation job. Merge still requires the current one-use Telegram approval.
 
-Example policy shape (replace placeholders with the project’s approved values):
+## Documentation
 
-```json
-{
-  "projectId": "proj_example",
-  "alias": "example",
-  "enabled": true,
-  "githubRepository": "OWNER/REPOSITORY",
-  "baseBranch": "main",
-  "implementation": {
-    "providerId": "PROVIDER_ID",
-    "model": "IMPLEMENTATION_MODEL",
-    "reasoningLevel": "high",
-    "serviceTier": "default",
-    "permissionMode": "auto"
-  },
-  "review": {
-    "providerId": "PROVIDER_ID",
-    "model": "REVIEW_MODEL",
-    "reasoningLevel": "medium",
-    "serviceTier": "default",
-    "permissionMode": "auto"
-  },
-  "validationCommands": [
-    { "name": "unit", "command": "npm test", "timeoutMs": 600000 }
-  ],
-  "production": {
-    "deployCommands": [
-      { "name": "deploy", "command": "./scripts/deploy-production.sh", "timeoutMs": 1800000 }
-    ],
-    "canaryCommands": [
-      { "name": "health", "command": "./scripts/verify-production.sh", "timeoutMs": 300000 }
-    ],
-    "rollbackCommand": {
-      "name": "rollback",
-      "command": "./scripts/rollback-production.sh",
-      "timeoutMs": 600000
-    },
-    "convexDeployRequired": false
-  },
-  "requiredChecks": ["unit"],
-  "outputRedactionPatterns": [],
-  "workerLivenessWatchdogMs": 300000,
-  "maxReviewCycles": 3,
-  "mergeMethod": "squash"
-}
+| Guide | Use it for |
+| --- | --- |
+| [Documentation index](docs/README.md) | Find operator, contributor, security, and design-history material. |
+| [Architecture](docs/architecture.md) | Understand ownership, durability, review isolation, and worktree boundaries. |
+| [Configuration](docs/configuration.md) | Install, pair, select a controller profile, and enable project policies. |
+| [Operations](docs/operations.md) | Inspect, retry, cancel, rotate credentials, recover, and remove. |
+| [Disposable live acceptance](docs/live-acceptance.md) | Prove the end-to-end pipeline without risking a production repository. |
+| [Contributing](CONTRIBUTING.md) | Set up development and prepare a reviewable change. |
+| [Security](SECURITY.md) | Report vulnerabilities and understand the trust model. |
+
+## Repository layout
+
+```text
+telegram-bb-agent-plugin/
+├── src/
+│   ├── bb/           # BB thread, environment, handoff, validation, and merge adapters
+│   ├── controller/   # Durable conversational controller and guarded native tools
+│   ├── domain/       # Project policies, job state machine, review, and pipeline graph
+│   ├── services/     # Leased executor, effects, review, merge, production, and liveness
+│   ├── storage/      # SQLite migrations and transactional store
+│   └── telegram/     # Telegram API client, ingress, errors, and bounded rendering
+├── tests/            # Unit, integration, state-machine, and mocked end-to-end coverage
+├── docs/             # Public guides plus design/implementation history
+├── server.ts         # BB plugin entry point
+└── package.json      # Plugin manifest and verification scripts
 ```
 
-The profiles accept optional `providerId`, `model`, `reasoningLevel`, `serviceTier`, and `permissionMode`. Validation, deploy, canary, and rollback entries are owner-authored commands with a name, command, and timeout in milliseconds. Deploy and canary must both be configured before the plugin will issue merge approval. After merge, the managed job worktree is detached at the exact merge commit fetched from the base branch; each production stage verifies that checkout before running its configured commands sequentially. Commands should be safe to reconcile after interruption. A rollback command is operator guidance only: the plugin records it but never runs it automatically. Set `convexDeployRequired` to `true` for a Convex project; the policy is then rejected unless deployment explicitly invokes `convex deploy` through the Convex CLI. `requiredChecks` are the required GitHub check names. Redaction patterns are regular expressions applied to persisted command/output evidence. The project alias is lowercase, starts with a letter or number, and is at most 24 characters.
+## Development
 
 ```bash
-bb telegram-agent project enable <project-id> --policy-json '<policy-json>'
-bb telegram-agent project list
-bb telegram-agent project disable <project-id>
+npm ci
+npx vitest run tests/controller-service.test.ts
+npm run check
+bb plugin types --check .
 ```
 
-Individual policy mode also accepts repeatable `--deploy-json` and `--canary-json` entries, one `--rollback-json` entry, and `--convex-deploy-required`:
+`npm run check` runs TypeScript validation, the full Vitest suite, and `bb plugin build`. See [CONTRIBUTING.md](CONTRIBUTING.md) for change boundaries, documentation checks, and pull-request evidence.
 
-```bash
-bb telegram-agent project enable <project-id> \
-  --alias example --base main --merge-method squash \
-  --deploy-json '{"name":"deploy","command":"./scripts/deploy-production.sh","timeoutMs":1800000}' \
-  --canary-json '{"name":"health","command":"./scripts/verify-production.sh","timeoutMs":300000}'
-```
+## Project status
 
-For a policy file on a project host, use an absolute host path and, when needed, `--host <host-id>`:
+The repository currently declares version `0.1.0` and installs directly from a local path. The package is marked private and no public package or release channel is claimed.
 
-```bash
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json --host <host-id>
-```
-
-## Telegram conversation and task flow
-
-1. The paired owner sends a normal message in the private chat. Telegram ingress durably queues it and nudges the leased executor; ingress never starts a BB session itself.
-2. The executor creates or resumes one hidden controller thread in BB's personal workspace with provider `codex` and the saved controller execution profile (Luna/Max/Fast/Auto by default). Later messages stay FIFO and use `mode: start` only when that thread is idle.
-3. The controller answers ordinary questions conversationally. For software work it uses the registered tools to list enabled projects, ask which project is intended when needed, and atomically create a guarded confirmed job. The tools only write durable intent; they cannot spawn, merge, or touch a worktree.
-4. A fresh Luna Max planner creates one visible managed-worktree thread and writes a bounded plan artifact. A separate fresh Luna Max critic receives that artifact; it may request one fresh planning revision but cannot implement.
-5. The executor creates the implementation thread in that same environment and gives it only the immutable work order and accepted plan attachments.
-6. When implementation is idle, BB locates the pull request and resolves its full head SHA with Git-native `git ls-remote` evidence.
-7. Deterministic tests run before a visible review child is spawned in the exact implementation environment. The reviewer has a fresh provider conversation, receives an immutable review packet, and returns a strict JSON verdict without editing the worktree.
-8. A changes-requested verdict sends bounded remediation to the implementation thread. A new head causes another test and fresh review cycle.
-9. After review passes, a fresh Luna Max documentation thread uses Docs Guard and BB CLI instructions, updates only necessary docs, commits and pushes, and reports a bounded artifact. Final validation then runs before a separate fresh final review.
-10. The final gate produces a one-use, expiring Telegram **Merge + deploy &lt;SHA&gt;** approval only when deployment and canary are configured. The merge executor re-checks the exact receipt immediately before the BB merge SDK call. Stale or unknown evidence fails closed and requires fresh review and validation.
-11. After GitHub reports the merge, Git fetches the base branch, requires its head to equal GitHub's merge commit, verifies that every path changed by the approved head has the approved Git object, and detaches the managed worktree at that exact commit. Deploy and canary each re-check the checkout before their configured commands run. Merge, deploy, and canary each have a separate durable receipt. Only canary success reaches `complete`. A post-merge failure reaches `production_failed`, preserves the successful merge fact, alerts the owner, and never attempts automatic rollback.
-12. During a controller turn, the executor uses Telegram's native `sendMessageDraft` stream: an ephemeral `Thinking…` preview appears first, then the same stable draft animates bounded controller output about once per second. An unchanged draft is refreshed every 20 seconds so Telegram's 30-second preview does not expire during a long tool call. The executor also refreshes Telegram's `typing...` action while any authoritative worker is active.
-13. On controller completion, the executor switches the same logical outbox item to a normal persistent response; the draft remains only a temporary preview. Final delivery retains the plugin's bounded retry behavior. Durable job/controller state survives restart without issuing a second merge, deployment, or canary.
-
-One status message is durably edited at job milestones and exposes the current job state, review findings, validation evidence, pull request identity, merge fact, deployment/canary outcome, worker liveness, and approval expiry without storing the raw merge callback nonce. Controller replies use native animated Telegram drafts derived from bounded output deltas, followed by normal persistent final delivery; background job agents report through durable milestone status rather than forwarding private provider transcripts.
-
-Natural messages continue going to the controller while a job runs. Reply to the exact current status message to steer its implementation thread. `/status`, `/projects`, `/retry`, `/cancel`, and merge buttons remain deterministic recovery paths and do not become controller turns.
-
-## Operations and recovery
-
-```bash
-bb telegram-agent job list
-bb telegram-agent job show <job-id>
-bb telegram-agent job retry <job-id>
-bb telegram-agent job cancel <job-id>
-bb telegram-agent unpair
-bb plugin reload telegram-agent
-bb plugin list --json
-bb plugin logs telegram-agent -n 50
-```
-
-- `job retry` is for a failed job and resumes its durable resume state.
-- `job cancel` requests safe worker cancellation; it does not delete the worktree or artifacts.
-- Review-limit blocks expose a Telegram **Re-run Review** action. Continue starts another bounded review window; stopping leaves the job blocked.
-- Rotate the bot token in **Extensions → Plugins → Telegram Agent**. The polling service recreates its Telegram client for the new token while retaining the stored bot identity. Never use a command-line token setter.
-- `unpair` revokes the owner, pairing codes, and outstanding approvals. Pair again only after the owner intentionally reconfigures access.
-- Restarting BB or the plugin services resumes durable effects, outbox delivery, and worker reconciliation. It does not create speculative replacement workers when BB liveness is stale or unknown.
-- `production_failed` means the pull request is already merged. Inspect the redacted `DEPLOY` or `CANARY` receipt and use the approved operator procedure. The plugin does not automatically retry deployment or run the configured rollback command.
-- Native draft streaming resumes from the durable controller cursor/text with the same derived draft id after executor failover. Typing presence expires naturally when work stops; draft/presence delivery failures remain isolated from durable BB work.
-- A Telegram `message is not modified` response is treated as success. Expired callback answers complete without replay; an uneditable status is replaced with a new durable message id; malformed HTML is retried once without `parse_mode`; permanent Telegram 4xx responses are dead-lettered; and 429/5xx responses retain bounded retry behavior.
-- If a controller send outcome is uncertain after executor loss, that turn fails closed and asks the owner to resend. Revoking and re-pairing starts a fresh controller conversation instead of reviving the old mapping.
-- Remove the plugin from **Extensions → Plugins** after stopping active work. Uninstalling does not replace GitHub protection or erase project-side work; inspect the job and worktree before removal.
-
-## Safety boundaries
-
-- There is one paired private-chat owner and one active job.
-- The executor has one generation-fenced owner. A second executor instance cannot mutate leased effects or issue a duplicate merge.
-- Telegram ingress only records intent and nudges the executor; it never touches a worktree or calls BB thread APIs.
-- The leased executor is the only execution engine. It owns controller spawn/send, job effects, Telegram draft/final delivery, native typing presence, and its authoritative lease heartbeat. Ingress and BB lifecycle handlers never own streaming or presence timers.
-- The Codex controller has durable BB thread identity, provider conversation/history/status/interactions, explicit execution settings and permissions, hidden visibility, plugin origin, and owner-bound tool authorization. It uses a personal workspace and has no implementation files.
-- Implementation work happens in a visible managed-worktree thread. Reviewers are visible spawned children, never provider-session forks, and reuse the implementation environment.
-- BB threads do not replace worktrees. Threads isolate provider conversations, durable histories, statuses, interactions, permissions, visibility, and parent-child coordination. Managed worktrees remain the branch, checkout, uncommitted-file, artifact, and filesystem-mutation boundary; threads that reuse one environment see the same files.
-- Work orders and review packets are immutable BB project attachments. Handoffs record their attachment paths and SHA-256 digests.
-- Exact full-SHA binding comes from `git ls-remote`, not from stale or authoritative-looking `gh` head metadata. After merge, a Git-native base fetch and object comparison verifies the approved content before deployment.
-- Worker liveness is BB-owned. Stale or unknown state is visible and fail-closed; it does not authorize a speculative restart.
-- The plugin never treats an HTTP success, a stale provider response, or a prose review as merge proof. Merge requires fresh structured review, deterministic validation, GitHub checks, a one-use owner approval, and post-merge confirmation. Completion additionally requires configured deployment and canary receipts.
-
-For disposable live testing, use [docs/acceptance-test.md](docs/acceptance-test.md). Do not use a production application repository.
+A license has not been selected. Before publishing the repository as open source, the maintainer must add a license that states the intended reuse terms.
