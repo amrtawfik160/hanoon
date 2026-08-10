@@ -1,6 +1,6 @@
-# Disposable live acceptance runbook
+# Disposable live acceptance
 
-This runbook is for the owner-only live acceptance after the automated Task 12 gate. It is evidence collection, not a substitute for the mocked end-to-end test.
+This runbook is for owner-only live acceptance after the automated test suite passes. It collects evidence from a real Telegram bot, BB environment, disposable GitHub repository, and disposable production commands. It is not a substitute for the mocked end-to-end test.
 
 ## Hard boundaries
 
@@ -29,7 +29,7 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | pairing Telegram message id(s) | `<message id>` |
 | task/status/review/approval/completion message ids | `<message ids only>` |
 | controller BB thread/project/host ids | `<thread id>`, `<personal project id>`, `<host id>` |
-| controller execution tuple | `codex`, `gpt-5.6-luna`, `max`, `auto` |
+| controller execution tuple | `codex`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
 | controller conversation check | `<ordinary question received a natural answer and created no job>` |
 | paired owner identity | `<redacted Telegram user/chat identifiers>` |
 | configured project alias | `<alias, not a private path>` |
@@ -63,7 +63,7 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | restart recovery result | `<completion delivered; no second merge>` |
 | final `bb plugin list --json` status | `<installed/running status>` |
 
-## Twelve design-spec steps
+## Acceptance procedure
 
 ### 1. Pair the owner
 
@@ -86,15 +86,15 @@ bb telegram-agent doctor <disposable-project-id>
 
 Record the alias and doctor check statuses. Do not record the policy file contents if they contain private paths.
 
-### 3. Verify the Luna conversation
+### 3. Verify the controller conversation
 
-Send an ordinary question such as which projects are available. Confirm that BB creates one hidden plugin-owned controller thread in the personal workspace with the exact execution tuple in the evidence sheet. The host must be the personal project's selected source host, or the only connected BB host when the personal project has no source. Confirm Telegram receives a natural answer and `bb telegram-agent job list --json` still shows no new job.
+Send an ordinary question such as which projects are available. Confirm that BB creates one hidden plugin-owned controller thread in the personal workspace with the execution tuple currently saved in plugin settings. The host must be the personal project's selected source host, or the only connected BB host when the personal project has no source. Confirm Telegram receives a natural answer and `bb telegram-agent job list --json` still shows no new job.
 
 Record only the message ids and bounded answer summary, not the raw private conversation.
 
-### 4. Submit a bounded task through Luna
+### 4. Submit a bounded task through the controller
 
-Send one small software task from the paired private chat. Luna must use `telegram_agent_list_projects` when project selection is needed and `telegram_agent_start_job` to commit the guarded job. If more than one project matches, answer Luna's project question; there is no deterministic project-picker or Start callback in the conversational path.
+Send one small software task from the paired private chat. The controller must use `telegram_agent_list_projects` when project selection is needed and `telegram_agent_start_job` to commit the guarded job. If more than one project matches, answer the controller's project question; there is no deterministic project-picker or Start callback in the conversational path.
 
 Record the task/status message ids and confirm that only one active job exists:
 
