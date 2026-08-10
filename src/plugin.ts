@@ -1,5 +1,5 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { parseGlobalConfig } from "./config";
+import { controllerExecutionProfile, parseGlobalConfig } from "./config";
 import { BbRunner } from "./bb/runner";
 import { resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
@@ -24,6 +24,13 @@ import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
 import { registerControllerTools } from "./controller/tools";
 import { BbControllerAdapter } from "./controller/bb-controller";
+import {
+  CONTROLLER_MODELS,
+  CONTROLLER_PERMISSION_MODES,
+  CONTROLLER_REASONING_LEVELS,
+  CONTROLLER_SERVICE_TIERS,
+  DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+} from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { ThreadOperationService } from "./controller/operations";
@@ -42,6 +49,34 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       type: "string",
       label: "Telegram poll timeout in seconds",
       default: "30",
+    },
+    controllerModel: {
+      type: "select",
+      label: "Controller model",
+      description: "Codex model for subsequent Telegram conversation turns. Job workers remain project-controlled.",
+      options: [...CONTROLLER_MODELS],
+      default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.model,
+    },
+    controllerReasoningLevel: {
+      type: "select",
+      label: "Controller reasoning level",
+      description: "Reasoning effort for subsequent Telegram conversation turns.",
+      options: [...CONTROLLER_REASONING_LEVELS],
+      default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.reasoningLevel,
+    },
+    controllerServiceTier: {
+      type: "select",
+      label: "Controller service tier",
+      description: "Fast prioritizes latency; default uses the provider's standard tier.",
+      options: [...CONTROLLER_SERVICE_TIERS],
+      default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier,
+    },
+    controllerPermissionMode: {
+      type: "select",
+      label: "Controller permission mode",
+      description: "BB and the execution machine still enforce their permission limits.",
+      options: [...CONTROLLER_PERMISSION_MODES],
+      default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
     },
   });
   const store = openStore(bb.storage);
@@ -304,7 +339,14 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const controller = new LunaControllerService({
     store,
-    adapter: new BbControllerAdapter({ sdk: bb.sdk, pluginId: bb.pluginId }),
+    adapter: new BbControllerAdapter({
+      sdk: bb.sdk,
+      pluginId: bb.pluginId,
+      executionProfile: () => {
+        if (!config.ok) throw new Error(config.message);
+        return controllerExecutionProfile(config.value);
+      },
+    }),
     clock: { now: clock },
   });
   const presence = new TelegramPresenceCoordinator({

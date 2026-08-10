@@ -7,6 +7,10 @@ import {
   BbControllerAdapter,
   type ControllerAdapter,
 } from "../src/controller/bb-controller";
+import {
+  DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  type ControllerExecutionProfile,
+} from "../src/controller/execution-profile";
 import { LunaControllerService } from "../src/controller/service";
 
 function personalProject(overrides: Record<string, unknown> = {}) {
@@ -74,7 +78,13 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
   } as const;
 }
 
-function sdkFixture(options: { projects?: unknown[]; threads?: unknown[]; hosts?: unknown[]; events?: unknown[] } = {}) {
+function sdkFixture(options: {
+  projects?: unknown[];
+  threads?: unknown[];
+  hosts?: unknown[];
+  events?: unknown[];
+  executionProfile?: ControllerExecutionProfile;
+} = {}) {
   const spawn = vi.fn(async () => ({ id: "thr_controller", environmentId: "env_personal" }));
   const send = vi.fn(async () => ({ ok: true }));
   const list = vi.fn(async () => options.threads ?? []);
@@ -86,7 +96,12 @@ function sdkFixture(options: { projects?: unknown[]; threads?: unknown[]; hosts?
     hosts: { list: vi.fn(async () => options.hosts ?? [{ id: "host_personal", status: "connected" }]) },
     threads: { spawn, send, list, get, output, events: { list: eventsList } },
   } as unknown as BbPluginApi["sdk"];
-  return { adapter: new BbControllerAdapter({ sdk, pluginId: "telegram-agent" }), spawn, send, list, eventsList };
+  const dependencies = {
+    sdk,
+    pluginId: "telegram-agent",
+    executionProfile: () => options.executionProfile ?? DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  };
+  return { adapter: new BbControllerAdapter(dependencies), spawn, send, list, eventsList };
 }
 
 it("spawns the hidden personal controller with the exact Luna Max execution tuple", async () => {
@@ -182,6 +197,42 @@ it("uses the only connected host when the personal project has no source binding
       type: "host",
       hostId: "host_connected",
       workspace: { type: "personal" },
+    },
+  }));
+});
+
+it("uses the configured execution profile for initial and later controller turns", async () => {
+  const executionProfile: ControllerExecutionProfile = {
+    model: "gpt-5.6-terra",
+    reasoningLevel: "high",
+    serviceTier: "default",
+    permissionMode: "accept-edits",
+  };
+  const { adapter, spawn, send } = sdkFixture({ executionProfile });
+
+  await adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000));
+  await adapter.send("thr_controller", "Show active threads", AbortSignal.timeout(1_000));
+
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
+    providerId: "codex",
+    title: "Telegram Codex controller owner-7-controller",
+    ...executionProfile,
+    executionInputSources: {
+      providerId: "explicit",
+      model: "explicit",
+      reasoningLevel: "explicit",
+      serviceTier: "explicit",
+      permissionMode: "explicit",
+    },
+  }));
+  expect(send).toHaveBeenCalledWith(expect.objectContaining({
+    threadId: "thr_controller",
+    ...executionProfile,
+    executionInputSources: {
+      model: "explicit",
+      reasoningLevel: "explicit",
+      serviceTier: "explicit",
+      permissionMode: "explicit",
     },
   }));
 });

@@ -193,6 +193,10 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   expect(selected.tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
+    thread: { ...context.thread, title: "Telegram Codex controller owner-7-controller" },
+  })).tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  expect((await harness.behavior.resolveAgentConfiguration({
+    ...context,
     thread: { ...context.thread, id: "thr_unrelated" },
   })).tools).toEqual([]);
   expect((await harness.behavior.resolveAgentConfiguration({

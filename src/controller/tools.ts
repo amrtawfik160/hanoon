@@ -2,6 +2,7 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import type { Job } from "../domain/models";
 import type { TelegramAgentStore } from "../storage/store";
+import { isControllerThreadTitle } from "./bb-controller";
 import { CONTROLLER_INSTRUCTIONS } from "./instructions";
 import type { ThreadOperationService } from "./operations";
 import { listVisibleThreads, visibleThreadStatus } from "./thread-observer";
@@ -223,7 +224,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       context.provider.id === "codex" &&
       context.project.kind === "personal" &&
       context.environment.workspaceProvisionType === "personal" &&
-      context.thread.title === `Telegram Luna controller ${controller.controllerKey}`;
+      isControllerThreadTitle(context.thread.title, controller.controllerKey);
     return candidate
       ? { tools: [...CONTROLLER_TOOL_NAMES], skills: [], instructions: CONTROLLER_INSTRUCTIONS }
       : { tools: [], skills: [] };

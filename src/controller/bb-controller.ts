@@ -1,12 +1,16 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { buildInitialControllerPrompt } from "./instructions";
+import {
+  DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  type ControllerExecutionProfile,
+} from "./execution-profile";
 
 export const CONTROLLER_PROVIDER = "codex";
-export const CONTROLLER_MODEL = "gpt-5.6-luna";
-export const CONTROLLER_REASONING = "max";
-export const CONTROLLER_SERVICE_TIER = "fast";
-export const CONTROLLER_PERMISSION = "auto";
+export const CONTROLLER_MODEL = DEFAULT_CONTROLLER_EXECUTION_PROFILE.model;
+export const CONTROLLER_REASONING = DEFAULT_CONTROLLER_EXECUTION_PROFILE.reasoningLevel;
+export const CONTROLLER_SERVICE_TIER = DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier;
+export const CONTROLLER_PERMISSION = DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode;
 
 export type ControllerLocation = { threadId: string; projectId: string; hostId: string };
 export type ControllerStatus = "idle" | "active" | "starting" | "stopping" | "error" | "missing";
@@ -34,11 +38,20 @@ export type ControllerAdapter = {
 type BbSdk = BbPluginApi["sdk"];
 
 function controllerTitle(controllerKey: string): string {
-  return `Telegram Luna controller ${controllerKey}`;
+  return `Telegram Codex controller ${controllerKey}`;
+}
+
+export function isControllerThreadTitle(title: string | null, controllerKey: string): boolean {
+  return title === controllerTitle(controllerKey) ||
+    title === `Telegram Luna controller ${controllerKey}`;
 }
 
 export class BbControllerAdapter implements ControllerAdapter {
-  public constructor(private readonly dependencies: { sdk: BbSdk; pluginId: string }) {}
+  public constructor(private readonly dependencies: {
+    sdk: BbSdk;
+    pluginId: string;
+    executionProfile: () => ControllerExecutionProfile;
+  }) {}
 
   public async spawn(
     turn: ControllerTurnRecord,
@@ -46,6 +59,7 @@ export class BbControllerAdapter implements ControllerAdapter {
     signal: AbortSignal,
   ): Promise<ControllerLocation> {
     const personal = await this.resolvePersonalProject(signal);
+    const execution = this.dependencies.executionProfile();
     const thread = await this.dependencies.sdk.threads.spawn({
       projectId: personal.projectId,
       title: controllerTitle(controller.controllerKey),
@@ -57,10 +71,10 @@ export class BbControllerAdapter implements ControllerAdapter {
         workspace: { type: "personal" },
       },
       providerId: CONTROLLER_PROVIDER,
-      model: CONTROLLER_MODEL,
-      reasoningLevel: CONTROLLER_REASONING,
-      serviceTier: CONTROLLER_SERVICE_TIER,
-      permissionMode: CONTROLLER_PERMISSION,
+      model: execution.model,
+      reasoningLevel: execution.reasoningLevel,
+      serviceTier: execution.serviceTier,
+      permissionMode: execution.permissionMode,
       executionInputSources: {
         providerId: "explicit",
         model: "explicit",
@@ -73,13 +87,14 @@ export class BbControllerAdapter implements ControllerAdapter {
   }
 
   public async send(threadId: string, text: string, signal: AbortSignal): Promise<void> {
+    const execution = this.dependencies.executionProfile();
     await this.dependencies.sdk.threads.send({
       threadId,
       mode: "start",
-      model: CONTROLLER_MODEL,
-      reasoningLevel: CONTROLLER_REASONING,
-      serviceTier: CONTROLLER_SERVICE_TIER,
-      permissionMode: CONTROLLER_PERMISSION,
+      model: execution.model,
+      reasoningLevel: execution.reasoningLevel,
+      serviceTier: execution.serviceTier,
+      permissionMode: execution.permissionMode,
       executionInputSources: {
         model: "explicit",
         reasoningLevel: "explicit",
@@ -137,9 +152,8 @@ export class BbControllerAdapter implements ControllerAdapter {
       originPluginId: this.dependencies.pluginId,
       signal,
     });
-    const title = controllerTitle(controllerKey);
     const candidates = threads.filter((thread) =>
-      thread.title === title &&
+      isControllerThreadTitle(thread.title, controllerKey) &&
       thread.projectId === personal.projectId &&
       thread.providerId === CONTROLLER_PROVIDER &&
       thread.status !== "error" && thread.status !== "stopping" &&

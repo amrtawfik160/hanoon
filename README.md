@@ -1,6 +1,6 @@
 # Telegram Agent BB plugin
 
-Telegram Agent gives one paired private Telegram owner a durable Luna Max conversation for controlling reviewed BB delivery jobs. Ordinary messages go to one hidden BB controller thread. Guarded controller tools commit job intent to durable plugin storage; the single leased executor runs fresh-context planning, critique, implementation, review, documentation, validation, merge, deployment, and canary stages around one managed worktree.
+Telegram Agent gives one paired private Telegram owner a durable, configurable Codex conversation for controlling reviewed BB delivery jobs. Luna Max remains the default. Ordinary messages go to one hidden BB controller thread. Guarded controller tools commit job intent to durable plugin storage; the single leased executor runs fresh-context planning, critique, implementation, review, documentation, validation, merge, deployment, and canary stages around one managed worktree.
 
 This project is inspired by [Valor](https://github.com/tomcounsell/ai).
 
@@ -10,7 +10,7 @@ This project is inspired by [Valor](https://github.com/tomcounsell/ai).
 - GitHub CLI (`gh`) authenticated on every host that owns an enabled project source.
 - A standard BB project backed by a GitHub repository, with a reachable local or cloned source and a named base branch.
 - A source host for BB's personal project, or exactly one connected BB host when that project has no source binding. The hidden controller runs there in a personal workspace and never receives an implementation worktree.
-- Codex access to `gpt-5.6-luna` with the `max` reasoning level.
+- Codex access to the selected controller model. The default is `gpt-5.6-luna` with `max` reasoning.
 - A Telegram bot created through [BotFather](https://core.telegram.org/bots#botfather).
 
 Installation is full-trust code: review the plugin source and every BB project policy before installing it. The plugin can start agent threads, run owner-authored commands, request a BB-managed pull-request merge, deploy production, and verify a canary. GitHub branch protection and repository rules still apply to the merge.
@@ -32,6 +32,17 @@ The check runs TypeScript validation, the full Vitest suite, and the BB plugin b
 ## Configure the bot and pair the owner
 
 Enter the bot token only in **Extensions → Plugins → Telegram Agent**. The setting is secret-backed. Do not put the token in a shell command, policy file, README, issue, log, or chat message.
+
+The same page configures subsequent conversational-controller turns:
+
+| Setting | Options | Default |
+| --- | --- | --- |
+| Controller model | `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `gpt-5.6-luna` |
+| Controller reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `max` |
+| Controller service tier | `fast`, `default` | `fast` |
+| Controller permission mode | `auto`, `accept-edits`, `full` | `auto` |
+
+Saving a profile affects the next controller turn, including later turns in the existing durable conversation. It does not rewrite a running turn or any implementation/review job. Implementation and review execution stays in each project's immutable policy. BB and the execution machine may reduce a requested permission mode; use `auto` unless the controller has a specific need for a different mode.
 
 After the token is configured, create a one-use pairing link:
 
@@ -128,8 +139,8 @@ bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/po
 ## Telegram conversation and task flow
 
 1. The paired owner sends a normal message in the private chat. Telegram ingress durably queues it and nudges the leased executor; ingress never starts a BB session itself.
-2. The executor creates or resumes one hidden controller thread in BB's personal workspace with provider `codex`, model `gpt-5.6-luna`, reasoning `max`, and permission mode `auto`. Later messages stay FIFO and use `mode: start` only when that thread is idle.
-3. Luna answers ordinary questions conversationally. For software work it uses the registered tools to list enabled projects, ask which project is intended when needed, and atomically create a guarded confirmed job. The tools only write durable intent; they cannot spawn, merge, or touch a worktree.
+2. The executor creates or resumes one hidden controller thread in BB's personal workspace with provider `codex` and the saved controller execution profile (Luna/Max/Fast/Auto by default). Later messages stay FIFO and use `mode: start` only when that thread is idle.
+3. The controller answers ordinary questions conversationally. For software work it uses the registered tools to list enabled projects, ask which project is intended when needed, and atomically create a guarded confirmed job. The tools only write durable intent; they cannot spawn, merge, or touch a worktree.
 4. A fresh Luna Max planner creates one visible managed-worktree thread and writes a bounded plan artifact. A separate fresh Luna Max critic receives that artifact; it may request one fresh planning revision but cannot implement.
 5. The executor creates the implementation thread in that same environment and gives it only the immutable work order and accepted plan attachments.
 6. When implementation is idle, BB locates the pull request and resolves its full head SHA with Git-native `git ls-remote` evidence.
@@ -138,12 +149,12 @@ bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/po
 9. After review passes, a fresh Luna Max documentation thread uses Docs Guard and BB CLI instructions, updates only necessary docs, commits and pushes, and reports a bounded artifact. Final validation then runs before a separate fresh final review.
 10. The final gate produces a one-use, expiring Telegram **Merge + deploy &lt;SHA&gt;** approval only when deployment and canary are configured. The merge executor re-checks the exact receipt immediately before the BB merge SDK call. Stale or unknown evidence fails closed and requires fresh review and validation.
 11. After GitHub reports the merge, Git fetches the base branch, requires its head to equal GitHub's merge commit, verifies that every path changed by the approved head has the approved Git object, and detaches the managed worktree at that exact commit. Deploy and canary each re-check the checkout before their configured commands run. Merge, deploy, and canary each have a separate durable receipt. Only canary success reaches `complete`. A post-merge failure reaches `production_failed`, preserves the successful merge fact, alerts the owner, and never attempts automatic rollback.
-12. During a controller turn, the executor uses Telegram's native `sendMessageDraft` stream: an ephemeral `Thinking…` preview appears first, then the same stable draft animates bounded Luna output about once per second. An unchanged draft is refreshed every 20 seconds so Telegram's 30-second preview does not expire during a long tool call. The executor also refreshes Telegram's `typing...` action while any authoritative worker is active.
+12. During a controller turn, the executor uses Telegram's native `sendMessageDraft` stream: an ephemeral `Thinking…` preview appears first, then the same stable draft animates bounded controller output about once per second. An unchanged draft is refreshed every 20 seconds so Telegram's 30-second preview does not expire during a long tool call. The executor also refreshes Telegram's `typing...` action while any authoritative worker is active.
 13. On controller completion, the executor switches the same logical outbox item to a normal persistent response; the draft remains only a temporary preview. Final delivery retains the plugin's bounded retry behavior. Durable job/controller state survives restart without issuing a second merge, deployment, or canary.
 
-One status message is durably edited at job milestones and exposes the current job state, review findings, validation evidence, pull request identity, merge fact, deployment/canary outcome, worker liveness, and approval expiry without storing the raw merge callback nonce. Luna controller replies use native animated Telegram drafts derived from bounded output deltas, followed by normal persistent final delivery; background job agents report through durable milestone status rather than forwarding private provider transcripts.
+One status message is durably edited at job milestones and exposes the current job state, review findings, validation evidence, pull request identity, merge fact, deployment/canary outcome, worker liveness, and approval expiry without storing the raw merge callback nonce. Controller replies use native animated Telegram drafts derived from bounded output deltas, followed by normal persistent final delivery; background job agents report through durable milestone status rather than forwarding private provider transcripts.
 
-Natural messages continue going to Luna while a job runs. Reply to the exact current status message to steer its implementation thread. `/status`, `/projects`, `/retry`, `/cancel`, and merge buttons remain deterministic recovery paths and do not become controller turns.
+Natural messages continue going to the controller while a job runs. Reply to the exact current status message to steer its implementation thread. `/status`, `/projects`, `/retry`, `/cancel`, and merge buttons remain deterministic recovery paths and do not become controller turns.
 
 ## Operations and recovery
 
@@ -176,7 +187,7 @@ bb plugin logs telegram-agent -n 50
 - The executor has one generation-fenced owner. A second executor instance cannot mutate leased effects or issue a duplicate merge.
 - Telegram ingress only records intent and nudges the executor; it never touches a worktree or calls BB thread APIs.
 - The leased executor is the only execution engine. It owns controller spawn/send, job effects, Telegram draft/final delivery, native typing presence, and its authoritative lease heartbeat. Ingress and BB lifecycle handlers never own streaming or presence timers.
-- The Luna controller has durable BB thread identity, provider conversation/history/status/interactions, explicit execution settings and permissions, hidden visibility, plugin origin, and owner-bound tool authorization. It uses a personal workspace and has no implementation files.
+- The Codex controller has durable BB thread identity, provider conversation/history/status/interactions, explicit execution settings and permissions, hidden visibility, plugin origin, and owner-bound tool authorization. It uses a personal workspace and has no implementation files.
 - Implementation work happens in a visible managed-worktree thread. Reviewers are visible spawned children, never provider-session forks, and reuse the implementation environment.
 - BB threads do not replace worktrees. Threads isolate provider conversations, durable histories, statuses, interactions, permissions, visibility, and parent-child coordination. Managed worktrees remain the branch, checkout, uncommitted-file, artifact, and filesystem-mutation boundary; threads that reuse one environment see the same files.
 - Work orders and review packets are immutable BB project attachments. Handoffs record their attachment paths and SHA-256 digests.

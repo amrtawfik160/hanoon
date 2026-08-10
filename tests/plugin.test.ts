@@ -25,6 +25,33 @@ it("requests the secret bot token when configuration is absent", async () => {
   ]);
 });
 
+it("registers configurable controller execution settings with safe defaults", async () => {
+  const { harness } = await loadPlugin();
+
+  expect(harness.registrations.settingsDescriptors).toMatchObject({
+    controllerModel: {
+      type: "select",
+      options: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      default: "gpt-5.6-luna",
+    },
+    controllerReasoningLevel: {
+      type: "select",
+      options: ["low", "medium", "high", "xhigh", "max"],
+      default: "max",
+    },
+    controllerServiceTier: {
+      type: "select",
+      options: ["fast", "default"],
+      default: "fast",
+    },
+    controllerPermissionMode: {
+      type: "select",
+      options: ["auto", "accept-edits", "full"],
+      default: "auto",
+    },
+  });
+});
+
 it("registers both background services and all enqueue-only thread lifecycle handlers", async () => {
   const { bb, harness } = await loadPlugin();
   const serviceNames = harness.registrations.services.map((service) => service.name);

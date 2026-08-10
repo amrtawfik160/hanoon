@@ -36,6 +36,7 @@ If the settings are missing, defaults reproduce the current Luna Max/Fast/Auto t
 ## Safety and recovery
 
 - The provider stays fixed to `codex`; the settings page cannot create provider/model mismatches.
+- New controller threads use a model-neutral Codex title. Recovery and tool authorization continue accepting the legacy Luna title so existing durable conversations keep their history and access.
 - Controller authorization, hidden visibility, owner pairing, durable FIFO turns, and fail-closed recovery remain unchanged.
 - Project policy snapshots remain the only source of implementation and review execution settings.
 - Changing controller settings never rewrites an active job, approval, review receipt, or worktree.
