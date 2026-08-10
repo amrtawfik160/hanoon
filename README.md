@@ -1,10 +1,12 @@
-# Telegram Agent
+# Hanoon
 
-A BB plugin that lets one private Telegram owner talk to a Codex controller and run a reviewed software-delivery pipeline from planning through merge, deployment, and canary verification.
+Hanoon is a private Telegram AI agent for BB. It lets one paired owner talk to a configurable controller and run a reviewed software-delivery pipeline from planning through merge, deployment, and canary verification.
 
 Inspired by [Valor](https://github.com/tomcounsell/ai) and adapted to BB's native projects, threads, environments, worktrees, permissions, and merge API.
 
-## Why Telegram Agent?
+The installed plugin and CLI namespace remain `telegram-agent`.
+
+## Why Hanoon?
 
 - **Work from Telegram.** Ask questions, inspect BB threads, start a bounded change, receive live drafts, and follow one durable status message without opening another dashboard.
 - **Keep the controller durable.** Ordinary messages stay in one hidden BB conversation. Controller identity, FIFO turns, streaming cursors, jobs, approvals, and delivery state survive plugin restarts.
@@ -14,7 +16,7 @@ Inspired by [Valor](https://github.com/tomcounsell/ai) and adapted to BB's nativ
 
 ## How it works
 
-Telegram Agent has three layers:
+Hanoon has three layers:
 
 | Layer | Responsibility |
 | --- | --- |
@@ -27,7 +29,7 @@ Ingress never starts a BB session. One generation-fenced executor owns controlle
 ## Architecture
 
 <p align="center">
-  <img src="docs/assets/architecture.svg" alt="Telegram Agent architecture: private Telegram chat → I/O bridge → durable SQLite control plane → single leased executor → isolated BB controller and pipeline threads backed by a managed Git worktree" width="680">
+  <img src="docs/assets/architecture.svg" alt="Hanoon architecture: private Telegram chat → I/O bridge → durable SQLite control plane → single leased executor → isolated BB controller and pipeline threads backed by a managed Git worktree" width="680">
 </p>
 
 Read the [architecture guide](docs/architecture.md) for diagrams, state ownership, and the exact BB thread/worktree boundary.
@@ -81,9 +83,9 @@ bb telegram-agent doctor <project-id>
 
 The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. See [Configuration](docs/configuration.md) for the complete verified schema and examples.
 
-### 4. Talk to the controller
+### 4. Talk to Hanoon
 
-Send a normal private message to the bot. The controller can answer conversationally, list enabled projects, report truthful BB thread progress, or create one guarded implementation job. Merge still requires the current one-use Telegram approval.
+Send a normal private message to Hanoon. It can answer conversationally, list enabled projects, report truthful BB thread progress, or create one guarded implementation job. Merge still requires the current one-use Telegram approval.
 
 ## Documentation
 
