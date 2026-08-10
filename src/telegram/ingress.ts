@@ -15,7 +15,14 @@ import {
   type TelegramMessage,
   type TelegramUpdate,
 } from "./types";
-import { parseCallbackData, renderJobStatus, renderProjectPicker, type CallbackAction } from "./view";
+import {
+  ephemeralTelegramPayload,
+  parseCallbackData,
+  persistableJobStatusPayload,
+  renderJobStatus,
+  renderProjectPicker,
+  type CallbackAction,
+} from "./view";
 
 export type TelegramIngressTransport = {
   sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }>;
@@ -523,20 +530,20 @@ export class TelegramIngress {
       logicalKey,
       chatId,
       messageId: outboxMessageId,
-      payload: payload as unknown as Record<string, unknown>,
+      payload: persistableJobStatusPayload(payload),
     });
     if (messageId !== null) {
       this.store.enqueueOutbox(outbox(messageId), now);
-      await this.telegram.editMessage(chatId, messageId, payload);
+      await this.telegram.editMessage(chatId, messageId, ephemeralTelegramPayload(payload));
     } else if (callbackMessageId !== undefined) {
       const intent = outbox(callbackMessageId);
       this.store.enqueueOutbox(intent, now);
-      await this.telegram.editMessage(chatId, callbackMessageId, payload);
+      await this.telegram.editMessage(chatId, callbackMessageId, ephemeralTelegramPayload(payload));
       current = this.setStatusMessageAndOutbox(current, callbackMessageId, intent, now);
     } else {
       const intent = outbox(null);
       this.store.enqueueOutbox(intent, now);
-      const sent = await this.telegram.sendMessage(chatId, payload);
+      const sent = await this.telegram.sendMessage(chatId, ephemeralTelegramPayload(payload));
       current = this.setStatusMessageAndOutbox(
         current,
         sent.message_id,

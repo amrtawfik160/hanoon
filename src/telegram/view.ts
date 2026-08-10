@@ -1,4 +1,5 @@
 import { projectPolicySchema, type Job, type ProjectPolicy } from "../domain/models";
+import { hashSecret } from "../crypto";
 import type {
   InlineKeyboardButton,
   InlineKeyboardMarkup,
@@ -11,6 +12,8 @@ const NONCE_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 const MAX_CALLBACK_BYTES = 64;
 const MAX_TELEGRAM_TEXT_LENGTH = 4_096;
 const MAX_EVIDENCE_LENGTH = 3_500;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const RAW_MERGE_CALLBACK_PATTERN = /^m:[A-Za-z0-9_-]{32}$/;
 const CREDENTIAL_ASSIGNMENT_PATTERN =
   /(^|[^A-Za-z0-9])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|auth[_-]?(?:token|key)|session[_-]?token|private[_-]?key|credentials?|password|secret|token|key)["']?\s*[:=]\s*["']?[^\s"'&;,)}\]]+/gi;
 
@@ -62,7 +65,19 @@ export type JobStatusContext = {
   evidence?: string;
   approvalExpiresAt?: number | string | Date;
   mergeNonce?: string;
+  mergeNonceHash?: string;
   ready?: boolean;
+};
+
+type ApprovalDeliveryMetadata = {
+  nonceHash: string;
+  jobId: string;
+  headSha: string | null;
+  expiresAt: number | null;
+};
+
+type RenderedStatusPayload = SendMessagePayload & {
+  __approval_metadata?: ApprovalDeliveryMetadata;
 };
 
 type ProjectRecord = ProjectPolicy | { policy: ProjectPolicy; version?: number };
@@ -225,6 +240,54 @@ export function parseCallbackData(data: string): CallbackAction {
   match = /^m:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "merge", nonce: match[1] };
   throw new TypeError("Telegram callback data is invalid");
+}
+
+function approvalExpiryMillis(value: number | string | Date | undefined): number | null {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function approvalMetadata(
+  payload: RenderedStatusPayload,
+): ApprovalDeliveryMetadata | undefined {
+  const metadata = payload.__approval_metadata;
+  if (!metadata || !SHA256_PATTERN.test(metadata.nonceHash) || !validJobId(metadata.jobId)) return undefined;
+  if (metadata.headSha !== null && !/^[0-9a-f]{40}$/.test(metadata.headSha)) return undefined;
+  return {
+    nonceHash: metadata.nonceHash,
+    jobId: metadata.jobId,
+    headSha: metadata.headSha,
+    expiresAt: metadata.expiresAt,
+  };
+}
+
+/** Remove internal approval metadata while retaining the raw callback for one in-memory Telegram delivery. */
+export function ephemeralTelegramPayload(payload: SendMessagePayload): SendMessagePayload {
+  const { __approval_metadata: _metadata, ...telegramPayload } = payload as RenderedStatusPayload;
+  return telegramPayload;
+}
+
+/** Make a crash-safe outbox payload: raw approval callbacks are removed, hash metadata is retained. */
+export function persistableJobStatusPayload(payload: SendMessagePayload): Record<string, unknown> {
+  const rendered = payload as RenderedStatusPayload;
+  const { __approval_metadata: _metadata, reply_markup: markup, ...rest } = rendered;
+  const persisted: Record<string, unknown> = { ...rest };
+  if (markup) {
+    persisted.reply_markup = {
+      inline_keyboard: markup.inline_keyboard
+        .map((row) => row.filter((button) =>
+          !(typeof button.callback_data === "string" && RAW_MERGE_CALLBACK_PATTERN.test(button.callback_data))))
+        .filter((row) => row.length > 0),
+    } satisfies InlineKeyboardMarkup;
+  }
+  const metadata = approvalMetadata(rendered);
+  if (metadata) persisted.approval_metadata = metadata;
+  return persisted;
 }
 
 function keyboard(buttons: InlineKeyboardButton[]): InlineKeyboardMarkup {
@@ -390,9 +453,22 @@ export function renderJobStatus(
   const text = truncateHtml(lines.join("\n"), MAX_TELEGRAM_TEXT_LENGTH);
 
   const buttons = statusButtons(job, context, ready);
+  const nonceHash = context.mergeNonceHash ??
+    (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce) ? hashSecret(context.mergeNonce) : undefined);
+  const expiresAt = approvalExpiryMillis(context.approvalExpiresAt);
   return {
     text,
     parse_mode: "HTML",
     ...(buttons.length > 0 ? { reply_markup: keyboard(buttons) } : {}),
+    ...(nonceHash && SHA256_PATTERN.test(nonceHash)
+      ? {
+          __approval_metadata: {
+            nonceHash,
+            jobId: job.id,
+            headSha: job.prHeadSha,
+            expiresAt,
+          },
+        }
+      : {}),
   };
 }

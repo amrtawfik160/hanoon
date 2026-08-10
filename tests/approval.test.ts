@@ -5,9 +5,11 @@ import type { JobEffect } from "../src/domain/models";
 import { hashSecret } from "../src/crypto";
 import { ApprovalService } from "../src/services/approval-service";
 import { openStore } from "../src/storage/store";
+import { persistableJobStatusPayload } from "../src/telegram/view";
 import { policyFixture, sha } from "./helpers";
 
 const HEAD = sha();
+const MOVED = sha("b");
 const NOW = 1_000;
 const APPROVAL_TTL_MS = 15 * 60_000;
 
@@ -46,16 +48,26 @@ function approvalFixture(options: { now?: number } = {}) {
   return { db, store, service, now, job: store.getJob("job_1")! };
 }
 
-function mergeEffect(jobVersion: number, payload: Record<string, unknown> = {}): JobEffect {
+function mergeEffect(
+  jobVersion: number,
+  approvalNonceHash: string,
+  payload: Record<string, unknown> = {},
+): JobEffect {
+  const idempotencyKey = `job_1:${jobVersion + 1}:merge_pr`;
   return {
-    idempotencyKey: "job_1:merge_pr:7",
+    idempotencyKey,
     jobId: "job_1",
     kind: "merge_pr",
     payload: {
       headSha: HEAD,
       receipt: {
         jobId: "job_1",
-        jobVersion,
+        effectIdempotencyKey: idempotencyKey,
+        approvalNonceHash,
+        approvalOwnerUserId: "7",
+        approvalOwnerChatId: "70",
+        jobVersion: jobVersion + 1,
+        approvalJobVersion: jobVersion,
         projectId: "proj_1",
         environmentId: "env_1",
         prNumber: 17,
@@ -126,7 +138,7 @@ describe("Telegram merge approvals", () => {
   it("atomically consumes an approval and enqueues exactly one merge effect", () => {
     const fixture = approvalFixture();
     const issued = fixture.service.issue("job_1", HEAD);
-    const effect = mergeEffect(fixture.job.version);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
 
     expect(fixture.store.acceptApprovalAndEnqueueMerge({
       nonceHash: hashSecret(issued.nonce),
@@ -156,18 +168,99 @@ describe("Telegram merge approvals", () => {
     expect(() => fixture.store.acceptApprovalAndEnqueueMerge({
       nonceHash: hashSecret(issued.nonce),
       expectedJobVersion: fixture.job.version,
-      effect: mergeEffect(fixture.job.version, { cyclic }),
+      effect: mergeEffect(fixture.job.version, hashSecret(issued.nonce), { cyclic }),
       now: NOW + 1,
     })).toThrow();
     expect(fixture.db.prepare("SELECT consumed_at, outcome FROM approvals").get()).toEqual({ consumed_at: null, outcome: null });
     expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
     expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(0);
+
+    const payloadMismatch = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
+    payloadMismatch.payload.headSha = MOVED;
+    expect(() => fixture.store.acceptApprovalAndEnqueueMerge({
+      nonceHash: hashSecret(issued.nonce),
+      expectedJobVersion: fixture.job.version,
+      effect: payloadMismatch,
+      now: NOW + 1,
+    })).toThrow(/payload|head|receipt/i);
+    expect(fixture.db.prepare("SELECT consumed_at, outcome FROM approvals").get()).toEqual({ consumed_at: null, outcome: null });
+  });
+
+  it("rejects a caller-supplied merge effect whose generated key is not exact", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
+    effect.idempotencyKey = "job_1:999:merge_pr";
+
+    expect(() => fixture.store.acceptApprovalAndEnqueueMerge({
+      nonceHash: hashSecret(issued.nonce),
+      expectedJobVersion: fixture.job.version,
+      effect,
+      now: NOW + 1,
+    })).toThrow(/idempotency|generated|effect/i);
+    expect(fixture.db.prepare("SELECT consumed_at, outcome FROM approvals").get()).toEqual({ consumed_at: null, outcome: null });
+    expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
+    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(0);
+  });
+
+  it("rolls back when the exact generated effect key collides with another payload", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
+    fixture.db.prepare(
+      `INSERT INTO effects (
+         idempotency_key, job_id, kind, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, 'merge_pr', ?, 'pending', 0, ?, ?, ?)`,
+    ).run(effect.idempotencyKey, effect.jobId, JSON.stringify({ receipt: { jobId: "wrong" } }), NOW, NOW, NOW);
+
+    expect(() => fixture.store.acceptApprovalAndEnqueueMerge({
+      nonceHash: hashSecret(issued.nonce),
+      expectedJobVersion: fixture.job.version,
+      effect,
+      now: NOW + 1,
+    })).toThrow(/collision|idempotency|effect/i);
+    expect(fixture.db.prepare("SELECT consumed_at, outcome FROM approvals").get()).toEqual({ consumed_at: null, outcome: null });
+    expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
+    expect(fixture.store.getEffect("job_1", effect.idempotencyKey)?.payload).toEqual({ receipt: { jobId: "wrong" } });
+  });
+
+  it("never persists a raw merge callback nonce in outbox or callback storage", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const rawCallback = `m:${issued.nonce}`;
+
+    fixture.store.enqueueOutbox({
+      logicalKey: "job_1:safe-merge-status",
+      chatId: "70",
+      payload: persistableJobStatusPayload({
+        text: "Ready",
+        reply_markup: { inline_keyboard: [[{ text: "Merge", callback_data: rawCallback }]] },
+      }),
+    }, NOW + 1);
+
+    expect(() => fixture.store.enqueueOutbox({
+      logicalKey: "job_1:merge-status",
+      chatId: "70",
+      payload: {
+        text: "Ready",
+        reply_markup: { inline_keyboard: [[{ text: "Merge", callback_data: rawCallback }]] },
+      },
+    }, NOW + 1)).toThrow(/raw|nonce|callback/i);
+
+    const persisted = JSON.stringify({
+      approvals: fixture.db.prepare("SELECT * FROM approvals").all(),
+      effects: fixture.db.prepare("SELECT * FROM effects").all(),
+      outbox: fixture.db.prepare("SELECT * FROM outbox").all(),
+      callbacks: fixture.db.prepare("SELECT * FROM callbacks").all(),
+    });
+    expect(persisted).not.toContain(rawCallback);
   });
 
   it("returns the same accepted result when two consumers race the same nonce", () => {
     const fixture = approvalFixture();
     const issued = fixture.service.issue("job_1", HEAD);
-    const effect = mergeEffect(fixture.job.version);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
 
     const first = fixture.store.acceptApprovalAndEnqueueMerge({
       nonceHash: hashSecret(issued.nonce),

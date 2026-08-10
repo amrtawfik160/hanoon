@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   encodeCallbackData,
+  ephemeralTelegramPayload,
   parseCallbackData,
+  persistableJobStatusPayload,
   renderJobStatus,
   renderProjectPicker,
 } from "../src/telegram/view";
@@ -73,6 +75,26 @@ describe("Telegram callback grammar", () => {
   it("keeps merge callbacks bound to only the approval nonce", () => {
     expect(encodeCallbackData({ type: "merge", nonce: mergeNonce })).toBe(`m:${mergeNonce}`);
     expect(encodeCallbackData({ type: "merge", nonce: mergeNonce })).not.toContain(telegramJobId);
+  });
+
+  it("keeps raw approval callbacks ephemeral and persists only hash metadata", () => {
+    const nonce = mergeNonce;
+    const rendered = renderJobStatus(jobFixture({
+      id: telegramJobId,
+      state: "awaiting_merge_approval",
+      prHeadSha: "a".repeat(40),
+    }), {
+      mergeNonce: nonce,
+      approvalExpiresAt: 1_770_000_000_000,
+    });
+    const raw = `m:${nonce}`;
+    const ephemeral = ephemeralTelegramPayload(rendered);
+    const persisted = JSON.stringify(persistableJobStatusPayload(rendered));
+
+    expect(JSON.stringify(ephemeral)).toContain(raw);
+    expect(persisted).not.toContain(raw);
+    expect(persisted).toContain("approval_metadata");
+    expect(persisted).toContain("nonceHash");
   });
 });
 
