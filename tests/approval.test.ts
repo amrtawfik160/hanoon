@@ -5,8 +5,12 @@ import type { JobEffect } from "../src/domain/models";
 import { hashSecret } from "../src/crypto";
 import { ApprovalService } from "../src/services/approval-service";
 import { openStore } from "../src/storage/store";
-import { persistableJobStatusPayload } from "../src/telegram/view";
-import { policyFixture, sha } from "./helpers";
+import {
+  ephemeralTelegramPayload,
+  persistableJobStatusPayload,
+  renderJobStatus,
+} from "../src/telegram/view";
+import { jobFixture, policyFixture, sha } from "./helpers";
 
 const HEAD = sha();
 const MOVED = sha("b");
@@ -255,6 +259,118 @@ describe("Telegram merge approvals", () => {
       callbacks: fixture.db.prepare("SELECT * FROM callbacks").all(),
     });
     expect(persisted).not.toContain(rawCallback);
+  });
+
+  it("rejects raw merge callbacks recursively in completed results", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
+    expect(fixture.store.acceptApprovalAndEnqueueMerge({
+      nonceHash: hashSecret(issued.nonce),
+      expectedJobVersion: fixture.job.version,
+      effect,
+      now: NOW + 1,
+      identity: { userId: "7", chatId: "70" },
+    })).toMatchObject({ ok: true });
+    fixture.db.prepare(
+      `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+         lease_expires_at = ?, payload_json = ? WHERE job_id = ? AND idempotency_key = ?`,
+    ).run(
+      "executor-1",
+      1,
+      NOW + 60_000,
+      JSON.stringify({ ...effect.payload, mergeCallStartedAt: NOW + 1, mergeCallOutcome: "unknown" }),
+      effect.jobId,
+      effect.idempotencyKey,
+    );
+
+    const raw = `m:${issued.nonce}`;
+    expect(() => fixture.store.completeMergeSuccess({
+      jobId: effect.jobId,
+      effectIdempotencyKey: effect.idempotencyKey,
+      message: "merged",
+      result: { nested: { rawCallback: raw } },
+      outbox: {
+        logicalKey: "job_1:merge:completion",
+        chatId: "70",
+        payload: { text: "merged" },
+      },
+      now: NOW + 2,
+      leaseOwner: "executor-1",
+      leaseGeneration: 1,
+    })).toThrow(/raw|nonce|callback/i);
+
+  });
+
+  it("renders only bounded HTTPS external URLs as Telegram links", () => {
+    const viewJob = jobFixture({
+      id: "abcdefghijklmnopqrstuv",
+      state: "awaiting_merge_approval",
+      projectId: "proj_1",
+      policyVersion: 1,
+      policy: policyFixture({ requiredChecks: [] }),
+      prNumber: 17,
+      prUrl: "http://example.test/pull/17",
+      prHeadSha: HEAD,
+    });
+    const insecure = renderJobStatus(viewJob, { bbAppBaseUrl: "http://bb.example/app" });
+    expect(insecure.reply_markup?.inline_keyboard.flat().some((button) => button.url)).toBe(false);
+
+    const oversized = renderJobStatus(viewJob, {
+      bbAppBaseUrl: `https://bb.example/${"x".repeat(2_000)}`,
+    });
+    expect(oversized.reply_markup?.inline_keyboard.flat().some((button) => button.url)).toBe(false);
+  });
+
+  it("reissues a crashed approval with a fresh ephemeral button and no nonce in SQLite", () => {
+    const fixture = approvalFixture();
+    const viewJob = jobFixture({
+      id: "abcdefghijklmnopqrstuv",
+      state: "awaiting_merge_approval",
+      projectId: "proj_1",
+      policyVersion: 1,
+      policy: policyFixture({ requiredChecks: [] }),
+      prNumber: 17,
+      prUrl: "https://github.com/acme/cyndra/pull/17",
+      prHeadSha: HEAD,
+    });
+    const oldApproval = fixture.service.issue("job_1", HEAD, NOW);
+    const oldRendered = renderJobStatus(viewJob, {
+      mergeNonce: oldApproval.nonce,
+      approvalExpiresAt: oldApproval.expiresAt,
+    });
+    fixture.store.enqueueOutbox({
+      logicalKey: "job_1:ready",
+      chatId: "70",
+      payload: persistableJobStatusPayload(oldRendered),
+    }, NOW + 1);
+
+    const freshApproval = fixture.service.issue("job_1", HEAD, NOW + 2);
+    const freshRendered = renderJobStatus(viewJob, {
+      mergeNonce: freshApproval.nonce,
+      approvalExpiresAt: freshApproval.expiresAt,
+    });
+    const ephemeral = ephemeralTelegramPayload(freshRendered);
+    const freshButton = ephemeral.reply_markup?.inline_keyboard.flat().find((button) => button.text === "Merge");
+    expect(freshButton?.callback_data).toBe(`m:${freshApproval.nonce}`);
+    expect(fixture.service.lookup(oldApproval.nonce)).toMatchObject({ outcome: "superseded" });
+    expect(fixture.service.consume(oldApproval.nonce, NOW + 3)).toEqual({ ok: false, reason: "revoked" });
+
+    fixture.store.enqueueOutbox({
+      logicalKey: "job_1:ready",
+      chatId: "70",
+      payload: persistableJobStatusPayload(freshRendered),
+    }, NOW + 3);
+    const sqlite = JSON.stringify({
+      approvals: fixture.db.prepare("SELECT * FROM approvals").all(),
+      effects: fixture.db.prepare("SELECT * FROM effects").all(),
+      outbox: fixture.db.prepare("SELECT * FROM outbox").all(),
+      callbacks: fixture.db.prepare("SELECT * FROM callbacks").all(),
+    });
+    expect(sqlite).not.toContain(oldApproval.nonce);
+    expect(sqlite).not.toContain(freshApproval.nonce);
+    expect(sqlite).not.toContain(`m:${oldApproval.nonce}`);
+    expect(sqlite).not.toContain(`m:${freshApproval.nonce}`);
   });
 
   it("returns the same accepted result when two consumers race the same nonce", () => {

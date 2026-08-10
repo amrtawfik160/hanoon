@@ -94,6 +94,7 @@ function mergeFixture(options: {
   collectError?: Error;
   preMergeError?: Error;
   beforePreMerge?: (db: Database.Database) => void;
+  clock?: () => number;
 } = {}) {
   const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
   const db = bb.storage.database();
@@ -154,7 +155,7 @@ function mergeFixture(options: {
     collectGateInput,
     commandRunner,
     bb: { sdk: { environments: { mergePullRequest } } },
-    now: () => NOW,
+    now: options.clock ?? (() => NOW),
   });
   return { db, store, approvals, issued, handler, collectGateInput, mergePullRequest, commandRunner };
 }
@@ -193,11 +194,11 @@ function leaseMergeEffect(fixture: ReturnType<typeof mergeFixture>, expiresAt = 
 function executeLeased(
   fixture: ReturnType<typeof mergeFixture>,
   effect: StoredEffect,
-  now: number,
+  now?: number,
 ) {
   return fixture.handler.executeMergeEffect({
     effect,
-    now,
+    ...(now === undefined ? {} : { now }),
     leaseOwner: LEASE_OWNER,
     leaseGeneration: LEASE_GENERATION,
   });
@@ -390,6 +391,29 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
   });
 
+  it("replays an accepted callback after completion from the bounded durable merge result", async () => {
+    const fixture = mergeFixture();
+    const first = await acceptApproval(fixture);
+    const effect = leaseMergeEffect(fixture);
+
+    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "merged" });
+    const completed = fixture.store.getEffect("job_1", effect.idempotencyKey);
+    expect(completed?.status).toBe("done");
+    expect(completed?.payload).toHaveProperty("mergeResult");
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: "callback_after_completion",
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+      now: NOW + 3,
+    })).resolves.toEqual(first);
+    expect(fixture.collectGateInput).toHaveBeenCalledTimes(2);
+    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(1);
+    expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(fixture.commandRunner.run).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects a caller-supplied fallback effect without calling the merge SDK", async () => {
     const fixture = mergeFixture();
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
@@ -427,6 +451,22 @@ describe("fresh Telegram merge execution", () => {
 
     await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("does not call the SDK or completion after async validation crosses the lease expiry", async () => {
+    let currentNow = NOW + 2;
+    const fixture = mergeFixture({
+      clock: () => currentNow,
+      beforePreMerge: () => {
+        currentNow = NOW + 60_001;
+      },
+    });
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture, NOW + 60_000);
+
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    expect(fixture.commandRunner.run).not.toHaveBeenCalled();
   });
 
   it("fails closed and releases the effect when cancellation is requested before the SDK fence", async () => {
@@ -499,6 +539,51 @@ describe("fresh Telegram merge execution", () => {
       leaseGeneration: null,
       leaseExpiresAt: null,
     });
+  });
+
+  it("fails and releases a current-owner leased effect with an unparseable payload by key", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    fixture.db.prepare(
+      "UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ? AND lease_owner = ? AND lease_generation = ?",
+    ).run("{malformed", effect.jobId, effect.idempotencyKey, LEASE_OWNER, LEASE_GENERATION);
+
+    await expect(executeLeased(fixture, effect, NOW + 2)).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    expect(fixture.commandRunner.run).not.toHaveBeenCalled();
+    expect(fixture.db.prepare(
+      "SELECT status, lease_owner, lease_generation, lease_expires_at FROM effects WHERE job_id = ? AND idempotency_key = ?",
+    ).get(effect.jobId, effect.idempotencyKey)).toEqual({
+      status: "failed",
+      lease_owner: null,
+      lease_generation: null,
+      lease_expires_at: null,
+    });
+  });
+
+  it("fails and releases an unknown-outcome effect when prepare rejects the current durable binding", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    const fencedPayload = { ...effect.payload, mergeCallStartedAt: NOW + 2, mergeCallOutcome: "unknown" };
+    fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ?")
+      .run(JSON.stringify(fencedPayload), effect.jobId, effect.idempotencyKey);
+    fixture.db.prepare("UPDATE jobs SET cancel_requested_at = ? WHERE id = ?")
+      .run(NOW + 2, effect.jobId);
+
+    await expect(executeLeased(fixture, effect, NOW + 3)).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    expect(fixture.commandRunner.run).not.toHaveBeenCalled();
+    expect(fixture.db.prepare(
+      "SELECT status, lease_owner, lease_generation, lease_expires_at FROM effects WHERE job_id = ? AND idempotency_key = ?",
+    ).get(effect.jobId, effect.idempotencyKey)).toEqual({
+      status: "failed",
+      lease_owner: null,
+      lease_generation: null,
+      lease_expires_at: null,
+    });
+    expect(fixture.store.getJob(effect.jobId)?.state).toBe("cancelled");
   });
 
   it.each([

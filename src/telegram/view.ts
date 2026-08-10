@@ -12,6 +12,7 @@ const NONCE_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 const MAX_CALLBACK_BYTES = 64;
 const MAX_TELEGRAM_TEXT_LENGTH = 4_096;
 const MAX_EVIDENCE_LENGTH = 3_500;
+const MAX_EXTERNAL_URL_LENGTH = 500;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const RAW_MERGE_CALLBACK_PATTERN = /^m:[A-Za-z0-9_-]{32}$/;
 const CREDENTIAL_ASSIGNMENT_PATTERN =
@@ -340,9 +341,10 @@ function mergeContexts(values: readonly unknown[]): JobStatusContext {
 
 function safeHttpUrl(value: string | null | undefined): string | null {
   if (!value) return null;
+  if (value.length > MAX_EXTERNAL_URL_LENGTH) return null;
   try {
     const url = new URL(value);
-    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    if (url.protocol !== "https:") return null;
     if (url.username || url.password || redact(value) !== value) return null;
     return value;
   } catch {

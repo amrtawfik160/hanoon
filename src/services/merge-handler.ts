@@ -13,6 +13,7 @@ import { ApprovalService } from "./approval-service";
 import {
   parseDurableMergeReceipt,
   parseMergeEffectPayload,
+  parsePersistedMergeEffectPayload,
   type ApprovalIdentity,
   type DurableMergeReceipt,
   type MergeEffectPayload,
@@ -392,9 +393,29 @@ export class MergeHandler {
     input: ExecuteMergeEffectInput,
     retryOptions?: { now?: number },
   ): Promise<MergeEffectResult> {
-    const now = retryOptions?.now ?? input.now ?? this.clock();
-    assertNow(now);
-    const durableEffect = this.options.store.getEffect(input.effect.jobId, input.effect.idempotencyKey);
+    const explicitNow = retryOptions?.now ?? input.now;
+    const freshNow = (): number => {
+      const now = explicitNow ?? this.clock();
+      assertNow(now);
+      return now;
+    };
+    freshNow();
+    let durableEffect: StoredEffect | null;
+    try {
+      durableEffect = this.options.store.getEffect(input.effect.jobId, input.effect.idempotencyKey);
+    } catch {
+      if (input.leaseOwner !== undefined && input.leaseGeneration !== undefined) {
+        this.options.store.failMergeEffect({
+          jobId: input.effect.jobId,
+          effectIdempotencyKey: input.effect.idempotencyKey,
+          reason: "Invalid durable merge receipt",
+          now: freshNow(),
+          leaseOwner: input.leaseOwner,
+          leaseGeneration: input.leaseGeneration,
+        });
+      }
+      return { outcome: "failed" };
+    }
     if (!durableEffect) return { outcome: "failed" };
     if (durableEffect.jobId !== input.effect.jobId || durableEffect.idempotencyKey !== input.effect.idempotencyKey) {
       return { outcome: "failed" };
@@ -414,7 +435,7 @@ export class MergeHandler {
         jobId: effect.jobId,
         effectIdempotencyKey: effect.idempotencyKey,
         reason: "Invalid durable merge receipt",
-        now,
+        now: freshNow(),
         leaseOwner: input.leaseOwner,
         leaseGeneration: input.leaseGeneration,
       });
@@ -430,28 +451,39 @@ export class MergeHandler {
         effectIdempotencyKey: effect.idempotencyKey,
         leaseOwner: input.leaseOwner,
         leaseGeneration: input.leaseGeneration,
-        now,
+        now: freshNow(),
       });
-      if (!prepared.ok) return { outcome: "failed" };
-      return this.finishProviderAttempt(prepared, input, now);
+      if (!prepared.ok) {
+        this.options.store.failMergeEffect({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          reason: safeFailureReason(prepared.reason, "Merge effect fence rejected the provider call"),
+          now: freshNow(),
+          leaseOwner: input.leaseOwner,
+          leaseGeneration: input.leaseGeneration,
+        });
+        return { outcome: "failed" };
+      }
+      return this.finishProviderAttempt(prepared, input, freshNow);
     }
 
     let collected: GateInput;
     let evaluation: GateEvaluation;
+    const validationNow = freshNow();
     try {
       collected = await this.options.collectGateInput({
         job,
         phase: "pre_merge",
         receipt: storedPayload.receipt as MergeReadyReceipt,
-        now,
+        now: validationNow,
       });
-      evaluation = readyEvaluation(collected, now);
+      evaluation = readyEvaluation(collected, freshNow());
     } catch (error) {
       this.options.store.failMergeEffect({
         jobId: effect.jobId,
         effectIdempotencyKey: effect.idempotencyKey,
         reason: safeFailureReason(error, "Fresh merge validation failed"),
-        now,
+        now: freshNow(),
         leaseOwner: input.leaseOwner,
         leaseGeneration: input.leaseGeneration,
       });
@@ -462,7 +494,7 @@ export class MergeHandler {
         jobId: effect.jobId,
         effectIdempotencyKey: effect.idempotencyKey,
         reason: "APPROVAL_STALE: fresh pre-merge evidence no longer matches the accepted receipt",
-        now,
+        now: freshNow(),
         leaseOwner: input.leaseOwner,
         leaseGeneration: input.leaseGeneration,
       });
@@ -474,20 +506,20 @@ export class MergeHandler {
       effectIdempotencyKey: effect.idempotencyKey,
       leaseOwner: input.leaseOwner,
       leaseGeneration: input.leaseGeneration,
-      now,
+      now: freshNow(),
     });
     if (!prepared.ok) {
       this.options.store.failMergeEffect({
         jobId: effect.jobId,
         effectIdempotencyKey: effect.idempotencyKey,
         reason: safeFailureReason(prepared.reason, "Merge effect fence rejected the provider call"),
-        now,
+        now: freshNow(),
         leaseOwner: input.leaseOwner,
         leaseGeneration: input.leaseGeneration,
       });
       return { outcome: "failed" };
     }
-    return this.finishProviderAttempt(prepared, input, now);
+    return this.finishProviderAttempt(prepared, input, freshNow);
   }
 
   public async runMergeEffect(
@@ -500,9 +532,27 @@ export class MergeHandler {
   private async finishProviderAttempt(
     prepared: Extract<MergeCallPreparation, { ok: true }>,
     input: ExecuteMergeEffectInput,
-    now: number,
+    freshNow: () => number,
   ): Promise<MergeEffectResult> {
     const { effect, job, receipt } = prepared;
+    const sdkFence = this.options.store.prepareMergeCall({
+      jobId: effect.jobId,
+      effectIdempotencyKey: effect.idempotencyKey,
+      leaseOwner: input.leaseOwner!,
+      leaseGeneration: input.leaseGeneration!,
+      now: freshNow(),
+    });
+    if (!sdkFence.ok) {
+      this.options.store.failMergeEffect({
+        jobId: effect.jobId,
+        effectIdempotencyKey: effect.idempotencyKey,
+        reason: safeFailureReason(sdkFence.reason, "Merge effect fence rejected the provider call"),
+        now: freshNow(),
+        leaseOwner: input.leaseOwner!,
+        leaseGeneration: input.leaseGeneration!,
+      });
+      return { outcome: "failed" };
+    }
     if (prepared.shouldCallProvider) {
       try {
         await this.options.bb.sdk.environments.mergePullRequest({
@@ -514,7 +564,7 @@ export class MergeHandler {
           jobId: effect.jobId,
           effectIdempotencyKey: effect.idempotencyKey,
           reason: safeFailureReason(error, "merge provider call outcome is unknown; manual reconciliation required"),
-          now,
+          now: freshNow(),
           leaseOwner: input.leaseOwner!,
           leaseGeneration: input.leaseGeneration!,
         });
@@ -522,9 +572,38 @@ export class MergeHandler {
       }
     }
 
+    const completionFence = this.options.store.prepareMergeCall({
+      jobId: effect.jobId,
+      effectIdempotencyKey: effect.idempotencyKey,
+      leaseOwner: input.leaseOwner!,
+      leaseGeneration: input.leaseGeneration!,
+      now: freshNow(),
+    });
+    if (!completionFence.ok) {
+      this.options.store.failMergeEffect({
+        jobId: effect.jobId,
+        effectIdempotencyKey: effect.idempotencyKey,
+        reason: safeFailureReason(completionFence.reason, "Merge completion fence rejected the changed job state"),
+        now: freshNow(),
+        leaseOwner: input.leaseOwner!,
+        leaseGeneration: input.leaseGeneration!,
+      });
+      return { outcome: "failed" };
+    }
+
     let confirmed: { ok: true; result: Record<string, unknown> } | { ok: false; reason: string };
     try {
-      confirmed = await this.confirmPostMerge(receipt as MergeReadyReceipt, now);
+      confirmed = await this.confirmPostMerge(
+        completionFence.receipt as MergeReadyReceipt,
+        freshNow,
+        (now) => this.options.store.prepareMergeCall({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          leaseOwner: input.leaseOwner!,
+          leaseGeneration: input.leaseGeneration!,
+          now,
+        }).ok,
+      );
     } catch (error) {
       confirmed = { ok: false, reason: safeFailureReason(error, "post-merge provider truth is unavailable") };
     }
@@ -533,33 +612,46 @@ export class MergeHandler {
         jobId: effect.jobId,
         effectIdempotencyKey: effect.idempotencyKey,
         reason: confirmed.reason,
-        now,
+        now: freshNow(),
         leaseOwner: input.leaseOwner!,
         leaseGeneration: input.leaseGeneration!,
       });
       return { outcome: "failed" };
     }
 
-    const completed = this.options.store.completeMergeSuccess({
-      jobId: effect.jobId,
-      effectIdempotencyKey: effect.idempotencyKey,
-      message: `Merged PR #${String(receipt.prNumber)} for ${job.projectId ?? "the selected project"}.`,
-      result: confirmed.result,
-      outbox: {
-        logicalKey: `${effect.jobId}:${effect.idempotencyKey}:completion`,
-        chatId: receipt.approvalOwnerChatId,
-        payload: completionPayload(job, receipt.prNumber),
-      },
-      now,
-      leaseOwner: input.leaseOwner!,
-      leaseGeneration: input.leaseGeneration!,
-    });
+    let completed: boolean;
+    try {
+      completed = this.options.store.completeMergeSuccess({
+        jobId: effect.jobId,
+        effectIdempotencyKey: effect.idempotencyKey,
+        message: `Merged PR #${String(receipt.prNumber)} for ${job.projectId ?? "the selected project"}.`,
+        result: confirmed.result,
+        outbox: {
+          logicalKey: `${effect.jobId}:${effect.idempotencyKey}:completion`,
+          chatId: receipt.approvalOwnerChatId,
+          payload: completionPayload(job, receipt.prNumber),
+        },
+        now: freshNow(),
+        leaseOwner: input.leaseOwner!,
+        leaseGeneration: input.leaseGeneration!,
+      });
+    } catch (error) {
+      this.options.store.failMergeEffect({
+        jobId: effect.jobId,
+        effectIdempotencyKey: effect.idempotencyKey,
+        reason: safeFailureReason(error, "Merge completion could not be persisted"),
+        now: freshNow(),
+        leaseOwner: input.leaseOwner!,
+        leaseGeneration: input.leaseGeneration!,
+      });
+      return { outcome: "failed" };
+    }
     if (completed) return { outcome: "merged" };
     this.options.store.failMergeEffect({
       jobId: effect.jobId,
       effectIdempotencyKey: effect.idempotencyKey,
       reason: "Merge completion fence rejected the changed job state",
-      now,
+      now: freshNow(),
       leaseOwner: input.leaseOwner!,
       leaseGeneration: input.leaseGeneration!,
     });
@@ -571,7 +663,7 @@ export class MergeHandler {
       if (effect.kind !== "merge_pr") return false;
       if (effect.status === "failed" || effect.status === "dead") return false;
       try {
-        const payload = effectPayload(effect);
+        const payload = parsePersistedMergeEffectPayload(effect.payload, effect.status);
         return payload.mergeOutcome !== "stale" && payload.headSha === headSha;
       } catch {
         return false;
@@ -581,8 +673,12 @@ export class MergeHandler {
 
   private async confirmPostMerge(
     receipt: MergeReadyReceipt,
-    now: number,
+    freshNow: () => number,
+    checkFence: (now: number) => boolean,
   ): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; reason: string }> {
+    if (!checkFence(freshNow())) {
+      return { ok: false, reason: "post-merge effect fence rejected the Git head confirmation" };
+    }
     const headResult = await this.options.commandRunner.run({
       scope: { kind: "environment", environmentId: receipt.environmentId },
       title: "Telegram post-merge Git head confirmation",
@@ -602,6 +698,9 @@ export class MergeHandler {
       return { ok: false, reason: "post-merge Git-native head does not equal the approved head" };
     }
 
+    if (!checkFence(freshNow())) {
+      return { ok: false, reason: "post-merge effect fence rejected the GitHub confirmation" };
+    }
     const prResult = await this.options.commandRunner.run({
       scope: { kind: "environment", environmentId: receipt.environmentId },
       title: "Telegram post-merge GitHub confirmation",
@@ -668,7 +767,7 @@ export class MergeHandler {
           url: typeof pr.url === "string" ? pr.url.slice(0, 500) : null,
           state: pr.state,
         },
-        confirmedAt: new Date(now).toISOString(),
+        confirmedAt: new Date(freshNow()).toISOString(),
       },
     };
   }
