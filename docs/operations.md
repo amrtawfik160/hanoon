@@ -1,10 +1,18 @@
 # Operations
 
-Telegram Agent keeps controller turns, jobs, effects, approvals, worker liveness, and Telegram delivery state in its plugin database. Operational decisions should come from those durable records and BB's live thread/environment state—not from elapsed time or a missing process alone.
+Telegram Agent keeps controller turns, memories, monitors, tool receipts, jobs, effects, approvals, worker liveness, and Telegram delivery state in its plugin database. Operational decisions should come from those durable records and BB's live thread/environment state—not from elapsed time or a missing process alone.
 
 ## Health
 
-Check plugin and service state:
+Send `/health` in the paired chat. It is answered from durable state rather than by the agent, so it still reports when the agent itself is the stuck part:
+
+```text
+/health
+```
+
+A healthy reply confirms the executor is running and reports queued job steps, waiting messages, armed monitors, and stored memories. An unhealthy reply names each problem: an executor lease that is not current, job steps that gave up, messages that could not be delivered, failed Telegram updates, failed monitors, unavailable memory search, or a database integrity fault.
+
+From a shell:
 
 ```bash
 bb plugin list --json
@@ -16,6 +24,23 @@ bb plugin logs telegram-agent -n 50
 A healthy loaded plugin reports `running` with both `telegram-ingress` and `job-executor` services running. The global doctor requires a configured token and paired owner. The project doctor reports every failing prerequisite and returns a non-zero exit code if the project is not ready.
 
 Use `--json` on Telegram Agent commands when another tool must consume the result.
+
+## Memory and monitors
+
+Both are owner-facing in the chat rather than through the CLI:
+
+- ask what it remembers, or tell it something is wrong and to forget it;
+- ask what it is watching, or to stop watching something.
+
+Memories are bounded per scope; when the bound is reached the weakest is dropped, so recall stays useful rather than unbounded. Credential-shaped text is refused at the write, so a pasted token never enters memory or the search index.
+
+An invalid cron expression is rejected when the monitor is created. A schedule that later cannot be advanced is marked failed and reported by `/health` rather than retried forever.
+
+## Thread notices
+
+Notices about top-level threads are automatic; nothing needs arming. The plugin records each thread the first time it sees it and reports later moves into `idle` or `error`, so a freshly installed or restarted plugin does not replay a backlog.
+
+If a thread seems stuck and you were told nothing, check that it is top-level — a sub-agent's thread is reported to its parent, not to you — and that it is `visible`. To recover a controller thread that has wedged, `bb thread archive <id>`: the plugin reads the archived thread as missing and opens a fresh session on its own, which is safer than editing the database.
 
 ## Inspect jobs
 

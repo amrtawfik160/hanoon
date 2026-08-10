@@ -360,6 +360,31 @@ export class TelegramIngress {
       );
       return;
     }
+    if (action.type === "thread_interaction") {
+      const answered = this.store.answerThreadInteraction({
+        token: action.token,
+        userId: identity.userId,
+        chatId: identity.chatId,
+        now,
+      });
+      const recorded = this.store.recordCallback(
+        callback.id,
+        null,
+        "thread_interaction",
+        answered.ok ? "accepted" : answered.reason,
+        now,
+      );
+      if (recorded) {
+        this.enqueueCallbackAnswer(
+          callback.id,
+          identity.chatId,
+          answered.ok ? answered.label : "That thread is no longer waiting on you.",
+          now,
+        );
+      }
+      if (answered.ok && recorded) this.onWorkAvailable();
+      return;
+    }
     if (action.type === "question") {
       const answered = this.store.answerControllerQuestion({
         token: action.token,

@@ -33,6 +33,9 @@ import {
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
+import { MonitorService } from "./services/monitor-service";
+import { ThreadNoticeService } from "./services/thread-notice-service";
+import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
 import { runProductionStage } from "./services/production-runner";
@@ -53,7 +56,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     controllerModel: {
       type: "select",
       label: "Controller model",
-      description: "Codex model for subsequent Telegram conversation turns. Job workers remain project-controlled.",
+      description: "Model for Telegram conversation turns. Claude models run on Claude Code, gpt models on Codex. Job workers remain project-controlled.",
       options: [...CONTROLLER_MODELS],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.model,
     },
@@ -67,7 +70,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     controllerServiceTier: {
       type: "select",
       label: "Controller service tier",
-      description: "Fast prioritizes latency; default uses the provider's standard tier.",
+      description: "Codex only. Fast prioritizes latency; default uses the provider's standard tier. Ignored by Claude models.",
       options: [...CONTROLLER_SERVICE_TIERS],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier,
     },
@@ -116,6 +119,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     store,
     sdk: bb.sdk,
     threadOperations,
+    health: (now) => buildHealthReport(bb.storage.database(), now),
     notify: () => executorNudge.notify(),
     now: clock,
   });
@@ -331,11 +335,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     bb: { sdk: bb.sdk },
     collectGateInput,
   });
+  const health = (now: number) => buildHealthReport(bb.storage.database(), now);
   const ingress = new TelegramIngress({
     store,
     telegram: telegramTransport,
     mergeHandler,
     onWorkAvailable: () => executorNudge.notify(),
+    health,
   });
   const controller = new LunaControllerService({
     store,
@@ -348,6 +354,51 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       },
     }),
     clock: { now: clock },
+  });
+  const monitors = new MonitorService({
+    store,
+    threads: {
+      status: async (threadId) => {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
+        return thread.status;
+      },
+    },
+    clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
+  });
+  const threadNotices = new ThreadNoticeService({
+    store,
+    threads: {
+      listWatchable: async () => {
+        const threads = await bb.sdk.threads.list({ includeHidden: false, archived: false, limit: 100 });
+        return threads
+          .filter((thread) => thread.visibility === "visible" && thread.archivedAt === null && thread.deletedAt === null)
+          .map((thread) => ({
+            id: thread.id,
+            title: thread.title ?? thread.titleFallback ?? "Untitled thread",
+            status: thread.status,
+            parentThreadId: thread.parentThreadId,
+          }));
+      },
+      interactions: async (threadId) => {
+        const pending = await bb.sdk.threads.interactions.list({ threadId });
+        return pending.map((interaction) => ({
+          id: interaction.id,
+          status: interaction.status,
+          payload: interaction.payload,
+        }));
+      },
+      resolve: async (threadId, interactionId, resolution) => {
+        await bb.sdk.threads.interactions.resolve({
+          threadId,
+          interactionId,
+          resolution: resolution as Parameters<typeof bb.sdk.threads.interactions.resolve>[0]["resolution"],
+        });
+      },
+    },
+    clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
   });
   const presence = new TelegramPresenceCoordinator({
     store,
@@ -577,6 +628,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       ingress,
       getConfig: () => config,
       clock: { now: clock },
+      warn: (message) => bb.log.warn(message),
     }, signal),
   });
   bb.background.service("job-executor", {
@@ -599,6 +651,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       releaseOnShutdown: true,
       controller,
       operations: threadOperations,
+      monitors,
+      threadNotices,
       presence,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),
     }, signal),

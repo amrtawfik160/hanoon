@@ -112,7 +112,11 @@ export type RenderedQuestion = {
  * question it belongs to, so asking them in sequence is what keeps a tap
  * unambiguous.
  */
-export function renderQuestion(interactionId: string, question: ControllerQuestion): RenderedQuestion {
+export function renderQuestion(
+  interactionId: string,
+  question: ControllerQuestion,
+  callbackPrefix = "q",
+): RenderedQuestion {
   const lines = [question.prompt];
   for (const option of question.options) {
     lines.push(option.description === null ? `• ${option.label}` : `• ${option.label} — ${option.description}`);
@@ -123,7 +127,84 @@ export function renderQuestion(interactionId: string, question: ControllerQuesti
     reply_markup: {
       inline_keyboard: question.options.map((option) => [{
         text: option.label,
-        callback_data: `q:${questionOptionToken(interactionId, question.id, option.value)}`,
+        callback_data: `${callbackPrefix}:${questionOptionToken(interactionId, question.id, option.value)}`,
+      }]),
+    },
+  };
+}
+
+/** What a worker thread is blocked on: a question, or a permission request. */
+export type ThreadApprovalDecision = "allow_once" | "allow_for_session" | "deny";
+export type ThreadInteraction =
+  | { kind: "user_question"; interactionId: string; questions: ControllerQuestion[] }
+  | { kind: "approval"; interactionId: string; summary: string; decisions: ThreadApprovalDecision[] };
+
+const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
+  allow_once: "Allow once",
+  allow_for_session: "Allow all session",
+  deny: "Deny",
+};
+
+function approvalSummary(subject: Record<string, unknown>): string | null {
+  if (subject.kind === "command") {
+    const command = boundedString(subject.command, MAX_PROMPT);
+    if (!command) return null;
+    const cwd = boundedString(subject.cwd, 120);
+    return cwd ? `wants to run:\n\n\`${command}\`\n\nin ${cwd}` : `wants to run:\n\n\`${command}\``;
+  }
+  if (subject.kind === "file_change") {
+    const scope = boundedString(subject.writeScope, 200);
+    return scope ? `wants to write files under ${scope}` : "wants to write files";
+  }
+  return null;
+}
+
+/**
+ * Reads whatever a thread is waiting on into something answerable from a phone.
+ * An interaction the plugin cannot represent returns null: the owner is told the
+ * thread is blocked rather than shown buttons that would resolve it wrongly.
+ */
+export function parseThreadInteraction(interactionId: unknown, payload: unknown): ThreadInteraction | null {
+  if (typeof interactionId !== "string" || interactionId.length === 0) return null;
+  if (typeof payload !== "object" || payload === null) return null;
+  const candidate = payload as Record<string, unknown>;
+  if (candidate.kind === "user_question") {
+    const question = parsePendingQuestion(interactionId, payload);
+    return question ? { kind: "user_question", interactionId, questions: question.questions } : null;
+  }
+  if (candidate.kind !== "approval") return null;
+  const subject = candidate.subject;
+  if (typeof subject !== "object" || subject === null) return null;
+  const summary = approvalSummary(subject as Record<string, unknown>);
+  if (!summary) return null;
+  const offered = Array.isArray(candidate.decisions) ? candidate.decisions : Object.keys(APPROVAL_LABELS);
+  const decisions = (Object.keys(APPROVAL_LABELS) as ThreadApprovalDecision[])
+    .filter((decision) => offered.includes(decision));
+  if (decisions.length === 0) return null;
+  return { kind: "approval", interactionId, summary, decisions };
+}
+
+export function threadDecisionToken(interactionId: string, decision: string): string {
+  return createHash("sha256")
+    .update(`thread-interaction:${interactionId}:${decision}`, "utf8")
+    .digest("base64url")
+    .slice(0, 32);
+}
+
+/** The message that asks the owner to unblock a thread, with its buttons. */
+export function renderThreadInteraction(title: string, interaction: ThreadInteraction): RenderedQuestion {
+  if (interaction.kind === "user_question") {
+    const first = interaction.questions[0];
+    if (!first) throw new TypeError("a thread question must have a question");
+    const rendered = renderQuestion(interaction.interactionId, first, "w");
+    return { ...rendered, text: `*${title}* needs your answer.\n\n${rendered.text}` };
+  }
+  return {
+    text: `*${title}* ${interaction.summary}`,
+    reply_markup: {
+      inline_keyboard: interaction.decisions.map((decision) => [{
+        text: APPROVAL_LABELS[decision],
+        callback_data: `w:${threadDecisionToken(interaction.interactionId, decision)}`,
       }]),
     },
   };

@@ -29,9 +29,16 @@ export type JobExecutorDependencies = {
   controller?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
     reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
+    isStreaming?(): boolean;
   };
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
+  };
+  monitors?: {
+    processDue(): Promise<boolean>;
+  };
+  threadNotices?: {
+    processDue(): Promise<boolean>;
   };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
@@ -44,6 +51,10 @@ const LEASE_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
 const ACTIVE_POLL_MS = 1_000;
 const IDLE_POLL_MS = 60_000;
+// A streaming reply reaches Telegram once per loop pass, so the ordinary active
+// wait is also the draft's frame rate: a whole second of output lands in one
+// jump. While an answer is arriving the loop runs at roughly draft speed.
+const STREAM_POLL_MS = 250;
 const PERMANENT_EFFECT_ERROR_NAMES = new Set([
   "TypeError",
   "SyntaxError",
@@ -107,10 +118,14 @@ function controllerTurnId(logicalKey: string): string | null {
   return match?.[1] ?? null;
 }
 
-function stableControllerDraftId(turnId: string): number {
+// Telegram keys an ephemeral draft by (chat, draft_id) and offers no way to
+// clear one, so one id per turn leaves the previous turn's 30-second preview
+// standing beside its own persisted answer. One id per chat means every new
+// turn overwrites that preview instead of stacking a second copy of the reply.
+function stableChatDraftId(chatId: string): number {
   let hash = 2_166_136_261;
-  for (let index = 0; index < turnId.length; index += 1) {
-    hash = Math.imul(hash ^ turnId.charCodeAt(index), 16_777_619);
+  for (let index = 0; index < chatId.length; index += 1) {
+    hash = Math.imul(hash ^ chatId.charCodeAt(index), 16_777_619);
   }
   return ((hash >>> 0) & 0x7fff_ffff) || 1;
 }
@@ -207,6 +222,12 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         if (deps.operations) {
           didWork = await deps.operations.processOne(effectFence, workAbort.signal) || didWork;
         }
+        if (deps.monitors) {
+          didWork = await deps.monitors.processDue() || didWork;
+        }
+        if (deps.threadNotices) {
+          didWork = await deps.threadNotices.processDue() || didWork;
+        }
         const jobs = deps.store.listJobs(1_000);
         for (const job of jobs) {
           if (isTerminal(job)) continue;
@@ -286,7 +307,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             ) {
               await telegram.sendMessageDraft(
                 item.chatId,
-                stableControllerDraftId(turnId),
+                stableChatDraftId(item.chatId),
                 controllerTurn.streamText,
               );
             } else if (knownMessageId !== null) {
@@ -413,7 +434,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           if (leaseLost) continueAcquiring = true;
           break;
         }
-        const ordinaryWaitMs = didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+        const ordinaryWaitMs = deps.controller?.isStreaming?.()
+          ? STREAM_POLL_MS
+          : didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS;
         const waitMs = presenceWaitMs === null
           ? ordinaryWaitMs
           : Math.min(ordinaryWaitMs, Math.max(1, presenceWaitMs));

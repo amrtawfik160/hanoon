@@ -473,6 +473,29 @@ CREATE TABLE controller_questions (
 CREATE INDEX controller_questions_pending ON controller_questions (controller_key, state, asked_at);
 `] as const;
 
+export const THREAD_NOTICE_MIGRATIONS = [String.raw`
+CREATE TABLE observed_threads (
+  thread_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  last_status TEXT NOT NULL,
+  notified_status TEXT,
+  first_seen_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE thread_interactions (
+  interaction_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user_question', 'approval')),
+  payload_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answer_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER
+);
+CREATE INDEX thread_interactions_state ON thread_interactions (state, asked_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -487,4 +510,5 @@ export const ALL_MIGRATIONS = [
   ...MONITOR_MIGRATIONS,
   ...CONTINUITY_MIGRATIONS,
   ...CONTROLLER_QUESTION_MIGRATIONS,
+  ...THREAD_NOTICE_MIGRATIONS,
 ] as const;

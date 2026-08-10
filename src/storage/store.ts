@@ -27,8 +27,11 @@ import {
   nextUnansweredQuestion,
   questionOptionToken,
   renderQuestion,
+  renderThreadInteraction,
+  threadDecisionToken,
   type ControllerQuestion,
   type ControllerQuestionAnswers,
+  type ThreadInteraction,
 } from "../controller/questions";
 
 type PluginStorage = BbPluginApi["storage"];
@@ -565,6 +568,34 @@ export type ControllerQuestionRecord = {
   questions: ControllerQuestion[];
   answers: ControllerQuestionAnswers;
   askedAt: number;
+};
+type ObservedThreadRow = {
+  thread_id: string;
+  title: string;
+  last_status: string;
+  notified_status: string | null;
+  first_seen_at: number;
+  updated_at: number;
+};
+type ThreadInteractionRow = {
+  interaction_id: string;
+  thread_id: string;
+  title: string;
+  kind: ThreadInteraction["kind"];
+  payload_json: string;
+  state: "pending" | "answered" | "delivered";
+  answer_json: string | null;
+  asked_at: number;
+  answered_at: number | null;
+};
+export type ThreadInteractionAnswer =
+  | { ok: true; interactionId: string; threadId: string; title: string; label: string }
+  | { ok: false; reason: "stale" };
+export type ThreadInteractionDelivery = {
+  interactionId: string;
+  threadId: string;
+  title: string;
+  resolution: Record<string, unknown>;
 };
 export type ControllerQuestionAnswer =
   | {
@@ -1585,6 +1616,30 @@ export interface TelegramAgentStore {
     text: string;
     now: number;
   }): ControllerQuestionAnswer;
+  observeThread(input: {
+    threadId: string;
+    title: string;
+    status: string;
+    chatId: string;
+    now: number;
+  }): "finished" | "failed" | null;
+  recordThreadInteraction(input: {
+    interactionId: string;
+    threadId: string;
+    title: string;
+    interaction: ThreadInteraction;
+    chatId: string;
+    now: number;
+  }): boolean;
+  answerThreadInteraction(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ThreadInteractionAnswer;
+  getAnsweredThreadInteraction(): ThreadInteractionDelivery | null;
+  markThreadInteractionDelivered(interactionId: string, now: number): boolean;
+  discardThreadInteractions(threadId: string, keep: readonly string[]): number;
   getPendingControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
   getAnsweredControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
   markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string }): boolean;
@@ -2070,6 +2125,38 @@ function parseMemory(row: MemoryRow): MemoryRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/**
+ * Recovers which button was tapped. Callback data carries only a digest, so the
+ * candidates are re-derived from the stored interaction and compared.
+ */
+function matchThreadInteractionToken(
+  interaction: ThreadInteraction,
+  token: string,
+): { label: string; resolution: Record<string, unknown> } | null {
+  if (interaction.kind === "approval") {
+    for (const decision of interaction.decisions) {
+      if (threadDecisionToken(interaction.interactionId, decision) !== token) continue;
+      return {
+        label: decision === "deny" ? "Denied" : "Allowed",
+        resolution: decision === "deny"
+          ? { decision }
+          : { decision, grantedPermissions: null },
+      };
+    }
+    return null;
+  }
+  for (const question of interaction.questions) {
+    for (const option of question.options) {
+      if (questionOptionToken(interaction.interactionId, question.id, option.value) !== token) continue;
+      return {
+        label: option.label,
+        resolution: { kind: "user_answer", answers: { [question.id]: { selected: [option.value] } } },
+      };
+    }
+  }
+  return null;
 }
 
 function controllerFailureOutbox(turnId: string, chatId: string, ownerMessage?: string): OutboxInput {
@@ -3130,6 +3217,167 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       });
       return true;
     }).immediate();
+  }
+
+  /**
+   * Records where a watched thread stands and returns the notice the owner is
+   * owed, if any. A thread first seen already finished is recorded silently:
+   * the owner wants to hear about threads that finish while they are watching,
+   * not a backlog of every thread that ever ran.
+   */
+  public observeThread(input: {
+    threadId: string;
+    title: string;
+    status: string;
+    chatId: string;
+    now: number;
+  }): "finished" | "failed" | null {
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertControllerText(input.title, "thread title");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): "finished" | "failed" | null => {
+      const known = this.db.prepare("SELECT * FROM observed_threads WHERE thread_id = ?")
+        .get(input.threadId) as ObservedThreadRow | undefined;
+      if (!known) {
+        this.db.prepare(
+          `INSERT INTO observed_threads
+             (thread_id, title, last_status, notified_status, first_seen_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(input.threadId, input.title, input.status, input.status, input.now, input.now);
+        return null;
+      }
+      this.db.prepare(
+        "UPDATE observed_threads SET title = ?, last_status = ?, updated_at = ? WHERE thread_id = ?",
+      ).run(input.title, input.status, input.now, input.threadId);
+      if (input.status === known.notified_status) return null;
+      this.db.prepare("UPDATE observed_threads SET notified_status = ? WHERE thread_id = ?")
+        .run(input.status, input.threadId);
+      const notice = input.status === "idle" ? "finished" : input.status === "error" ? "failed" : null;
+      if (notice === null) return null;
+      persistControllerOutbox(this.db, {
+        logicalKey: `thread:${input.threadId}:${input.status}`,
+        chatId: input.chatId,
+        payload: {
+          ...formattedMessage(`*${input.title}* ${notice}.`),
+          disable_web_page_preview: true,
+        },
+      }, input.now);
+      return notice;
+    }).immediate();
+  }
+
+  /** Asks the owner to unblock a thread that is waiting on a decision. */
+  public recordThreadInteraction(input: {
+    interactionId: string;
+    threadId: string;
+    title: string;
+    interaction: ThreadInteraction;
+    chatId: string;
+    now: number;
+  }): boolean {
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertControllerText(input.title, "thread title");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      const known = this.db.prepare("SELECT 1 FROM thread_interactions WHERE interaction_id = ?")
+        .get(input.interactionId);
+      if (known) return false;
+      this.db.prepare(
+        `INSERT INTO thread_interactions
+           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)`,
+      ).run(
+        input.interactionId,
+        input.threadId,
+        input.title,
+        input.interaction.kind,
+        JSON.stringify(input.interaction),
+        input.now,
+      );
+      const rendered = renderThreadInteraction(input.title, input.interaction);
+      persistControllerOutbox(this.db, {
+        logicalKey: `thread-interaction:${input.interactionId}`,
+        chatId: input.chatId,
+        payload: {
+          ...formattedMessage(rendered.text),
+          reply_markup: rendered.reply_markup,
+          disable_web_page_preview: true,
+        },
+      }, input.now);
+      return true;
+    }).immediate();
+  }
+
+  /** Resolves a watched thread's block from a tapped button. */
+  public answerThreadInteraction(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ThreadInteractionAnswer {
+    assertCanonicalPositiveDecimal(input.userId, "userId");
+    assertCanonicalPositiveDecimal(input.chatId, "chatId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ThreadInteractionAnswer => {
+      const owner = this.db.prepare(
+        `SELECT 1 FROM owners WHERE singleton = 1 AND revoked_at IS NULL
+          AND telegram_user_id = ? AND telegram_chat_id = ?`,
+      ).get(input.userId, input.chatId);
+      if (!owner) return { ok: false, reason: "stale" };
+      const rows = this.db.prepare(
+        "SELECT * FROM thread_interactions WHERE state = 'pending' ORDER BY asked_at DESC LIMIT 20",
+      ).all() as ThreadInteractionRow[];
+      for (const row of rows) {
+        const interaction = JSON.parse(row.payload_json) as ThreadInteraction;
+        const matched = matchThreadInteractionToken(interaction, input.token);
+        if (!matched) continue;
+        const updated = this.db.prepare(
+          `UPDATE thread_interactions SET state = 'answered', answer_json = ?, answered_at = ?
+            WHERE interaction_id = ? AND state = 'pending'`,
+        ).run(JSON.stringify(matched.resolution), input.now, row.interaction_id);
+        if (updated.changes !== 1) return { ok: false, reason: "stale" };
+        return {
+          ok: true,
+          interactionId: row.interaction_id,
+          threadId: row.thread_id,
+          title: row.title,
+          label: matched.label,
+        };
+      }
+      return { ok: false, reason: "stale" };
+    }).immediate();
+  }
+
+  public getAnsweredThreadInteraction(): ThreadInteractionDelivery | null {
+    const row = this.db.prepare(
+      "SELECT * FROM thread_interactions WHERE state = 'answered' ORDER BY answered_at ASC LIMIT 1",
+    ).get() as ThreadInteractionRow | undefined;
+    if (!row || row.answer_json === null) return null;
+    return {
+      interactionId: row.interaction_id,
+      threadId: row.thread_id,
+      title: row.title,
+      resolution: JSON.parse(row.answer_json) as Record<string, unknown>,
+    };
+  }
+
+  public markThreadInteractionDelivered(interactionId: string, now: number): boolean {
+    assertControllerIdentifier(interactionId, "interactionId");
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      "UPDATE thread_interactions SET state = 'delivered' WHERE interaction_id = ? AND state = 'answered'",
+    ).run(interactionId).changes === 1;
+  }
+
+  /** Forgets a block the thread resolved without the owner, so it stops being offered. */
+  public discardThreadInteractions(threadId: string, keep: readonly string[]): number {
+    assertControllerIdentifier(threadId, "threadId");
+    const placeholders = keep.map(() => "?").join(", ");
+    const sql = keep.length === 0
+      ? "DELETE FROM thread_interactions WHERE thread_id = ? AND state = 'pending'"
+      : `DELETE FROM thread_interactions WHERE thread_id = ? AND state = 'pending' AND interaction_id NOT IN (${placeholders})`;
+    return this.db.prepare(sql).run(threadId, ...keep).changes;
   }
 
   /** An answer the owner has given that BB has not been told about yet. */
