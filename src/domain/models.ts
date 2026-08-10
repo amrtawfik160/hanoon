@@ -56,6 +56,65 @@ export const projectPolicySchema = z
 export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
 export type ProjectPolicy = z.infer<typeof projectPolicySchema>;
 
+export type ReviewSeverity = "critical" | "high" | "medium" | "low";
+
+export interface ReviewFinding {
+  severity: ReviewSeverity;
+  file: string | null;
+  line: number | null;
+  title: string;
+  details: string;
+}
+
+export interface ReviewCheck {
+  name: string;
+  command: string | null;
+  outcome: "passed" | "failed" | "blocked";
+  exitCode: number | null;
+  summary: string;
+}
+
+export interface ReviewVerdict {
+  verdict: "pass" | "changes_requested" | "blocked";
+  reviewedHeadSha: string;
+  summary: string;
+  findings: ReviewFinding[];
+  checks: ReviewCheck[];
+}
+
+export type ReviewAssessmentOutcome = "pass" | "changes_requested" | "blocked";
+
+export interface ReviewAssessment {
+  outcome: ReviewAssessmentOutcome;
+  reasons: string[];
+  findings: ReviewFinding[];
+}
+
+export type ReviewAttemptOutcome = ReviewAssessmentOutcome | "format_correction_sent";
+
+export interface ReviewAttemptResult {
+  outcome: ReviewAttemptOutcome;
+  reasons: string[];
+  findings: ReviewFinding[];
+  reviewedHeadSha: string | null;
+  verdict?: ReviewVerdict;
+  formatCorrectionSent?: boolean;
+}
+
+export interface ReviewAttempt {
+  id: string;
+  jobId: string;
+  kind: "review";
+  ordinal: number;
+  threadId: string | null;
+  headSha: string;
+  formatCorrectionSent: boolean;
+  requiresNewHead: boolean;
+  result: ReviewAttemptResult | null;
+  createdAt: number;
+  completedAt: number | null;
+}
+
 export type JobState =
   | "awaiting_project"
   | "awaiting_confirmation"
