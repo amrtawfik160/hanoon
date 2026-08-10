@@ -155,6 +155,56 @@ export type MergeEffectPayload = {
   mergeOutcome?: "stale";
 };
 
+export type StaleMergeTombstone = {
+  mergeOutcome: "stale";
+  jobId: string;
+  effectIdempotencyKey: string;
+};
+
+export type PersistedMergeEvidence =
+  | {
+      disposition: "failed" | "dead";
+      status: "failed" | "dead";
+      jobId: string;
+      effectIdempotencyKey: string;
+    }
+  | {
+      disposition: "stale";
+      status: "done";
+      jobId: string;
+      effectIdempotencyKey: string;
+      tombstone: StaleMergeTombstone;
+    }
+  | {
+      disposition: "active";
+      status: "pending" | "leased";
+      jobId: string;
+      effectIdempotencyKey: string;
+      payload: MergeEffectPayload;
+    }
+  | {
+      disposition: "success";
+      status: "done";
+      jobId: string;
+      effectIdempotencyKey: string;
+      payload: MergeEffectPayload;
+      result: PersistedMergeSuccessResult;
+    };
+
+export type PersistedMergeEvidenceInput = {
+  idempotencyKey: unknown;
+  jobId: unknown;
+  kind: unknown;
+  status: unknown;
+  payload: unknown;
+};
+
+export function isReplayableMergeEvidence(
+  evidence: PersistedMergeEvidence,
+): evidence is Extract<PersistedMergeEvidence, { disposition: "active" | "success" }> {
+  return evidence.disposition === "active" || evidence.disposition === "success";
+}
+
 export type MergeCallPreparation =
   | {
       ok: true;
@@ -774,6 +824,251 @@ export function parsePersistedMergeEffectPayload(
   const { mergeResult, ...activePayload } = persisted;
   parsePersistedMergeSuccessResult(mergeResult);
   return parseMergeEffectPayload(activePayload);
+}
+
+function parseActiveMergeEffectPayload(value: unknown): MergeEffectPayload {
+  const payload = parseMergeEffectPayload(value);
+  if (payload.mergeOutcome !== undefined) {
+    throw new TypeError("an active merge effect cannot have a terminal stale outcome");
+  }
+  return payload;
+}
+
+function parseStaleMergeTombstone(
+  value: unknown,
+  jobId: string,
+  effectIdempotencyKey: string,
+): StaleMergeTombstone {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("stale merge tombstone must be a JSON object");
+  }
+  const tombstone = value as Record<string, unknown>;
+  assertExactObjectKeys(
+    tombstone,
+    ["mergeOutcome", "jobId", "effectIdempotencyKey"],
+    "stale merge tombstone",
+  );
+  if (tombstone.mergeOutcome !== "stale") {
+    throw new TypeError("stale merge tombstone outcome is invalid");
+  }
+  assertBoundedString(tombstone.jobId, "stale merge tombstone.jobId");
+  assertBoundedString(tombstone.effectIdempotencyKey, "stale merge tombstone.effectIdempotencyKey", MAX_EFFECT_KEY);
+  assertNoRawMergeCallback(tombstone.jobId, "stale merge tombstone.jobId");
+  assertNoRawMergeCallback(tombstone.effectIdempotencyKey, "stale merge tombstone.effectIdempotencyKey");
+  if (tombstone.jobId !== jobId || tombstone.effectIdempotencyKey !== effectIdempotencyKey) {
+    throw new TypeError("stale merge tombstone identity does not match its effect");
+  }
+  return {
+    mergeOutcome: "stale",
+    jobId: tombstone.jobId,
+    effectIdempotencyKey: tombstone.effectIdempotencyKey,
+  };
+}
+
+type PersistedMergeStatus = "pending" | "leased" | "done" | "failed" | "dead";
+
+function parseMergeEvidenceIdentity(input: PersistedMergeEvidenceInput): {
+  jobId: string;
+  effectIdempotencyKey: string;
+  status: PersistedMergeStatus;
+} {
+  assertBoundedString(input.jobId, "merge effect.jobId");
+  assertBoundedString(input.idempotencyKey, "merge effect.idempotencyKey", MAX_EFFECT_KEY);
+  assertNoRawMergeCallback(input.jobId, "merge effect.jobId");
+  assertNoRawMergeCallback(input.idempotencyKey, "merge effect.idempotencyKey");
+  if (input.kind !== "merge_pr") throw new TypeError("merge evidence kind is not merge_pr");
+  if (input.status !== "pending" && input.status !== "leased" && input.status !== "done" &&
+      input.status !== "failed" && input.status !== "dead") {
+    throw new TypeError("merge evidence status is invalid");
+  }
+  return {
+    jobId: input.jobId,
+    effectIdempotencyKey: input.idempotencyKey,
+    status: input.status,
+  };
+}
+
+function parseTerminalMergeEvidence(
+  payload: unknown,
+  status: "failed" | "dead",
+  jobId: string,
+  effectIdempotencyKey: string,
+): PersistedMergeEvidence {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("failed merge effect payload must be a JSON object");
+  }
+  const cleanupPayload = payload as Record<string, unknown>;
+  assertExactObjectKeys(cleanupPayload, ["mergeCleanup"], `${status} merge effect payload`);
+  if (cleanupPayload.mergeCleanup !== "failed") {
+    throw new TypeError(`${status} merge effect cleanup outcome is invalid`);
+  }
+  return { disposition: status, status, jobId, effectIdempotencyKey };
+}
+
+function parseStaleMergeEvidence(
+  payload: unknown,
+  jobId: string,
+  effectIdempotencyKey: string,
+): PersistedMergeEvidence {
+  return {
+    disposition: "stale",
+    status: "done",
+    jobId,
+    effectIdempotencyKey,
+    tombstone: parseStaleMergeTombstone(payload, jobId, effectIdempotencyKey),
+  };
+}
+
+function assertMergeReceiptRowBinding(
+  payload: MergeEffectPayload,
+  jobId: string,
+  effectIdempotencyKey: string,
+): void {
+  if (payload.receipt.jobId !== jobId || payload.receipt.effectIdempotencyKey !== effectIdempotencyKey) {
+    throw new TypeError("merge receipt identity does not match its effect");
+  }
+}
+
+function parseSuccessfulMergeEvidence(
+  payload: unknown,
+  jobId: string,
+  effectIdempotencyKey: string,
+): PersistedMergeEvidence {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("done merge effect payload must be a JSON object");
+  }
+  const persisted = payload as Record<string, unknown>;
+  assertExactObjectKeys(
+    persisted,
+    ["headSha", "receipt", "mergeCallStartedAt", "mergeCallOutcome", "mergeResult"],
+    "done merge effect payload",
+  );
+  const { mergeResult, ...activePayload } = persisted;
+  const mergePayload = parseActiveMergeEffectPayload(activePayload);
+  const successResult = parsePersistedMergeSuccessResult(mergeResult);
+  assertMergeReceiptRowBinding(mergePayload, jobId, effectIdempotencyKey);
+  if (
+    successResult.jobId !== jobId ||
+    successResult.effectIdempotencyKey !== effectIdempotencyKey ||
+    successResult.approvalNonceHash !== mergePayload.receipt.approvalNonceHash ||
+    successResult.environmentId !== mergePayload.receipt.environmentId ||
+    successResult.prNumber !== mergePayload.receipt.prNumber ||
+    successResult.authoritativeHeadSha !== mergePayload.receipt.headSha ||
+    successResult.pullRequest.number !== mergePayload.receipt.prNumber ||
+    successResult.pullRequest.state !== "MERGED"
+  ) throw new TypeError("done merge result does not match its durable receipt");
+  return {
+    disposition: "success",
+    status: "done",
+    jobId,
+    effectIdempotencyKey,
+    payload: mergePayload,
+    result: successResult,
+  };
+}
+
+export function parsePersistedMergeEvidence(
+  input: PersistedMergeEvidenceInput,
+): PersistedMergeEvidence {
+  const identity = parseMergeEvidenceIdentity(input);
+  if (identity.status === "failed" || identity.status === "dead") {
+    return parseTerminalMergeEvidence(input.payload, identity.status, identity.jobId, identity.effectIdempotencyKey);
+  }
+  if (identity.status === "done" && input.payload !== null && typeof input.payload === "object" &&
+      !Array.isArray(input.payload) && Object.prototype.hasOwnProperty.call(input.payload, "mergeOutcome")) {
+    return parseStaleMergeEvidence(input.payload, identity.jobId, identity.effectIdempotencyKey);
+  }
+  if (identity.status === "done") {
+    return parseSuccessfulMergeEvidence(input.payload, identity.jobId, identity.effectIdempotencyKey);
+  }
+  const mergePayload = parseActiveMergeEffectPayload(input.payload);
+  assertMergeReceiptRowBinding(mergePayload, identity.jobId, identity.effectIdempotencyKey);
+  return {
+    disposition: "active",
+    status: identity.status,
+    jobId: identity.jobId,
+    effectIdempotencyKey: identity.effectIdempotencyKey,
+    payload: mergePayload,
+  };
+}
+
+function mergeEvidenceJobBindingError(
+  evidence: Extract<PersistedMergeEvidence, { disposition: "active" | "success" }>,
+  job: Job,
+): string | null {
+  const receipt = evidence.payload.receipt;
+  if (evidence.jobId !== job.id || receipt.jobId !== job.id) {
+    return "merge evidence job binding does not match the selected job";
+  }
+  if (receipt.jobVersion !== receipt.approvalJobVersion + 1) {
+    return "merge evidence job-version binding is invalid";
+  }
+  if (job.projectId !== receipt.projectId || job.environmentId !== receipt.environmentId ||
+      job.prNumber !== receipt.prNumber || job.policy === null ||
+      job.policy.baseBranch !== receipt.baseBranch || job.policy.mergeMethod !== receipt.mergeMethod ||
+      JSON.stringify([...job.policy.requiredChecks].sort()) !== JSON.stringify(receipt.requiredCheckNames)) {
+    return "merge evidence does not match the immutable job policy";
+  }
+  return null;
+}
+
+function mergeEvidenceApprovalBindingError(
+  evidence: Extract<PersistedMergeEvidence, { disposition: "active" | "success" }>,
+  job: Job,
+  approval: ApprovalState | null,
+): string | null {
+  const receipt = evidence.payload.receipt;
+  if (
+    approval === null ||
+    approval.jobId !== job.id ||
+    approval.headSha !== receipt.headSha ||
+    approval.consumedAt === null ||
+    approval.outcome !== "accepted" ||
+    approval.jobVersion !== receipt.approvalJobVersion ||
+    approval.ownerUserId !== receipt.approvalOwnerUserId ||
+    approval.ownerChatId !== receipt.approvalOwnerChatId ||
+    approval.expiresAt !== Date.parse(receipt.expiresAt)
+  ) {
+    return "merge evidence does not match its approval";
+  }
+  return null;
+}
+
+function mergeEvidenceAttemptBindingError(
+  evidence: Extract<PersistedMergeEvidence, { disposition: "active" | "success" }>,
+  job: Job,
+  attempt: AttemptRecord | null,
+): string | null {
+  const receipt = evidence.payload.receipt;
+  if (evidence.disposition === "active" && !isCompletedReviewAttempt(attempt, job.id, receipt.headSha)) {
+    return "merge evidence owning review attempt is not a strict completed pass";
+  }
+  if (evidence.disposition === "success") {
+    if (attempt === null || attempt.resultJson === null) {
+      return "merge success evidence owning attempt result is missing";
+    }
+    try {
+      const attemptResult = parsePersistedMergeSuccessResult(JSON.parse(attempt.resultJson));
+      if (JSON.stringify(attemptResult) !== JSON.stringify(evidence.result)) {
+        return "merge success evidence does not match its owning attempt result";
+      }
+    } catch {
+      return "merge success evidence owning attempt result is invalid";
+    }
+  }
+  return null;
+}
+
+export function mergeEvidenceBindingError(
+  evidence: PersistedMergeEvidence,
+  job: Job,
+  approval: ApprovalState | null,
+  attempt: AttemptRecord | null,
+): string | null {
+  if (!isReplayableMergeEvidence(evidence)) return null;
+  return mergeEvidenceJobBindingError(evidence, job) ??
+    mergeEvidenceApprovalBindingError(evidence, job, approval) ??
+    mergeEvidenceAttemptBindingError(evidence, job, attempt);
 }
 
 function ensureTask9ApprovalColumns(db: SqliteDatabase): void {
@@ -2589,7 +2884,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             payload: {},
           }];
       persistPendingEffects(this.db, effects, boundaryNow);
-      const stalePayloadJson = serializeBoundedJson({ mergeOutcome: "stale" }, "stale merge effect payload", MAX_MERGE_RESULT_JSON);
+      const stalePayloadJson = serializeBoundedJson({
+        mergeOutcome: "stale",
+        jobId: input.jobId,
+        effectIdempotencyKey: input.effectIdempotencyKey,
+      }, "stale merge effect payload", MAX_MERGE_RESULT_JSON);
       const updated = this.db
         .prepare(
           `UPDATE effects SET payload_json = ?, status = 'done', lease_owner = NULL,
@@ -2841,37 +3140,37 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!job) return null;
     const owner = this.getOwner();
     for (const row of rows) {
-      if (row.status === "failed" || row.status === "dead") continue;
-      let persistedPayload: Record<string, unknown>;
-      let parsed: MergeEffectPayload;
+      let evidence: PersistedMergeEvidence;
       try {
-        persistedPayload = JSON.parse(row.payload_json) as Record<string, unknown>;
-        parsed = parsePersistedMergeEffectPayload(persistedPayload, row.status);
+        evidence = parsePersistedMergeEvidence({
+          idempotencyKey: row.idempotency_key,
+          jobId: row.job_id,
+          kind: row.kind,
+          status: row.status,
+          payload: JSON.parse(row.payload_json),
+        });
       } catch {
         return null;
       }
-      const receipt = parsed.receipt;
-      if (parsed.mergeOutcome === "stale") continue;
-      if (receipt.jobId !== jobId) return null;
+      if (!isReplayableMergeEvidence(evidence)) continue;
+      const receipt = evidence.payload.receipt;
       const approval = this.readApproval(receipt.approvalNonceHash);
-      if (row.status === "done") {
-        let result: PersistedMergeSuccessResult;
-        try {
-          result = parsePersistedMergeSuccessResult(persistedPayload.mergeResult);
-        } catch {
-          return null;
-        }
+      const bindingError = mergeEvidenceBindingError(
+        evidence,
+        job,
+        this.getApproval(receipt.approvalNonceHash),
+        this.getAttempt(receipt.reviewAttemptId),
+      );
+      if (bindingError !== null) return null;
+      if (evidence.disposition === "success") {
         if (
-          !mergeSuccessResultMatchesDurable(result, row, parsed, job, approval, "merged") ||
-          !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, result) ||
+          !mergeSuccessResultMatchesDurable(evidence.result, row, evidence.payload, job, approval, "merged") ||
+          !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, evidence.result) ||
           owner === null ||
           owner.userId !== receipt.approvalOwnerUserId ||
           owner.chatId !== receipt.approvalOwnerChatId
         ) return null;
-      } else if (
-        this.acceptedMergeReceiptBindingError(row, parsed, job, approval) !== null ||
-        !isCompletedReviewAttempt(this.getAttempt(receipt.reviewAttemptId), jobId, receipt.headSha)
-      ) {
+      } else if (this.acceptedMergeReceiptBindingError(row, evidence.payload, job, approval) !== null) {
         return null;
       }
       const identity = {
@@ -2898,52 +3197,44 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!job) return null;
     const owner = this.getOwner();
     for (const row of rows) {
-      if (row.status === "failed" || row.status === "dead") continue;
-      let persistedPayload: Record<string, unknown>;
-      let parsed: MergeEffectPayload;
+      let evidence: PersistedMergeEvidence;
       try {
-        persistedPayload = JSON.parse(row.payload_json) as Record<string, unknown>;
-        parsed = parsePersistedMergeEffectPayload(persistedPayload, row.status);
+        evidence = parsePersistedMergeEvidence({
+          idempotencyKey: row.idempotency_key,
+          jobId: row.job_id,
+          kind: row.kind,
+          status: row.status,
+          payload: JSON.parse(row.payload_json),
+        });
       } catch {
         return null;
       }
-      const receipt = parsed.receipt;
-      if (parsed.mergeOutcome === "stale") continue;
-      if (receipt.jobId !== jobId) return null;
+      if (!isReplayableMergeEvidence(evidence)) continue;
+      const receipt = evidence.payload.receipt;
+      const approval = this.readApproval(receipt.approvalNonceHash);
+      const bindingError = mergeEvidenceBindingError(
+        evidence,
+        job,
+        this.getApproval(receipt.approvalNonceHash),
+        this.getAttempt(receipt.reviewAttemptId),
+      );
+      if (bindingError !== null) return null;
       if (receipt.headSha !== headSha || receipt.approvalNonceHash !== approvalNonceHash) continue;
-      if (receipt.effectIdempotencyKey !== row.idempotency_key) return null;
-      if (row.status === "done") {
-        let result: PersistedMergeSuccessResult;
-        try {
-          result = parsePersistedMergeSuccessResult(persistedPayload.mergeResult);
-        } catch {
-          return null;
-        }
+      if (evidence.disposition === "success") {
         if (
           !mergeSuccessResultMatchesDurable(
-            result,
+            evidence.result,
             row,
-            parsed,
+            evidence.payload,
             job,
-            this.readApproval(receipt.approvalNonceHash),
+            approval,
             "merged",
-          ) || !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, result) ||
+          ) || !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, evidence.result) ||
           owner === null ||
           owner.userId !== receipt.approvalOwnerUserId ||
           owner.chatId !== receipt.approvalOwnerChatId
         ) return null;
-      } else if (
-        this.acceptedMergeReceiptBindingError(
-          row,
-          parsed,
-          job,
-          this.readApproval(receipt.approvalNonceHash),
-        ) !== null || !isCompletedReviewAttempt(
-          this.getAttempt(receipt.reviewAttemptId),
-          jobId,
-          receipt.headSha,
-        )
-      ) {
+      } else if (this.acceptedMergeReceiptBindingError(row, evidence.payload, job, approval) !== null) {
         return null;
       }
       const identity = {

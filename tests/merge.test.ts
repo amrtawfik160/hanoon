@@ -232,7 +232,7 @@ function insertCompetingMergeEffect(
   fixture: ReturnType<typeof mergeFixture>,
   idempotencyKey: string,
   payloadJson: string,
-  status: "pending" | "done" = "pending",
+  status: "pending" | "leased" | "done" | "failed" | "dead" = "pending",
 ): void {
   fixture.db.prepare(
     `INSERT INTO effects (
@@ -240,6 +240,72 @@ function insertCompetingMergeEffect(
        next_attempt_at, created_at, updated_at
      ) VALUES (?, ?, 'merge_pr', ?, ?, 0, ?, ?, ?)`,
   ).run(idempotencyKey, "job_1", payloadJson, status, NOW, NOW, NOW);
+}
+
+async function staleOldApprovalAndCreateNewEffect() {
+  const fixture = mergeFixture();
+  await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+  const oldEffect = leaseMergeEffect(fixture);
+  expect(fixture.store.staleMergeEffect({
+    jobId: oldEffect.jobId,
+    effectIdempotencyKey: oldEffect.idempotencyKey,
+    reason: "APPROVAL_STALE: test stale head",
+    now: NOW + 3,
+    leaseOwner: LEASE_OWNER,
+    leaseGeneration: LEASE_GENERATION,
+  })).toBe(true);
+
+  const movedReviewResult = JSON.parse(COMPLETED_REVIEW_RESULT) as Record<string, unknown> & {
+    verdict: Record<string, unknown>;
+  };
+  movedReviewResult.reviewedHeadSha = MOVED;
+  movedReviewResult.verdict = { ...movedReviewResult.verdict, reviewedHeadSha: MOVED };
+  fixture.db.prepare(
+    `INSERT INTO attempts (id, job_id, kind, ordinal, head_sha, result_json, created_at, completed_at)
+       VALUES (?, ?, 'review', ?, ?, ?, ?, ?)`,
+  ).run("review_2", "job_1", 2, MOVED, JSON.stringify(movedReviewResult), NOW + 4, NOW + 5);
+  fixture.db.prepare(
+    "UPDATE jobs SET state = 'awaiting_merge_approval', pr_head_sha = ?, version = ?, updated_at = ? WHERE id = ?",
+  ).run(MOVED, 10, NOW + 4, "job_1");
+
+  const newApproval = fixture.approvals.issue("job_1", MOVED, NOW + 4);
+  const oldPayload = oldEffect.payload as { receipt: Record<string, unknown> };
+  const newEffectKey = "job_1:11:merge_pr";
+  const newEffect = {
+    idempotencyKey: newEffectKey,
+    jobId: "job_1",
+    kind: "merge_pr" as const,
+    payload: {
+      headSha: MOVED,
+      receipt: {
+        ...oldPayload.receipt,
+        effectIdempotencyKey: newEffectKey,
+        approvalNonceHash: hashSecret(newApproval.nonce),
+        jobVersion: 11,
+        approvalJobVersion: 10,
+        headSha: MOVED,
+        reviewAttemptId: "review_2",
+        validationCompletedAt: new Date(NOW + 5).toISOString(),
+        expiresAt: new Date(NOW + 4 + 15 * 60_000).toISOString(),
+      },
+    },
+  };
+  expect(fixture.store.acceptApprovalAndEnqueueMerge({
+    nonceHash: hashSecret(newApproval.nonce),
+    expectedJobVersion: 10,
+    effect: newEffect,
+    now: NOW + 6,
+    identity: { userId: "7", chatId: "70" },
+  })).toMatchObject({ ok: true });
+  expect(fixture.store.recordCallback(
+    "callback_2",
+    "job_1",
+    "merge",
+    "accepted",
+    NOW + 6,
+    { approvalNonceHash: hashSecret(newApproval.nonce), headSha: MOVED, effectIdempotencyKey: newEffectKey },
+  )).toBe(true);
+  return { fixture, oldEffect, newApproval, newEffectKey };
 }
 
 describe("fresh Telegram merge execution", () => {
@@ -512,6 +578,179 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["failed", "dead"] as const)(
+    "rejects handler replay when a %s competing merge row has a corrupt terminal payload",
+    async (status) => {
+      const fixture = mergeFixture();
+      await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+      const effect = mergeEffect(fixture.store);
+      insertCompetingMergeEffect(
+        fixture,
+        `${effect.idempotencyKey}:corrupt-${status}`,
+        JSON.stringify({ mergeCleanup: "failed", unexpected: true }),
+        status,
+      );
+
+      await expect(fixture.handler.handleApprovalCallback({
+        callbackId: `handler_corrupt_${status}`,
+        nonce: fixture.issued.nonce,
+        userId: "7",
+        chatId: "70",
+      })).resolves.toEqual({ outcome: "rejected" });
+      expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["failed", "dead"] as const)(
+    "rejects legacy reconstruction when a %s competing merge row has a corrupt terminal payload",
+    async (status) => {
+      const fixture = mergeFixture();
+      await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+      const effect = mergeEffect(fixture.store);
+      fixture.db.prepare(
+        "UPDATE callbacks SET approval_nonce_hash = NULL, head_sha = NULL, effect_idempotency_key = NULL WHERE callback_query_id = 'callback_1'",
+      ).run();
+      insertCompetingMergeEffect(
+        fixture,
+        `${effect.idempotencyKey}:legacy-corrupt-${status}`,
+        JSON.stringify({ mergeCleanup: "failed", unexpected: true }),
+        status,
+      );
+
+      expect(fixture.store.getCallback("callback_1")).toMatchObject({
+        outcome: "accepted",
+        approvalNonceHash: null,
+        headSha: null,
+        effectIdempotencyKey: null,
+      });
+    },
+  );
+
+  it.each(["handler", "store", "legacy"] as const)(
+    "fails closed when a head-mismatched competitor has a bad internal binding in the %s replay path",
+    async (path) => {
+      const fixture = mergeFixture();
+      await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+      const effect = mergeEffect(fixture.store);
+      const payload = structuredClone(effect.payload) as {
+        headSha: string;
+        receipt: Record<string, unknown>;
+      };
+      payload.headSha = MOVED;
+      payload.receipt.headSha = MOVED;
+      payload.receipt.approvalNonceHash = "f".repeat(64);
+      payload.receipt.effectIdempotencyKey = "job_1:bad-internal-binding";
+      insertCompetingMergeEffect(
+        fixture,
+        `${effect.idempotencyKey}:head-mismatch-corrupt`,
+        JSON.stringify(payload),
+      );
+
+      if (path === "legacy") {
+        fixture.db.prepare(
+          "UPDATE callbacks SET approval_nonce_hash = NULL, head_sha = NULL, effect_idempotency_key = NULL WHERE callback_query_id = 'callback_1'",
+        ).run();
+        expect(fixture.store.getCallback("callback_1")).toMatchObject({
+          outcome: "accepted",
+          approvalNonceHash: null,
+          headSha: null,
+          effectIdempotencyKey: null,
+        });
+      } else if (path === "store") {
+        expect(fixture.store.rejectApprovalAndRecordCallback({
+          nonceHash: hashSecret(fixture.issued.nonce),
+          callbackId: "store_head_mismatch_corrupt",
+          jobId: "job_1",
+          headSha: HEAD,
+          now: NOW + 3,
+        })).toMatchObject({ outcome: "rejected" });
+      } else {
+        await expect(fixture.handler.handleApprovalCallback({
+          callbackId: "handler_head_mismatch_corrupt",
+          nonce: fixture.issued.nonce,
+          userId: "7",
+          chatId: "70",
+        })).resolves.toEqual({ outcome: "rejected" });
+      }
+      expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    },
+  );
+
+  it("replays the new approval while ignoring a canonical stale tombstone, but rejects old replay identities", async () => {
+    const { fixture, oldEffect, newApproval, newEffectKey } = await staleOldApprovalAndCreateNewEffect();
+    expect(fixture.db.prepare("SELECT payload_json FROM effects WHERE idempotency_key = ?").get(oldEffect.idempotencyKey)).toEqual({
+      payload_json: JSON.stringify({
+        mergeOutcome: "stale",
+        jobId: "job_1",
+        effectIdempotencyKey: oldEffect.idempotencyKey,
+      }),
+    });
+
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: "callback_1",
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+    })).resolves.toEqual({ outcome: "rejected" });
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: "old_consumed_replay",
+      nonce: fixture.issued.nonce,
+      userId: "7",
+      chatId: "70",
+    })).resolves.toEqual({ outcome: "rejected" });
+
+    fixture.db.prepare(
+      "UPDATE callbacks SET approval_nonce_hash = NULL, head_sha = NULL, effect_idempotency_key = NULL WHERE callback_query_id = 'callback_2'",
+    ).run();
+    await expect(fixture.handler.handleApprovalCallback({
+      callbackId: "callback_2",
+      nonce: newApproval.nonce,
+      userId: "7",
+      chatId: "70",
+    })).resolves.toEqual({ outcome: "accepted" });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM effects WHERE job_id = 'job_1' AND kind = 'merge_pr'").get())
+      .toEqual({ count: 2 });
+    expect(fixture.store.getCallback("callback_2")).toMatchObject({
+      approvalNonceHash: hashSecret(newApproval.nonce),
+      headSha: MOVED,
+      effectIdempotencyKey: newEffectKey,
+    });
+    expect(fixture.store.getEffect("job_1", newEffectKey)).toMatchObject({ status: "pending" });
+  });
+
+  it.each(["handler", "legacy"] as const)(
+    "poisons %s replay reconstruction for a malformed stale tombstone beside a valid new effect",
+    async (path) => {
+      const { fixture, newApproval, newEffectKey } = await staleOldApprovalAndCreateNewEffect();
+      insertCompetingMergeEffect(
+        fixture,
+        `${newEffectKey}:stale-lookalike`,
+        JSON.stringify({ mergeOutcome: "stale", jobId: "job_1" }),
+        "done",
+      );
+
+      if (path === "legacy") {
+        fixture.db.prepare(
+          "UPDATE callbacks SET approval_nonce_hash = NULL, head_sha = NULL, effect_idempotency_key = NULL WHERE callback_query_id = 'callback_2'",
+        ).run();
+        expect(fixture.store.getCallback("callback_2")).toMatchObject({
+          outcome: "accepted",
+          approvalNonceHash: null,
+          headSha: null,
+          effectIdempotencyKey: null,
+        });
+      } else {
+        await expect(fixture.handler.handleApprovalCallback({
+          callbackId: "handler_stale_lookalike",
+          nonce: newApproval.nonce,
+          userId: "7",
+          chatId: "70",
+        })).resolves.toEqual({ outcome: "rejected" });
+      }
+      expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     ["JSON-valid schema-invalid", (effect: StoredEffect) => JSON.stringify({ headSha: HEAD, receipt: {} })],
     ["malformed JSON", () => "{malformed"],
@@ -644,6 +883,8 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
     expect(fixture.store.getEffect("job_1", mergeEffect(fixture.store).idempotencyKey)?.payload).toEqual({
       mergeOutcome: "stale",
+      jobId: "job_1",
+      effectIdempotencyKey: mergeEffect(fixture.store).idempotencyKey,
     });
   });
 
@@ -865,7 +1106,11 @@ describe("fresh Telegram merge execution", () => {
       leaseGeneration: LEASE_GENERATION,
     })).toBe(true);
     expect(fixture.db.prepare("SELECT payload_json FROM effects WHERE idempotency_key = ?").get(effect.idempotencyKey)).toEqual({
-      payload_json: JSON.stringify({ mergeOutcome: "stale" }),
+      payload_json: JSON.stringify({
+        mergeOutcome: "stale",
+        jobId: "job_1",
+        effectIdempotencyKey: effect.idempotencyKey,
+      }),
     });
     const textColumns = fixture.db.prepare(
       "SELECT payload_json, last_error FROM effects UNION ALL SELECT last_error, request_text FROM jobs UNION ALL SELECT payload_json, last_error FROM outbox",
