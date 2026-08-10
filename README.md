@@ -7,7 +7,7 @@ Telegram Agent gives one paired private Telegram owner a durable Luna Max conver
 - BB 0.36 or newer.
 - GitHub CLI (`gh`) authenticated on every host that owns an enabled project source.
 - A standard BB project backed by a GitHub repository, with a reachable local or cloned source and a named base branch.
-- A connected source host for BB's personal project. The hidden controller runs there in a personal workspace and never receives an implementation worktree.
+- A source host for BB's personal project, or exactly one connected BB host when that project has no source binding. The hidden controller runs there in a personal workspace and never receives an implementation worktree.
 - Codex access to `gpt-5.6-luna` with the `max` reasoning level.
 - A Telegram bot created through [BotFather](https://core.telegram.org/bots#botfather).
 

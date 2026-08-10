@@ -109,6 +109,16 @@ export class BbControllerAdapter implements ControllerAdapter {
     if (personal.length !== 1) throw new Error("Exactly one BB personal project is required for the controller");
     const project = personal[0];
     if (!project) throw new Error("BB personal project is unavailable");
+    if (project.sources.length === 0) {
+      const hosts = await this.dependencies.sdk.hosts.list({ signal });
+      const connected = hosts.filter((host) => host.status === "connected");
+      if (connected.length !== 1) {
+        throw new Error("BB personal project has no source and its connected host is ambiguous");
+      }
+      const host = connected[0];
+      if (!host) throw new Error("BB personal project has no connected host");
+      return { projectId: project.id, hostId: host.id };
+    }
     const source = project.sources.find((candidate) => candidate.isDefault) ??
       (project.sources.length === 1 ? project.sources[0] : undefined);
     if (!source) throw new Error("BB personal project has no unambiguous source");

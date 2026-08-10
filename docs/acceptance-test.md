@@ -83,7 +83,7 @@ Record the alias and doctor check statuses. Do not record the policy file conten
 
 ### 3. Verify the Luna conversation
 
-Send an ordinary question such as which projects are available. Confirm that BB creates one hidden plugin-owned controller thread in the personal workspace with the exact execution tuple in the evidence sheet. Confirm Telegram receives a natural answer and `bb telegram-agent job list --json` still shows no new job.
+Send an ordinary question such as which projects are available. Confirm that BB creates one hidden plugin-owned controller thread in the personal workspace with the exact execution tuple in the evidence sheet. The host must be the personal project's selected source host, or the only connected BB host when the personal project has no source. Confirm Telegram receives a natural answer and `bb telegram-agent job list --json` still shows no new job.
 
 Record only the message ids and bounded answer summary, not the raw private conversation.
 

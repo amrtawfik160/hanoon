@@ -68,7 +68,7 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
   } as const;
 }
 
-function sdkFixture(options: { projects?: unknown[]; threads?: unknown[] } = {}) {
+function sdkFixture(options: { projects?: unknown[]; threads?: unknown[]; hosts?: unknown[] } = {}) {
   const spawn = vi.fn(async () => ({ id: "thr_controller", environmentId: "env_personal" }));
   const send = vi.fn(async () => ({ ok: true }));
   const list = vi.fn(async () => options.threads ?? []);
@@ -76,6 +76,7 @@ function sdkFixture(options: { projects?: unknown[]; threads?: unknown[] } = {})
   const output = vi.fn(async () => ({ output: "Hello from Luna." }));
   const sdk = {
     projects: { list: vi.fn(async () => options.projects ?? [personalProject()]) },
+    hosts: { list: vi.fn(async () => options.hosts ?? [{ id: "host_personal", status: "connected" }]) },
     threads: { spawn, send, list, get, output },
   } as unknown as BbPluginApi["sdk"];
   return { adapter: new BbControllerAdapter({ sdk, pluginId: "telegram-agent" }), spawn, send, list };
@@ -106,6 +107,41 @@ it("spawns the hidden personal controller with the exact Luna Max execution tupl
     },
     input: [{ type: "text", text: expect.stringContaining("What projects can you work on?"), mentions: [] }],
   }));
+});
+
+it("uses the only connected host when the personal project has no source binding", async () => {
+  const { adapter, spawn } = sdkFixture({
+    projects: [personalProject({ sources: [] })],
+    hosts: [
+      { id: "host_offline", status: "disconnected" },
+      { id: "host_connected", status: "connected" },
+    ],
+  });
+
+  await adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000));
+
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
+    projectId: "proj_personal",
+    environment: {
+      type: "host",
+      hostId: "host_connected",
+      workspace: { type: "personal" },
+    },
+  }));
+});
+
+it("fails closed when an unbound personal project has multiple connected hosts", async () => {
+  const { adapter, spawn } = sdkFixture({
+    projects: [personalProject({ sources: [] })],
+    hosts: [
+      { id: "host_one", status: "connected" },
+      { id: "host_two", status: "connected" },
+    ],
+  });
+
+  await expect(adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000)))
+    .rejects.toThrow(/connected host|ambiguous/i);
+  expect(spawn).not.toHaveBeenCalled();
 });
 
 it.each([
