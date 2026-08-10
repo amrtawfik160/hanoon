@@ -267,11 +267,20 @@ export class LunaControllerService {
         return true;
       }
       if (parked === null && refreshedAt - submitted.updatedAt >= CONTROLLER_STALL_MS) {
+        // Retiring the thread is the half that matters. Failing only the turn
+        // leaves the wedge in place, and every later message then waits out the
+        // busy timeout against a thread that will never go idle.
+        this.dependencies.store.resetControllerThread({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          controllerKey: controller.controllerKey,
+          expectedThreadId: controller.threadId,
+          reason: "Thread stopped producing events mid-answer",
+        });
         this.fail(
           submitted,
           fence,
           "Controller turn stopped producing events",
-          "That one stalled — the thread stopped responding, so I gave up on it. Ask me again and I'll retry.",
+          "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
         );
       }
       return true;

@@ -532,3 +532,23 @@ it("stops re-steering a message the thread keeps refusing", async () => {
   expect(steer.mock.calls.length).toBeLessThanOrEqual(3);
   expect(store.getControllerTurn(correction.id)?.state).toBe("queued");
 });
+
+it("retires the wedged thread when a turn stalls, so the next message is not stuck behind it", async () => {
+  const { store, fence } = storeFixture("stall-retires");
+  const turn = submittedTurn(store, fence);
+  const service = new LunaControllerService({
+    store,
+    adapter: serviceAdapter(),
+    clock: { now: () => 2_000 + CONTROLLER_STALL_MS + 1 },
+  });
+  const signal = AbortSignal.timeout(2_000);
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
+  // Failing the turn while leaving the thread wedged means every later message
+  // waits out the busy timeout instead of getting a fresh thread.
+  const controller = store.getControllerForOwner("7", "7");
+  expect(controller?.threadId).toBeNull();
+  expect(controller?.state).toBe("pending_spawn");
+});
