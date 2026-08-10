@@ -189,6 +189,66 @@ describe("deterministic Telegram views", () => {
     expect(rendered.text).toContain("temporary failure");
   });
 
+  it("shows one worker resource, liveness state, and source observation age", () => {
+    const job = jobFixture({
+      id: telegramJobId,
+      state: "failed",
+      lastError: "temporary failure",
+      implementationThreadId: "thr_worker",
+    });
+    const staleWorker = {
+        jobId: telegramJobId,
+        workerKind: "implementation",
+        resourceKind: "bb_thread",
+        resourceId: "thr_worker",
+        generation: 2,
+        state: "stale",
+        sourceUpdatedAt: 1_000,
+        observedAt: 61_000,
+        staleNotifiedAt: 61_000,
+      } as const;
+    const fresh = renderJobStatus(job, {
+      workerLiveness: { ...staleWorker, state: "active", sourceUpdatedAt: 61_000 },
+      now: 61_000,
+    });
+    const rendered = renderJobStatus(job, {
+      workerLiveness: staleWorker,
+      now: 61_000,
+    });
+
+    expect(rendered.text).toContain("Worker: thr_worker");
+    expect(rendered.text).toContain("stale");
+    expect(rendered.text).toContain("60s ago");
+    expect(rendered.text).toContain("fresh BB observation");
+    expect(fresh.reply_markup?.inline_keyboard.flat().map((button) => button.callback_data)).toContain(`r:${telegramJobId}`);
+    expect(rendered.reply_markup?.inline_keyboard.flat().map((button) => button.text)).not.toContain("Retry");
+  });
+
+  it.each(["unknown", "stale"] as const)("does not expose a speculative diagnosis for %s liveness", (state) => {
+    const rendered = renderJobStatus(jobFixture({
+      id: telegramJobId,
+      state: "failed",
+      lastError: "temporary failure",
+      implementationThreadId: "thr_worker",
+    }), {
+      workerLiveness: {
+        jobId: telegramJobId,
+        workerKind: "implementation",
+        resourceKind: "bb_thread",
+        resourceId: "thr_worker",
+        generation: 2,
+        state,
+        sourceUpdatedAt: 1_000,
+        observedAt: 2_000,
+        staleNotifiedAt: null,
+      },
+    });
+
+    expect(rendered.text).toContain(state === "unknown" ? "authoritative BB observation" : "fresh BB observation");
+    expect(rendered.reply_markup?.inline_keyboard.flat().map((button) => button.text)).not.toContain("Retry");
+    expect(rendered.text).not.toMatch(/crash|dead|stuck|provider|network/i);
+  });
+
   it("does not turn credential-bearing URLs into Telegram links", () => {
     const policy = policyFixture();
     const job = jobFixture({

@@ -1,4 +1,4 @@
-import { projectPolicySchema, type Job, type ProjectPolicy } from "../domain/models";
+import { projectPolicySchema, type Job, type ProjectPolicy, type WorkerLiveness } from "../domain/models";
 import { hashSecret } from "../crypto";
 import { assertSafeExternalHttpsUrl } from "../storage/store";
 import type {
@@ -69,6 +69,8 @@ export type JobStatusContext = {
   mergeNonce?: string;
   mergeNonceHash?: string;
   ready?: boolean;
+  workerLiveness?: WorkerLiveness | null;
+  now?: number;
 };
 
 function containsForbiddenCallbackMaterial(value: string): boolean {
@@ -396,16 +398,17 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
   if (prUrl) buttons.push({ text: "View PR", url: prUrl });
   if (bbUrl) buttons.push({ text: "Open BB", url: bbUrl });
 
-  if (ready) {
+  const livenessBlocked = context.workerLiveness?.state === "unknown" || context.workerLiveness?.state === "stale";
+  if (ready && !livenessBlocked) {
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
     if (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce)) {
       buttons.push({ text: "Merge", callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
     }
-  } else if (job.state === "awaiting_confirmation") {
+  } else if (job.state === "awaiting_confirmation" && !livenessBlocked) {
     buttons.push({ text: "Start", callback_data: encodeCallbackData({ type: "start", jobId: job.id }) });
-  } else if (job.state === "failed") {
+  } else if (job.state === "failed" && !livenessBlocked) {
     buttons.push({ text: "Retry", callback_data: encodeCallbackData({ type: "retry", jobId: job.id }) });
-  } else if (job.state === "blocked") {
+  } else if (job.state === "blocked" && !livenessBlocked) {
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
   }
 
@@ -448,6 +451,18 @@ export function renderJobStatus(
   }
   if (job.implementationThreadId) lines.push(`Implementation thread: <code>${html(job.implementationThreadId, 120)}</code>`);
   if (job.reviewThreadId) lines.push(`Review thread: <code>${html(job.reviewThreadId, 120)}</code>`);
+  if (context.workerLiveness) {
+    const worker = context.workerLiveness;
+    const now = context.now ?? worker.observedAt;
+    const ageSeconds = Math.max(0, Math.floor((now - worker.sourceUpdatedAt) / 1_000));
+    lines.push(`Worker: ${html(worker.resourceId, 120)} (<code>${html(worker.state, 40)}</code>)`);
+    lines.push(`Observation age: <code>${ageSeconds}s ago</code>`);
+    if (worker.state === "unknown") {
+      lines.push("Warning: waiting for an authoritative BB observation; no worker diagnosis is available.");
+    } else if (worker.state === "stale") {
+      lines.push("Warning: waiting for a fresh BB observation; no worker diagnosis is available.");
+    }
+  }
   if (context.review) {
     const count = context.review.findings?.length ?? 0;
     lines.push(`Review: ${html(context.review.verdict ?? "unknown", 80)} (${count} findings)`);

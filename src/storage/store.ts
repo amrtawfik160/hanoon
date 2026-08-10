@@ -9,6 +9,7 @@ import {
   type JobState,
   type ProjectPolicy,
   type StoredEffect,
+  type WorkerLiveness,
 } from "../domain/models";
 import { reviewVerdictSchema } from "../domain/review";
 import { assertSafeFailureSummary, transition } from "../domain/state-machine";
@@ -38,6 +39,18 @@ export type OutboxInput = {
   chatId: string;
   messageId?: number | null;
   payload: Record<string, unknown>;
+};
+
+export type StoredOutbox = OutboxInput & {
+  status: "pending" | "leased" | "sent" | "failed" | "dead";
+  attempts: number;
+  leaseOwner: string | null;
+  leaseGeneration: number | null;
+  leaseExpiresAt: number | null;
+  nextAttemptAt: number;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type ApprovalIdentity = { userId: string; chatId: string };
@@ -80,7 +93,11 @@ export type AttemptRecord = {
   id: string;
   jobId: string;
   kind: "implementation" | "review" | "validation";
+  ordinal: number;
+  threadId: string | null;
   headSha: string | null;
+  handoffPath: string | null;
+  handoffSha256: string | null;
   resultJson: string | null;
   completedAt: number | null;
 };
@@ -292,6 +309,21 @@ type EffectRow = {
   kind: StoredEffect["kind"];
   payload_json: string;
   status: StoredEffect["status"];
+  attempts: number;
+  lease_owner: string | null;
+  lease_generation: number | null;
+  lease_expires_at: number | null;
+  next_attempt_at: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+type OutboxRow = {
+  logical_key: string;
+  chat_id: string;
+  message_id: number | null;
+  payload_json: string;
+  status: StoredOutbox["status"];
   attempts: number;
   lease_owner: string | null;
   lease_generation: number | null;
@@ -1145,6 +1177,54 @@ export interface TelegramAgentStore {
   listEffectsForJob(jobId: string): StoredEffect[];
   getEffect(jobId: string, idempotencyKey: string): StoredEffect | null;
   getAttempt(attemptId: string): AttemptRecord | null;
+  createAttempt(input: {
+    id: string;
+    jobId: string;
+    kind: AttemptRecord["kind"];
+    ordinal: number;
+    headSha?: string | null;
+    now: number;
+  }): AttemptRecord;
+  updateAttempt(attemptId: string, patch: {
+    threadId?: string | null;
+    headSha?: string | null;
+    handoffPath?: string | null;
+    handoffSha256?: string | null;
+    result?: Record<string, unknown> | null;
+    completedAt?: number | null;
+  }): AttemptRecord;
+  registerReviewThread(jobId: string, expectedVersion: number, threadId: string, now: number): Job;
+  acquireExecutorLease(
+    ownerId: string,
+    now: number,
+    leaseMs: number,
+  ): { acquired: true; generation: number } | { acquired: false };
+  renewExecutorLease(ownerId: string, generation: number, now: number, leaseMs: number): boolean;
+  releaseExecutorLease(ownerId: string, generation: number, now: number): boolean;
+  isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean;
+  leaseEffects(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredEffect[];
+  leaseOutbox(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredOutbox[];
+  completeEffect(key: string, ownerId: string, generation: number, now: number): boolean;
+  completeOutbox(key: string, ownerId: string, generation: number, messageId: number | null, now: number): boolean;
+  completeStatusOutbox(
+    key: string,
+    ownerId: string,
+    generation: number,
+    jobId: string,
+    expectedVersion: number,
+    messageId: number,
+    now: number,
+  ): boolean;
+  failEffect(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean;
+  failOutbox(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean;
+  deadLetterEffect(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
+  deadLetterOutbox(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
+  getOutbox(logicalKey: string): StoredOutbox | null;
+  listOutbox(limit: number): StoredOutbox[];
+  upsertWorkerLiveness(value: WorkerLiveness): void;
+  getWorkerLiveness(jobId: string): WorkerLiveness | null;
+  markWorkerLivenessNotified(jobId: string, generation: number, now: number): boolean;
+  clearWorkerLiveness(jobId: string, generation: number): boolean;
   leaseMergeEffect(input: {
     jobId: string;
     effectIdempotencyKey: string;
@@ -1288,6 +1368,50 @@ function parseEffect(row: EffectRow): StoredEffect {
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function parseOutbox(row: OutboxRow): StoredOutbox {
+  return {
+    logicalKey: row.logical_key,
+    chatId: row.chat_id,
+    messageId: row.message_id,
+    payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+    status: row.status,
+    attempts: row.attempts,
+    leaseOwner: row.lease_owner,
+    leaseGeneration: row.lease_generation,
+    leaseExpiresAt: row.lease_expires_at,
+    nextAttemptAt: row.next_attempt_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function parseAttempt(row: {
+  id: string;
+  job_id: string;
+  kind: AttemptRecord["kind"];
+  ordinal: number;
+  thread_id: string | null;
+  head_sha: string | null;
+  handoff_path: string | null;
+  handoff_sha256: string | null;
+  result_json: string | null;
+  completed_at: number | null;
+}): AttemptRecord {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    kind: row.kind,
+    ordinal: row.ordinal,
+    threadId: row.thread_id,
+    headSha: row.head_sha,
+    handoffPath: row.handoff_path,
+    handoffSha256: row.handoff_sha256,
+    resultJson: row.result_json,
+    completedAt: row.completed_at,
   };
 }
 
@@ -1967,25 +2091,498 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public getAttempt(attemptId: string): AttemptRecord | null {
     if (!attemptId) throw new TypeError("attemptId must not be empty");
     const row = this.db
-      .prepare("SELECT id, job_id, kind, head_sha, result_json, completed_at FROM attempts WHERE id = ?")
+      .prepare(
+        "SELECT id, job_id, kind, ordinal, thread_id, head_sha, handoff_path, handoff_sha256, result_json, completed_at FROM attempts WHERE id = ?",
+      )
       .get(attemptId) as {
         id: string;
         job_id: string;
         kind: AttemptRecord["kind"];
+        ordinal?: number;
+        thread_id?: string | null;
         head_sha: string | null;
+        handoff_path?: string | null;
+        handoff_sha256?: string | null;
         result_json: string | null;
         completed_at: number | null;
       } | undefined;
     return row
-      ? {
+      ? parseAttempt({
           id: row.id,
-          jobId: row.job_id,
+          job_id: row.job_id,
           kind: row.kind,
-          headSha: row.head_sha,
-          resultJson: row.result_json,
-          completedAt: row.completed_at,
+          ordinal: row.ordinal ?? 0,
+          thread_id: row.thread_id ?? null,
+          head_sha: row.head_sha,
+          handoff_path: row.handoff_path ?? null,
+          handoff_sha256: row.handoff_sha256 ?? null,
+          result_json: row.result_json,
+          completed_at: row.completed_at,
+        })
+      : null;
+  }
+
+  public createAttempt(input: {
+    id: string;
+    jobId: string;
+    kind: AttemptRecord["kind"];
+    ordinal: number;
+    headSha?: string | null;
+    now: number;
+  }): AttemptRecord {
+    if (!input.id || !input.jobId) throw new TypeError("attempt identity is required");
+    if (!Number.isInteger(input.ordinal) || input.ordinal < 1) {
+      throw new TypeError("attempt ordinal must be a positive integer");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    if (input.headSha !== undefined && input.headSha !== null) assertFullSha(input.headSha, "headSha");
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO attempts (
+           id, job_id, kind, ordinal, head_sha, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(input.id, input.jobId, input.kind, input.ordinal, input.headSha ?? null, input.now);
+    const stored = this.getAttempt(input.id);
+    if (!stored) throw new Error("Attempt was not stored");
+    if (stored.jobId !== input.jobId || stored.kind !== input.kind || stored.ordinal !== input.ordinal) {
+      throw new IdempotencyConflictError(input.ordinal);
+    }
+    return stored;
+  }
+
+  public updateAttempt(attemptId: string, patch: {
+    threadId?: string | null;
+    headSha?: string | null;
+    handoffPath?: string | null;
+    handoffSha256?: string | null;
+    result?: Record<string, unknown> | null;
+    completedAt?: number | null;
+  }): AttemptRecord {
+    if (!attemptId) throw new TypeError("attemptId must not be empty");
+    if (patch.headSha !== undefined && patch.headSha !== null) assertFullSha(patch.headSha, "headSha");
+    if (patch.handoffSha256 !== undefined && patch.handoffSha256 !== null) assertSha256Hex(patch.handoffSha256);
+    if (patch.completedAt !== undefined && patch.completedAt !== null) assertNonNegativeInteger(patch.completedAt, "completedAt");
+    const fields: string[] = [];
+    const values: unknown[] = [];
+    if (patch.threadId !== undefined) { fields.push("thread_id = ?"); values.push(patch.threadId); }
+    if (patch.headSha !== undefined) { fields.push("head_sha = ?"); values.push(patch.headSha); }
+    if (patch.handoffPath !== undefined) { fields.push("handoff_path = ?"); values.push(patch.handoffPath); }
+    if (patch.handoffSha256 !== undefined) { fields.push("handoff_sha256 = ?"); values.push(patch.handoffSha256); }
+    if (patch.result !== undefined) {
+      fields.push("result_json = ?");
+      values.push(patch.result === null ? null : serializeBoundedJson(patch.result, "attempt result", MAX_MERGE_RESULT_JSON));
+    }
+    if (patch.completedAt !== undefined) { fields.push("completed_at = ?"); values.push(patch.completedAt); }
+    if (fields.length > 0) {
+      values.push(attemptId);
+      this.db.prepare(`UPDATE attempts SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+    }
+    const stored = this.getAttempt(attemptId);
+    if (!stored) throw new Error(`Attempt ${attemptId} was not found`);
+    return stored;
+  }
+
+  public registerReviewThread(jobId: string, expectedVersion: number, threadId: string, now: number): Job {
+    if (!jobId || !threadId) throw new TypeError("jobId and threadId are required");
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) throw new TypeError("expectedVersion must be a positive integer");
+    assertNonNegativeInteger(now, "now");
+    const update = this.db
+      .prepare(
+        `UPDATE jobs SET review_thread_id = ?, version = ?, updated_at = ?
+           WHERE id = ? AND version = ?`,
+      )
+      .run(threadId, expectedVersion + 1, now, jobId, expectedVersion);
+    if (update.changes !== 1) throw new VersionConflictError(jobId, expectedVersion);
+    const stored = this.readJobById(jobId);
+    if (!stored) throw new Error(`Job ${jobId} was not found after review-thread registration`);
+    return stored;
+  }
+
+  public acquireExecutorLease(
+    ownerId: string,
+    now: number,
+    leaseMs: number,
+  ): { acquired: true; generation: number } | { acquired: false } {
+    this.assertLeaseInput(ownerId, now, leaseMs);
+    return this.db.transaction(() => {
+      const current = this.executorLeaseRow();
+      if (current.owner_id !== null && current.lease_expires_at !== null && current.lease_expires_at > now) {
+        return { acquired: false } as const;
+      }
+      const generation = current.generation + 1;
+      const updated = this.db
+        .prepare(
+          `UPDATE executor_lease SET owner_id = ?, generation = ?, heartbeat_at = ?, lease_expires_at = ?
+             WHERE singleton = 1 AND generation = ?`,
+        )
+        .run(ownerId, generation, now, now + leaseMs, current.generation);
+      if (updated.changes !== 1) return { acquired: false } as const;
+      return { acquired: true, generation } as const;
+    }).immediate();
+  }
+
+  public renewExecutorLease(ownerId: string, generation: number, now: number, leaseMs: number): boolean {
+    this.assertLeaseInput(ownerId, now, leaseMs);
+    assertPositiveInteger(generation, "generation");
+    return this.db.transaction(() => this.db
+      .prepare(
+        `UPDATE executor_lease SET heartbeat_at = ?, lease_expires_at = ?
+           WHERE singleton = 1 AND owner_id = ? AND generation = ? AND lease_expires_at > ?`,
+      )
+      .run(now, now + leaseMs, ownerId, generation, now).changes === 1).immediate();
+  }
+
+  public releaseExecutorLease(ownerId: string, generation: number, now: number): boolean {
+    if (!ownerId) throw new TypeError("ownerId must not be empty");
+    assertPositiveInteger(generation, "generation");
+    assertNonNegativeInteger(now, "now");
+    return this.db.transaction(() => this.db
+      .prepare(
+        `UPDATE executor_lease SET owner_id = NULL, heartbeat_at = ?, lease_expires_at = NULL
+           WHERE singleton = 1 AND owner_id = ? AND generation = ?`,
+      )
+      .run(now, ownerId, generation).changes === 1).immediate();
+  }
+
+  public isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean {
+    if (!ownerId) return false;
+    if (!Number.isInteger(generation) || generation < 1) return false;
+    if (!Number.isInteger(now) || now < 0) return false;
+    return this.executorLeaseIsCurrent(ownerId, generation, now);
+  }
+
+  public leaseEffects(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredEffect[] {
+    this.assertLeaseInput(ownerId, now, leaseMs);
+    assertPositiveInteger(generation, "generation");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    return this.db.transaction((): StoredEffect[] => {
+      if (!this.executorLeaseIsCurrent(ownerId, generation, now)) return [];
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM effects
+             WHERE (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+                OR (status = 'leased' AND lease_expires_at <= ?)
+             ORDER BY created_at ASC, idempotency_key ASC LIMIT ?`,
+        )
+        .all(now, now, limit) as EffectRow[];
+      const result: StoredEffect[] = [];
+      for (const row of rows) {
+        if (!this.executorLeaseIsCurrent(ownerId, generation, now)) break;
+        const updated = this.db
+          .prepare(
+            `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+               lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+             WHERE idempotency_key = ? AND (
+               (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+               OR (status = 'leased' AND lease_expires_at <= ?)
+             )`,
+          )
+          .run(ownerId, generation, now + leaseMs, now, row.idempotency_key, now, now);
+        if (updated.changes !== 1) continue;
+        const claimed = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?").get(row.idempotency_key) as EffectRow;
+        result.push(parseEffect(claimed));
+      }
+      return result;
+    }).immediate();
+  }
+
+  public leaseOutbox(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredOutbox[] {
+    this.assertLeaseInput(ownerId, now, leaseMs);
+    assertPositiveInteger(generation, "generation");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    return this.db.transaction((): StoredOutbox[] => {
+      if (!this.executorLeaseIsCurrent(ownerId, generation, now)) return [];
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM outbox
+             WHERE (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+                OR (status = 'leased' AND lease_expires_at <= ?)
+             ORDER BY created_at ASC, logical_key ASC LIMIT ?`,
+        )
+        .all(now, now, limit) as OutboxRow[];
+      const result: StoredOutbox[] = [];
+      for (const row of rows) {
+        if (!this.executorLeaseIsCurrent(ownerId, generation, now)) break;
+        const updated = this.db
+          .prepare(
+            `UPDATE outbox SET status = 'leased', lease_owner = ?, lease_generation = ?,
+               lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+             WHERE logical_key = ? AND (
+               (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+               OR (status = 'leased' AND lease_expires_at <= ?)
+             )`,
+          )
+          .run(ownerId, generation, now + leaseMs, now, row.logical_key, now, now);
+        if (updated.changes !== 1) continue;
+        const claimed = this.db.prepare("SELECT * FROM outbox WHERE logical_key = ?").get(row.logical_key) as OutboxRow;
+        result.push(parseOutbox(claimed));
+      }
+      return result;
+    }).immediate();
+  }
+
+  public completeEffect(key: string, ownerId: string, generation: number, now: number): boolean {
+    this.assertLeaseIdentity(key, ownerId, generation, now);
+    return this.db
+      .prepare(
+        `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
+           lease_expires_at = NULL, last_error = NULL, updated_at = ?
+         WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+           AND lease_generation = ? AND lease_expires_at > ?
+           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
+             AND generation = ? AND lease_expires_at > ?)`,
+      )
+      .run(now, key, ownerId, generation, now, ownerId, generation, now).changes === 1;
+  }
+
+  public completeOutbox(key: string, ownerId: string, generation: number, messageId: number | null, now: number): boolean {
+    this.assertLeaseIdentity(key, ownerId, generation, now);
+    if (messageId !== null && (!Number.isInteger(messageId) || messageId < 1)) throw new TypeError("messageId must be positive or null");
+    return this.db
+      .prepare(
+        `UPDATE outbox SET status = 'sent', message_id = COALESCE(?, message_id),
+           lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL,
+           last_error = NULL, updated_at = ?
+         WHERE logical_key = ? AND status = 'leased' AND lease_owner = ?
+           AND lease_generation = ? AND lease_expires_at > ?
+           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
+             AND generation = ? AND lease_expires_at > ?)`,
+      )
+      .run(messageId, now, key, ownerId, generation, now, ownerId, generation, now).changes === 1;
+  }
+
+  public completeStatusOutbox(
+    key: string,
+    ownerId: string,
+    generation: number,
+    jobId: string,
+    expectedVersion: number,
+    messageId: number,
+    now: number,
+  ): boolean {
+    this.assertLeaseIdentity(key, ownerId, generation, now);
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    assertPositiveInteger(expectedVersion, "expectedVersion");
+    if (!Number.isInteger(messageId) || messageId < 1) throw new TypeError("messageId must be positive");
+    return this.db.transaction(() => {
+      const updatedJob = this.db
+        .prepare(
+          `UPDATE jobs SET status_message_id = ?, version = ?, updated_at = ?
+             WHERE id = ? AND version = ?`,
+        )
+        .run(messageId, expectedVersion + 1, now, jobId, expectedVersion);
+      if (updatedJob.changes !== 1) return false;
+      const updatedOutbox = this.db
+        .prepare(
+          `UPDATE outbox SET status = 'sent', message_id = ?, lease_owner = NULL,
+             lease_generation = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ?
+             WHERE logical_key = ? AND status = 'leased' AND lease_owner = ?
+               AND lease_generation = ? AND lease_expires_at > ?
+               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
+                 AND generation = ? AND lease_expires_at > ?)`,
+        )
+        .run(messageId, now, key, ownerId, generation, now, ownerId, generation, now);
+      if (updatedOutbox.changes !== 1) throw new Error("status outbox lease changed before atomic completion");
+      return true;
+    }).immediate();
+  }
+
+  public failEffect(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean {
+    this.assertLeaseIdentity(key, ownerId, generation, now);
+    assertSafeFailureSummary(error);
+    assertNoRawMergeCallback(error, "effect error");
+    assertNonNegativeInteger(nextAttemptAt, "nextAttemptAt");
+    return this.db.transaction(() => {
+      const effect = this.effectByKey(key);
+      if (!effect || !this.effectLeaseIsActiveForRow(effect, ownerId, generation, now)) return false;
+      if (effect.attempts >= 20) {
+        const updated = this.db
+          .prepare(
+            `UPDATE effects SET status = 'dead', lease_owner = NULL, lease_generation = NULL,
+               lease_expires_at = NULL, last_error = ?, updated_at = ?
+             WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+               AND lease_generation = ? AND lease_expires_at > ?`,
+          )
+          .run(error, now, key, ownerId, generation, now);
+        if (updated.changes === 1) this.markJobPermanentFailure(effect.job_id, error, now);
+        return updated.changes === 1;
+      }
+      return this.db
+        .prepare(
+          `UPDATE effects SET status = 'failed', lease_owner = NULL, lease_generation = NULL,
+             lease_expires_at = NULL, last_error = ?, next_attempt_at = ?, updated_at = ?
+           WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+             AND lease_generation = ? AND lease_expires_at > ?`,
+        )
+        .run(error, nextAttemptAt, now, key, ownerId, generation, now).changes === 1;
+    }).immediate();
+  }
+
+  public failOutbox(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean {
+    this.assertLeaseIdentity(key, ownerId, generation, now);
+    assertSafeFailureSummary(error);
+    assertNoRawMergeCallback(error, "outbox error");
+    assertNonNegativeInteger(nextAttemptAt, "nextAttemptAt");
+    return this.db.transaction(() => {
+      const outbox = this.outboxByKey(key);
+      if (!outbox || !this.outboxLeaseIsActiveForRow(outbox, ownerId, generation, now)) return false;
+      const status = outbox.attempts >= 20 ? "dead" : "failed";
+      const updated = this.db
+        .prepare(
+          `UPDATE outbox SET status = ?, lease_owner = NULL, lease_generation = NULL,
+             lease_expires_at = NULL, last_error = ?, next_attempt_at = ?, updated_at = ?
+           WHERE logical_key = ? AND status = 'leased' AND lease_owner = ?
+             AND lease_generation = ? AND lease_expires_at > ?`,
+        )
+        .run(status, error, nextAttemptAt, now, key, ownerId, generation, now);
+      if (updated.changes === 1 && status === "dead") this.markJobPermanentFailureFromOutbox(key, error, now);
+      return updated.changes === 1;
+    }).immediate();
+  }
+
+  public deadLetterEffect(key: string, ownerId: string, generation: number, error: string, now: number): boolean {
+    this.assertLeaseIdentity(key, ownerId, generation, now);
+    assertSafeFailureSummary(error);
+    assertNoRawMergeCallback(error, "effect error");
+    return this.db.transaction(() => {
+      const effect = this.effectByKey(key);
+      if (!effect || !this.effectLeaseIsActiveForRow(effect, ownerId, generation, now)) return false;
+      const updated = this.db
+        .prepare(
+          `UPDATE effects SET status = 'dead', lease_owner = NULL, lease_generation = NULL,
+             lease_expires_at = NULL, last_error = ?, updated_at = ?
+           WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+             AND lease_generation = ? AND lease_expires_at > ?`,
+        )
+        .run(error, now, key, ownerId, generation, now);
+      if (updated.changes === 1) this.markJobPermanentFailure(effect.job_id, error, now);
+      return updated.changes === 1;
+    }).immediate();
+  }
+
+  public deadLetterOutbox(key: string, ownerId: string, generation: number, error: string, now: number): boolean {
+    this.assertLeaseIdentity(key, ownerId, generation, now);
+    assertSafeFailureSummary(error);
+    assertNoRawMergeCallback(error, "outbox error");
+    return this.db.transaction(() => {
+      const outbox = this.outboxByKey(key);
+      if (!outbox || !this.outboxLeaseIsActiveForRow(outbox, ownerId, generation, now)) return false;
+      const updated = this.db
+        .prepare(
+          `UPDATE outbox SET status = 'dead', lease_owner = NULL, lease_generation = NULL,
+             lease_expires_at = NULL, last_error = ?, updated_at = ?
+           WHERE logical_key = ? AND status = 'leased' AND lease_owner = ?
+             AND lease_generation = ? AND lease_expires_at > ?`,
+        )
+        .run(error, now, key, ownerId, generation, now);
+      if (updated.changes === 1) this.markJobPermanentFailureFromOutbox(key, error, now);
+      return updated.changes === 1;
+    }).immediate();
+  }
+
+  public getOutbox(logicalKey: string): StoredOutbox | null {
+    if (!logicalKey) throw new TypeError("logicalKey must not be empty");
+    const row = this.db.prepare("SELECT * FROM outbox WHERE logical_key = ?").get(logicalKey) as OutboxRow | undefined;
+    return row ? parseOutbox(row) : null;
+  }
+
+  public listOutbox(limit: number): StoredOutbox[] {
+    if (!Number.isInteger(limit) || limit < 1) throw new TypeError("limit must be a positive integer");
+    const rows = this.db
+      .prepare("SELECT * FROM outbox ORDER BY created_at ASC, logical_key ASC LIMIT ?")
+      .all(limit) as OutboxRow[];
+    return rows.map(parseOutbox);
+  }
+
+  public upsertWorkerLiveness(value: WorkerLiveness): void {
+    if (!value.jobId || !value.resourceId) throw new TypeError("worker liveness identity is required");
+    assertPositiveInteger(value.generation, "generation");
+    assertNonNegativeInteger(value.sourceUpdatedAt, "sourceUpdatedAt");
+    assertNonNegativeInteger(value.observedAt, "observedAt");
+    if (value.staleNotifiedAt !== null) assertNonNegativeInteger(value.staleNotifiedAt, "staleNotifiedAt");
+    this.db
+      .prepare(
+        `INSERT INTO worker_liveness (
+           job_id, worker_kind, resource_kind, resource_id, generation, state,
+           source_updated_at, observed_at, stale_notified_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(job_id) DO UPDATE SET
+           worker_kind = excluded.worker_kind,
+           resource_kind = excluded.resource_kind,
+           resource_id = excluded.resource_id,
+           generation = excluded.generation,
+           state = excluded.state,
+           source_updated_at = excluded.source_updated_at,
+           observed_at = excluded.observed_at,
+           stale_notified_at = excluded.stale_notified_at
+         WHERE worker_liveness.generation <= excluded.generation`,
+      )
+      .run(
+        value.jobId,
+        value.workerKind,
+        value.resourceKind,
+        value.resourceId,
+        value.generation,
+        value.state,
+        value.sourceUpdatedAt,
+        value.observedAt,
+        value.staleNotifiedAt,
+      );
+  }
+
+  public getWorkerLiveness(jobId: string): WorkerLiveness | null {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    const row = this.db
+      .prepare(
+        `SELECT job_id, worker_kind, resource_kind, resource_id, generation, state,
+                source_updated_at, observed_at, stale_notified_at
+           FROM worker_liveness WHERE job_id = ?`,
+      )
+      .get(jobId) as {
+        job_id: string;
+        worker_kind: WorkerLiveness["workerKind"];
+        resource_kind: WorkerLiveness["resourceKind"];
+        resource_id: string;
+        generation: number;
+        state: WorkerLiveness["state"];
+        source_updated_at: number;
+        observed_at: number;
+        stale_notified_at: number | null;
+      } | undefined;
+    return row
+      ? {
+          jobId: row.job_id,
+          workerKind: row.worker_kind,
+          resourceKind: row.resource_kind,
+          resourceId: row.resource_id,
+          generation: row.generation,
+          state: row.state,
+          sourceUpdatedAt: row.source_updated_at,
+          observedAt: row.observed_at,
+          staleNotifiedAt: row.stale_notified_at,
         }
       : null;
+  }
+
+  public markWorkerLivenessNotified(jobId: string, generation: number, now: number): boolean {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    assertPositiveInteger(generation, "generation");
+    assertNonNegativeInteger(now, "now");
+    return this.db
+      .prepare(
+        `UPDATE worker_liveness SET stale_notified_at = ?
+           WHERE job_id = ? AND generation = ? AND state IN ('stale', 'unknown') AND stale_notified_at IS NULL`,
+      )
+      .run(now, jobId, generation).changes === 1;
+  }
+
+  public clearWorkerLiveness(jobId: string, generation: number): boolean {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    assertPositiveInteger(generation, "generation");
+    return this.db
+      .prepare("DELETE FROM worker_liveness WHERE job_id = ? AND generation = ?")
+      .run(jobId, generation).changes === 1;
   }
 
   public leaseMergeEffect(input: {
@@ -3119,6 +3716,106 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       return result.changes === 1;
     });
     return enqueue();
+  }
+
+  private assertLeaseInput(ownerId: string, now: number, leaseMs: number): void {
+    if (!ownerId) throw new TypeError("ownerId must not be empty");
+    assertNonNegativeInteger(now, "now");
+    if (!Number.isInteger(leaseMs) || leaseMs < 1) throw new TypeError("leaseMs must be a positive integer");
+  }
+
+  private assertLeaseIdentity(key: string, ownerId: string, generation: number, now: number): void {
+    if (!key) throw new TypeError("lease key must not be empty");
+    if (!ownerId) throw new TypeError("ownerId must not be empty");
+    assertPositiveInteger(generation, "generation");
+    assertNonNegativeInteger(now, "now");
+  }
+
+  private executorLeaseRow(): {
+    owner_id: string | null;
+    generation: number;
+    heartbeat_at: number | null;
+    lease_expires_at: number | null;
+  } {
+    const row = this.db
+      .prepare("SELECT owner_id, generation, heartbeat_at, lease_expires_at FROM executor_lease WHERE singleton = 1")
+      .get() as {
+        owner_id: string | null;
+        generation: number;
+        heartbeat_at: number | null;
+        lease_expires_at: number | null;
+      } | undefined;
+    if (!row) throw new Error("Executor lease was not initialized");
+    return row;
+  }
+
+  private executorLeaseIsCurrent(ownerId: string, generation: number, now: number): boolean {
+    const row = this.executorLeaseRow();
+    return row.owner_id === ownerId && row.generation === generation &&
+      row.lease_expires_at !== null && row.lease_expires_at > now;
+  }
+
+  private effectByKey(key: string): EffectRow | undefined {
+    return this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?").get(key) as EffectRow | undefined;
+  }
+
+  private outboxByKey(key: string): OutboxRow | undefined {
+    return this.db.prepare("SELECT * FROM outbox WHERE logical_key = ?").get(key) as OutboxRow | undefined;
+  }
+
+  private effectLeaseIsActiveForRow(
+    effect: EffectRow,
+    ownerId: string,
+    generation: number,
+    now: number,
+  ): boolean {
+    return effect.status === "leased" && effect.lease_owner === ownerId &&
+      effect.lease_generation === generation && effect.lease_expires_at !== null && effect.lease_expires_at > now &&
+      this.executorLeaseIsCurrent(ownerId, generation, now);
+  }
+
+  private outboxLeaseIsActiveForRow(
+    outbox: OutboxRow,
+    ownerId: string,
+    generation: number,
+    now: number,
+  ): boolean {
+    return outbox.status === "leased" && outbox.lease_owner === ownerId &&
+      outbox.lease_generation === generation && outbox.lease_expires_at !== null && outbox.lease_expires_at > now &&
+      this.executorLeaseIsCurrent(ownerId, generation, now);
+  }
+
+  private markJobPermanentFailure(jobId: string, error: string, now: number): void {
+    const job = this.readJobById(jobId);
+    if (!job || ["merged", "cancelled", "blocked"].includes(job.state)) return;
+    const changed = this.db
+      .prepare(
+        `UPDATE jobs SET state = 'blocked', resume_state = ?, blocked_reason = 'permanent_effect_failure',
+           last_error = ?, version = ?, updated_at = ?
+         WHERE id = ? AND version = ?`,
+      )
+      .run(job.state, error, job.version + 1, now, job.id, job.version);
+    if (changed.changes === 1) {
+      this.db
+        .prepare(
+          `UPDATE approvals SET consumed_at = COALESCE(consumed_at, ?), outcome = 'revoked'
+             WHERE job_id = ? AND consumed_at IS NULL`,
+        )
+        .run(now, job.id);
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO effects (
+             idempotency_key, job_id, kind, payload_json, status, attempts,
+             next_attempt_at, created_at, updated_at
+           ) VALUES (?, ?, 'render_status', '{}', 'pending', 0, ?, ?, ?)`,
+        )
+        .run(`${job.id}:${job.version + 1}:render_status`, job.id, now, now, now);
+    }
+  }
+
+  private markJobPermanentFailureFromOutbox(key: string, error: string, now: number): void {
+    const match = /^job:([^:]+):status$/.exec(key);
+    if (match) this.markJobPermanentFailure(match[1], error, now);
   }
 
   private readJobById(jobId: string): Job | null {
