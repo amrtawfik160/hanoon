@@ -160,4 +160,45 @@ ALTER TABLE callbacks ADD COLUMN head_sha TEXT;
 ALTER TABLE callbacks ADD COLUMN effect_idempotency_key TEXT;
 `] as const;
 
-export const ALL_MIGRATIONS = [...INITIAL_MIGRATIONS, ...TASK_3_MIGRATIONS, ...TASK_9_MIGRATIONS] as const;
+export const CONTROLLER_MIGRATIONS = [String.raw`
+CREATE TABLE controller_threads (
+  controller_key TEXT PRIMARY KEY,
+  telegram_user_id TEXT NOT NULL,
+  telegram_chat_id TEXT NOT NULL,
+  project_id TEXT,
+  host_id TEXT,
+  bb_thread_id TEXT UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('pending_spawn', 'active', 'failed')),
+  pending_spawn_token TEXT UNIQUE,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE controller_turns (
+  id TEXT PRIMARY KEY,
+  telegram_update_id INTEGER NOT NULL UNIQUE,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  ordinal INTEGER NOT NULL,
+  input_text TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('queued', 'dispatching', 'submitted', 'completed', 'failed')),
+  lease_owner TEXT,
+  lease_generation INTEGER,
+  response_text TEXT,
+  last_error TEXT,
+  submitted_at INTEGER,
+  completed_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(controller_key, ordinal)
+);
+CREATE UNIQUE INDEX one_controller_turn_in_flight
+  ON controller_turns(controller_key)
+  WHERE state IN ('dispatching', 'submitted');
+`] as const;
+
+export const ALL_MIGRATIONS = [
+  ...INITIAL_MIGRATIONS,
+  ...TASK_3_MIGRATIONS,
+  ...TASK_9_MIGRATIONS,
+  ...CONTROLLER_MIGRATIONS,
+] as const;
