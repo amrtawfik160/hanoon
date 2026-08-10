@@ -5,10 +5,18 @@ import { buildInitialControllerPrompt } from "./instructions";
 export const CONTROLLER_PROVIDER = "codex";
 export const CONTROLLER_MODEL = "gpt-5.6-luna";
 export const CONTROLLER_REASONING = "max";
+export const CONTROLLER_SERVICE_TIER = "fast";
 export const CONTROLLER_PERMISSION = "auto";
 
 export type ControllerLocation = { threadId: string; projectId: string; hostId: string };
 export type ControllerStatus = "idle" | "active" | "starting" | "stopping" | "error" | "missing";
+export type ControllerEventObservation = {
+  latestSeq: number;
+  inputAccepted: boolean;
+  assistantDelta: string;
+  completed: boolean;
+  error: string | null;
+};
 
 export type ControllerAdapter = {
   spawn(
@@ -19,6 +27,7 @@ export type ControllerAdapter = {
   send(threadId: string, text: string, signal: AbortSignal): Promise<void>;
   status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
   output(threadId: string, signal: AbortSignal): Promise<string>;
+  events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventObservation>;
   findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null>;
 };
 
@@ -50,11 +59,13 @@ export class BbControllerAdapter implements ControllerAdapter {
       providerId: CONTROLLER_PROVIDER,
       model: CONTROLLER_MODEL,
       reasoningLevel: CONTROLLER_REASONING,
+      serviceTier: CONTROLLER_SERVICE_TIER,
       permissionMode: CONTROLLER_PERMISSION,
       executionInputSources: {
         providerId: "explicit",
         model: "explicit",
         reasoningLevel: "explicit",
+        serviceTier: "explicit",
         permissionMode: "explicit",
       },
     });
@@ -65,6 +76,16 @@ export class BbControllerAdapter implements ControllerAdapter {
     await this.dependencies.sdk.threads.send({
       threadId,
       mode: "start",
+      model: CONTROLLER_MODEL,
+      reasoningLevel: CONTROLLER_REASONING,
+      serviceTier: CONTROLLER_SERVICE_TIER,
+      permissionMode: CONTROLLER_PERMISSION,
+      executionInputSources: {
+        model: "explicit",
+        reasoningLevel: "explicit",
+        serviceTier: "explicit",
+        permissionMode: "explicit",
+      },
       input: [{ type: "text", text, mentions: [] }],
     });
   }
@@ -78,6 +99,34 @@ export class BbControllerAdapter implements ControllerAdapter {
   public async output(threadId: string, signal: AbortSignal): Promise<string> {
     const result = await this.dependencies.sdk.threads.output({ threadId, signal });
     return result.output ?? "";
+  }
+
+  public async events(
+    threadId: string,
+    afterSeq: number,
+    signal: AbortSignal,
+  ): Promise<ControllerEventObservation> {
+    const rows = await this.dependencies.sdk.threads.events.list({
+      threadId,
+      afterSeq: String(afterSeq),
+      limit: "100",
+      signal,
+    });
+    let latestSeq = afterSeq;
+    let inputAccepted = false;
+    let assistantDelta = "";
+    let completed = false;
+    let error: string | null = null;
+    for (const row of rows) {
+      latestSeq = Math.max(latestSeq, row.seq);
+      if (row.type === "turn/input/accepted") inputAccepted = true;
+      if (row.type === "item/agentMessage/delta") assistantDelta += row.data.delta;
+      if (row.type === "turn/completed") completed = true;
+      if (row.type === "system/error" || row.type === "provider/error") {
+        error = "Controller provider turn failed";
+      }
+    }
+    return { latestSeq, inputAccepted, assistantDelta, completed, error };
   }
 
   public async findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null> {

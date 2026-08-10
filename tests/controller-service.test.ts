@@ -58,6 +58,12 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
     state: "dispatching",
     leaseOwner: "executor",
     leaseGeneration: 1,
+    dispatchAfterSeq: 0,
+    retryCount: 0,
+    bbEventSeq: 0,
+    streamText: "",
+    telegramMessageId: null,
+    streamPhase: "queued",
     responseText: null,
     lastError: null,
     submittedAt: null,
@@ -68,18 +74,19 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
   } as const;
 }
 
-function sdkFixture(options: { projects?: unknown[]; threads?: unknown[]; hosts?: unknown[] } = {}) {
+function sdkFixture(options: { projects?: unknown[]; threads?: unknown[]; hosts?: unknown[]; events?: unknown[] } = {}) {
   const spawn = vi.fn(async () => ({ id: "thr_controller", environmentId: "env_personal" }));
   const send = vi.fn(async () => ({ ok: true }));
   const list = vi.fn(async () => options.threads ?? []);
   const get = vi.fn(async () => ({ id: "thr_controller", status: "idle", archivedAt: null, deletedAt: null }));
   const output = vi.fn(async () => ({ output: "Hello from Luna." }));
+  const eventsList = vi.fn(async () => options.events ?? []);
   const sdk = {
     projects: { list: vi.fn(async () => options.projects ?? [personalProject()]) },
     hosts: { list: vi.fn(async () => options.hosts ?? [{ id: "host_personal", status: "connected" }]) },
-    threads: { spawn, send, list, get, output },
+    threads: { spawn, send, list, get, output, events: { list: eventsList } },
   } as unknown as BbPluginApi["sdk"];
-  return { adapter: new BbControllerAdapter({ sdk, pluginId: "telegram-agent" }), spawn, send, list };
+  return { adapter: new BbControllerAdapter({ sdk, pluginId: "telegram-agent" }), spawn, send, list, eventsList };
 }
 
 it("spawns the hidden personal controller with the exact Luna Max execution tuple", async () => {
@@ -92,6 +99,7 @@ it("spawns the hidden personal controller with the exact Luna Max execution tupl
     providerId: "codex",
     model: "gpt-5.6-luna",
     reasoningLevel: "max",
+    serviceTier: "fast",
     permissionMode: "auto",
     visibility: "hidden",
     environment: {
@@ -103,10 +111,58 @@ it("spawns the hidden personal controller with the exact Luna Max execution tupl
       providerId: "explicit",
       model: "explicit",
       reasoningLevel: "explicit",
+      serviceTier: "explicit",
       permissionMode: "explicit",
     },
     input: [{ type: "text", text: expect.stringContaining("What projects can you work on?"), mentions: [] }],
   }));
+});
+
+it("keeps the exact Luna Max fast execution tuple on later controller turns", async () => {
+  const { adapter, send } = sdkFixture();
+
+  await adapter.send("thr_controller", "Show active threads", AbortSignal.timeout(1_000));
+
+  expect(send).toHaveBeenCalledWith({
+    threadId: "thr_controller",
+    mode: "start",
+    model: "gpt-5.6-luna",
+    reasoningLevel: "max",
+    serviceTier: "fast",
+    permissionMode: "auto",
+    executionInputSources: {
+      model: "explicit",
+      reasoningLevel: "explicit",
+      serviceTier: "explicit",
+      permissionMode: "explicit",
+    },
+    input: [{ type: "text", text: "Show active threads", mentions: [] }],
+  });
+});
+
+it("reduces BB controller events after the durable sequence without exposing reasoning", async () => {
+  const events = [
+    { id: "e11", threadId: "thr_controller", seq: 11, createdAt: 11, scope: { kind: "thread" }, type: "turn/input/accepted", data: {} },
+    { id: "e12", threadId: "thr_controller", seq: 12, createdAt: 12, scope: { kind: "thread" }, type: "item/reasoning/textDelta", data: { delta: "private chain" } },
+    { id: "e13", threadId: "thr_controller", seq: 13, createdAt: 13, scope: { kind: "thread" }, type: "item/agentMessage/delta", data: { delta: "Hello" } },
+    { id: "e14", threadId: "thr_controller", seq: 14, createdAt: 14, scope: { kind: "thread" }, type: "turn/completed", data: {} },
+  ];
+  const { adapter, eventsList } = sdkFixture({ events });
+  const signal = AbortSignal.timeout(1_000);
+
+  await expect(adapter.events("thr_controller", 10, signal)).resolves.toEqual({
+    latestSeq: 14,
+    inputAccepted: true,
+    assistantDelta: "Hello",
+    completed: true,
+    error: null,
+  });
+  expect(eventsList).toHaveBeenCalledWith({
+    threadId: "thr_controller",
+    afterSeq: "10",
+    limit: "100",
+    signal,
+  });
 });
 
 it("uses the only connected host when the personal project has no source binding", async () => {
@@ -201,6 +257,7 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
     send: vi.fn(async () => undefined),
     status: async () => status,
     output: vi.fn(async () => "First answer."),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
@@ -225,6 +282,7 @@ it("fails an uncertain send closed and never submits it twice", async () => {
     send: vi.fn(async () => { throw new Error("uncertain send"); }),
     status: vi.fn(async () => "idle" as const),
     output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed" })),
     findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
@@ -282,6 +340,7 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     output: vi.fn(async () => { throw new Error("temporary BB output failure"); }),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
@@ -290,4 +349,123 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
 
   expect(store.listControllerTurns("owner-7-controller", 10)[0]?.state).toBe("submitted");
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toBeNull();
+});
+
+it("retires an errored controller so a later queued message can start a fresh generation", async () => {
+  const { store, fence } = serviceFixture();
+  const failed = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 41, inputText: "show active threads" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 42, inputText: "try again" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(failed.id);
+  expect(store.markControllerSpawned({
+    turnId: failed.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_poisoned",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: failed.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+  })).toBe(true);
+  const spawn = vi.fn(async () => ({
+    threadId: "thr_fresh",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  }));
+  const adapter: ControllerAdapter = {
+    spawn,
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async (threadId: string) => threadId === "thr_poisoned" ? "error" : "active"),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed" })),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state))
+    .toEqual(["failed", "queued"]);
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    threadId: null,
+    state: "pending_spawn",
+  });
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(store.getControllerForOwner("7", "7")?.threadId).toBe("thr_fresh");
+});
+
+it("retries one controller generation when BB proves the input was never accepted", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 51, inputText: "show active threads" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_never_accepted",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    dispatchAfterSeq: 9,
+    now: 2_000,
+  })).toBe(true);
+  const spawn = vi.fn(async () => ({
+    threadId: "thr_retry",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  }));
+  const adapter: ControllerAdapter = {
+    spawn,
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async (threadId: string) => threadId === "thr_never_accepted" ? "error" : "active"),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({
+      latestSeq: 11,
+      inputAccepted: false,
+      assistantDelta: "",
+      completed: false,
+      error: "Controller provider turn failed",
+    })),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.listControllerTurns("owner-7-controller", 10)[0]).toMatchObject({
+    state: "queued",
+    retryCount: 1,
+    dispatchAfterSeq: 0,
+  });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)).toBeNull();
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(store.getControllerForOwner("7", "7")?.threadId).toBe("thr_retry");
 });

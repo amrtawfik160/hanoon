@@ -64,6 +64,13 @@ export class LunaControllerService {
           this.fail(turn, fence, "Controller thread was not idle for a new turn");
           return true;
         }
+        let dispatchAfterSeq: number;
+        try {
+          dispatchAfterSeq = (await this.dependencies.adapter.events(controller.threadId, 0, signal)).latestSeq;
+        } catch {
+          this.fail(turn, fence, "Controller event baseline could not be verified");
+          return true;
+        }
         try {
           await this.dependencies.adapter.send(controller.threadId, turn.inputText, signal);
         } catch {
@@ -73,6 +80,7 @@ export class LunaControllerService {
         if (!this.dependencies.store.markControllerTurnSubmitted({
           ...fenceAt(fence, this.dependencies.clock.now()),
           turnId: turn.id,
+          dispatchAfterSeq,
         })) {
           throw new Error("Controller turn changed before send completion was recorded");
         }
@@ -130,6 +138,28 @@ export class LunaControllerService {
       return true;
     }
     if (status === "error") {
+      try {
+        const observation = await this.dependencies.adapter.events(
+          controller.threadId,
+          submitted.dispatchAfterSeq,
+          signal,
+        );
+        if (!observation.inputAccepted && submitted.retryCount === 0) {
+          if (this.dependencies.store.retryUnacceptedControllerTurn({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            turnId: submitted.id,
+            controllerKey: controller.controllerKey,
+            expectedThreadId: controller.threadId,
+          })) return true;
+        }
+      } catch {
+        // Event acceptance is uncertain, so the turn must fail closed below.
+      }
+      this.dependencies.store.resetControllerThread({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        controllerKey: controller.controllerKey,
+        expectedThreadId: controller.threadId,
+      });
       this.fail(submitted, fence, "Controller provider turn failed");
       return true;
     }

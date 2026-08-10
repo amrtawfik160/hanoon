@@ -196,9 +196,19 @@ CREATE UNIQUE INDEX one_controller_turn_in_flight
   WHERE state IN ('dispatching', 'submitted');
 `] as const;
 
+export const CONTROLLER_STREAM_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN dispatch_after_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN bb_event_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN stream_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE controller_turns ADD COLUMN telegram_message_id INTEGER;
+ALTER TABLE controller_turns ADD COLUMN stream_phase TEXT NOT NULL DEFAULT 'queued';
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
   ...TASK_9_MIGRATIONS,
   ...CONTROLLER_MIGRATIONS,
+  ...CONTROLLER_STREAM_MIGRATIONS,
 ] as const;

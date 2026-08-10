@@ -372,6 +372,12 @@ type ControllerTurnRow = {
   state: ControllerTurnState;
   lease_owner: string | null;
   lease_generation: number | null;
+  dispatch_after_seq: number;
+  retry_count: number;
+  bb_event_seq: number;
+  stream_text: string;
+  telegram_message_id: number | null;
+  stream_phase: ControllerTurnRecord["streamPhase"];
   response_text: string | null;
   last_error: string | null;
   submitted_at: number | null;
@@ -1258,7 +1264,16 @@ export interface TelegramAgentStore {
     threadId: string;
     leaseMs?: number;
   }): boolean;
-  markControllerTurnSubmitted(input: ControllerLeaseFence & { turnId: string; leaseMs?: number }): boolean;
+  markControllerTurnSubmitted(input: ControllerLeaseFence & {
+    turnId: string;
+    dispatchAfterSeq?: number;
+    leaseMs?: number;
+  }): boolean;
+  retryUnacceptedControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+  }): boolean;
   resetControllerThread(input: ControllerLeaseFence & {
     controllerKey: string;
     expectedThreadId: string;
@@ -1501,6 +1516,12 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     state: row.state,
     leaseOwner: row.lease_owner,
     leaseGeneration: row.lease_generation,
+    dispatchAfterSeq: row.dispatch_after_seq,
+    retryCount: row.retry_count,
+    bbEventSeq: row.bb_event_seq,
+    streamText: row.stream_text,
+    telegramMessageId: row.telegram_message_id,
+    streamPhase: row.stream_phase,
     responseText: row.response_text,
     lastError: row.last_error,
     submittedAt: row.submitted_at,
@@ -2129,20 +2150,74 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   public markControllerTurnSubmitted(
-    input: ControllerLeaseFence & { turnId: string; leaseMs?: number },
+    input: ControllerLeaseFence & {
+      turnId: string;
+      dispatchAfterSeq?: number;
+      leaseMs?: number;
+    },
   ): boolean {
     this.assertControllerMutation(input);
+    const dispatchAfterSeq = input.dispatchAfterSeq ?? 0;
+    assertNonNegativeInteger(dispatchAfterSeq, "dispatchAfterSeq");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       return this.db.prepare(
-        `UPDATE controller_turns SET state = 'submitted', submitted_at = ?, updated_at = ?
+        `UPDATE controller_turns
+            SET state = 'submitted', dispatch_after_seq = ?, bb_event_seq = ?,
+                stream_phase = 'connecting', submitted_at = ?, updated_at = ?
           WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?
             AND EXISTS (
               SELECT 1 FROM controller_threads
                WHERE controller_key = controller_turns.controller_key
                  AND state = 'active' AND bb_thread_id IS NOT NULL
             )`,
-      ).run(input.now, input.now, input.turnId, input.ownerId, input.generation).changes === 1;
+      ).run(
+        dispatchAfterSeq,
+        dispatchAfterSeq,
+        input.now,
+        input.now,
+        input.turnId,
+        input.ownerId,
+        input.generation,
+      ).changes === 1;
+    }).immediate();
+  }
+
+  public retryUnacceptedControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const eligible = this.db.prepare(
+        `SELECT 1 FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+          WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+            AND turn.retry_count = 0 AND controller.bb_thread_id = ? AND controller.state = 'active'`,
+      ).get(input.turnId, input.controllerKey, input.expectedThreadId);
+      if (!eligible) return false;
+      const turn = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
+                dispatch_after_seq = 0, bb_event_seq = 0, retry_count = retry_count + 1,
+                stream_text = '', stream_phase = 'queued', submitted_at = NULL,
+                last_error = NULL, updated_at = ?
+          WHERE id = ? AND controller_key = ? AND state = 'submitted' AND retry_count = 0`,
+      ).run(input.now, input.turnId, input.controllerKey);
+      if (turn.changes !== 1) throw new Error("Controller turn changed during unaccepted retry");
+      const controller = this.db.prepare(
+        `UPDATE controller_threads
+            SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+                state = 'pending_spawn', pending_spawn_token = NULL,
+                last_error = NULL, updated_at = ?
+          WHERE controller_key = ? AND bb_thread_id = ? AND state = 'active'`,
+      ).run(input.now, input.controllerKey, input.expectedThreadId);
+      if (controller.changes !== 1) throw new Error("Controller generation changed during unaccepted retry");
+      return true;
     }).immediate();
   }
 

@@ -1,5 +1,13 @@
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
+export type ControllerStreamPhase =
+  | "queued"
+  | "connecting"
+  | "thinking"
+  | "using_tools"
+  | "responding"
+  | "complete"
+  | "failed";
 
 export type ControllerThreadRecord = {
   controllerKey: string;
@@ -24,6 +32,12 @@ export type ControllerTurnRecord = {
   state: ControllerTurnState;
   leaseOwner: string | null;
   leaseGeneration: number | null;
+  dispatchAfterSeq: number;
+  retryCount: number;
+  bbEventSeq: number;
+  streamText: string;
+  telegramMessageId: number | null;
+  streamPhase: ControllerStreamPhase;
   responseText: string | null;
   lastError: string | null;
   submittedAt: number | null;

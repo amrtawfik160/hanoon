@@ -32,9 +32,11 @@ function acquire(store: ReturnType<typeof openStore>) {
 }
 
 it("appends one controller migration", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(4);
-  expect(ALL_MIGRATIONS.at(-1)).toContain("CREATE TABLE controller_threads");
-  expect(ALL_MIGRATIONS.at(-1)).toContain("CREATE TABLE controller_turns");
+  expect(ALL_MIGRATIONS).toHaveLength(5);
+  expect(ALL_MIGRATIONS.at(-2)).toContain("CREATE TABLE controller_threads");
+  expect(ALL_MIGRATIONS.at(-2)).toContain("CREATE TABLE controller_turns");
+  expect(ALL_MIGRATIONS.at(-1)).toContain("dispatch_after_seq");
+  expect(ALL_MIGRATIONS.at(-1)).toContain("telegram_message_id");
 });
 
 it("enqueues Telegram controller turns idempotently and rejects changed replay input", () => {
@@ -48,6 +50,12 @@ it("enqueues Telegram controller turns idempotently and rejects changed replay i
     ordinal: 1,
     inputText: "What can you do?",
     state: "queued",
+    dispatchAfterSeq: 0,
+    retryCount: 0,
+    bbEventSeq: 0,
+    streamText: "",
+    telegramMessageId: null,
+    streamPhase: "queued",
   });
   expect(store.enqueueControllerTurn(turnInput(101))).toEqual(first);
   expect(() => store.enqueueControllerTurn(turnInput(101, "different"))).toThrow(IdempotencyConflictError);
@@ -115,6 +123,36 @@ it("fails a stale uncertain dispatch closed so the FIFO can continue", () => {
     generation: successor.generation,
     now: 32_001,
   })).toMatchObject({ updateId: 352, state: "dispatching" });
+});
+
+it("requeues one unaccepted controller turn in a fresh generation without losing FIFO order", () => {
+  const { store } = fixture();
+  const first = store.enqueueControllerTurn(turnInput(371, "first"));
+  store.enqueueControllerTurn(turnInput(372, "second"));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(first.id);
+  expect(store.markControllerSpawned({
+    turnId: first.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_failed_init",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: first.id, dispatchAfterSeq: 21, ...fence })).toBe(true);
+
+  expect(store.retryUnacceptedControllerTurn({
+    turnId: first.id,
+    controllerKey: "owner-7-controller",
+    expectedThreadId: "thr_failed_init",
+    ...fence,
+  })).toBe(true);
+
+  expect(store.listControllerTurns("owner-7-controller", 10)).toMatchObject([
+    { id: first.id, state: "queued", retryCount: 1, dispatchAfterSeq: 0 },
+    { updateId: 372, state: "queued", retryCount: 0 },
+  ]);
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+  expect(store.claimNextControllerTurn(fence)).toMatchObject({ id: first.id, state: "dispatching", retryCount: 1 });
 });
 
 it("rejects credential-shaped controller failure text", () => {
