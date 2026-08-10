@@ -18,12 +18,12 @@ The existing bot token, BB URL, and poll timeout remain. Add four static BB-supp
 
 | Setting | Options | Default |
 | --- | --- | --- |
-| Controller model | `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.4` | `gpt-5.6-luna` |
+| Controller model | `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `gpt-5.6-luna` |
 | Controller reasoning | `low`, `medium`, `high`, `xhigh`, `max` | `max` |
 | Controller service tier | `fast`, `default` | `fast` |
 | Controller permission mode | `auto`, `accept-edits`, `full` | `auto` |
 
-The model list stays within the installed Codex provider family. The common reasoning options avoid combinations known to be unavailable across those presets. BB and the execution machine still enforce provider availability and the machine's maximum permission mode.
+The model list stays within the installed Codex 5.6 provider family. Every listed model supports the exposed reasoning range, avoiding invalid combinations such as `gpt-5.4` with `max`. BB and the execution machine still enforce provider availability and the machine's maximum permission mode.
 
 ## Runtime behavior
 

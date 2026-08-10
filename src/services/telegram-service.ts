@@ -1,4 +1,4 @@
-import type { GlobalConfigResult } from "../config";
+import type { GlobalConfig } from "../config";
 import { needsConfiguration, redactError } from "../errors";
 import type { TelegramAgentStore } from "../storage/store";
 import { TelegramConflictError } from "../telegram/client";
@@ -13,7 +13,9 @@ export type TelegramServiceDeps = {
   store: Pick<TelegramAgentStore, "getNextTelegramOffset" | "beginTelegramUpdate" | "completeTelegramUpdate" | "failTelegramUpdate" | "bindTelegramIdentity" | "getActiveJob">;
   client: (token: string) => TelegramServiceClient;
   ingress: { handleClaimed(update: TelegramUpdate, now: number): Promise<void> };
-  getConfig: () => GlobalConfigResult;
+  getConfig: () =>
+    | { ok: true; value: Pick<GlobalConfig, "botToken" | "pollTimeoutSeconds"> }
+    | { ok: false; message: string };
   clock: { now(): number };
 };
 

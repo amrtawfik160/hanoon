@@ -12,6 +12,7 @@
 
 - Provider remains fixed to `codex`.
 - Defaults remain `gpt-5.6-luna`, reasoning `max`, service tier `fast`, permission mode `auto`.
+- Model choices remain `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-5.6-sol` so every exposed reasoning level is valid.
 - Controller settings never modify active or stored project job policies.
 - Use BB native settings descriptors; do not add a custom frontend or dependency.
 - Follow RED → GREEN TDD and preserve owner pairing, FIFO, recovery, and hidden-thread behavior.
