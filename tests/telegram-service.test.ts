@@ -110,7 +110,6 @@ describe("Telegram ingress service", () => {
       abort.signal,
     );
 
-    await vi.waitFor(() => expect(seen).toEqual([10, 11, 12]));
     await promise;
 
     expect(seen).toEqual([10, 11, 12]);
@@ -156,7 +155,6 @@ describe("Telegram ingress service", () => {
       ),
       abort.signal,
     );
-    await vi.waitFor(() => expect(store.getJob(draft.id)?.state).toBe("creating_implementation"));
     await promise;
 
     expect(store.listEffectsForJob(draft.id).filter((effect) => effect.kind === "spawn_implementation")).toHaveLength(1);

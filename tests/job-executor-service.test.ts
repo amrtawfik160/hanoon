@@ -152,6 +152,30 @@ describe("singleton job executor", () => {
     });
   });
 
+  it("dead-letters schema and idempotency conflicts without transient retries", async () => {
+    const { store, db } = fixture();
+    store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES ('job_1:2:one', 'job_1', 'render_status', '{}', 'pending', 0, 1000, 1000, 1000)`,
+    ).run();
+    const abort = new AbortController();
+    const conflict = Object.assign(new Error("duplicate idempotency key"), { name: "IdempotencyConflictError" });
+    const deps: JobExecutorDependencies = {
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      effectRunnerFactory: () => ({ run: async () => { throw conflict; } }),
+    };
+
+    await runJobExecutorService(deps, abort.signal);
+
+    expect(db.prepare("SELECT status, attempts FROM effects WHERE idempotency_key = 'job_1:2:one'").get()).toEqual({
+      status: "dead",
+      attempts: 1,
+    });
+  });
+
   it("releases the singleton lease on an explicit clean shutdown", async () => {
     const { store } = fixture();
     const abort = new AbortController();

@@ -2,7 +2,7 @@ import type { Job, JobEffect, ReviewFinding, StoredEffect, WorkerLiveness } from
 import { ApprovalService } from "./approval-service";
 import type { BbAttempt, EnvironmentSnapshot } from "../bb/runner";
 import type { TerminalCommandRunner } from "../bb/terminal-command";
-import type { ValidationSnapshot } from "../bb/validation";
+import { ValidationError, type ValidationSnapshot } from "../bb/validation";
 import { persistableJobStatusPayload, renderJobStatus } from "../telegram/view";
 import type {
   AttemptRecord,
@@ -89,7 +89,7 @@ export type EffectRunnerDependencies = {
     }): Promise<unknown>;
   };
   approvals?: ApprovalService;
-  reconcileJob?: (job: Job, signal: AbortSignal) => Promise<void>;
+  reconcileJob?: (job: Job, signal: AbortSignal, fence: EffectFence) => Promise<void>;
   resolvePrHead?: (job: Job, effect: StoredEffect, signal: AbortSignal) => Promise<{
     event: "PR_HEAD_RESOLVED" | "PR_HEAD_RESOLUTION_FAILED";
     headSha?: string;
@@ -393,7 +393,22 @@ export class EffectRunner {
 
   private async runValidation(effect: StoredEffect, job: Job): Promise<void> {
     if (!this.dependencies.runValidation) throw new PermanentEffectError("validation runner is not configured");
-    const result = await this.dependencies.runValidation(job, effect, this.dependencies.fence.signal);
+    let result: ValidationSnapshot;
+    try {
+      result = await this.dependencies.runValidation(job, effect, this.dependencies.fence.signal);
+    } catch (error) {
+      if (!(error instanceof ValidationError)) throw error;
+      this.assertFence();
+      const current = this.dependencies.store.getJob(job.id);
+      if (current?.state === "validating") {
+        this.dependencies.store.applyJobEvent(job.id, current.version, {
+          type: "VALIDATION_FAILED",
+          headSha: current.prHeadSha ?? undefined,
+          reason: error.message,
+        }, this.now());
+      }
+      return;
+    }
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "validating") return;
@@ -429,19 +444,68 @@ export class EffectRunner {
     }
     await bb.stopWorker(worker);
     this.assertFence();
-    if (!bb.getThread) return;
-    const thread = await bb.getThread(resourceId);
-    const current = this.dependencies.store.getJob(job.id);
-    if (!current) return;
-    const projected = projectWorkerLiveness(this.dependencies.store, current, thread, this.now());
-    if (current.cancelRequestedAt !== null && (projected.state === "idle" || projected.state === "failed")) {
-      this.dependencies.store.applyJobEvent(job.id, current.version, { type: "CANCEL_CONFIRMED" }, this.now());
+    const maxChecks = 4;
+    for (let check = 0; check < maxChecks; check += 1) {
+      this.assertFence();
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.cancelRequestedAt === null) return;
+      if (!bb.getThread) break;
+      try {
+        const thread = await bb.getThread(resourceId);
+        this.assertFence();
+        const latest = this.dependencies.store.getJob(job.id);
+        if (!latest || latest.cancelRequestedAt === null) return;
+        const projected = projectWorkerLiveness(
+          this.dependencies.store,
+          latest,
+          thread,
+          this.now(),
+          worker.workerKind,
+          worker.generation,
+        );
+        if (projected.state === "idle" || projected.state === "failed") {
+          this.assertFence();
+          const confirmed = this.dependencies.store.getJob(job.id);
+          if (confirmed && confirmed.cancelRequestedAt !== null && confirmed.state !== "blocked") {
+            this.dependencies.store.applyJobEvent(confirmed.id, confirmed.version, { type: "CANCEL_CONFIRMED" }, this.now());
+          }
+          return;
+        }
+      } catch {
+        this.assertFence();
+      }
+      if (check + 1 < maxChecks) {
+        await new Promise<void>((resolve, reject) => {
+          let timer: ReturnType<typeof setTimeout>;
+          const cleanup = () => {
+            clearTimeout(timer);
+            this.dependencies.fence.signal.removeEventListener("abort", onAbort);
+          };
+          const onAbort = () => {
+            cleanup();
+            reject(this.dependencies.fence.signal.reason ?? new Error("executor stopped"));
+          };
+          timer = setTimeout(() => {
+            cleanup();
+            resolve();
+          }, 250);
+          this.dependencies.fence.signal.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+    }
+    this.assertFence();
+    const unresolved = this.dependencies.store.getJob(job.id);
+    if (unresolved && unresolved.cancelRequestedAt !== null && unresolved.state !== "blocked" && unresolved.state !== "cancelled") {
+      this.dependencies.store.applyJobEvent(unresolved.id, unresolved.version, {
+        type: "CANCELLATION_UNCONFIRMED",
+        reason: "Cancellation could not be confirmed while the BB worker remained active or stopping",
+      }, this.now());
     }
   }
 
   private async reconcile(job: Job): Promise<void> {
     if (this.dependencies.reconcileJob) {
-      await this.dependencies.reconcileJob(job, this.dependencies.fence.signal);
+      await this.dependencies.reconcileJob(job, this.dependencies.fence.signal, this.dependencies.fence);
       return;
     }
     const bb = this.dependencies.bb;
@@ -452,9 +516,29 @@ export class EffectRunner {
       const current = this.dependencies.store.getJob(job.id) ?? job;
       try {
         const thread = await bb.getThread(resourceId);
-        projectWorkerLiveness(this.dependencies.store, current, thread, this.now());
+        this.assertFence();
+        const latest = this.dependencies.store.getJob(job.id) ?? current;
+        const worker = this.dependencies.store.getWorkerLiveness(job.id);
+        projectWorkerLiveness(
+          this.dependencies.store,
+          latest,
+          thread,
+          this.now(),
+          worker?.resourceId === resourceId ? worker.workerKind : undefined,
+          worker?.resourceId === resourceId ? worker.generation : undefined,
+        );
       } catch {
-        projectUnknownWorker(this.dependencies.store, job, resourceId, this.now());
+        this.assertFence();
+        const latest = this.dependencies.store.getJob(job.id) ?? current;
+        const worker = this.dependencies.store.getWorkerLiveness(job.id);
+        projectUnknownWorker(
+          this.dependencies.store,
+          latest,
+          resourceId,
+          this.now(),
+          worker?.resourceId === resourceId ? worker.workerKind : undefined,
+          worker?.resourceId === resourceId ? worker.generation : undefined,
+        );
       }
     }
   }

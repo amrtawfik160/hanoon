@@ -9,9 +9,16 @@ import { openStore } from "./storage/store";
 import { EffectRunner } from "./services/effect-runner";
 import type { EffectFence } from "./services/effect-runner";
 import { runJobExecutorService } from "./services/job-executor-service";
-import { MergeHandler } from "./services/merge-handler";
+import { createTask9FreshGateCollector, MergeHandler } from "./services/merge-handler";
+import type { GateInput } from "./domain/gates";
+import { ReviewHandler, type ReviewHandlerEvent } from "./services/review-handler";
 import { runTelegramService } from "./services/telegram-service";
-import { projectUnknownWorker, projectWorkerLiveness } from "./services/worker-liveness";
+import {
+  projectUnknownWorker,
+  projectTerminalLiveness,
+  projectWorkerLiveness,
+  workerRegistrationGeneration,
+} from "./services/worker-liveness";
 
 function clock(): number {
   return Date.now();
@@ -55,13 +62,175 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
 
   const terminal = new TerminalCommandRunner(bb.sdk);
   const bbRunner = new BbRunner(bb.sdk);
+  let reviewStatusJob: NonNullable<ReturnType<typeof store.getJob>> | null = null;
+  let reviewEvent: ReviewHandlerEvent | null = null;
+  const reviewHandler = new ReviewHandler({
+    threads: {
+      output: (threadId) => bb.sdk.threads.output({ threadId }),
+      send: (threadId, prompt) => bbRunner.sendSteering(threadId, prompt),
+      create: async () => {
+        throw new Error("review cycle creation belongs to the leased review effect");
+      },
+    },
+    environment: {
+      status: async () => {
+        const job = reviewStatusJob;
+        if (!job?.environmentId || !job.policy) return { available: false, clean: false, headSha: null };
+        const value = await bb.sdk.environments.status({
+          environmentId: job.environmentId,
+          mergeBaseBranch: job.policy.baseBranch,
+        });
+        const raw = value as unknown as Record<string, unknown>;
+        const workspace = (raw.workspace ?? {}) as Record<string, unknown>;
+        const workingTree = (raw.workingTree ?? workspace.workingTree ?? {}) as Record<string, unknown>;
+        const checkout = (raw.checkout ?? workspace.checkout ?? {}) as Record<string, unknown>;
+        const clean = raw.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false);
+        const available = raw.available !== false && raw.outcome !== "unavailable" && raw.outcome !== "not_applicable";
+        return {
+          available,
+          clean,
+          headSha: typeof checkout.headSha === "string" ? checkout.headSha : null,
+        };
+      },
+    },
+    attempts: {
+      get: (attemptId) => {
+        const attempt = store.getAttempt(attemptId);
+        if (!attempt) return {};
+        let result: Record<string, unknown> | null = null;
+        if (attempt.resultJson !== null) {
+          try {
+            const parsed = JSON.parse(attempt.resultJson);
+            if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) result = parsed as Record<string, unknown>;
+          } catch {
+            result = null;
+          }
+        }
+        return {
+          threadId: attempt.threadId,
+          headSha: attempt.headSha ?? undefined,
+          formatCorrectionSent: result?.formatCorrectionSent === true,
+          requiresNewHead: result?.requiresNewHead === true,
+          result: result as never,
+        };
+      },
+      update: (attemptId, patch) => {
+        const existing = store.getAttempt(attemptId);
+        let result = patch.result === undefined
+          ? existing?.resultJson
+            ? JSON.parse(existing.resultJson) as Record<string, unknown>
+            : null
+          : patch.result;
+        if (result !== null && result !== undefined) {
+          result = {
+            ...result,
+            ...(patch.formatCorrectionSent === undefined ? {} : { formatCorrectionSent: patch.formatCorrectionSent }),
+            ...(patch.requiresNewHead === undefined ? {} : { requiresNewHead: patch.requiresNewHead }),
+          };
+        }
+        store.updateAttempt(attemptId, {
+          threadId: patch.threadId,
+          headSha: patch.headSha,
+          result: result as Record<string, unknown> | null,
+        });
+      },
+      claimFormatCorrection: (attemptId, threadId, headSha) => store.claimReviewFormatCorrection(attemptId, threadId, headSha),
+    },
+    emit: (event) => {
+      reviewEvent = event;
+    },
+  });
+  const collectGateInput = createTask9FreshGateCollector({
+    validation: { runner: terminal, environments: bb.sdk.environments },
+    runValidation: (input) => runValidation({
+      runner: terminal,
+      environments: bb.sdk.environments,
+      environmentId: input.environmentId,
+      job: input.job,
+      currentReviewAttempt: store.getJob(input.job.id)?.reviewThreadId
+        ? (() => {
+            const reviewThreadId = store.getJob(input.job.id)?.reviewThreadId;
+            const attempt = reviewThreadId ? store.getAttemptByThreadId(reviewThreadId) : null;
+            return attempt ? { id: attempt.id } : undefined;
+          })()
+        : undefined,
+      signal: input.signal,
+    }),
+    getContext: async ({ job, receipt, validation, approvalExpiresAt }): Promise<{
+      environment: GateInput["environment"];
+      review: GateInput["review"];
+      receipt: GateInput["receipt"];
+    }> => {
+      if (!job.environmentId || !job.projectId || !job.policy || job.prNumber === null) {
+        throw new TypeError("Merge gate collection requires a fully configured job");
+      }
+      const rawStatus = await bb.sdk.environments.status({
+        environmentId: job.environmentId,
+        mergeBaseBranch: job.policy.baseBranch,
+      }) as unknown as Record<string, unknown>;
+      const workspace = (rawStatus.workspace ?? {}) as Record<string, unknown>;
+      const workingTree = (rawStatus.workingTree ?? workspace.workingTree ?? {}) as Record<string, unknown>;
+      const checkout = (rawStatus.checkout ?? workspace.checkout ?? {}) as Record<string, unknown>;
+      const rawPullRequest = await bb.sdk.environments.pullRequest({ environmentId: job.environmentId });
+      const pullRequestRecord = rawPullRequest as unknown as Record<string, unknown>;
+      const pullRequest = (pullRequestRecord.pullRequest ?? {}) as Record<string, unknown>;
+      const attempt = job.reviewThreadId ? store.getAttemptByThreadId(job.reviewThreadId) : null;
+      let attemptResult: Record<string, unknown> = {};
+      if (attempt?.resultJson) {
+        try {
+          const parsed = JSON.parse(attempt.resultJson);
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) attemptResult = parsed as Record<string, unknown>;
+        } catch {
+          attemptResult = {};
+        }
+      }
+      const defaultReceipt = {
+        jobId: job.id,
+        jobVersion: job.version,
+        projectId: job.projectId,
+        environmentId: job.environmentId,
+        prNumber: job.prNumber,
+        baseBranch: job.policy.baseBranch,
+        headSha: validation.headSha,
+        reviewAttemptId: attempt?.id ?? validation.reviewAttemptId ?? `review:${job.id}`,
+        validationCompletedAt: validation.completedAt,
+        requiredCheckNames: [...job.policy.requiredChecks].sort(),
+        mergeMethod: job.policy.mergeMethod,
+        expiresAt: new Date(approvalExpiresAt ?? (typeof validation.completedAt === "string" ? Date.parse(validation.completedAt) + 15 * 60_000 : Date.now() + 15 * 60_000)).toISOString(),
+      };
+      return {
+        environment: {
+          id: job.environmentId,
+          projectId: job.projectId,
+          status: rawStatus.outcome === "available" || rawStatus.status === "available" ? "available" : String(rawStatus.status ?? rawStatus.outcome ?? "unavailable"),
+          worktree: {
+            clean: rawStatus.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false),
+            untrackedFiles: Array.isArray(workingTree.untrackedFiles) ? workingTree.untrackedFiles.filter((item): item is string => typeof item === "string") : [],
+          },
+          checkout: {
+            kind: typeof checkout.kind === "string" ? checkout.kind : "unknown",
+            branchName: typeof checkout.branchName === "string" ? checkout.branchName : typeof checkout.branch === "string" ? checkout.branch : undefined,
+            headSha: typeof checkout.headSha === "string" ? checkout.headSha : null,
+          },
+        },
+        review: {
+          attemptId: attempt?.id ?? validation.reviewAttemptId ?? `review:${job.id}`,
+          headSha: typeof attemptResult.reviewedHeadSha === "string" ? attemptResult.reviewedHeadSha : attempt?.headSha ?? null,
+          verdict: typeof (attemptResult.verdict as Record<string, unknown> | undefined)?.verdict === "string"
+            ? String((attemptResult.verdict as Record<string, unknown>).verdict)
+            : typeof attemptResult.outcome === "string" ? attemptResult.outcome : "blocked",
+          findings: Array.isArray(attemptResult.findings) ? attemptResult.findings : [],
+          reviewerMutated: attemptResult.reviewerMutated === true,
+        },
+        receipt: receipt ?? defaultReceipt,
+      };
+    },
+  });
   const mergeHandler = new MergeHandler({
     store,
     commandRunner: terminal,
     bb: { sdk: bb.sdk },
-    collectGateInput: async () => {
-      throw new Error("Merge gate collection is supplied by the leased effect runner");
-    },
+    collectGateInput,
   });
   const ingress = new TelegramIngress({
     store,
@@ -80,15 +249,85 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     getPullRequestSnapshot: (environmentId: string) => bbRunner.getPullRequestSnapshot(environmentId),
     sdk: { threads: bb.sdk.threads },
   };
-  const reconcileJob = async (job: NonNullable<ReturnType<typeof store.getJob>>, signal: AbortSignal): Promise<void> => {
-    if (signal.aborted) return;
-    for (const resourceId of [job.implementationThreadId, job.reviewThreadId].filter((id): id is string => id !== null)) {
-      try {
-        const thread = await bbRunner.getThread(resourceId);
-        projectWorkerLiveness(store, job, thread, clock());
-      } catch {
-        projectUnknownWorker(store, job, resourceId, clock());
+  const reconcileJob = async (
+    job: NonNullable<ReturnType<typeof store.getJob>>,
+    signal: AbortSignal,
+    fence: EffectFence,
+  ): Promise<void> => {
+    const fenceCurrent = (): boolean => !signal.aborted && !fence.signal.aborted &&
+      store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock());
+    if (!fenceCurrent()) return;
+
+    const reviewStage = job.state === "reviewing";
+    const implementationStage = ["creating_implementation", "implementing", "locating_pr", "resolving_pr_head", "remediating"].includes(job.state);
+    const resourceId = reviewStage ? job.reviewThreadId : implementationStage ? job.implementationThreadId : null;
+    if (!resourceId) return;
+    const workerKind = reviewStage ? "review" as const : "implementation" as const;
+    const generation = workerRegistrationGeneration(job, workerKind);
+    let thread: Awaited<ReturnType<BbRunner["getThread"]>>;
+    try {
+      thread = await bbRunner.getThread(resourceId);
+    } catch {
+      if (!fenceCurrent()) return;
+      const current = store.getJob(job.id);
+      if (current) projectUnknownWorker(store, current, resourceId, clock(), workerKind, generation);
+      return;
+    }
+    if (!fenceCurrent()) return;
+    const current = store.getJob(job.id);
+    if (!current || current.state !== job.state || (reviewStage ? current.reviewThreadId : current.implementationThreadId) !== resourceId) return;
+    if (!fenceCurrent()) return;
+    const projected = projectWorkerLiveness(store, current, thread, clock(), workerKind, generation);
+    const failed = thread.status === "error" || thread.runtime.displayStatus === "error";
+    if (failed) {
+      if (!fenceCurrent()) return;
+      const latest = store.getJob(job.id);
+      if (latest && latest.cancelRequestedAt === null) {
+        store.applyJobEvent(job.id, latest.version, { type: "THREAD_FAILED", workerKind, error: `${workerKind} worker thread failed` }, clock());
       }
+      return;
+    }
+    if (projected.state !== "idle") return;
+
+    if (!reviewStage) {
+      if (!fenceCurrent()) return;
+      const latest = store.getJob(job.id);
+      if (latest && (latest.state === "implementing" || latest.state === "remediating")) {
+        store.applyJobEvent(job.id, latest.version, { type: "IMPLEMENTATION_IDLE" }, clock());
+      }
+      return;
+    }
+
+    const attempt = store.getAttemptByThreadId(resourceId);
+    if (!attempt || !current.implementationThreadId || !current.prHeadSha) {
+      if (!fenceCurrent()) return;
+      const latest = store.getJob(job.id);
+      if (latest) store.applyJobEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" }, clock());
+      return;
+    }
+    reviewStatusJob = current;
+    reviewEvent = null;
+    await reviewHandler.handleThreadIdle({
+      attemptId: attempt.id,
+      reviewThreadId: resourceId,
+      implementationThreadId: current.implementationThreadId,
+      expectedSha: current.prHeadSha,
+    });
+    const event = (reviewEvent as unknown) as ReviewHandlerEvent | null;
+    reviewStatusJob = null;
+    if (!event || !fenceCurrent()) return;
+    const latest = store.getJob(job.id);
+    if (!latest || latest.state !== "reviewing" || !fenceCurrent()) return;
+    if (event.type === "REVIEW_PASSED") {
+      store.applyJobEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: String(event.payload.headSha) }, clock());
+    } else if (event.type === "REVIEW_CHANGES_REQUESTED") {
+      store.applyJobEvent(job.id, latest.version, {
+        type: "REVIEW_CHANGES_REQUESTED",
+        headSha: typeof event.payload.headSha === "string" ? event.payload.headSha : undefined,
+        summary: typeof event.payload.summary === "string" ? event.payload.summary : undefined,
+      }, clock());
+    } else {
+      store.applyJobEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" }, clock());
     }
   };
   const effectRunnerFactory = (fence: EffectFence) => new EffectRunner({
@@ -122,6 +361,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         environmentId: job.environmentId,
         job: { id: job.id, version: job.version, policy: job.policy, prNumber: job.prNumber },
         signal,
+        onTerminalObservation: (observation) => {
+          if (signal.aborted || !store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock())) return;
+          const current = store.getJob(job.id);
+          if (current) projectTerminalLiveness(store, current, observation, "validation", clock());
+        },
       });
     },
   });

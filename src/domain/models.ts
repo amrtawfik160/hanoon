@@ -255,4 +255,5 @@ export type JobEvent =
   | { type: "RETRY" }
   | { type: "CANCEL_REQUESTED"; activeWorker?: WorkerLiveness | null }
   | { type: "CANCEL_CONFIRMED" }
+  | { type: "CANCELLATION_UNCONFIRMED"; reason?: string }
   | { type: "CONTINUE_REVIEW" };

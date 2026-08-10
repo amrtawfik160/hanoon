@@ -172,6 +172,16 @@ export type MergeEffectPayload = {
   mergeOutcome?: "stale";
 };
 
+export type PendingMergeEffectPayload = {
+  headSha: string;
+  reviewAttemptId: string;
+  approvalNonceHash: string;
+  approvalOwnerUserId: string;
+  approvalOwnerChatId: string;
+  approvalJobVersion: number;
+  approvalExpiresAt: number;
+};
+
 export type StaleMergeTombstone = {
   mergeOutcome: "stale";
   jobId: string;
@@ -846,6 +856,42 @@ export function parseMergeEffectPayload(value: unknown): MergeEffectPayload {
   };
 }
 
+export function parsePendingMergeEffectPayload(value: unknown): PendingMergeEffectPayload {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("pending merge effect payload must be a JSON object");
+  }
+  const payload = value as Record<string, unknown>;
+  assertExactKeys(payload, [
+    "headSha",
+    "reviewAttemptId",
+    "approvalNonceHash",
+    "approvalOwnerUserId",
+    "approvalOwnerChatId",
+    "approvalJobVersion",
+    "approvalExpiresAt",
+  ], "pending merge effect payload");
+  assertBoundedString(payload.headSha, "pending.headSha");
+  if (!FULL_SHA.test(payload.headSha)) throw new TypeError("pending.headSha must be a full lowercase SHA");
+  assertBoundedString(payload.reviewAttemptId, "pending.reviewAttemptId");
+  assertBoundedString(payload.approvalNonceHash, "pending.approvalNonceHash");
+  if (!SHA256_HEX.test(payload.approvalNonceHash)) throw new TypeError("pending.approvalNonceHash must be SHA-256 hex");
+  assertBoundedString(payload.approvalOwnerUserId, "pending.approvalOwnerUserId");
+  assertBoundedString(payload.approvalOwnerChatId, "pending.approvalOwnerChatId");
+  assertCanonicalPositiveDecimal(payload.approvalOwnerUserId, "pending.approvalOwnerUserId");
+  assertCanonicalPositiveDecimal(payload.approvalOwnerChatId, "pending.approvalOwnerChatId");
+  assertPositiveInteger(payload.approvalJobVersion as number, "pending.approvalJobVersion");
+  assertPositiveInteger(payload.approvalExpiresAt as number, "pending.approvalExpiresAt");
+  return {
+    headSha: payload.headSha,
+    reviewAttemptId: payload.reviewAttemptId,
+    approvalNonceHash: payload.approvalNonceHash,
+    approvalOwnerUserId: payload.approvalOwnerUserId,
+    approvalOwnerChatId: payload.approvalOwnerChatId,
+    approvalJobVersion: payload.approvalJobVersion as number,
+    approvalExpiresAt: payload.approvalExpiresAt as number,
+  };
+}
+
 export function parsePersistedMergeEffectPayload(
   value: unknown,
   status: StoredEffect["status"],
@@ -1177,6 +1223,7 @@ export interface TelegramAgentStore {
   listEffectsForJob(jobId: string): StoredEffect[];
   getEffect(jobId: string, idempotencyKey: string): StoredEffect | null;
   getAttempt(attemptId: string): AttemptRecord | null;
+  getAttemptByThreadId(threadId: string): AttemptRecord | null;
   createAttempt(input: {
     id: string;
     jobId: string;
@@ -1193,6 +1240,7 @@ export interface TelegramAgentStore {
     result?: Record<string, unknown> | null;
     completedAt?: number | null;
   }): AttemptRecord;
+  claimReviewFormatCorrection(attemptId: string, threadId: string, headSha: string): boolean;
   registerReviewThread(jobId: string, expectedVersion: number, threadId: string, now: number): Job;
   acquireExecutorLease(
     ownerId: string,
@@ -1232,6 +1280,14 @@ export interface TelegramAgentStore {
     leaseGeneration: number;
     now: number;
     leaseDurationMs: number;
+  }): boolean;
+  bindMergeEffectReceipt(input: {
+    jobId: string;
+    effectIdempotencyKey: string;
+    receipt: DurableMergeReceipt;
+    leaseOwner: string;
+    leaseGeneration: number;
+    now: number;
   }): boolean;
   prepareMergeCall(input: {
     jobId: string;
@@ -2122,6 +2178,40 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       : null;
   }
 
+  public getAttemptByThreadId(threadId: string): AttemptRecord | null {
+    if (!threadId) throw new TypeError("threadId must not be empty");
+    const row = this.db
+      .prepare(
+        "SELECT id, job_id, kind, ordinal, thread_id, head_sha, handoff_path, handoff_sha256, result_json, completed_at FROM attempts WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      )
+      .get(threadId) as {
+        id: string;
+        job_id: string;
+        kind: AttemptRecord["kind"];
+        ordinal?: number;
+        thread_id?: string | null;
+        head_sha: string | null;
+        handoff_path?: string | null;
+        handoff_sha256?: string | null;
+        result_json: string | null;
+        completed_at: number | null;
+      } | undefined;
+    return row
+      ? parseAttempt({
+          id: row.id,
+          job_id: row.job_id,
+          kind: row.kind,
+          ordinal: row.ordinal ?? 0,
+          thread_id: row.thread_id ?? null,
+          head_sha: row.head_sha,
+          handoff_path: row.handoff_path ?? null,
+          handoff_sha256: row.handoff_sha256 ?? null,
+          result_json: row.result_json,
+          completed_at: row.completed_at,
+        })
+      : null;
+  }
+
   public createAttempt(input: {
     id: string;
     jobId: string;
@@ -2181,6 +2271,31 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const stored = this.getAttempt(attemptId);
     if (!stored) throw new Error(`Attempt ${attemptId} was not found`);
     return stored;
+  }
+
+  public claimReviewFormatCorrection(attemptId: string, threadId: string, headSha: string): boolean {
+    if (!attemptId || !threadId) throw new TypeError("review correction identity is required");
+    assertFullSha(headSha, "headSha");
+    const claim = this.db.transaction((): boolean => {
+      const attempt = this.getAttempt(attemptId);
+      if (!attempt || attempt.kind !== "review" || attempt.threadId !== threadId || attempt.headSha !== headSha) return false;
+      let current: Record<string, unknown> = {};
+      if (attempt.resultJson !== null) {
+        try {
+          const parsed = JSON.parse(attempt.resultJson);
+          if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+          current = parsed as Record<string, unknown>;
+        } catch {
+          return false;
+        }
+      }
+      if (current.formatCorrectionSent === true) return false;
+      const updated = this.db
+        .prepare("UPDATE attempts SET result_json = ? WHERE id = ? AND thread_id = ? AND head_sha = ?")
+        .run(serializeBoundedJson({ ...current, formatCorrectionSent: true }, "attempt result", MAX_MERGE_RESULT_JSON), attemptId, threadId, headSha);
+      return updated.changes === 1;
+    });
+    return claim();
   }
 
   public registerReviewThread(jobId: string, expectedVersion: number, threadId: string, now: number): Job {
@@ -2632,6 +2747,65 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return lease();
   }
 
+  public bindMergeEffectReceipt(input: {
+    jobId: string;
+    effectIdempotencyKey: string;
+    receipt: DurableMergeReceipt;
+    leaseOwner: string;
+    leaseGeneration: number;
+    now: number;
+  }): boolean {
+    if (!input.jobId || !input.effectIdempotencyKey || !input.leaseOwner) {
+      throw new TypeError("merge receipt binding identity is required");
+    }
+    assertPositiveInteger(input.leaseGeneration, "leaseGeneration");
+    assertNonNegativeInteger(input.now, "now");
+    const receipt = parseDurableMergeReceipt(input.receipt);
+    const bind = this.db.transaction((): boolean => {
+      const boundaryNow = this.currentNow();
+      const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
+      if (!effect || effect.kind !== "merge_pr" || !this.effectLeaseIsActive(effect, input.leaseOwner, input.leaseGeneration, boundaryNow)) return false;
+      let pending: PendingMergeEffectPayload;
+      try {
+        pending = parsePendingMergeEffectPayload(JSON.parse(effect.payload_json));
+      } catch {
+        return false;
+      }
+      const job = this.readJobById(input.jobId);
+      const approval = this.readApproval(pending.approvalNonceHash);
+      if (!job || job.state !== "merging" || job.cancelRequestedAt !== null || !approval) return false;
+      if (
+        receipt.jobId !== input.jobId ||
+        receipt.effectIdempotencyKey !== input.effectIdempotencyKey ||
+        receipt.headSha !== pending.headSha ||
+        receipt.reviewAttemptId !== pending.reviewAttemptId ||
+        receipt.approvalNonceHash !== pending.approvalNonceHash ||
+        receipt.approvalOwnerUserId !== pending.approvalOwnerUserId ||
+        receipt.approvalOwnerChatId !== pending.approvalOwnerChatId ||
+        receipt.approvalJobVersion !== pending.approvalJobVersion ||
+        Date.parse(receipt.expiresAt) !== pending.approvalExpiresAt
+      ) return false;
+      if (this.mergeReceiptBindingError(effect, { headSha: receipt.headSha, receipt }, job, approval, boundaryNow) !== null) return false;
+      const updated = this.db
+        .prepare(
+          `UPDATE effects SET payload_json = ?, updated_at = ?
+             WHERE job_id = ? AND idempotency_key = ? AND status = 'leased'
+               AND lease_owner = ? AND lease_generation = ? AND lease_expires_at > ?`,
+        )
+        .run(
+          serializeBoundedJson({ headSha: receipt.headSha, receipt }, "merge effect payload", MAX_MERGE_RESULT_JSON),
+          boundaryNow,
+          input.jobId,
+          input.effectIdempotencyKey,
+          input.leaseOwner,
+          input.leaseGeneration,
+          boundaryNow,
+        );
+      return updated.changes === 1;
+    });
+    return bind();
+  }
+
   public prepareMergeCall(input: {
     jobId: string;
     effectIdempotencyKey: string;
@@ -2967,27 +3141,47 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           const expectedKey = `${row.job_id}:${(row.job_version ?? input.expectedJobVersion) + 1}:merge_pr`;
           const existing = this.readEffect(row.job_id, expectedKey);
           if (!current || !existing) throw new Error("accepted approval is missing its durable merge effect");
-          let payload: MergeEffectPayload;
-          try {
-            payload = parseMergeEffectPayload(JSON.parse(existing.payload_json));
-          } catch (error) {
-            throw new Error(error instanceof Error ? `accepted merge effect is invalid: ${error.message}` : "accepted merge effect is invalid");
-          }
-          let suppliedPayload: MergeEffectPayload;
-          try {
-            suppliedPayload = parseMergeEffectPayload(input.effect.payload);
-          } catch (error) {
-            throw new Error(error instanceof Error ? `caller-supplied merge effect is invalid: ${error.message}` : "caller-supplied merge effect is invalid");
-          }
           if (input.effect.idempotencyKey !== expectedKey || input.effect.jobId !== row.job_id) {
             throw new Error("accepted merge effect idempotency key does not match the generated key");
           }
-          if (
-            payload.receipt.approvalNonceHash !== input.nonceHash ||
-            payload.receipt.headSha !== row.head_sha ||
-            suppliedPayload.headSha !== payload.headSha ||
-            JSON.stringify(suppliedPayload.receipt) !== JSON.stringify(payload.receipt)
-          ) {
+          let existingPayload: MergeEffectPayload | PendingMergeEffectPayload;
+          let suppliedPayload: MergeEffectPayload | PendingMergeEffectPayload;
+          try {
+            const existingRaw = JSON.parse(existing.payload_json) as Record<string, unknown>;
+            existingPayload = Object.prototype.hasOwnProperty.call(existingRaw, "receipt")
+              ? parseMergeEffectPayload(existingRaw)
+              : parsePendingMergeEffectPayload(existingRaw);
+            const suppliedRaw = input.effect.payload as Record<string, unknown>;
+            if (Object.prototype.hasOwnProperty.call(suppliedRaw, "receipt")) {
+              suppliedPayload = parseMergeEffectPayload(suppliedRaw);
+            } else if (Object.keys(suppliedRaw).length === 1 && Object.prototype.hasOwnProperty.call(suppliedRaw, "headSha")) {
+              if ("receipt" in existingPayload) throw new TypeError("accepted merge effect payload shape changed");
+              suppliedPayload = {
+                headSha: suppliedRaw.headSha as string,
+                reviewAttemptId: existingPayload.reviewAttemptId,
+                approvalNonceHash: input.nonceHash,
+                approvalOwnerUserId: row.owner_user_id ?? "",
+                approvalOwnerChatId: row.owner_chat_id ?? "",
+                approvalJobVersion: row.job_version ?? input.expectedJobVersion,
+                approvalExpiresAt: row.expires_at,
+              };
+            } else {
+              suppliedPayload = parsePendingMergeEffectPayload(suppliedRaw);
+            }
+          } catch (error) {
+            throw new Error(error instanceof Error ? `accepted merge effect is invalid: ${error.message}` : "accepted merge effect is invalid");
+          }
+          const existingMatches = "receipt" in existingPayload
+            ? existingPayload.receipt.approvalNonceHash === input.nonceHash &&
+              existingPayload.receipt.headSha === row.head_sha
+            : existingPayload.approvalNonceHash === input.nonceHash &&
+              existingPayload.headSha === row.head_sha &&
+              existingPayload.reviewAttemptId.length > 0 &&
+              existingPayload.approvalJobVersion === (row.job_version ?? input.expectedJobVersion);
+          const suppliedMatches = "receipt" in suppliedPayload
+            ? suppliedPayload.receipt.approvalNonceHash === input.nonceHash && suppliedPayload.receipt.headSha === row.head_sha
+            : suppliedPayload.approvalNonceHash === input.nonceHash && suppliedPayload.headSha === row.head_sha;
+          if (!existingMatches || !suppliedMatches || JSON.stringify(suppliedPayload) !== JSON.stringify(existingPayload)) {
             throw new Error("accepted merge effect payload does not match the approval");
           }
           return { ok: true, jobId: row.job_id, headSha: row.head_sha };
@@ -3029,28 +3223,46 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ) {
         throw new Error("caller-supplied merge effect does not use the exact generated identity");
       }
-      let payload: MergeEffectPayload;
-      try {
-        payload = parseMergeEffectPayload(input.effect.payload);
-      } catch (error) {
-        throw new TypeError(error instanceof Error ? error.message : "invalid durable merge effect payload");
+      const rawPayload = input.effect.payload as Record<string, unknown>;
+      let persistedPayload: MergeEffectPayload | PendingMergeEffectPayload;
+      if (Object.prototype.hasOwnProperty.call(rawPayload, "receipt")) {
+        const payload = parseMergeEffectPayload(rawPayload);
+        if (payload.mergeCallStartedAt !== undefined || payload.mergeCallOutcome !== undefined) {
+          throw new TypeError("a new merge effect cannot already have an external-call fence");
+        }
+        if (JSON.stringify(generatedEffect.payload) !== JSON.stringify({ headSha: payload.headSha })) {
+          throw new TypeError("caller-supplied merge effect does not use the exact generated payload");
+        }
+        const receiptError = this.approvalReceiptBindingError(
+          input.effect,
+          payload,
+          generatedEffect.idempotencyKey,
+          current,
+          row,
+          input.nonceHash,
+          boundaryNow,
+        );
+        if (receiptError) throw new TypeError(receiptError);
+        persistedPayload = payload;
+      } else {
+        const headSha = rawPayload.headSha;
+        if (Object.keys(rawPayload).length !== 1 || typeof headSha !== "string" || headSha !== row.head_sha) {
+          throw new TypeError("caller-supplied pending merge effect does not use the exact generated head");
+        }
+        const reviewAttempt = this.db
+          .prepare("SELECT id FROM attempts WHERE job_id = ? AND kind = 'review' AND head_sha = ? ORDER BY created_at DESC, id DESC LIMIT 1")
+          .get(row.job_id, row.head_sha) as { id?: string } | undefined;
+        persistedPayload = {
+          headSha: row.head_sha,
+          reviewAttemptId: reviewAttempt?.id ?? `review:${row.job_id}`,
+          approvalNonceHash: input.nonceHash,
+          approvalOwnerUserId: row.owner_user_id ?? input.identity?.userId ?? "",
+          approvalOwnerChatId: row.owner_chat_id ?? input.identity?.chatId ?? "",
+          approvalJobVersion: row.job_version ?? input.expectedJobVersion,
+          approvalExpiresAt: row.expires_at,
+        };
+        parsePendingMergeEffectPayload(persistedPayload);
       }
-      if (payload.mergeCallStartedAt !== undefined || payload.mergeCallOutcome !== undefined) {
-        throw new TypeError("a new merge effect cannot already have an external-call fence");
-      }
-      if (JSON.stringify(generatedEffect.payload) !== JSON.stringify({ headSha: payload.headSha })) {
-        throw new TypeError("caller-supplied merge effect does not use the exact generated payload");
-      }
-      const receiptError = this.approvalReceiptBindingError(
-        input.effect,
-        payload,
-        generatedEffect.idempotencyKey,
-        current,
-        row,
-        input.nonceHash,
-        boundaryNow,
-      );
-      if (receiptError) throw new TypeError(receiptError);
 
       const consumed = this.db
         .prepare(
@@ -3062,7 +3274,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (consumed.changes !== 1) return { ok: false, reason: "consumed" };
 
       persistJobTransition(this.db, current.id, input.expectedJobVersion, transitioned.job);
-      const effectPayloadJson = serializeBoundedJson(input.effect.payload, "merge effect payload", MAX_MERGE_RESULT_JSON);
+      const effectPayloadJson = serializeBoundedJson(persistedPayload, "merge effect payload", MAX_MERGE_RESULT_JSON);
       const inserted = this.db
         .prepare(
           `INSERT INTO effects (

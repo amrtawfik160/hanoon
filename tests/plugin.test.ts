@@ -1,5 +1,5 @@
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import plugin from "../server";
 import { openStore } from "../src/storage/store";
 
@@ -51,4 +51,24 @@ it("registers both background services and all enqueue-only thread lifecycle han
     lastAssistantText: null,
   })).errors).toEqual([]);
   expect(store.listEffectsForJob(job.id).map((effect) => effect.kind)).toEqual(["reconcile_job"]);
+});
+
+it("reconciles an authoritative implementation idle observation into the job state", async () => {
+  const { bb, harness } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const job = store.createJob({ id: "abcdefghijklmnopqrstuv", sourceUpdateId: 2, requestText: "work", now: 1_000 });
+  bb.storage.database().prepare(
+    "UPDATE jobs SET state = 'implementing', implementation_thread_id = ?, version = ?, updated_at = ? WHERE id = ?",
+  ).run("thr_plugin", job.version + 1, 1_001, job.id);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({
+    id: "thr_plugin",
+    status: "idle",
+    updatedAt: 2_000,
+  }));
+
+  const run = harness.behavior.runService("job-executor");
+  await vi.waitFor(() => expect(store.listEffectsForJob(job.id).some((effect) => effect.kind === "inspect_implementation")).toBe(true));
+  expect(store.getJob(job.id)?.state).not.toBe("implementing");
+  run.controller.abort();
+  await run.done;
 });

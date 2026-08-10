@@ -9,12 +9,20 @@ export type CommandResult =
   | { outcome: "timed_out" }
   | { outcome: "aborted" };
 
+export type TerminalObservation = {
+  id: string;
+  status: string;
+  updatedAt: number;
+  exitCode?: number | null;
+};
+
 export interface TerminalRunInput {
   scope: TerminalScope;
   title: string;
   command: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  onObservation?: (observation: TerminalObservation) => void;
 }
 
 type TerminalClient = {
@@ -156,6 +164,7 @@ export class TerminalCommandRunner {
     deadline: number,
     signal: AbortSignal | undefined,
     closeOnce: () => void,
+    onObservation?: (observation: TerminalObservation) => void,
   ): Promise<CommandResult> {
     while (true) {
       if (signal?.aborted) {
@@ -181,6 +190,7 @@ export class TerminalCommandRunner {
         return { outcome: "timed_out" };
       }
       const status = statusResult.value;
+      onObservation?.({ id: terminalId, status: status.status, updatedAt: Date.now(), exitCode: status.exitCode });
       if (status.status === "exited") {
         const outputResult = await this.bounded(() => this.collect(terminalId, signal), deadline, signal);
         if (outputResult.outcome === "aborted") {
@@ -254,6 +264,7 @@ export class TerminalCommandRunner {
     if (startResult.outcome === "aborted") return { outcome: "aborted" };
     if (startResult.outcome === "timed_out") return { outcome: "timed_out" };
     terminalId = startResult.value.id;
-    return this.waitForExit(terminalId, deadline, input.signal, closeOnce);
+    input.onObservation?.({ id: terminalId, status: "starting", updatedAt: Date.now() });
+    return this.waitForExit(terminalId, deadline, input.signal, closeOnce, input.onObservation);
   }
 }

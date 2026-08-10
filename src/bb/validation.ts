@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Job, ProjectPolicy } from "../domain/models";
-import type { CommandResult } from "./terminal-command";
+import type { CommandResult, TerminalObservation } from "./terminal-command";
 
 export const GIT_REMOTE_COMMAND = "git remote get-url origin";
 export const PR_HEAD_COMMAND = (number: number): string =>
@@ -90,6 +90,7 @@ type CommandRunner = {
     command: string;
     timeoutMs: number;
     signal?: AbortSignal;
+    onObservation?: (observation: TerminalObservation) => void;
   }): Promise<CommandResult>;
 };
 
@@ -107,6 +108,7 @@ export interface ValidationInput {
   };
   currentReviewAttempt?: { id: string };
   signal?: AbortSignal;
+  onTerminalObservation?: (observation: TerminalObservation) => void;
 }
 
 export interface PrHeadResolutionInput {
@@ -264,6 +266,7 @@ async function runCommand(
   command: string,
   timeoutMs: number,
   signal?: AbortSignal,
+  onTerminalObservation?: (observation: TerminalObservation) => void,
 ): Promise<Extract<CommandResult, { outcome: "exited" }>> {
   const redactedCommand = collector.redactor(command);
   let result: CommandResult;
@@ -274,6 +277,7 @@ async function runCommand(
       command,
       timeoutMs,
       signal,
+      onObservation: onTerminalObservation,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -326,6 +330,7 @@ async function collectHeadTruth(input: {
   signal?: AbortSignal;
   collector: ReceiptCollector;
   requireSecondLookup: boolean;
+  onTerminalObservation?: (observation: TerminalObservation) => void;
 }): Promise<{ originRepository: string; remoteHeadSha: string; local: EnvironmentEvidence }> {
   validatePrNumber(input.prNumber);
   const local = await getEnvironmentEvidence(input.environments, input.environmentId, input.baseBranch, input.signal);
@@ -336,6 +341,7 @@ async function collectHeadTruth(input: {
     GIT_REMOTE_COMMAND,
     60_000,
     input.signal,
+    input.onTerminalObservation,
   );
   if (remoteResult.exitCode !== 0) fail("command_failed", "Unable to read the origin repository");
   const originRepository = parseGitHubRemote(remoteResult.output);
@@ -350,6 +356,7 @@ async function collectHeadTruth(input: {
     PR_HEAD_COMMAND(input.prNumber),
     60_000,
     input.signal,
+    input.onTerminalObservation,
   );
   if (first.exitCode !== 0) fail("command_failed", "Unable to read the pull-request head from git");
   const firstSha = parseLsRemoteHead(first.output, input.prNumber);
@@ -363,6 +370,7 @@ async function collectHeadTruth(input: {
       PR_HEAD_COMMAND(input.prNumber),
       60_000,
       input.signal,
+      input.onTerminalObservation,
     );
     if (second.exitCode !== 0) fail("command_failed", "Unable to re-read the pull-request head from git");
     const secondSha = parseLsRemoteHead(second.output, input.prNumber);
@@ -417,6 +425,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     signal: input.signal,
     collector,
     requireSecondLookup: false,
+    onTerminalObservation: input.onTerminalObservation,
   });
 
   for (const validation of validationCommands(policy)) {
@@ -427,6 +436,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
       validation.command,
       validation.timeoutMs,
       input.signal,
+      input.onTerminalObservation,
     );
     if (result.exitCode !== 0) {
       return {
@@ -448,6 +458,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     PR_VIEW_COMMAND(input.job.prNumber),
     120_000,
     input.signal,
+    input.onTerminalObservation,
   );
   if (pr.exitCode !== 0) fail("command_failed", "GitHub pull-request metadata lookup failed");
   const githubPr = parseJson(pr.output, githubPrSchema, "GitHub pull-request metadata") as GitHubPrSnapshot;
@@ -459,6 +470,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     PR_CHECKS_COMMAND(input.job.prNumber),
     120_000,
     input.signal,
+    input.onTerminalObservation,
   );
   if (![0, 1, 8].includes(checks.exitCode)) fail("invalid_checks_exit", "GitHub checks lookup returned an infrastructure failure");
   const requiredChecks = parseJson(checks.output, checksSchema(), "GitHub required checks");
@@ -470,6 +482,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     PR_HEAD_COMMAND(input.job.prNumber),
     60_000,
     input.signal,
+    input.onTerminalObservation,
   );
   if (second.exitCode !== 0) fail("command_failed", "Unable to re-read the pull-request head from git");
   const secondSha = parseLsRemoteHead(second.output, input.job.prNumber);

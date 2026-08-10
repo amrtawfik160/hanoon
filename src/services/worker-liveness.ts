@@ -9,7 +9,19 @@ export type BbThreadObservation = {
   runtime: { displayStatus: string; hostReconnectGraceExpiresAt: number | null };
 };
 
+export type BbTerminalObservation = {
+  id: string;
+  status: string;
+  updatedAt: number;
+  exitCode?: number | null;
+};
+
 type ThreadLike = BbThreadObservation;
+
+export function workerRegistrationGeneration(job: Job, workerKind: WorkerLiveness["workerKind"]): number {
+  const role = workerKind === "implementation" ? 1 : workerKind === "review" ? 2 : workerKind === "validation" ? 3 : 4;
+  return job.version * 10 + role;
+}
 
 function unknownThreadObservation(resourceId: string): ThreadLike {
   return {
@@ -42,14 +54,19 @@ function withStaleness(job: Job, state: WorkerLivenessState, sourceUpdatedAt: nu
   return state;
 }
 
-export function observeThreadWorker(job: Job, thread: ThreadLike, now: number): WorkerLiveness {
+export function observeThreadWorker(
+  job: Job,
+  thread: ThreadLike,
+  now: number,
+  generation = job.version,
+): WorkerLiveness {
   const state = stateForThread(thread);
   return {
     jobId: job.id,
     workerKind: thread.id === job.reviewThreadId ? "review" : "implementation",
     resourceKind: "bb_thread",
     resourceId: thread.id,
-    generation: job.version,
+    generation,
     state: withStaleness(job, state, thread.updatedAt, now),
     sourceUpdatedAt: thread.updatedAt,
     observedAt: now,
@@ -57,13 +74,19 @@ export function observeThreadWorker(job: Job, thread: ThreadLike, now: number): 
   };
 }
 
-export function observeUnknownWorker(job: Job, resourceId: string, now: number, workerKind?: WorkerLiveness["workerKind"]): WorkerLiveness {
+export function observeUnknownWorker(
+  job: Job,
+  resourceId: string,
+  now: number,
+  workerKind?: WorkerLiveness["workerKind"],
+  generation = job.version,
+): WorkerLiveness {
   return {
     jobId: job.id,
     workerKind: workerKind ?? (resourceId === job.reviewThreadId ? "review" : "implementation"),
     resourceKind: "bb_thread",
     resourceId,
-    generation: job.version,
+    generation,
     state: "unknown",
     sourceUpdatedAt: 0,
     observedAt: now,
@@ -71,24 +94,40 @@ export function observeUnknownWorker(job: Job, resourceId: string, now: number, 
   };
 }
 
-export function projectUnknownWorker(
-  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
-    Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>,
-  job: Job,
-  resourceId: string,
-  now: number,
-): WorkerLiveness {
-  return projectWorkerLiveness(store, job, unknownThreadObservation(resourceId), now);
+function stateForTerminal(terminal: BbTerminalObservation): WorkerLivenessState {
+  if (terminal.status === "starting" || terminal.status === "created" || terminal.status === "running") return "active";
+  if (terminal.status === "stopping" || terminal.status === "closing") return "stopping";
+  if (terminal.status === "exited") return terminal.exitCode === 0 ? "idle" : "failed";
+  if (terminal.status === "timed_out" || terminal.status === "aborted" || terminal.status === "failed" || terminal.status === "error") {
+    return "failed";
+  }
+  return "unknown";
 }
 
-export function projectWorkerLiveness(
-  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
-    Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>,
+export function observeTerminalWorker(
   job: Job,
-  thread: ThreadLike,
+  terminal: BbTerminalObservation,
+  workerKind: Extract<WorkerLiveness["workerKind"], "validation" | "merge">,
   now: number,
+  generation = workerRegistrationGeneration(job, workerKind),
 ): WorkerLiveness {
-  const observed = observeThreadWorker(job, thread, now);
+  return {
+    jobId: job.id,
+    workerKind,
+    resourceKind: "bb_terminal",
+    resourceId: terminal.id,
+    generation,
+    state: stateForTerminal(terminal),
+    sourceUpdatedAt: terminal.updatedAt,
+    observedAt: now,
+    staleNotifiedAt: null,
+  };
+}
+
+type LivenessStore = Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
+  Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>;
+
+function projectObservation(store: LivenessStore, job: Job, observed: WorkerLiveness, now: number): WorkerLiveness {
   const current = store.getWorkerLiveness(job.id);
   const accepted =
     current === null ||
@@ -99,9 +138,7 @@ export function projectWorkerLiveness(
       (observed.state === "stale" || observed.state === "unknown")
     ? { ...observed, staleNotifiedAt: current.staleNotifiedAt }
     : observed;
-  if (accepted) {
-    store.upsertWorkerLiveness(persistedObservation);
-  }
+  if (accepted) store.upsertWorkerLiveness(persistedObservation);
   if (!accepted) return observed;
   const stored = store.getWorkerLiveness(job.id) ?? observed;
   if ((stored.state === "stale" || stored.state === "unknown") && stored.staleNotifiedAt === null) {
@@ -122,4 +159,46 @@ export function projectWorkerLiveness(
     return notified;
   }
   return stored;
+}
+
+export function projectUnknownWorker(
+  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
+    Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>,
+  job: Job,
+  resourceId: string,
+  now: number,
+  workerKind?: WorkerLiveness["workerKind"],
+  generation?: number,
+): WorkerLiveness {
+  return projectWorkerLiveness(store, job, unknownThreadObservation(resourceId), now, workerKind, generation);
+}
+
+export function projectWorkerLiveness(
+  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
+    Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>,
+  job: Job,
+  thread: ThreadLike,
+  now: number,
+  workerKind?: WorkerLiveness["workerKind"],
+  generation = job.version,
+): WorkerLiveness {
+  const observed = observeThreadWorker(
+    job,
+    workerKind ? { ...thread, id: thread.id } : thread,
+    now,
+    generation,
+  );
+  if (workerKind) observed.workerKind = workerKind;
+  return projectObservation(store, job, observed, now);
+}
+
+export function projectTerminalLiveness(
+  store: LivenessStore,
+  job: Job,
+  terminal: BbTerminalObservation,
+  workerKind: Extract<WorkerLiveness["workerKind"], "validation" | "merge">,
+  now: number,
+  generation = workerRegistrationGeneration(job, workerKind),
+): WorkerLiveness {
+  return projectObservation(store, job, observeTerminalWorker(job, terminal, workerKind, now, generation), now);
 }

@@ -20,7 +20,7 @@ export type JobExecutorDependencies = {
   telegram?: (token?: string) => JobExecutorTelegram;
   getTelegramClient?: (token?: string) => JobExecutorTelegram;
   telegramToken?: () => string | undefined;
-  reconcileJob?: (job: JobRecord, signal: AbortSignal) => Promise<void>;
+  reconcileJob?: (job: JobRecord, signal: AbortSignal, fence: EffectFence) => Promise<void>;
   jitter?: () => number;
   leaseMs?: number;
   releaseOnShutdown?: boolean;
@@ -30,6 +30,19 @@ const LEASE_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
 const ACTIVE_POLL_MS = 5_000;
 const IDLE_POLL_MS = 60_000;
+const PERMANENT_EFFECT_ERROR_NAMES = new Set([
+  "TypeError",
+  "SyntaxError",
+  "ZodError",
+  "ValidationError",
+  "AuthorizationError",
+  "UnauthorizedError",
+  "SchemaValidationError",
+  "IdempotencyConflictError",
+  "VersionConflictError",
+  "ActiveJobConflictError",
+  "IllegalTransitionError",
+]);
 
 function assertNow(now: number): void {
   if (!Number.isInteger(now) || now < 0) throw new TypeError("executor clock must be a non-negative integer");
@@ -54,6 +67,11 @@ function defaultSleep(milliseconds: number, signal: AbortSignal): Promise<void> 
 function safeFailure(error: unknown): string {
   const message = redactError(error).replace(/\s+/g, " ").trim();
   return message.length > 500 ? message.slice(0, 499) + "…" : message || "Executor operation failed";
+}
+
+function isPermanentEffectFailure(error: unknown): boolean {
+  return error instanceof PermanentEffectError ||
+    (error instanceof Error && PERMANENT_EFFECT_ERROR_NAMES.has(error.name));
 }
 
 function isTerminal(job: JobRecord): boolean {
@@ -157,7 +175,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         for (const job of jobs) {
           if (isTerminal(job)) continue;
           if (deps.reconcileJob) {
-            await deps.reconcileJob(job, workAbort.signal);
+            await deps.reconcileJob(job, workAbort.signal, {
+              ownerId,
+              generation: lease.generation,
+              signal: workAbort.signal,
+            });
             didWork = true;
           }
         }
@@ -178,7 +200,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               break;
             }
             const failure = safeFailure(error);
-            if (error instanceof PermanentEffectError) {
+            if (isPermanentEffectFailure(error)) {
               deps.store.deadLetterEffect(effect.idempotencyKey, ownerId, lease.generation, failure, deps.clock.now());
             } else if (effect.attempts >= 20) {
               deps.store.deadLetterEffect(effect.idempotencyKey, ownerId, lease.generation, failure, deps.clock.now());

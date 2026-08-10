@@ -12,15 +12,18 @@ import { hashSecret } from "../crypto";
 import { ApprovalService } from "./approval-service";
 import {
   parseDurableMergeReceipt,
+  parsePendingMergeEffectPayload,
   mergeEvidenceBindingError,
   parseMergeEffectPayload,
   isReplayableMergeEvidence,
   parsePersistedMergeEvidence,
   parsePersistedMergeEffectPayload,
   parsePersistedMergeSuccessResult,
+  isCompletedReviewAttempt,
   type ApprovalIdentity,
   type DurableMergeReceipt,
   type MergeEffectPayload,
+  type PendingMergeEffectPayload,
   type MergeCallPreparation,
   type MergeCallbackIdentity,
   type PersistedMergeSuccessResult,
@@ -32,7 +35,6 @@ const POST_MERGE_HEAD_COMMAND = (number: number): string =>
   `git ls-remote --exit-code origin refs/pull/${String(number)}/head`;
 const POST_MERGE_PR_COMMAND = (number: number): string =>
   `gh pr view ${String(number)} --json state,mergedAt,mergeCommit,url,number`;
-const FULL_SHA = /^[0-9a-f]{40}$/;
 const MAX_PROVIDER_RESULT_JSON = 64_000;
 
 type CommandResult =
@@ -54,6 +56,7 @@ export type GateCollectionInput = {
   phase: "approval" | "pre_merge";
   receipt: MergeReadyReceipt | null;
   now: number;
+  approvalExpiresAt?: number;
 };
 
 export type Task9FreshGateContext = {
@@ -70,6 +73,7 @@ export type Task9FreshGateCollectorOptions = {
     receipt: MergeReadyReceipt | null;
     validation: ValidationSnapshot;
     now: number;
+    approvalExpiresAt?: number;
   }) => Promise<Task9FreshGateContext>;
   runValidation?: (input: ValidationInput) => Promise<ValidationSnapshot>;
 };
@@ -122,6 +126,7 @@ export function createTask9FreshGateCollector(
       receipt: input.receipt,
       validation: snapshot,
       now: input.now,
+      approvalExpiresAt: input.approvalExpiresAt,
     });
     const remoteHead = remoteHeadEvidenceFromTask8(snapshot, job.prNumber);
     const githubPr = snapshot.githubPr;
@@ -157,7 +162,11 @@ export function createTask9FreshGateCollector(
         completedAt: snapshot.completedAt,
         requiredChecks: snapshot.requiredChecks,
       },
-      receipt: context.receipt,
+      receipt: {
+        ...context.receipt,
+        jobVersion: input.receipt?.jobVersion ?? job.version,
+        ...(input.approvalExpiresAt === undefined ? {} : { expiresAt: new Date(input.approvalExpiresAt).toISOString() }),
+      },
     };
   };
 }
@@ -222,13 +231,6 @@ function effectPayload(effect: StoredEffect): MergeEffectPayload {
   return parseMergeEffectPayload(effect.payload);
 }
 
-function completionPayload(job: Job, prNumber: number): Record<string, unknown> {
-  return {
-    text: `Merged PR #${String(prNumber)} for ${job.projectId ?? "the selected project"}.`,
-    disable_web_page_preview: true,
-  };
-}
-
 function gateReceiptMatchesDurable(
   fresh: MergeReadyReceipt,
   durable: DurableMergeReceipt,
@@ -268,20 +270,21 @@ export class MergeHandler {
     const previous = this.options.store.getCallback(input.callbackId);
     if (previous) {
       const owner = this.options.store.getOwner();
+      const legacyIdentity = previous.outcome === "accepted" && previous.action === "merge" && previous.jobId !== null &&
+        owner?.userId === input.userId && owner.chatId === input.chatId &&
+        previous.approvalNonceHash === null
+        ? this.findAcceptedMergeIdentityByNonce(previous.jobId, approvalNonceHash)
+        : null;
       return previous.outcome === "accepted" &&
         previous.action === "merge" &&
         previous.jobId !== null &&
         owner?.userId === input.userId &&
         owner.chatId === input.chatId &&
-        previous.approvalNonceHash === approvalNonceHash &&
-        previous.headSha !== null &&
-        previous.effectIdempotencyKey !== null &&
-        this.hasAcceptedMergeEffect(
-          previous.jobId,
-          previous.headSha,
-          approvalNonceHash,
-          previous.effectIdempotencyKey,
-        )
+        ((previous.approvalNonceHash === null && legacyIdentity !== null) ||
+          (previous.approvalNonceHash === approvalNonceHash &&
+            previous.headSha !== null &&
+            previous.effectIdempotencyKey !== null &&
+            this.hasAcceptedMergeEffect(previous.jobId, previous.headSha, approvalNonceHash, previous.effectIdempotencyKey)))
         ? { outcome: "accepted" }
         : { outcome: "rejected" };
     }
@@ -326,60 +329,12 @@ export class MergeHandler {
     }
 
     try {
-      const collected = await this.options.collectGateInput({
-        job,
-        phase: "approval",
-        receipt: null,
-        now: freshNow(),
-      });
-      const evaluation = readyEvaluation(collected, freshNow());
-      if (!evaluation.ready || evaluation.receipt.headSha !== approval.headSha || evaluation.receipt.jobId !== approval.jobId) {
-        const rejected = this.options.store.rejectApprovalAndRecordCallback({
-          nonceHash: approvalNonceHash,
-          callbackId: input.callbackId,
-          jobId: approval.jobId,
-          headSha: typeof collected.environment.checkout.headSha === "string" && FULL_SHA.test(collected.environment.checkout.headSha)
-            ? collected.environment.checkout.headSha
-            : undefined,
-          now: freshNow(),
-        });
-        return { outcome: rejected.outcome === "accepted" ? "accepted" : "rejected" };
-      }
-      const expiryNow = freshNow();
-      if (
-        Date.parse(evaluation.receipt.expiresAt) !== approval.expiresAt ||
-        approval.jobVersion !== job.version ||
-        approval.ownerUserId !== identity.userId ||
-        approval.ownerChatId !== identity.chatId ||
-        expiryNow >= approval.expiresAt
-      ) {
-        const rejected = this.options.store.rejectApprovalAndRecordCallback({
-          nonceHash: approvalNonceHash,
-          callbackId: input.callbackId,
-          jobId: approval.jobId,
-          now: freshNow(),
-        });
-        return { outcome: rejected.outcome === "accepted" ? "accepted" : "rejected" };
-      }
-
       const idempotencyKey = `${job.id}:${job.version + 1}:merge_pr`;
-      const durableReceipt = parseDurableMergeReceipt({
-        ...evaluation.receipt,
-        effectIdempotencyKey: idempotencyKey,
-        approvalNonceHash,
-        approvalOwnerUserId: identity.userId,
-        approvalOwnerChatId: identity.chatId,
-        jobVersion: job.version + 1,
-        approvalJobVersion: job.version,
-      });
       const effect: JobEffectForMerge = {
         idempotencyKey,
         jobId: job.id,
         kind: "merge_pr",
-        payload: {
-          headSha: approval.headSha,
-          receipt: durableReceipt,
-        },
+        payload: { headSha: approval.headSha },
       };
       const accepted = this.approvals.accept(
         input.nonce,
@@ -405,8 +360,8 @@ export class MergeHandler {
         freshNow(),
         {
           approvalNonceHash,
-          headSha: durableReceipt.headSha,
-          effectIdempotencyKey: durableReceipt.effectIdempotencyKey,
+          headSha: approval.headSha,
+          effectIdempotencyKey: idempotencyKey,
         },
       );
       return { outcome: "accepted" };
@@ -480,26 +435,66 @@ export class MergeHandler {
     if (effect.status === "failed" || effect.status === "dead") return { outcome: "already_done" };
     if (input.leaseOwner === undefined || input.leaseGeneration === undefined) return { outcome: "failed" };
 
-    let storedPayload: MergeEffectPayload;
-    try {
-      storedPayload = effectPayload(effect);
-    } catch (error) {
-      return failCurrentLease(error);
-    }
-
     let job: Job | null;
     try {
       job = this.options.store.getJob(effect.jobId);
     } catch (error) {
-      return storedPayload.mergeCallStartedAt === undefined
-        ? failCurrentLease(error)
-        : preserveUnknownOutcome();
+      return failCurrentLease(error);
     }
-    if (!job || job.state !== "merging") {
-      return storedPayload.mergeCallStartedAt === undefined
-        ? failCurrentLease("Merge effect job is not an active merge")
-        : preserveUnknownOutcome();
+    if (!job || job.state !== "merging") return failCurrentLease("Merge effect job is not an active merge");
+
+    let storedPayload: MergeEffectPayload;
+    try {
+      storedPayload = effectPayload(effect);
+    } catch (error) {
+      let pending: PendingMergeEffectPayload;
+      try {
+        pending = parsePendingMergeEffectPayload(effect.payload);
+      } catch {
+        return failCurrentLease(error);
+      }
+      try {
+        const approvalCollected = await this.options.collectGateInput({
+          job,
+          phase: "approval",
+          receipt: null,
+          approvalExpiresAt: pending.approvalExpiresAt,
+          now: freshNow(),
+        });
+        const approvalEvaluation = readyEvaluation(approvalCollected, freshNow());
+        if (!approvalEvaluation.ready || approvalEvaluation.receipt.jobId !== job.id || approvalEvaluation.receipt.headSha !== pending.headSha) {
+          return failCurrentLease("approval gate evidence is stale");
+        }
+        const durableReceipt = parseDurableMergeReceipt({
+          ...approvalEvaluation.receipt,
+          jobId: job.id,
+          effectIdempotencyKey: effect.idempotencyKey,
+          approvalNonceHash: pending.approvalNonceHash,
+          approvalOwnerUserId: pending.approvalOwnerUserId,
+          approvalOwnerChatId: pending.approvalOwnerChatId,
+          jobVersion: job.version,
+          approvalJobVersion: pending.approvalJobVersion,
+          reviewAttemptId: pending.reviewAttemptId,
+          expiresAt: new Date(pending.approvalExpiresAt).toISOString(),
+        });
+        const bound = this.options.store.bindMergeEffectReceipt({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          receipt: durableReceipt,
+          leaseOwner: input.leaseOwner!,
+          leaseGeneration: input.leaseGeneration!,
+          now: freshNow(),
+        });
+        if (!bound) return failCurrentLease("merge receipt binding lost its leased effect");
+        const rebound = this.options.store.getEffect(effect.jobId, effect.idempotencyKey);
+        if (!rebound) return failCurrentLease("merge effect disappeared after receipt binding");
+        storedPayload = effectPayload(rebound);
+      } catch (bindError) {
+        return failCurrentLease(bindError);
+      }
     }
+    job = this.options.store.getJob(effect.jobId);
+    if (!job || job.state !== "merging") return failCurrentLease("Merge effect job is not an active merge");
 
     if (storedPayload.mergeCallStartedAt !== undefined) {
       let prepared: MergeCallPreparation;
@@ -667,11 +662,6 @@ export class MergeHandler {
         effectIdempotencyKey: effect.idempotencyKey,
         message: `Merged PR #${String(receipt.prNumber)} for ${job.projectId ?? "the selected project"}.`,
         result: confirmed.result,
-        outbox: {
-          logicalKey: `${effect.jobId}:${effect.idempotencyKey}:completion`,
-          chatId: receipt.approvalOwnerChatId,
-          payload: completionPayload(job, receipt.prNumber),
-        },
         now: freshNow(),
         leaseOwner: input.leaseOwner!,
         leaseGeneration: input.leaseGeneration!,
@@ -766,6 +756,48 @@ export class MergeHandler {
     for (const effect of effects) {
       if (effect.kind !== "merge_pr") continue;
       if (effect.jobId !== jobId) return null;
+      if (!Object.prototype.hasOwnProperty.call(effect.payload, "receipt")) {
+        try {
+          const pending = parsePendingMergeEffectPayload(effect.payload);
+          if (
+            pending.headSha !== headSha ||
+            pending.approvalNonceHash !== approvalNonceHash ||
+            !approval ||
+            approval.jobId !== jobId ||
+            approval.headSha !== headSha ||
+            approval.consumedAt === null ||
+            approval.outcome !== "accepted" ||
+            approval.jobVersion !== pending.approvalJobVersion ||
+            approval.ownerUserId !== pending.approvalOwnerUserId ||
+            approval.ownerChatId !== pending.approvalOwnerChatId ||
+            approval.expiresAt !== pending.approvalExpiresAt ||
+            job.state !== "merging" ||
+            job.cancelRequestedAt !== null ||
+            job.version !== pending.approvalJobVersion + 1 ||
+            currentOwner?.userId !== pending.approvalOwnerUserId ||
+            currentOwner?.chatId !== pending.approvalOwnerChatId ||
+            !isCompletedReviewAttempt(this.options.store.getAttempt(pending.reviewAttemptId), jobId, headSha)
+          ) return null;
+          const identity = { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
+          if (candidate !== null) return null;
+          candidate = identity;
+          continue;
+        } catch {
+          try {
+            const evidence = parsePersistedMergeEvidence({
+              idempotencyKey: effect.idempotencyKey,
+              jobId: effect.jobId,
+              kind: effect.kind,
+              status: effect.status,
+              payload: effect.payload,
+            });
+            if (evidence.disposition === "stale") continue;
+          } catch {
+            // Malformed or otherwise unrecognized terminal evidence poisons replay reconstruction.
+          }
+          return null;
+        }
+      }
       let evidence: PersistedMergeEvidence;
       try {
         evidence = parsePersistedMergeEvidence({
@@ -832,6 +864,11 @@ export class MergeHandler {
     effectIdempotencyKey: string,
   ): boolean {
     return this.findAcceptedMergeIdentity(jobId, headSha, approvalNonceHash)?.effectIdempotencyKey === effectIdempotencyKey;
+  }
+
+  private findAcceptedMergeIdentityByNonce(jobId: string, approvalNonceHash: string): MergeCallbackIdentity | null {
+    const approval = this.options.store.getApproval(approvalNonceHash);
+    return approval ? this.findAcceptedMergeIdentity(jobId, approval.headSha, approvalNonceHash) : null;
   }
 
   private async confirmPostMerge(

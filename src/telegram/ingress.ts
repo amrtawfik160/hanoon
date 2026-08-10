@@ -310,9 +310,11 @@ export class TelegramIngress {
         userId: identity.userId,
         chatId: identity.chatId,
       });
-      await this.telegram.answerCallback(
+      this.enqueueCallbackAnswer(
         callback.id,
+        identity.chatId,
         result.outcome === "accepted" ? "Merge queued." : "Approval is stale or no longer valid.",
+        now,
       );
       return;
     }
@@ -383,7 +385,7 @@ export class TelegramIngress {
     }
 
     await this.deliverJobView(selected, renderJobStatus(selected), chatId, callback.message?.message_id, now);
-    await this.finishCallback(callback.id, selected.id, "project", "accepted", now, "Project selected.");
+    await this.finishCallback(callback.id, selected.id, chatId, "project", "accepted", now, "Project selected.");
   }
 
   private async startJob(
@@ -396,12 +398,12 @@ export class TelegramIngress {
     if (job.state === "awaiting_confirmation") {
       started = this.store.applyJobEvent(job.id, job.version, { type: "CONFIRMED" }, now);
     } else if (!this.hasSpawnEffect(job)) {
-      await this.finishCallback(callback.id, job.id, "start", "rejected", now, "Start is no longer available.");
+      await this.finishCallback(callback.id, job.id, chatId, "start", "rejected", now, "Start is no longer available.");
       return;
     }
 
     await this.deliverJobView(started, renderJobStatus(started), chatId, callback.message?.message_id, now);
-    await this.finishCallback(callback.id, started.id, "start", "accepted", now, "Job started.");
+    await this.finishCallback(callback.id, started.id, chatId, "start", "accepted", now, "Job started.");
   }
 
   private hasSpawnEffect(job: Job): boolean {
@@ -417,11 +419,16 @@ export class TelegramIngress {
   ): Promise<void> {
     let cancelled = job;
     if (job.cancelRequestedAt === null && !jobIsTerminal(job)) {
-      cancelled = this.store.applyJobEvent(job.id, job.version, { type: "CANCEL_REQUESTED", activeWorker: null }, now);
+      cancelled = this.store.applyJobEvent(
+        job.id,
+        job.version,
+        { type: "CANCEL_REQUESTED", activeWorker: this.store.getWorkerLiveness(job.id) },
+        now,
+      );
     }
     if (callback) {
       await this.deliverJobView(cancelled, renderJobStatus(cancelled), chatId, messageId, now);
-      await this.finishCallback(callback.id, cancelled.id, "cancel", "accepted", now, "Cancellation requested.");
+      await this.finishCallback(callback.id, cancelled.id, chatId, "cancel", "accepted", now, "Cancellation requested.");
     } else {
       await this.deliverJobView(cancelled, renderJobStatus(cancelled), chatId, messageId, now);
     }
@@ -437,7 +444,7 @@ export class TelegramIngress {
     if (job.state !== "failed") return;
     const retried = this.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, now);
     await this.deliverJobView(retried, renderJobStatus(retried), chatId, messageId, now);
-    if (callback) await this.finishCallback(callback.id, retried.id, "retry", "accepted", now, "Retry scheduled.");
+    if (callback) await this.finishCallback(callback.id, retried.id, chatId, "retry", "accepted", now, "Retry scheduled.");
   }
 
   private async reviewJob(
@@ -450,7 +457,7 @@ export class TelegramIngress {
     if (job.state !== "blocked" || job.blockedReason !== "review_limit") return;
     const reviewed = this.store.applyJobEvent(job.id, job.version, { type: "CONTINUE_REVIEW" }, now);
     await this.deliverJobView(reviewed, renderJobStatus(reviewed), chatId, messageId, now);
-    if (callback) await this.finishCallback(callback.id, reviewed.id, "review", "accepted", now, "Review continued.");
+    if (callback) await this.finishCallback(callback.id, reviewed.id, chatId, "review", "accepted", now, "Review continued.");
   }
 
   private steer(job: Job, text: string, updateId: number, now: number): void {
@@ -461,13 +468,24 @@ export class TelegramIngress {
   private async finishCallback(
     callbackId: string,
     jobId: string,
+    chatId: string,
     action: string,
     outcome: string,
     now: number,
     answer: string,
   ): Promise<void> {
     const recorded = this.store.recordCallback(callbackId, jobId, action, safeOutcome(outcome), now);
-    if (recorded) await this.telegram.answerCallback(callbackId, answer);
+    if (recorded || this.store.getOutbox(`callback:${callbackId}`)?.status !== "sent") {
+      this.enqueueCallbackAnswer(callbackId, chatId, answer, now);
+    }
+  }
+
+  private enqueueCallbackAnswer(callbackId: string, chatId: string, answer: string, now: number): void {
+    this.store.enqueueOutbox({
+      logicalKey: `callback:${callbackId}`,
+      chatId,
+      payload: { text: answer },
+    }, now);
   }
 
   private async sendProjects(chatId: string): Promise<void> {
@@ -524,7 +542,7 @@ export class TelegramIngress {
   ): Promise<Job> {
     let current = this.store.getJob(job.id) ?? job;
     let messageId = current.statusMessageId;
-    const logicalKey = `${current.id}${STATUS_LOGICAL_SUFFIX}`;
+    const logicalKey = `job:${current.id}${STATUS_LOGICAL_SUFFIX}`;
     const outbox = (outboxMessageId: number | null): OutboxInput => ({
       logicalKey,
       chatId,

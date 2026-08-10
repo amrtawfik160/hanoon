@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { jobFixture, policyFixture } from "./helpers";
 import {
+  observeTerminalWorker,
   observeThreadWorker,
   observeUnknownWorker,
   projectWorkerLiveness,
+  workerRegistrationGeneration,
 } from "../src/services/worker-liveness";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
@@ -101,5 +103,22 @@ describe("worker liveness projection", () => {
     expect(store.getWorkerLiveness(job.id)?.staleNotifiedAt).toBe(62_000);
     expect(store.markWorkerLivenessNotified(job.id, currentJob.version, 62_002)).toBe(false);
     expect(store.markWorkerLivenessNotified(job.id, currentJob.version, 62_003)).toBe(false);
+  });
+
+  it("uses distinct role generations and projects terminal command failures", () => {
+    const job = jobFixture({ policy: policyFixture() });
+    expect(workerRegistrationGeneration(job, "implementation"))
+      .not.toBe(workerRegistrationGeneration(job, "review"));
+    expect(observeTerminalWorker(job, {
+      id: "term_1",
+      status: "timed_out",
+      updatedAt: 2_000,
+      exitCode: null,
+    }, "validation", 2_001)).toMatchObject({
+      resourceKind: "bb_terminal",
+      resourceId: "term_1",
+      workerKind: "validation",
+      state: "failed",
+    });
   });
 });

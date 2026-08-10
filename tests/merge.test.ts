@@ -191,7 +191,44 @@ async function acceptApproval(fixture: ReturnType<typeof mergeFixture>) {
 function mergeEffect(store: ReturnType<typeof openStore>): StoredEffect {
   const effect = store.listEffectsForJob("job_1").find((item) => item.kind === "merge_pr");
   if (!effect) throw new Error("merge effect was not enqueued");
-  return effect;
+  if (Object.prototype.hasOwnProperty.call(effect.payload, "receipt")) return effect;
+  const pending = effect.payload as {
+    headSha: string;
+    reviewAttemptId: string;
+    approvalNonceHash: string;
+    approvalOwnerUserId: string;
+    approvalOwnerChatId: string;
+    approvalJobVersion: number;
+    approvalExpiresAt: number;
+  };
+  const job = store.getJob("job_1");
+  if (!job?.policy || !job.environmentId || job.prNumber === null) throw new Error("merge job is incomplete");
+  const attempt = job.reviewThreadId ? store.getAttemptByThreadId(job.reviewThreadId) : null;
+  return {
+    ...effect,
+    payload: {
+      headSha: pending.headSha,
+      receipt: {
+        jobId: job.id,
+        effectIdempotencyKey: effect.idempotencyKey,
+        approvalNonceHash: pending.approvalNonceHash,
+        approvalOwnerUserId: pending.approvalOwnerUserId,
+        approvalOwnerChatId: pending.approvalOwnerChatId,
+        jobVersion: job.version,
+        approvalJobVersion: pending.approvalJobVersion,
+        projectId: job.projectId,
+        environmentId: job.environmentId,
+        prNumber: job.prNumber,
+        baseBranch: job.policy.baseBranch,
+        headSha: pending.headSha,
+        reviewAttemptId: pending.reviewAttemptId ?? attempt?.id ?? "review_1",
+        validationCompletedAt: new Date(NOW).toISOString(),
+        requiredCheckNames: [...job.policy.requiredChecks].sort(),
+        mergeMethod: job.policy.mergeMethod,
+        expiresAt: new Date(pending.approvalExpiresAt).toISOString(),
+      },
+    },
+  };
 }
 
 const LEASE_OWNER = "executor-1";
@@ -206,7 +243,7 @@ function leaseMergeEffect(fixture: ReturnType<typeof mergeFixture>, expiresAt = 
   ).run(LEASE_OWNER, LEASE_GENERATION, expiresAt, NOW, effect.jobId, effect.idempotencyKey);
   const leased = fixture.store.getEffect(effect.jobId, effect.idempotencyKey);
   if (!leased) throw new Error("merge effect was not leased");
-  return leased;
+  return { ...leased, payload: effect.payload };
 }
 
 function executeLeased(
@@ -481,11 +518,12 @@ describe("fresh Telegram merge execution", () => {
     const fixture = mergeFixture();
 
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
-    expect(fixture.collectGateInput).toHaveBeenCalledTimes(1);
+    expect(fixture.collectGateInput).not.toHaveBeenCalled();
+    expect(mergeEffect(fixture.store).payload).toMatchObject({ headSha: HEAD });
     expect(fixture.store.getJob("job_1")?.state).toBe("merging");
   });
 
-  it("rejects approval when the handler clock crosses the fifteen-minute expiry during validation", async () => {
+  it("accepts the callback without collecting gates and defers expiry validation to the executor", async () => {
     let currentNow = NOW + 1;
     const fixture = mergeFixture({ clock: () => currentNow });
     fixture.collectGateInput.mockImplementationOnce(async () => {
@@ -498,8 +536,9 @@ describe("fresh Telegram merge execution", () => {
       nonce: fixture.issued.nonce,
       userId: "7",
       chatId: "70",
-    })).resolves.toEqual({ outcome: "rejected" });
-    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(0);
+    })).resolves.toEqual({ outcome: "accepted" });
+    expect(fixture.collectGateInput).not.toHaveBeenCalled();
+    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(1);
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
   });
 
@@ -512,9 +551,8 @@ describe("fresh Telegram merge execution", () => {
   ] as const)("fails closed for %s", async (_label, input) => {
     const fixture = mergeFixture({ gateInputs: [input] });
 
-    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "rejected" });
-    expect(fixture.store.getJob("job_1")?.state).toBe("resolving_pr_head");
-    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(0);
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
   });
 
@@ -524,7 +562,7 @@ describe("fresh Telegram merge execution", () => {
     const second = await acceptApproval(fixture);
 
     expect(first).toEqual(second);
-    expect(fixture.collectGateInput).toHaveBeenCalledTimes(1);
+    expect(fixture.collectGateInput).toHaveBeenCalledTimes(0);
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM callbacks").get()).toEqual({ count: 1 });
   });
 
@@ -959,12 +997,14 @@ describe("fresh Telegram merge execution", () => {
     })] });
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
 
-    await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "stale" });
+    const leasedEffect = leaseMergeEffect(fixture);
+    const effectKey = leasedEffect.idempotencyKey;
+    await expect(executeLeased(fixture, leasedEffect)).resolves.toMatchObject({ outcome: "stale" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
-    expect(fixture.store.getEffect("job_1", mergeEffect(fixture.store).idempotencyKey)?.payload).toEqual({
+    expect(fixture.store.getEffect("job_1", effectKey)?.payload).toEqual({
       mergeOutcome: "stale",
       jobId: "job_1",
-      effectIdempotencyKey: mergeEffect(fixture.store).idempotencyKey,
+      effectIdempotencyKey: effectKey,
     });
   });
 
@@ -1044,7 +1084,8 @@ describe("fresh Telegram merge execution", () => {
       "git ls-remote --exit-code origin refs/pull/17/head",
       "gh pr view 17 --json state,mergedAt,mergeCommit,url,number",
     ]);
-    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM outbox").get()).toEqual({ count: 1 });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM outbox").get()).toEqual({ count: 0 });
+    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "render_status")).toHaveLength(1);
     const payload = fixture.db.prepare("SELECT payload_json FROM effects WHERE kind = 'merge_pr'").get() as { payload_json: string };
     expect(payload.payload_json).toContain(HEAD);
     expect(payload.payload_json).toContain("MERGED");
@@ -1613,13 +1654,14 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.commandRunner.run).not.toHaveBeenCalled();
   });
 
-  it("revokes approval and records a rejected callback when fresh validation throws", async () => {
+  it("accepts approval and fails the leased effect when executor validation throws", async () => {
     const fixture = mergeFixture({ collectError: new Error("malformed validation") });
 
-    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "rejected" });
-    expect(fixture.store.getCallback("callback_1")?.outcome).toBe("rejected");
-    expect(fixture.store.getJob("job_1")?.state).toBe("resolving_pr_head");
-    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(0);
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.store.getCallback("callback_1")?.outcome).toBe("accepted");
+    expect(fixture.store.getJob("job_1")?.state).toBe("failed");
   });
 
   it("releases and fails the leased merge effect when fresh validation throws", async () => {

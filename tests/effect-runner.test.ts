@@ -185,4 +185,70 @@ describe("leased effect execution", () => {
       now: () => 1_001,
     }).run(claimed)).rejects.toBeInstanceOf(PermanentEffectError);
   });
+
+  it("blocks cancellation when the stopped BB worker never reaches a terminal state", async () => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      "UPDATE jobs SET state = 'implementing', implementation_thread_id = ?, version = ?, updated_at = ? WHERE id = ?",
+    ).run("thr_cancel", 2, 1_000, job.id);
+    const current = store.getJob(job.id);
+    if (!current) throw new Error("job missing");
+    store.upsertWorkerLiveness({
+      jobId: job.id,
+      workerKind: "implementation",
+      resourceKind: "bb_thread",
+      resourceId: "thr_cancel",
+      generation: current.version,
+      state: "active",
+      sourceUpdatedAt: 1_000,
+      observedAt: 1_000,
+      staleNotifiedAt: null,
+    });
+    const cancelled = store.applyJobEvent(job.id, current.version, {
+      type: "CANCEL_REQUESTED",
+      activeWorker: store.getWorkerLiveness(job.id),
+    }, 1_001);
+    const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "stop_thread");
+    if (!effect) throw new Error("stop effect missing");
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("executor lease missing");
+    const claimed = store.leaseEffects("owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((item) => item.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("stop effect was not leased");
+    const controller = new AbortController();
+
+    vi.useFakeTimers();
+    try {
+      const running = new EffectRunner({
+        store,
+        fence: { ownerId: "owner-a", generation: lease.generation, signal: controller.signal },
+        bb: {
+          stopWorker: vi.fn(async () => undefined),
+          getThread: vi.fn(async () => ({
+            id: "thr_cancel",
+            projectId: "proj_1",
+            environmentId: null,
+            parentThreadId: null,
+            title: "worker",
+            status: "stopping",
+            updatedAt: 1_000,
+            runtime: { displayStatus: "stopping", hostReconnectGraceExpiresAt: null },
+          })),
+        },
+        now: () => 1_001,
+      }).run(claimed);
+      await vi.advanceTimersByTimeAsync(750);
+      await expect(running).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "blocked",
+      blockedReason: "cancellation_unconfirmed",
+    });
+    expect(store.getWorkerLiveness(job.id)?.state).toBe("stopping");
+    expect(cancelled.cancelRequestedAt).not.toBeNull();
+  });
 });

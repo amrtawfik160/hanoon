@@ -171,6 +171,24 @@ function applyCancellation(
   return finish(job, effects, now);
 }
 
+function applyCancellationUnconfirmed(
+  job: Job,
+  event: Extract<JobEvent, { type: "CANCELLATION_UNCONFIRMED" }>,
+  effects: JobEffect[],
+  now: number,
+): TransitionResult {
+  if (job.cancelRequestedAt === null || job.state === "cancelled" || job.state === "merged") illegal(job, event);
+  const reason = event.reason ?? "Cancellation could not be confirmed while the worker remained active";
+  assertSafeFailureSummary(reason);
+  job.resumeState = job.state;
+  job.state = "blocked";
+  job.blockedReason = "cancellation_unconfirmed";
+  job.lastError = reason;
+  emitEffect(job, effects, "revoke_approvals");
+  emitEffect(job, effects, "render_status");
+  return finish(job, effects, now);
+}
+
 type StateTransitionHandler = (job: Job, event: JobEvent, effects: JobEffect[]) => void;
 
 function transitionAwaitingProject(job: Job, event: JobEvent, effects: JobEffect[]): void {
@@ -422,6 +440,9 @@ export function transition(job: Job, event: JobEvent, now: number): TransitionRe
     next.state = "cancelled";
     emitEffect(next, effects, "render_status");
     return finish(next, effects, now);
+  }
+  if (event.type === "CANCELLATION_UNCONFIRMED") {
+    return applyCancellationUnconfirmed(next, event, effects, now);
   }
   if (next.cancelRequestedAt !== null) return finish(next, [], now);
   if (event.type === "FAILED") {

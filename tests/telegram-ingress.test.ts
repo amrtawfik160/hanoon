@@ -372,14 +372,31 @@ it("rejects standalone text while a job is active and steers only a status-messa
 it("requests cancellation once and keeps it replay-safe", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const jobId = await createDraft(fixture, 50);
+  const job = fixture.store.getJob(jobId);
+  if (!job) throw new Error("draft was not created");
+  fixture.store.upsertWorkerLiveness({
+    jobId,
+    workerKind: "implementation",
+    resourceKind: "bb_thread",
+    resourceId: "thr_active",
+    generation: job.version,
+    state: "active",
+    sourceUpdatedAt: 5_099,
+    observedAt: 5_099,
+    staleNotifiedAt: null,
+  });
   const cancel = callbackUpdate(51, "cancel-callback", 7, 70, encodeCallbackData({ type: "cancel", jobId }));
 
   await fixture.ingress.handleClaimed(cancel, 5_100);
   await fixture.ingress.handleClaimed(cancel, 5_101);
 
-  const job = fixture.store.getJob(jobId);
-  expect(job?.cancelRequestedAt).toBe(5_100);
+  expect(fixture.store.getJob(jobId)?.cancelRequestedAt).toBe(5_100);
   expect(fixture.store.listEffectsForJob(jobId).filter((effect) => effect.kind === "revoke_approvals")).toHaveLength(1);
+  expect(fixture.store.listEffectsForJob(jobId).filter((effect) => effect.kind === "stop_thread")).toHaveLength(1);
+  expect(fixture.telegram.answered).toEqual([]);
+  expect(fixture.store.getOutbox("callback:cancel-callback")).toMatchObject({
+    payload: { text: "Cancellation requested." },
+  });
 });
 
 it("exposes no project data for malformed, wrong-identity, bot, textless, or non-private callbacks", async () => {
@@ -422,7 +439,7 @@ it("persists status-message identity with optimistic versioning and stores outbo
 
   fixture.store.enqueueOutbox(
     {
-      logicalKey: `${job.id}:status`,
+      logicalKey: `job:${job.id}:status`,
       chatId: "70",
       messageId: 123,
       payload: { text: "hello", reply_markup: {} as InlineKeyboardMarkup },
@@ -431,7 +448,7 @@ it("persists status-message identity with optimistic versioning and stores outbo
   );
   fixture.store.enqueueOutbox(
     {
-      logicalKey: `${job.id}:status`,
+      logicalKey: `job:${job.id}:status`,
       chatId: "70",
       messageId: 999,
       payload: { text: "replay" },
@@ -440,7 +457,7 @@ it("persists status-message identity with optimistic versioning and stores outbo
   );
   expect(fixture.db.prepare("SELECT logical_key, chat_id, message_id, payload_json FROM outbox").all()).toEqual([
     {
-      logical_key: `${job.id}:status`,
+      logical_key: `job:${job.id}:status`,
       chat_id: "70",
       message_id: 999,
       payload_json: JSON.stringify({ text: "replay" }),
@@ -511,13 +528,13 @@ it("stages the SQLite status outbox before a first send and finalizes its messag
   const job = fixture.store.getActiveJob();
   if (!job) throw new Error("missing job");
   expect(rowAtSend).toEqual({
-    logical_key: `${job.id}:status`,
+    logical_key: `job:${job.id}:status`,
     message_id: null,
     status: "pending",
   });
   expect(job.statusMessageId).toBe(100);
   expect(fixture.db.prepare("SELECT logical_key, message_id, status FROM outbox").get()).toEqual({
-    logical_key: `${job.id}:status`,
+    logical_key: `job:${job.id}:status`,
     message_id: job.statusMessageId,
     status: "pending",
   });
@@ -535,7 +552,7 @@ it("retains a pending null-message outbox intent when the first Telegram send th
   if (!job) throw new Error("missing job");
   expect(job.statusMessageId).toBeNull();
   expect(fixture.db.prepare("SELECT logical_key, message_id, status FROM outbox").get()).toEqual({
-    logical_key: `${job.id}:status`,
+    logical_key: `job:${job.id}:status`,
     message_id: null,
     status: "pending",
   });
@@ -553,7 +570,7 @@ it("upserts the status outbox before an edit so a thrown edit leaves the latest 
   const attemptedPayload = fixture.telegram.edited.at(-1)?.payload;
   if (!attemptedPayload) throw new Error("missing attempted edit");
   expect(fixture.db.prepare("SELECT logical_key, message_id, payload_json, status FROM outbox").get()).toEqual({
-    logical_key: `${jobId}:status`,
+    logical_key: `job:${jobId}:status`,
     message_id: statusMessageId,
     payload_json: JSON.stringify(attemptedPayload),
     status: "pending",
