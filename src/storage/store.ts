@@ -681,13 +681,17 @@ function isStrictPassReviewResult(value: unknown, headSha: string): boolean {
     verdict.data.checks.every((check) => check.outcome === "passed");
 }
 
+function isBoundedAttemptCompletion(value: number | null): value is number {
+  return value !== null && Number.isSafeInteger(value) && value >= 0;
+}
+
 export function isCompletedReviewAttempt(
   attempt: AttemptRecord | null,
   jobId: string,
   headSha: string,
 ): boolean {
   if (!attempt || attempt.jobId !== jobId || attempt.kind !== "review" || attempt.headSha !== headSha ||
-      attempt.completedAt === null || attempt.resultJson === null) return false;
+      !isBoundedAttemptCompletion(attempt.completedAt) || typeof attempt.resultJson !== "string") return false;
   try {
     return isStrictPassReviewResult(JSON.parse(attempt.resultJson), headSha);
   } catch {
@@ -1040,13 +1044,22 @@ function mergeEvidenceAttemptBindingError(
   attempt: AttemptRecord | null,
 ): string | null {
   const receipt = evidence.payload.receipt;
+  if (
+    attempt === null ||
+    attempt.id !== receipt.reviewAttemptId ||
+    attempt.jobId !== evidence.jobId ||
+    attempt.jobId !== receipt.jobId ||
+    attempt.kind !== "review" ||
+    attempt.headSha !== receipt.headSha ||
+    !isBoundedAttemptCompletion(attempt.completedAt) ||
+    typeof attempt.resultJson !== "string"
+  ) {
+    return "merge evidence owning review attempt is not a strict completed pass";
+  }
   if (evidence.disposition === "active" && !isCompletedReviewAttempt(attempt, job.id, receipt.headSha)) {
     return "merge evidence owning review attempt is not a strict completed pass";
   }
   if (evidence.disposition === "success") {
-    if (attempt === null || attempt.resultJson === null) {
-      return "merge success evidence owning attempt result is missing";
-    }
     try {
       const attemptResult = parsePersistedMergeSuccessResult(JSON.parse(attempt.resultJson));
       if (JSON.stringify(attemptResult) !== JSON.stringify(evidence.result)) {

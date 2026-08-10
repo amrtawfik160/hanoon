@@ -242,6 +242,86 @@ function insertCompetingMergeEffect(
   ).run(idempotencyKey, "job_1", payloadJson, status, NOW, NOW, NOW);
 }
 
+const COMPLETED_ATTEMPT_ISSUES = [
+  "wrong job",
+  "wrong kind",
+  "wrong head",
+  "null completion",
+  "malformed result",
+  "mismatched result/effect binding",
+] as const;
+type CompletedAttemptIssue = (typeof COMPLETED_ATTEMPT_ISSUES)[number];
+
+function insertCompletedAttemptCompetitor(
+  fixture: ReturnType<typeof mergeFixture>,
+  issue: CompletedAttemptIssue,
+): void {
+  const completed = mergeEffect(fixture.store);
+  if (completed.status !== "done") throw new Error("the valid merge candidate was not completed");
+  const completedPayload = completed.payload as {
+    headSha: string;
+    receipt: Record<string, unknown>;
+    mergeResult: Record<string, unknown>;
+  };
+  const suffix = issue.replaceAll(/[^a-z]+/g, "-");
+  const competitorKey = `${completed.idempotencyKey}:attempt-${suffix}`;
+  const attemptId = `review_competitor_${suffix}`;
+  const approvalNonceHash = hashSecret(`competitor-${suffix}`);
+  fixture.db.prepare(
+    `INSERT INTO approvals (
+       nonce_hash, job_id, head_sha, expires_at, consumed_at, outcome,
+       owner_user_id, owner_chat_id, job_version
+     ) VALUES (?, 'job_1', ?, ?, ?, 'accepted', '7', '70', 7)`,
+  ).run(approvalNonceHash, MOVED, NOW + 15 * 60_000, NOW + 3);
+
+  const payload = structuredClone(completedPayload);
+  payload.headSha = MOVED;
+  payload.receipt = {
+    ...payload.receipt,
+    effectIdempotencyKey: competitorKey,
+    approvalNonceHash,
+    headSha: MOVED,
+    reviewAttemptId: attemptId,
+  };
+  payload.mergeResult = {
+    ...payload.mergeResult,
+    effectIdempotencyKey: competitorKey,
+    approvalNonceHash,
+    authoritativeHeadSha: MOVED,
+  };
+
+  let attemptJobId = "job_1";
+  let attemptKind = "review";
+  let attemptHeadSha = MOVED;
+  let attemptResultJson = JSON.stringify(payload.mergeResult);
+  let completedAt: number | null = NOW + 10;
+  if (issue === "wrong job") {
+    fixture.db.prepare(
+      "INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at) VALUES (?, ?, ?, 'merged', ?, ?)",
+    ).run("job_other", 2, "other", NOW, NOW);
+    attemptJobId = "job_other";
+  } else if (issue === "wrong kind") {
+    attemptKind = "validation";
+  } else if (issue === "wrong head") {
+    attemptHeadSha = HEAD;
+  } else if (issue === "null completion") {
+    completedAt = null;
+  } else if (issue === "malformed result") {
+    attemptResultJson = "{}";
+  } else if (issue === "mismatched result/effect binding") {
+    attemptResultJson = JSON.stringify({
+      ...payload.mergeResult,
+      effectIdempotencyKey: `${competitorKey}:different`,
+    });
+  }
+
+  fixture.db.prepare(
+    `INSERT INTO attempts (id, job_id, kind, ordinal, head_sha, result_json, created_at, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(attemptId, attemptJobId, attemptKind, 20, attemptHeadSha, attemptResultJson, NOW + 9, completedAt);
+  insertCompetingMergeEffect(fixture, competitorKey, JSON.stringify(payload), "done");
+}
+
 async function staleOldApprovalAndCreateNewEffect() {
   const fixture = mergeFixture();
   await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
@@ -1008,6 +1088,44 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
     expect(fixture.commandRunner.run).toHaveBeenCalledTimes(2);
   });
+
+  it.each(COMPLETED_ATTEMPT_ISSUES)(
+    "rejects handler replay when an off-head successful competitor has a %s owning attempt",
+    async (issue) => {
+      const fixture = mergeFixture();
+      await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+      await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "merged" });
+      insertCompletedAttemptCompetitor(fixture, issue);
+
+      await expect(fixture.handler.handleApprovalCallback({
+        callbackId: `handler_competitor_${issue.replaceAll(/[^a-z]+/g, "_")}`,
+        nonce: fixture.issued.nonce,
+        userId: "7",
+        chatId: "70",
+      })).resolves.toEqual({ outcome: "rejected" });
+      expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(COMPLETED_ATTEMPT_ISSUES)(
+    "rejects store replay when an off-head successful competitor has a %s owning attempt",
+    async (issue) => {
+      const fixture = mergeFixture();
+      await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+      await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "merged" });
+      insertCompletedAttemptCompetitor(fixture, issue);
+
+      const callbackId = `store_competitor_${issue.replaceAll(/[^a-z]+/g, "_")}`;
+      expect(fixture.store.rejectApprovalAndRecordCallback({
+        nonceHash: hashSecret(fixture.issued.nonce),
+        callbackId,
+        jobId: "job_1",
+        now: NOW + 20,
+      })).toMatchObject({ outcome: "rejected" });
+      expect(fixture.store.getCallback(callbackId)?.outcome).toBe("rejected");
+      expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("replays an accepted callback after a harmless terminal status version increment", async () => {
     const fixture = mergeFixture();
