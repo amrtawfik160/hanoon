@@ -37,6 +37,9 @@ export type JobExecutorDependencies = {
   monitors?: {
     processDue(): Promise<boolean>;
   };
+  threadNotices?: {
+    processDue(): Promise<boolean>;
+  };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
     reset(): void;
@@ -221,6 +224,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
         if (deps.monitors) {
           didWork = await deps.monitors.processDue() || didWork;
+        }
+        if (deps.threadNotices) {
+          didWork = await deps.threadNotices.processDue() || didWork;
         }
         const jobs = deps.store.listJobs(1_000);
         for (const job of jobs) {

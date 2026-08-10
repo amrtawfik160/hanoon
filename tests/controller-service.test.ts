@@ -72,6 +72,7 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
     lastError: null,
     submittedAt: null,
     completedAt: null,
+    awaitingInteractionId: null,
     createdAt: 1_000,
     updatedAt: 1_000,
     ...overrides,
@@ -191,6 +192,7 @@ it("reduces BB controller events after the durable sequence without exposing rea
     assistantDelta: "Hello",
     completed: true,
     error: null,
+    pendingQuestion: null,
   });
   expect(eventsList).toHaveBeenCalledWith({
     threadId: "thr_controller",
@@ -372,7 +374,9 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
     status: async () => status,
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "First answer."),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
@@ -442,7 +446,9 @@ it("requeues a turn while the controller thread is still busy instead of failing
     status: vi.fn(async () => status),
     latestSeq: vi.fn(async () => 4),
         output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 4, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    events: vi.fn(async () => ({ latestSeq: 4, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
@@ -496,7 +502,9 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
         output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const wedgedAt = 2_001 + 15 * 60_000;
@@ -549,7 +557,10 @@ it("delivers a completed answer even when the controller thread ends in error", 
       assistantDelta: "Here is the answer.",
       completed: true,
       error: null,
+      pendingQuestion: null,
     })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
@@ -572,7 +583,9 @@ it("reports a streaming turn only while its answer is still arriving", async () 
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
@@ -611,7 +624,9 @@ it("fails an uncertain send closed and never submits it twice", async () => {
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed" })),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
@@ -670,7 +685,9 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => { throw new Error("temporary BB output failure"); }),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
@@ -722,7 +739,10 @@ it("projects active Luna assistant deltas into the durable controller reply", as
       assistantDelta: "Working on it",
       completed: false,
       error: null,
+      pendingQuestion: null,
     })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
@@ -780,7 +800,10 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
       assistantDelta: "",
       completed: false,
       error: null,
+      pendingQuestion: null,
     })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 22_000 } });
@@ -835,7 +858,9 @@ it("retires an errored controller so a later queued message can start a fresh ge
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed" })),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
@@ -896,7 +921,9 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned_idle" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_003 } });
@@ -943,7 +970,9 @@ it("retires an errored controller generation even when no turn remains submitted
     status: vi.fn(async () => "error" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
@@ -999,7 +1028,10 @@ it("retries one controller generation when BB proves the input was never accepte
       assistantDelta: "",
       completed: false,
       error: "Controller provider turn failed",
+      pendingQuestion: null,
     })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });

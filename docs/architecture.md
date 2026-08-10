@@ -82,6 +82,7 @@ The plugin database records:
 - long-term memories with full-text search, supersession, and provenance;
 - tool receipts keyed by turn, tool name, and argument hash;
 - armed monitors, their trigger, and their firing history;
+- watched threads with their last reported status, and the interactions offered to the owner with their answers and delivery state;
 - jobs, state-machine versions, stage attempts, and immutable handoff digests;
 - idempotent effects and retry accounting;
 - executor lease ownership and worker liveness;
@@ -109,6 +110,27 @@ Restating a subject supersedes its predecessor instead of overwriting it, so cor
 ## Monitors
 
 A monitor is a durable obligation, not a reminder. It watches a BB thread for completion or failure, or fires on a cron schedule. Firing is claimed before it happens, so a crash mid-fire cannot double-book it; a one-shot watch retires and a schedule re-arms for its next occurrence. The agent receives its own instruction back as an ordinary turn, acts on it, and reports to the owner.
+
+## Thread notices
+
+The owner drives BB from Telegram, so anything that would wait for a click in the BB app is work that waits forever. A background sweep watches every **top-level** visible thread — a sub-agent's thread is reported to its parent, not to the owner — and delivers two things:
+
+- **Finished and failed.** A thread's first observation is recorded silently, so enabling the sweep does not replay a backlog. After that, only a thread that was *working* can stop working: a move into `idle` or `error` is announced when it comes from `active`, `starting`, or `stopping`. A thread marked failed after it already finished has had its say, and repeating it as a failure would contradict what the owner just read. A thread being steered turn by turn is announced at most once every ten minutes, so it does not narrate every reply.
+- **Blocked.** A thread waiting on a BB interaction is rendered into Telegram with inline buttons: the options of a question, or *Allow once* / *Allow all session* / *Deny* for a command or file-change approval. The tap is carried back through BB's interaction resolution, and delivery is recorded separately from the answer so a crash between the two re-sends rather than loses it.
+
+Notices are written straight to the durable outbox rather than routed through the agent. They are a property of the plugin, not of the conversation, so they still arrive when the agent itself is the stuck part.
+
+An interaction the plugin cannot render into buttons — an unfamiliar payload, or an approval whose subject it does not recognise — is reported without them, naming the thread and saying it needs the BB app. Guessing at a resolution would answer it wrongly; saying nothing would leave the thread waiting on an owner who was never told.
+
+The sweep is paced independently of the executor loop it rides on, which polls as often as every 250ms while an answer streams. An owner's tap is delivered immediately; only the polling is paced.
+
+## Controller questions
+
+The conversational agent can ask the owner a question mid-answer. BB raises that as a pending interaction, which is answerable only in the BB app, so the plugin bridges it: the question is detected on the event stream the reconcile loop already reads, asked in Telegram with buttons, and resolved from a tap or a plain typed reply. Multi-question interactions are asked one at a time and resolved once every question is settled. While a turn is parked on a question the typing indicator stops, because the turn is waiting on a person rather than composing.
+
+Two timeouts bound the ways an answer can go missing, and their ordering matters. A submitted turn that produces no BB event for eight minutes is treated as wedged: the turn fails with a message to the owner **and the thread is retired**, so the next message opens a fresh session. That deadline sits below the ten-minute limit on how long a queued message waits for a busy thread, so recovery happens before the queue starts failing behind it. A turn parked on a question is exempt — waiting on a person is not a stall.
+
+A message the owner sends while an answer is still being written is steered into the running thread rather than queued behind it, so a correction lands while it can still correct something.
 
 ## Safety properties
 

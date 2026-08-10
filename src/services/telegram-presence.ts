@@ -27,7 +27,11 @@ const JOB_WORKER_KIND: Partial<Record<JobState, WorkerKind>> = {
 type PresenceStore = {
   getOwner(): { userId: string; chatId: string } | null;
   getControllerForOwner(userId: string, chatId: string): { controllerKey: string } | null;
-  getPendingControllerTurn(controllerKey: string): { id: string; state: ControllerTurnState } | null;
+  getPendingControllerTurn(controllerKey: string): {
+    id: string;
+    state: ControllerTurnState;
+    awaitingInteractionId?: string | null;
+  } | null;
   getActiveJob(): { id: string; state: JobState } | null;
   getWorkerLiveness(jobId: string): WorkerLiveness | null;
 };
@@ -47,9 +51,11 @@ function controllerPresenceTarget(store: PresenceStore, owner: PresenceOwner): T
   const controller = store.getControllerForOwner(owner.userId, owner.chatId);
   if (!controller) return null;
   const turn = store.getPendingControllerTurn(controller.controllerKey);
-  return turn && CONTROLLER_PRESENCE_STATES.has(turn.state)
-    ? { key: `controller:${turn.id}`, chatId: owner.chatId }
-    : null;
+  if (!turn || !CONTROLLER_PRESENCE_STATES.has(turn.state)) return null;
+  // Typing while the ball is in the owner's court is a lie: the turn is waiting
+  // on their answer, not composing one.
+  if (turn.awaitingInteractionId) return null;
+  return { key: `controller:${turn.id}`, chatId: owner.chatId };
 }
 
 function workerPresenceTarget(store: PresenceStore, owner: PresenceOwner): TelegramPresenceTarget | null {

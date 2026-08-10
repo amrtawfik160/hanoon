@@ -15,6 +15,15 @@ const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
 // How long a queued message may wait for a busy controller thread before the
 // owner is told it will not be answered.
 const CONTROLLER_BUSY_WAIT_MS = 10 * 60_000;
+/**
+ * How long a submitted turn may go without producing a single BB event before
+ * it is treated as wedged. Any event at all — reasoning, a tool call, output —
+ * resets this, so only a thread that has genuinely stopped trips it. Silence is
+ * the worst answer the owner can get, so it is bounded even when BB still
+ * reports the thread as active.
+ */
+export const CONTROLLER_STALL_MS = 8 * 60_000;
+const MAX_STEER_ATTEMPTS = 3;
 
 function boundedResponse(value: string): string | null {
   const text = value.trim();
@@ -162,6 +171,27 @@ export class LunaControllerService {
       });
     }
 
+    // An answer the owner already gave outranks anything else: until BB hears
+    // it, the thread cannot make progress and every other check is noise.
+    const ownerAnswer = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey);
+    if (ownerAnswer) {
+      try {
+        await this.dependencies.adapter.answerQuestion(
+          controller.threadId,
+          ownerAnswer.interactionId,
+          ownerAnswer.answers,
+          signal,
+        );
+      } catch {
+        return false;
+      }
+      this.dependencies.store.markControllerQuestionDelivered({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        interactionId: ownerAnswer.interactionId,
+      });
+      return true;
+    }
+
     let status: ControllerStatus;
     try {
       status = await this.dependencies.adapter.status(controller.threadId, signal);
@@ -192,13 +222,69 @@ export class LunaControllerService {
     } catch {
       observation = null;
     }
+    if (observation?.pendingQuestion) {
+      this.dependencies.store.recordControllerQuestion({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: submitted.id,
+        interactionId: observation.pendingQuestion.interactionId,
+        questions: observation.pendingQuestion.questions,
+      });
+    }
     const refreshedAt = this.dependencies.clock.now();
-    this.dependencies.store.refreshControllerDraft({
-      ...fenceAt(fence, refreshedAt),
-      turnId: submitted.id,
-      sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
-    });
-    if (status === "active" || status === "starting" || status === "stopping") return true;
+    // A turn parked on a question is waiting on a person. Redrawing its draft
+    // would only replace the question with stale half-written output.
+    const parked = this.dependencies.store.getControllerTurn(submitted.id)?.awaitingInteractionId ?? null;
+    if (parked === null) {
+      this.dependencies.store.refreshControllerDraft({
+        ...fenceAt(fence, refreshedAt),
+        turnId: submitted.id,
+        sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
+      });
+    }
+    if (status === "active" || status === "starting" || status === "stopping") {
+      // Anything the owner says while an answer is being written belongs to that
+      // answer. Holding it back until the turn ends is how a correction arrives
+      // too late to correct anything.
+      const waiting = parked === null
+        ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
+        : null;
+      if (waiting && waiting.retryCount < MAX_STEER_ATTEMPTS) {
+        try {
+          await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
+        } catch {
+          // Out of attempts it stays queued, and the ordinary dispatch answers
+          // it once the turn in flight finishes.
+          this.dependencies.store.recordControllerSteerFailure({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            turnId: waiting.id,
+          });
+          return true;
+        }
+        this.dependencies.store.foldControllerTurnIntoRunning({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          turnId: waiting.id,
+        });
+        return true;
+      }
+      if (parked === null && refreshedAt - submitted.updatedAt >= CONTROLLER_STALL_MS) {
+        // Retiring the thread is the half that matters. Failing only the turn
+        // leaves the wedge in place, and every later message then waits out the
+        // busy timeout against a thread that will never go idle.
+        this.dependencies.store.resetControllerThread({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          controllerKey: controller.controllerKey,
+          expectedThreadId: controller.threadId,
+          reason: "Thread stopped producing events mid-answer",
+        });
+        this.fail(
+          submitted,
+          fence,
+          "Controller turn stopped producing events",
+          "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
+        );
+      }
+      return true;
+    }
     if (status === "missing") {
       this.dependencies.store.resetControllerThread({
         ...fenceAt(fence, this.dependencies.clock.now()),
@@ -326,11 +412,17 @@ export class LunaControllerService {
     this.dependencies.store.requeueControllerTurn({ ...fenceAt(fence, now), turnId: turn.id });
   }
 
-  private fail(turn: ControllerTurnRecord, fence: EffectFence, error: string): void {
+  private fail(
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    error: string,
+    ownerMessage?: string,
+  ): void {
     this.dependencies.store.failControllerTurn({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       error,
+      ownerMessage,
     });
   }
 }

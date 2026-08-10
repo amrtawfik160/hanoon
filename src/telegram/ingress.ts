@@ -269,8 +269,20 @@ export class TelegramIngress {
       return;
     }
 
+    const controllerKey = stableControllerKey(identity.userId, identity.chatId);
+    // The agent asked something and is blocked on it. A reply now is the answer,
+    // not a new request to line up behind the answer it is waiting to give.
+    if (this.store.getPendingControllerQuestion(controllerKey)) {
+      const answered = this.store.answerControllerQuestionWithText({ controllerKey, text: normalized, now });
+      if (answered.ok) {
+        this.rememberStandingInstruction(normalized, answered.turnId, now);
+        this.onWorkAvailable();
+        return;
+      }
+    }
+
     const turn = this.store.enqueueControllerTurn({
-      controllerKey: stableControllerKey(identity.userId, identity.chatId),
+      controllerKey,
       telegramUserId: identity.userId,
       telegramChatId: identity.chatId,
       updateId,
@@ -346,6 +358,56 @@ export class TelegramIngress {
         result.outcome === "accepted" ? "Merge queued." : "Approval is stale or no longer valid.",
         now,
       );
+      return;
+    }
+    if (action.type === "thread_interaction") {
+      const answered = this.store.answerThreadInteraction({
+        token: action.token,
+        userId: identity.userId,
+        chatId: identity.chatId,
+        now,
+      });
+      const recorded = this.store.recordCallback(
+        callback.id,
+        null,
+        "thread_interaction",
+        answered.ok ? "accepted" : answered.reason,
+        now,
+      );
+      if (recorded) {
+        this.enqueueCallbackAnswer(
+          callback.id,
+          identity.chatId,
+          answered.ok ? answered.label : "That thread is no longer waiting on you.",
+          now,
+        );
+      }
+      if (answered.ok && recorded) this.onWorkAvailable();
+      return;
+    }
+    if (action.type === "question") {
+      const answered = this.store.answerControllerQuestion({
+        token: action.token,
+        userId: identity.userId,
+        chatId: identity.chatId,
+        now,
+      });
+      const recorded = this.store.recordCallback(
+        callback.id,
+        null,
+        "controller_question",
+        answered.ok ? "accepted" : answered.reason,
+        now,
+      );
+      if (recorded) {
+        this.enqueueCallbackAnswer(
+          callback.id,
+          identity.chatId,
+          answered.ok ? "Got it." : "That question is no longer open.",
+          now,
+        );
+      }
+      if (answered.ok && recorded) this.onWorkAvailable();
       return;
     }
     if (action.type === "operation") {
