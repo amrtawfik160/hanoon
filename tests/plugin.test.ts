@@ -121,7 +121,7 @@ it("projects fresh-gate validation terminal observations into liveness", async (
   });
   harness.sdk.stub("terminals.get", async ({ terminalId }: { terminalId: string }) => ({
     status: "exited",
-    exitCode: commands.get(terminalId)?.startsWith("git remote") ? 1 : 0,
+    exitCode: commands.get(terminalId)?.includes("git remote") ? 1 : 0,
   }));
   harness.sdk.stub("terminals.output", async () => ({ chunks: [] }));
   harness.sdk.stub("terminals.close", async () => undefined);

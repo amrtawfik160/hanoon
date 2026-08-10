@@ -307,7 +307,6 @@ function transitionReviewing(job: Job, event: JobEvent, effects: JobEffect[]): v
 function transitionRemediating(job: Job, event: JobEvent, effects: JobEffect[]): void {
   if (event.type === "REMEDIATION_SENT") {
     job.state = "implementing";
-    emitEffect(job, effects, "steer_implementation");
     return;
   }
   if (event.type === "IMPLEMENTATION_IDLE") {

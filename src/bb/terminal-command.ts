@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 
 export type TerminalScope =
@@ -34,8 +35,10 @@ type TerminalClient = {
     title: string;
   }): Promise<{ id: string }>;
   get(input: { terminalId: string; signal?: AbortSignal }): Promise<{ status: string; exitCode?: number | null }>;
-  output(input: { terminalId: string; tailBytes: number; signal?: AbortSignal }): Promise<{
+  output(input: { terminalId: string; sinceSeq: number; tailBytes: number; signal?: AbortSignal }): Promise<{
     chunks: Array<{ seq?: number; sequence?: number; dataBase64?: string; data?: string }>;
+    nextSeq?: number;
+    truncated?: boolean;
   }>;
   close(input: { terminalId: string; mode: "force" }): Promise<unknown>;
 };
@@ -49,6 +52,7 @@ type BoundedResult<T> =
 
 const POLL_INTERVAL_MS = 250;
 const TAIL_BYTES = 65_536;
+const RESULT_MARKER_PREFIX = "__BB_TELEGRAM_AGENT_RESULT_";
 
 function stripAnsi(terminalOutput: string): string {
   return terminalOutput
@@ -66,6 +70,39 @@ function collectOutput(chunks: Array<{ seq?: number; sequence?: number; dataBase
       })
       .join(""),
   );
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function commandEnvelope(command: string, marker: string): string {
+  if (command.includes("\0")) throw new TypeError("command must not contain NUL bytes");
+  return [
+    `__bb_telegram_agent_command=${shellSingleQuote(command)}`,
+    '"${SHELL:-/bin/sh}" -lc "$__bb_telegram_agent_command"',
+    "__bb_telegram_agent_exit=$?",
+    `printf '\\n${marker}:%s\\n' "$__bb_telegram_agent_exit"`,
+    "IFS= read -r __bb_telegram_agent_release",
+    'exit "$__bb_telegram_agent_exit"',
+  ].join("; ");
+}
+
+function parseCommandResult(output: string, marker: string): { exitCode: number; output: string } | null {
+  const expression = new RegExp(`(?:\\r?\\n)${marker}:([0-9]{1,3})(?:\\r?\\n)`);
+  const match = expression.exec(output);
+  if (!match || match.index === undefined) return null;
+  const exitCode = Number.parseInt(match[1] ?? "", 10);
+  if (!Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255) return null;
+  return {
+    exitCode,
+    output: output.slice(0, match.index) + output.slice(match.index + match[0].length),
+  };
+}
+
+function appendBounded(current: string, next: string): string {
+  const bytes = Buffer.from(current + next, "utf8");
+  return bytes.length <= TAIL_BYTES ? bytes.toString("utf8") : bytes.subarray(bytes.length - TAIL_BYTES).toString("utf8");
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -100,19 +137,24 @@ export class TerminalCommandRunner {
     }
   }
 
-  private async collect(terminalId: string, signal?: AbortSignal): Promise<string> {
-    const result = await this.terminals().output({ terminalId, tailBytes: TAIL_BYTES, signal });
-    return collectOutput(result.chunks);
+  private async collect(terminalId: string, sinceSeq: number, signal?: AbortSignal): Promise<{ nextSeq: number; output: string }> {
+    const result = await this.terminals().output({ terminalId, sinceSeq, tailBytes: TAIL_BYTES, signal });
+    return {
+      nextSeq: result.nextSeq ?? sinceSeq,
+      output: collectOutput(result.chunks),
+    };
   }
 
-  private async start(input: TerminalRunInput): Promise<{ id: string }> {
-    return this.terminals().create({
+  private async start(input: TerminalRunInput): Promise<{ id: string; marker: string }> {
+    const marker = `${RESULT_MARKER_PREFIX}${randomBytes(16).toString("hex")}__`;
+    const session = await this.terminals().create({
       cols: 120,
       rows: 40,
       scope: input.scope,
-      start: { mode: "command", command: input.command },
+      start: { mode: "command", command: commandEnvelope(input.command, marker) },
       title: input.title,
     });
+    return { id: session.id, marker };
   }
 
   private bounded<T>(
@@ -164,8 +206,11 @@ export class TerminalCommandRunner {
     deadline: number,
     signal: AbortSignal | undefined,
     closeOnce: () => void,
+    resultMarker: string,
     onObservation?: (observation: TerminalObservation) => void,
   ): Promise<CommandResult> {
+    let nextSeq = 0;
+    let output = "";
     while (true) {
       if (signal?.aborted) {
         closeOnce();
@@ -192,29 +237,29 @@ export class TerminalCommandRunner {
       const status = statusResult.value;
       onObservation?.({ id: terminalId, status: status.status, updatedAt: Date.now(), exitCode: status.exitCode });
       if (status.status === "exited") {
-        const outputResult = await this.bounded(() => this.collect(terminalId, signal), deadline, signal);
-        if (outputResult.outcome === "aborted") {
-          closeOnce();
-          return { outcome: "aborted" };
-        }
-        if (outputResult.outcome === "timed_out") {
-          closeOnce();
-          return { outcome: "timed_out" };
-        }
-        if (signal?.aborted) {
-          closeOnce();
-          return { outcome: "aborted" };
-        }
-        if (deadline <= Date.now()) {
-          closeOnce();
-          return { outcome: "timed_out" };
-        }
         closeOnce();
         return {
           outcome: "exited",
           exitCode: status.exitCode ?? 1,
-          output: outputResult.value,
+          output,
         };
+      }
+
+      const outputResult = await this.bounded(() => this.collect(terminalId, nextSeq, signal), deadline, signal);
+      if (outputResult.outcome === "aborted") {
+        closeOnce();
+        return { outcome: "aborted" };
+      }
+      if (outputResult.outcome === "timed_out") {
+        closeOnce();
+        return { outcome: "timed_out" };
+      }
+      nextSeq = outputResult.value.nextSeq;
+      output = appendBounded(output, outputResult.value.output);
+      const commandResult = parseCommandResult(output, resultMarker);
+      if (commandResult) {
+        closeOnce();
+        return { outcome: "exited", ...commandResult };
       }
 
       try {
@@ -265,6 +310,6 @@ export class TerminalCommandRunner {
     if (startResult.outcome === "timed_out") return { outcome: "timed_out" };
     terminalId = startResult.value.id;
     input.onObservation?.({ id: terminalId, status: "starting", updatedAt: Date.now() });
-    return this.waitForExit(terminalId, deadline, input.signal, closeOnce, input.onObservation);
+    return this.waitForExit(terminalId, deadline, input.signal, closeOnce, startResult.value.marker, input.onObservation);
   }
 }

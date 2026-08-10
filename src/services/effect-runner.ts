@@ -239,11 +239,16 @@ export class EffectRunner {
     const bb = this.dependencies.bb;
     if (!bb) throw new PermanentEffectError("BB runner is not configured");
     const attemptInput = attemptFor(effect, job, kind);
+    const existingAttempt = this.dependencies.store.getAttempt(attemptInput.id);
     const attempt = this.dependencies.store.createAttempt({
       id: attemptInput.id,
       jobId: job.id,
       kind,
-      ordinal: attemptInput.ordinal,
+      ordinal: existingAttempt?.ordinal ?? (
+        kind === "review"
+          ? this.dependencies.store.nextAttemptOrdinal(job.id, kind)
+          : attemptInput.ordinal
+      ),
       headSha: attemptInput.headSha,
       now: this.now(),
     });

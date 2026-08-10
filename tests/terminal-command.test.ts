@@ -29,6 +29,53 @@ afterEach(() => {
 });
 
 describe("TerminalCommandRunner", () => {
+  test("captures a command result before BB removes scrollback for an exited terminal", async () => {
+    let marker: string | null = null;
+    let statusReads = 0;
+    const create = vi.fn().mockImplementation(async ({ start }: { start: { command: string } }) => {
+      marker = start.command.match(/__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/)?.[0] ?? null;
+      return { id: "terminal-1" };
+    });
+    const get = vi.fn().mockImplementation(async () => {
+      statusReads += 1;
+      return statusReads === 1
+        ? { status: "running", exitCode: null, closeReason: null }
+        : { status: "exited", exitCode: 1, closeReason: "process-exit" };
+    });
+    const output = vi.fn().mockImplementation(async () => {
+      if (statusReads > 1) {
+        throw Object.assign(new Error("Terminal output is unavailable"), {
+          code: "terminal_output_unavailable",
+          status: 409,
+        });
+      }
+      expect(marker).not.toBeNull();
+      return {
+        chunks: [{ seq: 0, dataBase64: encoded(`user output\n${marker}:17\n`) }],
+        nextSeq: 1,
+        truncated: false,
+      };
+    });
+    const close = vi.fn().mockResolvedValue(undefined);
+    const sdk = makeSdk({ create, get, output, close });
+    const runner = new TerminalCommandRunner(sdk as never);
+
+    const result = await runner.run({
+      scope: { kind: "host_path", hostId: "host-1", cwd: "/workspace/project" },
+      title: "fast command",
+      command: `printf "%s" "owner's repo"`,
+      timeoutMs: 5_000,
+    });
+
+    expect(result).toEqual({ outcome: "exited", exitCode: 17, output: "user output" });
+    expect(output).toHaveBeenCalledWith({
+      terminalId: "terminal-1",
+      sinceSeq: 0,
+      tailBytes: 65_536,
+    });
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   test.each([
     {
       scope: { kind: "environment", environmentId: "env-1" } as const,
@@ -65,12 +112,12 @@ describe("TerminalCommandRunner", () => {
         cols: 120,
         rows: 40,
         scope,
-        start: { mode: "command", command: "git status --short" },
+        start: { mode: "command", command: expect.stringContaining("git status --short") },
         title,
       });
       expect(get).toHaveBeenNthCalledWith(1, { terminalId: "terminal-1" });
       expect(get).toHaveBeenNthCalledWith(2, { terminalId: "terminal-1" });
-      expect(output).toHaveBeenCalledWith({ terminalId: "terminal-1", tailBytes: 65_536 });
+      expect(output).toHaveBeenCalledWith({ terminalId: "terminal-1", sinceSeq: 0, tailBytes: 65_536 });
       expect(result).toEqual({
         outcome: "exited",
         exitCode: 17,
@@ -132,7 +179,9 @@ describe("TerminalCommandRunner", () => {
         const get =
           blockedStage === "get"
             ? vi.fn().mockImplementation(never)
-            : vi.fn().mockResolvedValue({ status: "exited", exitCode: 0 });
+            : blockedStage === "output"
+              ? vi.fn().mockResolvedValue({ status: "running", exitCode: null })
+              : vi.fn().mockResolvedValue({ status: "exited", exitCode: 0 });
         const output =
           blockedStage === "output"
             ? vi.fn().mockImplementation(never)
@@ -189,7 +238,7 @@ describe("TerminalCommandRunner", () => {
       expect(close).toHaveBeenCalledTimes(1);
     });
 
-    test("closes a normally exited session after collecting bounded output", async () => {
+    test("closes an exited session without requesting scrollback that BB has already removed", async () => {
       const close = vi.fn().mockResolvedValue(undefined);
       const sdk = makeSdk({
         get: vi.fn().mockResolvedValue({ status: "exited", exitCode: 0 }),
@@ -205,7 +254,8 @@ describe("TerminalCommandRunner", () => {
         timeoutMs: 1_000,
       });
 
-      expect(result).toEqual({ outcome: "exited", exitCode: 0, output: "done" });
+      expect(result).toEqual({ outcome: "exited", exitCode: 0, output: "" });
+      expect(sdk.terminals.output).not.toHaveBeenCalled();
       expect(close).toHaveBeenCalledTimes(1);
     });
   });

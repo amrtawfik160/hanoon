@@ -1224,6 +1224,7 @@ export interface TelegramAgentStore {
   getEffect(jobId: string, idempotencyKey: string): StoredEffect | null;
   getAttempt(attemptId: string): AttemptRecord | null;
   getAttemptByThreadId(threadId: string): AttemptRecord | null;
+  nextAttemptOrdinal(jobId: string, kind: AttemptRecord["kind"]): number;
   createAttempt(input: {
     id: string;
     jobId: string;
@@ -2210,6 +2211,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           completed_at: row.completed_at,
         })
       : null;
+  }
+
+  public nextAttemptOrdinal(jobId: string, kind: AttemptRecord["kind"]): number {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    const row = this.db
+      .prepare("SELECT COALESCE(MAX(ordinal), 0) AS max_ordinal FROM attempts WHERE job_id = ? AND kind = ?")
+      .get(jobId, kind) as { max_ordinal: number };
+    return row.max_ordinal + 1;
   }
 
   public createAttempt(input: {

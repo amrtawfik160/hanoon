@@ -140,8 +140,8 @@ it("reports individual readiness rows for every Telegram, BB, host, provider, an
   expect(output.checks.every((check) => check.status === "pass")).toBe(true);
   expect(commands.size).toBe(2);
   expect([...commands.values()]).toEqual(expect.arrayContaining([
-    expect.stringMatching(/^gh auth status/),
-    expect.stringMatching(/^gh repo view acme\/cyndra/),
+    expect.stringContaining("gh auth status"),
+    expect.stringContaining("gh repo view acme/cyndra"),
   ]));
   for (const command of commands.values()) {
     const terminalId = [...commands.entries()].find(([, value]) => value === command)?.[0];
