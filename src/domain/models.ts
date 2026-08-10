@@ -12,6 +12,34 @@ export const executionProfileSchema = z
   })
   .strict();
 
+export const policyCommandSchema = z
+  .object({
+    name: z.string().min(1).max(40),
+    command: z.string().min(1).max(8_000),
+    timeoutMs: z.number().int().min(1_000).max(3_600_000),
+  })
+  .strict();
+
+export const productionPolicySchema = z
+  .object({
+    deployCommands: z.array(policyCommandSchema).min(1).max(20),
+    canaryCommands: z.array(policyCommandSchema).min(1).max(20),
+    rollbackCommand: policyCommandSchema.optional(),
+    convexDeployRequired: z.boolean().default(false),
+  })
+  .strict()
+  .superRefine((production, context) => {
+    if (!production.convexDeployRequired) return;
+    const convexCliDeploy = /(?:^|&&|\|\||;|\||\n)\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+)\s+)*(?:(?:npx|bunx)\s+|(?:yarn\s+dlx|pnpm\s+exec)\s+)?convex\s+deploy(?:\s|$)/;
+    if (!production.deployCommands.some((entry) => convexCliDeploy.test(entry.command))) {
+      context.addIssue({
+        code: "custom",
+        path: ["deployCommands"],
+        message: "A Convex deployment must use the Convex CLI",
+      });
+    }
+  });
+
 export const projectPolicySchema = z
   .object({
     projectId: z.string().startsWith("proj_"),
@@ -21,17 +49,8 @@ export const projectPolicySchema = z
     baseBranch: z.string().min(1),
     implementation: executionProfileSchema,
     review: executionProfileSchema,
-    validationCommands: z
-      .array(
-        z
-          .object({
-            name: z.string().min(1).max(40),
-            command: z.string().min(1),
-            timeoutMs: z.number().int().min(1_000).max(3_600_000),
-          })
-          .strict(),
-      )
-      .max(20),
+    validationCommands: z.array(policyCommandSchema).max(20),
+    production: productionPolicySchema.optional(),
     requiredChecks: z.array(z.string().min(1)).max(50),
     outputRedactionPatterns: z.array(z.string().min(1).max(200)).max(20),
     workerLivenessWatchdogMs: z.number().int().min(60_000).max(3_600_000).default(300_000),
@@ -54,6 +73,8 @@ export const projectPolicySchema = z
   });
 
 export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
+export type PolicyCommand = z.infer<typeof policyCommandSchema>;
+export type ProductionPolicy = z.infer<typeof productionPolicySchema>;
 export type ProjectPolicy = z.infer<typeof projectPolicySchema>;
 
 export type ReviewSeverity = "critical" | "high" | "medium" | "low";
@@ -133,12 +154,16 @@ export type JobState =
   | "final_reviewing"
   | "awaiting_merge_approval"
   | "merging"
+  | "deploying"
+  | "verifying_production"
+  | "production_failed"
+  | "complete"
   | "failed"
   | "blocked"
   | "cancelled"
   | "merged";
 
-export type WorkerKind = "plan" | "critique" | "implementation" | "review" | "validation" | "docs" | "merge";
+export type WorkerKind = "plan" | "critique" | "implementation" | "review" | "validation" | "docs" | "merge" | "deploy" | "canary";
 export type WorkerResourceKind = "bb_thread" | "bb_terminal";
 export type WorkerLivenessState =
   | "starting"
@@ -184,6 +209,11 @@ export interface Job {
   prNumber: number | null;
   prUrl: string | null;
   prHeadSha: string | null;
+  mergeMessage: string | null;
+  mergeCommitSha: string | null;
+  mergedAt: string | null;
+  deploymentSummary: string | null;
+  canarySummary: string | null;
   statusMessageId: number | null;
   planCycle: number;
   reviewCycle: number;
@@ -215,6 +245,8 @@ export interface JobEffect {
     | "issue_approval"
     | "revoke_approvals"
     | "merge_pr"
+    | "deploy_production"
+    | "verify_production"
     | "stop_thread"
     | "steer_implementation"
     | "reconcile_job";
@@ -273,8 +305,12 @@ export type JobEvent =
   | { type: "DOCS_IDLE" }
   | { type: "APPROVAL_ACCEPTED"; headSha: string }
   | { type: "APPROVAL_STALE"; headSha?: string }
-  | { type: "MERGE_SUCCEEDED"; message: string }
+  | { type: "MERGE_SUCCEEDED"; message: string; mergeCommitSha: string; mergedAt: string; baseContentVerified: boolean }
   | { type: "MERGE_FAILED"; reason?: string }
+  | { type: "DEPLOY_SUCCEEDED"; summary: string }
+  | { type: "DEPLOY_FAILED"; reason: string }
+  | { type: "CANARY_SUCCEEDED"; summary: string }
+  | { type: "CANARY_FAILED"; reason: string }
   | { type: "THREAD_FAILED"; workerKind?: WorkerKind; error?: string }
   | { type: "FAILED"; error: string }
   | { type: "RETRY" }

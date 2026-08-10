@@ -165,6 +165,9 @@ function mergeFixture(options: {
           }),
         };
       }
+      if (command.startsWith("bash -lc")) {
+        return { outcome: "exited" as const, exitCode: 0, output: "" };
+      }
       throw new Error(`unexpected confirmation command ${command}`);
     }),
   };
@@ -511,7 +514,7 @@ describe("fresh Telegram merge execution", () => {
     })).resolves.toMatchObject({ outcome: "merged" });
     expect(runValidation).toHaveBeenCalledTimes(2);
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
-    expect(fixture.store.getJob("job_1")?.state).toBe("merged");
+    expect(fixture.store.getJob("job_1")?.state).toBe("deploying");
   });
 
   it("requires a fresh ready-gate evaluation before accepting approval", async () => {
@@ -1079,16 +1082,44 @@ describe("fresh Telegram merge execution", () => {
     const result = await executeLeased(fixture, leaseMergeEffect(fixture));
 
     expect(result).toMatchObject({ outcome: "merged" });
-    expect(fixture.store.getJob("job_1")?.state).toBe("merged");
+    expect(fixture.store.getJob("job_1")?.state).toBe("deploying");
     expect(fixture.commandRunner.run.mock.calls.map(([call]) => call.command)).toEqual([
       "git ls-remote --exit-code origin refs/pull/17/head",
       "gh pr view 17 --json state,mergedAt,mergeCommit,url,number",
+      expect.stringMatching(/git fetch --no-tags origin[\s\S]*while .*; do\n/),
     ]);
+    const baseCheckoutCommand = fixture.commandRunner.run.mock.calls[2]?.[0].command;
+    expect(baseCheckoutCommand).toContain("merge_commit=");
+    expect(baseCheckoutCommand).toContain("c".repeat(40));
+    expect(baseCheckoutCommand).toContain('git switch --detach "$merge_commit"');
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM outbox").get()).toEqual({ count: 0 });
-    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "render_status")).toHaveLength(1);
+    expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "deploy_production")).toHaveLength(1);
     const payload = fixture.db.prepare("SELECT payload_json FROM effects WHERE kind = 'merge_pr'").get() as { payload_json: string };
     expect(payload.payload_json).toContain(HEAD);
     expect(payload.payload_json).toContain("MERGED");
+  });
+
+  it("preserves the merge fact and blocks deployment when base-content verification fails", async () => {
+    const fixture = mergeFixture();
+    const defaultRun = fixture.commandRunner.run.getMockImplementation();
+    if (!defaultRun) throw new Error("default command runner is missing");
+    fixture.commandRunner.run.mockImplementation(async (input) => (
+      input.command.startsWith("bash -lc")
+        ? { outcome: "exited" as const, exitCode: 1, output: "content mismatch" }
+        : defaultRun(input)
+    ));
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+
+    await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "merged" });
+
+    expect(fixture.store.getJob("job_1")).toMatchObject({
+      state: "production_failed",
+      mergeCommitSha: "c".repeat(40),
+      lastError: "Merge succeeded but the base branch did not verify the approved content",
+    });
+    expect(fixture.store.listEffectsForJob("job_1").some((effect) => effect.kind === "deploy_production")).toBe(false);
+    const mergeEffect = fixture.store.listEffectsForJob("job_1").find((effect) => effect.kind === "merge_pr");
+    expect(mergeEffect?.payload).toMatchObject({ mergeResult: { baseContentVerified: false } });
   });
 
   it("projects a post-merge confirmation timeout as failed terminal liveness", async () => {
@@ -1121,7 +1152,7 @@ describe("fresh Telegram merge execution", () => {
     const effect = leaseMergeEffect(fixture);
 
     await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
-    expect(fixture.store.getJob("job_1")?.state).toBe("merged");
+    expect(fixture.store.getJob("job_1")?.state).toBe("deploying");
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
 
     await expect(fixture.handler.executeMergeEffect({
@@ -1151,7 +1182,7 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.collectGateInput).toHaveBeenCalledTimes(2);
     expect(fixture.store.listEffectsForJob("job_1").filter((item) => item.kind === "merge_pr")).toHaveLength(1);
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
-    expect(fixture.commandRunner.run).toHaveBeenCalledTimes(2);
+    expect(fixture.commandRunner.run).toHaveBeenCalledTimes(3);
   });
 
   it.each(COMPLETED_ATTEMPT_ISSUES)(
@@ -1661,7 +1692,7 @@ describe("fresh Telegram merge execution", () => {
 
     await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
-    expect(fixture.store.getJob("job_1")?.state).toBe("merged");
+    expect(fixture.store.getJob("job_1")?.state).toBe("deploying");
   });
 
   it("rejects malformed durable receipts before command interpolation or SDK execution", async () => {

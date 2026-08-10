@@ -28,6 +28,7 @@ import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
+import { runProductionStage } from "./services/production-runner";
 
 function clock(): number {
   return Date.now();
@@ -509,6 +510,20 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           const current = store.getJob(job.id);
           if (current) projectTerminalLiveness(store, current, observation, "validation", clock());
         },
+      });
+    },
+    runProductionStage: (job, _effect, phase, signal, onTerminalObservation) => {
+      if (!job.environmentId || !job.policy || !job.mergeCommitSha) {
+        throw new Error("Production stage requires an active environment, immutable policy, and merge commit");
+      }
+      return runProductionStage({
+        runner: terminal,
+        environmentId: job.environmentId,
+        expectedHeadSha: job.mergeCommitSha,
+        policy: job.policy,
+        phase,
+        signal,
+        onTerminalObservation,
       });
     },
   });

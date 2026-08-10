@@ -57,6 +57,10 @@ const PROJECT_ENABLE_FLAGS: Record<string, FlagSpec> = {
   base: { kind: "value" },
   "merge-method": { kind: "value" },
   "validation-json": { kind: "value", repeatable: true },
+  "deploy-json": { kind: "value", repeatable: true },
+  "canary-json": { kind: "value", repeatable: true },
+  "rollback-json": { kind: "value" },
+  "convex-deploy-required": { kind: "flag" },
   "required-check": { kind: "value", repeatable: true },
   "redact-pattern": { kind: "value", repeatable: true },
   "worker-liveness-watchdog-ms": { kind: "value" },
@@ -248,6 +252,10 @@ function safeJob(job: Job): JsonRecord {
     prNumber: job.prNumber,
     prUrl: job.prUrl,
     prHeadSha: job.prHeadSha,
+    mergeCommitSha: job.mergeCommitSha,
+    mergedAt: job.mergedAt,
+    deploymentSummary: job.deploymentSummary,
+    canarySummary: job.canarySummary,
     reviewCycle: job.reviewCycle,
     cancelRequested: job.cancelRequestedAt !== null,
     blockedReason: job.blockedReason,
@@ -265,6 +273,7 @@ function policySummary(record: { policy: ProjectPolicy; version: number }): Json
     githubRepository: record.policy.githubRepository,
     baseBranch: record.policy.baseBranch,
     mergeMethod: record.policy.mergeMethod,
+    productionConfigured: record.policy.production !== undefined,
     version: record.version,
   };
 }
@@ -359,6 +368,21 @@ function individualPolicy(
     if (!isRecord(parsedValue)) throw new CliOperationError("--validation-json must contain objects");
     return parsedValue;
   });
+  const parseCommands = (name: "deploy-json" | "canary-json"): JsonRecord[] =>
+    (parsed.repeated.get(name) ?? []).map((value) => {
+      const parsedValue = parseJsonValue(value, `--${name}`);
+      if (!isRecord(parsedValue)) throw new CliOperationError(`--${name} must contain objects`);
+      return parsedValue;
+    });
+  const deployCommands = parseCommands("deploy-json");
+  const canaryCommands = parseCommands("canary-json");
+  const rollbackValue = parsed.values.get("rollback-json");
+  const rollbackCommand = rollbackValue === undefined ? undefined : parseJsonValue(rollbackValue, "--rollback-json");
+  if (rollbackCommand !== undefined && !isRecord(rollbackCommand)) {
+    throw new CliOperationError("--rollback-json must contain an object");
+  }
+  const hasProduction = deployCommands.length > 0 || canaryCommands.length > 0 || rollbackCommand !== undefined ||
+    parsed.flags.has("convex-deploy-required");
   const candidate: JsonRecord = {
     projectId,
     alias,
@@ -368,6 +392,14 @@ function individualPolicy(
     implementation: profileFromFlags(parsed, "implementation"),
     review: profileFromFlags(parsed, "review"),
     validationCommands,
+    ...(hasProduction ? {
+      production: {
+        deployCommands,
+        canaryCommands,
+        ...(rollbackCommand === undefined ? {} : { rollbackCommand }),
+        convexDeployRequired: parsed.flags.has("convex-deploy-required"),
+      },
+    } : {}),
     requiredChecks: parsed.repeated.get("required-check") ?? [],
     outputRedactionPatterns: parsed.repeated.get("redact-pattern") ?? [],
     workerLivenessWatchdogMs: readOptionalInteger(parsed, "worker-liveness-watchdog-ms", "--worker-liveness-watchdog-ms", 60_000, 3_600_000),
@@ -414,6 +446,10 @@ async function enableProject(
     "base",
     "merge-method",
     "validation-json",
+    "deploy-json",
+    "canary-json",
+    "rollback-json",
+    "convex-deploy-required",
     "required-check",
     "redact-pattern",
     "worker-liveness-watchdog-ms",
@@ -627,6 +663,13 @@ async function doctor(
     policyRecord?.policy.enabled === true,
     "enabled",
     "no enabled policy",
+  );
+  addCheck(
+    checks,
+    "production deployment and canary",
+    policyRecord?.policy.production !== undefined,
+    "configured",
+    "missing; merge approval is blocked",
   );
 
   let project: JsonRecord | null = null;

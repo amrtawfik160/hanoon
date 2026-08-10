@@ -233,6 +233,7 @@ export type PersistedMergeSuccessResult = {
   environmentId: string;
   prNumber: number;
   authoritativeHeadSha: string;
+  baseContentVerified: boolean;
   mergedAt: string;
   mergeCommit: { oid: string };
   pullRequest: { number: number; url: string; state: "MERGED" };
@@ -378,6 +379,11 @@ type JobRow = {
   pr_number: number | null;
   pr_url: string | null;
   pr_head_sha: string | null;
+  merge_message: string | null;
+  merge_commit_sha: string | null;
+  merged_at: string | null;
+  deployment_summary: string | null;
+  canary_summary: string | null;
   status_message_id: number | null;
   plan_cycle: number;
   review_cycle: number;
@@ -521,6 +527,10 @@ const JOB_STATES: ReadonlySet<JobState> = new Set([
   "final_reviewing",
   "awaiting_merge_approval",
   "merging",
+  "deploying",
+  "verifying_production",
+  "production_failed",
+  "complete",
   "failed",
   "blocked",
   "cancelled",
@@ -794,6 +804,7 @@ function parsePersistedMergeSuccessResultInternal(value: unknown): PersistedMerg
     "environmentId",
     "prNumber",
     "authoritativeHeadSha",
+    "baseContentVerified",
     "mergedAt",
     "mergeCommit",
     "pullRequest",
@@ -808,6 +819,7 @@ function parsePersistedMergeSuccessResultInternal(value: unknown): PersistedMerg
   if ((result.prNumber as number) > 2_147_483_647) throw new TypeError("merge result.prNumber is too large");
   assertBoundedString(result.authoritativeHeadSha, "merge result.authoritativeHeadSha");
   if (!FULL_SHA.test(result.authoritativeHeadSha)) throw new TypeError("merge result head must be a full lowercase SHA");
+  if (typeof result.baseContentVerified !== "boolean") throw new TypeError("merge result base-content verification must be boolean");
   assertFiniteTimestamp(result.mergedAt, "merge result.mergedAt");
   assertFiniteTimestamp(result.confirmedAt, "merge result.confirmedAt");
 
@@ -817,7 +829,7 @@ function parsePersistedMergeSuccessResultInternal(value: unknown): PersistedMerg
   const mergeCommit = result.mergeCommit as Record<string, unknown>;
   assertExactObjectKeys(mergeCommit, ["oid"], "merge result.mergeCommit");
   assertBoundedString(mergeCommit.oid, "merge result.mergeCommit.oid");
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(mergeCommit.oid)) {
+  if (!FULL_SHA.test(mergeCommit.oid)) {
     throw new TypeError("merge result merge commit must be a full lowercase SHA");
   }
 
@@ -839,6 +851,7 @@ function parsePersistedMergeSuccessResultInternal(value: unknown): PersistedMerg
     environmentId: result.environmentId,
     prNumber: result.prNumber as number,
     authoritativeHeadSha: result.authoritativeHeadSha,
+    baseContentVerified: result.baseContentVerified,
     mergedAt: result.mergedAt,
     mergeCommit: { oid: mergeCommit.oid },
     pullRequest: { number: pullRequest.number as number, url, state: "MERGED" },
@@ -856,10 +869,17 @@ function mergeSuccessResultMatchesDurable(
   payload: MergeEffectPayload,
   job: Job,
   approval: ApprovalRow | undefined,
-  expectedJobState: "merging" | "merged",
+  expectedJobState: "merging" | "post_merge",
 ): boolean {
   const receipt = payload.receipt;
-  const expectedJobVersion = expectedJobState === "merged" ? receipt.jobVersion + 1 : receipt.jobVersion;
+  const postMergeStates = new Set<JobState>(["deploying", "verifying_production", "production_failed", "complete", "merged"]);
+  const expectedJobVersion = expectedJobState === "post_merge" ? receipt.jobVersion + 1 : receipt.jobVersion;
+  const stateMatches = expectedJobState === "merging"
+    ? job.state === "merging"
+    : postMergeStates.has(job.state);
+  const mergeFactMatches = expectedJobState === "merging" || job.state === "merged"
+    ? true
+    : job.mergeMessage !== null && job.mergeCommitSha === result.mergeCommit.oid && job.mergedAt === result.mergedAt;
   return effect.job_id === job.id &&
     result.jobId === job.id &&
     result.effectIdempotencyKey === effect.idempotency_key &&
@@ -873,9 +893,10 @@ function mergeSuccessResultMatchesDurable(
     result.authoritativeHeadSha === job.prHeadSha &&
     result.pullRequest.number === receipt.prNumber &&
     result.pullRequest.state === "MERGED" &&
-    job.state === expectedJobState &&
+    stateMatches &&
+    mergeFactMatches &&
     job.cancelRequestedAt === null &&
-    (expectedJobState === "merged" ? job.version >= expectedJobVersion : job.version === expectedJobVersion) &&
+    (expectedJobState === "post_merge" ? job.version >= expectedJobVersion : job.version === expectedJobVersion) &&
     job.projectId === receipt.projectId &&
     job.policy !== null &&
     job.policy.baseBranch === receipt.baseBranch &&
@@ -1789,6 +1810,11 @@ function parseJob(row: JobRow): Job {
     prNumber: row.pr_number,
     prUrl: row.pr_url,
     prHeadSha: row.pr_head_sha,
+    mergeMessage: row.merge_message,
+    mergeCommitSha: row.merge_commit_sha,
+    mergedAt: row.merged_at,
+    deploymentSummary: row.deployment_summary,
+    canarySummary: row.canary_summary,
     statusMessageId: row.status_message_id,
     planCycle: row.plan_cycle,
     reviewCycle: row.review_cycle,
@@ -1904,7 +1930,8 @@ function persistJobTransition(
          request_text = ?, state = ?, resume_state = ?, project_id = ?,
          policy_version = ?, policy_json = ?, environment_id = ?,
          implementation_thread_id = ?, review_thread_id = ?, documentation_thread_id = ?, pr_number = ?,
-         pr_url = ?, pr_head_sha = ?, status_message_id = ?, plan_cycle = ?, review_cycle = ?,
+         pr_url = ?, pr_head_sha = ?, merge_message = ?, merge_commit_sha = ?, merged_at = ?,
+         deployment_summary = ?, canary_summary = ?, status_message_id = ?, plan_cycle = ?, review_cycle = ?,
          review_block_at = ?, cancel_requested_at = ?, blocked_reason = ?,
          last_error = ?, version = ?, updated_at = ?
        WHERE id = ? AND version = ?`,
@@ -1923,6 +1950,11 @@ function persistJobTransition(
       transitionedJob.prNumber,
       transitionedJob.prUrl,
       transitionedJob.prHeadSha,
+      transitionedJob.mergeMessage,
+      transitionedJob.mergeCommitSha,
+      transitionedJob.mergedAt,
+      transitionedJob.deploymentSummary,
+      transitionedJob.canarySummary,
       transitionedJob.statusMessageId,
       transitionedJob.planCycle,
       transitionedJob.reviewCycle,
@@ -1966,7 +1998,8 @@ function persistPendingEffects(
 const JOB_SELECT = `
   SELECT id, source_update_id, request_text, state, resume_state, project_id,
          policy_version, policy_json, environment_id, implementation_thread_id,
-         review_thread_id, documentation_thread_id, pr_number, pr_url, pr_head_sha, status_message_id,
+         review_thread_id, documentation_thread_id, pr_number, pr_url, pr_head_sha,
+         merge_message, merge_commit_sha, merged_at, deployment_summary, canary_summary, status_message_id,
          plan_cycle, review_cycle, review_block_at, cancel_requested_at, blocked_reason,
          last_error, version, created_at, updated_at
     FROM jobs`;
@@ -2908,7 +2941,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return (
       this.db
         .prepare(
-          "SELECT 1 FROM jobs WHERE state NOT IN ('merged', 'cancelled', 'blocked') LIMIT 1",
+          "SELECT 1 FROM jobs WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed') LIMIT 1",
         )
         .get() !== undefined
     );
@@ -3194,7 +3227,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
     const enqueue = this.db.transaction((): boolean => {
       const job = this.readJobById(jobId);
-      if (!job || job.implementationThreadId !== threadId || ["merged", "cancelled", "blocked"].includes(job.state)) {
+      if (!job || job.implementationThreadId !== threadId || ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) {
         return false;
       }
       const steeringPayloadJson = serializeBoundedJson({ text, threadId }, "steering effect payload", 64_000);
@@ -3241,7 +3274,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getActiveJob(): Job | null {
     const row = this.db
-      .prepare(`${JOB_SELECT} WHERE state NOT IN ('merged', 'cancelled', 'blocked') ORDER BY updated_at DESC, id DESC LIMIT 1`)
+      .prepare(`${JOB_SELECT} WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed') ORDER BY updated_at DESC, id DESC LIMIT 1`)
       .get() as JobRow | undefined;
     return row ? parseJob(row) : null;
   }
@@ -4787,7 +4820,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             payload,
             current,
             this.readApproval(payload.receipt.approvalNonceHash),
-            "merged",
+            "post_merge",
           ) || !this.attemptResultMatches(
             payload.receipt.reviewAttemptId,
             input.jobId,
@@ -4845,6 +4878,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const transitioned = transition(current, {
         type: "MERGE_SUCCEEDED",
         message: input.message,
+        mergeCommitSha: persistedResult.mergeCommit.oid,
+        mergedAt: persistedResult.mergedAt,
+        baseContentVerified: persistedResult.baseContentVerified,
       }, boundaryNow);
       const payloadJson = serializeBoundedJson({
         ...storedPayload,
@@ -5402,14 +5438,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   private markJobPermanentFailure(jobId: string, error: string, now: number): void {
     const job = this.readJobById(jobId);
-    if (!job || ["merged", "cancelled", "blocked"].includes(job.state)) return;
+    if (!job || ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) return;
+    const isProductionIncident = job.mergeCommitSha !== null &&
+      (job.state === "deploying" || job.state === "verifying_production");
     const changed = this.db
       .prepare(
-        `UPDATE jobs SET state = 'blocked', resume_state = ?, blocked_reason = 'permanent_effect_failure',
+        `UPDATE jobs SET state = ?, resume_state = ?, blocked_reason = ?,
            last_error = ?, version = ?, updated_at = ?
          WHERE id = ? AND version = ?`,
       )
-      .run(job.state, error, job.version + 1, now, job.id, job.version);
+      .run(
+        isProductionIncident ? "production_failed" : "blocked",
+        isProductionIncident ? null : job.state,
+        isProductionIncident ? null : "permanent_effect_failure",
+        error,
+        job.version + 1,
+        now,
+        job.id,
+        job.version,
+      );
     if (changed.changes === 1) {
       this.db
         .prepare(
@@ -5489,7 +5536,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (bindingError !== null) return null;
       if (evidence.disposition === "success") {
         if (
-          !mergeSuccessResultMatchesDurable(evidence.result, row, evidence.payload, job, approval, "merged") ||
+          !mergeSuccessResultMatchesDurable(evidence.result, row, evidence.payload, job, approval, "post_merge") ||
           !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, evidence.result) ||
           owner === null ||
           owner.userId !== receipt.approvalOwnerUserId ||
@@ -5553,7 +5600,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             evidence.payload,
             job,
             approval,
-            "merged",
+            "post_merge",
           ) || !this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, evidence.result) ||
           owner === null ||
           owner.userId !== receipt.approvalOwnerUserId ||
@@ -5819,7 +5866,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private hasActiveJobExcluding(jobId: string): boolean {
     return this.db
       .prepare(
-        "SELECT 1 FROM jobs WHERE id <> ? AND state NOT IN ('merged', 'cancelled', 'blocked') LIMIT 1",
+        "SELECT 1 FROM jobs WHERE id <> ? AND state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed') LIMIT 1",
       )
       .get(jobId) !== undefined;
   }

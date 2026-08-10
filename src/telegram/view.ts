@@ -409,7 +409,8 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
   if (ready && !livenessBlocked) {
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
     if (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce)) {
-      buttons.push({ text: "Merge", callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
+      const shortSha = job.prHeadSha?.slice(0, 8) ?? "approved";
+      buttons.push({ text: `Merge + deploy ${shortSha}`, callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
     }
   } else if (job.state === "awaiting_confirmation" && !livenessBlocked) {
     buttons.push({ text: "Start", callback_data: encodeCallbackData({ type: "start", jobId: job.id }) });
@@ -419,7 +420,7 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
   }
 
-  if (!(["merged", "cancelled"].includes(job.state))) {
+  if (!(["merged", "cancelled", "deploying", "verifying_production", "production_failed", "complete"].includes(job.state))) {
     buttons.push({ text: "Cancel", callback_data: encodeCallbackData({ type: "cancel", jobId: job.id }) });
   }
   return buttons;
@@ -433,7 +434,13 @@ export function renderJobStatus(
   assertJobId(job.id);
   const policy = context.project ?? job.policy;
   const ready = context.ready ?? job.state === "awaiting_merge_approval";
-  const title = ready ? "Ready to merge" : `Job ${displayText(job.state, 80)}`;
+  const title = ready
+    ? "Ready to merge and deploy"
+    : job.state === "production_failed"
+      ? "PRODUCTION INCIDENT"
+      : job.state === "complete"
+        ? "Merged, deployed, and verified"
+        : `Job ${displayText(job.state, 80)}`;
   const lines = [
     `<b>${escapeHtml(title)}</b>`,
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,
@@ -448,6 +455,14 @@ export function renderJobStatus(
   }
   if (job.prUrl) lines.push(`PR URL: ${html(safeHttpUrl(job.prUrl) ?? "[redacted URL]", 300)}`);
   if (job.prHeadSha) lines.push(`Head: <code>${html(job.prHeadSha.slice(0, 16), 40)}</code>`);
+  if (job.mergeMessage) lines.push(`Merge: ${html(job.mergeMessage, 500)}`);
+  if (job.mergeCommitSha) lines.push(`Merge commit: <code>${html(job.mergeCommitSha.slice(0, 16), 40)}</code>`);
+  if (job.mergedAt) lines.push(`Merged at: <code>${html(job.mergedAt, 80)}</code>`);
+  if (job.deploymentSummary) lines.push(`Deploy: ${html(job.deploymentSummary, 500)}`);
+  if (job.canarySummary) lines.push(`Canary: ${html(job.canarySummary, 500)}`);
+  if (job.state === "production_failed") {
+    lines.push("The merge succeeded, but production did not pass. No automatic rollback was attempted; follow the configured operator rollback procedure.");
+  }
   if (pullRequest || context.changedFiles !== undefined || context.diffStat) {
     const changedFiles = context.diffStat?.changedFiles ?? context.changedFiles ?? pullRequest?.changedFiles;
     const additions = context.diffStat?.additions ?? context.additions ?? pullRequest?.additions;

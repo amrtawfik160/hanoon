@@ -129,6 +129,7 @@ it("reports individual readiness rows for every Telegram, BB, host, provider, an
     "token presence",
     "owner pairing",
     "enabled project",
+    "production deployment and canary",
     "standard Git project/source",
     "default execution options",
     "provider availability",
@@ -156,7 +157,7 @@ it("reports individual readiness rows for every Telegram, BB, host, provider, an
 
 it("returns bounded pass/fail rows when doctor dependencies are missing or unhealthy", async () => {
   const { harness, store } = await loadPlugin();
-  store.upsertProjectPolicy(policyFixture(), 1);
+  store.upsertProjectPolicy(policyFixture({ production: undefined }), 1);
   harness.sdk.stub("projects.get", async () => ({
     ...standardProject(),
     kind: "personal",
@@ -177,6 +178,7 @@ it("returns bounded pass/fail rows when doctor dependencies are missing or unhea
   expect(output.checks.some((check) => check.name === "token presence" && check.status === "fail")).toBe(true);
   expect(output.checks.some((check) => check.name === "owner pairing" && check.status === "fail")).toBe(true);
   expect(output.checks.some((check) => check.name === "provider availability" && check.status === "fail")).toBe(true);
+  expect(output.checks.some((check) => check.name === "production deployment and canary" && check.status === "fail")).toBe(true);
   expect(output.checks.some((check) => check.name === "gh auth status" && check.status === "fail")).toBe(true);
   expect(output.checks.every((check) => (check.summary ?? "").length <= 200)).toBe(true);
   expect(result.stdout).not.toContain("must-not-print");

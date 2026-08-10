@@ -19,14 +19,18 @@ export type BbTerminalObservation = {
 type ThreadLike = BbThreadObservation;
 
 export function workerRegistrationGeneration(job: Job, workerKind: WorkerLiveness["workerKind"]): number {
-  const role = workerKind === "plan" ? 1
-    : workerKind === "critique" ? 2
-    : workerKind === "implementation" ? 3
-    : workerKind === "review" ? 4
-    : workerKind === "validation" ? 5
-    : workerKind === "docs" ? 6
-    : 7;
-  return job.version * 10 + role;
+  const role: Record<WorkerLiveness["workerKind"], number> = {
+    plan: 1,
+    critique: 2,
+    implementation: 3,
+    review: 4,
+    validation: 5,
+    docs: 6,
+    merge: 7,
+    deploy: 8,
+    canary: 9,
+  };
+  return job.version * 100 + role[workerKind];
 }
 
 function unknownThreadObservation(resourceId: string): ThreadLike {
@@ -113,7 +117,7 @@ function stateForTerminal(terminal: BbTerminalObservation): WorkerLivenessState 
 export function observeTerminalWorker(
   job: Job,
   terminal: BbTerminalObservation,
-  workerKind: Extract<WorkerLiveness["workerKind"], "validation" | "merge">,
+  workerKind: Extract<WorkerLiveness["workerKind"], "validation" | "merge" | "deploy" | "canary">,
   now: number,
   generation = workerRegistrationGeneration(job, workerKind),
 ): WorkerLiveness {
@@ -202,7 +206,7 @@ export function projectTerminalLiveness(
   store: LivenessStore,
   job: Job,
   terminal: BbTerminalObservation,
-  workerKind: Extract<WorkerLiveness["workerKind"], "validation" | "merge">,
+  workerKind: Extract<WorkerLiveness["workerKind"], "validation" | "merge" | "deploy" | "canary">,
   now: number,
   generation = workerRegistrationGeneration(job, workerKind),
 ): WorkerLiveness {

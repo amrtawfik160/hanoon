@@ -120,7 +120,20 @@ export class LunaControllerService {
     const submitted = this.dependencies.store
       .listControllerTurns(controller.controllerKey, 1_000)
       .find((turn) => turn.state === "submitted");
-    if (!submitted) return false;
+    if (!submitted) {
+      let status: ControllerStatus;
+      try {
+        status = await this.dependencies.adapter.status(controller.threadId, signal);
+      } catch {
+        return false;
+      }
+      if (status !== "missing" && status !== "error") return false;
+      return this.dependencies.store.resetControllerThread({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        controllerKey: controller.controllerKey,
+        expectedThreadId: controller.threadId,
+      });
+    }
 
     let status: ControllerStatus;
     try {

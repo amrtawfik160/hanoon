@@ -413,7 +413,7 @@ describe("Telegram merge approvals", () => {
       approvalExpiresAt: freshApproval.expiresAt,
     });
     const ephemeral = ephemeralTelegramPayload(freshRendered);
-    const freshButton = ephemeral.reply_markup?.inline_keyboard.flat().find((button) => button.text === "Merge");
+    const freshButton = ephemeral.reply_markup?.inline_keyboard.flat().find((button) => button.text === "Merge + deploy aaaaaaaa");
     expect(freshButton?.callback_data).toBe(`m:${freshApproval.nonce}`);
     expect(fixture.service.lookup(oldApproval.nonce)).toMatchObject({ outcome: "superseded" });
     expect(fixture.service.consume(oldApproval.nonce, NOW + 3)).toEqual({ ok: false, reason: "revoked" });

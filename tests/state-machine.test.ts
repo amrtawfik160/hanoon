@@ -23,7 +23,9 @@ describe("job state machine", () => {
     ["final_validating", { type: "VALIDATION_PASSED", headSha: sha() }, "final_reviewing", "spawn_final_review"],
     ["final_reviewing", { type: "REVIEW_PASSED", headSha: sha() }, "awaiting_merge_approval", "issue_approval"],
     ["awaiting_merge_approval", { type: "APPROVAL_ACCEPTED", headSha: sha() }, "merging", "merge_pr"],
-    ["merging", { type: "MERGE_SUCCEEDED", message: "merged" }, "merged", "render_status"],
+    ["merging", { type: "MERGE_SUCCEEDED", message: "merged", mergeCommitSha: sha("d"), mergedAt: "2026-08-10T18:00:00.000Z", baseContentVerified: true }, "deploying", "deploy_production"],
+    ["deploying", { type: "DEPLOY_SUCCEEDED", summary: "Production deployment passed" }, "verifying_production", "verify_production"],
+    ["verifying_production", { type: "CANARY_SUCCEEDED", summary: "Production canary passed" }, "complete", "render_status"],
   ] as const)("moves %s to %s", (from, event, to, effect) => {
     const base = stateJob(from as JobState, {
       projectId: "proj_1",
@@ -37,6 +39,91 @@ describe("job state machine", () => {
 
     expect(result.job.state).toBe(to);
     expect(result.effects.map((item) => item.kind)).toContain(effect);
+  });
+
+  it("blocks before approval when production deployment and canary are not configured", () => {
+    const policy = policyFixture();
+    delete (policy as Partial<typeof policy>).production;
+    const result = transition(
+      stateJob("final_reviewing", { policy, prHeadSha: sha() }),
+      { type: "REVIEW_PASSED", headSha: sha() },
+      2_250,
+    );
+
+    expect(result.job).toMatchObject({
+      state: "blocked",
+      blockedReason: "configuration",
+      lastError: "Production deployment and canary are not configured",
+    });
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+  });
+
+  it.each([
+    ["deploying", { type: "DEPLOY_FAILED", reason: "Production deploy failed" }],
+    ["verifying_production", { type: "CANARY_FAILED", reason: "Production canary failed" }],
+  ] as const)("preserves the merge fact when %s fails", (state, event) => {
+    const result = transition(
+      stateJob(state, {
+        mergeMessage: "Merged pull request #7",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+      }),
+      event,
+      2_300,
+    );
+
+    expect(result.job).toMatchObject({
+      state: "production_failed",
+      mergeMessage: "Merged pull request #7",
+      mergeCommitSha: sha("d"),
+      mergedAt: "2026-08-10T18:00:00.000Z",
+      lastError: event.reason,
+    });
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+  });
+
+  it("reports a production incident when the merge succeeds but base-content verification fails", () => {
+    const result = transition(
+      stateJob("merging"),
+      {
+        type: "MERGE_SUCCEEDED",
+        message: "Merged pull request #7",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+        baseContentVerified: false,
+      },
+      2_350,
+    );
+
+    expect(result.job).toMatchObject({
+      state: "production_failed",
+      mergeCommitSha: sha("d"),
+      lastError: "Merge succeeded but the base branch did not verify the approved content",
+    });
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+  });
+
+  it("preserves the merge fact when a legacy approval has no production configuration", () => {
+    const policy = policyFixture();
+    delete (policy as Partial<typeof policy>).production;
+    const result = transition(
+      stateJob("merging", { policy }),
+      {
+        type: "MERGE_SUCCEEDED",
+        message: "Merged pull request #7",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+        baseContentVerified: true,
+      },
+      2_360,
+    );
+
+    expect(result.job).toMatchObject({
+      state: "production_failed",
+      mergeCommitSha: sha("d"),
+      lastError: "Merge succeeded but production deployment and canary are not configured",
+    });
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
   });
 
   it("routes one critique revision back through a fresh plan and blocks the second", () => {

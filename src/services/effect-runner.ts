@@ -4,7 +4,7 @@ import { ApprovalService } from "./approval-service";
 import { buildWorkOrder } from "../bb/handoffs";
 import { buildPlanArtifact } from "../bb/pipeline-handoffs";
 import type { BbAttempt, EnvironmentSnapshot, PipelineThreadAttempt } from "../bb/runner";
-import type { TerminalCommandRunner } from "../bb/terminal-command";
+import type { TerminalCommandRunner, TerminalObservation } from "../bb/terminal-command";
 import { ValidationError, type ValidationSnapshot } from "../bb/validation";
 import { persistableJobStatusPayload, renderJobStatus } from "../telegram/view";
 import type {
@@ -14,7 +14,17 @@ import type {
   PipelineStageRole,
   TelegramAgentStore,
 } from "../storage/store";
-import { projectUnknownWorker, projectWorkerLiveness } from "./worker-liveness";
+import {
+  projectTerminalLiveness,
+  projectUnknownWorker,
+  projectWorkerLiveness,
+  workerRegistrationGeneration,
+} from "./worker-liveness";
+import {
+  parseProductionStageSnapshot,
+  type ProductionPhase,
+  type ProductionStageSnapshot,
+} from "./production-runner";
 
 export class PermanentEffectError extends Error {
   public constructor(message: string) {
@@ -106,6 +116,13 @@ export type EffectRunnerDependencies = {
     reason?: string;
   }>;
   runValidation?: (job: Job, effect: StoredEffect, signal: AbortSignal) => Promise<ValidationSnapshot>;
+  runProductionStage?: (
+    job: Job,
+    effect: StoredEffect,
+    phase: ProductionPhase,
+    signal: AbortSignal,
+    onTerminalObservation: (observation: TerminalObservation) => void,
+  ) => Promise<ProductionStageSnapshot>;
 };
 
 export function retryDelay(attempts: number, injectedJitter: () => number): number {
@@ -146,6 +163,8 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "issue_approval": return ["awaiting_merge_approval"];
     case "revoke_approvals": return [];
     case "merge_pr": return ["merging"];
+    case "deploy_production": return ["deploying"];
+    case "verify_production": return ["verifying_production"];
     case "stop_thread": return [];
     case "steer_implementation": return ["implementing", "remediating"];
     case "reconcile_job": return [];
@@ -172,6 +191,8 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
   "issue_approval",
   "revoke_approvals",
   "merge_pr",
+  "deploy_production",
+  "verify_production",
   "stop_thread",
   "steer_implementation",
   "reconcile_job",
@@ -253,6 +274,12 @@ function pipelineAttemptForRunner(attempt: PipelineStageAttempt): PipelineThread
     environmentId: attempt.environmentId,
     outputText: attempt.outputText,
   };
+}
+
+function productionReceiptCountIsValid(snapshot: ProductionStageSnapshot, configuredCommands: number): boolean {
+  return snapshot.outcome === "pass"
+    ? snapshot.commandReceipts.length === configuredCommands
+    : snapshot.commandReceipts.length <= configuredCommands;
 }
 
 export class EffectRunner {
@@ -771,6 +798,132 @@ export class EffectRunner {
     });
   }
 
+  private applyProductionResult(job: Job, phase: ProductionPhase, result: ProductionStageSnapshot): void {
+    const expectedState = phase === "deploy" ? "deploying" : "verifying_production";
+    const current = this.dependencies.store.getJob(job.id);
+    if (!current || current.state !== expectedState) return;
+    if (result.outcome === "pass") {
+      this.dependencies.store.applyJobEvent(job.id, current.version, phase === "deploy"
+        ? { type: "DEPLOY_SUCCEEDED", summary: result.summary }
+        : { type: "CANARY_SUCCEEDED", summary: result.summary }, this.now());
+      return;
+    }
+    this.dependencies.store.applyJobEvent(job.id, current.version, phase === "deploy"
+      ? { type: "DEPLOY_FAILED", reason: result.summary }
+      : { type: "CANARY_FAILED", reason: result.summary }, this.now());
+  }
+
+  private async runProduction(effect: StoredEffect, job: Job, phase: ProductionPhase): Promise<void> {
+    if (!this.dependencies.runProductionStage) throw new PermanentEffectError("production runner is not configured");
+    const environmentId = job.environmentId;
+    if (!job.policy?.production || !environmentId || !job.mergeCommitSha || !job.mergeMessage || !job.mergedAt) {
+      throw new PermanentEffectError("production stage requires configured policy, owned environment, and durable merge facts");
+    }
+    const role = phase === "deploy" ? "DEPLOY" as const : "CANARY" as const;
+    const commands = phase === "deploy" ? job.policy.production.deployCommands : job.policy.production.canaryCommands;
+    const expectedReceiptCount = commands.length + 1;
+    const attempt = this.createPipelineAttempt(
+      effect,
+      job,
+      role,
+      stageInputSha(job.mergeCommitSha, job.mergedAt, JSON.stringify(commands)),
+    );
+    if (attempt.state === "completed") {
+      let outcome: ProductionStageSnapshot;
+      try {
+        outcome = parseProductionStageSnapshot(attempt.outcome, phase);
+      } catch {
+        throw new PermanentEffectError("completed production stage has invalid durable evidence");
+      }
+      if (!productionReceiptCountIsValid(outcome, expectedReceiptCount)) {
+        throw new PermanentEffectError("completed production stage receipt count is invalid");
+      }
+      this.applyProductionResult(job, phase, outcome);
+      return;
+    }
+    if (effect.attempts > 1) {
+      const reason = `Production ${phase} outcome is unknown after executor interruption`;
+      this.dependencies.store.failPipelineStageAttempt({
+        id: attempt.id,
+        error: reason,
+        ownerId: this.dependencies.fence.ownerId,
+        generation: this.dependencies.fence.generation,
+        now: this.now(),
+      });
+      const current = this.dependencies.store.getJob(job.id);
+      if (current?.state === (phase === "deploy" ? "deploying" : "verifying_production")) {
+        this.dependencies.store.applyJobEvent(job.id, current.version, phase === "deploy"
+          ? { type: "DEPLOY_FAILED", reason }
+          : { type: "CANARY_FAILED", reason }, this.now());
+      }
+      return;
+    }
+
+    let resourceBound = attempt.resourceId !== null;
+    const workerKind = phase === "deploy" ? "deploy" as const : "canary" as const;
+    const terminalGenerations = new Map<string, number>();
+    const generationBase = workerRegistrationGeneration(job, workerKind);
+    const observe = (observation: TerminalObservation): void => {
+      this.assertFence();
+      if (!resourceBound) {
+        const bound = this.dependencies.store.bindPipelineStageResource({
+          id: attempt.id,
+          resourceKind: "bb_terminal",
+          resourceId: observation.id,
+          environmentId,
+          ownerId: this.dependencies.fence.ownerId,
+          generation: this.dependencies.fence.generation,
+          now: this.now(),
+        });
+        if (!bound) throw new Error("production stage resource binding lost its executor fence");
+        resourceBound = true;
+      }
+      const current = this.dependencies.store.getJob(job.id);
+      const terminalGeneration = terminalGenerations.get(observation.id) ?? generationBase + terminalGenerations.size + 1;
+      terminalGenerations.set(observation.id, terminalGeneration);
+      if (current) {
+        projectTerminalLiveness(
+          this.dependencies.store,
+          current,
+          observation,
+          workerKind,
+          this.now(),
+          terminalGeneration,
+        );
+      }
+    };
+    const rawResult = await this.dependencies.runProductionStage(
+      job,
+      effect,
+      phase,
+      this.dependencies.fence.signal,
+      observe,
+    );
+    const result = parseProductionStageSnapshot(rawResult, phase);
+    if (!productionReceiptCountIsValid(result, expectedReceiptCount)) {
+      throw new PermanentEffectError("production stage receipt count is invalid");
+    }
+    this.assertFence();
+    const outputText = JSON.stringify(result);
+    if (Buffer.byteLength(outputText, "utf8") > 60_000) {
+      throw new PermanentEffectError("production stage evidence exceeded its durable bound");
+    }
+    const completed = this.dependencies.store.completePipelineStageAttempt({
+      id: attempt.id,
+      outputText,
+      outputSha256: createHash("sha256").update(outputText, "utf8").digest("hex"),
+      outcome: result as unknown as Record<string, unknown>,
+      startSha: job.mergeCommitSha,
+      endSha: job.mergeCommitSha,
+      ownerId: this.dependencies.fence.ownerId,
+      generation: this.dependencies.fence.generation,
+      now: this.now(),
+    });
+    if (!completed) throw new Error("production stage completion lost its executor fence");
+    this.assertFence();
+    this.applyProductionResult(job, phase, result);
+  }
+
   private async stopThread(effect: StoredEffect, job: Job): Promise<void> {
     const bb = this.dependencies.bb;
     const payload = recordPayload(effect);
@@ -941,6 +1094,12 @@ export class EffectRunner {
           leaseOwner: this.dependencies.fence.ownerId,
           leaseGeneration: this.dependencies.fence.generation,
         });
+        return;
+      case "deploy_production":
+        await this.runProduction(effect, job, "deploy");
+        return;
+      case "verify_production":
+        await this.runProduction(effect, job, "canary");
         return;
       case "stop_thread":
         await this.stopThread(effect, job);

@@ -32,14 +32,16 @@ function acquire(store: ReturnType<typeof openStore>) {
 }
 
 it("keeps controller and operation migrations before the appended pipeline migration", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(8);
-  expect(ALL_MIGRATIONS.at(-5)).toContain("CREATE TABLE controller_threads");
-  expect(ALL_MIGRATIONS.at(-5)).toContain("CREATE TABLE controller_turns");
-  expect(ALL_MIGRATIONS.at(-4)).toContain("dispatch_after_seq");
-  expect(ALL_MIGRATIONS.at(-4)).toContain("telegram_message_id");
-  expect(ALL_MIGRATIONS.at(-3)).toContain("CREATE TABLE thread_operations");
-  expect(ALL_MIGRATIONS.at(-2)).toContain("CREATE TABLE pipeline_stage_attempts");
-  expect(ALL_MIGRATIONS.at(-1)).toContain("documentation_thread_id");
+  expect(ALL_MIGRATIONS).toHaveLength(9);
+  expect(ALL_MIGRATIONS.at(-6)).toContain("CREATE TABLE controller_threads");
+  expect(ALL_MIGRATIONS.at(-6)).toContain("CREATE TABLE controller_turns");
+  expect(ALL_MIGRATIONS.at(-5)).toContain("dispatch_after_seq");
+  expect(ALL_MIGRATIONS.at(-5)).toContain("telegram_message_id");
+  expect(ALL_MIGRATIONS.at(-4)).toContain("CREATE TABLE thread_operations");
+  expect(ALL_MIGRATIONS.at(-3)).toContain("CREATE TABLE pipeline_stage_attempts");
+  expect(ALL_MIGRATIONS.at(-2)).toContain("documentation_thread_id");
+  expect(ALL_MIGRATIONS.at(-1)).toContain("merge_commit_sha");
+  expect(ALL_MIGRATIONS.at(-1)).toContain("production_failed");
 });
 
 it("enqueues Telegram controller turns idempotently and rejects changed replay input", () => {

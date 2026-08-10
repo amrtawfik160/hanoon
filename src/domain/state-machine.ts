@@ -88,7 +88,7 @@ function failJob(
   error: string,
 ): void {
   assertSafeFailureSummary(error);
-  if (job.state === "failed" || job.state === "blocked" || job.state === "cancelled" || job.state === "merged") {
+  if (["failed", "blocked", "cancelled", "merged", "production_failed", "complete"].includes(job.state)) {
     throw new IllegalTransitionError(job.state, "FAILED");
   }
   job.resumeState = job.state;
@@ -143,6 +143,8 @@ function retryEffect(job: Job, effects: JobEffect[], resumeState: JobState): voi
     final_reviewing: "spawn_final_review",
     awaiting_merge_approval: "issue_approval",
     merging: "merge_pr",
+    deploying: "deploy_production",
+    verifying_production: "verify_production",
   };
   const kind = effectByState[resumeState];
   if (!kind) throw new IllegalTransitionError(job.state, "RETRY");
@@ -169,7 +171,7 @@ function applyCancellation(
   effects: JobEffect[],
   now: number,
 ): TransitionResult {
-  if (job.state === "cancelled" || job.state === "merged") illegal(job, event);
+  if (["cancelled", "merged", "deploying", "verifying_production", "production_failed", "complete"].includes(job.state)) illegal(job, event);
   if (job.cancelRequestedAt === null) {
     job.cancelRequestedAt = now;
     emitEffect(job, effects, "revoke_approvals");
@@ -480,6 +482,13 @@ function transitionFinalReviewing(job: Job, event: JobEvent, effects: JobEffect[
       invalidateDriftedHead(job, effects);
       return;
     }
+    if (!job.policy?.production) {
+      job.state = "blocked";
+      job.blockedReason = "configuration";
+      job.lastError = "Production deployment and canary are not configured";
+      emitEffect(job, effects, "render_status");
+      return;
+    }
     job.state = "awaiting_merge_approval";
     emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
     return;
@@ -525,12 +534,68 @@ function transitionMerging(job: Job, event: JobEvent, effects: JobEffect[]): voi
   if (event.type === "MERGE_SUCCEEDED") {
     assertSummary(event.message, "message");
     assertNonEmpty(event.message, "message");
-    job.state = "merged";
+    assertHeadSha(event.mergeCommitSha);
+    if (event.mergedAt.length > 128 || !Number.isFinite(Date.parse(event.mergedAt))) {
+      throw new TypeError("mergedAt must be a bounded timestamp");
+    }
+    job.mergeMessage = event.message;
+    job.mergeCommitSha = event.mergeCommitSha;
+    job.mergedAt = event.mergedAt;
+    if (!event.baseContentVerified) {
+      enterProductionIncident(job, effects, "Merge succeeded but the base branch did not verify the approved content");
+      return;
+    }
+    if (!job.policy?.production) {
+      enterProductionIncident(job, effects, "Merge succeeded but production deployment and canary are not configured");
+      return;
+    }
+    job.state = "deploying";
     emitEffect(job, effects, "render_status");
+    emitEffect(job, effects, "deploy_production");
     return;
   }
   if (event.type === "MERGE_FAILED") {
     failJob(job, effects, event.reason ?? "Merge failed");
+    return;
+  }
+  illegal(job, event);
+}
+
+function enterProductionIncident(job: Job, effects: JobEffect[], reason: string): void {
+  assertSafeFailureSummary(reason);
+  job.lastError = reason;
+  job.state = "production_failed";
+  emitEffect(job, effects, "render_status");
+}
+
+function transitionDeploying(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "DEPLOY_SUCCEEDED") {
+    assertSummary(event.summary, "summary");
+    assertNonEmpty(event.summary, "summary");
+    job.deploymentSummary = event.summary;
+    job.state = "verifying_production";
+    emitEffect(job, effects, "render_status");
+    emitEffect(job, effects, "verify_production");
+    return;
+  }
+  if (event.type === "DEPLOY_FAILED") {
+    enterProductionIncident(job, effects, event.reason);
+    return;
+  }
+  illegal(job, event);
+}
+
+function transitionVerifyingProduction(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "CANARY_SUCCEEDED") {
+    assertSummary(event.summary, "summary");
+    assertNonEmpty(event.summary, "summary");
+    job.canarySummary = event.summary;
+    job.state = "complete";
+    emitEffect(job, effects, "render_status");
+    return;
+  }
+  if (event.type === "CANARY_FAILED") {
+    enterProductionIncident(job, effects, event.reason);
     return;
   }
   illegal(job, event);
@@ -575,6 +640,10 @@ const STATE_HANDLERS: Record<JobState, StateTransitionHandler> = {
   final_reviewing: transitionFinalReviewing,
   awaiting_merge_approval: transitionAwaitingMergeApproval,
   merging: transitionMerging,
+  deploying: transitionDeploying,
+  verifying_production: transitionVerifyingProduction,
+  production_failed: transitionTerminal,
+  complete: transitionTerminal,
   failed: transitionFailed,
   blocked: transitionBlocked,
   cancelled: transitionTerminal,
@@ -587,7 +656,7 @@ export function transition(job: Job, event: JobEvent, now: number): TransitionRe
 
   if (event.type === "CANCEL_REQUESTED") return applyCancellation(next, event, effects, now);
   if (event.type === "CANCEL_CONFIRMED") {
-    if (next.cancelRequestedAt === null || next.state === "cancelled" || next.state === "merged") illegal(next, event);
+    if (next.cancelRequestedAt === null || ["cancelled", "merged", "production_failed", "complete"].includes(next.state)) illegal(next, event);
     next.state = "cancelled";
     emitEffect(next, effects, "render_status");
     return finish(next, effects, now);

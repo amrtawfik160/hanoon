@@ -55,6 +55,11 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | fresh approval outcome | `<accepted>` |
 | merge response | `<bounded response summary>` |
 | merge commit | `<full merge commit SHA>` |
+| base content verification | `<pass/fail plus terminal id>` |
+| production checkout | `<detached HEAD equals merge commit>` |
+| deploy receipt | `<command names/outcomes and terminal ids>` |
+| canary receipt | `<command names/outcomes and terminal ids>` |
+| production state | `<complete or production_failed>` |
 | restart recovery result | `<completion delivered; no second merge>` |
 | final `bb plugin list --json` status | `<installed/running status>` |
 
@@ -72,7 +77,7 @@ Open the short-lived link from the intended owner account in a private chat. Rec
 
 ### 2. Enable the disposable project
 
-Create a policy JSON that names the disposable `proj_...` project, its GitHub repository, test branch base, implementation/review profiles, deterministic validation commands, required checks, redaction patterns, liveness watchdog, review limit, and merge method. Enable it with an absolute policy file or JSON input:
+Create a policy JSON that names the disposable `proj_...` project, its GitHub repository, test branch base, implementation/review profiles, deterministic validation commands, required checks, redaction patterns, liveness watchdog, review limit, merge method, and disposable deploy/canary commands. Include an operator-only rollback command if desired. If the fixture uses Convex, set `convexDeployRequired` and invoke `convex deploy` through the Convex CLI. Enable it with an absolute policy file or JSON input:
 
 ```bash
 bb telegram-agent project enable <disposable-project-id> --policy-file /absolute/path/to/policy.json
@@ -125,11 +130,11 @@ Confirm stale handling resolves the new exact Git-native head, revokes the old a
 
 ### 11. Race executors and merge once
 
-Start or exercise a second executor instance at the merge boundary. Record the winning executor owner/generation and the losing instance’s rejected acquisition or lease-fence result. Accept the fresh approval and record the bounded merge response, one BB merge SDK call, post-merge GitHub confirmation, and full merge commit SHA. A second merge call is a failure.
+Start or exercise a second executor instance at the merge boundary. Record the winning executor owner/generation and the losing instance’s rejected acquisition or lease-fence result. Accept the fresh **Merge + deploy** approval and record the bounded merge response, one BB merge SDK call, post-merge GitHub confirmation, full merge commit SHA, exact detached production checkout, ordered disposable deployment commands, ordered canary commands, terminal-owned liveness, and separate `DEPLOY`/`CANARY` receipts. A second merge, deploy, or canary call is a failure.
 
 ### 12. Fail delivery, restart, and recover completion
 
-Cause the first Telegram completion delivery to fail in the disposable run, record the failure as a bounded liveness/outbox event, restart the plugin services, and verify that completion is delivered from durable state without a second merge. Record restart time, final completion message id, and:
+Cause the first Telegram completion delivery to fail in the disposable run, record the failure as a bounded liveness/outbox event, restart the plugin services, and verify that completion is delivered from durable state without a second merge, deploy, or canary. Record restart time, final completion message id, and:
 
 ```bash
 bb plugin list --json
@@ -142,4 +147,4 @@ Also exercise one recoverable Telegram failure: an expired callback must not rep
 
 ## Final acceptance decision
 
-Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, three review attempts, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, Telegram recovery, and restart recovery. If the owner did not configure the token or the disposable project was not used, report the live acceptance as **not run**, not successful.
+Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. If the owner did not configure the token, production commands, or a disposable project, report the live acceptance as **not run**, not successful.

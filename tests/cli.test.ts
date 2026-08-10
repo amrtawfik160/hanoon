@@ -239,6 +239,13 @@ it("builds and validates individual policy fields including repeatable controls 
     "squash",
     "--validation-json",
     JSON.stringify({ name: "unit", command: "npm test", timeoutMs: 600_000 }),
+    "--deploy-json",
+    JSON.stringify({ name: "convex", command: "bunx convex deploy --yes", timeoutMs: 600_000 }),
+    "--canary-json",
+    JSON.stringify({ name: "health", command: "npm run canary", timeoutMs: 120_000 }),
+    "--rollback-json",
+    JSON.stringify({ name: "rollback", command: "npm run rollback", timeoutMs: 120_000 }),
+    "--convex-deploy-required",
     "--required-check",
     "unit",
     "--redact-pattern",
@@ -291,7 +298,31 @@ it("builds and validates individual policy fields including repeatable controls 
     },
     requiredChecks: ["unit"],
     outputRedactionPatterns: ["secret"],
+    production: {
+      deployCommands: [{ name: "convex", command: "bunx convex deploy --yes", timeoutMs: 600_000 }],
+      canaryCommands: [{ name: "health", command: "npm run canary", timeoutMs: 120_000 }],
+      rollbackCommand: { name: "rollback", command: "npm run rollback", timeoutMs: 120_000 },
+      convexDeployRequired: true,
+    },
   });
+});
+
+it("rejects Convex production policy flags that do not invoke the Convex CLI", async () => {
+  const { harness, store } = await loadPlugin();
+  stubProject(harness);
+
+  const result = await harness.behavior.runCli([
+    "project", "enable", "proj_1",
+    "--alias", "operator-policy",
+    "--base", "main",
+    "--merge-method", "squash",
+    "--deploy-json", JSON.stringify({ name: "deploy", command: "npm run deploy", timeoutMs: 60_000 }),
+    "--canary-json", JSON.stringify({ name: "health", command: "npm run canary", timeoutMs: 60_000 }),
+    "--convex-deploy-required",
+  ]);
+
+  expect(result.exitCode).toBe(1);
+  expect(store.getProjectPolicy("proj_1")).toBeNull();
 });
 
 it("routes an absolute policy file through the primary BB host when context is absent", async () => {

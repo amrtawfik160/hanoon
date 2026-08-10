@@ -338,6 +338,34 @@ DROP TABLE worker_liveness;
 ALTER TABLE worker_liveness_v3 RENAME TO worker_liveness;
 `] as const;
 
+export const PRODUCTION_PIPELINE_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN merge_message TEXT;
+ALTER TABLE jobs ADD COLUMN merge_commit_sha TEXT;
+ALTER TABLE jobs ADD COLUMN merged_at TEXT;
+ALTER TABLE jobs ADD COLUMN deployment_summary TEXT;
+ALTER TABLE jobs ADD COLUMN canary_summary TEXT;
+DROP INDEX one_active_job;
+CREATE UNIQUE INDEX one_active_job
+  ON jobs ((1))
+  WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed');
+CREATE TABLE worker_liveness_v4 (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  worker_kind TEXT NOT NULL CHECK (worker_kind IN (
+    'plan', 'critique', 'implementation', 'review', 'validation', 'docs', 'merge', 'deploy', 'canary'
+  )),
+  resource_kind TEXT NOT NULL CHECK (resource_kind IN ('bb_thread', 'bb_terminal')),
+  resource_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('starting', 'active', 'stopping', 'idle', 'failed', 'unknown', 'stale')),
+  source_updated_at INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL,
+  stale_notified_at INTEGER
+);
+INSERT INTO worker_liveness_v4 SELECT * FROM worker_liveness;
+DROP TABLE worker_liveness;
+ALTER TABLE worker_liveness_v4 RENAME TO worker_liveness;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -347,4 +375,5 @@ export const ALL_MIGRATIONS = [
   ...THREAD_OPERATION_MIGRATIONS,
   ...PIPELINE_MIGRATIONS,
   ...PIPELINE_FINAL_REVIEW_MIGRATIONS,
+  ...PRODUCTION_PIPELINE_MIGRATIONS,
 ] as const;

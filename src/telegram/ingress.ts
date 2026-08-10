@@ -105,7 +105,7 @@ function callbackJobId(action: CallbackAction): string | null {
 }
 
 function jobIsTerminal(job: Job): boolean {
-  return ["merged", "cancelled", "blocked"].includes(job.state);
+  return ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state);
 }
 
 function callbackMessageMatches(job: Job, callback: TelegramCallbackQuery): boolean {

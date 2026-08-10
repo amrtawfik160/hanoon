@@ -74,6 +74,15 @@ export function policyFixture(
     validationCommands: [
       { name: "unit", command: "npm test", timeoutMs: 600_000 },
     ],
+    production: {
+      deployCommands: [
+        { name: "deploy", command: "./scripts/deploy-production.sh", timeoutMs: 1_800_000 },
+      ],
+      canaryCommands: [
+        { name: "canary", command: "./scripts/verify-production.sh", timeoutMs: 300_000 },
+      ],
+      convexDeployRequired: false,
+    },
     requiredChecks: ["test"],
     outputRedactionPatterns: [],
     workerLivenessWatchdogMs: 300_000,
@@ -100,6 +109,11 @@ export function jobFixture(overrides: Partial<Job> = {}): Job {
     prNumber: null,
     prUrl: null,
     prHeadSha: null,
+    mergeMessage: null,
+    mergeCommitSha: null,
+    mergedAt: null,
+    deploymentSummary: null,
+    canarySummary: null,
     statusMessageId: null,
     planCycle: 0,
     reviewCycle: 0,

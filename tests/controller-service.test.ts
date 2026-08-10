@@ -526,6 +526,50 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
   expect(store.getControllerForOwner("7", "7")?.threadId).toBe("thr_fresh_after_poison");
 });
 
+it("retires an errored controller generation even when no turn remains submitted", async () => {
+  const { store, fence } = serviceFixture();
+  const previous = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 48, inputText: "provider initialization timed out" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(previous.id);
+  expect(store.markControllerSpawned({
+    turnId: previous.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_initialize_timeout",
+  })).toBe(true);
+  expect(store.failControllerTurn({
+    turnId: previous.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_001,
+    error: "Controller send outcome is uncertain",
+  })).toBe(true);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "error" as const),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null })),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    threadId: null,
+    state: "pending_spawn",
+  });
+});
+
 it("retries one controller generation when BB proves the input was never accepted", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({

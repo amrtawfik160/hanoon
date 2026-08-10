@@ -168,13 +168,13 @@ describe("deterministic Telegram views", () => {
       "View PR",
       "Open BB",
       "Re-run Review",
-      "Merge",
+      "Merge + deploy aaaaaaaa",
       "Cancel",
     ]);
     const buttons = rendered.reply_markup?.inline_keyboard.flat() ?? [];
     expect(buttons.find((button) => button.text === "View PR")?.url).toBe(job.prUrl);
     expect(buttons.find((button) => button.text === "Open BB")?.url).toBe("https://bb.example/app");
-    expect(buttons.find((button) => button.text === "Merge")?.callback_data).toBe(`m:${mergeNonce}`);
+    expect(buttons.find((button) => button.text === "Merge + deploy aaaaaaaa")?.callback_data).toBe(`m:${mergeNonce}`);
     expect(rendered.text).not.toContain("/threads/");
     expect(rendered.text).not.toContain("/environments/");
   });

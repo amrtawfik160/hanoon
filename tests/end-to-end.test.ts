@@ -19,6 +19,7 @@ import { runJobExecutorService, type JobExecutorTelegram } from "../src/services
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { hashSecret } from "../src/crypto";
 import { privateMessage, policyFixture } from "./helpers";
+import { runProductionStage } from "../src/services/production-runner";
 
 const HEAD_ONE = "a".repeat(40);
 const HEAD_TWO = "b".repeat(40);
@@ -525,6 +526,16 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
         validationSnapshots.push(snapshot);
         return snapshot;
       },
+      runProductionStage: (job, _effect, phase, signal, onTerminalObservation) => runProductionStage({
+        runner: terminal,
+        environmentId: job.environmentId!,
+        expectedHeadSha: job.mergeCommitSha!,
+        policy: job.policy!,
+        phase,
+        signal,
+        onTerminalObservation,
+        now,
+      }),
     });
 
     const policy = policyFixture({ projectId: "proj_1", alias: "cyndra", githubRepository: "acme/cyndra" });
@@ -791,7 +802,12 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     store.completeEffect(leased.idempotencyKey, "merge-winner", winner.generation, now());
     store.releaseExecutorLease("merge-winner", winner.generation, now());
     await drainEffects(store, makeRunner, now, "post-merge-status-executor");
-    expect(store.getJob(job.id)?.state).toBe("merged");
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "complete",
+      mergeCommitSha: MERGE_COMMIT,
+      deploymentSummary: `1/1 production deploy commands passed at ${MERGE_COMMIT.slice(0, 12)}`,
+      canarySummary: `1/1 production canary commands passed at ${MERGE_COMMIT.slice(0, 12)}`,
+    });
 
     let deliveryFailures = 1;
     const delivered: Array<Record<string, unknown>> = [];
@@ -855,7 +871,11 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     ))).toBe(true);
     expect(forks).toHaveLength(0);
     expect(terminalCommands.filter((command) => command.includes("git ls-remote --exit-code origin refs/pull/17/head")).length).toBeGreaterThanOrEqual(6);
+    expect(terminalCommands.some((command) => command.includes("./scripts/deploy-production.sh"))).toBe(true);
+    expect(terminalCommands.some((command) => command.includes("./scripts/verify-production.sh"))).toBe(true);
+    expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toMatchObject({ state: "completed" });
+    expect(store.getLatestPipelineStageAttempt(job.id, "CANARY")).toMatchObject({ state: "completed" });
     expect(store.getJob(job.id)?.prHeadSha).toBe(HEAD_THREE);
-    expect(store.getJob(job.id)?.state).toBe("merged");
+    expect(store.getJob(job.id)?.state).toBe("complete");
   });
 });

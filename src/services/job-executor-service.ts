@@ -88,7 +88,7 @@ function isPermanentEffectFailure(error: unknown): boolean {
 }
 
 function isTerminal(job: JobRecord): boolean {
-  return ["merged", "cancelled", "blocked"].includes(job.state);
+  return ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state);
 }
 
 function statusJobId(logicalKey: string): string | null {

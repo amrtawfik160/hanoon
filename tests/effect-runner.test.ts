@@ -79,6 +79,132 @@ describe("leased effect execution", () => {
     expect(retryDelay(attempts, () => jitter)).toBe(expected);
   });
 
+  it.each([
+    ["deploying", "deploy_production", "deploy", "DEPLOY", "verifying_production"],
+    ["verifying_production", "verify_production", "canary", "CANARY", "complete"],
+  ] as const)("persists terminal-bound production receipts for %s before advancing", async (state, kind, phase, role, nextState) => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = ?, project_id = 'proj_1', policy_version = 1, policy_json = ?,
+         environment_id = 'env_1', pr_number = 7, pr_head_sha = ?, merge_message = 'Merged PR #7',
+         merge_commit_sha = ?, merged_at = '2026-08-10T00:00:00.000Z',
+         deployment_summary = ?, version = 2 WHERE id = ?`,
+    ).run(
+      state,
+      JSON.stringify(policyFixture()),
+      "a".repeat(40),
+      "d".repeat(40),
+      phase === "canary" ? "Production deploy passed" : null,
+      job.id,
+    );
+    const effect: JobEffect = {
+      idempotencyKey: `job_1:3:${kind}`,
+      jobId: job.id,
+      kind,
+      payload: {},
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, '{}', 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const claimed = store.leaseEffects("owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("production effect missing");
+    const runStage = vi.fn(async (_job, _effect, calledPhase, _signal, observe) => {
+      expect(calledPhase).toBe(phase);
+      observe({ id: `term_${phase}`, status: "running", updatedAt: 1_001 });
+      observe({ id: `term_${phase}`, status: "exited", updatedAt: 1_002, exitCode: 0 });
+      return {
+        phase,
+        outcome: "pass" as const,
+        summary: `Production ${phase} passed`,
+        failedCommand: null,
+        commandReceipts: [
+          { name: "verify-merged-checkout", command: "git-head-check", outcome: "pass" as const, exitCode: 0, output: "ok" },
+          { name: phase, command: `./${phase}`, outcome: "pass" as const, exitCode: 0, output: "ok" },
+        ],
+        terminalIds: [`term_${phase}`],
+        completedAt: "2026-08-10T00:01:00.000Z",
+      };
+    });
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      runProductionStage: runStage,
+    }).run(claimed);
+
+    expect(store.getJob(job.id)?.state).toBe(nextState);
+    expect(store.getLatestPipelineStageAttempt(job.id, role)).toMatchObject({
+      state: "completed",
+      resourceKind: "bb_terminal",
+      resourceId: `term_${phase}`,
+      startSha: "d".repeat(40),
+      endSha: "d".repeat(40),
+      outcome: expect.objectContaining({ phase, outcome: "pass" }),
+    });
+    expect(store.getWorkerLiveness(job.id)).toMatchObject({ workerKind: phase === "deploy" ? "deploy" : "canary" });
+  });
+
+  it("fails closed without repeating a production command after executor interruption", async () => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = 'deploying', project_id = 'proj_1', policy_version = 1, policy_json = ?,
+         environment_id = 'env_1', pr_number = 7, pr_head_sha = ?, merge_message = 'Merged PR #7',
+         merge_commit_sha = ?, merged_at = '2026-08-10T00:00:00.000Z', version = 2 WHERE id = ?`,
+    ).run(JSON.stringify(policyFixture()), "a".repeat(40), "d".repeat(40), job.id);
+    const effect: JobEffect = {
+      idempotencyKey: "job_1:3:deploy_production",
+      jobId: job.id,
+      kind: "deploy_production",
+      payload: {},
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, '{}', 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind);
+
+    const firstLease = store.acquireExecutorLease("owner-a", 1_001, 100);
+    if (!firstLease.acquired) throw new Error("first lease missing");
+    const firstClaim = store.leaseEffects("owner-a", firstLease.generation, 1_001, 10, 100)[0];
+    if (!firstClaim) throw new Error("first claim missing");
+    const firstRun = vi.fn(async (_job, _effect, _phase, _signal, observe) => {
+      observe({ id: "term_uncertain", status: "running", updatedAt: 1_001 });
+      throw new Error("executor disconnected after command start");
+    });
+    await expect(new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: firstLease.generation, signal: new AbortController().signal },
+      now: () => 1_001,
+      runProductionStage: firstRun,
+    }).run(firstClaim)).rejects.toThrow("executor disconnected");
+
+    const secondLease = store.acquireExecutorLease("owner-b", 1_102, 30_000);
+    if (!secondLease.acquired) throw new Error("second lease missing");
+    const secondClaim = store.leaseEffects("owner-b", secondLease.generation, 1_102, 10, 30_000)[0];
+    if (!secondClaim) throw new Error("second claim missing");
+    const repeatedRun = vi.fn();
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-b", generation: secondLease.generation, signal: new AbortController().signal },
+      now: () => 1_102,
+      runProductionStage: repeatedRun,
+    }).run(secondClaim);
+
+    expect(repeatedRun).not.toHaveBeenCalled();
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "production_failed",
+      mergeCommitSha: "d".repeat(40),
+      lastError: "Production deploy outcome is unknown after executor interruption",
+    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toMatchObject({ state: "failed" });
+  });
+
   it("dead-letters the twentieth transient failure and blocks the owning job", () => {
     const { store, db } = storeFixture();
     const effect: JobEffect = {
@@ -103,6 +229,37 @@ describe("leased effect execution", () => {
       attempts: 20,
     });
     expect(store.getJob("job_1")?.blockedReason).toBe("permanent_effect_failure");
+  });
+
+  it("turns a permanent post-merge effect failure into a production incident", () => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = 'deploying', merge_message = 'Merged PR #7', merge_commit_sha = ?,
+         merged_at = '2026-08-10T00:00:00.000Z', version = 2 WHERE id = ?`,
+    ).run("d".repeat(40), job.id);
+    const effect: JobEffect = {
+      idempotencyKey: "job_1:3:deploy_production",
+      jobId: job.id,
+      kind: "deploy_production",
+      payload: {},
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, '{}', 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind);
+    const lease = fence(store);
+    const claimed = store.leaseEffects(lease.ownerId, lease.generation, 1_000, 1, 30_000)[0];
+    if (!claimed) throw new Error("production effect missing");
+
+    expect(store.deadLetterEffect(claimed.idempotencyKey, lease.ownerId, lease.generation, "Malformed deploy receipt", 1_001)).toBe(true);
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "production_failed",
+      resumeState: null,
+      blockedReason: null,
+      mergeCommitSha: "d".repeat(40),
+      lastError: "Malformed deploy receipt",
+    });
   });
 
   it("dispatches Start to a planner only through the injected BB runner after a live fence check", async () => {

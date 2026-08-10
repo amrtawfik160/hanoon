@@ -31,13 +31,48 @@ import {
   type TelegramAgentStore,
 } from "../storage/store";
 import type { TerminalObservation } from "../bb/terminal-command";
-import { projectTerminalLiveness } from "./worker-liveness";
+import { projectTerminalLiveness, workerRegistrationGeneration } from "./worker-liveness";
 
 const POST_MERGE_HEAD_COMMAND = (number: number): string =>
   `git ls-remote --exit-code origin refs/pull/${String(number)}/head`;
 const POST_MERGE_PR_COMMAND = (number: number): string =>
   `gh pr view ${String(number)} --json state,mergedAt,mergeCommit,url,number`;
 const MAX_PROVIDER_RESULT_JSON = 64_000;
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function postMergeBaseContentCommand(baseBranch: string, approvedHead: string, mergeCommit: string): string {
+  const baseRef = `refs/remotes/origin/${baseBranch}`;
+  const refspec = `+refs/heads/${baseBranch}:${baseRef}`;
+  const script = [
+    "set -euo pipefail",
+    `git fetch --no-tags origin ${shellSingleQuote(refspec)}`,
+    `approved_head=${shellSingleQuote(approvedHead)}`,
+    `base_ref=${shellSingleQuote(baseRef)}`,
+    `merge_commit=${shellSingleQuote(mergeCommit)}`,
+    'base_head=$(git rev-parse --verify "$base_ref^{commit}")',
+    'test "$base_head" = "$merge_commit"',
+    'merge_base=$(git merge-base "$approved_head" "$base_ref")',
+    'test -n "$merge_base"',
+    'while IFS= read -r -d "" path; do',
+    '  approved_object=$(git rev-parse --verify "$approved_head:$path" 2>/dev/null || true)',
+    '  base_object=$(git rev-parse --verify "$base_ref:$path" 2>/dev/null || true)',
+    '  test "$approved_object" = "$base_object" || exit 1',
+    'done < <(git diff --name-only -z "$merge_base" "$approved_head")',
+    'git switch --detach "$merge_commit"',
+    'test "$(git rev-parse --verify HEAD)" = "$merge_commit"',
+  ].join("\n");
+  return `bash -lc ${shellSingleQuote(script)}`;
+}
+const POST_MERGE_JOB_STATES = new Set<Job["state"]>([
+  "deploying",
+  "verifying_production",
+  "production_failed",
+  "complete",
+  "merged",
+]);
 
 type CommandResult =
   | { outcome: "exited"; exitCode: number; output: string }
@@ -707,7 +742,12 @@ export class MergeHandler {
         result.pullRequest.number === receipt.prNumber &&
         result.pullRequest.state === "MERGED" &&
         job.id === receipt.jobId &&
-        job.state === "merged" &&
+        POST_MERGE_JOB_STATES.has(job.state) &&
+        (job.state === "merged" || (
+          job.mergeMessage !== null &&
+          job.mergeCommitSha === result.mergeCommit.oid &&
+          job.mergedAt === result.mergedAt
+        )) &&
         job.cancelRequestedAt === null &&
         job.version >= receipt.jobVersion + 1 &&
         job.projectId === receipt.projectId &&
@@ -880,13 +920,19 @@ export class MergeHandler {
     freshNow: () => number,
     checkFence: (now: number) => boolean,
   ): Promise<{ ok: true; result: PersistedMergeSuccessResult } | { ok: false; reason: string }> {
+    const livenessJob = this.options.store.getJob(receipt.jobId);
+    if (!livenessJob) return { ok: false, reason: "post-merge job is unavailable" };
     let lastObservation: TerminalObservation | null = null;
+    const terminalGenerations = new Map<string, number>();
+    const generationBase = workerRegistrationGeneration(livenessJob, "merge");
     const observe = (observation: TerminalObservation): void => {
       lastObservation = observation;
       const now = freshNow();
       if (!checkFence(now)) return;
       const current = this.options.store.getJob(receipt.jobId);
-      if (current) projectTerminalLiveness(this.options.store, current, observation, "merge", now);
+      const terminalGeneration = terminalGenerations.get(observation.id) ?? generationBase + terminalGenerations.size + 1;
+      terminalGenerations.set(observation.id, terminalGeneration);
+      if (current) projectTerminalLiveness(this.options.store, current, observation, "merge", now, terminalGeneration);
     };
     if (!checkFence(freshNow())) {
       return { ok: false, reason: "post-merge effect fence rejected the Git head confirmation" };
@@ -983,11 +1029,22 @@ export class MergeHandler {
       mergeCommitRecord === null ||
       Object.keys(mergeCommitRecord).some((key) => key !== "oid") ||
       typeof mergeCommitOid !== "string" ||
-      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(mergeCommitOid) ||
+      !/^[0-9a-f]{40}$/.test(mergeCommitOid) ||
       typeof pr.url !== "string"
     ) {
       return { ok: false, reason: "post-merge GitHub state was not strictly merged" };
     }
+    if (!checkFence(freshNow())) {
+      return { ok: false, reason: "post-merge effect fence rejected the base-content confirmation" };
+    }
+    const baseResult = await this.options.commandRunner.run({
+      scope: { kind: "environment", environmentId: receipt.environmentId },
+      title: "Telegram post-merge base-content confirmation",
+      command: postMergeBaseContentCommand(receipt.baseBranch, authoritativeHead, mergeCommitOid),
+      timeoutMs: 120_000,
+      onObservation: observe,
+    });
+    const baseContentVerified = baseResult.outcome === "exited" && baseResult.exitCode === 0;
     let result: PersistedMergeSuccessResult;
     try {
       result = parsePersistedMergeSuccessResult({
@@ -997,6 +1054,7 @@ export class MergeHandler {
         environmentId: receipt.environmentId,
         prNumber: receipt.prNumber,
         authoritativeHeadSha: authoritativeHead,
+        baseContentVerified,
         mergedAt: pr.mergedAt,
         mergeCommit: { oid: mergeCommitOid },
         pullRequest: {

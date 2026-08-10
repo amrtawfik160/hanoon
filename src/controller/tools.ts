@@ -45,9 +45,14 @@ function jobProjection(job: Job | null) {
       projectId: job.projectId,
       implementationThreadId: job.implementationThreadId,
       reviewThreadId: job.reviewThreadId,
+      documentationThreadId: job.documentationThreadId,
       prNumber: job.prNumber,
       prUrl: job.prUrl,
       prHead: job.prHeadSha?.slice(0, 12) ?? null,
+      mergeCommit: job.mergeCommitSha?.slice(0, 12) ?? null,
+      mergedAt: job.mergedAt,
+      deployment: job.deploymentSummary,
+      canary: job.canarySummary,
       reviewCycle: job.reviewCycle,
       cancelRequested: job.cancelRequestedAt !== null,
       blocker: job.blockedReason,
@@ -77,6 +82,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           baseBranch: policy.baseBranch,
           implementationModel: policy.implementation.model ?? null,
           reviewModel: policy.review.model ?? null,
+          productionConfigured: policy.production !== undefined,
         })),
       });
     },
@@ -136,7 +142,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     execute: (params, context) => {
       authorizedController(dependencies.store, context);
       const job = dependencies.store.getJob(params.jobId);
-      if (!job || ["merged", "cancelled", "blocked"].includes(job.state)) {
+      if (!job || ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) {
         throw new Error("The requested job cannot be cancelled");
       }
       const updated = dependencies.store.applyJobEvent(job.id, job.version, {
