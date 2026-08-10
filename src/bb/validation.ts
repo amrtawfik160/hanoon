@@ -269,6 +269,11 @@ async function runCommand(
   onTerminalObservation?: (observation: TerminalObservation) => void,
 ): Promise<Extract<CommandResult, { outcome: "exited" }>> {
   const redactedCommand = collector.redactor(command);
+  let lastObservation: TerminalObservation | null = null;
+  const observe = (observation: TerminalObservation): void => {
+    lastObservation = observation;
+    onTerminalObservation?.(observation);
+  };
   let result: CommandResult;
   try {
     result = await runner.run({
@@ -277,7 +282,7 @@ async function runCommand(
       command,
       timeoutMs,
       signal,
-      onObservation: onTerminalObservation,
+      onObservation: observe,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -285,6 +290,17 @@ async function runCommand(
     fail("command_failed", `Command failed: ${redactedMessage}`);
   }
   receiptFor(collector, command, result);
+  if (result.outcome === "timed_out" || result.outcome === "aborted") {
+    const observation = lastObservation as TerminalObservation | null;
+    if (onTerminalObservation && observation && observation.status !== result.outcome) {
+      onTerminalObservation({
+        id: observation.id,
+        status: result.outcome,
+        updatedAt: Date.now(),
+        exitCode: observation.exitCode,
+      });
+    }
+  }
   if (result.outcome === "timed_out") fail("command_timeout", `Command timed out: ${redactedCommand}`);
   if (result.outcome === "aborted") fail("command_aborted", `Command was aborted: ${redactedCommand}`);
   return result;

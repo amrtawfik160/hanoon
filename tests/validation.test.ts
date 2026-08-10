@@ -147,6 +147,25 @@ describe("ls-remote head parsing", () => {
 });
 
 describe("runValidation", () => {
+  test("projects a timed-out validation terminal as failed liveness", async () => {
+    const { input, runner } = makeValidationHarness();
+    const observations: Array<{ id: string; status: string }> = [];
+    runner.run.mockImplementation((async ({ command, onObservation }: {
+      command: string;
+      onObservation?: (observation: { id: string; status: string; updatedAt: number; exitCode?: number | null }) => void;
+    }) => {
+      onObservation?.({ id: "validation-terminal-1", status: "running", updatedAt: 1_000 });
+      if (command === "git remote get-url origin") return { outcome: "timed_out" as const };
+      throw new Error(`unexpected command: ${command}`);
+    }) as never);
+
+    await expect(runValidation({
+      ...input,
+      onTerminalObservation: (observation: { id: string; status: string }) => observations.push({ id: observation.id, status: observation.status }),
+    } as never)).rejects.toThrow(/timed out/i);
+    expect(observations).toContainEqual({ id: "validation-terminal-1", status: "timed_out" });
+  });
+
   test("runs the exact origin, PR, checks, and repeated head commands in order", async () => {
     const { input, runner } = makeValidationHarness();
 

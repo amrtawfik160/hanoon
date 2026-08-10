@@ -30,6 +30,8 @@ import {
   type PersistedMergeEvidence,
   type TelegramAgentStore,
 } from "../storage/store";
+import type { TerminalObservation } from "../bb/terminal-command";
+import { projectTerminalLiveness } from "./worker-liveness";
 
 const POST_MERGE_HEAD_COMMAND = (number: number): string =>
   `git ls-remote --exit-code origin refs/pull/${String(number)}/head`;
@@ -48,6 +50,7 @@ export type MergeCommandRunner = {
     command: string;
     timeoutMs: number;
     signal?: AbortSignal;
+    onObservation?: (observation: TerminalObservation) => void;
   }): Promise<CommandResult>;
 };
 
@@ -877,6 +880,14 @@ export class MergeHandler {
     freshNow: () => number,
     checkFence: (now: number) => boolean,
   ): Promise<{ ok: true; result: PersistedMergeSuccessResult } | { ok: false; reason: string }> {
+    let lastObservation: TerminalObservation | null = null;
+    const observe = (observation: TerminalObservation): void => {
+      lastObservation = observation;
+      const now = freshNow();
+      if (!checkFence(now)) return;
+      const current = this.options.store.getJob(receipt.jobId);
+      if (current) projectTerminalLiveness(this.options.store, current, observation, "merge", now);
+    };
     if (!checkFence(freshNow())) {
       return { ok: false, reason: "post-merge effect fence rejected the Git head confirmation" };
     }
@@ -885,7 +896,19 @@ export class MergeHandler {
       title: "Telegram post-merge Git head confirmation",
       command: POST_MERGE_HEAD_COMMAND(receipt.prNumber),
       timeoutMs: 60_000,
+      onObservation: observe,
     });
+    if (headResult.outcome === "timed_out" || headResult.outcome === "aborted") {
+      const observation = lastObservation as TerminalObservation | null;
+      if (observation) {
+        observe({
+          id: observation.id,
+          status: headResult.outcome,
+          updatedAt: freshNow(),
+          exitCode: observation.exitCode,
+        });
+      }
+    }
     if (headResult.outcome !== "exited" || headResult.exitCode !== 0) {
       return { ok: false, reason: "post-merge Git-native head confirmation failed" };
     }
@@ -907,7 +930,19 @@ export class MergeHandler {
       title: "Telegram post-merge GitHub confirmation",
       command: POST_MERGE_PR_COMMAND(receipt.prNumber),
       timeoutMs: 60_000,
+      onObservation: observe,
     });
+    if (prResult.outcome === "timed_out" || prResult.outcome === "aborted") {
+      const observation = lastObservation as TerminalObservation | null;
+      if (observation) {
+        observe({
+          id: observation.id,
+          status: prResult.outcome,
+          updatedAt: freshNow(),
+          exitCode: observation.exitCode,
+        });
+      }
+    }
     if (prResult.outcome !== "exited" || prResult.exitCode !== 0) {
       return { ok: false, reason: "post-merge GitHub confirmation failed" };
     }

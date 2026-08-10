@@ -1,7 +1,10 @@
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import plugin from "../server";
+import { hashSecret } from "../src/crypto";
+import { ApprovalService } from "../src/services/approval-service";
 import { openStore } from "../src/storage/store";
+import { policyFixture, sha } from "./helpers";
 
 let pluginNumber = 0;
 
@@ -71,4 +74,67 @@ it("reconciles an authoritative implementation idle observation into the job sta
   expect(store.getJob(job.id)?.state).not.toBe("implementing");
   run.controller.abort();
   await run.done;
+});
+
+it("projects fresh-gate validation terminal observations into liveness", async () => {
+  const { bb, harness } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const db = bb.storage.database();
+  const now = Date.now();
+  const headSha = sha();
+  const policy = policyFixture();
+  store.createPairingCode(hashSecret("pair"), now, now + 60_000);
+  expect(store.pairOwnerWithPrivateChatCode(hashSecret("pair"), "7", "70", now)).toEqual({ ok: true });
+  store.upsertProjectPolicy(policy, now);
+  const job = store.createJob({ id: "abcdefghijklmnopqrstuv", sourceUpdateId: 3, requestText: "merge this", now });
+  db.prepare(
+    `UPDATE jobs SET state = 'awaiting_merge_approval', project_id = ?,
+       policy_version = 1, policy_json = ?, environment_id = ?, pr_number = ?,
+       pr_url = ?, pr_head_sha = ?, version = 7, updated_at = ? WHERE id = ?`,
+  ).run(policy.projectId, JSON.stringify(policy), "env_1", 17, "https://github.com/acme/cyndra/pull/17", headSha, now, job.id);
+
+  const approvals = new ApprovalService(store, {
+    now: () => Date.now(),
+    randomBytes: () => Buffer.alloc(24, 2),
+  });
+  const issued = approvals.issue(job.id, headSha, now);
+  expect(approvals.accept(
+    issued.nonce,
+    7,
+    { idempotencyKey: `${job.id}:8:merge_pr`, jobId: job.id, kind: "merge_pr", payload: { headSha } },
+    now,
+    { userId: "7", chatId: "70" },
+  )).toMatchObject({ ok: true });
+
+  harness.sdk.stub("environments.status", async () => ({
+    available: true,
+    clean: true,
+    workingTree: { state: "clean", hasUncommittedChanges: false },
+    checkout: { kind: "branch", branchName: "feature/telegram", headSha },
+  }));
+  const commands = new Map<string, string>();
+  let terminalNumber = 0;
+  harness.sdk.stub("terminals.create", async ({ start }: { start: { command: string } }) => {
+    const id = `fresh-terminal-${++terminalNumber}`;
+    commands.set(id, start.command);
+    return { id };
+  });
+  harness.sdk.stub("terminals.get", async ({ terminalId }: { terminalId: string }) => ({
+    status: "exited",
+    exitCode: commands.get(terminalId)?.startsWith("git remote") ? 1 : 0,
+  }));
+  harness.sdk.stub("terminals.output", async () => ({ chunks: [] }));
+  harness.sdk.stub("terminals.close", async () => undefined);
+
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(store.getWorkerLiveness(job.id)).toMatchObject({
+      workerKind: "validation",
+      resourceKind: "bb_terminal",
+      state: "failed",
+    }));
+  } finally {
+    run.controller.abort();
+    await run.done;
+  }
 });

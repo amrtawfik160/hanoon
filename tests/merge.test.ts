@@ -1091,6 +1091,30 @@ describe("fresh Telegram merge execution", () => {
     expect(payload.payload_json).toContain("MERGED");
   });
 
+  it("projects a post-merge confirmation timeout as failed terminal liveness", async () => {
+    const fixture = mergeFixture();
+    fixture.commandRunner.run.mockImplementation((async ({ command, onObservation }: {
+      command: string;
+      onObservation?: (observation: { id: string; status: string; updatedAt: number; exitCode?: number | null }) => void;
+    }) => {
+      if (!command.startsWith("git ls-remote")) {
+        throw new Error(`unexpected confirmation command ${command}`);
+      }
+      onObservation?.({ id: "merge-terminal-1", status: "running", updatedAt: NOW + 1 });
+      return { outcome: "timed_out" as const };
+    }) as never);
+
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "failed" });
+
+    expect(fixture.store.getWorkerLiveness("job_1")).toMatchObject({
+      workerKind: "merge",
+      resourceKind: "bb_terminal",
+      resourceId: "merge-terminal-1",
+      state: "failed",
+    });
+  });
+
   it("persists merge success and leaves Telegram delivery to the outbox worker", async () => {
     const fixture = mergeFixture();
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });

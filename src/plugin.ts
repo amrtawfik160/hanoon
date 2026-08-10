@@ -155,6 +155,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           })()
         : undefined,
       signal: input.signal,
+      onTerminalObservation: (observation) => {
+        if (input.signal?.aborted) return;
+        const current = store.getJob(input.job.id);
+        if (current) projectTerminalLiveness(store, current, observation, "validation", clock());
+      },
     }),
     getContext: async ({ job, receipt, validation, approvalExpiresAt }): Promise<{
       environment: GateInput["environment"];

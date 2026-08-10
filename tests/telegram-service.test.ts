@@ -1,6 +1,6 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TelegramUpdate } from "../src/telegram/types";
 import { TelegramIngress } from "../src/telegram/ingress";
 import { TelegramClient } from "../src/telegram/client";
@@ -9,6 +9,10 @@ import { policyFixture, telegramFetch } from "./helpers";
 import { runTelegramService, type TelegramServiceDeps } from "../src/services/telegram-service";
 
 let fixtureNumber = 0;
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 type Kv = {
   get<T>(key: string): Promise<T | undefined>;
@@ -84,6 +88,7 @@ function serviceDeps(
 
 describe("Telegram ingress service", () => {
   it("orders updates and advances the SQLite cursor only after each claimed update completes", async () => {
+    vi.useFakeTimers();
     const { store } = storeFixture();
     const seen: number[] = [];
     const abort = new AbortController();
@@ -115,6 +120,7 @@ describe("Telegram ingress service", () => {
     expect(seen).toEqual([10, 11, 12]);
     expect(store.getNextTelegramOffset()).toBe(13);
     expect(client).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("lets the pure service persist a Start transition without any BB worker capability", async () => {
@@ -234,6 +240,7 @@ describe("Telegram ingress service", () => {
   });
 
   it("recreates the client after an in-memory token rotation without resetting the same bot identity", async () => {
+    vi.useFakeTimers();
     const { store } = storeFixture();
     const abort = new AbortController();
     let token = "123:first";
@@ -242,26 +249,83 @@ describe("Telegram ingress service", () => {
       clientTokens.push(clientToken);
       return {
         getMe: vi.fn(async () => ({ id: 123, username: "bot" })),
-        getUpdates: vi.fn(async () => {
-          if (clientToken === "123:first") {
-            token = "123:second";
-            return [];
-          }
-          abort.abort();
-          return [];
-        }),
+        getUpdates: vi.fn((_offset: number, _timeoutSeconds: number, signal: AbortSignal) => new Promise<TelegramUpdate[]>((resolve) => {
+          const timer = setTimeout(() => {
+            if (clientToken === "123:first") {
+              token = "123:second";
+            } else {
+              abort.abort();
+            }
+            resolve([]);
+          }, 100);
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            resolve([]);
+          }, { once: true });
+        })),
       };
     }) as TelegramServiceDeps["client"];
 
-    await runTelegramService(
+    const promise = runTelegramService(
       serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
         ok: true,
         value: { botToken: token, bbAppBaseUrl: "", pollTimeoutSeconds: 5 },
       })),
       abort.signal,
     );
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(100);
+    await promise;
 
     expect(clientTokens).toEqual(["123:first", "123:second"]);
     expect(store.getTelegramIdentity()).toMatchObject({ botId: "123", username: "bot" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("aborts a pending polling heartbeat without leaking its timer", async () => {
+    vi.useFakeTimers();
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const client = vi.fn(() => ({
+      getMe: vi.fn(async () => ({ id: 123, username: "bot" })),
+      getUpdates: vi.fn((_offset: number, _timeoutSeconds: number, signal: AbortSignal) => new Promise<TelegramUpdate[]>((resolve) => {
+        const timer = setTimeout(() => resolve([]), 30_000);
+        signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          resolve([]);
+        }, { once: true });
+      })),
+    })) as TelegramServiceDeps["client"];
+
+    const promise = runTelegramService(
+      serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+        ok: true,
+        value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 30 },
+      })),
+      abort.signal,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    abort.abort();
+    await promise;
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fails a stalled Telegram poll at its timeout without leaking timer handles", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("request aborted")), { once: true });
+    }));
+    const client = new TelegramClient("123:secret", fetchMock);
+    const controller = new AbortController();
+    const pending = client.getUpdates(0, 5, controller.signal);
+    setTimeout(() => controller.abort(), 1_000);
+    const rejected = expect(pending).rejects.toThrow("Telegram request aborted");
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
