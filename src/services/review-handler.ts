@@ -39,7 +39,7 @@ export interface ReviewAttemptStore {
     attemptId: string,
     patch: Partial<ReviewAttemptState>,
   ): Promise<void> | void;
-  claimFormatCorrection?(
+  claimFormatCorrection(
     attemptId: string,
     threadId: string,
     headSha: string,
@@ -111,8 +111,6 @@ function remediationPrompt(findings: ReviewFinding[], reasons: string[]): string
 }
 
 export class ReviewHandler {
-  private readonly formatCorrectionClaims = new Set<string>();
-
   public constructor(private readonly dependencies: ReviewHandlerDependencies) {}
 
   public async handleThreadIdle(input: ReviewThreadIdleInput): Promise<ReviewHandlerResult> {
@@ -160,34 +158,11 @@ export class ReviewHandler {
   }
 
   private async claimFormatCorrection(input: ReviewThreadIdleInput): Promise<boolean> {
-    const claimKey = `${input.attemptId}:${input.reviewThreadId}:${input.expectedSha}`;
-    if (this.formatCorrectionClaims.has(claimKey)) return false;
-    this.formatCorrectionClaims.add(claimKey);
-    try {
-      const latest = await this.dependencies.attempts.get(input.attemptId);
-      if (
-        latest.threadId !== input.reviewThreadId ||
-        latest.headSha !== input.expectedSha ||
-        latest.formatCorrectionSent
-      ) {
-        return false;
-      }
-      if (this.dependencies.attempts.claimFormatCorrection) {
-        return await this.dependencies.attempts.claimFormatCorrection(
-          input.attemptId,
-          input.reviewThreadId,
-          input.expectedSha,
-        );
-      }
-      await this.dependencies.attempts.update(input.attemptId, {
-        threadId: input.reviewThreadId,
-        headSha: input.expectedSha,
-        formatCorrectionSent: true,
-      });
-      return true;
-    } finally {
-      this.formatCorrectionClaims.delete(claimKey);
-    }
+    return this.dependencies.attempts.claimFormatCorrection(
+      input.attemptId,
+      input.reviewThreadId,
+      input.expectedSha,
+    );
   }
 
   private async handleInvalidOutput(
@@ -211,7 +186,6 @@ export class ReviewHandler {
       buildReviewFormatCorrectionPrompt(),
     );
     await this.dependencies.attempts.update(input.attemptId, {
-      threadId: input.reviewThreadId,
       formatCorrectionSent: true,
       result,
     });
@@ -302,8 +276,6 @@ export class ReviewHandler {
       reviewedHeadSha: null,
     };
     await this.dependencies.attempts.update(input.attemptId, {
-      threadId: input.reviewThreadId,
-      headSha: input.expectedSha,
       result,
     });
     this.dependencies.emit({

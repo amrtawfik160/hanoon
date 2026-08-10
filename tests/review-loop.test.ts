@@ -50,11 +50,13 @@ function makeHarness({
   headSha = EXPECTED_SHA,
   clean = true,
   attemptState = { threadId: "review-thread-1", headSha: EXPECTED_SHA },
+  synchronizeCorrectionClaims = false,
 }: {
   reviewOutputs?: string[];
   headSha?: string;
   clean?: boolean;
   attemptState?: Record<string, unknown>;
+  synchronizeCorrectionClaims?: boolean;
 } = {}) {
   const threads = {
     outputs: [...reviewOutputs],
@@ -82,8 +84,15 @@ function makeHarness({
 
   const attempts = {
     values: new Map<string, Record<string, unknown>>([["attempt-1", attemptState]]),
+    getCalls: 0,
     async get(attemptId: string) {
-      return attempts.values.get(attemptId) ?? {};
+      const state = attempts.values.get(attemptId) ?? {};
+      attempts.getCalls += 1;
+      if (synchronizeCorrectionClaims && attempts.getCalls > 2) {
+        if (attempts.getCalls === 4) correctionReadsReleased();
+        await correctionReadsReleasedPromise;
+      }
+      return state;
     },
     async update(attemptId: string, patch: Record<string, unknown>) {
       attempts.values.set(attemptId, {
@@ -91,19 +100,51 @@ function makeHarness({
         ...patch,
       });
     },
+    async claimFormatCorrection(
+      attemptId: string,
+      threadId: string,
+      headSha: string,
+    ) {
+      const state = attempts.values.get(attemptId) ?? {};
+      if (
+        state.threadId !== threadId ||
+        state.headSha !== headSha ||
+        state.formatCorrectionSent
+      ) {
+        return false;
+      }
+      attempts.values.set(attemptId, {
+        ...state,
+        formatCorrectionSent: true,
+      });
+      return true;
+    },
   };
 
+  let correctionReadsReleased!: () => void;
+  const correctionReadsReleasedPromise = new Promise<void>((resolve) => {
+    correctionReadsReleased = resolve;
+  });
+
   const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
-  const handler = new ReviewHandler({
+  const dependencies = {
     threads,
     environment,
     attempts,
     emit(event: { type: string; payload: Record<string, unknown> }) {
       events.push(event);
     },
-  });
+  };
+  const handler = new ReviewHandler(dependencies);
 
-  return { handler, threads, environment, attempts, events };
+  return {
+    handler,
+    makeHandler: () => new ReviewHandler(dependencies),
+    threads,
+    environment,
+    attempts,
+    events,
+  };
 }
 
 async function idle(
@@ -125,6 +166,30 @@ async function idle(
 }
 
 describe("review remediation loop", () => {
+  it("does not rebind a trusted attempt from a repeated stale idle event", async () => {
+    const harness = makeHarness({ reviewOutputs: [output()] });
+    const cycle = await harness.handler.startReviewCycle({
+      attemptId: "attempt-1",
+      implementationThreadId: "implementation-thread-1",
+      expectedSha: EXPECTED_SHA,
+    });
+
+    const staleInput = {
+      reviewThreadId: "review-thread-1",
+      expectedSha: EXPECTED_SHA,
+    };
+    const first = await idle(harness.handler, staleInput);
+    const second = await idle(harness.handler, staleInput);
+
+    expect(first.outcome).toBe("blocked");
+    expect(second.outcome).toBe("blocked");
+    expect(harness.threads.outputCalls).toEqual([]);
+    expect(harness.attempts.values.get("attempt-1")).toMatchObject({
+      threadId: cycle.reviewThreadId,
+      headSha: EXPECTED_SHA,
+    });
+  });
+
   it.each([
     ["unset", {}],
     ["stale thread", { threadId: "old-review-thread", headSha: EXPECTED_SHA }],
@@ -281,6 +346,24 @@ describe("review remediation loop", () => {
 
     expect(retry.outcome).toBe("blocked");
     expect(sendCalls).toBe(1);
+  });
+
+  it("allows at most one correction across concurrent handler instances", async () => {
+    const harness = makeHarness({
+      reviewOutputs: ["not json", "still not json"],
+      synchronizeCorrectionClaims: true,
+    });
+
+    const [first, second] = await Promise.all([
+      idle(harness.handler),
+      idle(harness.makeHandler()),
+    ]);
+
+    expect([first.outcome, second.outcome].sort()).toEqual([
+      "blocked",
+      "format_correction_sent",
+    ]);
+    expect(harness.threads.sent).toHaveLength(1);
   });
 
   it("sends remediation to the original implementation thread", async () => {
