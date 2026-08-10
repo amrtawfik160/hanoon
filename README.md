@@ -24,15 +24,19 @@ Telegram Agent has three layers:
 
 Ingress never starts a BB session. One generation-fenced executor owns controller dispatch, pipeline effects, and Telegram delivery. Reviewers are newly spawned BB threads with fresh provider conversations; they reuse the implementation environment only to inspect the same worktree.
 
+## Architecture
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="Telegram Agent architecture: private Telegram chat → I/O bridge → durable SQLite control plane → single leased executor → isolated BB controller and pipeline threads backed by a managed Git worktree" width="680">
+</p>
+
 Read the [architecture guide](docs/architecture.md) for diagrams, state ownership, and the exact BB thread/worktree boundary.
 
 ## Pipeline
 
-```text
-Intake → Plan → Critique → Build → Test → Review → Docs
-      → Final test → Final review → Owner approval
-      → Merge → Deploy → Canary → Complete
-```
+<p align="center">
+  <img src="docs/assets/reviewed-pipeline.svg" alt="Reviewed delivery pipeline: intake → plan → critique → build → test → fresh review → docs → final test and review → owner approval → merge → deploy → canary → complete, with bounded critique and patch loops" width="960">
+</p>
 
 Critique can request one replacement plan. Test or review failures return to a bounded patch/test/review cycle. Invalid evidence, stale pull-request heads, exhausted limits, unknown liveness, and expired approvals block instead of silently advancing.
 
