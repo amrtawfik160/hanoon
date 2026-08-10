@@ -193,3 +193,31 @@ it("revokes an owner once and reports no change after revocation", () => {
   expect(store.getOwner()).toBeNull();
   expect(store.revokeOwner(4_000)).toBe(false);
 });
+
+it.each([
+  "http://github.com/acme/cyndra/pull/17",
+  "https://user:password@github.com/acme/cyndra/pull/17",
+  "https://github.com/acme/cyndra/pull/17?token=secret",
+  "https://github.com/acme/cyndra/pull/17?%74oken=secret",
+  "https://github.com/acme/cyndra/pull/17?%2574oken=secret",
+  "https://github.com/acme/cyndra/pull/17?next=%2526token%253Dsecret",
+  `https://github.com/acme/cyndra/pull/17?next=m%3A${"N".repeat(32)}`,
+])("rejects an unsafe PR URL before PR_LOCATED persistence: %s", (url) => {
+  const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
+  const db = bb.storage.database();
+  const store = openStore(bb.storage);
+  store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "locate", now: 1_000 });
+  db.prepare("UPDATE jobs SET state = 'locating_pr' WHERE id = 'job_1'").run();
+
+  expect(() => store.applyJobEvent(
+    "job_1",
+    1,
+    { type: "PR_LOCATED", number: 17, url },
+    1_001,
+  )).toThrow(/URL|HTTPS|credential|callback/i);
+  expect(db.prepare("SELECT state, pr_url FROM jobs WHERE id = 'job_1'").get()).toEqual({
+    state: "locating_pr",
+    pr_url: null,
+  });
+  expect(db.prepare("SELECT COUNT(*) AS count FROM effects").get()).toEqual({ count: 0 });
+});

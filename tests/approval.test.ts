@@ -351,6 +351,39 @@ describe("Telegram merge approvals", () => {
     expect(oversized.reply_markup?.inline_keyboard.flat().some((button) => button.url)).toBe(false);
   });
 
+  it.each([
+    "https://github.com/acme/cyndra/pull/17?token=secret",
+    "https://github.com/acme/cyndra/pull/17?%74oken=secret",
+    "https://github.com/acme/cyndra/pull/17?%2574oken=secret",
+    "https://github.com/acme/cyndra/pull/17?next=secret",
+    "https://github.com/acme/cyndra/pull/17?next=%73ecret",
+    "https://github.com/acme/cyndra/pull/17?next=%2573ecret",
+    "https://github.com/acme/cyndra/pull/17?next=%26token%3Dsecret",
+    "https://github.com/acme/cyndra/pull/17?next=%2526token%253Dsecret",
+    "https://github.com/acme/cyndra/pull/17?%256eext=%2526%2574oken%253Dsecret",
+  ])("rejects nested or encoded credential URL material in persistence and Telegram rendering", (url) => {
+    const fixture = approvalFixture();
+    expect(() => fixture.store.enqueueOutbox({
+      logicalKey: `unsafe-url-${url.slice(-12)}`,
+      chatId: "70",
+      payload: { reply_markup: { inline_keyboard: [[{ text: "PR", url }]] } },
+    }, NOW + 1)).toThrow(/credential|HTTPS|URL/i);
+
+    const rendered = renderJobStatus(jobFixture({
+      id: "abcdefghijklmnopqrstuv",
+      state: "awaiting_merge_approval",
+      projectId: "proj_1",
+      policyVersion: 1,
+      policy: policyFixture({ requiredChecks: [] }),
+      prNumber: 17,
+      prUrl: url,
+      prHeadSha: HEAD,
+    }));
+    const buttons = rendered.reply_markup?.inline_keyboard.flat() ?? [];
+    expect(buttons.find((button) => button.text === "View PR")).toBeUndefined();
+    expect(rendered.text).not.toContain(url);
+  });
+
   it("reissues a crashed approval with a fresh ephemeral button and no nonce in SQLite", () => {
     const fixture = approvalFixture();
     const viewJob = jobFixture({
@@ -507,5 +540,41 @@ describe("Telegram merge approvals", () => {
         leaseGeneration: 1,
       })).toThrow(/callback|nonce/i);
     }
+  });
+
+  it("uses the fresh store clock for failure-cleanup lease predicates", () => {
+    const fixture = approvalFixture();
+    const issued = fixture.service.issue("job_1", HEAD);
+    const effect = mergeEffect(fixture.job.version, hashSecret(issued.nonce));
+    expect(fixture.store.acceptApprovalAndEnqueueMerge({
+      nonceHash: hashSecret(issued.nonce),
+      expectedJobVersion: fixture.job.version,
+      effect,
+      now: NOW + 1,
+    })).toMatchObject({ ok: true });
+    const durable = fixture.store.listEffectsForJob("job_1").find((item) => item.kind === "merge_pr");
+    if (!durable) throw new Error("merge effect was not stored");
+    fixture.db.prepare(
+      `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+         lease_expires_at = ?, updated_at = ? WHERE idempotency_key = ?`,
+    ).run("executor-1", 1, NOW + 10, NOW, durable.idempotencyKey);
+    fixture.setNow(NOW + 11);
+
+    expect(fixture.store.failLeasedMergeEffect({
+      jobId: durable.jobId,
+      effectIdempotencyKey: durable.idempotencyKey,
+      reason: "late cleanup",
+      now: NOW + 1,
+      leaseOwner: "executor-1",
+      leaseGeneration: 1,
+    })).toBe(false);
+    expect(fixture.db.prepare(
+      "SELECT status, lease_owner, lease_generation, lease_expires_at FROM effects WHERE idempotency_key = ?",
+    ).get(durable.idempotencyKey)).toEqual({
+      status: "leased",
+      lease_owner: "executor-1",
+      lease_generation: 1,
+      lease_expires_at: NOW + 10,
+    });
   });
 });

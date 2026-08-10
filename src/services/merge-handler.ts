@@ -15,6 +15,7 @@ import {
   parseMergeEffectPayload,
   parsePersistedMergeEffectPayload,
   parsePersistedMergeSuccessResult,
+  isCompletedReviewAttempt,
   type ApprovalIdentity,
   type DurableMergeReceipt,
   type MergeEffectPayload,
@@ -263,9 +264,12 @@ export class MergeHandler {
 
     const previous = this.options.store.getCallback(input.callbackId);
     if (previous) {
+      const owner = this.options.store.getOwner();
       return previous.outcome === "accepted" &&
         previous.action === "merge" &&
         previous.jobId !== null &&
+        owner?.userId === input.userId &&
+        owner.chatId === input.chatId &&
         previous.approvalNonceHash === approvalNonceHash &&
         previous.headSha !== null &&
         previous.effectIdempotencyKey !== null &&
@@ -690,6 +694,7 @@ export class MergeHandler {
         attempt.jobId !== effect.jobId ||
         attempt.kind !== "review" ||
         attempt.headSha !== payload.receipt.headSha ||
+        attempt.completedAt === null ||
         attempt.resultJson === null
       ) return false;
       const attemptResult = parsePersistedMergeSuccessResult(JSON.parse(attempt.resultJson));
@@ -707,6 +712,7 @@ export class MergeHandler {
         result.pullRequest.state === "MERGED" &&
         job.id === receipt.jobId &&
         job.state === "merged" &&
+        job.cancelRequestedAt === null &&
         job.version >= receipt.jobVersion + 1 &&
         job.projectId === receipt.projectId &&
         job.environmentId === receipt.environmentId &&
@@ -724,7 +730,9 @@ export class MergeHandler {
         approval.jobVersion === receipt.approvalJobVersion &&
         approval.ownerUserId === receipt.approvalOwnerUserId &&
         approval.ownerChatId === receipt.approvalOwnerChatId &&
-        approval.expiresAt === Date.parse(receipt.expiresAt);
+        approval.expiresAt === Date.parse(receipt.expiresAt) &&
+        this.options.store.getOwner()?.userId === receipt.approvalOwnerUserId &&
+        this.options.store.getOwner()?.chatId === receipt.approvalOwnerChatId;
     } catch {
       return false;
     }
@@ -749,6 +757,7 @@ export class MergeHandler {
     } catch {
       return null;
     }
+    let candidate: MergeCallbackIdentity | null = null;
     for (const effect of effects) {
       if (effect.kind !== "merge_pr" || effect.status === "failed" || effect.status === "dead") continue;
       try {
@@ -763,7 +772,9 @@ export class MergeHandler {
         ) continue;
         if (effect.status === "done") {
           if (this.isValidCompletedEffect(effect)) {
-            return { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
+            const identity = { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
+            if (candidate !== null) return null;
+            candidate = identity;
           }
           continue;
         }
@@ -789,12 +800,19 @@ export class MergeHandler {
           approval.ownerChatId !== receipt.approvalOwnerChatId ||
           approval.expiresAt !== Date.parse(receipt.expiresAt)
         ) continue;
-        return { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
+        if (!isCompletedReviewAttempt(
+          this.options.store.getAttempt(receipt.reviewAttemptId),
+          jobId,
+          receipt.headSha,
+        )) continue;
+        const identity = { approvalNonceHash, headSha, effectIdempotencyKey: effect.idempotencyKey };
+        if (candidate !== null) return null;
+        candidate = identity;
       } catch {
         continue;
       }
     }
-    return null;
+    return candidate;
   }
 
   private hasAcceptedMergeEffect(

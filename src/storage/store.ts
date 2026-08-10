@@ -10,6 +10,7 @@ import {
   type ProjectPolicy,
   type StoredEffect,
 } from "../domain/models";
+import { reviewVerdictSchema } from "../domain/review";
 import { assertSafeFailureSummary, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
 
@@ -320,6 +321,8 @@ const TELEGRAM_UPDATE_LEASE_MS = 300_000;
 const MAX_RECEIPT_STRING = 512;
 const MAX_EFFECT_KEY = 256;
 const MAX_MERGE_RESULT_JSON = 64_000;
+const MAX_EXTERNAL_URL_LENGTH = 500;
+const MAX_QUERY_DEPTH = 4;
 const SAFE_MERGE_FAILURE_REASON = "Merge effect failed safely";
 const UNKNOWN_MERGE_OUTCOME_REASON = "Merge outcome is unknown; provider truth requires reconciliation";
 const SAFE_FAILED_MERGE_PAYLOAD = JSON.stringify({ mergeCleanup: "failed" });
@@ -366,7 +369,7 @@ function assertFiniteTimestamp(value: unknown, field: string): asserts value is 
 
 function decodePercentLayers(value: string, field: string): string {
   let candidate = value;
-  for (let layer = 0; layer < 4; layer += 1) {
+  for (let layer = 0; layer < MAX_QUERY_DEPTH; layer += 1) {
     if (!candidate.includes("%")) return candidate;
     let decoded: string;
     try {
@@ -408,6 +411,7 @@ function serializeBoundedJson(value: unknown, field: string, maxLength: number):
     throw new TypeError(`${field} must be JSON serializable`);
   }
   if (json === undefined || json.length > maxLength) throw new TypeError(`${field} must be bounded JSON`);
+  assertPersistedExternalUrls(JSON.parse(json) as unknown, field);
   assertNoRawMergeCallback(json, field);
   return json;
 }
@@ -426,9 +430,11 @@ function assertExactObjectKeys(value: Record<string, unknown>, required: readonl
   }
 }
 
-function assertCredentialFreeQuery(url: URL, field: string): void {
-  const query = url.search.startsWith("?") ? url.search.slice(1) : "";
-  for (const part of query.split("&")) {
+function assertCredentialFreeQueryMaterial(material: string, field: string, depth: number): void {
+  if (depth >= MAX_QUERY_DEPTH || material.length > MAX_EXTERNAL_URL_LENGTH) {
+    throw new TypeError(`${field} contains excessive nested query material`);
+  }
+  for (const part of material.replace(/^[?&]/, "").split("&")) {
     if (part.length === 0) continue;
     const separator = part.indexOf("=");
     const rawKey = separator < 0 ? part : part.slice(0, separator);
@@ -443,11 +449,20 @@ function assertCredentialFreeQuery(url: URL, field: string): void {
     ) {
       throw new TypeError(`${field} must not contain credential-bearing query data`);
     }
+    if (key.includes("=") || key.includes("&") || queryValue.includes("=") || queryValue.includes("&")) {
+      assertCredentialFreeQueryMaterial(key, `${field} nested query key`, depth + 1);
+      assertCredentialFreeQueryMaterial(queryValue, `${field} nested query value`, depth + 1);
+    }
   }
 }
 
+function assertCredentialFreeQuery(url: URL, field: string): void {
+  const query = url.search.startsWith("?") ? url.search.slice(1) : "";
+  assertCredentialFreeQueryMaterial(query, field, 0);
+}
+
 export function assertSafeExternalHttpsUrl(value: unknown, field = "external URL"): string {
-  assertBoundedString(value, field, 500);
+  assertBoundedString(value, field, MAX_EXTERNAL_URL_LENGTH);
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -466,6 +481,21 @@ export function assertSafeExternalHttpsUrl(value: unknown, field = "external URL
   }
   assertCredentialFreeQuery(parsed, field);
   return value;
+}
+
+function assertPersistedExternalUrls(value: unknown, field: string): void {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertPersistedExternalUrls(entry, `${field}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    const path = `${field}.${key}`;
+    if (entry !== null && entry !== undefined && /(?:url|uri|href)s?$/i.test(key)) {
+      assertSafeExternalHttpsUrl(entry, path);
+    }
+    assertPersistedExternalUrls(entry, path);
+  }
 }
 
 function parsePersistedMergeSuccessResultInternal(value: unknown): PersistedMergeSuccessResult {
@@ -561,6 +591,7 @@ function mergeSuccessResultMatchesDurable(
     result.pullRequest.number === receipt.prNumber &&
     result.pullRequest.state === "MERGED" &&
     job.state === expectedJobState &&
+    job.cancelRequestedAt === null &&
     (expectedJobState === "merged" ? job.version >= expectedJobVersion : job.version === expectedJobVersion) &&
     job.projectId === receipt.projectId &&
     job.policy !== null &&
@@ -576,6 +607,42 @@ function mergeSuccessResultMatchesDurable(
     approval.owner_user_id === receipt.approvalOwnerUserId &&
     approval.owner_chat_id === receipt.approvalOwnerChatId &&
     approval.expires_at === Date.parse(receipt.expiresAt);
+}
+
+function isStrictPassReviewResult(value: unknown, headSha: string): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const parsed = value as Record<string, unknown>;
+  const requiredKeys = ["outcome", "reasons", "findings", "reviewedHeadSha", "verdict"];
+  if (
+    Object.keys(parsed).some((key) => !requiredKeys.includes(key)) ||
+    requiredKeys.some((key) => !Object.prototype.hasOwnProperty.call(parsed, key)) ||
+    parsed.outcome !== "pass" ||
+    parsed.reviewedHeadSha !== headSha ||
+    !Array.isArray(parsed.reasons) ||
+    parsed.reasons.length !== 0 ||
+    !Array.isArray(parsed.findings) ||
+    parsed.findings.length !== 0
+  ) return false;
+  const verdict = reviewVerdictSchema.safeParse(parsed.verdict);
+  return verdict.success &&
+    verdict.data.verdict === "pass" &&
+    verdict.data.reviewedHeadSha === headSha &&
+    verdict.data.findings.length === 0 &&
+    verdict.data.checks.every((check) => check.outcome === "passed");
+}
+
+export function isCompletedReviewAttempt(
+  attempt: AttemptRecord | null,
+  jobId: string,
+  headSha: string,
+): boolean {
+  if (!attempt || attempt.jobId !== jobId || attempt.kind !== "review" || attempt.headSha !== headSha ||
+      attempt.completedAt === null || attempt.resultJson === null) return false;
+  try {
+    return isStrictPassReviewResult(JSON.parse(attempt.resultJson), headSha);
+  } catch {
+    return false;
+  }
 }
 
 export function parseDurableMergeReceipt(value: unknown): DurableMergeReceipt {
@@ -923,6 +990,9 @@ function persistJobTransition(
   transitionedJob: Job,
 ): void {
   if (transitionedJob.lastError !== null) assertNoRawMergeCallback(transitionedJob.lastError, "job error");
+  if (transitionedJob.prUrl !== null) {
+    assertSafeExternalHttpsUrl(transitionedJob.prUrl, "job.prUrl");
+  }
   const updated = db
     .prepare(
       `UPDATE jobs SET
@@ -1008,6 +1078,27 @@ function serializeOutbox(item: OutboxInput, now: number): string {
     throw new TypeError("outbox messageId must be a positive integer");
   }
   return payloadJson;
+}
+
+function sanitizedUnknownMergePayload(payloadJson: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payloadJson);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const raw = parsed as Record<string, unknown>;
+  if (!Number.isInteger(raw.mergeCallStartedAt) || raw.mergeCallOutcome !== "unknown") return null;
+  try {
+    const payload = parseMergeEffectPayload(raw);
+    return serializeBoundedJson(payload, "unknown merge effect payload", MAX_MERGE_RESULT_JSON);
+  } catch {
+    return serializeBoundedJson({
+      mergeCallStartedAt: raw.mergeCallStartedAt,
+      mergeCallOutcome: "unknown",
+    }, "unknown merge fence", MAX_MERGE_RESULT_JSON);
+  }
 }
 
 function persistOutbox(
@@ -2104,6 +2195,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       .run(now, reason, jobId).changes;
   }
 
+  private releaseUnknownMergeFence(input: {
+    effect: EffectRow;
+    payloadJson: string;
+    boundaryNow: number;
+    leaseOwner: string;
+    leaseGeneration: number;
+  }): boolean {
+    const updated = this.db
+      .prepare(
+        `UPDATE effects SET payload_json = ?, status = 'pending', lease_owner = NULL,
+           lease_generation = NULL, lease_expires_at = NULL, last_error = ?,
+           next_attempt_at = ?, updated_at = ?
+         WHERE job_id = ? AND idempotency_key = ? AND status = 'leased'
+           AND lease_owner = ? AND lease_generation = ? AND lease_expires_at > ?`,
+      )
+      .run(
+        input.payloadJson,
+        UNKNOWN_MERGE_OUTCOME_REASON,
+        input.boundaryNow,
+        input.boundaryNow,
+        input.effect.job_id,
+        input.effect.idempotency_key,
+        input.leaseOwner,
+        input.leaseGeneration,
+        input.boundaryNow,
+      );
+    if (updated.changes !== 1) return false;
+
+    this.cancelUnknownMergeJob(input.effect.job_id, input.boundaryNow);
+    return true;
+  }
+
+  private cancelUnknownMergeJob(jobId: string, boundaryNow: number): void {
+    const job = this.db
+      .prepare("SELECT state, cancel_requested_at, version FROM jobs WHERE id = ?")
+      .get(jobId) as { state: string; cancel_requested_at: number | null; version: number } | undefined;
+    if (job?.state === "merging" && job.cancel_requested_at !== null) {
+      const cancelled = this.db
+        .prepare(
+          `UPDATE jobs SET state = 'cancelled', resume_state = NULL, last_error = NULL,
+             version = ?, updated_at = ? WHERE id = ? AND state = 'merging' AND version = ?`,
+        )
+        .run(job.version + 1, boundaryNow, jobId, job.version);
+      if (cancelled.changes === 1) {
+        persistPendingEffects(this.db, [{
+          idempotencyKey: `${jobId}:${job.version + 1}:render_status`,
+          jobId,
+          kind: "render_status",
+          payload: {},
+        }], boundaryNow);
+      }
+      this.db
+        .prepare(
+          `UPDATE approvals SET consumed_at = COALESCE(consumed_at, ?), outcome = 'revoked'
+             WHERE job_id = ? AND (outcome IS NULL OR outcome = 'accepted')`,
+        )
+        .run(boundaryNow, jobId);
+    }
+  }
+
   public completeMergeSuccess(input: MergeSuccessInput): boolean {
     assertSafeFailureSummary(input.message);
     assertNonNegativeInteger(input.now, "now");
@@ -2261,6 +2412,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     void input.reason;
 
     const fail = this.db.transaction((): boolean => {
+      const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
+      if (!effect || effect.kind !== "merge_pr") return false;
+      const boundaryNow = this.currentNow();
+      if (!this.effectLeaseIsActive(effect, input.leaseOwner, input.leaseGeneration, boundaryNow)) return false;
+      const unknownPayloadJson = sanitizedUnknownMergePayload(effect.payload_json);
+      if (unknownPayloadJson !== null) {
+        return this.releaseUnknownMergeFence({
+          effect,
+          payloadJson: unknownPayloadJson,
+          boundaryNow,
+          leaseOwner: input.leaseOwner,
+          leaseGeneration: input.leaseGeneration,
+        });
+      }
       const updated = this.db
         .prepare(
           `UPDATE effects SET payload_json = ?, status = 'failed', lease_owner = NULL,
@@ -2272,13 +2437,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .run(
           SAFE_FAILED_MERGE_PAYLOAD,
           SAFE_MERGE_FAILURE_REASON,
-          input.now,
-          input.now,
+          boundaryNow,
+          boundaryNow,
           input.jobId,
           input.effectIdempotencyKey,
           input.leaseOwner,
           input.leaseGeneration,
-          input.now,
+          boundaryNow,
         );
       if (updated.changes !== 1) return false;
 
@@ -2287,7 +2452,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           `UPDATE approvals SET consumed_at = COALESCE(consumed_at, ?), outcome = 'revoked'
              WHERE job_id = ? AND (outcome IS NULL OR outcome = 'accepted')`,
         )
-        .run(input.now, input.jobId);
+        .run(boundaryNow, input.jobId);
 
       const job = this.db
         .prepare("SELECT state, cancel_requested_at, version FROM jobs WHERE id = ?")
@@ -2305,7 +2470,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             cancelled ? null : "merging",
             cancelled ? null : SAFE_MERGE_FAILURE_REASON,
             nextVersion,
-            input.now,
+            boundaryNow,
             input.jobId,
             job.version,
           );
@@ -2314,10 +2479,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             .prepare(
               `INSERT OR IGNORE INTO effects (
                  idempotency_key, job_id, kind, payload_json, status, attempts,
-                 next_attempt_at, created_at, updated_at
-               ) VALUES (?, ?, 'render_status', '{}', 'pending', 0, ?, ?, ?)`,
+               next_attempt_at, created_at, updated_at
+             ) VALUES (?, ?, 'render_status', '{}', 'pending', 0, ?, ?, ?)`,
             )
-            .run(`${input.jobId}:${nextVersion}:render_status`, input.jobId, input.now, input.now, input.now);
+            .run(`${input.jobId}:${nextVersion}:render_status`, input.jobId, boundaryNow, boundaryNow, boundaryNow);
         }
       }
       return true;
@@ -2336,16 +2501,71 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const stale = this.db.transaction((): boolean => {
       const boundaryNow = this.currentNow();
       const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
-      if (!effect || effect.status === "done") return false;
+      if (!effect || effect.kind !== "merge_pr" || effect.status === "done") return false;
       if (!this.effectLeaseIsActive(effect, input.leaseOwner, input.leaseGeneration, boundaryNow)) return false;
+      const unknownPayloadJson = sanitizedUnknownMergePayload(effect.payload_json);
+      if (unknownPayloadJson !== null) {
+        return this.releaseUnknownMergeFence({
+          effect,
+          payloadJson: unknownPayloadJson,
+          boundaryNow,
+          leaseOwner: input.leaseOwner,
+          leaseGeneration: input.leaseGeneration,
+        });
+      }
       const current = this.readJobById(input.jobId);
       if (!current || current.state !== "merging") return false;
       if (current.prNumber === null) return false;
 
+      let validPrUrl: string;
+      try {
+        validPrUrl = assertSafeExternalHttpsUrl(current.prUrl, "job.prUrl");
+      } catch {
+        const transitioned = current.cancelRequestedAt !== null
+          ? transition(current, { type: "CANCEL_CONFIRMED" }, boundaryNow)
+          : transition(current, { type: "FAILED", error: SAFE_MERGE_FAILURE_REASON }, boundaryNow);
+        transitioned.job.prUrl = null;
+        persistJobTransition(this.db, input.jobId, current.version, transitioned.job);
+        this.db
+          .prepare(
+            `UPDATE approvals SET consumed_at = COALESCE(consumed_at, ?), outcome = 'revoked'
+               WHERE job_id = ? AND (outcome IS NULL OR outcome = 'accepted')`,
+          )
+          .run(boundaryNow, input.jobId);
+        persistPendingEffects(this.db, transitioned.effects, boundaryNow);
+        const cleaned = this.db
+          .prepare(
+            `UPDATE effects SET payload_json = ?, status = 'failed', lease_owner = NULL,
+               lease_generation = NULL, lease_expires_at = NULL, last_error = ?,
+               updated_at = ? WHERE job_id = ? AND idempotency_key = ?
+               AND status = 'leased' AND lease_owner = ? AND lease_generation = ?
+               AND lease_expires_at > ?`,
+          )
+          .run(
+            SAFE_FAILED_MERGE_PAYLOAD,
+            SAFE_MERGE_FAILURE_REASON,
+            boundaryNow,
+            input.jobId,
+            input.effectIdempotencyKey,
+            input.leaseOwner,
+            input.leaseGeneration,
+            boundaryNow,
+          );
+        if (cleaned.changes !== 1) throw new Error("Stale merge effect lost its durable row");
+        return true;
+      }
+
       const next = structuredClone(current);
-      next.prHeadSha = null;
-      next.state = "resolving_pr_head";
-      next.lastError = input.reason;
+      const cancelled = current.cancelRequestedAt !== null;
+      if (cancelled) {
+        next.state = "cancelled";
+        next.resumeState = null;
+        next.lastError = null;
+      } else {
+        next.prHeadSha = null;
+        next.state = "resolving_pr_head";
+        next.lastError = input.reason;
+      }
       next.version += 1;
       next.updatedAt = boundaryNow;
       persistJobTransition(this.db, input.jobId, current.version, next);
@@ -2355,19 +2575,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
              WHERE job_id = ? AND (outcome IS NULL OR outcome = 'accepted')`,
         )
         .run(boundaryNow, input.jobId);
-      const resolveEffect: JobEffect = {
-        idempotencyKey: `${input.jobId}:${next.version}:resolve_pr_head`,
-        jobId: input.jobId,
-        kind: "resolve_pr_head",
-        payload: { number: current.prNumber, url: current.prUrl },
-      };
-      const renderEffect: JobEffect = {
-        idempotencyKey: `${input.jobId}:${next.version}:render_status`,
-        jobId: input.jobId,
-        kind: "render_status",
-        payload: {},
-      };
-      persistPendingEffects(this.db, [resolveEffect, renderEffect], boundaryNow);
+      const effects: JobEffect[] = cancelled
+        ? [{ idempotencyKey: `${input.jobId}:${next.version}:render_status`, jobId: input.jobId, kind: "render_status", payload: {} }]
+        : [{
+            idempotencyKey: `${input.jobId}:${next.version}:resolve_pr_head`,
+            jobId: input.jobId,
+            kind: "resolve_pr_head",
+            payload: { number: current.prNumber, url: validPrUrl },
+          }, {
+            idempotencyKey: `${input.jobId}:${next.version}:render_status`,
+            jobId: input.jobId,
+            kind: "render_status",
+            payload: {},
+          }];
+      persistPendingEffects(this.db, effects, boundaryNow);
       const stalePayloadJson = serializeBoundedJson({ mergeOutcome: "stale" }, "stale merge effect payload", MAX_MERGE_RESULT_JSON);
       const updated = this.db
         .prepare(
@@ -2534,18 +2755,31 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            FROM callbacks WHERE callback_query_id = ?`,
       )
       .get(callbackId) as CallbackRow | undefined;
-    return row
-      ? {
-          callbackId: row.callback_query_id,
-          jobId: row.job_id,
-          action: row.action,
-          outcome: row.outcome,
-          processedAt: row.processed_at,
-          approvalNonceHash: row.approval_nonce_hash,
-          headSha: row.head_sha,
-          effectIdempotencyKey: row.effect_idempotency_key,
-        }
-      : null;
+    if (!row) return null;
+    const callback: CallbackRecord = {
+      callbackId: row.callback_query_id,
+      jobId: row.job_id,
+      action: row.action,
+      outcome: row.outcome,
+      processedAt: row.processed_at,
+      approvalNonceHash: row.approval_nonce_hash,
+      headSha: row.head_sha,
+      effectIdempotencyKey: row.effect_idempotency_key,
+    };
+    if (
+      callback.action !== "merge" ||
+      callback.outcome !== "accepted" ||
+      callback.approvalNonceHash !== null ||
+      callback.headSha !== null ||
+      callback.effectIdempotencyKey !== null ||
+      callback.jobId === null
+    ) return callback;
+    try {
+      const identity = this.findUniqueLegacyAcceptedCallbackIdentity(callback.jobId);
+      return identity ? { ...callback, ...identity } : callback;
+    } catch {
+      return callback;
+    }
   }
 
   public enqueueReconcileForThread(threadId: string, now: number): boolean {
@@ -2598,6 +2832,43 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       .get(jobId, idempotencyKey) as EffectRow | undefined;
   }
 
+  private findUniqueLegacyAcceptedCallbackIdentity(jobId: string): MergeCallbackIdentity | null {
+    const rows = this.db
+      .prepare("SELECT * FROM effects WHERE job_id = ? AND kind = 'merge_pr'")
+      .all(jobId) as EffectRow[];
+    let candidate: MergeCallbackIdentity | null = null;
+    const job = this.readJobById(jobId);
+    if (!job) return null;
+    for (const row of rows) {
+      if (row.status === "failed" || row.status === "dead") continue;
+      try {
+        const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+        const parsed = parsePersistedMergeEffectPayload(payload, row.status);
+        const receipt = parsed.receipt;
+        const approval = this.readApproval(receipt.approvalNonceHash);
+        const valid = row.status === "done"
+          ? (() => {
+              const result = parsePersistedMergeSuccessResult(payload.mergeResult);
+              return mergeSuccessResultMatchesDurable(result, row, parsed, job, approval, "merged") &&
+                this.attemptResultMatches(receipt.reviewAttemptId, jobId, receipt.headSha, result);
+            })()
+          : this.acceptedMergeReceiptBindingError(row, parsed, job, approval) === null &&
+            isCompletedReviewAttempt(this.getAttempt(receipt.reviewAttemptId), jobId, receipt.headSha);
+        if (!valid) continue;
+        const identity = {
+          approvalNonceHash: receipt.approvalNonceHash,
+          headSha: receipt.headSha,
+          effectIdempotencyKey: row.idempotency_key,
+        };
+        if (candidate !== null) return null;
+        candidate = identity;
+      } catch {
+        continue;
+      }
+    }
+    return candidate;
+  }
+
   private findAcceptedMergeCallbackIdentity(
     jobId: string,
     headSha: string,
@@ -2606,6 +2877,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const rows = this.db
       .prepare("SELECT * FROM effects WHERE job_id = ? AND kind = 'merge_pr'")
       .all(jobId) as EffectRow[];
+    let candidate: MergeCallbackIdentity | null = null;
     for (const row of rows) {
       if (row.status === "failed" || row.status === "dead") continue;
       try {
@@ -2641,17 +2913,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           this.readApproval(parsed.receipt.approvalNonceHash),
         )) {
           continue;
+        } else if (!isCompletedReviewAttempt(
+          this.getAttempt(parsed.receipt.reviewAttemptId),
+          jobId,
+          parsed.receipt.headSha,
+        )) {
+          continue;
         }
-        return {
+        const identity = {
           approvalNonceHash,
           headSha,
           effectIdempotencyKey: row.idempotency_key,
         };
+        if (candidate !== null) return null;
+        candidate = identity;
       } catch {
         continue;
       }
     }
-    return null;
+    return candidate;
   }
 
   private attemptResultMatches(
@@ -2666,6 +2946,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       attempt.jobId !== jobId ||
       attempt.kind !== "review" ||
       attempt.headSha !== headSha ||
+      attempt.completedAt === null ||
       attempt.resultJson === null
     ) return false;
     try {
