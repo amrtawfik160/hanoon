@@ -1,4 +1,4 @@
-export type ControllerThreadState = "pending_spawn" | "active" | "failed";
+export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
 
 export type ControllerThreadRecord = {

@@ -71,8 +71,12 @@ export function classifyTelegramError(error: unknown): TelegramErrorKind {
     return "bad_entities";
   }
   if (error.errorCode === 401 || error.httpStatus === 401) return "authentication";
-  if (error.errorCode === 429 || error.errorCode >= 500 || (error.httpStatus !== null && error.httpStatus >= 500)) {
+  if (error.errorCode === 429 || isServerFailure(error.errorCode) || isServerFailure(error.httpStatus)) {
     return "retryable";
   }
   return "permanent";
+}
+
+function isServerFailure(code: number | null): boolean {
+  return code !== null && code >= 500 && code <= 599;
 }

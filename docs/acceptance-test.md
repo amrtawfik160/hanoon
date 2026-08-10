@@ -10,7 +10,7 @@ This runbook is for the owner-only live acceptance after the automated Task 12 g
 - Record identifiers, digests, SHAs, statuses, and bounded summaries only.
 - A live run is not successful unless every required step has evidence. HTTP 200, static tests, or a plugin registration row alone is not live acceptance.
 
-## Owner-only Step 8 pause
+## Token configuration pause
 
 Before this runbook begins, the owner must perform exactly this UI action:
 
@@ -27,7 +27,10 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | plugin id and installed path | `telegram-agent`, `<local path without private parent details>` |
 | plugin restart time(s) | `<UTC timestamp>` |
 | pairing Telegram message id(s) | `<message id>` |
-| task/status/confirmation/review/approval/completion message ids | `<message ids only>` |
+| task/status/review/approval/completion message ids | `<message ids only>` |
+| controller BB thread/project/host ids | `<thread id>`, `<personal project id>`, `<host id>` |
+| controller execution tuple | `codex`, `gpt-5.6-luna`, `max`, `auto` |
+| controller conversation check | `<ordinary question received a natural answer and created no job>` |
 | paired owner identity | `<redacted Telegram user/chat identifiers>` |
 | configured project alias | `<alias, not a private path>` |
 | disposable project id and branch | `<project id>`, `<test branch>` |
@@ -78,9 +81,17 @@ bb telegram-agent doctor <disposable-project-id>
 
 Record the alias and doctor check statuses. Do not record the policy file contents if they contain private paths.
 
-### 3. Submit a bounded task
+### 3. Verify the Luna conversation
 
-Send one small task from the paired private chat. Record the task/status message ids and confirm that only one active job exists:
+Send an ordinary question such as which projects are available. Confirm that BB creates one hidden plugin-owned controller thread in the personal workspace with the exact execution tuple in the evidence sheet. Confirm Telegram receives a natural answer and `bb telegram-agent job list --json` still shows no new job.
+
+Record only the message ids and bounded answer summary, not the raw private conversation.
+
+### 4. Submit a bounded task through Luna
+
+Send one small software task from the paired private chat. Luna must use `telegram_agent_list_projects` when project selection is needed and `telegram_agent_start_job` to commit the guarded job. If more than one project matches, answer Luna's project question; there is no deterministic project-picker or Start callback in the conversational path.
+
+Record the task/status message ids and confirm that only one active job exists:
 
 ```bash
 bb telegram-agent job list --json
@@ -88,13 +99,9 @@ bb telegram-agent job list --json
 
 Do not record raw private message text.
 
-### 4. Select the project and confirm
-
-Use the Telegram project picker, select the disposable alias, and press **Start** only after the confirmation view appears. Record the selected alias, confirmation/status message ids, and resulting job id/state.
-
 ### 5. Capture implementation handoff and worker isolation
 
-Verify that BB creates a visible implementation thread in a managed worktree. Record the thread id, environment id, work-order filename/digest, executor owner/generation, and liveness source/state. Confirm the implementation input uses an attachment and a tiny handoff prompt. Prove that the thread was spawned and not forked.
+Verify that the leased executor creates a visible implementation thread in a managed worktree on the disposable project's exact source host. Record the thread id, environment id, work-order filename/digest, executor owner/generation, and liveness source/state. Confirm the implementation input uses an attachment and a small handoff prompt. Prove that the thread was spawned and not forked. Confirm the hidden controller remains in its personal workspace and cannot see the implementation checkout.
 
 ### 6. Observe the PR and bind its exact head
 
@@ -102,7 +109,7 @@ When the implementation thread is idle with a pull request, record the PR number
 
 ### 7. Run the first review and forced remediation
 
-Verify a visible spawned review child in the implementation environment, its immutable review-packet filename/digest, and its liveness source/state. Supply a strict JSON `changes_requested` verdict. Record the verdict and bounded finding summary. Confirm remediation is sent to the original implementation thread and that the review attempt remains bound to its original head.
+Verify a visible spawned review child in the implementation environment, its immutable review-packet filename/digest, and its liveness source/state. Confirm it has a fresh provider conversation rather than the implementation transcript. Supply a strict JSON `changes_requested` verdict. Record the verdict and bounded finding summary. Confirm remediation is sent to the original implementation thread and that the review attempt remains bound to its original head.
 
 ### 8. Produce a new implementation head and fresh review
 
@@ -131,6 +138,8 @@ bb plugin logs telegram-agent -n 50
 
 Record the final installed/running status and confirm logs contain no crash loop and no secret material.
 
+Also exercise one recoverable Telegram failure: an expired callback must not replay, or an uneditable status must be replaced and its new message id persisted. Record the classification and bounded recovery outcome without recording the response body.
+
 ## Final acceptance decision
 
-Accept only when the evidence sheet contains all required ids, attachment names/digests, thread/environment relationships, three review attempts, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, and restart recovery. If the owner did not configure the token or the disposable project was not used, report the live acceptance as **not run**, not successful.
+Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, three review attempts, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, Telegram recovery, and restart recovery. If the owner did not configure the token or the disposable project was not used, report the live acceptance as **not run**, not successful.

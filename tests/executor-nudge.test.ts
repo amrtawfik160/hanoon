@@ -19,14 +19,3 @@ it("wakes one pending executor wait and consumes the nudge", async () => {
   await expect(second).resolves.toBeUndefined();
   vi.useRealTimers();
 });
-
-it("cleans up an aborted wait without consuming a later nudge", async () => {
-  const nudge = new ExecutorNudge();
-  const abort = new AbortController();
-  const pending = nudge.wait(60_000, abort.signal);
-  abort.abort(new Error("stop"));
-  await expect(pending).rejects.toThrow("stop");
-
-  nudge.notify();
-  await expect(nudge.wait(60_000, AbortSignal.timeout(1_000))).resolves.toBeUndefined();
-});

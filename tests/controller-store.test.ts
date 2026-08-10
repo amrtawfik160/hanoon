@@ -93,6 +93,30 @@ it("fences controller mutations against a stale executor generation", () => {
   expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
 });
 
+it("fails a stale uncertain dispatch closed so the FIFO can continue", () => {
+  const { store } = fixture();
+  const first = store.enqueueControllerTurn(turnInput(351, "first"));
+  store.enqueueControllerTurn(turnInput(352, "second"));
+  const firstFence = acquire(store);
+  expect(store.claimNextControllerTurn(firstFence)?.id).toBe(first.id);
+  const successor = store.acquireExecutorLease("successor", 32_001, 30_000);
+  if (!successor.acquired) throw new Error("missing successor lease");
+
+  expect(store.failStaleControllerDispatches({
+    ownerId: "successor",
+    generation: successor.generation,
+    now: 32_001,
+  })).toBe(true);
+
+  expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["failed", "queued"]);
+  expect(store.getOutbox(`controller:${first.id}:reply`)).toMatchObject({ status: "pending" });
+  expect(store.claimNextControllerTurn({
+    ownerId: "successor",
+    generation: successor.generation,
+    now: 32_001,
+  })).toMatchObject({ updateId: 352, state: "dispatching" });
+});
+
 it("rejects credential-shaped controller failure text", () => {
   const { store } = fixture();
   const turn = store.enqueueControllerTurn(turnInput(401));
@@ -125,4 +149,31 @@ it("does not expose a controller mapping after its paired owner is revoked", () 
   expect(store.revokeOwner(2_001)).toBe(true);
   expect(store.getControllerByThreadId("thr_owner")).toBeNull();
   expect(store.getControllerForOwner("7", "7")).toBeNull();
+});
+
+it("starts a fresh controller mapping after the same identity is revoked and paired again", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(551));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_old_context",
+  })).toBe(true);
+  expect(store.revokeOwner(2_001)).toBe(true);
+  store.createPairingCode(hashSecret("pair-again"), 2_002, 10_000);
+  expect(store.pairOwnerWithCode(hashSecret("pair-again"), "7", "7", 2_003)).toEqual({ ok: true });
+  expect(store.getControllerForOwner("7", "7")).toBeNull();
+
+  store.enqueueControllerTurn(turnInput(552, "fresh context"));
+
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    state: "pending_spawn",
+    threadId: null,
+    projectId: null,
+    hostId: null,
+  });
 });

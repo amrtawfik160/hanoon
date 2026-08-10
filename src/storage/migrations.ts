@@ -168,7 +168,7 @@ CREATE TABLE controller_threads (
   project_id TEXT,
   host_id TEXT,
   bb_thread_id TEXT UNIQUE,
-  state TEXT NOT NULL CHECK (state IN ('pending_spawn', 'active', 'failed')),
+  state TEXT NOT NULL CHECK (state IN ('pending_spawn', 'active', 'failed', 'revoked')),
   pending_spawn_token TEXT UNIQUE,
   last_error TEXT,
   created_at INTEGER NOT NULL,

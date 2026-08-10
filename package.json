@@ -9,7 +9,7 @@
   },
   "bb": {
     "name": "Telegram Agent",
-    "description": "Control reviewed BB implementation jobs from a paired Telegram chat.",
+    "description": "Talk to a Luna Max controller and run reviewed BB implementation jobs from Telegram.",
     "branding": { "icon": "Bot" },
     "server": "./server.ts",
     "skills": []

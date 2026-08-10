@@ -141,6 +141,7 @@ describe("Telegram Bot API client", () => {
     ["Unauthorized", 401, "authentication"],
     ["Too Many Requests", 429, "retryable"],
     ["Internal Server Error", 500, "retryable"],
+    ["Unknown response", 600, "permanent"],
     ["Bad Request: chat not found", 400, "permanent"],
   ])("classifies %s", (description, errorCode, expected) => {
     const error = new TelegramApiError({

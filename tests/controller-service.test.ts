@@ -5,10 +5,6 @@ import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import {
   BbControllerAdapter,
-  CONTROLLER_MODEL,
-  CONTROLLER_PERMISSION,
-  CONTROLLER_PROVIDER,
-  CONTROLLER_REASONING,
   type ControllerAdapter,
 } from "../src/controller/bb-controller";
 import { LunaControllerService } from "../src/controller/service";
@@ -90,12 +86,6 @@ it("spawns the hidden personal controller with the exact Luna Max execution tupl
 
   await adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000));
 
-  expect({ CONTROLLER_PROVIDER, CONTROLLER_MODEL, CONTROLLER_REASONING, CONTROLLER_PERMISSION }).toEqual({
-    CONTROLLER_PROVIDER: "codex",
-    CONTROLLER_MODEL: "gpt-5.6-luna",
-    CONTROLLER_REASONING: "max",
-    CONTROLLER_PERMISSION: "auto",
-  });
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
     projectId: "proj_personal",
     providerId: "codex",
@@ -225,4 +215,43 @@ it("fails an uncertain send closed and never submits it twice", async () => {
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(false);
   expect(adapter.send).toHaveBeenCalledTimes(1);
   expect(store.listControllerTurns("owner-7-controller", 10).at(-1)?.state).toBe("failed");
+});
+
+it("keeps an idle submitted turn durable when BB output retrieval fails transiently", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 31, inputText: "answer after retry" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_controller",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+  })).toBe(true);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    output: vi.fn(async () => { throw new Error("temporary BB output failure"); }),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
+
+  await expect(service.reconcile(fence, fence.signal)).rejects.toThrow("temporary BB output failure");
+
+  expect(store.listControllerTurns("owner-7-controller", 10)[0]?.state).toBe("submitted");
+  expect(store.getOutbox(`controller:${turn.id}:reply`)).toBeNull();
 });

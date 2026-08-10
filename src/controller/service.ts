@@ -101,6 +101,9 @@ export class LunaControllerService {
   }
 
   public async reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
+    if (this.dependencies.store.failStaleControllerDispatches(
+      fenceAt(fence, this.dependencies.clock.now()),
+    )) return true;
     const owner = this.dependencies.store.getOwner();
     if (!owner) return false;
     const controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
@@ -131,12 +134,7 @@ export class LunaControllerService {
       return true;
     }
 
-    let response: string | null;
-    try {
-      response = boundedResponse(await this.dependencies.adapter.output(controller.threadId, signal));
-    } catch {
-      response = null;
-    }
+    const response = boundedResponse(await this.dependencies.adapter.output(controller.threadId, signal));
     if (!response) {
       this.fail(submitted, fence, "Controller completed without a usable response");
       return true;

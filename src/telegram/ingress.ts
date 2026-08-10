@@ -20,7 +20,6 @@ import {
   parseCallbackData,
   persistableJobStatusPayload,
   renderJobStatus,
-  renderProjectPicker,
   type CallbackAction,
 } from "./view";
 import { TelegramRequestError } from "./client";
@@ -64,19 +63,6 @@ const PRIVATE_ID = /^[1-9][0-9]*$/;
 const MAX_TASK_TEXT = 4_000;
 const MAX_AUDIT_RECORDS = 256;
 const STATUS_LOGICAL_SUFFIX = ":status";
-
-export function stableJobId(chatId: string, updateId: number): string {
-  if (typeof chatId !== "string" || !PRIVATE_ID.test(chatId)) {
-    throw new TypeError("chatId must be a canonical positive decimal string");
-  }
-  if (!Number.isInteger(updateId) || updateId < 0) {
-    throw new TypeError("updateId must be a non-negative integer");
-  }
-  return createHash("sha256")
-    .update(`telegram-job:${chatId}:${updateId}`, "utf8")
-    .digest("base64url")
-    .slice(0, 22);
-}
 
 function stableControllerKey(userId: string, chatId: string): string {
   return createHash("sha256")

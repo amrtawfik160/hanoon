@@ -1250,6 +1250,7 @@ export interface TelegramAgentStore {
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
   getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null;
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
+  failStaleControllerDispatches(fence: ControllerLeaseFence): boolean;
   markControllerSpawned(input: ControllerLeaseFence & {
     turnId: string;
     projectId: string;
@@ -1506,6 +1507,17 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     completedAt: row.completed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function controllerFailureOutbox(turnId: string, chatId: string): OutboxInput {
+  return {
+    logicalKey: `controller:${turnId}:reply`,
+    chatId,
+    payload: {
+      text: "I couldn't complete that controller turn safely. Please resend your request.",
+      disable_web_page_preview: true,
+    },
   };
 }
 
@@ -1909,12 +1921,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   public revokeOwner(now: number): boolean {
-    const result = this.db
-      .prepare(
-        "UPDATE owners SET revoked_at = ? WHERE singleton = 1 AND revoked_at IS NULL",
-      )
-      .run(now);
-    return result.changes === 1;
+    return this.db.transaction((): boolean => {
+      this.revokeControllerAccess(now);
+      return this.db
+        .prepare("UPDATE owners SET revoked_at = ? WHERE singleton = 1 AND revoked_at IS NULL")
+        .run(now).changes === 1;
+    }).immediate();
   }
 
   public enqueueControllerTurn(input: {
@@ -1960,6 +1972,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       )) {
         throw new TypeError("controller key belongs to a different Telegram owner");
       }
+      if (controller?.state === "revoked") {
+        this.db.prepare(
+          `UPDATE controller_threads
+              SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+                  state = 'pending_spawn', pending_spawn_token = NULL,
+                  last_error = NULL, updated_at = ?
+            WHERE controller_key = ? AND state = 'revoked'`,
+        ).run(input.now, input.controllerKey);
+      }
       if (!controller) {
         this.db.prepare(
           `INSERT INTO controller_threads (
@@ -1990,7 +2011,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           AND owners.revoked_at IS NULL
           AND owners.telegram_user_id = controller_threads.telegram_user_id
           AND owners.telegram_chat_id = controller_threads.telegram_chat_id
-        WHERE controller_threads.bb_thread_id = ?`,
+        WHERE controller_threads.bb_thread_id = ? AND controller_threads.state <> 'revoked'`,
     ).get(threadId) as ControllerThreadRow | undefined;
     return row ? parseControllerThread(row) : null;
   }
@@ -2004,7 +2025,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           AND owners.revoked_at IS NULL
           AND owners.telegram_user_id = controller_threads.telegram_user_id
           AND owners.telegram_chat_id = controller_threads.telegram_chat_id
-        WHERE controller_threads.telegram_user_id = ? AND controller_threads.telegram_chat_id = ?`,
+        WHERE controller_threads.telegram_user_id = ? AND controller_threads.telegram_chat_id = ?
+          AND controller_threads.state <> 'revoked'`,
     ).get(userId, chatId) as ControllerThreadRow | undefined;
     return row ? parseControllerThread(row) : null;
   }
@@ -2044,6 +2066,38 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(row.id, fence.now, row.controller_key);
       const claimed = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(row.id) as ControllerTurnRow;
       return parseControllerTurn(claimed);
+    }).immediate();
+  }
+
+  public failStaleControllerDispatches(fence: ControllerLeaseFence): boolean {
+    this.assertLeaseIdentity("controller-turn", fence.ownerId, fence.generation, fence.now);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(fence.ownerId, fence.generation, fence.now)) return false;
+      const stale = this.db.prepare(
+        `SELECT turn.*, controller.telegram_chat_id FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.state = 'dispatching'
+            AND (turn.lease_owner <> ? OR turn.lease_generation <> ?)
+          ORDER BY turn.created_at ASC, turn.ordinal ASC LIMIT 1`,
+      ).get(fence.ownerId, fence.generation) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
+      if (!stale) return false;
+      const error = "Controller dispatch ownership was lost before submission was confirmed";
+      const updated = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'failed', last_error = ?, completed_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'dispatching'`,
+      ).run(error, fence.now, fence.now, stale.id);
+      if (updated.changes !== 1) return false;
+      this.db.prepare(
+        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+          WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
+      ).run(fence.now, stale.controller_key, stale.id);
+      const outbox = controllerFailureOutbox(stale.id, stale.telegram_chat_id);
+      persistOutbox(this.db, outbox, serializeOutbox(outbox, fence.now), fence.now);
+      return true;
     }).immediate();
   }
 
@@ -2177,14 +2231,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
-      const outbox: OutboxInput = {
-        logicalKey: `controller:${input.turnId}:reply`,
-        chatId: row.telegram_chat_id,
-        payload: {
-          text: "I couldn't complete that controller turn safely. Please resend your request.",
-          disable_web_page_preview: true,
-        },
-      };
+      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id);
       persistOutbox(this.db, outbox, serializeOutbox(outbox, input.now), input.now);
       return true;
     }).immediate();
@@ -2237,6 +2284,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
       if (input.hasActiveJob || this.hasActiveJob()) return "active_job_conflict";
 
+      this.revokeControllerAccess(input.now);
       this.db
         .prepare(
           "UPDATE owners SET revoked_at = ? WHERE singleton = 1 AND revoked_at IS NULL",
@@ -2269,6 +2317,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         )
         .get() !== undefined
     );
+  }
+
+  private revokeControllerAccess(now: number): void {
+    this.db.prepare(
+      `UPDATE controller_turns
+          SET state = 'failed', last_error = 'Controller owner was revoked',
+              completed_at = ?, updated_at = ?
+        WHERE state IN ('queued', 'dispatching', 'submitted')`,
+    ).run(now, now);
+    this.db.prepare(
+      `UPDATE controller_threads
+          SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+              state = 'revoked', pending_spawn_token = NULL,
+              last_error = 'Controller owner was revoked', updated_at = ?
+        WHERE state <> 'revoked'`,
+    ).run(now);
   }
 
   public getTelegramIdentity(): TelegramIdentity | null {

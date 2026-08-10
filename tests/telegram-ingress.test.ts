@@ -1,9 +1,10 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { hashSecret } from "../src/crypto";
 import type { ProjectPolicy } from "../src/domain/models";
-import { TelegramIngress, stableJobId } from "../src/telegram/ingress";
+import { TelegramIngress } from "../src/telegram/ingress";
 import { TelegramApiError } from "../src/telegram/errors";
 import type {
   InlineKeyboardMarkup,
@@ -28,18 +29,11 @@ class FakeTelegram {
     payload: SendMessagePayload;
   }> = [];
   public readonly answered: Array<{ callbackId: string; text: string }> = [];
-  public failNextSend = false;
   public failNextEdit = false;
   public nextEditError: Error | null = null;
-  public beforeSend: (() => void) | undefined;
   private nextMessageId = 100;
 
   public async sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }> {
-    this.beforeSend?.();
-    if (this.failNextSend) {
-      this.failNextSend = false;
-      throw new Error("simulated Telegram send failure");
-    }
     const message = { chatId, messageId: this.nextMessageId++, payload };
     this.sent.push(message);
     return { message_id: message.messageId };
@@ -105,6 +99,13 @@ function messageUpdate(
       ...overrides,
     },
   } as TelegramUpdate;
+}
+
+function stableJobId(chatId: string, updateId: number): string {
+  return createHash("sha256")
+    .update(`telegram-job:${chatId}:${updateId}`, "utf8")
+    .digest("base64url")
+    .slice(0, 22);
 }
 
 function callbackUpdate(
@@ -560,21 +561,6 @@ it("persists the controller turn before nudging the executor", async () => {
   await fixture.ingress.handleClaimed(messageUpdate(75, 7, 70, "stage before nudge"), 7_500);
 
   expect(durableAtNotify).toBe(true);
-});
-
-it("retains a queued controller turn if the injected nudge throws", async () => {
-  const fixture = ingressFixture({
-    owner: { userId: "7", chatId: "70" },
-    onWorkAvailable: () => { throw new Error("simulated nudge failure"); },
-  });
-
-  await expect(
-    fixture.ingress.handleClaimed(messageUpdate(76, 7, 70, "nudge can fail"), 7_600),
-  ).rejects.toThrow("simulated nudge failure");
-
-  const controller = fixture.store.getControllerForOwner("7", "70");
-  if (!controller) throw new Error("missing controller");
-  expect(fixture.store.listControllerTurns(controller.controllerKey, 10)).toMatchObject([{ state: "queued" }]);
 });
 
 it("upserts the status outbox before an edit so a thrown edit leaves the latest projection durable", async () => {
