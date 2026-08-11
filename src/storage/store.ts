@@ -38,6 +38,7 @@ import {
   type ControllerTurnRecord,
   type ControllerTurnState,
 } from "../controller/models";
+import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervisor";
 import {
   nextUnansweredQuestion,
   questionOptionToken,
@@ -657,6 +658,11 @@ type ControllerTurnRow = {
   submitted_at: number | null;
   completed_at: number | null;
   awaiting_interaction_id: string | null;
+  tool_calls: number;
+  command_failures: number;
+  total_tokens: number;
+  supervisor_steers: number;
+  supervisor_reasons: string;
   created_at: number;
   updated_at: number;
 };
@@ -1576,6 +1582,13 @@ export interface TelegramAgentStore {
     cursor: number;
     text: string;
     phase: ControllerTurnRecord["streamPhase"];
+    toolCalls?: number;
+    commandFailures?: number;
+    totalTokens?: number;
+  }): boolean;
+  recordControllerSupervisorSteer(input: ControllerLeaseFence & {
+    turnId: string;
+    reason: SupervisorReason;
   }): boolean;
   refreshControllerDraft(input: ControllerLeaseFence & {
     turnId: string;
@@ -2013,9 +2026,20 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     submittedAt: row.submitted_at,
     completedAt: row.completed_at,
     awaitingInteractionId: row.awaiting_interaction_id ?? null,
+    toolCalls: row.tool_calls,
+    commandFailures: row.command_failures,
+    totalTokens: row.total_tokens,
+    supervisorSteers: row.supervisor_steers,
+    supervisorReasons: parseSupervisorReasons(row.supervisor_reasons),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+// Stored as a comma-separated slug list: the vocabulary is closed and tiny, so
+// JSON would only add a parse failure mode to a column that cannot grow.
+function parseSupervisorReasons(value: string): readonly SupervisorReason[] {
+  return value.split(",").filter((slug): slug is SupervisorReason => SUPERVISOR_REASONS.has(slug));
 }
 
 function parseControllerImage(row: ControllerTurnRow): ControllerImage | null {
@@ -2938,9 +2962,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     cursor: number;
     text: string;
     phase: ControllerTurnRecord["streamPhase"];
+    toolCalls?: number;
+    commandFailures?: number;
+    totalTokens?: number;
   }): boolean {
     this.assertControllerMutation(input);
     assertNonNegativeInteger(input.cursor, "cursor");
+    assertNonNegativeInteger(input.toolCalls ?? 0, "toolCalls");
+    assertNonNegativeInteger(input.commandFailures ?? 0, "commandFailures");
+    assertNonNegativeInteger(input.totalTokens ?? 0, "totalTokens");
     assertControllerText(input.text || "Controller stream is empty", "controller stream");
     const phases = new Set<ControllerTurnRecord["streamPhase"]>([
       "queued", "connecting", "thinking", "using_tools", "responding", "complete", "failed",
@@ -2955,11 +2985,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE turn.id = ? AND turn.state = 'submitted' AND turn.bb_event_seq < ?`,
       ).get(input.turnId, input.cursor) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
       if (!row) return false;
+      // The cursor guard that stops a replayed page from redrawing the draft is
+      // the same guard that stops it from counting its tool calls twice.
       const updated = this.db.prepare(
         `UPDATE controller_turns
-            SET bb_event_seq = ?, stream_text = ?, stream_phase = ?, updated_at = ?
+            SET bb_event_seq = ?, stream_text = ?, stream_phase = ?, updated_at = ?,
+                tool_calls = tool_calls + ?,
+                command_failures = command_failures + ?,
+                total_tokens = MAX(total_tokens, ?)
           WHERE id = ? AND state = 'submitted' AND bb_event_seq < ?`,
-      ).run(input.cursor, input.text, input.phase, input.now, input.turnId, input.cursor);
+      ).run(
+        input.cursor,
+        input.text,
+        input.phase,
+        input.now,
+        input.toolCalls ?? 0,
+        input.commandFailures ?? 0,
+        input.totalTokens ?? 0,
+        input.turnId,
+        input.cursor,
+      );
       if (updated.changes !== 1) return false;
       const displayText = input.text || (input.phase === "thinking" ? "Luna Max is thinking…" : "Connecting to Luna Max…");
       const outbox: OutboxInput = {
@@ -2970,6 +3015,34 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       };
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
+    }).immediate();
+  }
+
+  /**
+   * Records that the supervisor already nudged this turn for one reason. A
+   * tripped budget stays tripped on every later poll, so without this the same
+   * crossing would nudge the model forever.
+   */
+  public recordControllerSupervisorSteer(input: ControllerLeaseFence & {
+    turnId: string;
+    reason: SupervisorReason;
+  }): boolean {
+    this.assertControllerMutation(input);
+    if (!SUPERVISOR_REASONS.has(input.reason)) throw new TypeError("Unknown controller supervisor reason");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const updated = this.db.prepare(
+        `UPDATE controller_turns
+            SET supervisor_steers = supervisor_steers + 1,
+                supervisor_reasons = CASE
+                  WHEN supervisor_reasons = '' THEN ?
+                  ELSE supervisor_reasons || ',' || ?
+                END,
+                updated_at = ?
+          WHERE id = ? AND state = 'submitted'
+            AND instr(',' || supervisor_reasons || ',', ',' || ? || ',') = 0`,
+      ).run(input.reason, input.reason, input.now, input.turnId, input.reason);
+      return updated.changes === 1;
     }).immediate();
   }
 

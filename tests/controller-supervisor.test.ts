@@ -1,5 +1,8 @@
+import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
+import { hashSecret } from "../src/crypto";
+import { openStore } from "../src/storage/store";
 import { BbControllerAdapter } from "../src/controller/bb-controller";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
 import {
@@ -125,4 +128,122 @@ it("reports no usage for a window that carried none", async () => {
   const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
 
   expect(observation).toMatchObject({ toolCalls: 0, commandFailures: 0, totalTokens: 0 });
+});
+
+function storeFixture(name: string) {
+  const { bb } = createFakePluginHost({ pluginId: `telegram-supervisor-${name}` });
+  const store = openStore(bb.storage, bb.storage.kv, () => 2_000);
+  store.createPairingCode(hashSecret("pair"), 1_000, 10_000);
+  expect(store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001)).toEqual({ ok: true });
+  // Long enough that the stall watchdog stays out of these tests.
+  const lease = store.acquireExecutorLease("executor", 2_000, 60 * 60_000);
+  if (!lease.acquired) throw new Error("missing lease");
+  return { store, fence: { ownerId: "executor", generation: lease.generation } };
+}
+
+function submittedTurn(
+  store: ReturnType<typeof storeFixture>["store"],
+  fence: { ownerId: string; generation: number },
+) {
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 91,
+    inputText: "audit every machine",
+    now: 2_000,
+  });
+  store.claimNextControllerTurn({ ...fence, now: 2_000 });
+  store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_controller",
+  });
+  store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id });
+  return turn;
+}
+
+it("starts a turn with no recorded usage", () => {
+  const { store, fence } = storeFixture("initial");
+  const turn = submittedTurn(store, fence);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    toolCalls: 0,
+    commandFailures: 0,
+    totalTokens: 0,
+    supervisorSteers: 0,
+    supervisorReasons: [],
+  });
+});
+
+it("accumulates usage only when the stream cursor advances", () => {
+  const { store, fence } = storeFixture("accumulate");
+  const turn = submittedTurn(store, fence);
+  const at = (now: number) => ({ ...fence, now });
+
+  expect(store.updateControllerStream({
+    ...at(2_001), turnId: turn.id, cursor: 5, text: "working", phase: "thinking",
+    toolCalls: 3, commandFailures: 1, totalTokens: 900,
+  })).toBe(true);
+  // Replaying the same page must not double count what it already recorded.
+  expect(store.updateControllerStream({
+    ...at(2_002), turnId: turn.id, cursor: 5, text: "working", phase: "thinking",
+    toolCalls: 3, commandFailures: 1, totalTokens: 900,
+  })).toBe(false);
+  expect(store.updateControllerStream({
+    ...at(2_003), turnId: turn.id, cursor: 9, text: "working on", phase: "thinking",
+    toolCalls: 2, commandFailures: 0, totalTokens: 1_500,
+  })).toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    toolCalls: 5,
+    commandFailures: 1,
+    totalTokens: 1_500,
+  });
+});
+
+it("keeps the highest token total when a later window reports a lower one", () => {
+  const { store, fence } = storeFixture("token-max");
+  const turn = submittedTurn(store, fence);
+  const at = (now: number) => ({ ...fence, now });
+
+  store.updateControllerStream({
+    ...at(2_001), turnId: turn.id, cursor: 4, text: "a", phase: "thinking", totalTokens: 8_000,
+  });
+  store.updateControllerStream({
+    ...at(2_002), turnId: turn.id, cursor: 8, text: "ab", phase: "thinking", totalTokens: 0,
+  });
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ totalTokens: 8_000 });
+});
+
+it("records one steer per reason and refuses a duplicate", () => {
+  const { store, fence } = storeFixture("steers");
+  const turn = submittedTurn(store, fence);
+  const at = (now: number) => ({ ...fence, now });
+
+  expect(store.recordControllerSupervisorSteer({ ...at(2_004), turnId: turn.id, reason: "tool_budget" })).toBe(true);
+  expect(store.recordControllerSupervisorSteer({ ...at(2_005), turnId: turn.id, reason: "tool_budget" })).toBe(false);
+  expect(store.recordControllerSupervisorSteer({ ...at(2_006), turnId: turn.id, reason: "token_budget" })).toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    supervisorSteers: 2,
+    supervisorReasons: ["tool_budget", "token_budget"],
+  });
+});
+
+it("refuses to record a steer under a stale executor generation", () => {
+  const { store, fence } = storeFixture("stale");
+  const turn = submittedTurn(store, fence);
+
+  expect(store.recordControllerSupervisorSteer({
+    ownerId: fence.ownerId,
+    generation: fence.generation + 1,
+    now: 2_004,
+    turnId: turn.id,
+    reason: "tool_budget",
+  })).toBe(false);
 });

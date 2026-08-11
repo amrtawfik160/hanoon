@@ -648,6 +648,14 @@ ALTER TABLE controller_turns ADD COLUMN image_mime_type TEXT;
 ALTER TABLE controller_turns ADD COLUMN image_size_bytes INTEGER;
 `] as const;
 
+export const CONTROLLER_SUPERVISOR_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN command_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN supervisor_steers INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN supervisor_reasons TEXT NOT NULL DEFAULT '';
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -667,4 +675,5 @@ export const ALL_MIGRATIONS = [
   ...NOTICE_COOLDOWN_MIGRATIONS,
   ...AUTONOMY_MIGRATIONS,
   ...CONTROLLER_IMAGE_MIGRATIONS,
+  ...CONTROLLER_SUPERVISOR_MIGRATIONS,
 ] as const;
