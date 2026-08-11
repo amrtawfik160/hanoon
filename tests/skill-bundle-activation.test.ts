@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { afterEach, expect, test } from "vitest";
 import { activatePlugin } from "../server";
-import { verifySkillBundle } from "../src/agent-skills/bundle-integrity.js";
+import { resolvePluginRoot, verifySkillBundle } from "../src/agent-skills/bundle-integrity.js";
 
 const repositoryRoot = new URL("..", import.meta.url).pathname;
 const temporaryRoots: string[] = [];
@@ -30,6 +31,21 @@ function updateLockedDigest(root: string, path: string): void {
   const record = lock.files.find((entry) => entry.path === path);
   if (!record) throw new Error(`Missing test lock record for ${path}`);
   record.sha256 = createHash("sha256").update(readFileSync(join(root, path))).digest("hex");
+  writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+}
+
+function updateLock(root: string, mutate: (lock: {
+  files: Array<{ path: string; sha256: string }>;
+  skills: Array<{ id: string; skillPath: string; source: string; license: string }>;
+}) => void): void {
+  const lockPath = join(root, "skills/skills.lock.json");
+  const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
+    files: Array<{ path: string; sha256: string }>;
+    skills: Array<{ id: string; skillPath: string; source: string; license: string }>;
+  };
+  mutate(lock);
+  lock.files.sort((left, right) => left.path.localeCompare(right.path));
+  lock.skills.sort((left, right) => left.id.localeCompare(right.id));
   writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 }
 
@@ -66,20 +82,73 @@ test("verifies the real committed bundle", () => {
   expect(verified.bundleDigest).toMatch(/^[a-f0-9]{64}$/);
 });
 
-test("permits the pinned workflow-kit cross-skill Markdown resources", () => {
-  expect(() => verifySkillBundle(repositoryRoot)).not.toThrow();
-});
-
-test("rejects a Markdown resource that escapes its registered skill root", () => {
+test.each([
+  ["inline", "[escape](../../workflow-kit/LICENSE)"],
+  ["reference-style", "[escape]: ../../workflow-kit/LICENSE"],
+])("rejects a %s Markdown resource that escapes its registered skill root", (_variant, link) => {
   const root = copiedBundleRoot();
   const skillPath = "skills/guards/clean-code-guard/SKILL.md";
   const absolutePath = join(root, skillPath);
-  writeFileSync(absolutePath, `${readFileSync(absolutePath, "utf8")}\n[escape](../../workflow-kit/LICENSE)\n`);
+  writeFileSync(absolutePath, `${readFileSync(absolutePath, "utf8")}\n${link}\n`);
   updateLockedDigest(root, skillPath);
 
   expect(() => verifySkillBundle(root)).toThrow(
     `Skill bundle integrity error: Markdown link escapes registered skill root: ${skillPath} -> ../../workflow-kit/LICENSE`,
   );
+});
+
+test.each(["root", "ancestor"])("rejects a symbolic link in a plugin-root %s component before bundle reads", (position) => {
+  const parent = mkdtempSync(join(tmpdir(), "telegram-agent-root-link-"));
+  temporaryRoots.push(parent);
+  const actualRoot = position === "root" ? join(parent, "actual") : join(parent, "actual", "plugin");
+  mkdirSync(actualRoot, { recursive: true });
+  cpSync(join(repositoryRoot, "package.json"), join(actualRoot, "package.json"));
+  cpSync(join(repositoryRoot, "skills"), join(actualRoot, "skills"), { recursive: true });
+  const link = join(parent, "linked");
+  symlinkSync(position === "root" ? actualRoot : dirname(actualRoot), link, "dir");
+  const linkedRoot = position === "root" ? link : join(link, "plugin");
+
+  expect(() => verifySkillBundle(linkedRoot)).toThrow(/symbolic link is not allowed in plugin root/);
+});
+
+test.each([
+  ["missing workflow id", (root: string) => {
+    const prefix = "skills/workflow-kit/brainstorming/";
+    rmSync(join(root, "skills/workflow-kit/brainstorming"), { recursive: true, force: true });
+    updateLock(root, (lock) => {
+      lock.skills = lock.skills.filter((skill) => skill.id !== "brainstorming");
+      lock.files = lock.files.filter((file) => !file.path.startsWith(prefix));
+    });
+  }],
+  ["extra workflow id", (root: string) => {
+    const skillPath = "skills/workflow-kit/unreviewed/SKILL.md";
+    mkdirSync(dirname(join(root, skillPath)), { recursive: true });
+    writeFileSync(join(root, skillPath), "---\nname: unreviewed\ndescription: fixture\n---\n");
+    updateLock(root, (lock) => {
+      lock.skills.push({ id: "unreviewed", skillPath, source: "https://github.com/obra/superpowers", license: "MIT" });
+      lock.files.push({ path: skillPath, sha256: createHash("sha256").update(readFileSync(join(root, skillPath))).digest("hex") });
+    });
+  }],
+  ["guard id in the workflow root", (root: string) => {
+    const oldPrefix = "skills/guards/clean-code-guard/";
+    const newPrefix = "skills/workflow-kit/clean-code-guard/";
+    renameSync(join(root, oldPrefix), join(root, newPrefix));
+    updateLock(root, (lock) => {
+      const skill = lock.skills.find((record) => record.id === "clean-code-guard");
+      if (!skill) throw new Error("Missing clean-code-guard fixture record");
+      skill.skillPath = `${newPrefix}SKILL.md`;
+      skill.source = "https://github.com/obra/superpowers";
+      skill.license = "MIT";
+      for (const file of lock.files) {
+        if (file.path.startsWith(oldPrefix)) file.path = `${newPrefix}${file.path.slice(oldPrefix.length)}`;
+      }
+    });
+  }],
+])("rejects a catalog with %s", (_scenario, mutate) => {
+  const root = copiedBundleRoot();
+  mutate(root);
+
+  expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: required skill catalog differs");
 });
 
 test("rejects an oversized discovered bundle tree before hashing locked files", () => {
@@ -105,14 +174,38 @@ test.each([
   expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: malformed frontmatter");
 });
 
-test("rejects a reference-style Markdown link that escapes its registered skill root", () => {
-  const root = copiedBundleRoot();
-  const skillPath = "skills/guards/clean-code-guard/SKILL.md";
-  const absolutePath = join(root, skillPath);
-  writeFileSync(absolutePath, `${readFileSync(absolutePath, "utf8")}\n[escape]: ../../workflow-kit/LICENSE\n`);
-  updateLockedDigest(root, skillPath);
+test("root discovery skips only malformed package JSON", () => {
+  const root = mkdtempSync(join(tmpdir(), "telegram-agent-root-discovery-"));
+  temporaryRoots.push(root);
+  writeFileSync(join(root, "package.json"), '{"name":"bb-plugin-telegram-agent"}\n');
+  const nested = join(root, "nested", "dist");
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(join(root, "nested", "package.json"), "{malformed\n");
 
-  expect(() => verifySkillBundle(root)).toThrow(
-    `Skill bundle integrity error: Markdown link escapes registered skill root: ${skillPath} -> ../../workflow-kit/LICENSE`,
-  );
+  expect(resolvePluginRoot(pathToFileURL(join(nested, "server.js")).href)).toBe(root);
+});
+
+test("root discovery propagates a non-regular package.json read failure", () => {
+  const root = mkdtempSync(join(tmpdir(), "telegram-agent-root-discovery-"));
+  temporaryRoots.push(root);
+  writeFileSync(join(root, "package.json"), '{"name":"bb-plugin-telegram-agent"}\n');
+  const nested = join(root, "nested", "dist");
+  mkdirSync(join(root, "nested", "package.json"), { recursive: true });
+  mkdirSync(nested, { recursive: true });
+
+  expect(() => resolvePluginRoot(pathToFileURL(join(nested, "server.js")).href)).toThrow(/not a regular file/);
+});
+
+test("root discovery rejects an oversized package.json before parsing it", () => {
+  const root = mkdtempSync(join(tmpdir(), "telegram-agent-root-discovery-"));
+  temporaryRoots.push(root);
+  writeFileSync(join(root, "package.json"), '{"name":"bb-plugin-telegram-agent"}\n');
+  const nested = join(root, "nested", "dist");
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(join(root, "nested", "package.json"), JSON.stringify({
+    name: "bb-plugin-telegram-agent",
+    padding: "x".repeat(256 * 1024),
+  }));
+
+  expect(() => resolvePluginRoot(pathToFileURL(join(nested, "server.js")).href)).toThrow(/file exceeds 262144 bytes/);
 });

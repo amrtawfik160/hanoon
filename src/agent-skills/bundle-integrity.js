@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { skillFrontmatterName } from "./frontmatter.js";
@@ -11,6 +11,27 @@ const MAX_LOCKED_FILES = 512;
 const MAX_MARKDOWN_LINKS = 128;
 const LOCK_PATH = "skills/skills.lock.json";
 const REGISTERED_ROOTS = ["skills/workflow-kit", "skills/guards"];
+const WORKFLOW_SKILL_IDS = [
+  "brainstorming",
+  "dispatching-parallel-agents",
+  "executing-plans",
+  "finishing-a-development-branch",
+  "receiving-code-review",
+  "requesting-code-review",
+  "subagent-driven-development",
+  "systematic-debugging",
+  "test-driven-development",
+  "using-git-worktrees",
+  "using-superpowers",
+  "verification-before-completion",
+  "writing-plans",
+  "writing-skills",
+];
+const GUARD_SKILL_IDS = ["clean-code-guard", "docs-guard", "test-guard"];
+const REQUIRED_SKILL_PATHS = new Map([
+  ...WORKFLOW_SKILL_IDS.map((id) => [id, `skills/workflow-kit/${id}/SKILL.md`]),
+  ...GUARD_SKILL_IDS.map((id) => [id, `skills/guards/${id}/SKILL.md`]),
+]);
 
 function integrityError(reason) {
   return new Error(`Skill bundle integrity error: ${reason}`);
@@ -31,27 +52,69 @@ function normalizedRelativePath(path, description) {
   return path;
 }
 
-function readRegularFile(path, relativePath, maximumBytes) {
-  if (!existsSync(path)) throw integrityError(`missing ${relativePath}`);
-  const stats = lstatSync(path);
+function lstatIfPresent(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function pathInside(root, path) {
+  const pathFromRoot = relative(root, path);
+  return pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot);
+}
+
+function assertPathComponents(root, path, relativePath) {
+  if (!pathInside(root, path)) throw integrityError(`path escapes plugin root: ${relativePath}`);
+  let current = root;
+  let stats = lstatSync(root);
+  for (const component of relative(root, path).split(sep).filter(Boolean)) {
+    current = join(current, component);
+    stats = lstatIfPresent(current);
+    if (!stats) throw integrityError(`missing ${relativePath}`);
+    if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
+  }
+  const canonical = realpathSync(path);
+  if (!pathInside(root, canonical)) throw integrityError(`real path escapes plugin root: ${relativePath}`);
+  return stats;
+}
+
+function readRegularFile(pluginRoot, path, relativePath, maximumBytes) {
+  const stats = assertPathComponents(pluginRoot, path, relativePath);
   if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
   if (!stats.isFile()) throw integrityError(`not a regular file: ${relativePath}`);
   if (stats.size > maximumBytes) throw integrityError(`file exceeds ${maximumBytes} bytes: ${relativePath}`);
   return readFileSync(path);
 }
 
-function assertDirectory(path, relativePath) {
-  if (!existsSync(path)) throw integrityError(`missing root: ${relativePath}`);
-  const stats = lstatSync(path);
+function assertDirectory(pluginRoot, path, relativePath) {
+  const stats = assertPathComponents(pluginRoot, path, relativePath);
   if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
   if (!stats.isDirectory()) throw integrityError(`not a directory: ${relativePath}`);
+}
+
+function verifiedPluginRoot(pluginRoot) {
+  const absoluteRoot = resolve(pluginRoot);
+  const filesystemRoot = parse(absoluteRoot).root;
+  let current = filesystemRoot;
+  for (const component of relative(filesystemRoot, absoluteRoot).split(sep).filter(Boolean)) {
+    current = join(current, component);
+    const stats = lstatIfPresent(current);
+    if (!stats) throw integrityError(`missing plugin root: ${absoluteRoot}`);
+    if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed in plugin root: ${current}`);
+  }
+  const stats = lstatSync(absoluteRoot);
+  if (!stats.isDirectory()) throw integrityError(`plugin root is not a directory: ${absoluteRoot}`);
+  return realpathSync(absoluteRoot);
 }
 
 function parseLock(pluginRoot) {
   const lockAbsolute = join(pluginRoot, LOCK_PATH);
   let decoded;
   try {
-    decoded = JSON.parse(readRegularFile(lockAbsolute, LOCK_PATH, MAX_LOCK_BYTES).toString("utf8"));
+    decoded = JSON.parse(readRegularFile(pluginRoot, lockAbsolute, LOCK_PATH, MAX_LOCK_BYTES).toString("utf8"));
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Skill bundle integrity error:")) throw error;
     throw integrityError(`malformed lock JSON: ${LOCK_PATH}`);
@@ -69,7 +132,7 @@ function parseLock(pluginRoot) {
 function declaredRoots(pluginRoot) {
   let manifest;
   try {
-    manifest = JSON.parse(readRegularFile(join(pluginRoot, "package.json"), "package.json", MAX_FILE_BYTES).toString("utf8"));
+    manifest = JSON.parse(readRegularFile(pluginRoot, join(pluginRoot, "package.json"), "package.json", MAX_FILE_BYTES).toString("utf8"));
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Skill bundle integrity error:")) throw error;
     throw integrityError("malformed package.json");
@@ -83,7 +146,7 @@ function declaredRoots(pluginRoot) {
 function collectFiles(pluginRoot, roots) {
   const files = [];
   const visit = (absolute, relativePath) => {
-    const stats = lstatSync(absolute);
+    const stats = assertPathComponents(pluginRoot, absolute, relativePath);
     if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
     if (stats.isDirectory()) {
       for (const entry of readdirSync(absolute).sort()) visit(join(absolute, entry), `${relativePath}/${entry}`);
@@ -95,7 +158,7 @@ function collectFiles(pluginRoot, roots) {
     files.push(relativePath);
   };
   for (const root of roots) {
-    assertDirectory(join(pluginRoot, root), root);
+    assertDirectory(pluginRoot, join(pluginRoot, root), root);
     visit(join(pluginRoot, root), root);
   }
   return files.sort();
@@ -113,7 +176,7 @@ function verifyFiles(pluginRoot, lockFiles, actualFiles) {
     if (previousPath && previousPath.localeCompare(path) >= 0) throw integrityError("locked files are not lexically sorted");
     previousPath = path;
     lockedPaths.add(path);
-    const contents = readRegularFile(join(pluginRoot, path), path, MAX_FILE_BYTES);
+    const contents = readRegularFile(pluginRoot, join(pluginRoot, path), path, MAX_FILE_BYTES);
     const actual = createHash("sha256").update(contents).digest("hex");
     if (actual !== entry.sha256) throw bundleError(`digest mismatch: ${path}`);
   }
@@ -125,8 +188,8 @@ function verifyFiles(pluginRoot, lockFiles, actualFiles) {
   }
 }
 
-function skillName(skillPath, path) {
-  const contents = readRegularFile(skillPath, path, MAX_FILE_BYTES).toString("utf8");
+function skillName(pluginRoot, skillPath, path) {
+  const contents = readRegularFile(pluginRoot, skillPath, path, MAX_FILE_BYTES).toString("utf8");
   let name;
   try {
     name = skillFrontmatterName(contents);
@@ -174,7 +237,14 @@ function verifyNestedResources(pluginRoot, skillPath, contents) {
       throw integrityError(`Markdown link escapes registered skill root: ${skillPath} -> ${target}`);
     }
     const bundlePath = relative(pluginRoot, resolved).replaceAll(sep, "/");
-    readRegularFile(resolved, bundlePath, MAX_FILE_BYTES);
+    readRegularFile(pluginRoot, resolved, bundlePath, MAX_FILE_BYTES);
+  }
+}
+
+function assertRequiredCatalog(records) {
+  if (records.size !== REQUIRED_SKILL_PATHS.size) throw integrityError("required skill catalog differs");
+  for (const [id, expectedPath] of REQUIRED_SKILL_PATHS) {
+    if (records.get(id)?.skillPath !== expectedPath) throw integrityError("required skill catalog differs");
   }
 }
 
@@ -187,6 +257,7 @@ function verifySkills(pluginRoot, lock, roots) {
     if (records.has(record.id)) throw integrityError(`duplicate skill id: ${record.id}`);
     records.set(record.id, { ...record, skillPath });
   }
+  assertRequiredCatalog(records);
   const discovered = [];
   for (const root of roots) {
     for (const entry of readdirSync(join(pluginRoot, root), { withFileTypes: true })) {
@@ -196,7 +267,7 @@ function verifySkills(pluginRoot, lock, roots) {
       discovered.push(entry.name);
       const record = records.get(entry.name);
       if (record.skillPath !== path) throw integrityError(`skill lock path differs for ${entry.name}`);
-      const parsed = skillName(join(pluginRoot, path), path);
+      const parsed = skillName(pluginRoot, join(pluginRoot, path), path);
       if (parsed.name !== entry.name || parsed.name !== record.id) throw integrityError(`frontmatter name differs from lock record: ${path}`);
       verifyNestedResources(pluginRoot, path, parsed.contents);
     }
@@ -206,7 +277,7 @@ function verifySkills(pluginRoot, lock, roots) {
   if (workflow.version !== "6.2.0" || workflow.sourceUrl !== "https://github.com/obra/superpowers" || workflow.license !== "MIT" || workflow.licensePath !== "skills/workflow-kit/LICENSE") {
     throw integrityError("malformed workflow-kit provenance");
   }
-  readRegularFile(join(pluginRoot, workflow.licensePath), workflow.licensePath, MAX_FILE_BYTES);
+  readRegularFile(pluginRoot, join(pluginRoot, workflow.licensePath), workflow.licensePath, MAX_FILE_BYTES);
   for (const record of records.values()) {
     const expected = record.skillPath.startsWith("skills/workflow-kit/")
       ? ["https://github.com/obra/superpowers", "MIT"]
@@ -221,12 +292,18 @@ export function resolvePluginRoot(moduleUrl) {
   const start = dirname(fileURLToPath(moduleUrl));
   for (let current = start; ; current = dirname(current)) {
     const packagePath = join(current, "package.json");
-    if (existsSync(packagePath)) {
+    const packageStats = lstatIfPresent(packagePath);
+    if (packageStats) {
+      verifiedPluginRoot(current);
+      if (!packageStats.isFile()) throw integrityError(`not a regular file: ${packagePath}`);
+      if (packageStats.size > MAX_FILE_BYTES) throw integrityError(`file exceeds ${MAX_FILE_BYTES} bytes: ${packagePath}`);
+      let manifest;
       try {
-        if (JSON.parse(readFileSync(packagePath, "utf8")).name === "bb-plugin-telegram-agent") return current;
-      } catch {
-        // A parent package may be unrelated or malformed; keep searching upward.
+        manifest = JSON.parse(readFileSync(packagePath, "utf8"));
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
       }
+      if (manifest?.name === "bb-plugin-telegram-agent") return current;
     }
     if (dirname(current) === current || parse(current).root === current) break;
   }
@@ -235,7 +312,7 @@ export function resolvePluginRoot(moduleUrl) {
 
 /** @param {string} pluginRoot */
 export function verifySkillBundle(pluginRoot) {
-  const root = resolve(pluginRoot);
+  const root = verifiedPluginRoot(pluginRoot);
   const roots = declaredRoots(root);
   const lock = parseLock(root);
   const actualFiles = collectFiles(root, roots);

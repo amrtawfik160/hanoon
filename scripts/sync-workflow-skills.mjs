@@ -19,7 +19,28 @@ const REVIEWED_VERSION = "6.2.0";
 const REVIEWED_PACKAGE_NAME = "superpowers";
 const REVIEWED_MIT_LICENSE_SHA256 = "a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400";
 const SOURCE_URL = "https://github.com/obra/superpowers";
-const EXCLUDED_SEGMENTS = new Set([".git", ".cache", "node_modules", "coverage", "dist", "build", "out"]);
+const MAX_FILE_BYTES = 256 * 1024;
+const MAX_LOCK_BYTES = 1024 * 1024;
+const MAX_SKILLS = 64;
+const MAX_BUNDLE_FILES = 512;
+const WORKFLOW_SKILL_IDS = [
+  "brainstorming",
+  "dispatching-parallel-agents",
+  "executing-plans",
+  "finishing-a-development-branch",
+  "receiving-code-review",
+  "requesting-code-review",
+  "subagent-driven-development",
+  "systematic-debugging",
+  "test-driven-development",
+  "using-git-worktrees",
+  "using-superpowers",
+  "verification-before-completion",
+  "writing-plans",
+  "writing-skills",
+];
+const GUARD_SKILL_IDS = ["clean-code-guard", "docs-guard", "test-guard"];
+const EXCLUDED_SEGMENTS = new Set([".git", ".cache", "cache", "caches", "node_modules", "coverage", "dist", "build", "out", "output"]);
 const EXCLUDED_FILES = new Set([".DS_Store", "Thumbs.db"]);
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(moduleDirectory, "..");
@@ -61,15 +82,34 @@ function isExcluded(sourceRoot, current) {
   return segments.some((segment) => EXCLUDED_SEGMENTS.has(segment)) || EXCLUDED_FILES.has(segments.at(-1));
 }
 
-function assertRegularTree(root, current = root, label = relative(root, current)) {
+function assertRegularTree(root, current = root, label = relative(root, current), limits = null) {
   const stats = lstatIfPresent(current);
   if (!stats) fail(`missing ${label || "directory"}`);
   if (stats.isSymbolicLink()) fail(`symbolic link is not allowed: ${label || "."}`);
-  if (stats.isFile()) return;
+  if (stats.isFile()) {
+    if (stats.size > MAX_FILE_BYTES) fail(`file exceeds ${MAX_FILE_BYTES} bytes: ${label}`);
+    if (limits && ++limits.files > MAX_BUNDLE_FILES) fail(`bundle file count exceeds ${MAX_BUNDLE_FILES}`);
+    return;
+  }
   if (!stats.isDirectory()) fail(`non-regular entry is not allowed: ${label || "."}`);
   for (const entry of readdirSync(current).sort()) {
-    assertRegularTree(root, join(current, entry), label ? `${label}/${entry}` : entry);
+    assertRegularTree(root, join(current, entry), label ? `${label}/${entry}` : entry, limits);
   }
+}
+
+function assertFilteredTree(sourceRoot, current, limits) {
+  if (isExcluded(sourceRoot, current)) return;
+  const stats = lstatIfPresent(current);
+  const label = relative(sourceRoot, current) || ".";
+  if (!stats) fail(`missing ${label}`);
+  if (stats.isSymbolicLink()) fail(`symbolic link is not allowed: ${label}`);
+  if (stats.isFile()) {
+    if (stats.size > MAX_FILE_BYTES) fail(`file exceeds ${MAX_FILE_BYTES} bytes: ${label}`);
+    if (++limits.files > MAX_BUNDLE_FILES) fail(`bundle file count exceeds ${MAX_BUNDLE_FILES}`);
+    return;
+  }
+  if (!stats.isDirectory()) fail(`non-regular entry is not allowed: ${label}`);
+  for (const entry of readdirSync(current).sort()) assertFilteredTree(sourceRoot, join(current, entry), limits);
 }
 
 function assertDirectory(path, label) {
@@ -119,11 +159,11 @@ function bundleFiles(root) {
   return files;
 }
 
-function skillRecords(root, publicRoot, source, license) {
+function skillRecords(root, publicRoot, provenance, filterRoot = null) {
   if (!lstatIfPresent(root)) return [];
   const seenNames = new Set();
   return readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && (!filterRoot || !isExcluded(filterRoot, join(root, entry.name))))
     .sort((left, right) => left.name.localeCompare(right.name))
     .map((entry) => {
       const skillPath = join(root, entry.name, "SKILL.md");
@@ -132,15 +172,34 @@ function skillRecords(root, publicRoot, source, license) {
       if (id !== entry.name) fail(`skill name does not match directory: ${relative(pluginRoot, skillPath)}`);
       if (seenNames.has(id)) fail(`duplicate skill name: ${id}`);
       seenNames.add(id);
-      return { id, skillPath: `${publicRoot}/${relative(root, skillPath).replaceAll(sep, "/")}`, source, license };
+      return {
+        id,
+        skillPath: `${publicRoot}/${relative(root, skillPath).replaceAll(sep, "/")}`,
+        source: provenance.source,
+        license: provenance.license,
+      };
     });
+}
+
+function assertCatalog(records, expectedIds, expectedRoot) {
+  if (records.length > MAX_SKILLS) fail(`skill count exceeds ${MAX_SKILLS}`);
+  if (records.length !== expectedIds.length) fail(`required ${expectedRoot} skill catalog differs`);
+  for (let index = 0; index < expectedIds.length; index += 1) {
+    const expectedId = expectedIds[index];
+    const record = records[index];
+    if (record.id !== expectedId || record.skillPath !== `${expectedRoot}/${expectedId}/SKILL.md`) {
+      fail(`required ${expectedRoot} skill catalog differs`);
+    }
+  }
 }
 
 function buildLock(workflowRoot) {
   const skills = [
-    ...skillRecords(workflowRoot, "skills/workflow-kit", SOURCE_URL, "MIT"),
-    ...skillRecords(guardsRoot, "skills/guards", "project-owned", "repository"),
+    ...skillRecords(workflowRoot, "skills/workflow-kit", { source: SOURCE_URL, license: "MIT" }),
+    ...skillRecords(guardsRoot, "skills/guards", { source: "project-owned", license: "repository" }),
   ];
+  assertCatalog(skills.filter((skill) => skill.skillPath.startsWith("skills/workflow-kit/")), WORKFLOW_SKILL_IDS, "skills/workflow-kit");
+  assertCatalog(skills.filter((skill) => skill.skillPath.startsWith("skills/guards/")), GUARD_SKILL_IDS, "skills/guards");
   const ids = new Set();
   for (const skill of skills) {
     if (ids.has(skill.id)) fail(`duplicate skill name: ${skill.id}`);
@@ -155,7 +214,7 @@ function buildLock(workflowRoot) {
       sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
     }))
     .sort((left, right) => left.path.localeCompare(right.path));
-  return {
+  const lock = {
     schemaVersion: 1,
     workflowKit: {
       version: REVIEWED_VERSION,
@@ -166,6 +225,9 @@ function buildLock(workflowRoot) {
     skills: skills.sort((left, right) => left.id.localeCompare(right.id)),
     files,
   };
+  const lockContents = `${JSON.stringify(lock, null, 2)}\n`;
+  if (Buffer.byteLength(lockContents) > MAX_LOCK_BYTES) fail(`lock file exceeds ${MAX_LOCK_BYTES} bytes`);
+  return lockContents;
 }
 
 function validateSource(source, version) {
@@ -188,25 +250,50 @@ function validateSource(source, version) {
   if (metadata.version !== version) fail(`source package version ${JSON.stringify(metadata.version)} does not match ${version}`);
   const licenseDigest = createHash("sha256").update(readFileSync(license)).digest("hex");
   if (licenseDigest !== REVIEWED_MIT_LICENSE_SHA256) fail("source LICENSE does not match the reviewed MIT license");
-  assertRegularTree(source, source, "source");
+  assertSourceBundle(source, license, sourceSkills);
   return { license, sourceSkills };
+}
+
+function assertSourceBundle(source, license, sourceSkills) {
+  const limits = { files: 0 };
+  assertFilteredTree(source, license, limits);
+  assertFilteredTree(source, sourceSkills, limits);
+  assertRegularTree(guardsRoot, guardsRoot, "skills/guards", limits);
+  assertCatalog(skillRecords(sourceSkills, "skills/workflow-kit", { source: SOURCE_URL, license: "MIT" }, source), WORKFLOW_SKILL_IDS, "skills/workflow-kit");
+  assertCatalog(skillRecords(guardsRoot, "skills/guards", { source: "project-owned", license: "repository" }), GUARD_SKILL_IDS, "skills/guards");
 }
 
 function replaceBundle(stage, lockContents) {
   const stagedWorkflow = join(stage, "workflow-kit");
   const stagedLock = join(stage, "skills.lock.json");
   writeFileSync(stagedLock, lockContents);
-  const backup = join(skillsRoot, `.workflow-kit-backup-${process.pid}-${Date.now()}`);
-  const hasCurrentWorkflow = Boolean(lstatIfPresent(workflowDestination));
-  if (hasCurrentWorkflow) renameSync(workflowDestination, backup);
+  const suffix = `${process.pid}-${Date.now()}`;
+  const workflowBackup = lstatIfPresent(workflowDestination)
+    ? join(skillsRoot, `.workflow-kit-backup-${suffix}`)
+    : null;
+  const lockBackup = lstatIfPresent(lockDestination)
+    ? join(skillsRoot, `.skills-lock-backup-${suffix}`)
+    : null;
   try {
+    if (workflowBackup) renameSync(workflowDestination, workflowBackup);
+    if (lockBackup) renameSync(lockDestination, lockBackup);
     renameSync(stagedWorkflow, workflowDestination);
     renameSync(stagedLock, lockDestination);
-    if (hasCurrentWorkflow) rmSync(backup, { recursive: true, force: true });
   } catch (error) {
-    if (lstatIfPresent(workflowDestination)) rmSync(workflowDestination, { recursive: true, force: true });
-    if (hasCurrentWorkflow && lstatIfPresent(backup)) renameSync(backup, workflowDestination);
+    rollbackReplacement(workflowDestination, workflowBackup);
+    rollbackReplacement(lockDestination, lockBackup);
     throw error;
+  }
+  if (workflowBackup) rmSync(workflowBackup, { recursive: true, force: true });
+  if (lockBackup) rmSync(lockBackup, { recursive: true, force: true });
+}
+
+function rollbackReplacement(destination, backup) {
+  if (backup && lstatIfPresent(backup)) {
+    if (lstatIfPresent(destination)) rmSync(destination, { recursive: true, force: true });
+    renameSync(backup, destination);
+  } else if (!backup && lstatIfPresent(destination)) {
+    rmSync(destination, { recursive: true, force: true });
   }
 }
 
@@ -222,8 +309,10 @@ function main() {
     mkdirSync(stagedWorkflow);
     copyFiltered(license, join(stagedWorkflow, "LICENSE"), source);
     copyFiltered(sourceSkills, stagedWorkflow, source);
-    assertRegularTree(stagedWorkflow, stagedWorkflow, "staged workflow-kit");
-    const lockContents = `${JSON.stringify(buildLock(stagedWorkflow), null, 2)}\n`;
+    const stagedLimits = { files: 0 };
+    assertRegularTree(stagedWorkflow, stagedWorkflow, "staged workflow-kit", stagedLimits);
+    assertRegularTree(guardsRoot, guardsRoot, "skills/guards", stagedLimits);
+    const lockContents = buildLock(stagedWorkflow);
     assertDestinationSafe();
     replaceBundle(stage, lockContents);
   } finally {
