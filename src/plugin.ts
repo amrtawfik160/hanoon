@@ -48,6 +48,7 @@ import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
 import { ThreadNoticeService } from "./services/thread-notice-service";
+import { JobMemoryService } from "./services/job-memory-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -481,6 +482,39 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
+  const jobMemory = new JobMemoryService({
+    store,
+    threads: {
+      spawnHidden: async ({ projectId, title, prompt }) => {
+        const hosts = await bb.sdk.hosts.list({});
+        const host = hosts.find((candidate) => candidate.status === "connected");
+        if (!host) throw new Error("No connected BB host can run a memory extraction");
+        const thread = await bb.sdk.threads.spawn({
+          projectId,
+          title,
+          visibility: "hidden",
+          input: [{ type: "text", text: prompt, mentions: [] }],
+          environment: {
+            type: "host",
+            hostId: host.id,
+            workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+          },
+        });
+        return thread.id;
+      },
+      status: async (threadId) => {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
+        return thread.status;
+      },
+      output: async (threadId) => {
+        const result = await bb.sdk.threads.output({ threadId });
+        return result.output ?? "";
+      },
+    },
+    clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
+  });
   const threadNotices = new ThreadNoticeService({
     store,
     threads: {
@@ -812,6 +846,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       operations: threadOperations,
       monitors,
       threadNotices,
+      jobMemory,
       presence,
       laneSnapshots,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),

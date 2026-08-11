@@ -681,6 +681,23 @@ CREATE TABLE delegation_threads (
 );
 `] as const;
 
+export const JOB_MEMORY_MIGRATIONS = [String.raw`
+CREATE TABLE job_memory_extractions (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  project_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'done', 'failed')),
+  thread_id TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  saved_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX job_memory_extractions_due ON job_memory_extractions (state, created_at);
+ALTER TABLE memories ADD COLUMN origin TEXT;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -702,4 +719,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_IMAGE_MIGRATIONS,
   ...CONTROLLER_SUPERVISOR_MIGRATIONS,
   ...DELEGATION_MIGRATIONS,
+  ...JOB_MEMORY_MIGRATIONS,
 ] as const;

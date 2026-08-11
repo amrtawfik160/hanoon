@@ -237,6 +237,26 @@ export type MonitorRecord = {
   updatedAt: number;
 };
 
+export type JobMemoryExtractionState = "pending" | "running" | "done" | "failed";
+
+/**
+ * One attempt to learn something durable from a finished job. Jobs are the only
+ * place the plugin spends inference of its own, so this is deliberately rare:
+ * a handful a day rather than one per message.
+ */
+export type JobMemoryExtractionRecord = {
+  jobId: string;
+  projectId: string;
+  outcome: string;
+  state: JobMemoryExtractionState;
+  threadId: string | null;
+  attempts: number;
+  savedCount: number;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type DelegationState = "open" | "fired" | "cancelled" | "failed";
 export type DelegationThreadState = "running" | "finished" | "failed" | "missing";
 
@@ -277,6 +297,8 @@ export type MemoryRecord = {
   importance: number;
   confidence: number;
   source: "owner" | "agent";
+  /** Where an agent-written memory came from, e.g. "job_outcome". */
+  origin: string | null;
   sourceTurnId: string | null;
   useCount: number;
   lastUsedAt: number | null;
@@ -294,6 +316,8 @@ export type MemoryInput = {
   importance?: number;
   confidence?: number;
   source: "owner" | "agent";
+  /** Where an agent-written memory came from, e.g. "job_outcome". */
+  origin?: string;
   sourceTurnId?: string;
   now: number;
 };
@@ -1732,6 +1756,11 @@ export interface TelegramAgentStore {
   recordDelegationFired(input: { id: string; now: number }): boolean;
   failDelegation(input: { id: string; error: string; now: number }): boolean;
   cancelDelegation(id: string, now: number): boolean;
+  enrolFinishedJobsForMemory(outcomes: readonly string[], limit: number, now: number): number;
+  listJobMemoryExtractions(state: JobMemoryExtractionState, limit: number): JobMemoryExtractionRecord[];
+  startJobMemoryExtraction(input: { jobId: string; threadId: string; now: number }): boolean;
+  completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean;
+  failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean;
   rememberMemory(input: MemoryInput): MemoryRecord;
   recallMemories(input: { scope: string; query?: string; limit: number; now: number }): MemoryRecord[];
   getMemory(id: string): MemoryRecord | null;
@@ -2156,6 +2185,41 @@ type MonitorRow = {
   updated_at: number;
 };
 
+type JobMemoryExtractionRow = {
+  job_id: string;
+  project_id: string;
+  outcome: string;
+  state: string;
+  thread_id: string | null;
+  attempts: number;
+  saved_count: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+const JOB_MEMORY_EXTRACTION_STATES: ReadonlySet<string> = new Set<JobMemoryExtractionState>([
+  "pending", "running", "done", "failed",
+]);
+
+function parseJobMemoryExtraction(row: JobMemoryExtractionRow): JobMemoryExtractionRecord {
+  if (!JOB_MEMORY_EXTRACTION_STATES.has(row.state)) {
+    throw new Error(`Unknown persisted job memory extraction state: ${row.state}`);
+  }
+  return {
+    jobId: row.job_id,
+    projectId: row.project_id,
+    outcome: row.outcome,
+    state: row.state as JobMemoryExtractionState,
+    threadId: row.thread_id,
+    attempts: row.attempts,
+    savedCount: row.saved_count,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 type DelegationRow = {
   id: string;
   controller_key: string;
@@ -2251,6 +2315,7 @@ type MemoryRow = {
   importance: number;
   confidence: number;
   source: string;
+  origin: string | null;
   source_turn_id: string | null;
   use_count: number;
   last_used_at: number | null;
@@ -2323,6 +2388,7 @@ function parseMemory(row: MemoryRow): MemoryRecord {
     importance: row.importance,
     confidence: row.confidence,
     source: row.source,
+    origin: row.origin ?? null,
     sourceTurnId: row.source_turn_id,
     useCount: row.use_count,
     lastUsedAt: row.last_used_at,
@@ -4096,6 +4162,75 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return rows.map(parseDelegationThread);
   }
 
+  /**
+   * Enrolls terminal jobs that have never been learned from. Scanning for them
+   * rather than emitting an effect at the transition keeps the job state
+   * machine untouched and makes enrolment self-healing across restarts.
+   */
+  public enrolFinishedJobsForMemory(outcomes: readonly string[], limit: number, now: number): number {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    assertNonNegativeInteger(now, "now");
+    if (outcomes.length === 0) return 0;
+    const placeholders = outcomes.map(() => "?").join(", ");
+    const rows = this.db.prepare(
+      `SELECT id, state, project_id FROM jobs
+        WHERE state IN (${placeholders})
+          AND project_id IS NOT NULL
+          AND id NOT IN (SELECT job_id FROM job_memory_extractions)
+        ORDER BY updated_at ASC LIMIT ?`,
+    ).all(...outcomes, limit) as { id: string; state: string; project_id: string }[];
+    for (const row of rows) {
+      this.db.prepare(
+        `INSERT OR IGNORE INTO job_memory_extractions (
+           job_id, project_id, outcome, state, thread_id, attempts, saved_count,
+           last_error, created_at, updated_at
+         ) VALUES (?, ?, ?, 'pending', NULL, 0, 0, NULL, ?, ?)`,
+      ).run(row.id, row.project_id, row.state, now, now);
+    }
+    return rows.length;
+  }
+
+  public listJobMemoryExtractions(
+    state: JobMemoryExtractionState,
+    limit: number,
+  ): JobMemoryExtractionRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      "SELECT * FROM job_memory_extractions WHERE state = ? ORDER BY created_at ASC LIMIT ?",
+    ).all(state, limit) as JobMemoryExtractionRow[];
+    return rows.map(parseJobMemoryExtraction);
+  }
+
+  public startJobMemoryExtraction(input: { jobId: string; threadId: string; now: number }): boolean {
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET state = 'running', thread_id = ?, attempts = attempts + 1, updated_at = ?
+        WHERE job_id = ? AND state = 'pending'`,
+    ).run(input.threadId, input.now, input.jobId).changes === 1;
+  }
+
+  public completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean {
+    assertNonNegativeInteger(input.savedCount, "savedCount");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET state = 'done', saved_count = ?, updated_at = ?
+        WHERE job_id = ? AND state = 'running'`,
+    ).run(input.savedCount, input.now, input.jobId).changes === 1;
+  }
+
+  public failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean {
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET state = 'failed', last_error = ?, updated_at = ?
+        WHERE job_id = ? AND state IN ('pending', 'running')`,
+    ).run(input.error, input.now, input.jobId).changes === 1;
+  }
+
   private countOpenDelegations(controllerKey: string): number {
     const row = this.db.prepare(
       "SELECT COUNT(*) AS count FROM delegations WHERE controller_key = ? AND state = 'open'",
@@ -4151,9 +4286,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }
       this.db.prepare(
         `INSERT INTO memories (
-           id, scope, kind, subject, body, importance, confidence, source, source_turn_id,
+           id, scope, kind, subject, body, importance, confidence, source, origin, source_turn_id,
            use_count, last_used_at, superseded_by, forgotten_at, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?)`,
       ).run(
         id,
         input.scope,
@@ -4163,6 +4298,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         importance,
         confidence,
         input.source,
+        input.origin ?? null,
         input.sourceTurnId ?? null,
         input.now,
         input.now,
