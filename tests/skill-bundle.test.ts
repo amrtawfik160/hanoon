@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, test } from "vitest";
+import { ROLE_SKILLS } from "../src/agent-skills/role-resolver";
 
 const repositoryRoot = new URL("..", import.meta.url).pathname;
 const workflowIds = [
@@ -128,5 +129,13 @@ describe("committed agent skill bundle", () => {
         license: "repository",
       });
     }
+  });
+
+  test("cross-checks every role-selected skill against the registered manifest", () => {
+    const selected = Object.values(ROLE_SKILLS).flat();
+    for (const id of selected) expect(allIds, `${id} is registered in the manifest`).toContain(id);
+    expect(new Set(ROLE_SKILLS.implementation).size).toBe(ROLE_SKILLS.implementation.length);
+    expect(ROLE_SKILLS.planner).toEqual([]);
+    expect(ROLE_SKILLS.critic).toEqual([]);
   });
 });
