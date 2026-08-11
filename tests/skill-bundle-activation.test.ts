@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BbPluginApi } from "@bb/plugin-sdk";
@@ -75,6 +75,41 @@ test("rejects a Markdown resource that escapes its registered skill root", () =>
   const skillPath = "skills/guards/clean-code-guard/SKILL.md";
   const absolutePath = join(root, skillPath);
   writeFileSync(absolutePath, `${readFileSync(absolutePath, "utf8")}\n[escape](../../workflow-kit/LICENSE)\n`);
+  updateLockedDigest(root, skillPath);
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    `Skill bundle integrity error: Markdown link escapes registered skill root: ${skillPath} -> ../../workflow-kit/LICENSE`,
+  );
+});
+
+test("rejects an oversized discovered bundle tree before hashing locked files", () => {
+  const root = copiedBundleRoot();
+  const directory = join(root, "skills/guards/clean-code-guard/excess");
+  mkdirSync(directory, { recursive: true });
+  for (let index = 0; index < 460; index += 1) {
+    writeFileSync(join(directory, `extra-${String(index).padStart(3, "0")}.txt`), "x");
+  }
+
+  expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: bundle file count exceeds 512");
+});
+
+test.each([
+  ["duplicate name keys", "---\nname: clean-code-guard\nname: clean-code-guard\ndescription: fixture\n---\n"],
+  ["a literal-block fake name", "---\ndescription: |\nname: clean-code-guard\n---\n"],
+])("rejects %s in skill frontmatter", (_label, contents) => {
+  const root = copiedBundleRoot();
+  const skillPath = "skills/guards/clean-code-guard/SKILL.md";
+  writeFileSync(join(root, skillPath), contents);
+  updateLockedDigest(root, skillPath);
+
+  expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: malformed frontmatter");
+});
+
+test("rejects a reference-style Markdown link that escapes its registered skill root", () => {
+  const root = copiedBundleRoot();
+  const skillPath = "skills/guards/clean-code-guard/SKILL.md";
+  const absolutePath = join(root, skillPath);
+  writeFileSync(absolutePath, `${readFileSync(absolutePath, "utf8")}\n[escape]: ../../workflow-kit/LICENSE\n`);
   updateLockedDigest(root, skillPath);
 
   expect(() => verifySkillBundle(root)).toThrow(

@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { skillFrontmatterName } from "./frontmatter.js";
 
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_LOCK_BYTES = 1024 * 1024;
 const MAX_SKILLS = 64;
 const MAX_LOCKED_FILES = 512;
+const MAX_MARKDOWN_LINKS = 128;
 const LOCK_PATH = "skills/skills.lock.json";
 const REGISTERED_ROOTS = ["skills/workflow-kit", "skills/guards"];
 
@@ -89,6 +91,7 @@ function collectFiles(pluginRoot, roots) {
     }
     if (!stats.isFile()) throw integrityError(`not a regular file: ${relativePath}`);
     if (stats.size > MAX_FILE_BYTES) throw integrityError(`file exceeds ${MAX_FILE_BYTES} bytes: ${relativePath}`);
+    if (files.length >= MAX_LOCKED_FILES) throw integrityError(`bundle file count exceeds ${MAX_LOCKED_FILES}`);
     files.push(relativePath);
   };
   for (const root of roots) {
@@ -124,20 +127,30 @@ function verifyFiles(pluginRoot, lockFiles, actualFiles) {
 
 function skillName(skillPath, path) {
   const contents = readRegularFile(skillPath, path, MAX_FILE_BYTES).toString("utf8");
-  const frontmatter = /^---\r?\n([\s\S]{0,8192}?)\r?\n---\r?\n/.exec(contents)?.[1];
-  const name = frontmatter?.match(/^name:\s*([^\r\n#]+)\s*$/m)?.[1].trim();
-  if (!name || !/^[a-z][a-z0-9-]{0,127}$/.test(name)) throw integrityError(`missing or invalid frontmatter name: ${path}`);
+  let name;
+  try {
+    name = skillFrontmatterName(contents);
+  } catch (error) {
+    throw integrityError(`${error.message}: ${path}`);
+  }
   return { name, contents };
 }
 
 function localMarkdownTargets(contents) {
   const withoutCode = contents.replace(/^(```|~~~)[^\r\n]*\r?\n[\s\S]*?^\1[^\r\n]*\r?$/gm, "");
   const targets = [];
+  const addTarget = (target) => {
+    if (!target || target.startsWith("#") || /^(https?:|mailto:)/i.test(target)) return;
+    if (targets.length >= MAX_MARKDOWN_LINKS) throw integrityError(`Markdown link count exceeds ${MAX_MARKDOWN_LINKS}`);
+    targets.push(target.split("#", 1)[0]);
+  };
   for (const match of withoutCode.matchAll(/!?\[[^\]]*\]\(([^)]+)\)/g)) {
     const raw = match[1].trim();
     const target = raw.startsWith("<") && raw.endsWith(">") ? raw.slice(1, -1) : raw.split(/\s+/)[0];
-    if (!target || target.startsWith("#") || /^(https?:|mailto:)/i.test(target)) continue;
-    targets.push(target.split("#", 1)[0]);
+    addTarget(target);
+  }
+  for (const match of withoutCode.matchAll(/^\s*\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))(?:\s+.*)?$/gm)) {
+    addTarget(match[1] ?? match[2]);
   }
   return targets.filter(Boolean);
 }
