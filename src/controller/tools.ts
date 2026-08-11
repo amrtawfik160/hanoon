@@ -49,6 +49,7 @@ export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_list_watches",
   "telegram_agent_cancel_watch",
   "telegram_agent_health",
+  "telegram_agent_delegate",
 ] as const;
 
 type ToolDependencies = {
@@ -620,6 +621,77 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     execute: (_params, context) => {
       authorizedController(dependencies.store, context);
       return json(dependencies.health(dependencies.now()));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[18],
+    description: "Send several independent pieces of work out at once and get one combined result back. Each task opens its own BB thread; when they have all finished you are woken with their outputs and the instruction you wrote here. Use this instead of working through independent questions one at a time. Guarded code changes still belong to telegram_agent_start_job.",
+    experimental_statusLabels: { pending: "Delegating work", completed: "Delegated work" },
+    parameters: z.object({
+      instruction: z.string().trim().min(1).max(1_000)
+        .describe("What to do once every task has finished. You will receive only this text and their results."),
+      tasks: z.array(z.object({
+        projectId: z.string().min(1).max(256),
+        title: z.string().trim().min(1).max(120),
+        prompt: z.string().trim().min(1).max(4_000),
+      }).strict()).min(1).max(4),
+    }).strict(),
+    execute: async (params, context) => {
+      const controller = authorizedController(dependencies.store, context);
+      return once(dependencies, {
+        controllerKey: controller.controllerKey,
+        toolName: CONTROLLER_TOOL_NAMES[18],
+        params,
+      }, async () => {
+        // The delegation is recorded before anything is spawned, so a failure
+        // partway through leaves threads that are still joined and reported
+        // rather than orphans nobody is waiting on.
+        const delegation = dependencies.store.createDelegation({
+          controllerKey: controller.controllerKey,
+          instruction: params.instruction,
+          now: dependencies.now(),
+        });
+        const started: { threadId: string; title: string; projectId: string }[] = [];
+        for (const task of params.tasks) {
+          let threadId: string;
+          try {
+            const created = await createProjectThread({
+              sdk: dependencies.sdk,
+              projectId: task.projectId,
+              title: task.title,
+              prompt: task.prompt,
+              signal: context.signal,
+            });
+            threadId = created.thread.id;
+          } catch (error) {
+            if (started.length === 0) {
+              dependencies.store.cancelDelegation(delegation.id, dependencies.now());
+              throw error;
+            }
+            dependencies.notify();
+            return json({
+              outcome: "partial",
+              detail: "Some tasks did not start. The ones that did are still being watched and will report together.",
+              delegation: { id: delegation.id, instruction: delegation.instruction, threads: started },
+              failed: { title: task.title, reason: redactError(error).slice(0, 200) },
+            });
+          }
+          dependencies.store.addDelegationThread({
+            delegationId: delegation.id,
+            threadId,
+            projectId: task.projectId,
+            title: task.title,
+            now: dependencies.now(),
+          });
+          started.push({ threadId, title: task.title, projectId: task.projectId });
+        }
+        dependencies.notify();
+        return json({
+          outcome: "delegated",
+          delegation: { id: delegation.id, instruction: delegation.instruction, threads: started },
+        });
+      });
     },
   });
 

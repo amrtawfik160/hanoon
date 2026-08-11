@@ -832,3 +832,133 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     { threadId: "thr_controller", projectId: "proj_personal" },
   )).rejects.toThrow(/not visible/i);
 });
+
+function delegationProjects() {
+  return ["proj_a", "proj_b"].map((id) => ({
+    id,
+    kind: "standard" as const,
+    name: id,
+    gitRemoteUrl: `https://github.com/acme/${id}.git`,
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [{
+      id: `src_${id}`,
+      projectId: id,
+      isDefault: true,
+      createdAt: 1,
+      updatedAt: 1,
+      type: "local_path" as const,
+      hostId: `host_${id}`,
+      path: `/work/${id}`,
+    }],
+  }));
+}
+
+it("fans work out to one thread per task and records them against one delegation", async () => {
+  const { bb, harness, store } = fixture();
+  const spawned: string[] = [];
+  harness.sdk.stub("projects.list", async () => delegationProjects());
+  harness.sdk.stub("threads.spawn", async ({ title }: { title: string }) => {
+    spawned.push(title);
+    return { id: `thr_${spawned.length}`, environmentId: "env_worker" };
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const result = parseToolJson(await harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "tell me which of the two is worse",
+    tasks: [
+      { projectId: "proj_a", title: "invoice spike", prompt: "look into the invoice spike" },
+      { projectId: "proj_b", title: "billing latency", prompt: "look into billing latency" },
+    ],
+  }, controllerToolContext)) as { outcome: string; delegation: { id: string; threads: unknown[] } };
+
+  expect(result.outcome).toBe("delegated");
+  expect(spawned).toEqual(["invoice spike", "billing latency"]);
+  expect(store.getDelegation(result.delegation.id)).toMatchObject({
+    state: "open",
+    instruction: "tell me which of the two is worse",
+    threads: [
+      { threadId: "thr_1", projectId: "proj_a", title: "invoice spike", state: "running" },
+      { threadId: "thr_2", projectId: "proj_b", title: "billing latency", state: "running" },
+    ],
+  });
+});
+
+it("keeps the threads that did start when a later spawn fails", async () => {
+  const { bb, harness, store } = fixture();
+  let spawnCount = 0;
+  harness.sdk.stub("projects.list", async () => delegationProjects());
+  harness.sdk.stub("threads.spawn", async () => {
+    spawnCount += 1;
+    if (spawnCount === 2) throw new Error("BB refused the second spawn");
+    return { id: `thr_${spawnCount}`, environmentId: "env_worker" };
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const result = parseToolJson(await harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "compare them",
+    tasks: [
+      { projectId: "proj_a", title: "first", prompt: "first task" },
+      { projectId: "proj_b", title: "second", prompt: "second task" },
+    ],
+  }, controllerToolContext)) as { outcome: string; delegation: { id: string }; failed: { title: string } };
+
+  expect(result.outcome).toBe("partial");
+  expect(result.failed.title).toBe("second");
+  expect(store.getDelegation(result.delegation.id)).toMatchObject({
+    state: "open",
+    threads: [{ threadId: "thr_1", title: "first", state: "running" }],
+  });
+});
+
+it("opens no delegation when the very first spawn fails", async () => {
+  const { bb, harness, store } = fixture();
+  harness.sdk.stub("threads.spawn", async () => { throw new Error("BB refused the spawn"); });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "compare them",
+    tasks: [{ projectId: "proj_a", title: "only", prompt: "only task" }],
+  }, controllerToolContext)).rejects.toThrow();
+
+  expect(store.listOpenDelegations(10)).toEqual([]);
+});
+
+it("refuses to delegate for a thread that is not the durable controller", async () => {
+  const { bb, harness, store } = fixture();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "compare them",
+    tasks: [{ projectId: "proj_a", title: "only", prompt: "only task" }],
+  }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/not authorized/);
+  expect(store.listOpenDelegations(10)).toEqual([]);
+});
