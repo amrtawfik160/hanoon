@@ -3,8 +3,13 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
-import { BbControllerAdapter } from "../src/controller/bb-controller";
+import {
+  BbControllerAdapter,
+  type ControllerAdapter,
+  type ControllerStatus,
+} from "../src/controller/bb-controller";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
+import { LunaControllerService } from "../src/controller/service";
 import {
   evaluateSupervisor,
   SUPERVISOR_HARD_TOKENS,
@@ -246,4 +251,126 @@ it("refuses to record a steer under a stale executor generation", () => {
     turnId: turn.id,
     reason: "tool_budget",
   })).toBe(false);
+});
+
+type Observation = Awaited<ReturnType<ControllerAdapter["events"]>>;
+
+function serviceAdapter(observation: () => Observation, status: () => ControllerStatus): ControllerAdapter {
+  return {
+    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => status()),
+    latestSeq: vi.fn(async () => 0),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => observation()),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+}
+
+function observation(overrides: Partial<Observation> = {}): Observation {
+  return {
+    latestSeq: 1,
+    inputAccepted: true,
+    assistantDelta: "",
+    completed: false,
+    error: null,
+    pendingQuestion: null,
+    toolCalls: 0,
+    commandFailures: 0,
+    totalTokens: 0,
+    ...overrides,
+  };
+}
+
+it("steers a turn that crosses the soft tool budget, then stops it at the hard budget", async () => {
+  const { store, fence } = storeFixture("budget-path");
+  const turn = submittedTurn(store, fence);
+  let seq = 1;
+  let toolCalls = SUPERVISOR_SOFT_TOOL_CALLS;
+  const adapter = serviceAdapter(
+    () => observation({ latestSeq: (seq += 1), toolCalls }),
+    () => "active",
+  );
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
+
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  expect(adapter.steer).toHaveBeenCalledWith(
+    "thr_controller",
+    expect.stringContaining("answer now"),
+    runFence.signal,
+  );
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    supervisorSteers: 1,
+    supervisorReasons: ["tool_budget"],
+  });
+
+  // A second poll at the same tripped budget must not nudge again.
+  toolCalls = 0;
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+  expect(adapter.steer).toHaveBeenCalledTimes(1);
+
+  toolCalls = SUPERVISOR_HARD_TOOL_CALLS;
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "failed",
+    lastError: "Controller turn exceeded its budget",
+  });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
+    .toContain("ran past its budget");
+});
+
+it("leaves a turn parked on an owner question alone however much it has spent", async () => {
+  const { store, fence } = storeFixture("parked");
+  const turn = submittedTurn(store, fence);
+  expect(store.recordControllerQuestion({
+    ...fence,
+    now: 2_001,
+    turnId: turn.id,
+    interactionId: "int_1",
+    questions: [{
+      id: "q1",
+      prompt: "Which project?",
+      shortLabel: "Project",
+      multiSelect: false,
+      allowFreeText: false,
+      options: [{ value: "cyndra", label: "cyndra", description: "the invoice service" }],
+    }],
+  })).toBe(true);
+  const adapter = serviceAdapter(
+    () => observation({ latestSeq: 9, toolCalls: SUPERVISOR_HARD_TOOL_CALLS }),
+    () => "active",
+  );
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
+
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted" });
+});
+
+it("keeps the turn running when a budget nudge cannot be delivered", async () => {
+  const { store, fence } = storeFixture("steer-fails");
+  const turn = submittedTurn(store, fence);
+  const adapter = serviceAdapter(
+    () => observation({ latestSeq: 4, toolCalls: SUPERVISOR_SOFT_TOOL_CALLS }),
+    () => "active",
+  );
+  adapter.steer = vi.fn(async () => { throw new Error("steer channel is down"); });
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
+
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    supervisorSteers: 0,
+  });
 });
