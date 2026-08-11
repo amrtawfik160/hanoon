@@ -495,6 +495,7 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
   const bbUrl = safeHttpUrl(context.bbAppBaseUrl);
   if (prUrl) buttons.push({ text: "View PR", url: prUrl });
   if (bbUrl) buttons.push({ text: "Open BB", url: bbUrl });
+  if (job.cancelRequestedAt !== null) return buttons;
 
   const livenessBlocked = context.workerLiveness?.state === "unknown" || context.workerLiveness?.state === "stale";
   const queuedConfirmation = job.state === "awaiting_confirmation" &&

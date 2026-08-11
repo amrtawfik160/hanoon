@@ -558,7 +558,13 @@ it("routes standalone text to Luna while a job is active and steers only a statu
 });
 
 it("requests cancellation once and keeps it replay-safe", async () => {
-  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  let workNotifications = 0;
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => {
+      workNotifications += 1;
+    },
+  });
   const jobId = await createDraft(fixture, 50);
   const job = fixture.store.getJob(jobId);
   if (!job) throw new Error("draft was not created");
@@ -581,6 +587,10 @@ it("requests cancellation once and keeps it replay-safe", async () => {
   expect(fixture.store.getJob(jobId)?.cancelRequestedAt).toBe(5_100);
   expect(fixture.store.listEffectsForJob(jobId).filter((effect) => effect.kind === "revoke_approvals")).toHaveLength(1);
   expect(fixture.store.listEffectsForJob(jobId).filter((effect) => effect.kind === "stop_thread")).toHaveLength(1);
+  const latestStatus = fixture.telegram.edited.at(-1)?.payload;
+  expect(latestStatus?.reply_markup?.inline_keyboard.flat().map((button) => button.text) ?? []).not.toContain("Cancel");
+  expect(fixture.store.getOutbox(`job:${jobId}:status`)?.payload).toEqual(latestStatus);
+  expect(workNotifications).toBe(1);
   expect(fixture.telegram.answered).toEqual([]);
   expect(fixture.store.getOutbox("callback:cancel-callback")).toMatchObject({
     payload: { text: "Cancellation requested." },

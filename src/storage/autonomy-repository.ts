@@ -667,7 +667,7 @@ export class AutonomyRepository {
             admission.state IN ('admitted', 'draining')
             AND job.state IN (${releaseStatePlaceholders})
           ) OR (
-            admission.state = 'queued' AND job.state = 'cancelled'
+            admission.state = 'queued' AND job.cancel_requested_at IS NOT NULL
           )
           ORDER BY CASE WHEN admission.state IN ('admitted', 'draining') THEN 0 ELSE 1 END,
                    admission.queue_seq ASC, admission.job_id ASC

@@ -4802,7 +4802,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const begin = this.db.transaction((): Job | null => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
       const job = this.readJobById(input.jobId);
-      if (!job || !isReleaseCandidate(job.state)) return null;
+      const admission = this.autonomyRepository.getAdmission(input.jobId);
+      const queuedCancellation = admission?.state === "queued" && job !== null && job.cancelRequestedAt !== null;
+      if (!job || (!isReleaseCandidate(job.state) && !queuedCancellation)) return null;
       this.autonomyRepository.markDrainingInTransaction(input.jobId, input.now);
       return job;
     });
@@ -4818,7 +4820,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const admission = this.autonomyRepository.getAdmission(input.jobId);
       if (!job || !admission) return null;
       if (admission.state === "released") return { outcome: "released", admission };
-      if (!isReleaseCandidate(job.state)) return null;
+      const queuedCancellation = admission.state === "queued" && job.cancelRequestedAt !== null;
+      if (!isReleaseCandidate(job.state) && !queuedCancellation) return null;
 
       const liveness = this.getWorkerLiveness(input.jobId);
       if (liveness && ["active", "starting", "stopping"].includes(liveness.state)) {
@@ -4850,6 +4853,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         )
         .get(input.jobId, input.now);
       if (unresolvedEffects) return { outcome: "waiting", reason: "unresolved_effect" };
+
+      if (queuedCancellation && job.state !== "cancelled") {
+        const transitioned = transition(job, { type: "CANCEL_CONFIRMED" }, input.now);
+        persistJobTransition(this.db, input.jobId, job.version, transitioned.job);
+        persistPendingEffects(this.db, transitioned.effects, input.now);
+        return { outcome: "waiting", reason: "safe_cleanup" };
+      }
 
       this.autonomyRepository.markDrainingInTransaction(input.jobId, input.now);
       this.db
@@ -5470,7 +5480,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .prepare(
           `SELECT e.* FROM effects AS e
              JOIN job_admissions AS admission ON admission.job_id = e.job_id
-            WHERE admission.state IN ('queued', 'admitted', 'draining')
+             JOIN jobs AS job ON job.id = e.job_id
+            WHERE (
+                admission.state IN ('queued', 'admitted', 'draining')
+                OR (
+                  admission.state = 'released'
+                  AND job.state IN ('blocked', 'cancelled', 'merged', 'production_failed', 'complete')
+                  AND e.idempotency_key = e.job_id || ':' || job.version || ':render_status'
+                )
+              )
               AND e.kind IN ('render_status', 'revoke_approvals')
               AND (
                 (e.status IN ('pending', 'failed') AND e.next_attempt_at <= ?)

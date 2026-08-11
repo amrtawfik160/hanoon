@@ -1598,20 +1598,27 @@ describe("singleton job executor", () => {
   it("releases a queued cancellation after its safe controls settle", async () => {
     const { store } = fixture();
     const jobId = "job_executor_queued_cancel";
-    queueExecutorBoundaryJob(store, jobId);
+    const queued = queueExecutorBoundaryJob(store, jobId);
+    store.applyJobEvent(queued.id, queued.version, { type: "CANCEL_REQUESTED" }, 1_999);
     const abort = new AbortController();
+    let passes = 0;
 
     await runJobExecutorService({
       store,
       clock: { now: () => 2_000 },
-      sleep: vi.fn(async () => abort.abort()),
-      controller: queuedCancellationController(store, jobId, 2_000),
+      sleep: vi.fn(async () => {
+        passes += 1;
+        if (passes >= 2) abort.abort();
+      }),
       effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
       releaseOnShutdown: true,
     }, abort.signal);
 
     expect(store.getJob(jobId)?.state).toBe("cancelled");
     expect(store.getAdmission(jobId)?.state).toBe("released");
+    expect(store.listEffectsForJob(jobId)
+      .filter((effect) => effect.kind === "render_status")
+      .every((effect) => effect.status === "done")).toBe(true);
     expect(store.listHeldResourceClaims(jobId, 10)).toHaveLength(0);
   });
 

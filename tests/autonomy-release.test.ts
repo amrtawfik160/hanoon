@@ -216,4 +216,49 @@ describe("autonomy draining and release", () => {
     expect(store.getAdmission(selected.id)?.state).toBe("released");
     expect(store.listHeldResourceClaims(selected.id, 10)).toHaveLength(0);
   });
+
+  it("recovers a terminal status control stranded after admission release", () => {
+    const { store, db } = storeFixture();
+    const selected = selectedJob(store, "job_released_status");
+    const lease = store.acquireExecutorLease("released-status", 2_000, 30_000);
+    if (!lease.acquired) throw new Error("executor lease was not acquired");
+    const requested = store.applyExecutorJobEvent({
+      jobId: selected.id,
+      expectedVersion: selected.version,
+      event: { type: "CANCEL_REQUESTED" },
+      ownerId: "released-status",
+      generation: lease.generation,
+      now: 2_001,
+    });
+    if (!requested) throw new Error("queued cancellation request was not persisted");
+    const cancelled = store.applyExecutorJobEvent({
+      jobId: selected.id,
+      expectedVersion: requested.version,
+      event: { type: "CANCEL_CONFIRMED" },
+      ownerId: "released-status",
+      generation: lease.generation,
+      now: 2_002,
+    });
+    if (!cancelled) throw new Error("queued cancellation was not confirmed");
+    settleSafeControls(store, "released-status", lease.generation, 2_003);
+    expect(store.finalizeRelease({
+      jobId: selected.id,
+      ownerId: "released-status",
+      generation: lease.generation,
+      now: 2_005,
+    })).toMatchObject({ outcome: "released" });
+
+    const terminalStatusKey = `${selected.id}:${cancelled.version}:render_status`;
+    db.prepare(
+      "UPDATE effects SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE idempotency_key = ?",
+    ).run(2_006, 2_006, terminalStatusKey);
+    expect(store.leaseControlEffects({
+      ownerId: "released-status",
+      generation: lease.generation,
+      now: 2_007,
+      limit: 1,
+      leaseMs: 10_000,
+      busyJobIds: [],
+    }).map((effect) => effect.idempotencyKey)).toEqual([terminalStatusKey]);
+  });
 });

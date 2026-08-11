@@ -595,6 +595,7 @@ export class TelegramIngress {
         { type: "CANCEL_REQUESTED", activeWorker: this.store.getWorkerLiveness(job.id) },
         now,
       );
+      this.onWorkAvailable();
     }
     if (callback) {
       await this.deliverJobView(cancelled, this.renderStatus(cancelled), chatId, messageId, now);
