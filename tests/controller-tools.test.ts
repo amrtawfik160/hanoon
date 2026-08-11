@@ -516,6 +516,19 @@ it("routes verified implementation attempts through their exact durable effect b
     thread: { id: "thr_implementation", title: buildWorkerThreadTitle(identity), parentThreadId: null, sourceThreadId: null },
   }));
   expect(resumed).toMatchObject({ tools: [], skills: firstStart.skills, instructions: firstStart.instructions });
+
+  const wrongEnvironment = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity, {
+    thread: { id: "thr_implementation", title: buildWorkerThreadTitle(identity), parentThreadId: null, sourceThreadId: null },
+    environment: {
+      id: "env_other",
+      name: "other worker",
+      path: "/workspace/other",
+      workspaceProvisionType: "managed-worktree",
+      branchName: "agent/other",
+    },
+  }));
+  expect(wrongEnvironment).toMatchObject({ tools: [], skills: [] });
+  expect(wrongEnvironment.instructions).toBeNull();
 });
 
 it("routes review variants and pipeline stages only when their stored role and effect kind exactly agree", async () => {
@@ -547,6 +560,16 @@ it("routes review variants and pipeline stages only when their stored role and e
     }));
     expect(configuration).toMatchObject({ tools: [], skills });
     expect(configuration.instructions).toContain(`Verified worker role: ${identity.role}`);
+  }
+
+  const swappedReviewTitles = [
+    { jobId: review.job.id, attemptId: reviewId, role: "final-review" as const },
+    { jobId: finalReview.job.id, attemptId: finalReviewId, role: "review" as const },
+  ];
+  for (const identity of swappedReviewTitles) {
+    const configuration = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity));
+    expect(configuration).toMatchObject({ tools: [], skills: [] });
+    expect(configuration.instructions).toBeNull();
   }
 });
 
