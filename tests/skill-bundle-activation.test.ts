@@ -78,6 +78,20 @@ function extendDepth(parent: string, currentDepth: number, targetDepth: number):
   }
 }
 
+function fillLockedFileCount(root: string, targetCount: number): void {
+  const directory = join(root, "skills/guards/clean-code-guard/file-boundary");
+  mkdirSync(directory);
+  updateLock(root, (lock) => {
+    const filesToAdd = targetCount - lock.files.length;
+    if (filesToAdd < 0) throw new Error(`Fixture already exceeds ${targetCount} locked files`);
+    for (let index = 0; index < filesToAdd; index += 1) {
+      const path = `skills/guards/clean-code-guard/file-boundary/file-${String(index).padStart(3, "0")}.txt`;
+      writeFileSync(join(root, path), "x");
+      lock.files.push({ path, sha256: createHash("sha256").update("x").digest("hex") });
+    }
+  });
+}
+
 test("rejects a corrupted locked skill before the BB host is accessed", async () => {
   const root = copiedBundleRoot();
   const corruptedPath = "skills/guards/clean-code-guard/SKILL.md";
@@ -140,12 +154,13 @@ test.each(["root", "ancestor"])("rejects a symbolic link in a plugin-root %s com
   expect(() => verifySkillBundle(linkedRoot)).toThrow(/symbolic link is not allowed in plugin root/);
 });
 
-test("rejects a descendant symbolic link beneath a real plugin root", () => {
+test("rejects a symbolic link in an intermediate component beneath a real plugin root", () => {
   const root = copiedBundleRoot();
-  const link = join(root, "skills/guards/clean-code-guard/license-link");
-  symlinkSync(join(root, "skills/workflow-kit/LICENSE"), link);
+  const actualSkills = join(root, "in-root-skills");
+  renameSync(join(root, "skills"), actualSkills);
+  symlinkSync(actualSkills, join(root, "skills"), "dir");
 
-  expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: symbolic link is not allowed: skills/guards/clean-code-guard/license-link");
+  expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: symbolic link is not allowed: skills/skills.lock.json");
 });
 
 test.each([
@@ -217,13 +232,17 @@ test.each([
   expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: required skill catalog differs");
 });
 
-test("rejects an oversized discovered bundle tree before hashing locked files", () => {
+test("accepts exactly 512 locked bundle files", () => {
   const root = copiedBundleRoot();
-  const directory = join(root, "skills/guards/clean-code-guard/excess");
-  mkdirSync(directory, { recursive: true });
-  for (let index = 0; index < 460; index += 1) {
-    writeFileSync(join(directory, `extra-${String(index).padStart(3, "0")}.txt`), "x");
-  }
+  fillLockedFileCount(root, 512);
+
+  expect(() => verifySkillBundle(root)).not.toThrow();
+});
+
+test("rejects discovered bundle file 513 before unlocked-file validation", () => {
+  const root = copiedBundleRoot();
+  fillLockedFileCount(root, 512);
+  writeFileSync(join(root, "skills/guards/clean-code-guard/file-boundary/file-513.txt"), "x");
 
   expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: bundle file count exceeds 512");
 });
@@ -276,8 +295,14 @@ test("root discovery rejects an oversized package.json before parsing it", () =>
   expect(() => resolvePluginRoot(pathToFileURL(join(nested, "server.js")).href)).toThrow(/file exceeds 262144 bytes/);
 });
 
-test("bundle verification propagates package.json filesystem read errors", () => {
-  const root = copiedBundleRoot();
+test("root discovery propagates a nested package.json filesystem read error", () => {
+  const root = mkdtempSync(join(tmpdir(), "telegram-agent-root-discovery-"));
+  temporaryRoots.push(root);
+  writeFileSync(join(root, "package.json"), '{"name":"bb-plugin-telegram-agent"}\n');
+  const nested = join(root, "nested", "dist");
+  const nestedPackage = join(root, "nested", "package.json");
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(nestedPackage, '{"name":"not-the-plugin"}\n');
   const modulePath = join(repositoryRoot, "src/agent-skills/bundle-integrity.js");
   const harness = `
     import fs from "node:fs";
@@ -285,14 +310,14 @@ test("bundle verification propagates package.json filesystem read errors", () =>
     import { pathToFileURL } from "node:url";
     const originalRead = fs.readFileSync.bind(fs);
     fs.readFileSync = (path, options) => {
-      if (String(path) === ${JSON.stringify(join(root, "package.json"))}) {
+      if (String(path) === ${JSON.stringify(nestedPackage)}) {
         throw Object.assign(new Error("injected package read failure"), { code: "EACCES" });
       }
       return originalRead(path, options);
     };
     syncBuiltinESMExports();
-    const { verifySkillBundle } = await import(pathToFileURL(${JSON.stringify(modulePath)}).href + "?read-error");
-    verifySkillBundle(${JSON.stringify(root)});
+    const { resolvePluginRoot } = await import(pathToFileURL(${JSON.stringify(modulePath)}).href + "?read-error");
+    resolvePluginRoot(pathToFileURL(${JSON.stringify(join(nested, "server.js"))}).href);
   `;
 
   const result = spawnSync(process.execPath, ["--input-type=module", "--eval", harness], { encoding: "utf8" });

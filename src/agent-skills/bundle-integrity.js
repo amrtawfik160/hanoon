@@ -74,7 +74,6 @@ function assertPathComponents(root, path, relativePath) {
 
 function readRegularFile(pluginRoot, path, relativePath, maximumBytes) {
   const stats = assertPathComponents(pluginRoot, path, relativePath);
-  if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
   if (!stats.isFile()) throw integrityError(`not a regular file: ${relativePath}`);
   if (stats.size > maximumBytes) throw integrityError(`file exceeds ${maximumBytes} bytes: ${relativePath}`);
   return readFileSync(path);
@@ -91,7 +90,6 @@ function parsedJson(contents, malformedReason) {
 
 function assertDirectory(pluginRoot, path, relativePath) {
   const stats = assertPathComponents(pluginRoot, path, relativePath);
-  if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
   if (!stats.isDirectory()) throw integrityError(`not a directory: ${relativePath}`);
 }
 
@@ -166,7 +164,6 @@ function collectFiles(pluginRoot, roots) {
   while (pending.length > 0) {
     const current = pending.pop();
     const stats = assertPathComponents(pluginRoot, current.absolute, current.relativePath);
-    if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${current.relativePath}`);
     if (stats.isDirectory()) {
       addDirectoryChildren(current.absolute, current.relativePath, current.depth, pending, traversal);
       continue;
@@ -278,7 +275,6 @@ function verifySkills(pluginRoot, lock, roots) {
     const directory = opendirSync(join(pluginRoot, root));
     try {
       for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-        if (entry.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${root}/${entry.name}`);
         if (!entry.isDirectory()) continue;
         const path = `${root}/${entry.name}/SKILL.md`;
         if (!records.has(entry.name)) throw integrityError(`unlocked skill directory: ${root}/${entry.name}`);
