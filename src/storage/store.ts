@@ -237,6 +237,35 @@ export type MonitorRecord = {
   updatedAt: number;
 };
 
+export type DelegationState = "open" | "fired" | "cancelled" | "failed";
+export type DelegationThreadState = "running" | "finished" | "failed" | "missing";
+
+export type DelegationThreadRecord = {
+  threadId: string;
+  projectId: string;
+  title: string;
+  state: DelegationThreadState;
+  /** Bounded excerpt of the thread's final output; null until it settles. */
+  summary: string | null;
+  settledAt: number | null;
+};
+
+/**
+ * A fan-out with a join: several BB threads doing independent work, and one
+ * instruction the agent wrote to its future self for when they all land.
+ */
+export type DelegationRecord = {
+  id: string;
+  controllerKey: string;
+  instruction: string;
+  state: DelegationState;
+  threads: readonly DelegationThreadRecord[];
+  firedAt: number | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type MemoryKind = "preference" | "fact" | "decision" | "correction";
 
 export type MemoryRecord = {
@@ -843,6 +872,12 @@ const MAX_DIGEST_TURNS = 12;
 const MAX_DIGEST_TEXT = 600;
 const MAX_MONITOR_INSTRUCTION = 1_000;
 const MAX_ARMED_MONITORS = 20;
+// Four is what one owner can follow in a chat, and two open fan-outs is already
+// eight threads of work the agent has to reconcile into one answer.
+const MAX_DELEGATION_THREADS = 4;
+const MAX_OPEN_DELEGATIONS = 2;
+const MAX_DELEGATION_SUMMARY = 600;
+const MAX_DELEGATION_TITLE = 120;
 const MAX_RECEIPT_RESULT = 4_000;
 const MAX_EFFECT_KEY = 256;
 const MAX_PIPELINE_OUTPUT_BYTES = 65_536;
@@ -1677,6 +1712,26 @@ export interface TelegramAgentStore {
   cancelMonitor(id: string, now: number): boolean;
   recordMonitorFired(input: { id: string; nextDueAt: number | null; now: number }): boolean;
   failMonitor(input: { id: string; error: string; now: number }): boolean;
+  createDelegation(input: { controllerKey: string; instruction: string; now: number }): DelegationRecord;
+  addDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    projectId: string;
+    title: string;
+    now: number;
+  }): boolean;
+  listOpenDelegations(limit: number): DelegationRecord[];
+  getDelegation(id: string): DelegationRecord | null;
+  settleDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    state: Exclude<DelegationThreadState, "running">;
+    summary: string | null;
+    now: number;
+  }): boolean;
+  recordDelegationFired(input: { id: string; now: number }): boolean;
+  failDelegation(input: { id: string; error: string; now: number }): boolean;
+  cancelDelegation(id: string, now: number): boolean;
   rememberMemory(input: MemoryInput): MemoryRecord;
   recallMemories(input: { scope: string; query?: string; limit: number; now: number }): MemoryRecord[];
   getMemory(id: string): MemoryRecord | null;
@@ -2101,6 +2156,68 @@ type MonitorRow = {
   updated_at: number;
 };
 
+type DelegationRow = {
+  id: string;
+  controller_key: string;
+  instruction: string;
+  state: string;
+  fired_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type DelegationThreadRow = {
+  delegation_id: string;
+  thread_id: string;
+  project_id: string;
+  title: string;
+  ordinal: number;
+  state: string;
+  summary: string | null;
+  settled_at: number | null;
+};
+
+const DELEGATION_STATES: ReadonlySet<string> = new Set<DelegationState>([
+  "open", "fired", "cancelled", "failed",
+]);
+const DELEGATION_THREAD_STATES: ReadonlySet<string> = new Set<DelegationThreadState>([
+  "running", "finished", "failed", "missing",
+]);
+const SETTLED_DELEGATION_THREAD_STATES: ReadonlySet<string> =
+  new Set<Exclude<DelegationThreadState, "running">>(["finished", "failed", "missing"]);
+
+function parseDelegationThread(row: DelegationThreadRow): DelegationThreadRecord {
+  if (!DELEGATION_THREAD_STATES.has(row.state)) {
+    throw new Error(`Unknown persisted delegation thread state: ${row.state}`);
+  }
+  return {
+    threadId: row.thread_id,
+    projectId: row.project_id,
+    title: row.title,
+    state: row.state as DelegationThreadState,
+    summary: row.summary,
+    settledAt: row.settled_at,
+  };
+}
+
+function parseDelegation(row: DelegationRow, threads: readonly DelegationThreadRecord[]): DelegationRecord {
+  if (!DELEGATION_STATES.has(row.state)) {
+    throw new Error(`Unknown persisted delegation state: ${row.state}`);
+  }
+  return {
+    id: row.id,
+    controllerKey: row.controller_key,
+    instruction: row.instruction,
+    state: row.state as DelegationState,
+    threads,
+    firedAt: row.fired_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function parseMonitor(row: MonitorRow): MonitorRecord {
   if (row.kind !== "thread_idle" && row.kind !== "schedule") {
     throw new Error(`Unknown persisted monitor kind: ${row.kind}`);
@@ -2155,6 +2272,34 @@ function assertMemoryText(value: string, limit: number, field: string): string {
     throw new TypeError(`${field} must be between 1 and ${limit} characters`);
   }
   return text;
+}
+
+/**
+ * Delegated output is arbitrary text from a shell the agent drove, which is a
+ * far wider exposure than the agent-authored summaries the shared guard was
+ * tuned for. These patterns are additive to it, and deliberately local: they
+ * withhold text here without changing what the merge and failure paths reject.
+ */
+const DELEGATION_SECRET_PATTERNS = [
+  // Env-var style assignment: AWS_SECRET_ACCESS_KEY=…, GITHUB_TOKEN: …
+  /[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|APIKEY)[A-Z0-9_]*\s*[:=]\s*\S+/i,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+];
+
+/**
+ * A delegated thread's output is arbitrary text the agent never wrote, so it is
+ * clipped rather than rejected — and withheld entirely when it looks like it
+ * carries a credential, because this text is replayed into a later prompt.
+ */
+function clipDelegationSummary(value: string, limit: number): string | null {
+  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (text.length === 0) return null;
+  const secret = containsCredentialLikeText(text) ||
+    DELEGATION_SECRET_PATTERNS.some((pattern) => pattern.test(text));
+  if (secret) return "(withheld: output looked like it contained a credential)";
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
 function assertUnitInterval(value: number, field: string): number {
@@ -3824,6 +3969,144 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.prepare(
       "UPDATE monitors SET state = 'failed', last_error = ?, updated_at = ? WHERE id = ? AND state = 'armed'",
     ).run(input.error, input.now, input.id).changes === 1;
+  }
+
+  /**
+   * Records the intent to fan out before any thread is spawned, so a crash
+   * partway through leaves a joinable delegation rather than orphan threads
+   * nobody is waiting on.
+   */
+  public createDelegation(input: {
+    controllerKey: string;
+    instruction: string;
+    now: number;
+  }): DelegationRecord {
+    assertControllerKey(input.controllerKey);
+    const instruction = assertMemoryText(input.instruction, MAX_MONITOR_INSTRUCTION, "delegation instruction");
+    assertNonNegativeInteger(input.now, "now");
+    if (this.countOpenDelegations(input.controllerKey) >= MAX_OPEN_DELEGATIONS) {
+      throw new TypeError(`at most ${MAX_OPEN_DELEGATIONS} delegations can be open at once`);
+    }
+    const id = `del-${randomUUID()}`;
+    this.db.prepare(
+      `INSERT INTO delegations (
+         id, controller_key, instruction, state, fired_at, last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, 'open', NULL, NULL, ?, ?)`,
+    ).run(id, input.controllerKey, instruction, input.now, input.now);
+    return this.requireDelegation(id);
+  }
+
+  public addDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    projectId: string;
+    title: string;
+    now: number;
+  }): boolean {
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertControllerIdentifier(input.projectId, "projectId");
+    const title = assertMemoryText(input.title, MAX_DELEGATION_TITLE, "delegation title");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      const delegation = this.db.prepare(
+        "SELECT * FROM delegations WHERE id = ? AND state = 'open'",
+      ).get(input.delegationId) as DelegationRow | undefined;
+      if (!delegation) return false;
+      const existing = this.db.prepare(
+        "SELECT COUNT(*) AS count FROM delegation_threads WHERE delegation_id = ?",
+      ).get(input.delegationId) as { count: number };
+      if (existing.count >= MAX_DELEGATION_THREADS) {
+        throw new TypeError(`a delegation may fan out to at most ${MAX_DELEGATION_THREADS} threads`);
+      }
+      const inserted = this.db.prepare(
+        `INSERT OR IGNORE INTO delegation_threads (
+           delegation_id, thread_id, project_id, title, ordinal, state, summary, settled_at
+         ) VALUES (?, ?, ?, ?, ?, 'running', NULL, NULL)`,
+      ).run(input.delegationId, input.threadId, input.projectId, title, existing.count);
+      if (inserted.changes !== 1) return false;
+      this.db.prepare("UPDATE delegations SET updated_at = ? WHERE id = ?")
+        .run(input.now, input.delegationId);
+      return true;
+    }).immediate();
+  }
+
+  public listOpenDelegations(limit: number): DelegationRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      "SELECT * FROM delegations WHERE state = 'open' ORDER BY created_at ASC LIMIT ?",
+    ).all(limit) as DelegationRow[];
+    return rows.map((row) => parseDelegation(row, this.delegationThreads(row.id)));
+  }
+
+  public getDelegation(id: string): DelegationRecord | null {
+    const row = this.db.prepare("SELECT * FROM delegations WHERE id = ?").get(id) as DelegationRow | undefined;
+    return row ? parseDelegation(row, this.delegationThreads(row.id)) : null;
+  }
+
+  /** Settles one member exactly once; a later poll seeing the same thread is ignored. */
+  public settleDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    state: Exclude<DelegationThreadState, "running">;
+    summary: string | null;
+    now: number;
+  }): boolean {
+    // Checked at runtime too: an untyped caller must not park a member back in
+    // 'running', which would make the join wait on a thread already settled.
+    if (!SETTLED_DELEGATION_THREAD_STATES.has(input.state)) {
+      throw new TypeError("a delegation thread settles as finished, failed, or missing");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    const summary = input.summary === null
+      ? null
+      : clipDelegationSummary(input.summary, MAX_DELEGATION_SUMMARY);
+    return this.db.prepare(
+      `UPDATE delegation_threads
+          SET state = ?, summary = ?, settled_at = ?
+        WHERE delegation_id = ? AND thread_id = ? AND state = 'running'`,
+    ).run(input.state, summary, input.now, input.delegationId, input.threadId).changes === 1;
+  }
+
+  public recordDelegationFired(input: { id: string; now: number }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE delegations SET state = 'fired', fired_at = ?, updated_at = ? WHERE id = ? AND state = 'open'",
+    ).run(input.now, input.now, input.id).changes === 1;
+  }
+
+  public failDelegation(input: { id: string; error: string; now: number }): boolean {
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE delegations SET state = 'failed', last_error = ?, updated_at = ? WHERE id = ? AND state = 'open'",
+    ).run(input.error, input.now, input.id).changes === 1;
+  }
+
+  public cancelDelegation(id: string, now: number): boolean {
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      "UPDATE delegations SET state = 'cancelled', updated_at = ? WHERE id = ? AND state = 'open'",
+    ).run(now, id).changes === 1;
+  }
+
+  private delegationThreads(delegationId: string): DelegationThreadRecord[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM delegation_threads WHERE delegation_id = ? ORDER BY ordinal ASC",
+    ).all(delegationId) as DelegationThreadRow[];
+    return rows.map(parseDelegationThread);
+  }
+
+  private countOpenDelegations(controllerKey: string): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM delegations WHERE controller_key = ? AND state = 'open'",
+    ).get(controllerKey) as { count: number };
+    return row.count;
+  }
+
+  private requireDelegation(id: string): DelegationRecord {
+    const delegation = this.getDelegation(id);
+    if (!delegation) throw new Error("Persisted delegation is unavailable");
+    return delegation;
   }
 
   private countArmedMonitors(controllerKey: string): number {

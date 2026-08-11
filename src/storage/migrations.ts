@@ -656,6 +656,31 @@ ALTER TABLE controller_turns ADD COLUMN supervisor_steers INTEGER NOT NULL DEFAU
 ALTER TABLE controller_turns ADD COLUMN supervisor_reasons TEXT NOT NULL DEFAULT '';
 `] as const;
 
+export const DELEGATION_MIGRATIONS = [String.raw`
+CREATE TABLE delegations (
+  id TEXT PRIMARY KEY,
+  controller_key TEXT NOT NULL,
+  instruction TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('open', 'fired', 'cancelled', 'failed')),
+  fired_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX delegations_open ON delegations (state, created_at);
+CREATE TABLE delegation_threads (
+  delegation_id TEXT NOT NULL REFERENCES delegations(id),
+  thread_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('running', 'finished', 'failed', 'missing')),
+  summary TEXT,
+  settled_at INTEGER,
+  PRIMARY KEY (delegation_id, thread_id)
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -676,4 +701,5 @@ export const ALL_MIGRATIONS = [
   ...AUTONOMY_MIGRATIONS,
   ...CONTROLLER_IMAGE_MIGRATIONS,
   ...CONTROLLER_SUPERVISOR_MIGRATIONS,
+  ...DELEGATION_MIGRATIONS,
 ] as const;
