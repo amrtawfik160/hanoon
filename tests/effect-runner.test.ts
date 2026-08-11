@@ -2,7 +2,6 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type { JobEffect, StoredEffect } from "../src/domain/models";
-import { buildWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { admitConfirmedJob, policyFixture } from "./helpers";
@@ -118,13 +117,20 @@ describe("leased effect execution", () => {
     const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
       .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("ordinary spawn effect missing");
-    const title = buildWorkerThreadTitle({
-      jobId: job.id,
-      attemptId: `attempt:${effect.idempotencyKey}`,
-      role: "implementation",
-    });
+    const title = "Telegram job_ordinary_recovery implementation attempt:job_ordinary_recovery:2:spawn_implementation";
+    const decoyTitle = "Telegram job_ordinary_recovery implementation attempt:job_ordinary_recovery:2:spawn_implementation:decoy";
+    const spawnImplementation = vi.fn(async () => ({ id: "thr_spawned_ordinary", environmentId: "env_spawned" }));
     const listThreads = vi.fn(async () => ({
       threads: [{
+        id: "thr_wrong_ordinary",
+        projectId: "proj_1",
+        environmentId: "env_ordinary",
+        parentThreadId: null,
+        title: decoyTitle,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }, {
         id: "thr_recovered_ordinary",
         projectId: "proj_1",
         environmentId: "env_ordinary",
@@ -140,11 +146,12 @@ describe("leased effect execution", () => {
     await new EffectRunner({
       store,
       fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
-      bb: { listThreads },
+      bb: { listThreads, spawnImplementation },
       now: () => 1_002,
     }).run(claimed);
 
     expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ projectId: "proj_1" }));
+    expect(spawnImplementation).not.toHaveBeenCalled();
     expect(store.getJob(job.id)).toMatchObject({
       state: "implementing",
       implementationThreadId: "thr_recovered_ordinary",
@@ -169,13 +176,20 @@ describe("leased effect execution", () => {
     const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
       .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("pipeline spawn effect missing");
-    const title = buildWorkerThreadTitle({
-      jobId: job.id,
-      attemptId: `stage:${effect.idempotencyKey}`,
-      role: "planner",
-    });
+    const title = "Telegram job_pipeline_recovery plan stage:job_pipeline_recovery:2:spawn_plan";
+    const decoyTitle = "Telegram job_pipeline_recovery plan stage:job_pipeline_recovery:2:spawn_plan:decoy";
+    const spawnPlanner = vi.fn(async () => ({ id: "thr_spawned_pipeline", environmentId: "env_spawned" }));
     const listThreads = vi.fn(async () => ({
       threads: [{
+        id: "thr_wrong_pipeline",
+        projectId: "proj_1",
+        environmentId: "env_pipeline",
+        parentThreadId: null,
+        title: decoyTitle,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }, {
         id: "thr_recovered_pipeline",
         projectId: "proj_1",
         environmentId: "env_pipeline",
@@ -193,14 +207,13 @@ describe("leased effect execution", () => {
       fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
       bb: {
         listThreads,
-        spawnPlanner: vi.fn(async () => {
-          throw new Error("planner spawn should not be reached during recovery");
-        }),
+        spawnPlanner,
       },
       now: () => 1_002,
     }).run(claimed);
 
     expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ projectId: "proj_1" }));
+    expect(spawnPlanner).not.toHaveBeenCalled();
     expect(store.getJob(job.id)).toMatchObject({
       state: "planning",
       environmentId: "env_pipeline",

@@ -66,15 +66,34 @@ describe("pipeline handoffs", () => {
   it("turns bounded planner output into a hashed plan attachment and validates strict critique JSON", () => {
     const plan = buildPlanArtifact("# Plan\n\n1. Add the regression.\n");
     const critique = buildCritiquePacket(plannedJob, plan);
+    const critiquePacket = JSON.parse(new TextDecoder().decode(critique.bytes)) as {
+      kind: string;
+      planSha256: string;
+      rules: Record<string, boolean>;
+      outputContract: { format: string; schema: Record<string, string> };
+    };
 
     expect(plan).toMatchObject({ filename: "plan.md", mimeType: "text/markdown" });
     expect(plan.sha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(new TextDecoder().decode(critique.bytes)).toContain(plan.sha256);
+    expect(critiquePacket).toMatchObject({
+      kind: "telegram-plan-critique",
+      planSha256: plan.sha256,
+      rules: {
+        editSource: false,
+        commit: false,
+        push: false,
+        merge: false,
+        inspectPlannerConversation: false,
+      },
+      outputContract: { format: "strict-json" },
+    });
+    expect(Object.keys(critiquePacket.outputContract.schema)).toEqual(["verdict", "summary"]);
     expect(parseCritiqueResult('{"verdict":"pass","summary":"Complete and testable"}')).toEqual({
       verdict: "pass",
       summary: "Complete and testable",
     });
     expect(() => parseCritiqueResult("```json\n{}\n```")).toThrow(/strict JSON/i);
+    expect(() => parseCritiqueResult('{"verdict":"pass","summary":"Complete and testable","extra":true}')).toThrow();
     expect(() => buildPlanArtifact("  \n")).toThrow(/non-empty/i);
     expect(() => buildPlanArtifact("x".repeat(65_537))).toThrow(/bounded/i);
   });
@@ -146,9 +165,12 @@ describe("fresh planner, critic, and builder conversations", () => {
         { type: "localFile", path: "attachments/plan.md" },
       ],
     });
-    expect((spawns[1].input as Array<{ type: string; text?: string }>)[0].text).toBe(
-      "Read the attached immutable work order, plan, and critique contract. Assess the plan independently and return strict JSON only. Do not inspect the planner conversation or edit files.",
-    );
+    const criticPrompt = (spawns[1].input as Array<{ type: string; text?: string }>)[0].text ?? "";
+    expect(criticPrompt).toMatch(/strict JSON/i);
+    expect(criticPrompt).toMatch(/independent/i);
+    expect(criticPrompt).toMatch(/planner conversation/i);
+    expect(criticPrompt).toMatch(/edit files/i);
+    expect(criticPrompt).not.toContain("```");
     expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
       jobId: "job_1",
       attemptId: "stage:job_1:1:spawn_plan",

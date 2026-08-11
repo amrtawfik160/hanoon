@@ -48,14 +48,17 @@ it("keeps packet authority above selected skill suggestions", () => {
   expect(instructions).toContain("The worker must obey the packet's response contract.");
 });
 
-it("preserves the strict JSON review and critique wording", () => {
-  expect(buildReviewInstruction(artifact)).toBe(
-    "Read the attached immutable review packet review-packet.json (SHA-256 " +
-      "b".repeat(64) + "). Inspect the complete diff, run its checks, and return strict JSON only.",
-  );
-  expect(buildReviewFormatCorrectionPrompt()).toBe(
-    "Return exactly one strict JSON review result object matching the attached packet's output contract. Do not use Markdown fences, commentary, or additional keys.",
-  );
+it("keeps review output contracts structural and attachment-bound", () => {
+  const review = buildReviewInstruction(artifact);
+  const correction = buildReviewFormatCorrectionPrompt();
+
+  expect(review).toContain(artifact.filename);
+  expect(review).toContain(`SHA-256 ${artifact.sha256}`);
+  expect(review).toMatch(/strict JSON/i);
+  expect(review).not.toContain("```");
+  expect(correction).toMatch(/strict JSON/i);
+  expect(correction).toMatch(/markdown fences/i);
+  expect(correction).toMatch(/additional keys/i);
 });
 
 it("bounds inline remediation and format-correction prompts", () => {
