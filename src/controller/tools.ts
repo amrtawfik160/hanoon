@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi, PluginAgentConfigurationContext } from "@bb/plugin-sdk";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { redactError } from "../errors";
@@ -14,6 +14,13 @@ import { nextCronOccurrence } from "../services/monitor-service";
 import { CONTROLLER_PROVIDERS } from "./execution-profile";
 import { isControllerThreadTitle } from "./bb-controller";
 import { CONTROLLER_INSTRUCTIONS } from "./instructions";
+import {
+  parseWorkerThreadTitle,
+  resolveWorkerSkillProfile,
+  type DurableWorkerIdentity,
+  type WorkerSkillRole,
+  type WorkerTitleIdentity,
+} from "../agent-skills/role-resolver";
 import type { ThreadOperationService } from "./operations";
 import {
   createProjectThread,
@@ -62,6 +69,78 @@ function authorizedController(
     throw new Error("This tool call is not authorized for the durable Telegram controller");
   }
   return controller;
+}
+
+const WORKER_ID_PREFIX: Readonly<Record<WorkerSkillRole, "attempt:" | "stage:">> = {
+  implementation: "attempt:",
+  review: "attempt:",
+  "final-review": "attempt:",
+  planner: "stage:",
+  critic: "stage:",
+  documentation: "stage:",
+};
+
+const WORKER_EFFECT_KIND = {
+  implementation: "spawn_implementation",
+  review: "spawn_review",
+  "final-review": "spawn_final_review",
+  planner: "spawn_plan",
+  critic: "spawn_critique",
+  documentation: "spawn_docs",
+} as const;
+
+function workerEffectIdempotencyKey(title: WorkerTitleIdentity): string | null {
+  const prefix = WORKER_ID_PREFIX[title.role];
+  if (!title.attemptId.startsWith(prefix)) return null;
+  const effectIdempotencyKey = title.attemptId.slice(prefix.length);
+  return effectIdempotencyKey || null;
+}
+
+function persistedWorkerThreadId(
+  store: TelegramAgentStore,
+  title: WorkerTitleIdentity,
+): string | null | undefined {
+  if (WORKER_ID_PREFIX[title.role] === "attempt:") {
+    const attempt = store.getAttempt(title.attemptId);
+    const expectedKind = title.role === "implementation" ? "implementation" : "review";
+    return attempt && attempt.jobId === title.jobId && attempt.kind === expectedKind ? attempt.threadId : undefined;
+  }
+  const attempt = store.getPipelineStageAttempt(title.attemptId);
+  const expectedRole = title.role === "planner" ? "PLAN" : title.role === "critic" ? "CRITIQUE" : "DOCS";
+  return attempt && attempt.jobId === title.jobId && attempt.role === expectedRole ? attempt.threadId : undefined;
+}
+
+function durableWorkerIdentity(
+  store: TelegramAgentStore,
+  input: Readonly<{
+    title: WorkerTitleIdentity;
+    context: PluginAgentConfigurationContext;
+    effectIdempotencyKey: string;
+    threadId: string | null;
+  }>,
+): DurableWorkerIdentity | null {
+  const effect = store.getEffect(input.title.jobId, input.effectIdempotencyKey);
+  if (!effect || effect.kind !== WORKER_EFFECT_KIND[input.title.role]) return null;
+  const job = store.getJob(input.title.jobId);
+  if (!job || job.projectId !== input.context.project.id) return null;
+  return {
+    ...input.title,
+    projectId: job.projectId,
+    environmentId: job.environmentId,
+    threadId: input.threadId,
+  };
+}
+
+function resolveDurableWorkerIdentity(
+  store: TelegramAgentStore,
+  title: WorkerTitleIdentity,
+  context: PluginAgentConfigurationContext,
+): DurableWorkerIdentity | null {
+  const effectIdempotencyKey = workerEffectIdempotencyKey(title);
+  if (!effectIdempotencyKey) return null;
+  const threadId = persistedWorkerThreadId(store, title);
+  if (threadId === undefined) return null;
+  return durableWorkerIdentity(store, { title, context, effectIdempotencyKey, threadId });
 }
 
 function canonicalArguments(params: unknown): string {
@@ -555,8 +634,20 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       context.project.kind === "personal" &&
       context.environment.workspaceProvisionType === "personal" &&
       isControllerThreadTitle(context.thread.title, controller.controllerKey);
-    return candidate
-      ? { tools: [...CONTROLLER_TOOL_NAMES], skills: [], instructions: CONTROLLER_INSTRUCTIONS }
+    if (candidate) {
+      return { tools: [...CONTROLLER_TOOL_NAMES], skills: [], instructions: CONTROLLER_INSTRUCTIONS };
+    }
+    const title = parseWorkerThreadTitle(context.thread.title);
+    const durableIdentity = title === null
+      ? null
+      : resolveDurableWorkerIdentity(dependencies.store, title, context);
+    const profile = resolveWorkerSkillProfile({
+      context,
+      pluginId: bb.pluginId,
+      durableIdentity,
+    });
+    return profile
+      ? { tools: [], skills: [...profile.skills], instructions: profile.instructions }
       : { tools: [], skills: [] };
   });
 }
