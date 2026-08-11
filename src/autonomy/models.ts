@@ -5,7 +5,7 @@ import type {
   WorkerLiveness,
 } from "../domain/models";
 
-export const DEFAULT_MAX_CONCURRENT_JOBS = 2;
+export const DEFAULT_MAX_CONCURRENT_JOBS = 5;
 export const MAX_CONCURRENT_JOBS = 8;
 
 export type MaxConcurrentJobs = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;

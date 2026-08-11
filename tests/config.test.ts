@@ -16,7 +16,7 @@ it("defaults controller execution to Opus 5 at xhigh with full permissions", () 
   expect(parsed.ok).toBe(true);
   if (!parsed.ok) throw new Error(parsed.message);
   expect(parsed.value).toMatchObject({
-    maxConcurrentJobs: 2,
+    maxConcurrentJobs: 5,
     controllerModel: "claude-opus-5[1m]",
     controllerReasoningLevel: "xhigh",
     controllerServiceTier: "default",

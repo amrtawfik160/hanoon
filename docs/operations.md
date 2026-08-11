@@ -59,7 +59,7 @@ In Telegram, the durable status message reports the current state, review/valida
 
 ## Admissions and concurrency
 
-The executor may run independent projects concurrently up to **Maximum concurrent jobs** (`2` by default, `1`–`8` allowed). One project claim permits only one admitted pipeline for a project, so same-project jobs remain FIFO even when spare global slots exist.
+The executor may run independent projects concurrently up to **Maximum concurrent jobs** (`5` by default, `1`–`8` allowed). One project claim permits only one admitted pipeline for a project, so same-project jobs remain FIFO even when spare global slots exist.
 
 - `queued`: waiting for capacity or the project claim;
 - `admitted`: occupies a slot and may run ordinary pipeline work;

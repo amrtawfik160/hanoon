@@ -67,7 +67,7 @@ it("registers the bounded concurrent job cap as a select setting", async () => {
     type: "select",
     description: "Independent projects may run together; each project remains serialized.",
     options: ["1", "2", "3", "4", "5", "6", "7", "8"],
-    default: "2",
+    default: "5",
   });
 });
 

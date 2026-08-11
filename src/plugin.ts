@@ -7,6 +7,7 @@ import { TelegramClient } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
 import { openStore, type TelegramAgentStore } from "./storage/store";
 import { AutonomyRepository } from "./storage/autonomy-repository";
+import { DEFAULT_MAX_CONCURRENT_JOBS } from "./autonomy/models";
 import { AutonomyScheduler } from "./autonomy/scheduler";
 import { EffectRunner } from "./services/effect-runner";
 import type { EffectFence } from "./services/effect-runner";
@@ -70,7 +71,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       label: "Maximum concurrent jobs",
       description: "Independent projects may run together; each project remains serialized.",
       options: ["1", "2", "3", "4", "5", "6", "7", "8"],
-      default: "2",
+      default: String(DEFAULT_MAX_CONCURRENT_JOBS),
     },
     controllerModel: {
       type: "select",
