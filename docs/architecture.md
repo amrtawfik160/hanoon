@@ -71,7 +71,15 @@ Documentation, final validation, and final review happen before the owner receiv
 
 ## Agent skill runtime
 
-The BB manifest registers exactly two local skill roots: `skills/workflow-kit` and `skills/guards`. The first is the pinned `6.2.0` MIT-licensed workflow kit from [obra/superpowers](https://github.com/obra/superpowers); the second contains three project-owned guards. All 17 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
+The BB manifest registers exactly three local skill roots, each vendored verbatim from one permissively licensed upstream and carrying that upstream's licence:
+
+| Root | Upstream | Licence | Contents |
+| --- | --- | --- | --- |
+| `skills/workflow-kit` | [obra/superpowers](https://github.com/obra/superpowers), pinned `6.2.0` | MIT | 14 workflow skills |
+| `skills/guards` | [amElnagdy/guard-skills](https://github.com/amElnagdy/guard-skills) | MIT | `clean-code-guard`, `test-guard`, `docs-guard` |
+| `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | Apache-2.0 | `pr-writer` |
+
+A root's licence is recorded per root rather than per bundle, because the three do not share one: folding Apache-2.0 material under an MIT notice would misstate its terms. All 18 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
 
 The existing single `bb.agents.configure` callback keeps the controller and worker boundaries separate. Its exact role-selection matrix is:
 
@@ -80,7 +88,7 @@ The existing single `bb.agents.configure` callback keeps the controller and work
 | controller | none; controller tools and `CONTROLLER_INSTRUCTIONS` only |
 | planner | none |
 | critic | none |
-| implementation | `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard` |
+| implementation | `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
 | review | `clean-code-guard`, `test-guard` |
 | documentation | `docs-guard`, `verification-before-completion` |
 | final-review | `clean-code-guard`, `test-guard`, `docs-guard` |
@@ -102,7 +110,7 @@ The controller branch is independently exact: it requires the active durable con
 
 ### Bundle integrity and maintenance
 
-`npm run skills:verify` runs the synchronous verifier used by activation. It requires the manifest roots and `skills/skills.lock.json` schema version 1, bounds the lock to 1 MiB, the bundle to 64 skills and 512 locked files, rejects symlinks/non-regular or over-256 KiB files, and requires every discovered file to be locked exactly once with a SHA-256 digest. It also checks lexical safe paths, skill directory/frontmatter/lock-name agreement, nested local Markdown links that stay within their registered root and resolve to regular files, the pinned workflow-kit provenance (`6.2.0`, source URL, MIT license and `skills/workflow-kit/LICENSE`), and project-owned guard provenance. Success prints a bundle digest and skill count.
+`npm run skills:verify` runs the synchronous verifier used by activation. It requires the manifest roots and `skills/skills.lock.json` schema version 1, bounds the lock to 1 MiB, the bundle to 64 skills and 512 locked files, rejects symlinks/non-regular or over-256 KiB files, and requires every discovered file to be locked exactly once with a SHA-256 digest. It also checks lexical safe paths, skill directory/frontmatter/lock-name agreement, nested local Markdown links that stay within their registered root and resolve to a regular file or a directory inside it, and the recorded provenance and licence of all three roots (pinned workflow-kit `6.2.0`, the MIT guard kit, and the Apache-2.0 delivery kit) against their committed LICENSE files. Success prints a bundle digest and skill count.
 
 The package `build` script runs `npm run skills:verify` before `bb plugin build`; `server.ts` runs the same verification before `createPlugin` can register services, tools, schedules, or commands. Any malformed lock, missing root/skill/resource, unlocked or escaped path, frontmatter/provenance mismatch, symlink, size/count limit, or digest mismatch stops the build or activation. There is no runtime download, replacement, or repair path.
 

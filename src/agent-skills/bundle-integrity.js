@@ -93,6 +93,19 @@ function assertDirectory(pluginRoot, path, relativePath) {
   if (!stats.isDirectory()) throw integrityError(`not a directory: ${relativePath}`);
 }
 
+/**
+ * A Markdown link may legitimately point at a directory of further reading, not
+ * only at a file. The trust boundary is unchanged either way: the component
+ * walk above still rejects every symlink and every escape from the plugin root,
+ * so the only thing relaxed here is the file-versus-directory shape.
+ */
+function assertLinkedResource(pluginRoot, path, relativePath, maximumBytes) {
+  const stats = assertPathComponents(pluginRoot, path, relativePath);
+  if (stats.isDirectory()) return;
+  if (!stats.isFile()) throw integrityError(`not a regular file or directory: ${relativePath}`);
+  if (stats.size > maximumBytes) throw integrityError(`file exceeds ${maximumBytes} bytes: ${relativePath}`);
+}
+
 function verifiedPluginRoot(pluginRoot) {
   const absoluteRoot = resolve(pluginRoot);
   const filesystemRoot = parse(absoluteRoot).root;
@@ -249,7 +262,7 @@ function verifyNestedResources(pluginRoot, skillPath, contents) {
       throw integrityError(`Markdown link escapes registered skill root: ${skillPath} -> ${target}`);
     }
     const bundlePath = relative(pluginRoot, resolved).replaceAll(sep, "/");
-    readRegularFile(pluginRoot, resolved, bundlePath, MAX_FILE_BYTES);
+    assertLinkedResource(pluginRoot, resolved, bundlePath, MAX_FILE_BYTES);
   }
 }
 

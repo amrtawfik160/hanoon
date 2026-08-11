@@ -12,7 +12,7 @@
     "description": "Talk to a configurable Codex controller and run reviewed BB implementation jobs from Telegram.",
     "branding": { "icon": "Bot" },
     "server": "./server.ts",
-    "skills": ["skills/workflow-kit", "skills/guards"]
+    "skills": ["skills/workflow-kit", "skills/guards", "skills/delivery"]
   },
   "scripts": {
     "build": "npm run skills:verify && bb plugin build",

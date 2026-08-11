@@ -493,6 +493,7 @@ it("routes verified implementation attempts through their exact durable effect b
       "verification-before-completion",
       "clean-code-guard",
       "test-guard",
+      "pr-writer",
     ],
   });
   expect(firstStart.instructions).toContain("Verified worker role: implementation");

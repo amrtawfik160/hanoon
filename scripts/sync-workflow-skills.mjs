@@ -15,10 +15,15 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BUNDLE_LIMITS,
+  DELIVERY_KIT,
+  DELIVERY_PROVENANCE,
+  DELIVERY_ROOT,
+  GUARD_KIT,
   GUARD_PROVENANCE,
   GUARDS_ROOT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
+  REQUIRED_DELIVERY_SKILLS,
   REQUIRED_GUARD_SKILLS,
   REQUIRED_WORKFLOW_SKILLS,
   SYNC_EXCLUDED_FILES,
@@ -47,6 +52,7 @@ const pluginRoot = resolve(moduleDirectory, "..");
 const skillsRoot = join(pluginRoot, dirname(WORKFLOW_ROOT));
 const workflowDestination = join(pluginRoot, WORKFLOW_ROOT);
 const guardsRoot = join(pluginRoot, GUARDS_ROOT);
+const deliveryRoot = join(pluginRoot, DELIVERY_ROOT);
 const lockDestination = join(pluginRoot, LOCK_PATH);
 
 function fail(message) {
@@ -158,6 +164,7 @@ function assertDestinationSafe() {
   const limits = { entries: 0, files: 0 };
   if (lstatIfPresent(workflowDestination)) scanTree(workflowDestination, WORKFLOW_ROOT, limits);
   if (lstatIfPresent(guardsRoot)) scanTree(guardsRoot, GUARDS_ROOT, limits);
+  if (lstatIfPresent(deliveryRoot)) scanTree(deliveryRoot, DELIVERY_ROOT, limits);
   const lock = lstatIfPresent(lockDestination);
   if (lock?.isSymbolicLink()) fail(`symbolic link is not allowed: ${LOCK_PATH}`);
   if (lock && !lock.isFile()) fail(`not a regular file: ${LOCK_PATH}`);
@@ -253,9 +260,11 @@ function assertCatalog(records, expectedSkills, expectedRoot) {
 function buildLock(workflowRoot) {
   const workflowSkills = skillRecords(workflowRoot, WORKFLOW_ROOT, WORKFLOW_PROVENANCE);
   const guardSkills = skillRecords(guardsRoot, GUARDS_ROOT, GUARD_PROVENANCE);
+  const deliverySkills = skillRecords(deliveryRoot, DELIVERY_ROOT, DELIVERY_PROVENANCE);
   assertCatalog(workflowSkills, REQUIRED_WORKFLOW_SKILLS, WORKFLOW_ROOT);
   assertCatalog(guardSkills, REQUIRED_GUARD_SKILLS, GUARDS_ROOT);
-  const skills = [...workflowSkills, ...guardSkills];
+  assertCatalog(deliverySkills, REQUIRED_DELIVERY_SKILLS, DELIVERY_ROOT);
+  const skills = [...workflowSkills, ...guardSkills, ...deliverySkills];
   const ids = new Set();
   for (const skill of skills) {
     if (ids.has(skill.id)) fail(`duplicate skill name: ${skill.id}`);
@@ -264,10 +273,13 @@ function buildLock(workflowRoot) {
   const files = bundleFileRecords([
     { path: workflowRoot, publicRoot: WORKFLOW_ROOT },
     { path: guardsRoot, publicRoot: GUARDS_ROOT },
+    { path: deliveryRoot, publicRoot: DELIVERY_ROOT },
   ]);
   const lock = {
     schemaVersion: LOCK_SCHEMA_VERSION,
     workflowKit: WORKFLOW_KIT,
+    guardKit: GUARD_KIT,
+    deliveryKit: DELIVERY_KIT,
     skills: skills.sort((left, right) => left.id.localeCompare(right.id)),
     files,
   };
@@ -304,8 +316,10 @@ function assertSourceBundle(source, license, sourceSkills) {
   scanTree(license, "LICENSE", limits, source);
   scanTree(sourceSkills, "skills", limits, source);
   scanTree(guardsRoot, GUARDS_ROOT, limits);
+  scanTree(deliveryRoot, DELIVERY_ROOT, limits);
   assertCatalog(skillRecords(sourceSkills, WORKFLOW_ROOT, WORKFLOW_PROVENANCE, source), REQUIRED_WORKFLOW_SKILLS, WORKFLOW_ROOT);
   assertCatalog(skillRecords(guardsRoot, GUARDS_ROOT, GUARD_PROVENANCE), REQUIRED_GUARD_SKILLS, GUARDS_ROOT);
+  assertCatalog(skillRecords(deliveryRoot, DELIVERY_ROOT, DELIVERY_PROVENANCE), REQUIRED_DELIVERY_SKILLS, DELIVERY_ROOT);
 }
 
 function replaceBundle(stage, lockContents) {
@@ -358,6 +372,7 @@ function main() {
     const stagedLimits = { entries: 0, files: 0 };
     scanTree(stagedWorkflow, WORKFLOW_ROOT, stagedLimits);
     scanTree(guardsRoot, GUARDS_ROOT, stagedLimits);
+    scanTree(deliveryRoot, DELIVERY_ROOT, stagedLimits);
     const lockContents = buildLock(stagedWorkflow);
     assertDestinationSafe();
     replaceBundle(stage, lockContents);

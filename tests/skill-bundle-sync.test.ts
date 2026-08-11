@@ -28,6 +28,7 @@ function syncFixture(): { root: string; source: string; sentinel: string } {
   cpSync(join(repositoryRoot, "src/agent-skills/bundle-contract.js"), join(root, "src/agent-skills/bundle-contract.js"));
   cpSync(join(repositoryRoot, "src/agent-skills/frontmatter.js"), join(root, "src/agent-skills/frontmatter.js"));
   cpSync(join(repositoryRoot, "skills/guards"), join(root, "skills/guards"), { recursive: true });
+  cpSync(join(repositoryRoot, "skills/delivery"), join(root, "skills/delivery"), { recursive: true });
   cpSync(join(repositoryRoot, "skills/workflow-kit/LICENSE"), join(source, "LICENSE"));
   for (const entry of readdirSync(join(repositoryRoot, "skills/workflow-kit"), { withFileTypes: true })) {
     if (entry.isDirectory()) {
@@ -109,7 +110,12 @@ function fileCount(paths: readonly string[]): number {
 }
 
 function sourceBundleRoots(root: string, source: string): string[] {
-  return [join(source, "LICENSE"), join(source, "skills"), join(root, "skills/guards")];
+  return [
+    join(source, "LICENSE"),
+    join(source, "skills"),
+    join(root, "skills/guards"),
+    join(root, "skills/delivery"),
+  ];
 }
 
 function fillEntryLimit(roots: readonly string[], parent: string, limit: number): void {

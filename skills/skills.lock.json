@@ -6,6 +6,16 @@
     "license": "MIT",
     "licensePath": "skills/workflow-kit/LICENSE"
   },
+  "guardKit": {
+    "sourceUrl": "https://github.com/amElnagdy/guard-skills",
+    "license": "MIT",
+    "licensePath": "skills/guards/LICENSE"
+  },
+  "deliveryKit": {
+    "sourceUrl": "https://github.com/getsentry/skills",
+    "license": "Apache-2.0",
+    "licensePath": "skills/delivery/LICENSE"
+  },
   "skills": [
     {
       "id": "brainstorming",
@@ -16,8 +26,8 @@
     {
       "id": "clean-code-guard",
       "skillPath": "skills/guards/clean-code-guard/SKILL.md",
-      "source": "project-owned",
-      "license": "repository"
+      "source": "https://github.com/amElnagdy/guard-skills",
+      "license": "MIT"
     },
     {
       "id": "dispatching-parallel-agents",
@@ -28,8 +38,8 @@
     {
       "id": "docs-guard",
       "skillPath": "skills/guards/docs-guard/SKILL.md",
-      "source": "project-owned",
-      "license": "repository"
+      "source": "https://github.com/amElnagdy/guard-skills",
+      "license": "MIT"
     },
     {
       "id": "executing-plans",
@@ -42,6 +52,12 @@
       "skillPath": "skills/workflow-kit/finishing-a-development-branch/SKILL.md",
       "source": "https://github.com/obra/superpowers",
       "license": "MIT"
+    },
+    {
+      "id": "pr-writer",
+      "skillPath": "skills/delivery/pr-writer/SKILL.md",
+      "source": "https://github.com/getsentry/skills",
+      "license": "Apache-2.0"
     },
     {
       "id": "receiving-code-review",
@@ -76,8 +92,8 @@
     {
       "id": "test-guard",
       "skillPath": "skills/guards/test-guard/SKILL.md",
-      "source": "project-owned",
-      "license": "repository"
+      "source": "https://github.com/amElnagdy/guard-skills",
+      "license": "MIT"
     },
     {
       "id": "using-git-worktrees",
@@ -112,16 +128,104 @@
   ],
   "files": [
     {
+      "path": "skills/delivery/LICENSE",
+      "sha256": "96e78a9ce85795b117c8929887bdb78f88bf23f7b85a31f0872cde4dff7e92cd"
+    },
+    {
+      "path": "skills/delivery/pr-writer/SKILL.md",
+      "sha256": "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/agents/openai.yaml",
+      "sha256": "9ad8cf7e8898531829bbb9dce8764fb3e727ea290798f897a8bfaffa0b9b379e"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/references/ai-failure-modes.md",
+      "sha256": "68521d364af5babb56e61aa74d50e1bc024d526fda8a8c45132966efef1b809e"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/references/comments-and-formatting.md",
+      "sha256": "e04f4b5c44670db584acd67d46de7ec0e4314cf19a6b073df20244499c5493ae"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/references/dry-kiss-yagni.md",
+      "sha256": "5fc58875570d05d5175566f53dc2a094440382d4cb6a44c0e59e508c8f13f3ec"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/references/naming-and-functions.md",
+      "sha256": "5ee0048f6b4172bc1a8709767ad0a408f6528eeea9801611f22df39615a24776"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/references/review-checklist.md",
+      "sha256": "1918d6894f3938e822b981e0379ce80ed787a9eb98d9ca678feb281583da33c1"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/references/solid.md",
+      "sha256": "c2bb694b1e651c2f2b89ecbabeac62bbb22a481d20d83e24ed265f42e73c4336"
+    },
+    {
+      "path": "skills/guards/clean-code-guard/references/sources.md",
+      "sha256": "d1699b19af1bd3d1a9db69bcd73ff6236bd0935f340acd8c9756889b7e20f3c1"
+    },
+    {
       "path": "skills/guards/clean-code-guard/SKILL.md",
-      "sha256": "d7ccadee70317c00a3b32722dcedd1f37367141142f6a7d29e82a8dde6465ec0"
+      "sha256": "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2"
+    },
+    {
+      "path": "skills/guards/docs-guard/agents/openai.yaml",
+      "sha256": "e2f00ef42c9c494123b247a2663d31514eb8677e94136fbb4a528d85d0fe574d"
+    },
+    {
+      "path": "skills/guards/docs-guard/references/code-samples.md",
+      "sha256": "7462456e27528e6144309ea34d56c5a2f542b0d8dd82474e60d3ac7a2134fb32"
+    },
+    {
+      "path": "skills/guards/docs-guard/references/docstrings.md",
+      "sha256": "fd2546a34d900fe37f3c5d6019646af2f1bfd27dd716d9b0ac1c6de07b7dbc6c"
+    },
+    {
+      "path": "skills/guards/docs-guard/references/review-checklist.md",
+      "sha256": "5f2a0448633658524cea474a48a122df1f85b71d691b85019b7dba3a96b4ec85"
+    },
+    {
+      "path": "skills/guards/docs-guard/references/sources.md",
+      "sha256": "a798f9336080cde43f814e62bdbfcf78354b81080809f2d24260fdf8706be618"
+    },
+    {
+      "path": "skills/guards/docs-guard/references/verification.md",
+      "sha256": "f68314292d20cefb33f26d8f1492f26d645dd94b9049df8e375729e3522ac794"
     },
     {
       "path": "skills/guards/docs-guard/SKILL.md",
-      "sha256": "d547261f9166eca57bffa62853036b9fdc7406acf6e0e8fa7b5618c157942238"
+      "sha256": "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef"
+    },
+    {
+      "path": "skills/guards/LICENSE",
+      "sha256": "b336404532649bdfd6b5c7558146c2e193c1287b633655ca103483c6ffe79857"
+    },
+    {
+      "path": "skills/guards/test-guard/agents/openai.yaml",
+      "sha256": "c9861f30bc8d933d44e8459e2b3c37ed623c1480df8812625888423fe69bad49"
+    },
+    {
+      "path": "skills/guards/test-guard/references/jest.md",
+      "sha256": "ebc8a3c1fcc131513a997f2e00c2979f1add50b4b6b510a1edc27dbbc55f3229"
+    },
+    {
+      "path": "skills/guards/test-guard/references/llm-app-testing.md",
+      "sha256": "13a69b64a07b5f6c593476f632477b6850698f819de14765336936d1cf954376"
+    },
+    {
+      "path": "skills/guards/test-guard/references/phpunit.md",
+      "sha256": "996557d1ef2c13991cfb53487d6b5961bdf13fc3bb4002f3f9eeff9b281b7e53"
+    },
+    {
+      "path": "skills/guards/test-guard/references/pytest.md",
+      "sha256": "294e7fe7dadfae7d623625688237ef2a410610747ffb8d981af9ab567e1e2980"
     },
     {
       "path": "skills/guards/test-guard/SKILL.md",
-      "sha256": "58b63c10570aa6a63870c0f43d21d525aa02c9876f0835364cf0078d3f0e7045"
+      "sha256": "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0"
     },
     {
       "path": "skills/workflow-kit/brainstorming/scripts/frame-template.html",

@@ -86,7 +86,7 @@ function effectIdempotencyKey(jobId: string, version: number, effectKind: string
 }
 
 describe("worker skill role table", () => {
-  test("contains exactly the six selected manifest skill ids", () => {
+  test("contains exactly the seven selected manifest skill ids", () => {
     expect(BUNDLED_SKILL_IDS).toEqual([
       "systematic-debugging",
       "test-driven-development",
@@ -94,6 +94,7 @@ describe("worker skill role table", () => {
       "clean-code-guard",
       "test-guard",
       "docs-guard",
+      "pr-writer",
     ]);
   });
 
@@ -108,6 +109,7 @@ describe("worker skill role table", () => {
         "verification-before-completion",
         "clean-code-guard",
         "test-guard",
+        "pr-writer",
       ],
     ],
     ["review", ["clean-code-guard", "test-guard"]],

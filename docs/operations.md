@@ -35,7 +35,7 @@ Run the deterministic integrity gate from the repository root:
 npm run skills:verify
 ```
 
-The command checks the manifest roots and lock, file sizes/counts and regular-file type, complete SHA-256 coverage, frontmatter and directory names, nested local Markdown resources, and pinned/project-owned provenance. Success prints a bounded `bundleDigest` and `skillCount`; a malformed lock, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter/resource mismatch, or digest mismatch exits non-zero. `npm run build` invokes this verifier before `bb plugin build`, and activation invokes it before plugin registration. Treat any failure as a stop: the runtime never downloads, substitutes, or repairs a bundle.
+The command checks the manifest roots and lock, file sizes/counts and regular-file type, complete SHA-256 coverage, frontmatter and directory names, nested local Markdown resources, and the pinned provenance and licence of every vendored root. Success prints a bounded `bundleDigest` and `skillCount`; a malformed lock, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter/resource mismatch, or digest mismatch exits non-zero. `npm run build` invokes this verifier before `bb plugin build`, and activation invokes it before plugin registration. Treat any failure as a stop: the runtime never downloads, substitutes, or repairs a bundle.
 
 Only a maintainer may synchronize the pinned upstream workflow kit. Use an already-reviewed local absolute checkout of the `superpowers` package with version `6.2.0`, `LICENSE`, `skills/`, and the reviewed MIT license; the synchronizer is network-free and has no runtime role:
 

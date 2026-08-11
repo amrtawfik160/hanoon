@@ -15,6 +15,7 @@ export const BUNDLED_SKILL_IDS = [
   "clean-code-guard",
   "test-guard",
   "docs-guard",
+  "pr-writer",
 ] as const;
 
 export type BundledSkillId = typeof BUNDLED_SKILL_IDS[number];
@@ -28,6 +29,9 @@ export const ROLE_SKILLS = {
     "verification-before-completion",
     "clean-code-guard",
     "test-guard",
+    // The implementation attempt is the one that opens the pull request the
+    // reviewer then reads, so it owns writing a reviewer-facing description.
+    "pr-writer",
   ],
   review: ["clean-code-guard", "test-guard"],
   documentation: ["docs-guard", "verification-before-completion"],

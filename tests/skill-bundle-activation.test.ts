@@ -114,12 +114,13 @@ test("rejects a corrupted locked skill before the BB host is accessed", async ()
 test("verifies the real committed bundle", () => {
   const verified = verifySkillBundle(repositoryRoot);
 
-  expect(verified.skillIds).toHaveLength(17);
+  expect(verified.skillIds).toHaveLength(18);
   expect(verified.skillIds).toEqual(expect.arrayContaining([
     "brainstorming",
     "clean-code-guard",
     "docs-guard",
     "test-guard",
+    "pr-writer",
     "writing-skills",
   ]));
   expect(verified.bundleDigest).toMatch(/^[a-f0-9]{64}$/);
@@ -168,7 +169,7 @@ test.each([
   [641, true],
 ])("enforces the total bundle-entry boundary at %i entries", (limit, rejected) => {
   const root = copiedBundleRoot();
-  const roots = [join(root, "skills/workflow-kit"), join(root, "skills/guards")];
+  const roots = [join(root, "skills/workflow-kit"), join(root, "skills/guards"), join(root, "skills/delivery")];
   fillEntryLimit(roots, join(root, "skills/guards/clean-code-guard/excess"), limit);
 
   if (rejected) {
