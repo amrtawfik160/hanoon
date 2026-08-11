@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { afterEach, expect, test } from "vitest";
 import { activatePlugin } from "../server";
@@ -47,6 +48,34 @@ function updateLock(root: string, mutate: (lock: {
   lock.files.sort((left, right) => left.path.localeCompare(right.path));
   lock.skills.sort((left, right) => left.id.localeCompare(right.id));
   writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+}
+
+function entryCount(paths: readonly string[]): number {
+  const pending = [...paths];
+  let count = 0;
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (!path) continue;
+    count += 1;
+    if (lstatSync(path).isDirectory()) {
+      for (const name of readdirSync(path)) pending.push(join(path, name));
+    }
+  }
+  return count;
+}
+
+function fillEntryLimit(roots: readonly string[], parent: string, limit: number): void {
+  mkdirSync(parent);
+  const remaining = limit - entryCount(roots);
+  for (let index = 0; index < remaining; index += 1) mkdirSync(join(parent, `entry-${index}`));
+}
+
+function extendDepth(parent: string, currentDepth: number, targetDepth: number): void {
+  let current = parent;
+  for (let depth = currentDepth + 1; depth <= targetDepth; depth += 1) {
+    current = join(current, `depth-${depth}`);
+    mkdirSync(current);
+  }
 }
 
 test("rejects a corrupted locked skill before the BB host is accessed", async () => {
@@ -109,6 +138,43 @@ test.each(["root", "ancestor"])("rejects a symbolic link in a plugin-root %s com
   const linkedRoot = position === "root" ? link : join(link, "plugin");
 
   expect(() => verifySkillBundle(linkedRoot)).toThrow(/symbolic link is not allowed in plugin root/);
+});
+
+test("rejects a descendant symbolic link beneath a real plugin root", () => {
+  const root = copiedBundleRoot();
+  const link = join(root, "skills/guards/clean-code-guard/license-link");
+  symlinkSync(join(root, "skills/workflow-kit/LICENSE"), link);
+
+  expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: symbolic link is not allowed: skills/guards/clean-code-guard/license-link");
+});
+
+test.each([
+  [640, false],
+  [641, true],
+])("enforces the total bundle-entry boundary at %i entries", (limit, rejected) => {
+  const root = copiedBundleRoot();
+  const roots = [join(root, "skills/workflow-kit"), join(root, "skills/guards")];
+  fillEntryLimit(roots, join(root, "skills/guards/clean-code-guard/excess"), limit);
+
+  if (rejected) {
+    expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: bundle entry count exceeds 640");
+  } else {
+    expect(() => verifySkillBundle(root)).not.toThrow();
+  }
+});
+
+test.each([
+  [32, false],
+  [33, true],
+])("enforces the bundle-depth boundary at depth %i", (depth, rejected) => {
+  const root = copiedBundleRoot();
+  extendDepth(join(root, "skills/guards/clean-code-guard"), 1, depth);
+
+  if (rejected) {
+    expect(() => verifySkillBundle(root)).toThrow("Skill bundle integrity error: bundle depth exceeds 32");
+  } else {
+    expect(() => verifySkillBundle(root)).not.toThrow();
+  }
 });
 
 test.each([
@@ -208,4 +274,30 @@ test("root discovery rejects an oversized package.json before parsing it", () =>
   }));
 
   expect(() => resolvePluginRoot(pathToFileURL(join(nested, "server.js")).href)).toThrow(/file exceeds 262144 bytes/);
+});
+
+test("bundle verification propagates package.json filesystem read errors", () => {
+  const root = copiedBundleRoot();
+  const modulePath = join(repositoryRoot, "src/agent-skills/bundle-integrity.js");
+  const harness = `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    import { pathToFileURL } from "node:url";
+    const originalRead = fs.readFileSync.bind(fs);
+    fs.readFileSync = (path, options) => {
+      if (String(path) === ${JSON.stringify(join(root, "package.json"))}) {
+        throw Object.assign(new Error("injected package read failure"), { code: "EACCES" });
+      }
+      return originalRead(path, options);
+    };
+    syncBuiltinESMExports();
+    const { verifySkillBundle } = await import(pathToFileURL(${JSON.stringify(modulePath)}).href + "?read-error");
+    verifySkillBundle(${JSON.stringify(root)});
+  `;
+
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", harness], { encoding: "utf8" });
+
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain("injected package read failure");
+  expect(result.stderr).not.toContain("malformed package.json");
 });

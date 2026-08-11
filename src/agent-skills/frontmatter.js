@@ -1,5 +1,4 @@
-const MAX_FRONTMATTER_BYTES = 8 * 1024;
-const SKILL_NAME = /^[a-z][a-z0-9-]{0,127}$/;
+import { BUNDLE_LIMITS, SKILL_ID_PATTERN } from "./bundle-contract.js";
 
 function frontmatterError(reason) {
   return new Error(`malformed frontmatter: ${reason}`);
@@ -11,7 +10,7 @@ export function skillFrontmatterName(contents) {
   }
   const newline = contents.indexOf("\n");
   const closing = /\r?\n---\r?\n/.exec(contents.slice(newline + 1));
-  if (!closing || closing.index + newline + 1 > MAX_FRONTMATTER_BYTES) {
+  if (!closing || closing.index + newline + 1 > BUNDLE_LIMITS.maximumFrontmatterBytes) {
     throw frontmatterError("closing delimiter is missing or too large");
   }
   const body = contents.slice(newline + 1, newline + 1 + closing.index);
@@ -27,6 +26,6 @@ export function skillFrontmatterName(contents) {
     fields.set(key, value);
   }
   const name = fields.get("name");
-  if (!name || !SKILL_NAME.test(name)) throw new Error("missing or invalid frontmatter name");
+  if (!name || !SKILL_ID_PATTERN.test(name)) throw new Error("missing or invalid frontmatter name");
   return name;
 }

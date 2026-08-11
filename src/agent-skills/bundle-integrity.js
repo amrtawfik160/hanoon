@@ -1,37 +1,28 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, opendirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  BUNDLE_LIMITS,
+  LOCK_PATH,
+  LOCK_SCHEMA_VERSION,
+  REGISTERED_ROOTS,
+  REQUIRED_SKILLS,
+  SKILL_ID_PATTERN,
+  WORKFLOW_KIT,
+} from "./bundle-contract.js";
 import { skillFrontmatterName } from "./frontmatter.js";
 
-const MAX_FILE_BYTES = 256 * 1024;
-const MAX_LOCK_BYTES = 1024 * 1024;
-const MAX_SKILLS = 64;
-const MAX_LOCKED_FILES = 512;
-const MAX_MARKDOWN_LINKS = 128;
-const LOCK_PATH = "skills/skills.lock.json";
-const REGISTERED_ROOTS = ["skills/workflow-kit", "skills/guards"];
-const WORKFLOW_SKILL_IDS = [
-  "brainstorming",
-  "dispatching-parallel-agents",
-  "executing-plans",
-  "finishing-a-development-branch",
-  "receiving-code-review",
-  "requesting-code-review",
-  "subagent-driven-development",
-  "systematic-debugging",
-  "test-driven-development",
-  "using-git-worktrees",
-  "using-superpowers",
-  "verification-before-completion",
-  "writing-plans",
-  "writing-skills",
-];
-const GUARD_SKILL_IDS = ["clean-code-guard", "docs-guard", "test-guard"];
-const REQUIRED_SKILL_PATHS = new Map([
-  ...WORKFLOW_SKILL_IDS.map((id) => [id, `skills/workflow-kit/${id}/SKILL.md`]),
-  ...GUARD_SKILL_IDS.map((id) => [id, `skills/guards/${id}/SKILL.md`]),
-]);
+const {
+  maximumFileBytes: MAX_FILE_BYTES,
+  maximumLockBytes: MAX_LOCK_BYTES,
+  maximumSkills: MAX_SKILLS,
+  maximumLockedFiles: MAX_LOCKED_FILES,
+  maximumMarkdownLinks: MAX_MARKDOWN_LINKS,
+  maximumTreeEntries: MAX_TREE_ENTRIES,
+  maximumTreeDepth: MAX_TREE_DEPTH,
+} = BUNDLE_LIMITS;
+const requiredSkillsById = new Map(REQUIRED_SKILLS.map((skill) => [skill.id, skill]));
 
 function integrityError(reason) {
   return new Error(`Skill bundle integrity error: ${reason}`);
@@ -89,6 +80,15 @@ function readRegularFile(pluginRoot, path, relativePath, maximumBytes) {
   return readFileSync(path);
 }
 
+function parsedJson(contents, malformedReason) {
+  try {
+    return JSON.parse(contents.toString("utf8"));
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw integrityError(malformedReason);
+  }
+}
+
 function assertDirectory(pluginRoot, path, relativePath) {
   const stats = assertPathComponents(pluginRoot, path, relativePath);
   if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
@@ -112,15 +112,10 @@ function verifiedPluginRoot(pluginRoot) {
 
 function parseLock(pluginRoot) {
   const lockAbsolute = join(pluginRoot, LOCK_PATH);
-  let decoded;
-  try {
-    decoded = JSON.parse(readRegularFile(pluginRoot, lockAbsolute, LOCK_PATH, MAX_LOCK_BYTES).toString("utf8"));
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Skill bundle integrity error:")) throw error;
-    throw integrityError(`malformed lock JSON: ${LOCK_PATH}`);
-  }
+  const contents = readRegularFile(pluginRoot, lockAbsolute, LOCK_PATH, MAX_LOCK_BYTES);
+  const decoded = parsedJson(contents, `malformed lock JSON: ${LOCK_PATH}`);
   if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw integrityError("malformed lock JSON: skills/skills.lock.json");
-  if (decoded.schemaVersion !== 1) throw integrityError("unsupported lock schema version");
+  if (decoded.schemaVersion !== LOCK_SCHEMA_VERSION) throw integrityError("unsupported lock schema version");
   if (!Array.isArray(decoded.files) || !Array.isArray(decoded.skills) || !decoded.workflowKit || typeof decoded.workflowKit !== "object") {
     throw integrityError("malformed lock schema");
   }
@@ -130,36 +125,56 @@ function parseLock(pluginRoot) {
 }
 
 function declaredRoots(pluginRoot) {
-  let manifest;
-  try {
-    manifest = JSON.parse(readRegularFile(pluginRoot, join(pluginRoot, "package.json"), "package.json", MAX_FILE_BYTES).toString("utf8"));
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Skill bundle integrity error:")) throw error;
-    throw integrityError("malformed package.json");
-  }
+  const contents = readRegularFile(pluginRoot, join(pluginRoot, "package.json"), "package.json", MAX_FILE_BYTES);
+  const manifest = parsedJson(contents, "malformed package.json");
   if (!Array.isArray(manifest?.bb?.skills) || manifest.bb.skills.length !== REGISTERED_ROOTS.length || manifest.bb.skills.some((root, index) => root !== REGISTERED_ROOTS[index])) {
-    throw integrityError("registered skill roots must be skills/workflow-kit and skills/guards");
+    throw integrityError(`registered skill roots must be ${REGISTERED_ROOTS.join(" and ")}`);
   }
   return REGISTERED_ROOTS;
 }
 
+function addTreeEntry(pending, traversal, entry) {
+  if (entry.depth > MAX_TREE_DEPTH) throw integrityError(`bundle depth exceeds ${MAX_TREE_DEPTH}: ${entry.relativePath}`);
+  traversal.entries += 1;
+  if (traversal.entries > MAX_TREE_ENTRIES) throw integrityError(`bundle entry count exceeds ${MAX_TREE_ENTRIES}`);
+  pending.push(entry);
+}
+
+function addDirectoryChildren(absolute, relativePath, depth, pending, traversal) {
+  const directory = opendirSync(absolute);
+  try {
+    for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+      addTreeEntry(pending, traversal, {
+        absolute: join(absolute, entry.name),
+        relativePath: `${relativePath}/${entry.name}`,
+        depth: depth + 1,
+      });
+    }
+  } finally {
+    directory.closeSync();
+  }
+}
+
 function collectFiles(pluginRoot, roots) {
   const files = [];
-  const visit = (absolute, relativePath) => {
-    const stats = assertPathComponents(pluginRoot, absolute, relativePath);
-    if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${relativePath}`);
-    if (stats.isDirectory()) {
-      for (const entry of readdirSync(absolute).sort()) visit(join(absolute, entry), `${relativePath}/${entry}`);
-      return;
-    }
-    if (!stats.isFile()) throw integrityError(`not a regular file: ${relativePath}`);
-    if (stats.size > MAX_FILE_BYTES) throw integrityError(`file exceeds ${MAX_FILE_BYTES} bytes: ${relativePath}`);
-    if (files.length >= MAX_LOCKED_FILES) throw integrityError(`bundle file count exceeds ${MAX_LOCKED_FILES}`);
-    files.push(relativePath);
-  };
+  const pending = [];
+  const traversal = { entries: 0 };
   for (const root of roots) {
     assertDirectory(pluginRoot, join(pluginRoot, root), root);
-    visit(join(pluginRoot, root), root);
+    addTreeEntry(pending, traversal, { absolute: join(pluginRoot, root), relativePath: root, depth: 0 });
+  }
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const stats = assertPathComponents(pluginRoot, current.absolute, current.relativePath);
+    if (stats.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${current.relativePath}`);
+    if (stats.isDirectory()) {
+      addDirectoryChildren(current.absolute, current.relativePath, current.depth, pending, traversal);
+      continue;
+    }
+    if (!stats.isFile()) throw integrityError(`not a regular file: ${current.relativePath}`);
+    if (stats.size > MAX_FILE_BYTES) throw integrityError(`file exceeds ${MAX_FILE_BYTES} bytes: ${current.relativePath}`);
+    if (files.length >= MAX_LOCKED_FILES) throw integrityError(`bundle file count exceeds ${MAX_LOCKED_FILES}`);
+    files.push(current.relativePath);
   }
   return files.sort();
 }
@@ -242,9 +257,9 @@ function verifyNestedResources(pluginRoot, skillPath, contents) {
 }
 
 function assertRequiredCatalog(records) {
-  if (records.size !== REQUIRED_SKILL_PATHS.size) throw integrityError("required skill catalog differs");
-  for (const [id, expectedPath] of REQUIRED_SKILL_PATHS) {
-    if (records.get(id)?.skillPath !== expectedPath) throw integrityError("required skill catalog differs");
+  if (records.size !== REQUIRED_SKILLS.length) throw integrityError("required skill catalog differs");
+  for (const expected of REQUIRED_SKILLS) {
+    if (records.get(expected.id)?.skillPath !== expected.skillPath) throw integrityError("required skill catalog differs");
   }
 }
 
@@ -252,7 +267,7 @@ function verifySkills(pluginRoot, lock, roots) {
   const records = new Map();
   for (const record of lock.skills) {
     if (!record || typeof record !== "object") throw integrityError("malformed skill record");
-    if (typeof record.id !== "string" || !/^[a-z][a-z0-9-]{0,127}$/.test(record.id)) throw integrityError("invalid skill id");
+    if (typeof record.id !== "string" || !SKILL_ID_PATTERN.test(record.id)) throw integrityError("invalid skill id");
     const skillPath = normalizedRelativePath(record.skillPath, "skill path");
     if (records.has(record.id)) throw integrityError(`duplicate skill id: ${record.id}`);
     records.set(record.id, { ...record, skillPath });
@@ -260,29 +275,33 @@ function verifySkills(pluginRoot, lock, roots) {
   assertRequiredCatalog(records);
   const discovered = [];
   for (const root of roots) {
-    for (const entry of readdirSync(join(pluginRoot, root), { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const path = `${root}/${entry.name}/SKILL.md`;
-      if (!records.has(entry.name)) throw integrityError(`unlocked skill directory: ${root}/${entry.name}`);
-      discovered.push(entry.name);
-      const record = records.get(entry.name);
-      if (record.skillPath !== path) throw integrityError(`skill lock path differs for ${entry.name}`);
-      const parsed = skillName(pluginRoot, join(pluginRoot, path), path);
-      if (parsed.name !== entry.name || parsed.name !== record.id) throw integrityError(`frontmatter name differs from lock record: ${path}`);
-      verifyNestedResources(pluginRoot, path, parsed.contents);
+    const directory = opendirSync(join(pluginRoot, root));
+    try {
+      for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+        if (entry.isSymbolicLink()) throw integrityError(`symbolic link is not allowed: ${root}/${entry.name}`);
+        if (!entry.isDirectory()) continue;
+        const path = `${root}/${entry.name}/SKILL.md`;
+        if (!records.has(entry.name)) throw integrityError(`unlocked skill directory: ${root}/${entry.name}`);
+        discovered.push(entry.name);
+        const record = records.get(entry.name);
+        if (record.skillPath !== path) throw integrityError(`skill lock path differs for ${entry.name}`);
+        const parsed = skillName(pluginRoot, join(pluginRoot, path), path);
+        if (parsed.name !== entry.name || parsed.name !== record.id) throw integrityError(`frontmatter name differs from lock record: ${path}`);
+        verifyNestedResources(pluginRoot, path, parsed.contents);
+      }
+    } finally {
+      directory.closeSync();
     }
   }
   if (discovered.length !== records.size) throw integrityError("lock references a missing skill directory");
   const workflow = lock.workflowKit;
-  if (workflow.version !== "6.2.0" || workflow.sourceUrl !== "https://github.com/obra/superpowers" || workflow.license !== "MIT" || workflow.licensePath !== "skills/workflow-kit/LICENSE") {
+  if (workflow.version !== WORKFLOW_KIT.version || workflow.sourceUrl !== WORKFLOW_KIT.sourceUrl || workflow.license !== WORKFLOW_KIT.license || workflow.licensePath !== WORKFLOW_KIT.licensePath) {
     throw integrityError("malformed workflow-kit provenance");
   }
   readRegularFile(pluginRoot, join(pluginRoot, workflow.licensePath), workflow.licensePath, MAX_FILE_BYTES);
   for (const record of records.values()) {
-    const expected = record.skillPath.startsWith("skills/workflow-kit/")
-      ? ["https://github.com/obra/superpowers", "MIT"]
-      : ["project-owned", "repository"];
-    if (record.source !== expected[0] || record.license !== expected[1]) throw integrityError(`invalid provenance for ${record.id}`);
+    const expected = requiredSkillsById.get(record.id);
+    if (record.source !== expected.source || record.license !== expected.license) throw integrityError(`invalid provenance for ${record.id}`);
   }
   return [...records.keys()].sort();
 }

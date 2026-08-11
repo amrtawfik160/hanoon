@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -25,6 +25,7 @@ function syncFixture(): { root: string; source: string; sentinel: string } {
   mkdirSync(join(root, "skills", "workflow-kit"), { recursive: true });
   mkdirSync(join(source, "skills"), { recursive: true });
   cpSync(join(repositoryRoot, "scripts/sync-workflow-skills.mjs"), join(root, "scripts/sync-workflow-skills.mjs"));
+  cpSync(join(repositoryRoot, "src/agent-skills/bundle-contract.js"), join(root, "src/agent-skills/bundle-contract.js"));
   cpSync(join(repositoryRoot, "src/agent-skills/frontmatter.js"), join(root, "src/agent-skills/frontmatter.js"));
   cpSync(join(repositoryRoot, "skills/guards"), join(root, "skills/guards"), { recursive: true });
   cpSync(join(repositoryRoot, "skills/workflow-kit/LICENSE"), join(source, "LICENSE"));
@@ -76,6 +77,66 @@ function runSyncWithFault(root: string, source: string, fault: "lock-publish" | 
     await import(pathToFileURL(${JSON.stringify(script)}).href + "?fault=" + fault);
   `;
   return spawnSync(process.execPath, ["--input-type=module", "--eval", harness], { encoding: "utf8" });
+}
+
+function entryCount(paths: readonly string[]): number {
+  const pending = [...paths];
+  let count = 0;
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (!path) continue;
+    count += 1;
+    if (lstatSync(path).isDirectory()) {
+      for (const name of readdirSync(path)) pending.push(join(path, name));
+    }
+  }
+  return count;
+}
+
+function fileCount(paths: readonly string[]): number {
+  const pending = [...paths];
+  let count = 0;
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (!path) continue;
+    if (lstatSync(path).isDirectory()) {
+      for (const name of readdirSync(path)) pending.push(join(path, name));
+    } else {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function sourceBundleRoots(root: string, source: string): string[] {
+  return [join(source, "LICENSE"), join(source, "skills"), join(root, "skills/guards")];
+}
+
+function fillEntryLimit(roots: readonly string[], parent: string, limit: number): void {
+  mkdirSync(parent);
+  const remaining = limit - entryCount(roots);
+  for (let index = 0; index < remaining; index += 1) mkdirSync(join(parent, `entry-${index}`));
+}
+
+function fillFileLimit(roots: readonly string[], parent: string, limit: number): void {
+  mkdirSync(parent);
+  const remaining = limit - fileCount(roots);
+  for (let index = 0; index < remaining; index += 1) writeFileSync(join(parent, `file-${index}.txt`), "x");
+}
+
+function extendDepth(parent: string, currentDepth: number, targetDepth: number): void {
+  let current = parent;
+  for (let depth = currentDepth + 1; depth <= targetDepth; depth += 1) {
+    current = join(current, `depth-${depth}`);
+    mkdirSync(current);
+  }
+}
+
+function writePackageAtSize(path: string, bytes: number): void {
+  const metadata = { name: "superpowers", version: "6.2.0", padding: "" };
+  const empty = `${JSON.stringify(metadata)}\n`;
+  metadata.padding = "x".repeat(bytes - Buffer.byteLength(empty));
+  writeFileSync(path, `${JSON.stringify(metadata)}\n`);
 }
 
 test("rejects an existing lock symlink without following its target", () => {
@@ -141,22 +202,93 @@ test("ignores excluded repository, dependency, cache, and output trees during pr
   }
 });
 
-test.each([
-  ["an oversized file", (source: string) => writeFileSync(join(source, "skills/brainstorming/oversized.bin"), Buffer.alloc(256 * 1024 + 1))],
-  ["more than 512 bundle files", (source: string) => {
-    const directory = join(source, "skills/brainstorming/excess");
-    mkdirSync(directory);
-    for (let index = 0; index < 513; index += 1) writeFileSync(join(directory, `extra-${index}.txt`), "x");
-  }],
-])("rejects %s before staging or replacing the current vendor bundle", (_scenario, mutate) => {
+test("rejects an oversized bundle file before staging or replacing the current vendor bundle", () => {
   const { root, source, sentinel } = syncFixture();
-  mutate(source);
+  writeFileSync(join(source, "skills/brainstorming/oversized.bin"), Buffer.alloc(256 * 1024 + 1));
 
   const result = runSync(root, source);
 
   expect(result.status).not.toBe(0);
   expect(readFileSync(sentinel, "utf8")).toBe("preserve me");
   expect(readdirSync(join(root, "skills")).some((entry) => entry.startsWith(".workflow-kit-stage-"))).toBe(false);
+});
+
+test.each([
+  [512, false],
+  [513, true],
+])("enforces the bundle-file boundary at %i files before staging", (limit, rejected) => {
+  const { root, source, sentinel } = syncFixture();
+  fillFileLimit(sourceBundleRoots(root, source), join(source, "skills/brainstorming/excess"), limit);
+
+  const result = runSync(root, source);
+
+  expect(result.status === 0).toBe(!rejected);
+  if (rejected) expect(readFileSync(sentinel, "utf8")).toBe("preserve me");
+});
+
+test.each([
+  [640, false],
+  [641, true],
+])("enforces the total bundle-entry boundary at %i entries before staging", (limit, rejected) => {
+  const { root, source, sentinel } = syncFixture();
+  fillEntryLimit(sourceBundleRoots(root, source), join(source, "skills/brainstorming/excess"), limit);
+
+  const result = runSync(root, source);
+
+  expect(result.status === 0).toBe(!rejected);
+  if (rejected) {
+    expect(result.stderr).toContain("bundle entry count exceeds 640");
+    expect(readFileSync(sentinel, "utf8")).toBe("preserve me");
+  }
+});
+
+test.each([
+  [32, false],
+  [33, true],
+])("enforces the bundle-depth boundary at depth %i before staging", (depth, rejected) => {
+  const { root, source, sentinel } = syncFixture();
+  extendDepth(join(source, "skills/brainstorming"), 1, depth);
+
+  const result = runSync(root, source);
+
+  expect(result.status === 0).toBe(!rejected);
+  if (rejected) {
+    expect(result.stderr).toContain("bundle depth exceeds 32");
+    expect(readFileSync(sentinel, "utf8")).toBe("preserve me");
+  }
+});
+
+test.each([
+  ["package.json", (source: string) => writePackageAtSize(join(source, "package.json"), 256 * 1024 + 1)],
+  ["LICENSE", (source: string) => writeFileSync(join(source, "LICENSE"), Buffer.alloc(256 * 1024 + 1))],
+])("rejects an oversized source %s before reading it", (_file, makeOversized) => {
+  const { root, source, sentinel } = syncFixture();
+  makeOversized(source);
+
+  const result = runSync(root, source);
+
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain("file exceeds 262144 bytes");
+  expect(readFileSync(sentinel, "utf8")).toBe("preserve me");
+});
+
+test("accepts a source package.json exactly at the byte limit", () => {
+  const { root, source } = syncFixture();
+  writePackageAtSize(join(source, "package.json"), 256 * 1024);
+
+  expect(runSync(root, source).status).toBe(0);
+});
+
+test("hashes a source LICENSE exactly at the byte limit", () => {
+  const { root, source, sentinel } = syncFixture();
+  writeFileSync(join(source, "LICENSE"), Buffer.alloc(256 * 1024));
+
+  const result = runSync(root, source);
+
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain("source LICENSE does not match the reviewed MIT license");
+  expect(result.stderr).not.toContain("file exceeds");
+  expect(readFileSync(sentinel, "utf8")).toBe("preserve me");
 });
 
 test("rolls back both the workflow tree and lock when lock publication fails after its rename", () => {

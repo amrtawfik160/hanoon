@@ -5,7 +5,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
+  opendirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -13,41 +13,41 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  BUNDLE_LIMITS,
+  GUARD_PROVENANCE,
+  GUARDS_ROOT,
+  LOCK_PATH,
+  LOCK_SCHEMA_VERSION,
+  REQUIRED_GUARD_SKILLS,
+  REQUIRED_WORKFLOW_SKILLS,
+  SYNC_EXCLUDED_FILES,
+  SYNC_EXCLUDED_SEGMENTS,
+  WORKFLOW_KIT,
+  WORKFLOW_PROVENANCE,
+  WORKFLOW_ROOT,
+} from "../src/agent-skills/bundle-contract.js";
 import { skillFrontmatterName } from "../src/agent-skills/frontmatter.js";
 
-const REVIEWED_VERSION = "6.2.0";
+const REVIEWED_VERSION = WORKFLOW_KIT.version;
 const REVIEWED_PACKAGE_NAME = "superpowers";
 const REVIEWED_MIT_LICENSE_SHA256 = "a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400";
-const SOURCE_URL = "https://github.com/obra/superpowers";
-const MAX_FILE_BYTES = 256 * 1024;
-const MAX_LOCK_BYTES = 1024 * 1024;
-const MAX_SKILLS = 64;
-const MAX_BUNDLE_FILES = 512;
-const WORKFLOW_SKILL_IDS = [
-  "brainstorming",
-  "dispatching-parallel-agents",
-  "executing-plans",
-  "finishing-a-development-branch",
-  "receiving-code-review",
-  "requesting-code-review",
-  "subagent-driven-development",
-  "systematic-debugging",
-  "test-driven-development",
-  "using-git-worktrees",
-  "using-superpowers",
-  "verification-before-completion",
-  "writing-plans",
-  "writing-skills",
-];
-const GUARD_SKILL_IDS = ["clean-code-guard", "docs-guard", "test-guard"];
-const EXCLUDED_SEGMENTS = new Set([".git", ".cache", "cache", "caches", "node_modules", "coverage", "dist", "build", "out", "output"]);
-const EXCLUDED_FILES = new Set([".DS_Store", "Thumbs.db"]);
+const {
+  maximumFileBytes: MAX_FILE_BYTES,
+  maximumLockBytes: MAX_LOCK_BYTES,
+  maximumSkills: MAX_SKILLS,
+  maximumLockedFiles: MAX_BUNDLE_FILES,
+  maximumTreeEntries: MAX_TREE_ENTRIES,
+  maximumTreeDepth: MAX_TREE_DEPTH,
+} = BUNDLE_LIMITS;
+const EXCLUDED_SEGMENTS = new Set(SYNC_EXCLUDED_SEGMENTS);
+const EXCLUDED_FILES = new Set(SYNC_EXCLUDED_FILES);
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(moduleDirectory, "..");
-const skillsRoot = join(pluginRoot, "skills");
-const workflowDestination = join(skillsRoot, "workflow-kit");
-const guardsRoot = join(skillsRoot, "guards");
-const lockDestination = join(skillsRoot, "skills.lock.json");
+const skillsRoot = join(pluginRoot, dirname(WORKFLOW_ROOT));
+const workflowDestination = join(pluginRoot, WORKFLOW_ROOT);
+const guardsRoot = join(pluginRoot, GUARDS_ROOT);
+const lockDestination = join(pluginRoot, LOCK_PATH);
 
 function fail(message) {
   throw new Error(`Workflow skill sync: ${message}`);
@@ -82,34 +82,58 @@ function isExcluded(sourceRoot, current) {
   return segments.some((segment) => EXCLUDED_SEGMENTS.has(segment)) || EXCLUDED_FILES.has(segments.at(-1));
 }
 
-function assertRegularTree(root, current = root, label = relative(root, current), limits = null) {
-  const stats = lstatIfPresent(current);
-  if (!stats) fail(`missing ${label || "directory"}`);
-  if (stats.isSymbolicLink()) fail(`symbolic link is not allowed: ${label || "."}`);
+function addTreeEntry(pending, limits, entry) {
+  if (entry.depth > MAX_TREE_DEPTH) fail(`bundle depth exceeds ${MAX_TREE_DEPTH}: ${entry.label}`);
+  limits.entries += 1;
+  if (limits.entries > MAX_TREE_ENTRIES) fail(`bundle entry count exceeds ${MAX_TREE_ENTRIES}`);
+  pending.push(entry);
+}
+
+function validatedTreeStats(current, limits) {
+  const stats = lstatIfPresent(current.path);
+  if (!stats) fail(`missing ${current.label}`);
+  if (stats.isSymbolicLink()) fail(`symbolic link is not allowed: ${current.label}`);
   if (stats.isFile()) {
-    if (stats.size > MAX_FILE_BYTES) fail(`file exceeds ${MAX_FILE_BYTES} bytes: ${label}`);
-    if (limits && ++limits.files > MAX_BUNDLE_FILES) fail(`bundle file count exceeds ${MAX_BUNDLE_FILES}`);
-    return;
+    if (stats.size > MAX_FILE_BYTES) fail(`file exceeds ${MAX_FILE_BYTES} bytes: ${current.label}`);
+    limits.files += 1;
+    if (limits.files > MAX_BUNDLE_FILES) fail(`bundle file count exceeds ${MAX_BUNDLE_FILES}`);
+  } else if (!stats.isDirectory()) {
+    fail(`non-regular entry is not allowed: ${current.label}`);
   }
-  if (!stats.isDirectory()) fail(`non-regular entry is not allowed: ${label || "."}`);
-  for (const entry of readdirSync(current).sort()) {
-    assertRegularTree(root, join(current, entry), label ? `${label}/${entry}` : entry, limits);
+  return stats;
+}
+
+function addDirectoryEntries(current, pending, limits, filterRoot) {
+  const directory = opendirSync(current.path);
+  try {
+    for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+      const childPath = join(current.path, entry.name);
+      if (filterRoot && isExcluded(filterRoot, childPath)) continue;
+      addTreeEntry(pending, limits, {
+        ...current,
+        path: childPath,
+        label: `${current.label}/${entry.name}`,
+        depth: current.depth + 1,
+      });
+    }
+  } finally {
+    directory.closeSync();
   }
 }
 
-function assertFilteredTree(sourceRoot, current, limits) {
-  if (isExcluded(sourceRoot, current)) return;
-  const stats = lstatIfPresent(current);
-  const label = relative(sourceRoot, current) || ".";
-  if (!stats) fail(`missing ${label}`);
-  if (stats.isSymbolicLink()) fail(`symbolic link is not allowed: ${label}`);
-  if (stats.isFile()) {
-    if (stats.size > MAX_FILE_BYTES) fail(`file exceeds ${MAX_FILE_BYTES} bytes: ${label}`);
-    if (++limits.files > MAX_BUNDLE_FILES) fail(`bundle file count exceeds ${MAX_BUNDLE_FILES}`);
-    return;
+function* boundedTreeEntries(roots, limits, filterRoot = null) {
+  const pending = [];
+  for (const root of roots) addTreeEntry(pending, limits, { ...root, depth: 0 });
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const stats = validatedTreeStats(current, limits);
+    yield { ...current, stats };
+    if (stats.isDirectory()) addDirectoryEntries(current, pending, limits, filterRoot);
   }
-  if (!stats.isDirectory()) fail(`non-regular entry is not allowed: ${label}`);
-  for (const entry of readdirSync(current).sort()) assertFilteredTree(sourceRoot, join(current, entry), limits);
+}
+
+function scanTree(root, label, limits, filterRoot = null) {
+  for (const _entry of boundedTreeEntries([{ path: root, label }], limits, filterRoot)) {}
 }
 
 function assertDirectory(path, label) {
@@ -119,109 +143,131 @@ function assertDirectory(path, label) {
   if (!stats.isDirectory()) fail(`not a directory: ${label}`);
 }
 
+function readBoundedRegularFile(path, label, maximumBytes = MAX_FILE_BYTES) {
+  const stats = lstatIfPresent(path);
+  if (!stats || stats.isSymbolicLink() || !stats.isFile()) fail(`${label} must be a regular file`);
+  if (stats.size > maximumBytes) fail(`file exceeds ${maximumBytes} bytes: ${label}`);
+  return readFileSync(path);
+}
+
 function assertDestinationSafe() {
   const skills = lstatIfPresent(skillsRoot);
   if (!skills) return;
   if (skills.isSymbolicLink()) fail("symbolic link is not allowed: skills");
   if (!skills.isDirectory()) fail("not a directory: skills");
-  assertRegularTree(skillsRoot, skillsRoot, "skills");
+  const limits = { entries: 0, files: 0 };
+  if (lstatIfPresent(workflowDestination)) scanTree(workflowDestination, WORKFLOW_ROOT, limits);
+  if (lstatIfPresent(guardsRoot)) scanTree(guardsRoot, GUARDS_ROOT, limits);
+  const lock = lstatIfPresent(lockDestination);
+  if (lock?.isSymbolicLink()) fail(`symbolic link is not allowed: ${LOCK_PATH}`);
+  if (lock && !lock.isFile()) fail(`not a regular file: ${LOCK_PATH}`);
+  if (lock && lock.size > MAX_LOCK_BYTES) fail(`file exceeds ${MAX_LOCK_BYTES} bytes: ${LOCK_PATH}`);
 }
 
-function copyFiltered(source, destination, sourceRoot) {
-  if (isExcluded(sourceRoot, source)) return;
-  const stats = lstatSync(source);
-  if (stats.isDirectory()) {
-    mkdirSync(destination, { recursive: true });
-    for (const entry of readdirSync(source).sort()) copyFiltered(join(source, entry), join(destination, entry), sourceRoot);
-    return;
+function copyFiltered(source, destination, sourceRoot, limits) {
+  const root = { path: source, label: relative(sourceRoot, source), source, destination };
+  for (const entry of boundedTreeEntries([root], limits, sourceRoot)) {
+    const destinationPath = join(entry.destination, relative(entry.source, entry.path));
+    if (entry.stats.isDirectory()) mkdirSync(destinationPath, { recursive: true });
+    else cpSync(entry.path, destinationPath, { force: true, errorOnExist: false, dereference: false });
   }
-  if (!stats.isFile()) fail(`non-regular entry is not allowed: ${relative(sourceRoot, source)}`);
-  cpSync(source, destination, { force: true, errorOnExist: false, dereference: false });
 }
 
 function frontmatterName(skillPath) {
+  const contents = readBoundedRegularFile(skillPath, relative(pluginRoot, skillPath)).toString("utf8");
   try {
-    return skillFrontmatterName(readFileSync(skillPath, "utf8"));
+    return skillFrontmatterName(contents);
   } catch (error) {
     fail(`${error.message} in ${relative(pluginRoot, skillPath)}`);
   }
 }
 
-function bundleFiles(root) {
-  if (!lstatIfPresent(root)) return [];
+function bundleFileRecords(roots) {
   const files = [];
-  for (const entry of readdirSync(root, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) files.push(...bundleFiles(path));
-    else if (entry.isFile()) files.push(path);
-    else fail(`bundle contains a non-regular file: ${relative(pluginRoot, path)}`);
+  const limits = { entries: 0, files: 0 };
+  const descriptors = roots.map((root) => ({ ...root, root: root.path, label: root.publicRoot }));
+  for (const current of boundedTreeEntries(descriptors, limits)) {
+    if (!current.stats.isFile()) continue;
+    files.push({
+      path: `${current.publicRoot}/${relative(current.root, current.path).replaceAll(sep, "/")}`,
+      sha256: createHash("sha256").update(readFileSync(current.path)).digest("hex"),
+    });
   }
-  return files;
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function skillRecord(context, directoryName) {
+  const skillPath = join(context.root, directoryName, "SKILL.md");
+  if (!lstatIfPresent(skillPath)) fail(`skill directory lacks SKILL.md: ${relative(pluginRoot, dirname(skillPath))}`);
+  const id = frontmatterName(skillPath);
+  if (id !== directoryName) fail(`skill name does not match directory: ${relative(pluginRoot, skillPath)}`);
+  return {
+    id,
+    skillPath: `${context.publicRoot}/${relative(context.root, skillPath).replaceAll(sep, "/")}`,
+    source: context.provenance.source,
+    license: context.provenance.license,
+  };
+}
+
+function appendSkillRecord(records, seenNames, context, directoryName) {
+  const record = skillRecord(context, directoryName);
+  if (seenNames.has(record.id)) fail(`duplicate skill name: ${record.id}`);
+  seenNames.add(record.id);
+  records.push(record);
+  if (records.length > MAX_SKILLS) fail(`skill count exceeds ${MAX_SKILLS}`);
 }
 
 function skillRecords(root, publicRoot, provenance, filterRoot = null) {
   if (!lstatIfPresent(root)) return [];
   const seenNames = new Set();
-  return readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && (!filterRoot || !isExcluded(filterRoot, join(root, entry.name))))
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .map((entry) => {
-      const skillPath = join(root, entry.name, "SKILL.md");
-      if (!lstatIfPresent(skillPath)) fail(`skill directory lacks SKILL.md: ${relative(pluginRoot, join(root, entry.name))}`);
-      const id = frontmatterName(skillPath);
-      if (id !== entry.name) fail(`skill name does not match directory: ${relative(pluginRoot, skillPath)}`);
-      if (seenNames.has(id)) fail(`duplicate skill name: ${id}`);
-      seenNames.add(id);
-      return {
-        id,
-        skillPath: `${publicRoot}/${relative(root, skillPath).replaceAll(sep, "/")}`,
-        source: provenance.source,
-        license: provenance.license,
-      };
-    });
+  const records = [];
+  const context = { root, publicRoot, provenance };
+  let entries = 0;
+  const directory = opendirSync(root);
+  try {
+    for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+      entries += 1;
+      if (entries > MAX_TREE_ENTRIES) fail(`bundle entry count exceeds ${MAX_TREE_ENTRIES}`);
+      const entryPath = join(root, entry.name);
+      if (filterRoot && isExcluded(filterRoot, entryPath)) continue;
+      if (entry.isSymbolicLink()) fail(`symbolic link is not allowed: ${relative(pluginRoot, entryPath)}`);
+      if (entry.isDirectory()) appendSkillRecord(records, seenNames, context, entry.name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return records.sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function assertCatalog(records, expectedIds, expectedRoot) {
-  if (records.length > MAX_SKILLS) fail(`skill count exceeds ${MAX_SKILLS}`);
-  if (records.length !== expectedIds.length) fail(`required ${expectedRoot} skill catalog differs`);
-  for (let index = 0; index < expectedIds.length; index += 1) {
-    const expectedId = expectedIds[index];
+function assertCatalog(records, expectedSkills, expectedRoot) {
+  if (records.length !== expectedSkills.length) fail(`required ${expectedRoot} skill catalog differs`);
+  for (let index = 0; index < expectedSkills.length; index += 1) {
+    const expected = expectedSkills[index];
     const record = records[index];
-    if (record.id !== expectedId || record.skillPath !== `${expectedRoot}/${expectedId}/SKILL.md`) {
+    if (record.id !== expected.id || record.skillPath !== expected.skillPath) {
       fail(`required ${expectedRoot} skill catalog differs`);
     }
   }
 }
 
 function buildLock(workflowRoot) {
-  const skills = [
-    ...skillRecords(workflowRoot, "skills/workflow-kit", { source: SOURCE_URL, license: "MIT" }),
-    ...skillRecords(guardsRoot, "skills/guards", { source: "project-owned", license: "repository" }),
-  ];
-  assertCatalog(skills.filter((skill) => skill.skillPath.startsWith("skills/workflow-kit/")), WORKFLOW_SKILL_IDS, "skills/workflow-kit");
-  assertCatalog(skills.filter((skill) => skill.skillPath.startsWith("skills/guards/")), GUARD_SKILL_IDS, "skills/guards");
+  const workflowSkills = skillRecords(workflowRoot, WORKFLOW_ROOT, WORKFLOW_PROVENANCE);
+  const guardSkills = skillRecords(guardsRoot, GUARDS_ROOT, GUARD_PROVENANCE);
+  assertCatalog(workflowSkills, REQUIRED_WORKFLOW_SKILLS, WORKFLOW_ROOT);
+  assertCatalog(guardSkills, REQUIRED_GUARD_SKILLS, GUARDS_ROOT);
+  const skills = [...workflowSkills, ...guardSkills];
   const ids = new Set();
   for (const skill of skills) {
     if (ids.has(skill.id)) fail(`duplicate skill name: ${skill.id}`);
     ids.add(skill.id);
   }
-  const files = [
-    ...bundleFiles(workflowRoot).map((path) => ({ path, publicPath: `skills/workflow-kit/${relative(workflowRoot, path).replaceAll(sep, "/")}` })),
-    ...bundleFiles(guardsRoot).map((path) => ({ path, publicPath: `skills/guards/${relative(guardsRoot, path).replaceAll(sep, "/")}` })),
-  ]
-    .map(({ path, publicPath }) => ({
-      path: publicPath,
-      sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
-    }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+  const files = bundleFileRecords([
+    { path: workflowRoot, publicRoot: WORKFLOW_ROOT },
+    { path: guardsRoot, publicRoot: GUARDS_ROOT },
+  ]);
   const lock = {
-    schemaVersion: 1,
-    workflowKit: {
-      version: REVIEWED_VERSION,
-      sourceUrl: SOURCE_URL,
-      license: "MIT",
-      licensePath: "skills/workflow-kit/LICENSE",
-    },
+    schemaVersion: LOCK_SCHEMA_VERSION,
+    workflowKit: WORKFLOW_KIT,
     skills: skills.sort((left, right) => left.id.localeCompare(right.id)),
     files,
   };
@@ -235,32 +281,31 @@ function validateSource(source, version) {
   const license = join(source, "LICENSE");
   const sourceSkills = join(source, "skills");
   const metadataPath = join(source, "package.json");
-  for (const [path, label] of [[license, "source LICENSE"], [metadataPath, "source package.json"]]) {
-    const stats = lstatIfPresent(path);
-    if (!stats || stats.isSymbolicLink() || !stats.isFile()) fail(`${label} must be a regular file`);
-  }
+  const licenseContents = readBoundedRegularFile(license, "source LICENSE");
+  const metadataContents = readBoundedRegularFile(metadataPath, "source package.json");
   assertDirectory(sourceSkills, "source skills directory");
   let metadata;
   try {
-    metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
-  } catch {
+    metadata = JSON.parse(metadataContents.toString("utf8"));
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
     fail("source package.json is malformed");
   }
   if (metadata.name !== REVIEWED_PACKAGE_NAME) fail(`source package name must be ${REVIEWED_PACKAGE_NAME}`);
   if (metadata.version !== version) fail(`source package version ${JSON.stringify(metadata.version)} does not match ${version}`);
-  const licenseDigest = createHash("sha256").update(readFileSync(license)).digest("hex");
+  const licenseDigest = createHash("sha256").update(licenseContents).digest("hex");
   if (licenseDigest !== REVIEWED_MIT_LICENSE_SHA256) fail("source LICENSE does not match the reviewed MIT license");
   assertSourceBundle(source, license, sourceSkills);
   return { license, sourceSkills };
 }
 
 function assertSourceBundle(source, license, sourceSkills) {
-  const limits = { files: 0 };
-  assertFilteredTree(source, license, limits);
-  assertFilteredTree(source, sourceSkills, limits);
-  assertRegularTree(guardsRoot, guardsRoot, "skills/guards", limits);
-  assertCatalog(skillRecords(sourceSkills, "skills/workflow-kit", { source: SOURCE_URL, license: "MIT" }, source), WORKFLOW_SKILL_IDS, "skills/workflow-kit");
-  assertCatalog(skillRecords(guardsRoot, "skills/guards", { source: "project-owned", license: "repository" }), GUARD_SKILL_IDS, "skills/guards");
+  const limits = { entries: 0, files: 0 };
+  scanTree(license, "LICENSE", limits, source);
+  scanTree(sourceSkills, "skills", limits, source);
+  scanTree(guardsRoot, GUARDS_ROOT, limits);
+  assertCatalog(skillRecords(sourceSkills, WORKFLOW_ROOT, WORKFLOW_PROVENANCE, source), REQUIRED_WORKFLOW_SKILLS, WORKFLOW_ROOT);
+  assertCatalog(skillRecords(guardsRoot, GUARDS_ROOT, GUARD_PROVENANCE), REQUIRED_GUARD_SKILLS, GUARDS_ROOT);
 }
 
 function replaceBundle(stage, lockContents) {
@@ -307,11 +352,12 @@ function main() {
   try {
     const stagedWorkflow = join(stage, "workflow-kit");
     mkdirSync(stagedWorkflow);
-    copyFiltered(license, join(stagedWorkflow, "LICENSE"), source);
-    copyFiltered(sourceSkills, stagedWorkflow, source);
-    const stagedLimits = { files: 0 };
-    assertRegularTree(stagedWorkflow, stagedWorkflow, "staged workflow-kit", stagedLimits);
-    assertRegularTree(guardsRoot, guardsRoot, "skills/guards", stagedLimits);
+    const copyLimits = { entries: 0, files: 0 };
+    copyFiltered(license, join(stagedWorkflow, "LICENSE"), source, copyLimits);
+    copyFiltered(sourceSkills, stagedWorkflow, source, copyLimits);
+    const stagedLimits = { entries: 0, files: 0 };
+    scanTree(stagedWorkflow, WORKFLOW_ROOT, stagedLimits);
+    scanTree(guardsRoot, GUARDS_ROOT, stagedLimits);
     const lockContents = buildLock(stagedWorkflow);
     assertDestinationSafe();
     replaceBundle(stage, lockContents);
