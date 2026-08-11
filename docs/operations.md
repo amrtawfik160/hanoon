@@ -25,6 +25,27 @@ A healthy loaded plugin reports `running` with both `telegram-ingress` and `job-
 
 Use `--json` on Telegram Agent commands when another tool must consume the result.
 
+## Verify the bundled skill runtime
+
+Skills are committed locally under the manifest roots `skills/workflow-kit` and `skills/guards`; operators do not install another skill plugin. The catalog has 17 local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+
+Run the deterministic integrity gate from the repository root:
+
+```bash
+npm run skills:verify
+```
+
+The command checks the manifest roots and lock, file sizes/counts and regular-file type, complete SHA-256 coverage, frontmatter and directory names, nested local Markdown resources, and pinned/project-owned provenance. Success prints a bounded `bundleDigest` and `skillCount`; a malformed lock, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter/resource mismatch, or digest mismatch exits non-zero. `npm run build` invokes this verifier before `bb plugin build`, and activation invokes it before plugin registration. Treat any failure as a stop: the runtime never downloads, substitutes, or repairs a bundle.
+
+Only a maintainer may synchronize the pinned upstream workflow kit. Use an already-reviewed local absolute checkout of the `superpowers` package with version `6.2.0`, `LICENSE`, `skills/`, and the reviewed MIT license; the synchronizer is network-free and has no runtime role:
+
+```bash
+WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.2.0
+npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.2.0
+```
+
+Synchronization rewrites the local `skills/workflow-kit` files and `skills/skills.lock.json`. Re-run `npm run skills:verify` and review the resulting diff before any plugin reload. Do not use synchronization as an activation-time repair mechanism.
+
 ## Memory and monitors
 
 Both are owner-facing in the chat rather than through the CLI:

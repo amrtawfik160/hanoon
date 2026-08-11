@@ -69,6 +69,52 @@ After implementation produces a pull request, deterministic validation runs befo
 
 Documentation, final validation, and final review happen before the owner receives a one-use merge approval. Merge, deploy, and canary each produce separate durable receipts. A successful merge followed by a failed deploy or canary is recorded as `production_failed`; the plugin does not claim completion or run rollback automatically.
 
+## Agent skill runtime
+
+The BB manifest registers exactly two local skill roots: `skills/workflow-kit` and `skills/guards`. The first is the pinned `6.2.0` MIT-licensed workflow kit from [obra/superpowers](https://github.com/obra/superpowers); the second contains three project-owned guards. All 17 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
+
+The existing single `bb.agents.configure` callback keeps the controller and worker boundaries separate. Its exact role-selection matrix is:
+
+| Verified role/context | Selected skill ids |
+| --- | --- |
+| controller | none; controller tools and `CONTROLLER_INSTRUCTIONS` only |
+| planner | none |
+| critic | none |
+| implementation | `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard` |
+| review | `clean-code-guard`, `test-guard` |
+| documentation | `docs-guard`, `verification-before-completion` |
+| final-review | `clean-code-guard`, `test-guard`, `docs-guard` |
+| validation, merge, deploy, canary | none; these are deterministic stages, not skill-bearing worker roles |
+
+### Fail-closed worker selection
+
+The resolver first checks structural context. The origin must be non-fork (`origin.kind === null`) and belong to plugin `telegram-agent`; the project must be `standard`; and the environment must be a `managed-worktree`. The thread title must match the anchored production protocol exactly:
+
+```text
+Telegram <jobId> <role-token> <attemptId>
+```
+
+The parser accepts job ids of 1–256 `[A-Za-z0-9_-]` characters and attempt ids of 1–264 `[A-Za-z0-9_.:-]` characters. The only role tokens are `implementation`, `plan`, `critique`, `review`, `docs`, and `final-review`, mapped respectively to implementation, planner, critic, review, documentation, and final-review.
+
+It then checks durable ownership. Implementation, review, and final-review titles must use an `attempt:` id and an exact durable attempt of kind `implementation` or `review`; planner, critic, and documentation titles must use a `stage:` id and an exact durable stage role `PLAN`, `CRITIQUE`, or `DOCS`. The id after that prefix is looked up as the exact job effect idempotency key, and its effect must be respectively `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs`. The job must exist and belong to the current project. Its persisted environment id, when non-null, and persisted worker thread id, when non-null, must equal the current context. A null binding is allowed only for the first start; it is not a wildcard after persistence. Title, job, attempt, role, effect, project, environment, thread, origin, project-kind, or workspace mismatches all return no tools and no skills. There is no fallback to a newest job, parent thread, or title-only inference.
+
+The controller branch is independently exact: it requires the active durable controller, matching project and host, the plugin origin, an allowed controller provider, a personal project and personal workspace, and the stable controller title. It receives controller tools and zero development skills. A spoofed or unrecognized context cannot inherit either controller tools or a worker profile.
+
+### Bundle integrity and maintenance
+
+`npm run skills:verify` runs the synchronous verifier used by activation. It requires the manifest roots and `skills/skills.lock.json` schema version 1, bounds the lock to 1 MiB, the bundle to 64 skills and 512 locked files, rejects symlinks/non-regular or over-256 KiB files, and requires every discovered file to be locked exactly once with a SHA-256 digest. It also checks lexical safe paths, skill directory/frontmatter/lock-name agreement, nested local Markdown links that stay within their registered root and resolve to regular files, the pinned workflow-kit provenance (`6.2.0`, source URL, MIT license and `skills/workflow-kit/LICENSE`), and project-owned guard provenance. Success prints a bundle digest and skill count.
+
+The package `build` script runs `npm run skills:verify` before `bb plugin build`; `server.ts` runs the same verification before `createPlugin` can register services, tools, schedules, or commands. Any malformed lock, missing root/skill/resource, unlocked or escaped path, frontmatter/provenance mismatch, symlink, size/count limit, or digest mismatch stops the build or activation. There is no runtime download, replacement, or repair path.
+
+Synchronization is a maintainer-only, network-free operation from an already-reviewed absolute checkout. The checkout must identify the `superpowers` package at version `6.2.0`, contain `LICENSE` and `skills/`, and carry the reviewed MIT license. The exact command is:
+
+```bash
+WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.2.0
+npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.2.0
+```
+
+It rewrites only the local `skills/workflow-kit` tree and `skills/skills.lock.json`; ordinary plugin startup never invokes it.
+
 ## BB threads and worktrees
 
 BB threads and Git worktrees solve different isolation problems:
