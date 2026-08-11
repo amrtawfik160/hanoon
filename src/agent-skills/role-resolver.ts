@@ -101,9 +101,10 @@ export function parseWorkerThreadTitle(title: string | null): WorkerTitleIdentit
 }
 
 export function buildWorkerInstructions(
-  profile: Readonly<Pick<WorkerSkillProfile, "role" | "skills">>,
+  profile: Readonly<Pick<WorkerSkillProfile, "role">>,
 ): string {
-  const selectedSkills = profile.skills.length > 0 ? profile.skills.join(", ") : "none";
+  const skills = ROLE_SKILLS[profile.role];
+  const selectedSkills = skills.length > 0 ? skills.join(", ") : "none";
   return [
     `Verified worker role: ${profile.role}.`,
     `Selected skill ids: ${selectedSkills}.`,
@@ -140,6 +141,6 @@ export function resolveWorkerSkillProfile(input: Readonly<{
   return {
     role: titleIdentity.role,
     skills,
-    instructions: buildWorkerInstructions({ role: titleIdentity.role, skills }),
+    instructions: buildWorkerInstructions({ role: titleIdentity.role }),
   };
 }

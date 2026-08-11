@@ -144,6 +144,21 @@ describe("worker skill role table", () => {
     expect(profile.instructions).not.toContain("https://github.com/example/project.git");
   });
 
+  test.each([
+    ["planner", "systematic-debugging", "none"],
+    ["review", "docs-guard", "clean-code-guard, test-guard"],
+  ] as const)("ignores forged repeated skill ids for the %s role", (role, forgedSkill, expectedSkills) => {
+    const forgedProfile = {
+      role,
+      skills: Array.from({ length: 400 }, () => forgedSkill),
+    } as Parameters<typeof buildWorkerInstructions>[0];
+    const instructions = buildWorkerInstructions(forgedProfile);
+
+    expect(instructions.length).toBeLessThanOrEqual(1_200);
+    expect(instructions).toContain(`Selected skill ids: ${expectedSkills}.`);
+    expect(instructions).not.toContain(forgedSkill);
+  });
+
   test("says none are selected for an empty profile", () => {
     const identity = durableIdentity({
       attemptId: `stage:${effectIdempotencyKey(JOB_ID, 7, "spawn_plan")}`,
