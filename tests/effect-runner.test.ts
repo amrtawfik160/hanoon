@@ -2,6 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type { JobEffect, StoredEffect } from "../src/domain/models";
+import { buildWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { admitConfirmedJob, policyFixture } from "./helpers";
@@ -79,7 +80,138 @@ function leaseEffectsForTest(
   return (store as LegacyLeaseStore).leaseEffects(ownerId, generation, now, limit, leaseMs);
 }
 
+function selectedJobForRecovery(
+  store: TelegramAgentStore,
+  db: Database.Database,
+  id: string,
+  state: "planning" | "creating_implementation",
+): ReturnType<TelegramAgentStore["getJob"]> {
+  const job = store.createJob({ id, sourceUpdateId: 1, requestText: "work", now: 1_000 });
+  db.prepare(
+    `UPDATE jobs SET state = ?, project_id = 'proj_1', policy_version = 1, policy_json = ?, version = 2 WHERE id = ?`,
+  ).run(state, JSON.stringify(policyFixture()), job.id);
+  return store.getJob(job.id);
+}
+
+function addPendingEffectForRecovery(db: Database.Database, effect: JobEffect): void {
+  db.prepare(
+    `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+  ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+}
+
 describe("leased effect execution", () => {
+  it("recovers an ordinary implementation thread by the centralized title bytes", async () => {
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_ordinary_recovery", "creating_implementation");
+    if (!job) throw new Error("job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("ordinary spawn effect missing");
+    const title = buildWorkerThreadTitle({
+      jobId: job.id,
+      attemptId: `attempt:${effect.idempotencyKey}`,
+      role: "implementation",
+    });
+    const listThreads = vi.fn(async () => ({
+      threads: [{
+        id: "thr_recovered_ordinary",
+        projectId: "proj_1",
+        environmentId: "env_ordinary",
+        parentThreadId: null,
+        title,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }],
+      total: 1,
+    }));
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: { listThreads },
+      now: () => 1_002,
+    }).run(claimed);
+
+    expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ projectId: "proj_1" }));
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "implementing",
+      implementationThreadId: "thr_recovered_ordinary",
+      environmentId: "env_ordinary",
+    });
+  });
+
+  it("recovers a pipeline planner thread by the same centralized title bytes", async () => {
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_pipeline_recovery", "planning");
+    if (!job) throw new Error("job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_plan`,
+      jobId: job.id,
+      kind: "spawn_plan",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("pipeline spawn effect missing");
+    const title = buildWorkerThreadTitle({
+      jobId: job.id,
+      attemptId: `stage:${effect.idempotencyKey}`,
+      role: "planner",
+    });
+    const listThreads = vi.fn(async () => ({
+      threads: [{
+        id: "thr_recovered_pipeline",
+        projectId: "proj_1",
+        environmentId: "env_pipeline",
+        parentThreadId: null,
+        title,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }],
+      total: 1,
+    }));
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: {
+        listThreads,
+        spawnPlanner: vi.fn(async () => {
+          throw new Error("planner spawn should not be reached during recovery");
+        }),
+      },
+      now: () => 1_002,
+    }).run(claimed);
+
+    expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ projectId: "proj_1" }));
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "planning",
+      environmentId: "env_pipeline",
+    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
+      id: `stage:${effect.idempotencyKey}`,
+      threadId: "thr_recovered_pipeline",
+      environmentId: "env_pipeline",
+    });
+  });
+
   it("allows exactly one executor generation to win a race", () => {
     const first = storeFixture();
     const one = first.store.acquireExecutorLease("one", 1_000, 30_000);

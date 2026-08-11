@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { buildWorkerThreadTitle } from "../agent-skills/role-resolver";
 import type { Job, JobEffect, JobEvent, ReviewFinding, StoredEffect, WorkerLiveness } from "../domain/models";
 import { ApprovalService } from "./approval-service";
 import { buildWorkOrder } from "../bb/handoffs";
@@ -399,7 +400,7 @@ export class EffectRunner {
     });
     if (!attempt) throw new Error("executor lease was lost before attempt creation");
     const titleRole = finalReview ? "final-review" : kind;
-    const expectedTitle = `Telegram ${job.id} ${titleRole} ${attempt.id}`;
+    const expectedTitle = buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: titleRole });
     const list = listThreadsAdapter(bb);
     if (list && job.projectId) {
       const candidates: BbThread[] = [];
@@ -464,8 +465,8 @@ export class EffectRunner {
   ): Promise<{ threadId: string; environmentId: string } | null> {
     const list = listThreadsAdapter(bb);
     if (!list || !job.projectId) return null;
-    const roleLabel = attempt.role === "PLAN" ? "plan" : attempt.role === "CRITIQUE" ? "critique" : "docs";
-    const expectedTitle = `Telegram ${job.id} ${roleLabel} ${attempt.id}`;
+    const role = attempt.role === "PLAN" ? "planner" : attempt.role === "CRITIQUE" ? "critic" : "documentation";
+    const expectedTitle = buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role });
     const candidates: BbThread[] = [];
     for (let offset = 0; offset < 1_000; offset += 100) {
       this.assertFence();

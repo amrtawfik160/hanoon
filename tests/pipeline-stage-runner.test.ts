@@ -2,6 +2,7 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { BbRunner } from "../src/bb/runner";
+import { parseWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import {
   buildCritiquePacket,
   buildPlanArtifact,
@@ -84,7 +85,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     const { runner, spawns, uploads } = pipelineSdk();
     await runner.spawnPlanner(
       { ...plannedJob, environmentId: "env_plan", planCycle: 1 },
-      { id: "stage_plan_2", role: "PLAN", ordinal: 2 },
+      { id: "stage:job_1:2:spawn_plan", role: "PLAN", ordinal: 2 },
       '{"verdict":"needs_revision","summary":"Add rollback evidence"}',
     );
 
@@ -102,10 +103,10 @@ describe("fresh planner, critic, and builder conversations", () => {
 
   it("uses Luna Max for fresh plan and critique spawns, then hands only files to the builder", async () => {
     const { runner, spawns, uploads } = pipelineSdk();
-    const planAttempt = { id: "stage_plan_1", role: "PLAN" as const, ordinal: 1 };
+    const planAttempt = { id: "stage:job_1:1:spawn_plan", role: "PLAN" as const, ordinal: 1 };
     const planThread = await runner.spawnPlanner(plannedJob, planAttempt);
     const plan = buildPlanArtifact(await runner.getThreadOutput(planThread.id));
-    const critiqueAttempt = { id: "stage_critique_1", role: "CRITIQUE" as const, ordinal: 1 };
+    const critiqueAttempt = { id: "stage:job_1:1:spawn_critique", role: "CRITIQUE" as const, ordinal: 1 };
     await runner.spawnCritic(
       { ...plannedJob, state: "critiquing", environmentId: "env_plan" },
       critiqueAttempt,
@@ -113,7 +114,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     );
     await runner.spawnBuilderFromPlan(
       { ...plannedJob, state: "creating_implementation", environmentId: "env_plan" },
-      { id: "attempt_impl_1" },
+      { id: "attempt:job_1:1:spawn_implementation" },
       { ...planAttempt, threadId: planThread.id, environmentId: "env_plan", outputText: new TextDecoder().decode(plan.bytes) },
     );
 
@@ -145,6 +146,21 @@ describe("fresh planner, critic, and builder conversations", () => {
         { type: "localFile", path: "attachments/plan.md" },
       ],
     });
+    expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "stage:job_1:1:spawn_plan",
+      role: "planner",
+    });
+    expect(parseWorkerThreadTitle(String(spawns[1].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "stage:job_1:1:spawn_critique",
+      role: "critic",
+    });
+    expect(parseWorkerThreadTitle(String(spawns[2].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "attempt:job_1:1:spawn_implementation",
+      role: "implementation",
+    });
     expect(uploads.map((upload) => upload.filename)).toEqual([
       "work-order.md",
       "work-order.md",
@@ -167,10 +183,10 @@ describe("fresh planner, critic, and builder conversations", () => {
       prHeadSha: "a".repeat(40),
     };
 
-    await runner.spawnDocs(job, { id: "stage_docs_1", role: "DOCS", ordinal: 1 });
+    await runner.spawnDocs(job, { id: "stage:job_1:1:spawn_docs", role: "DOCS", ordinal: 1 });
     await runner.spawnFinalReview(
       { ...job, state: "final_reviewing" },
-      { id: "attempt_final_review_1" },
+      { id: "attempt:job_1:1:spawn_final_review" },
     );
 
     expect(spawns[0]).toMatchObject({
@@ -182,17 +198,31 @@ describe("fresh planner, critic, and builder conversations", () => {
       serviceTier: "fast",
       permissionMode: "auto",
       input: [
-        { type: "text", text: expect.stringMatching(/Docs Guard.*BB CLI/i) },
+        { type: "text", text: expect.stringContaining("docs-guard") },
         { type: "localFile", path: "attachments/work-order.md" },
         { type: "localFile", path: "attachments/docs-packet.json" },
       ],
     });
+    expect((spawns[0].input as Array<{ type: string; text?: string }>)[0].text).toContain(
+      "verification-before-completion",
+    );
+    expect((spawns[0].input as Array<{ type: string; text?: string }>)[0].text).not.toMatch(/Docs Guard|BB CLI|bb-cli/);
+    expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "stage:job_1:1:spawn_docs",
+      role: "documentation",
+    });
     expect(spawns[1]).toMatchObject({
       parentThreadId: "thr_builder",
-      title: "Telegram job_1 final-review attempt_final_review_1",
+      title: "Telegram job_1 final-review attempt:job_1:1:spawn_final_review",
       environment: { type: "reuse", environmentId: "env_plan" },
     });
     expect(spawns[1]).not.toHaveProperty("sourceThreadId");
+    expect(parseWorkerThreadTitle(String(spawns[1].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "attempt:job_1:1:spawn_final_review",
+      role: "final-review",
+    });
     expect(uploads.map((upload) => upload.filename)).toEqual([
       "work-order.md",
       "docs-packet.json",

@@ -5,7 +5,9 @@ import {
   buildReviewFormatCorrectionPrompt,
   buildReviewInstruction,
 } from "../src/bb/prompts";
-import { jobFixture } from "./helpers";
+import { buildWorkOrder } from "../src/bb/handoffs";
+import { buildWorkerInstructions } from "../src/agent-skills/role-resolver";
+import { jobFixture, policyFixture } from "./helpers";
 
 const artifact = {
   filename: "review-packet.json",
@@ -29,6 +31,31 @@ it("keeps implementation and review instructions tiny and attachment-only", () =
   expect(review).toContain("b".repeat(64));
   expect(implementation).not.toContain("Ignore previous");
   expect(review).not.toContain("Ignore previous");
+  expect(implementation).not.toMatch(/SKILL\.md|systematic-debugging|test-driven-development|docs-guard/);
+  expect(review).not.toMatch(/SKILL\.md|systematic-debugging|test-driven-development|docs-guard/);
+});
+
+it("keeps packet authority above selected skill suggestions", () => {
+  const job = jobFixture({ projectId: "proj_1", policy: policyFixture() });
+  const packet = new TextDecoder().decode(buildWorkOrder(job, job.policy!).bytes);
+  const instructions = buildWorkerInstructions({ role: "implementation" });
+
+  expect(packet).toContain("This attachment is the immutable execution contract");
+  expect(packet).toContain("## Validation policy");
+  expect(instructions).toContain(
+    "The immutable attached work order/review packet and durable project policy outrank skill suggestions.",
+  );
+  expect(instructions).toContain("The worker must obey the packet's response contract.");
+});
+
+it("preserves the strict JSON review and critique wording", () => {
+  expect(buildReviewInstruction(artifact)).toBe(
+    "Read the attached immutable review packet review-packet.json (SHA-256 " +
+      "b".repeat(64) + "). Inspect the complete diff, run its checks, and return strict JSON only.",
+  );
+  expect(buildReviewFormatCorrectionPrompt()).toBe(
+    "Return exactly one strict JSON review result object matching the attached packet's output contract. Do not use Markdown fences, commentary, or additional keys.",
+  );
 });
 
 it("bounds inline remediation and format-correction prompts", () => {

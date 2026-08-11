@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
+import { parseWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import { BbRunner } from "../src/bb/runner";
 import { activeWorkerFixture, jobFixture, policyFixture } from "./helpers";
 
@@ -139,13 +140,13 @@ const selectedJob = jobFixture({
 
 it("spawns implementation in a visible managed worktree and records the immutable handoff", async () => {
   const { calls, runner } = runnerFixture();
-  const implementationAttempt = attempt("attempt_impl_1");
+  const implementationAttempt = attempt("attempt:job_1:1:spawn_implementation");
 
   await runner.spawnImplementation(selectedJob, implementationAttempt, policyFixture({ baseBranch: "wrong" }));
 
   expect(calls.spawns[0]).toMatchObject({
     projectId: "proj_1",
-    title: "Telegram job_1 implementation attempt_impl_1",
+    title: "Telegram job_1 implementation attempt:job_1:1:spawn_implementation",
     visibility: "visible",
     environment: {
       type: "host",
@@ -163,6 +164,11 @@ it("spawns implementation in a visible managed worktree and records the immutabl
   expect(calls.forks).toHaveLength(0);
   expect(implementationAttempt.handoffPath).toBe("attachments/work-order.md");
   expect(implementationAttempt.handoffSha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(parseWorkerThreadTitle(String((calls.spawns[0] as { title: string }).title))).toEqual({
+    jobId: "job_1",
+    attemptId: "attempt:job_1:1:spawn_implementation",
+    role: "implementation",
+  });
 });
 
 it.each([
@@ -215,14 +221,14 @@ it("requires an immutable job policy snapshot even when a caller supplies a poli
 
 it("spawns review as a visible child in the exact implementation environment", async () => {
   const { calls, runner } = runnerFixture();
-  const reviewAttempt = attempt("attempt_review_1");
+  const reviewAttempt = attempt("attempt:job_1:1:spawn_review");
 
   await runner.spawnReview(selectedJob, reviewAttempt, policyFixture({ baseBranch: "wrong" }));
 
   expect(calls.spawns[0]).toMatchObject({
     projectId: "proj_1",
     parentThreadId: "thr_i",
-    title: "Telegram job_1 review attempt_review_1",
+    title: "Telegram job_1 review attempt:job_1:1:spawn_review",
     visibility: "visible",
     environment: { type: "reuse", environmentId: "env_1" },
     input: [
@@ -236,6 +242,11 @@ it("spawns review as a visible child in the exact implementation environment", a
   expect(calls.diffs[0]).toEqual({ environmentId: "env_1", target: "all", mergeBaseBranch: "main" });
   expect(calls.pullRequests[0]).toEqual({ environmentId: "env_1" });
   expect(calls.forks).toHaveLength(0);
+  expect(parseWorkerThreadTitle(String((calls.spawns[0] as { title: string }).title))).toEqual({
+    jobId: "job_1",
+    attemptId: "attempt:job_1:1:spawn_review",
+    role: "review",
+  });
 });
 
 it("blocks a truncated environment diff before uploading or spawning review", async () => {
