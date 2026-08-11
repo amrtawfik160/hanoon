@@ -518,6 +518,13 @@ export const NOTICE_COOLDOWN_MIGRATIONS = [String.raw`
 ALTER TABLE observed_threads ADD COLUMN notified_at INTEGER;
 `] as const;
 
+export const CONTROLLER_IMAGE_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN image_file_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN image_file_name TEXT;
+ALTER TABLE controller_turns ADD COLUMN image_mime_type TEXT;
+ALTER TABLE controller_turns ADD COLUMN image_size_bytes INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -535,4 +542,5 @@ export const ALL_MIGRATIONS = [
   ...THREAD_NOTICE_MIGRATIONS,
   ...UNSUPPORTED_INTERACTION_MIGRATIONS,
   ...NOTICE_COOLDOWN_MIGRATIONS,
+  ...CONTROLLER_IMAGE_MIGRATIONS,
 ] as const;

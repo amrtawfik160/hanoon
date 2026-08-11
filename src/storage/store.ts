@@ -16,12 +16,15 @@ import { formattedMessage } from "../telegram/markdown";
 import { ftsQuery, memoryScore } from "./memory-ranking";
 import { assertSafeFailureSummary, containsCredentialLikeText, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
-import type {
-  ControllerLeaseFence,
-  ControllerThreadRecord,
-  ControllerThreadState,
-  ControllerTurnRecord,
-  ControllerTurnState,
+import {
+  CONTROLLER_IMAGE_MIME_TYPES,
+  MAX_CONTROLLER_IMAGE_BYTES,
+  type ControllerImage,
+  type ControllerLeaseFence,
+  type ControllerThreadRecord,
+  type ControllerThreadState,
+  type ControllerTurnRecord,
+  type ControllerTurnState,
 } from "../controller/models";
 import {
   nextUnansweredQuestion,
@@ -534,6 +537,10 @@ type ControllerTurnRow = {
   controller_key: string;
   ordinal: number;
   input_text: string;
+  image_file_id: string | null;
+  image_file_name: string | null;
+  image_mime_type: string | null;
+  image_size_bytes: number | null;
   state: ControllerTurnState;
   lease_owner: string | null;
   lease_generation: number | null;
@@ -772,6 +779,25 @@ function assertControllerIdentifier(value: string, field: string): void {
 function assertControllerText(value: string, field: string): void {
   if (typeof value !== "string" || value.trim().length === 0 || value.length > 4_000) {
     throw new TypeError(`${field} must be between 1 and 4000 characters`);
+  }
+}
+
+function assertControllerImage(value: ControllerImage): void {
+  if (typeof value.fileId !== "string" || value.fileId.length === 0 || value.fileId.length > 1_024) {
+    throw new TypeError("controller image fileId must be between 1 and 1024 characters");
+  }
+  if (!/^[A-Za-z0-9._-]{1,255}$/.test(value.fileName)) {
+    throw new TypeError("controller image fileName is invalid");
+  }
+  if (!CONTROLLER_IMAGE_MIME_TYPES.includes(value.mimeType)) {
+    throw new TypeError("controller image mimeType is invalid");
+  }
+  if (value.sizeBytes !== null && (
+    !Number.isSafeInteger(value.sizeBytes) ||
+    value.sizeBytes < 0 ||
+    value.sizeBytes > MAX_CONTROLLER_IMAGE_BYTES
+  )) {
+    throw new TypeError("controller image sizeBytes is invalid");
   }
 }
 const CREDENTIAL_QUERY_KEY = /^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|auth(?:orization)?|auth[_-]?(?:token|key)|session[_-]?token|private[_-]?key|credentials?|password|passwd|secret|token|key|jwt|signature|sig)$/i;
@@ -1566,6 +1592,7 @@ export interface TelegramAgentStore {
     telegramChatId: string;
     updateId: number;
     inputText: string;
+    image?: ControllerImage | null;
     now: number;
   }): ControllerTurnRecord;
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
@@ -1573,6 +1600,7 @@ export interface TelegramAgentStore {
   getControllerTurn(turnId: string): ControllerTurnRecord | null;
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
   requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
+  recordControllerImagePreparationFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
   failStaleControllerDispatches(fence: ControllerLeaseFence): boolean;
   markControllerSpawned(input: ControllerLeaseFence & {
     turnId: string;
@@ -1977,12 +2005,14 @@ function parseControllerThread(row: ControllerThreadRow): ControllerThreadRecord
 }
 
 function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
+  const image = parseControllerImage(row);
   return {
     id: row.id,
     updateId: row.telegram_update_id,
     controllerKey: row.controller_key,
     ordinal: row.ordinal,
     inputText: row.input_text,
+    image,
     state: row.state,
     leaseOwner: row.lease_owner,
     leaseGeneration: row.lease_generation,
@@ -2000,6 +2030,26 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function parseControllerImage(row: ControllerTurnRow): ControllerImage | null {
+  if (
+    row.image_file_id === null &&
+    row.image_file_name === null &&
+    row.image_mime_type === null &&
+    row.image_size_bytes === null
+  ) return null;
+  if (row.image_file_id === null || row.image_file_name === null || row.image_mime_type === null) {
+    throw new Error("Persisted controller image is incomplete");
+  }
+  const image = {
+    fileId: row.image_file_id,
+    fileName: row.image_file_name,
+    mimeType: row.image_mime_type,
+    sizeBytes: row.image_size_bytes,
+  } as ControllerImage;
+  assertControllerImage(image);
+  return image;
 }
 
 function parseThreadOperation(row: ThreadOperationRow): ThreadOperation {
@@ -2643,6 +2693,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     telegramChatId: string;
     updateId: number;
     inputText: string;
+    image?: ControllerImage | null;
     now: number;
   }): ControllerTurnRecord {
     assertControllerKey(input.controllerKey);
@@ -2650,6 +2701,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertCanonicalPositiveDecimal(input.telegramChatId, "telegramChatId");
     assertNonNegativeInteger(input.updateId, "updateId");
     assertControllerText(input.inputText, "controller input");
+    const image = input.image ?? null;
+    if (image) assertControllerImage(image);
     assertNonNegativeInteger(input.now, "now");
 
     return this.db.transaction((): ControllerTurnRecord => {
@@ -2664,7 +2717,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (existing) {
         if (
           existing.controller_key !== input.controllerKey ||
-          existing.input_text !== input.inputText
+          existing.input_text !== input.inputText ||
+          existing.image_file_id !== (image?.fileId ?? null) ||
+          existing.image_file_name !== (image?.fileName ?? null) ||
+          existing.image_mime_type !== (image?.mimeType ?? null) ||
+          existing.image_size_bytes !== (image?.sizeBytes ?? null)
         ) {
           throw new IdempotencyConflictError(input.updateId);
         }
@@ -2703,9 +2760,23 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const id = `controller-turn-${input.updateId}`;
       this.db.prepare(
         `INSERT INTO controller_turns (
-           id, telegram_update_id, controller_key, ordinal, input_text, state, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`,
-      ).run(id, input.updateId, input.controllerKey, next.ordinal, input.inputText, input.now, input.now);
+           id, telegram_update_id, controller_key, ordinal, input_text,
+           image_file_id, image_file_name, image_mime_type, image_size_bytes,
+           state, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+      ).run(
+        id,
+        input.updateId,
+        input.controllerKey,
+        next.ordinal,
+        input.inputText,
+        image?.fileId ?? null,
+        image?.fileName ?? null,
+        image?.mimeType ?? null,
+        image?.sizeBytes ?? null,
+        input.now,
+        input.now,
+      );
       const stored = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(id) as ControllerTurnRow;
       return parseControllerTurn(stored);
     }).immediate();
@@ -2792,6 +2863,28 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const requeued = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'queued', lease_owner = NULL, lease_generation = NULL, updated_at = ?
+          WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?`,
+      ).run(input.now, input.turnId, input.ownerId, input.generation);
+      if (requeued.changes !== 1) return false;
+      this.db.prepare(
+        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+          WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
+            AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
+      ).run(input.now, input.turnId, input.turnId);
+      return true;
+    }).immediate();
+  }
+
+  public recordControllerImagePreparationFailure(
+    input: ControllerLeaseFence & { turnId: string },
+  ): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const requeued = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'queued', retry_count = retry_count + 1,
+                lease_owner = NULL, lease_generation = NULL, updated_at = ?
           WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?`,
       ).run(input.now, input.turnId, input.ownerId, input.generation);
       if (requeued.changes !== 1) return false;

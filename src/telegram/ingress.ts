@@ -28,6 +28,8 @@ import {
 } from "./view";
 import { TelegramRequestError } from "./client";
 import { TelegramApiError } from "./errors";
+import { MAX_CONTROLLER_IMAGE_BYTES } from "../controller/models";
+import { CAPTIONLESS_IMAGE_PROMPT, controllerImageFromMessage } from "./image";
 
 export type TelegramIngressTransport = {
   sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }>;
@@ -202,7 +204,8 @@ export class TelegramIngress {
 
   private async handleMessage(message: TelegramMessage, updateId: number, now: number): Promise<void> {
     const identity = privateHumanIdentity(message.from, message.chat);
-    const text = message.text;
+    const image = controllerImageFromMessage(message);
+    const text = message.text ?? (image ? message.caption ?? CAPTIONLESS_IMAGE_PROMPT : undefined);
     if (text === undefined) return;
 
     const pairingCode = this.pairingCode(text);
@@ -228,6 +231,10 @@ export class TelegramIngress {
 
     if (!identity || !ownerMatches(this.store, identity)) {
       this.audit("unauthorized_message", updateId, message.from, message.chat);
+      return;
+    }
+    if (image && image.sizeBytes !== null && image.sizeBytes > MAX_CONTROLLER_IMAGE_BYTES) {
+      await this.sendPlain(identity.chatId, "That image is larger than BB's 10 MB image limit. Please resend a smaller copy.");
       return;
     }
     const normalized = boundedText(text);
@@ -287,6 +294,7 @@ export class TelegramIngress {
       telegramChatId: identity.chatId,
       updateId,
       inputText: normalized,
+      image,
       now,
     });
     this.rememberStandingInstruction(normalized, turn.id, now);

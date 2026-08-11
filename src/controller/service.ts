@@ -1,6 +1,11 @@
 import type { TelegramAgentStore } from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
-import type { ControllerAdapter, ControllerLocation, ControllerStatus } from "./bb-controller";
+import {
+  ControllerImagePreparationError,
+  type ControllerAdapter,
+  type ControllerLocation,
+  type ControllerStatus,
+} from "./bb-controller";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { projectControllerStream } from "./stream";
 import { buildTurnContext, composeTurnInput } from "./context";
@@ -15,6 +20,8 @@ const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
 // How long a queued message may wait for a busy controller thread before the
 // owner is told it will not be answered.
 const CONTROLLER_BUSY_WAIT_MS = 10 * 60_000;
+const CONTROLLER_IMAGE_FAILURE_MESSAGE =
+  "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.";
 /**
  * How long a submitted turn may go without producing a single BB event before
  * it is treated as wedged. Any event at all — reasoning, a tool call, output —
@@ -24,6 +31,7 @@ const CONTROLLER_BUSY_WAIT_MS = 10 * 60_000;
  */
 export const CONTROLLER_STALL_MS = 8 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
+const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
 
 function boundedResponse(value: string): string | null {
   const text = value.trim();
@@ -95,12 +103,14 @@ export class LunaControllerService {
           return true;
         }
         try {
-          await this.dependencies.adapter.send(
-            controller.threadId,
-            this.composeInput(turn, { includeDigest: false }),
-            signal,
-          );
-        } catch {
+          const input = this.composeInput(turn, { includeDigest: false });
+          if (turn.image) {
+            await this.dependencies.adapter.send(controller.threadId, input, signal, turn.image);
+          } else {
+            await this.dependencies.adapter.send(controller.threadId, input, signal);
+          }
+        } catch (error) {
+          if (this.handleImagePreparationError(error, turn, fence, signal)) return true;
           this.fail(turn, fence, "Controller send outcome is uncertain");
           return true;
         }
@@ -248,7 +258,7 @@ export class LunaControllerService {
       const waiting = parked === null
         ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
         : null;
-      if (waiting && waiting.retryCount < MAX_STEER_ATTEMPTS) {
+      if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
         try {
           await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
         } catch {
@@ -366,12 +376,18 @@ export class LunaControllerService {
     fence: EffectFence,
     signal: AbortSignal,
   ): Promise<ControllerLocation | null> {
-    let candidate: ControllerLocation | null;
-    try {
-      candidate = await this.dependencies.adapter.findSpawnCandidate(controller.controllerKey, signal);
-    } catch {
-      this.fail(turn, fence, "Controller spawn candidates are ambiguous");
-      return null;
+    let candidate: ControllerLocation | null = null;
+    // Image turns never adopt by title before attempting their own spawn. A
+    // title match cannot prove that the image was attached, and adopting it
+    // would silently drop the image. Recovery after an uncertain actual spawn
+    // remains available in the catch block below.
+    if (!turn.image) {
+      try {
+        candidate = await this.dependencies.adapter.findSpawnCandidate(controller.controllerKey, signal);
+      } catch {
+        this.fail(turn, fence, "Controller spawn candidates are ambiguous");
+        return null;
+      }
     }
     if (candidate) return candidate;
     // A replacement thread opens with the conversation so far, so retiring a
@@ -379,7 +395,8 @@ export class LunaControllerService {
     const seeded = { ...turn, inputText: this.composeInput(turn, { includeDigest: true }) };
     try {
       return await this.dependencies.adapter.spawn(seeded, controller, signal);
-    } catch {
+    } catch (error) {
+      if (this.handleImagePreparationError(error, turn, fence, signal)) return null;
       try {
         candidate = await this.dependencies.adapter.findSpawnCandidate(controller.controllerKey, signal);
       } catch {
@@ -410,6 +427,37 @@ export class LunaControllerService {
       return;
     }
     this.dependencies.store.requeueControllerTurn({ ...fenceAt(fence, now), turnId: turn.id });
+  }
+
+  private failImage(turn: ControllerTurnRecord, fence: EffectFence): void {
+    this.fail(
+      turn,
+      fence,
+      "Controller image preparation failed",
+      CONTROLLER_IMAGE_FAILURE_MESSAGE,
+    );
+  }
+
+  private handleImagePreparationError(
+    error: unknown,
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): boolean {
+    if (!(error instanceof ControllerImagePreparationError)) return false;
+    if (!error.retryable || turn.retryCount + 1 >= MAX_IMAGE_PREPARATION_ATTEMPTS) {
+      this.failImage(turn, fence);
+      return true;
+    }
+    const now = this.dependencies.clock.now();
+    const requeued = signal.aborted
+      ? this.dependencies.store.requeueControllerTurn({ ...fenceAt(fence, now), turnId: turn.id })
+      : this.dependencies.store.recordControllerImagePreparationFailure({
+        ...fenceAt(fence, now),
+        turnId: turn.id,
+      });
+    if (!requeued) throw new Error("Controller image retry could not be recorded");
+    return true;
   }
 
   private fail(

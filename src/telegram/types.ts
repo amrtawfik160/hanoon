@@ -14,12 +14,35 @@ const telegramChatSchema = z
   })
   .passthrough();
 
+const telegramPhotoSizeSchema = z
+  .object({
+    file_id: z.string().min(1).max(1_024),
+    file_unique_id: z.string().min(1).max(1_024),
+    width: z.number().int().nonnegative(),
+    height: z.number().int().nonnegative(),
+    file_size: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
+const telegramDocumentSchema = z
+  .object({
+    file_id: z.string().min(1).max(1_024),
+    file_unique_id: z.string().min(1).max(1_024),
+    file_name: z.string().max(1_024).optional(),
+    mime_type: z.string().max(255).optional(),
+    file_size: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
 export const telegramMessageSchema = z
   .object({
     message_id: z.number().int(),
     from: telegramUserSchema,
     chat: telegramChatSchema,
     text: z.string().optional(),
+    caption: z.string().optional(),
+    photo: z.array(telegramPhotoSizeSchema).min(1).optional(),
+    document: telegramDocumentSchema.optional(),
     reply_to_message: z
       .object({ message_id: z.number().int() })
       .passthrough()
@@ -61,6 +84,15 @@ export const telegramGetMeSchema = z
 
 export const telegramSentMessageSchema = z
   .object({ message_id: z.number().int() })
+  .passthrough();
+
+export const telegramFileSchema = z
+  .object({
+    file_id: z.string().min(1).max(1_024),
+    file_unique_id: z.string().min(1).max(1_024),
+    file_size: z.number().int().nonnegative().optional(),
+    file_path: z.string().min(1).max(2_048),
+  })
   .passthrough();
 
 export type TelegramMessage = z.infer<typeof telegramMessageSchema>;
