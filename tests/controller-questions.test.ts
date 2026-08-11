@@ -148,7 +148,7 @@ it("steers a busy controller thread instead of starting a competing turn", async
 
   expect(send).toHaveBeenCalledWith({
     threadId: "thr_controller",
-    mode: "auto",
+    mode: "steer-if-active",
     input: [{ type: "text", text: "in review i mean not in progress", mentions: [] }],
   });
 });

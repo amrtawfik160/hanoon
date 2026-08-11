@@ -1,6 +1,7 @@
 import { abortableSleep } from "../async";
 import {
   telegramGetMeSchema,
+  telegramFileSchema,
   telegramSentMessageSchema,
   telegramUpdateSchema,
   type SendMessagePayload,
@@ -16,6 +17,7 @@ const MAX_ATTEMPTS = 4;
 const MAX_RETRY_DELAY_MS = 30_000;
 const RETRY_BASE_DELAY_MS = 250;
 const TELEGRAM_API_ROOT = "https://api.telegram.org/bot";
+const TELEGRAM_FILE_ROOT = "https://api.telegram.org/file/bot";
 
 type Sleep = (milliseconds: number, signal: AbortSignal) => Promise<void>;
 type TelegramFetch = typeof fetch;
@@ -57,6 +59,13 @@ export class TelegramRequestError extends Error {
   public constructor(message: "Telegram request aborted" | "Telegram request failed") {
     super(message);
     this.name = "TelegramRequestError";
+  }
+}
+
+export class TelegramFileTooLargeError extends Error {
+  public constructor() {
+    super("Telegram file exceeds the configured size limit");
+    this.name = "TelegramFileTooLargeError";
   }
 }
 
@@ -127,6 +136,61 @@ function parseIdentity(apiResult: unknown): { id: number; username: string } {
   const parsedIdentity = telegramGetMeSchema.safeParse(apiResult);
   if (!parsedIdentity.success) throw new TelegramResponseValidationError();
   return { id: parsedIdentity.data.id, username: parsedIdentity.data.username };
+}
+
+function parseFile(apiResult: unknown): {
+  filePath: string;
+  fileSize: number | null;
+} {
+  const parsedFile = telegramFileSchema.safeParse(apiResult);
+  if (!parsedFile.success) throw new TelegramResponseValidationError();
+  return {
+    filePath: parsedFile.data.file_path,
+    fileSize: parsedFile.data.file_size ?? null,
+  };
+}
+
+function safeFilePath(value: string): string {
+  const segments = value.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    throw new TelegramResponseValidationError();
+  }
+  return segments.map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+function responseContentLength(response: Response): number | null {
+  const raw = response.headers.get("content-length");
+  if (raw === null || !/^[0-9]+$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+async function readBoundedBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) throw new TelegramFileTooLargeError();
+    return bytes;
+  }
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new TelegramFileTooLargeError();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function parseSuccessfulResult<T>(parseResult: (apiResult: unknown) => T, apiResult: unknown): T {
@@ -235,6 +299,54 @@ export class TelegramClient {
       timeoutMs: ORDINARY_REQUEST_TIMEOUT_MS,
       parseResult: parseIdentity,
     });
+  }
+
+  public async downloadFile(fileId: string, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
+    if (typeof fileId !== "string" || fileId.length === 0 || fileId.length > 1_024) {
+      throw new TypeError("fileId must be between 1 and 1024 characters");
+    }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+      throw new TypeError("maxBytes must be a positive safe integer");
+    }
+    const file = await this.request({
+      method: "getFile",
+      payload: { file_id: fileId },
+      callerSignal: signal,
+      timeoutMs: ORDINARY_REQUEST_TIMEOUT_MS,
+      parseResult: parseFile,
+    });
+    if (file.fileSize !== null && file.fileSize > maxBytes) {
+      throw new TelegramFileTooLargeError();
+    }
+    const requestSignal = composeRequestSignal(signal, ORDINARY_REQUEST_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await this.fetchFn(
+        `${TELEGRAM_FILE_ROOT}${this.token}/${safeFilePath(file.filePath)}`,
+        {
+          method: "GET",
+          redirect: "error",
+          cache: "no-store",
+          signal: requestSignal,
+        },
+      );
+    } catch (error) {
+      if (error instanceof TelegramResponseValidationError) throw error;
+      throw safeRequestError(requestSignal, signal);
+    }
+    if (requestSignal.aborted) throw safeRequestError(requestSignal, signal);
+    if (!response.ok) throw new TelegramRequestError("Telegram request failed");
+    const contentLength = responseContentLength(response);
+    if (contentLength !== null && contentLength > maxBytes) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new TelegramFileTooLargeError();
+    }
+    try {
+      return await readBoundedBytes(response, maxBytes);
+    } catch (error) {
+      if (error instanceof TelegramFileTooLargeError) throw error;
+      throw safeRequestError(requestSignal, signal);
+    }
   }
 
   private async request<T>(request: TelegramRequest<T>): Promise<T> {

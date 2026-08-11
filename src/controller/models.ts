@@ -1,5 +1,19 @@
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
+export const CONTROLLER_IMAGE_MIME_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+] as const;
+export const MAX_CONTROLLER_IMAGE_BYTES = 10 * 1024 * 1024;
+export type ControllerImageMimeType = (typeof CONTROLLER_IMAGE_MIME_TYPES)[number];
+export type ControllerImage = {
+  fileId: string;
+  fileName: string;
+  mimeType: ControllerImageMimeType;
+  sizeBytes: number | null;
+};
 export type ControllerStreamPhase =
   | "queued"
   | "connecting"
@@ -29,6 +43,7 @@ export type ControllerTurnRecord = {
   controllerKey: string;
   ordinal: number;
   inputText: string;
+  image: ControllerImage | null;
   state: ControllerTurnState;
   leaseOwner: string | null;
   leaseGeneration: number | null;

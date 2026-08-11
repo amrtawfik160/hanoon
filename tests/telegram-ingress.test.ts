@@ -1,6 +1,6 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { hashSecret } from "../src/crypto";
 import type { ProjectPolicy } from "../src/domain/models";
@@ -222,6 +222,102 @@ it("queues authorized standalone text for Luna without creating a software job",
     updateId: 9,
     state: "queued",
     inputText: "What projects can you work on?",
+  }]);
+});
+
+it("durably queues the largest Telegram photo with its caption for Luna", async () => {
+  const onWorkAvailable = vi.fn();
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable,
+  });
+
+  await fixture.ingress.handleClaimed(messageUpdate(10, 7, 70, undefined, {
+    caption: "Fix what is overlapping in this screenshot",
+    photo: [
+      {
+        file_id: "small-file-id",
+        file_unique_id: "small-unique-id",
+        width: 90,
+        height: 90,
+        file_size: 1_024,
+      },
+      {
+        file_id: "large-file-id",
+        file_unique_id: "large-unique-id",
+        width: 1_280,
+        height: 960,
+        file_size: 250_000,
+      },
+    ],
+  }), 1_901);
+
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  expect(controller).not.toBeNull();
+  expect(fixture.store.listControllerTurns(controller!.controllerKey, 10)).toMatchObject([{
+    updateId: 10,
+    state: "queued",
+    inputText: "Fix what is overlapping in this screenshot",
+    image: {
+      fileId: "large-file-id",
+      fileName: "telegram-large-unique-id.jpg",
+      mimeType: "image/jpeg",
+      sizeBytes: 250_000,
+    },
+  }]);
+  expect(onWorkAvailable).toHaveBeenCalledOnce();
+});
+
+it("queues a captionless image document with a default inspection prompt", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+
+  await fixture.ingress.handleClaimed(messageUpdate(11, 7, 70, undefined, {
+    document: {
+      file_id: "document-file-id",
+      file_unique_id: "document-unique-id",
+      file_name: "original screenshot.png",
+      mime_type: "image/png",
+      file_size: 125_000,
+    },
+  }), 1_902);
+
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  expect(controller).not.toBeNull();
+  expect(fixture.store.listControllerTurns(controller!.controllerKey, 10)).toMatchObject([{
+    updateId: 11,
+    inputText: "Please inspect this image.",
+    image: {
+      fileId: "document-file-id",
+      fileName: "telegram-document-unique-id.png",
+      mimeType: "image/png",
+      sizeBytes: 125_000,
+    },
+  }]);
+});
+
+it("rejects a known oversized image before queueing controller work", async () => {
+  const onWorkAvailable = vi.fn();
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable,
+  });
+
+  await fixture.ingress.handleClaimed(messageUpdate(12, 7, 70, undefined, {
+    caption: "Inspect this",
+    photo: [{
+      file_id: "oversized-file-id",
+      file_unique_id: "oversized-unique-id",
+      width: 2_000,
+      height: 2_000,
+      file_size: 10 * 1024 * 1024 + 1,
+    }],
+  }), 1_903);
+
+  expect(fixture.store.getControllerForOwner("7", "70")).toBeNull();
+  expect(onWorkAvailable).not.toHaveBeenCalled();
+  expect(fixture.telegram.sent).toMatchObject([{
+    chatId: "70",
+    payload: { text: expect.stringContaining("10 MB") },
   }]);
 });
 
