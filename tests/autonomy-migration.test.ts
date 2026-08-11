@@ -81,7 +81,7 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends images", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 5);
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 6);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -90,6 +90,7 @@ it("keeps the autonomy migration after the frozen legacy positions and appends i
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 2]).toContain("supervisor_reasons");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 3]).toContain("CREATE TABLE delegations");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 4]).toContain("CREATE TABLE job_memory_extractions");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 5]).toContain("CREATE TABLE memory_recalls");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {

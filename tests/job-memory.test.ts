@@ -76,7 +76,6 @@ function service(
 }
 
 it("appends the job memory migration after every shipped one", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(21);
   expect(ALL_MIGRATIONS[20]).toContain("CREATE TABLE job_memory_extractions");
   expect(ALL_MIGRATIONS[20]).toContain("ALTER TABLE memories ADD COLUMN origin");
 });

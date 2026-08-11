@@ -26,7 +26,6 @@ function openDelegation(store: ReturnType<typeof fixture>["store"], instruction 
 }
 
 it("appends the delegation migration after every shipped one", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(21);
   expect(ALL_MIGRATIONS[19]).toContain("CREATE TABLE delegations");
   expect(ALL_MIGRATIONS[19]).toContain("CREATE TABLE delegation_threads");
 });

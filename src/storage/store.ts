@@ -25,7 +25,16 @@ import {
 } from "../autonomy/models";
 import { reviewVerdictSchema } from "../domain/review";
 import { formattedMessage } from "../telegram/markdown";
-import { ftsQuery, memoryScore } from "./memory-ranking";
+import {
+  adjustedConfidence,
+  decayedConfidence,
+  ftsQuery,
+  memoryScore,
+  subjectsContradict,
+  MEMORY_DEMOTION,
+  MEMORY_REINFORCEMENT,
+  MEMORY_TOMBSTONE_CONFIDENCE,
+} from "./memory-ranking";
 import { assertSafeFailureSummary, containsCredentialLikeText, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
 import {
@@ -1762,7 +1771,21 @@ export interface TelegramAgentStore {
   completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean;
   failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean;
   rememberMemory(input: MemoryInput): MemoryRecord;
-  recallMemories(input: { scope: string; query?: string; limit: number; now: number }): MemoryRecord[];
+  recallMemories(input: {
+    scope: string;
+    query?: string;
+    limit: number;
+    now: number;
+    turnId?: string;
+  }): MemoryRecord[];
+  curateMemories(input: { now: number }): { decayed: number; tombstoned: number };
+  listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[];
+  getControllerTurnAfter(controllerKey: string, ordinal: number): ControllerTurnRecord | null;
+  scoreRecalledMemories(input: {
+    turnId: string;
+    outcome: "reinforced" | "demoted";
+    now: number;
+  }): number;
   getMemory(id: string): MemoryRecord | null;
   forgetMemory(input: { id: string; now: number }): boolean;
   countMemories(scope: string): number;
@@ -4284,6 +4307,24 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         this.db.prepare("UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?")
           .run(id, input.now, previous.id);
       }
+      // A correction is the owner saying a belief is wrong, so it retires the
+      // beliefs it contradicts rather than sitting alongside them. Only a
+      // correction may do this: an ordinary restatement is not a refutation.
+      if (input.kind === "correction") {
+        const live = this.db.prepare(
+          `SELECT id, subject FROM memories
+            WHERE scope = ? AND id != ? AND forgotten_at IS NULL AND superseded_by IS NULL`,
+        ).all(input.scope, id) as { id: string; subject: string }[];
+        const supersede = this.db.prepare(
+          "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
+        );
+        for (const candidate of live) {
+          if (candidate.id === previous?.id) continue;
+          if (subjectsContradict(candidate.subject, subject)) {
+            supersede.run(id, input.now, candidate.id);
+          }
+        }
+      }
       this.db.prepare(
         `INSERT INTO memories (
            id, scope, kind, subject, body, importance, confidence, source, origin, source_turn_id,
@@ -4313,6 +4354,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     query?: string;
     limit: number;
     now: number;
+    /** Links what was recalled to the turn it informed, so the answer's
+     *  reception can later reinforce or demote exactly those memories. */
+    turnId?: string;
   }): MemoryRecord[] {
     assertMemoryScope(input.scope);
     if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
@@ -4365,7 +4409,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const use = this.db.prepare(
         "UPDATE memories SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
       );
-      for (const candidate of ranked) use.run(input.now, candidate.row.id);
+      const link = this.db.prepare(
+        `INSERT OR IGNORE INTO memory_recalls (turn_id, memory_id, recalled_at, scored_at, outcome)
+         VALUES (?, ?, ?, NULL, NULL)`,
+      );
+      for (const candidate of ranked) {
+        use.run(input.now, candidate.row.id);
+        if (input.turnId !== undefined) link.run(input.turnId, candidate.row.id, input.now);
+      }
       return ranked.map((candidate) => this.requireMemory(candidate.row.id));
     }).immediate();
   }
@@ -4380,6 +4431,98 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.prepare(
       "UPDATE memories SET forgotten_at = ?, updated_at = ? WHERE id = ? AND forgotten_at IS NULL",
     ).run(input.now, input.now, input.id).changes === 1;
+  }
+
+  /**
+   * Ages out memories that were never useful. Confidence decays on idle time
+   * rather than raw age, and only agent-written memories can be tombstoned:
+   * something the owner said out loud must never vanish on a timer.
+   */
+  public curateMemories(input: { now: number }): { decayed: number; tombstoned: number } {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): { decayed: number; tombstoned: number } => {
+      const live = this.db.prepare(
+        `SELECT id, source, confidence, use_count, last_used_at, created_at FROM memories
+          WHERE forgotten_at IS NULL AND superseded_by IS NULL`,
+      ).all() as Pick<MemoryRow, "id" | "source" | "confidence" | "use_count" | "last_used_at" | "created_at">[];
+      const update = this.db.prepare(
+        "UPDATE memories SET confidence = ?, curated_at = ?, updated_at = ? WHERE id = ?",
+      );
+      const tombstone = this.db.prepare(
+        "UPDATE memories SET forgotten_at = ?, curated_at = ?, updated_at = ? WHERE id = ? AND forgotten_at IS NULL",
+      );
+      let decayed = 0;
+      let tombstoned = 0;
+      for (const row of live) {
+        const idleMs = input.now - (row.last_used_at ?? row.created_at);
+        const next = decayedConfidence(row.confidence, idleMs);
+        if (Math.abs(next - row.confidence) > 1e-9) {
+          update.run(next, input.now, input.now, row.id);
+          decayed += 1;
+        }
+        const expendable = row.source === "agent" && row.use_count === 0;
+        if (expendable && next <= MEMORY_TOMBSTONE_CONFIDENCE) {
+          tombstone.run(input.now, input.now, input.now, row.id);
+          tombstoned += 1;
+        }
+      }
+      return { decayed, tombstoned };
+    }).immediate();
+  }
+
+  /** Turns whose recalled memories have not yet been judged by what came next. */
+  public listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      `SELECT DISTINCT recall.turn_id AS turnId, turn.controller_key AS controllerKey, turn.ordinal AS ordinal
+         FROM memory_recalls AS recall
+         JOIN controller_turns AS turn ON turn.id = recall.turn_id
+        WHERE recall.scored_at IS NULL AND turn.state IN ('completed', 'failed')
+        ORDER BY recall.recalled_at ASC LIMIT ?`,
+    ).all(limit) as { turnId: string; controllerKey: string; ordinal: number }[];
+    return rows;
+  }
+
+  /** The owner's next message after a turn, which is how that turn is judged. */
+  public getControllerTurnAfter(controllerKey: string, ordinal: number): ControllerTurnRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT * FROM controller_turns
+        WHERE controller_key = ? AND ordinal > ?
+        ORDER BY ordinal ASC LIMIT 1`,
+    ).get(controllerKey, ordinal) as ControllerTurnRow | undefined;
+    return row ? parseControllerTurn(row) : null;
+  }
+
+  public scoreRecalledMemories(input: {
+    turnId: string;
+    outcome: "reinforced" | "demoted";
+    now: number;
+  }): number {
+    if (input.outcome !== "reinforced" && input.outcome !== "demoted") {
+      throw new TypeError("a recall is scored as reinforced or demoted");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    const delta = input.outcome === "reinforced" ? MEMORY_REINFORCEMENT : -MEMORY_DEMOTION;
+    return this.db.transaction((): number => {
+      const recalls = this.db.prepare(
+        "SELECT memory_id FROM memory_recalls WHERE turn_id = ? AND scored_at IS NULL",
+      ).all(input.turnId) as { memory_id: string }[];
+      if (recalls.length === 0) return 0;
+      const read = this.db.prepare("SELECT confidence FROM memories WHERE id = ?");
+      const update = this.db.prepare(
+        "UPDATE memories SET confidence = ?, updated_at = ? WHERE id = ?",
+      );
+      for (const recall of recalls) {
+        const memory = read.get(recall.memory_id) as { confidence: number } | undefined;
+        if (!memory) continue;
+        update.run(adjustedConfidence(memory.confidence, delta), input.now, recall.memory_id);
+      }
+      this.db.prepare(
+        "UPDATE memory_recalls SET scored_at = ?, outcome = ? WHERE turn_id = ? AND scored_at IS NULL",
+      ).run(input.now, input.outcome, input.turnId);
+      return recalls.length;
+    }).immediate();
   }
 
   public countMemories(scope: string): number {

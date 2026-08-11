@@ -698,6 +698,19 @@ CREATE INDEX job_memory_extractions_due ON job_memory_extractions (state, create
 ALTER TABLE memories ADD COLUMN origin TEXT;
 `] as const;
 
+export const MEMORY_CURATION_MIGRATIONS = [String.raw`
+CREATE TABLE memory_recalls (
+  turn_id TEXT NOT NULL,
+  memory_id TEXT NOT NULL REFERENCES memories(id),
+  recalled_at INTEGER NOT NULL,
+  scored_at INTEGER,
+  outcome TEXT CHECK (outcome IN ('reinforced', 'demoted')),
+  PRIMARY KEY (turn_id, memory_id)
+);
+CREATE INDEX memory_recalls_unscored ON memory_recalls (scored_at, recalled_at);
+ALTER TABLE memories ADD COLUMN curated_at INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -720,4 +733,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_SUPERVISOR_MIGRATIONS,
   ...DELEGATION_MIGRATIONS,
   ...JOB_MEMORY_MIGRATIONS,
+  ...MEMORY_CURATION_MIGRATIONS,
 ] as const;

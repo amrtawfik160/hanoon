@@ -49,6 +49,7 @@ import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
 import { ThreadNoticeService } from "./services/thread-notice-service";
 import { JobMemoryService } from "./services/job-memory-service";
+import { MemoryCurationService } from "./services/memory-curation-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -515,6 +516,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
+  const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
   const threadNotices = new ThreadNoticeService({
     store,
     threads: {
@@ -847,6 +849,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       monitors,
       threadNotices,
       jobMemory,
+      memoryCuration,
       presence,
       laneSnapshots,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),

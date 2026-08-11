@@ -51,6 +51,9 @@ export type JobExecutorDependencies = {
   jobMemory?: {
     processDue(): Promise<boolean>;
   };
+  memoryCuration?: {
+    processDue(): boolean;
+  };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
     reset(): void;
@@ -469,6 +472,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
         if (deps.jobMemory) {
           didWork = await deps.jobMemory.processDue() || didWork;
+        }
+        if (deps.memoryCuration) {
+          didWork = deps.memoryCuration.processDue() || didWork;
         }
 
         const configuredCap = validConfiguredCap(deps.maxConcurrentJobs?.());
