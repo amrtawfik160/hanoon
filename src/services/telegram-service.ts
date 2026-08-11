@@ -27,7 +27,7 @@ export type TelegramServiceDeps = {
   client: (token: string) => TelegramServiceClient;
   ingress: { handleClaimed(update: TelegramUpdate, now: number): Promise<void> };
   getConfig: () =>
-    | { ok: true; value: Pick<GlobalConfig, "botToken" | "pollTimeoutSeconds"> }
+    | { ok: true; value: Pick<GlobalConfig, "botToken"> }
     | { ok: false; message: string };
   clock: { now(): number };
   warn?: (message: string) => void;
@@ -35,6 +35,7 @@ export type TelegramServiceDeps = {
 
 const POLL_RETRY_BASE_MS = 1_000;
 const POLL_RETRY_MAX_MS = 30_000;
+const TELEGRAM_POLL_TIMEOUT_SECONDS = 30;
 
 function isConflict(error: unknown): boolean {
   return error instanceof TelegramConflictError ||
@@ -96,7 +97,7 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
 
     let updates: TelegramUpdate[];
     try {
-      updates = await client.getUpdates(deps.store.getNextTelegramOffset(), config.value.pollTimeoutSeconds, signal);
+      updates = await client.getUpdates(deps.store.getNextTelegramOffset(), TELEGRAM_POLL_TIMEOUT_SECONDS, signal);
     } catch (error) {
       if (signal.aborted) return;
       if (isConflict(error)) throw configurationError("Another process is polling this Telegram bot token.");

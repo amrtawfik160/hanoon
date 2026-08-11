@@ -61,11 +61,6 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
     botToken: { type: "string", label: "Telegram bot token", secret: true },
     bbAppBaseUrl: { type: "string", label: "BB app base URL", default: "" },
-    pollTimeoutSeconds: {
-      type: "string",
-      label: "Telegram poll timeout in seconds",
-      default: "30",
-    },
     maxConcurrentJobs: {
       type: "select",
       label: "Maximum concurrent jobs",

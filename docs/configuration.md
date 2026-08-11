@@ -42,7 +42,6 @@ The remaining connection settings are:
 | Setting | Accepted value | Default | Purpose |
 | --- | --- | --- | --- |
 | BB app base URL | Empty or a URL | Empty | An external HTTPS value adds an **Open BB** link to Telegram status messages. |
-| Telegram poll timeout | Integer from `5` to `50` seconds | `30` | Telegram long-poll timeout. |
 | Maximum concurrent jobs | Integer select from `1` to `8` | `5` | Bounds admitted or draining project pipelines across the installation. |
 
 An empty BB app URL disables the link. Non-HTTPS values are not rendered as Telegram buttons.

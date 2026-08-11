@@ -18,7 +18,6 @@ const maxConcurrentJobsSchema = z.preprocess(
 const globalConfigSchema = z.object({
   botToken: z.string().min(1),
   bbAppBaseUrl: z.union([z.literal(""), z.string().url()]),
-  pollTimeoutSeconds: z.coerce.number().int().min(5).max(50),
   maxConcurrentJobs: maxConcurrentJobsSchema,
   controllerModel: z.enum(CONTROLLER_MODELS).default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.model),
   controllerReasoningLevel: z.enum(CONTROLLER_REASONING_LEVELS)
@@ -37,7 +36,6 @@ export type GlobalConfigResult =
 export function parseGlobalConfig(values: {
   botToken?: string;
   bbAppBaseUrl: string;
-  pollTimeoutSeconds: string;
   maxConcurrentJobs?: string;
   controllerModel?: string;
   controllerReasoningLevel?: string;
@@ -56,7 +54,7 @@ export function parseGlobalConfig(values: {
     ? { ok: true, value: parsed.data }
     : {
         ok: false,
-        message: "Fix the Telegram Agent URL, polling timeout, or controller execution settings.",
+        message: "Fix the Telegram Agent URL or controller execution settings.",
       };
 }
 

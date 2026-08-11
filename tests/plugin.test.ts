@@ -71,6 +71,12 @@ it("registers the bounded concurrent job cap as a select setting", async () => {
   });
 });
 
+it("keeps the Telegram polling timeout out of user-facing settings", async () => {
+  const { harness } = await loadPlugin();
+
+  expect(harness.registrations.settingsDescriptors).not.toHaveProperty("pollTimeoutSeconds");
+});
+
 it("applies a changed concurrency cap to later admissions", async () => {
   const { bb, harness } = await loadPlugin();
   await harness.behavior.setSettings({ botToken: "123:test-token", maxConcurrentJobs: "1" });

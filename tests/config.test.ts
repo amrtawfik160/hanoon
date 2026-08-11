@@ -5,12 +5,11 @@ function globalValues(overrides: Record<string, string | undefined> = {}) {
   return {
     botToken: "123:test-token",
     bbAppBaseUrl: "",
-    pollTimeoutSeconds: "30",
     ...overrides,
   };
 }
 
-it("defaults controller execution to Opus 5 at xhigh with full permissions", () => {
+it("defaults controller execution when only public connection settings are present", () => {
   const parsed = parseGlobalConfig(globalValues({ maxConcurrentJobs: undefined }));
 
   expect(parsed.ok).toBe(true);
@@ -49,7 +48,7 @@ it("rejects an unknown controller model instead of silently falling back", () =>
     controllerModel: "made-up-model",
   })).toEqual({
     ok: false,
-    message: "Fix the Telegram Agent URL, polling timeout, or controller execution settings.",
+    message: "Fix the Telegram Agent URL or controller execution settings.",
   });
 });
 

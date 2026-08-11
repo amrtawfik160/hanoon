@@ -87,6 +87,32 @@ function serviceDeps(
 }
 
 describe("Telegram ingress service", () => {
+  it("uses the fixed 30-second Telegram long-poll timeout", async () => {
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const pollTimeouts: number[] = [];
+    const client = vi.fn(() => ({
+      getMe: vi.fn(async () => ({ id: 123, username: "bot" })),
+      getUpdates: vi.fn(async (_offset: number, timeoutSeconds: number) => {
+        pollTimeouts.push(timeoutSeconds);
+        abort.abort();
+        return [];
+      }),
+    })) as TelegramServiceDeps["client"];
+
+    await runTelegramService(
+      serviceDeps(
+        store,
+        client,
+        { handleClaimed: vi.fn() },
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
+      ),
+      abort.signal,
+    );
+
+    expect(pollTimeouts).toEqual([30]);
+  });
+
   it("orders updates and advances the SQLite cursor only after each claimed update completes", async () => {
     vi.useFakeTimers();
     const { store } = storeFixture();
@@ -110,7 +136,7 @@ describe("Telegram ingress service", () => {
         store,
         client,
         ingress,
-        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
     );
@@ -157,7 +183,7 @@ describe("Telegram ingress service", () => {
         store,
         client,
         ingress,
-        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
     );
@@ -185,7 +211,7 @@ describe("Telegram ingress service", () => {
         store,
         client,
         ingress,
-        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
     );
@@ -220,7 +246,7 @@ describe("Telegram ingress service", () => {
         store,
         client,
         ingress,
-        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
     );
@@ -251,7 +277,7 @@ describe("Telegram ingress service", () => {
         store,
         client,
         ingress,
-        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
     );
@@ -284,7 +310,7 @@ describe("Telegram ingress service", () => {
       {
         ...serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
           ok: true,
-          value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 },
+          value: { botToken: "123:secret" },
         })),
         warn: (message: string) => warnings.push(message),
       },
@@ -311,7 +337,7 @@ describe("Telegram ingress service", () => {
         store,
         client,
         { handleClaimed: vi.fn() },
-        () => ({ ok: true, value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
     )).rejects.toMatchObject({ name: "NeedsConfigurationError" });
@@ -335,7 +361,7 @@ describe("Telegram ingress service", () => {
         store,
         client,
         { handleClaimed: vi.fn(async () => { throw new Error("failed bot123:abcdefghijklmnopqrstuvwxyzABCDE"); }) },
-        () => ({ ok: true, value: { botToken: "123:abcdefghijklmnopqrstuvwxyzABCDE", bbAppBaseUrl: "", pollTimeoutSeconds: 5 } }),
+        () => ({ ok: true, value: { botToken: "123:abcdefghijklmnopqrstuvwxyzABCDE" } }),
       ),
       abort.signal,
     );
@@ -375,7 +401,7 @@ describe("Telegram ingress service", () => {
     const promise = runTelegramService(
       serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
         ok: true,
-        value: { botToken: token, bbAppBaseUrl: "", pollTimeoutSeconds: 5 },
+        value: { botToken: token },
       })),
       abort.signal,
     );
@@ -406,7 +432,7 @@ describe("Telegram ingress service", () => {
     const promise = runTelegramService(
       serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
         ok: true,
-        value: { botToken: "123:secret", bbAppBaseUrl: "", pollTimeoutSeconds: 30 },
+        value: { botToken: "123:secret" },
       })),
       abort.signal,
     );
