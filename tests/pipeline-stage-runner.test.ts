@@ -146,6 +146,9 @@ describe("fresh planner, critic, and builder conversations", () => {
         { type: "localFile", path: "attachments/plan.md" },
       ],
     });
+    expect((spawns[1].input as Array<{ type: string; text?: string }>)[0].text).toBe(
+      "Read the attached immutable work order, plan, and critique contract. Assess the plan independently and return strict JSON only. Do not inspect the planner conversation or edit files.",
+    );
     expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
       jobId: "job_1",
       attemptId: "stage:job_1:1:spawn_plan",
@@ -207,6 +210,12 @@ describe("fresh planner, critic, and builder conversations", () => {
       "verification-before-completion",
     );
     expect((spawns[0].input as Array<{ type: string; text?: string }>)[0].text).not.toMatch(/Docs Guard|BB CLI|bb-cli/);
+    const docsPacketUpload = uploads.find((upload) => upload.filename === "docs-packet.json");
+    if (!docsPacketUpload) throw new Error("docs packet upload missing");
+    const docsPacket = JSON.parse(new TextDecoder().decode(docsPacketUpload.clientFile)) as {
+      requiredSkills: string[];
+    };
+    expect(docsPacket.requiredSkills).toEqual(["docs-guard", "verification-before-completion"]);
     expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
       jobId: "job_1",
       attemptId: "stage:job_1:1:spawn_docs",

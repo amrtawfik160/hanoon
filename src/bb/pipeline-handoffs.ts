@@ -106,7 +106,7 @@ export function buildDocsPacket(job: Job): HandoffArtifact {
     prNumber: job.prNumber,
     prUrl: job.prUrl,
     reviewedHeadSha: job.prHeadSha,
-    requiredSkills: ["Docs Guard", "BB CLI"],
+    requiredSkills: ["docs-guard", "verification-before-completion"],
     rules: {
       inspectChangedBehavior: true,
       updateNecessaryDocumentationOnly: true,
