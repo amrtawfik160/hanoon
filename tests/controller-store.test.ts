@@ -34,7 +34,7 @@ function acquire(store: ReturnType<typeof openStore>) {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(17);
+  expect(ALL_MIGRATIONS).toHaveLength(18);
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -56,18 +56,26 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[14]).toContain("'unsupported'");
   expect(ALL_MIGRATIONS[15]).toContain("notified_at");
   expect(ALL_MIGRATIONS[16]).toContain("CREATE TABLE autonomy_sequence");
+  expect(ALL_MIGRATIONS[17]).toContain("image_file_id");
 });
 
 it("enqueues Telegram controller turns idempotently and rejects changed replay input", () => {
   const { store } = fixture();
+  const image = {
+    fileId: "telegram-file-id",
+    fileName: "telegram-screenshot.jpg",
+    mimeType: "image/jpeg" as const,
+    sizeBytes: 125_000,
+  };
 
-  const first = store.enqueueControllerTurn(turnInput(101));
+  const first = store.enqueueControllerTurn({ ...turnInput(101), image });
 
   expect(first).toMatchObject({
     controllerKey: "owner-7-controller",
     updateId: 101,
     ordinal: 1,
     inputText: "What can you do?",
+    image,
     state: "queued",
     dispatchAfterSeq: 0,
     retryCount: 0,
@@ -76,8 +84,12 @@ it("enqueues Telegram controller turns idempotently and rejects changed replay i
     telegramMessageId: null,
     streamPhase: "queued",
   });
-  expect(store.enqueueControllerTurn(turnInput(101))).toEqual(first);
+  expect(store.enqueueControllerTurn({ ...turnInput(101), image })).toEqual(first);
   expect(() => store.enqueueControllerTurn(turnInput(101, "different"))).toThrow(IdempotencyConflictError);
+  expect(() => store.enqueueControllerTurn({
+    ...turnInput(101),
+    image: { ...image, fileId: "different-file-id" },
+  })).toThrow(IdempotencyConflictError);
 });
 
 it("claims exactly one FIFO turn while a controller turn is dispatching or submitted", () => {
@@ -99,6 +111,25 @@ it("claims exactly one FIFO turn while a controller turn is dispatching or submi
   expect(store.claimNextControllerTurn(fence)).toBeNull();
   expect(store.completeControllerTurn({ turnId: first.id, ...fence, responseText: "Hello." })).toBe(true);
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ updateId: 202, ordinal: 2 });
+});
+
+it("counts a retryable image preparation failure while returning the turn to the queue", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnInput(203, "inspect this image"),
+    image: {
+      fileId: "telegram-file-id",
+      fileName: "telegram-screenshot.png",
+      mimeType: "image/png",
+      sizeBytes: null,
+    },
+  });
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+
+  expect(store.recordControllerImagePreparationFailure({ ...fence, turnId: turn.id })).toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", retryCount: 1 });
 });
 
 it("fences controller mutations against a stale executor generation", () => {

@@ -80,12 +80,13 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
   bb.storage.migrate(bb.storage.database(), [...ALL_MIGRATIONS]);
 }
 
-it("appends one autonomy migration after the frozen legacy positions", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 1);
+it("keeps the autonomy migration after the frozen legacy positions and appends images", () => {
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 2);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT]).toContain("CREATE TABLE autonomy_sequence");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 1]).toContain("image_file_id");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {

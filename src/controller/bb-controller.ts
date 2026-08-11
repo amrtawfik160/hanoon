@@ -1,5 +1,10 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
+import {
+  MAX_CONTROLLER_IMAGE_BYTES,
+  type ControllerImage,
+  type ControllerThreadRecord,
+  type ControllerTurnRecord,
+} from "./models";
 import { buildInitialControllerPrompt } from "./instructions";
 import {
   controllerExecutionArguments,
@@ -38,9 +43,18 @@ export type ControllerAdapter = {
     controller: ControllerThreadRecord,
     signal: AbortSignal,
   ): Promise<ControllerLocation>;
-  send(threadId: string, text: string, signal: AbortSignal): Promise<void>;
+  send(
+    threadId: string,
+    text: string,
+    signal: AbortSignal,
+    image?: ControllerImage | null,
+  ): Promise<void>;
   /** Redirects a thread that is already working, rather than queueing behind it. */
-  steer(threadId: string, text: string, signal: AbortSignal): Promise<void>;
+  steer(
+    threadId: string,
+    text: string,
+    signal: AbortSignal,
+  ): Promise<void>;
   answerQuestion(
     threadId: string,
     interactionId: string,
@@ -58,6 +72,14 @@ const EVENT_PAGE_LIMIT = 100;
 const MAX_EVENT_PAGES = 50;
 
 type BbSdk = BbPluginApi["sdk"];
+type ControllerPromptInput = Parameters<BbSdk["threads"]["send"]>[0]["input"];
+
+export class ControllerImagePreparationError extends Error {
+  public constructor(public readonly retryable: boolean) {
+    super("Controller image could not be prepared");
+    this.name = "ControllerImagePreparationError";
+  }
+}
 
 function controllerTitle(controllerKey: string): string {
   return `Telegram Codex controller ${controllerKey}`;
@@ -73,6 +95,11 @@ export class BbControllerAdapter implements ControllerAdapter {
     sdk: BbSdk;
     pluginId: string;
     executionProfile: () => ControllerExecutionProfile;
+    downloadImage?: (
+      fileId: string,
+      maxBytes: number,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array>;
   }) {}
 
   public async spawn(
@@ -80,13 +107,25 @@ export class BbControllerAdapter implements ControllerAdapter {
     controller: ControllerThreadRecord,
     signal: AbortSignal,
   ): Promise<ControllerLocation> {
-    const personal = await this.resolvePersonalProject(signal);
+    let personal: { projectId: string; hostId: string };
+    try {
+      personal = await this.resolvePersonalProject(signal);
+    } catch (error) {
+      if (turn.image) throw new ControllerImagePreparationError(true);
+      throw error;
+    }
     const execution = this.dependencies.executionProfile();
+    const input = await this.promptInput(
+      personal.projectId,
+      buildInitialControllerPrompt(turn.inputText),
+      turn.image,
+      signal,
+    );
     const thread = await this.dependencies.sdk.threads.spawn({
       projectId: personal.projectId,
       title: controllerTitle(controller.controllerKey),
       visibility: "hidden",
-      input: [{ type: "text", text: buildInitialControllerPrompt(turn.inputText), mentions: [] }],
+      input,
       environment: {
         type: "host",
         hostId: personal.hostId,
@@ -97,22 +136,41 @@ export class BbControllerAdapter implements ControllerAdapter {
     return { threadId: thread.id, ...personal };
   }
 
-  public async send(threadId: string, text: string, signal: AbortSignal): Promise<void> {
+  public async send(
+    threadId: string,
+    text: string,
+    signal: AbortSignal,
+    image: ControllerImage | null = null,
+  ): Promise<void> {
     const execution = this.dependencies.executionProfile();
+    let personal: { projectId: string; hostId: string } | null = null;
+    if (image) {
+      try {
+        personal = await this.resolvePersonalProject(signal);
+      } catch {
+        throw new ControllerImagePreparationError(true);
+      }
+    }
+    const input = await this.promptInput(personal?.projectId ?? null, text, image, signal);
     await this.dependencies.sdk.threads.send({
       threadId,
       mode: "start",
       ...controllerExecutionArguments(execution, { includeProvider: false }),
-      input: [{ type: "text", text, mentions: [] }],
+      input,
     });
   }
 
-  // "auto" lets BB fold the message into the running turn instead of starting a
-  // second one, so a correction the owner sends mid-answer still lands.
-  public async steer(threadId: string, text: string, signal: AbortSignal): Promise<void> {
+  // Images deliberately do not use this path: preparing one can outlive the
+  // active turn and BB may then start a new, untracked turn. The service leaves
+  // image turns queued for the ordinary idle-thread dispatch instead.
+  public async steer(
+    threadId: string,
+    text: string,
+    signal: AbortSignal,
+  ): Promise<void> {
     await this.dependencies.sdk.threads.send({
       threadId,
-      mode: "auto",
+      mode: "steer-if-active",
       input: [{ type: "text", text, mentions: [] }],
     });
   }
@@ -218,6 +276,47 @@ export class BbControllerAdapter implements ControllerAdapter {
     if (candidates.length > 1) throw new Error("Multiple ambiguous BB controller spawn candidates exist");
     const candidate = candidates[0];
     return candidate ? { threadId: candidate.id, ...personal } : null;
+  }
+
+  private async promptInput(
+    projectId: string | null,
+    text: string,
+    image: ControllerImage | null,
+    signal: AbortSignal,
+  ): Promise<ControllerPromptInput> {
+    const input: ControllerPromptInput = [{ type: "text", text, mentions: [] }];
+    if (!image) return input;
+    if (!projectId || !this.dependencies.downloadImage) {
+      throw new ControllerImagePreparationError(false);
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.dependencies.downloadImage(
+        image.fileId,
+        MAX_CONTROLLER_IMAGE_BYTES,
+        signal,
+      );
+    } catch (error) {
+      if (error instanceof ControllerImagePreparationError) throw error;
+      throw new ControllerImagePreparationError(true);
+    }
+    if (bytes.byteLength > MAX_CONTROLLER_IMAGE_BYTES) {
+      throw new ControllerImagePreparationError(false);
+    }
+    try {
+      const uploaded = await this.dependencies.sdk.projects.attachments.upload({
+        projectId,
+        clientFile: bytes,
+        filename: image.fileName,
+        mimeType: image.mimeType,
+      });
+      if (uploaded.type !== "localImage") throw new ControllerImagePreparationError(false);
+      input.push({ type: "localImage", path: uploaded.path });
+      return input;
+    } catch (error) {
+      if (error instanceof ControllerImagePreparationError) throw error;
+      throw new ControllerImagePreparationError(true);
+    }
   }
 
   private async resolvePersonalProject(signal: AbortSignal): Promise<{ projectId: string; hostId: string }> {

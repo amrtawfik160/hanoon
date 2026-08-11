@@ -5,6 +5,7 @@ import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import {
   BbControllerAdapter,
+  ControllerImagePreparationError,
   type ControllerAdapter,
 } from "../src/controller/bb-controller";
 import {
@@ -59,6 +60,7 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
     controllerKey: "owner-7-controller",
     ordinal: 1,
     inputText: "What projects can you work on?",
+    image: null,
     state: "dispatching",
     leaseOwner: "executor",
     leaseGeneration: 1,
@@ -88,9 +90,21 @@ function sdkFixture(options: {
   maxSeq?: number;
   threadProvider?: string;
   executionProfile?: ControllerExecutionProfile;
+  downloadImage?: (fileId: string, maxBytes: number, signal: AbortSignal) => Promise<Uint8Array>;
 } = {}) {
   const spawn = vi.fn(async () => ({ id: "thr_controller", environmentId: "env_personal" }));
   const send = vi.fn(async () => ({ ok: true }));
+  const upload = vi.fn(async (input: {
+    clientFile: Uint8Array;
+    filename: string;
+    mimeType?: string;
+  }) => ({
+    type: "localImage" as const,
+    path: `/attachments/${input.filename}`,
+    name: input.filename,
+    mimeType: input.mimeType,
+    sizeBytes: input.clientFile.byteLength,
+  }));
   const list = vi.fn(async () => options.threads ?? []);
   const get = vi.fn(async () => ({
     id: "thr_controller",
@@ -105,7 +119,10 @@ function sdkFixture(options: {
   const eventsList = vi.fn(async () => pages[page++] ?? []);
   const timeline = vi.fn(async () => ({ maxSeq: options.maxSeq ?? 0 }));
   const sdk = {
-    projects: { list: vi.fn(async () => options.projects ?? [personalProject()]) },
+    projects: {
+      list: vi.fn(async () => options.projects ?? [personalProject()]),
+      attachments: { upload },
+    },
     hosts: { list: vi.fn(async () => options.hosts ?? [{ id: "host_personal", status: "connected" }]) },
     threads: { spawn, send, list, get, output, timeline, events: { list: eventsList } },
   } as unknown as BbPluginApi["sdk"];
@@ -113,8 +130,9 @@ function sdkFixture(options: {
     sdk,
     pluginId: "telegram-agent",
     executionProfile: () => options.executionProfile ?? DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+    downloadImage: options.downloadImage,
   };
-  return { adapter: new BbControllerAdapter(dependencies), spawn, send, list, eventsList, timeline };
+  return { adapter: new BbControllerAdapter(dependencies), spawn, send, upload, list, eventsList, timeline };
 }
 
 function agentDelta(seq: number, delta: string) {
@@ -174,6 +192,58 @@ it("keeps the configured execution tuple on later controller turns", async () =>
     },
     input: [{ type: "text", text: "Show active threads", mentions: [] }],
   });
+});
+
+it("uploads and attaches a Telegram image to a controller turn", async () => {
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const downloadImage = vi.fn(async () => bytes);
+  const { adapter, send, upload } = sdkFixture({ downloadImage });
+  const signal = AbortSignal.timeout(1_000);
+
+  await adapter.send("thr_controller", "Fix this overlap", signal, {
+    fileId: "telegram-file-id",
+    fileName: "telegram-screenshot.png",
+    mimeType: "image/png",
+    sizeBytes: 4,
+  });
+
+  expect(downloadImage).toHaveBeenCalledWith("telegram-file-id", 10 * 1024 * 1024, signal);
+  expect(upload).toHaveBeenCalledWith(expect.objectContaining({
+    projectId: "proj_personal",
+    clientFile: bytes,
+    filename: "telegram-screenshot.png",
+    mimeType: "image/png",
+  }));
+  expect(send).toHaveBeenCalledWith(expect.objectContaining({
+    input: [
+      { type: "text", text: "Fix this overlap", mentions: [] },
+      { type: "localImage", path: "/attachments/telegram-screenshot.png" },
+    ],
+  }));
+});
+
+it("uses BB's active-steer mode for a text correction", async () => {
+  const { adapter, send } = sdkFixture();
+
+  await adapter.steer("thr_controller", "Use the second option instead", AbortSignal.timeout(1_000));
+
+  expect(send).toHaveBeenCalledWith(expect.objectContaining({
+    threadId: "thr_controller",
+    mode: "steer-if-active",
+  }));
+});
+
+it("classifies a pre-submit image download failure as retryable", async () => {
+  const downloadImage = vi.fn(async () => { throw new Error("temporary Telegram outage"); });
+  const { adapter, send } = sdkFixture({ downloadImage });
+
+  await expect(adapter.send("thr_controller", "Inspect this", AbortSignal.timeout(1_000), {
+    fileId: "telegram-file-id",
+    fileName: "telegram-screenshot.png",
+    mimeType: "image/png",
+    sizeBytes: null,
+  })).rejects.toMatchObject({ name: "ControllerImagePreparationError", retryable: true });
+  expect(send).not.toHaveBeenCalled();
 });
 
 it("reduces BB controller events after the durable sequence without exposing reasoning", async () => {
@@ -391,6 +461,145 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.send).toHaveBeenCalledWith("thr_controller", "second", fence.signal);
   expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["completed", "submitted"]);
+});
+
+it("keeps a queued image durable until the active turn finishes", async () => {
+  const { store, fence } = serviceFixture();
+  const running = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 15, inputText: "first request" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const leaseFence = { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 };
+  expect(store.claimNextControllerTurn(leaseFence)?.id).toBe(running.id);
+  expect(store.markControllerSpawned({
+    ...leaseFence,
+    turnId: running.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_controller",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...leaseFence, turnId: running.id })).toBe(true);
+  const image = {
+    fileId: "replacement-file-id",
+    fileName: "telegram-replacement.webp",
+    mimeType: "image/webp" as const,
+    sizeBytes: 8,
+  };
+  const waiting = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 16, inputText: "Use this screenshot instead", image }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  let status: "active" | "idle" = "active";
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => status),
+    latestSeq: vi.fn(async () => 1),
+    output: vi.fn(async () => "First answer."),
+    events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "queued", image });
+
+  status = "idle";
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(adapter.send).toHaveBeenCalledWith("thr_controller", "Use this screenshot instead", fence.signal, image);
+});
+
+it("requeues a transient image preparation failure without adopting a late spawn candidate", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({
+      updateId: 17,
+      inputText: "Read this",
+      image: {
+        fileId: "telegram-file-id",
+        fileName: "telegram-screenshot.jpg",
+        mimeType: "image/jpeg" as const,
+        sizeBytes: null,
+      },
+    }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const findSpawnCandidate = vi.fn()
+    .mockResolvedValueOnce(null)
+    .mockResolvedValueOnce({ threadId: "thr_unrelated", projectId: "proj_personal", hostId: "host_personal" });
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async () => { throw new ControllerImagePreparationError(true); }),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate,
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(findSpawnCandidate).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", retryCount: 2 });
+  expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
+});
+
+it("requeues an aborted image preparation without consuming a retry", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({
+      updateId: 18,
+      inputText: "Read this",
+      image: {
+        fileId: "telegram-file-id",
+        fileName: "telegram-screenshot.jpg",
+        mimeType: "image/jpeg" as const,
+        sizeBytes: null,
+      },
+    }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const aborted = new AbortController();
+  aborted.abort();
+  const findSpawnCandidate = vi.fn(async () => ({
+    threadId: "thr_unrelated",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  }));
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async () => { throw new ControllerImagePreparationError(true); }),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate,
+  };
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+
+  await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
+  await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
+
+  expect(findSpawnCandidate).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", retryCount: 0 });
 });
 
 it("retires a thread whose provider no longer matches the configured model", async () => {

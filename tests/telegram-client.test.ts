@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   TelegramClient,
   TelegramConflictError,
+  TelegramFileTooLargeError,
 } from "../src/telegram/client";
 import { classifyTelegramError, TelegramApiError } from "../src/telegram/errors";
 import { abortableSleep } from "../src/async";
@@ -12,6 +13,119 @@ import {
 } from "./helpers";
 
 describe("Telegram Bot API client", () => {
+  it("resolves and downloads a bounded Telegram file without returning a token-bearing URL", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/getFile")) {
+        return new Response(JSON.stringify({
+          ok: true,
+          result: {
+            file_id: "photo-file-id",
+            file_unique_id: "photo-unique-id",
+            file_size: 4,
+            file_path: "photos/screenshot.jpg",
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 200,
+        headers: { "content-length": "4", "content-type": "image/jpeg" },
+      });
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await expect(client.downloadFile(
+      "photo-file-id",
+      10_000,
+      AbortSignal.timeout(1_000),
+    )).resolves.toEqual(new Uint8Array([1, 2, 3, 4]));
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.url.endsWith("/bot123:secret/getFile")).toBe(true);
+    expect(calls[0]?.init?.body).toBe('{"file_id":"photo-file-id"}');
+    expect(calls[1]).toMatchObject({
+      url: "https://api.telegram.org/file/bot123:secret/photos/screenshot.jpg",
+      init: { method: "GET", redirect: "error", cache: "no-store" },
+    });
+  });
+
+  it("rejects an oversized Telegram file before downloading its bytes", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      result: {
+        file_id: "photo-file-id",
+        file_unique_id: "photo-unique-id",
+        file_size: 10_001,
+        file_path: "photos/too-large.jpg",
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await expect(client.downloadFile(
+      "photo-file-id",
+      10_000,
+      AbortSignal.timeout(1_000),
+    )).rejects.toBeInstanceOf(TelegramFileTooLargeError);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("stops a file download when the received bytes cross the size limit", async () => {
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        return new Response(JSON.stringify({
+          ok: true,
+          result: {
+            file_id: "photo-file-id",
+            file_unique_id: "photo-unique-id",
+            file_path: "photos/unknown-size.jpg",
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(new Uint8Array(10_001), { status: 200 });
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await expect(client.downloadFile(
+      "photo-file-id",
+      10_000,
+      AbortSignal.timeout(1_000),
+    )).rejects.toBeInstanceOf(TelegramFileTooLargeError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("redacts the bot token when the private file download fails", async () => {
+    let call = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      call += 1;
+      if (call === 1) {
+        return new Response(JSON.stringify({
+          ok: true,
+          result: {
+            file_id: "photo-file-id",
+            file_unique_id: "photo-unique-id",
+            file_path: "photos/screenshot.jpg",
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`network failure for ${String(input)}`);
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    const error = await client.downloadFile(
+      "photo-file-id",
+      10_000,
+      AbortSignal.timeout(1_000),
+    ).catch((value: unknown) => value);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).not.toContain("123:secret");
+    expect(String(error)).toContain("Telegram request failed");
+  });
+
   it("long-polls with an offset and validates the returned update", async () => {
     const fetchMock = telegramFetch([
       { ok: true, result: [{ update_id: 42, message: privateMessage("fix it") }] },

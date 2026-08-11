@@ -3,7 +3,7 @@ import { controllerExecutionProfile, parseGlobalConfig } from "./config";
 import { BbRunner } from "./bb/runner";
 import { resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
-import { TelegramClient } from "./telegram/client";
+import { TelegramClient, TelegramFileTooLargeError } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
 import { openStore, type TelegramAgentStore } from "./storage/store";
 import { AutonomyRepository } from "./storage/autonomy-repository";
@@ -35,7 +35,7 @@ import {
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
 import { registerControllerTools } from "./controller/tools";
-import { BbControllerAdapter } from "./controller/bb-controller";
+import { BbControllerAdapter, ControllerImagePreparationError } from "./controller/bb-controller";
 import {
   CONTROLLER_MODELS,
   CONTROLLER_PERMISSION_MODES,
@@ -450,6 +450,17 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       executionProfile: () => {
         if (!config.ok) throw new Error(config.message);
         return controllerExecutionProfile(config.value);
+      },
+      downloadImage: async (fileId, maxBytes, signal) => {
+        if (!config.ok) throw new Error(config.message);
+        try {
+          return await telegramForToken(config.value.botToken).downloadFile(fileId, maxBytes, signal);
+        } catch (error) {
+          if (error instanceof TelegramFileTooLargeError) {
+            throw new ControllerImagePreparationError(false);
+          }
+          throw error;
+        }
       },
     }),
     clock: { now: clock },
