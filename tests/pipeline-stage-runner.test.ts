@@ -62,6 +62,24 @@ const plannedJob = jobFixture({
   policy: policyFixture(),
 });
 
+function expectForbiddenClause(prompt: string, target: RegExp): void {
+  const clause = prompt.split(/[.!?]/u).find((part) => target.test(part));
+  expect(clause).toBeDefined();
+  if (clause === undefined) return;
+  expect(clause).toMatch(/\b(?:do not|must not|never|without|forbidden|prohibited|disallowed)\b/i);
+  expect(clause).not.toMatch(/\b(?:allowed|permitted|acceptable|okay|optional)\b/i);
+}
+
+function expectCriticPromptContract(prompt: string): void {
+  expect(prompt).toMatch(/\b(?:return|respond|output|requires?)\b[^.!?]{0,120}\bstrict JSON\b/i);
+  expect(prompt).not.toMatch(/\bnon[-\s]?strict JSON\b/i);
+  expect(prompt).not.toMatch(/\bstrict JSON\b[^.!?]{0,80}\b(?:optional|allowed|permitted)\b/i);
+  expect(prompt).toMatch(/\b(?:assess|review|evaluate|inspect)\b[^.!?]{0,120}\bindependent(?:ly)?\b/i);
+  expect(prompt).not.toMatch(/\b(?:do not|must not|never)\b[^.!?]{0,120}\b(?:assess|review|evaluate)\b[^.!?]{0,120}\bindependent(?:ly)?\b/i);
+  expectForbiddenClause(prompt, /\b(?:inspect|read|use)\b[^.!?]{0,120}\bplanner conversation\b/i);
+  expectForbiddenClause(prompt, /\bedit files?\b/i);
+}
+
 describe("pipeline handoffs", () => {
   it("turns bounded planner output into a hashed plan attachment and validates strict critique JSON", () => {
     const plan = buildPlanArtifact("# Plan\n\n1. Add the regression.\n");
@@ -166,10 +184,7 @@ describe("fresh planner, critic, and builder conversations", () => {
       ],
     });
     const criticPrompt = (spawns[1].input as Array<{ type: string; text?: string }>)[0].text ?? "";
-    expect(criticPrompt).toMatch(/strict JSON/i);
-    expect(criticPrompt).toMatch(/independent/i);
-    expect(criticPrompt).toMatch(/planner conversation/i);
-    expect(criticPrompt).toMatch(/edit files/i);
+    expectCriticPromptContract(criticPrompt);
     expect(criticPrompt).not.toContain("```");
     expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
       jobId: "job_1",

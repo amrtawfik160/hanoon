@@ -16,6 +16,25 @@ const artifact = {
   sha256: "b".repeat(64),
 };
 
+function expectStrictJsonRequired(prompt: string): void {
+  expect(prompt).toMatch(/\b(?:return|respond|output|requires?)\b[^.!?]{0,120}\bstrict JSON\b/i);
+  expect(prompt).not.toMatch(/\bnon[-\s]?strict JSON\b/i);
+  expect(prompt).not.toMatch(/\bstrict JSON\b[^.!?]{0,80}\b(?:optional|allowed|permitted)\b/i);
+}
+
+function expectForbiddenClause(prompt: string, target: RegExp): void {
+  const clause = prompt.split(/[.!?]/u).find((part) => target.test(part));
+  expect(clause).toBeDefined();
+  if (clause === undefined) return;
+  expect(clause).toMatch(/\b(?:do not|must not|never|without|forbidden|prohibited|disallowed)\b/i);
+  expect(clause).not.toMatch(/\b(?:allowed|permitted|acceptable|okay|optional)\b/i);
+}
+
+function expectForbiddenReviewOutputDecorations(prompt: string): void {
+  expectForbiddenClause(prompt, /\bMarkdown fences?\b/i);
+  expectForbiddenClause(prompt, /\badditional keys?\b/i);
+}
+
 it("keeps implementation and review instructions tiny and attachment-only", () => {
   const implementation = buildImplementationInstruction({
     ...artifact,
@@ -54,11 +73,10 @@ it("keeps review output contracts structural and attachment-bound", () => {
 
   expect(review).toContain(artifact.filename);
   expect(review).toContain(`SHA-256 ${artifact.sha256}`);
-  expect(review).toMatch(/strict JSON/i);
+  expectStrictJsonRequired(review);
   expect(review).not.toContain("```");
-  expect(correction).toMatch(/strict JSON/i);
-  expect(correction).toMatch(/markdown fences/i);
-  expect(correction).toMatch(/additional keys/i);
+  expectStrictJsonRequired(correction);
+  expectForbiddenReviewOutputDecorations(correction);
 });
 
 it("bounds inline remediation and format-correction prompts", () => {
