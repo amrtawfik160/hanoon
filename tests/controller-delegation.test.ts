@@ -1,8 +1,13 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { openStore } from "../src/storage/store";
+import {
+  DELEGATION_JOIN_TIMEOUT_MS,
+  MonitorService,
+  type MonitorThreadStatus,
+} from "../src/services/monitor-service";
 
 let fixtureNumber = 0;
 
@@ -178,4 +183,123 @@ it("lists only open delegations for the due pass", () => {
   store.recordDelegationFired({ id: done.id, now: 2_010 });
 
   expect(store.listOpenDelegations(10).map((delegation) => delegation.id)).toEqual([open.id]);
+});
+
+function joinService(
+  store: ReturnType<typeof fixture>["store"],
+  statuses: Record<string, MonitorThreadStatus>,
+  outputs: Record<string, string> = {},
+  now = () => 3_000,
+) {
+  const status = vi.fn(async (threadId: string) => statuses[threadId] ?? "active");
+  const output = vi.fn(async (threadId: string) => outputs[threadId] ?? "");
+  return {
+    service: new MonitorService({ store, threads: { status, output }, clock: { now } }),
+    status,
+    output,
+  };
+}
+
+function twoMemberDelegation(store: ReturnType<typeof fixture>["store"]) {
+  const delegation = store.createDelegation({
+    controllerKey: CONTROLLER_KEY,
+    instruction: "compare both and tell me which is worse",
+    now: 2_000,
+  });
+  store.addDelegationThread({
+    delegationId: delegation.id, threadId: "thr_a", projectId: "proj_a", title: "invoice spike", now: 2_001,
+  });
+  store.addDelegationThread({
+    delegationId: delegation.id, threadId: "thr_b", projectId: "proj_b", title: "billing latency", now: 2_002,
+  });
+  return delegation;
+}
+
+function joinedTurn(store: ReturnType<typeof fixture>["store"]) {
+  return store.listControllerTurns(CONTROLLER_KEY, 10)
+    .find((turn) => turn.inputText.startsWith("Work you delegated has finished."));
+}
+
+it("waits while any delegated thread is still working", async () => {
+  const { store } = fixture();
+  const delegation = twoMemberDelegation(store);
+  const { service } = joinService(store, { thr_a: "idle", thr_b: "active" }, { thr_a: "found it" });
+
+  await expect(service.processDueDelegations()).resolves.toBe(false);
+
+  expect(store.getDelegation(delegation.id)).toMatchObject({ state: "open" });
+  expect(store.getDelegation(delegation.id)?.threads.map((member) => member.state))
+    .toEqual(["finished", "running"]);
+  expect(joinedTurn(store)).toBeUndefined();
+});
+
+it("fires one joined turn naming every member once the last lands", async () => {
+  const { store } = fixture();
+  const delegation = twoMemberDelegation(store);
+  const { service } = joinService(
+    store,
+    { thr_a: "idle", thr_b: "idle" },
+    { thr_a: "the retry loop doubled the invoices", thr_b: "p99 is 4s on the billing read" },
+  );
+
+  await expect(service.processDueDelegations()).resolves.toBe(true);
+
+  const turn = joinedTurn(store);
+  expect(turn?.inputText).toContain("compare both and tell me which is worse");
+  expect(turn?.inputText).toContain("invoice spike (thr_a): finished — the retry loop doubled the invoices");
+  expect(turn?.inputText).toContain("billing latency (thr_b): finished — p99 is 4s on the billing read");
+  expect(store.getDelegation(delegation.id)).toMatchObject({ state: "fired" });
+
+  // A later pass must not enqueue the join a second time.
+  await expect(service.processDueDelegations()).resolves.toBe(false);
+  expect(store.listControllerTurns(CONTROLLER_KEY, 10)
+    .filter((each) => each.inputText.startsWith("Work you delegated has finished."))).toHaveLength(1);
+});
+
+it("reports a failed member instead of dropping it", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const { service, output } = joinService(
+    store,
+    { thr_a: "error", thr_b: "idle" },
+    { thr_a: "should never be quoted", thr_b: "clean run" },
+  );
+
+  await expect(service.processDueDelegations()).resolves.toBe(true);
+
+  expect(joinedTurn(store)?.inputText).toContain("invoice spike (thr_a): failed");
+  expect(joinedTurn(store)?.inputText).not.toContain("should never be quoted");
+  expect(output).not.toHaveBeenCalledWith("thr_a");
+});
+
+it("fires with an honest note when a member outlives the join deadline", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const { service } = joinService(
+    store,
+    { thr_a: "idle", thr_b: "active" },
+    { thr_a: "done early" },
+    () => 2_000 + DELEGATION_JOIN_TIMEOUT_MS,
+  );
+
+  await expect(service.processDueDelegations()).resolves.toBe(true);
+
+  expect(joinedTurn(store)?.inputText)
+    .toContain("billing latency (thr_b): still running when the deadline passed");
+});
+
+it("leaves a delegation open when BB cannot be reached", async () => {
+  const { store } = fixture();
+  const delegation = twoMemberDelegation(store);
+  const status = vi.fn(async () => { throw new Error("BB unreachable"); });
+  const service = new MonitorService({
+    store,
+    threads: { status, output: async () => "" },
+    clock: { now: () => 3_000 },
+    warn: () => undefined,
+  });
+
+  await expect(service.processDueDelegations()).resolves.toBe(false);
+
+  expect(store.getDelegation(delegation.id)).toMatchObject({ state: "open" });
 });

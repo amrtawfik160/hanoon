@@ -473,6 +473,10 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
         return thread.status;
       },
+      output: async (threadId) => {
+        const result = await bb.sdk.threads.output({ threadId });
+        return result.output ?? "";
+      },
     },
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),

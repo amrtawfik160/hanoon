@@ -43,6 +43,7 @@ export type JobExecutorDependencies = {
   };
   monitors?: {
     processDue(): Promise<boolean>;
+    processDueDelegations(): Promise<boolean>;
   };
   threadNotices?: {
     processDue(): Promise<boolean>;
@@ -458,6 +459,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
         if (deps.monitors) {
           didWork = await deps.monitors.processDue() || didWork;
+          didWork = await deps.monitors.processDueDelegations() || didWork;
         }
         if (deps.threadNotices) {
           didWork = await deps.threadNotices.processDue() || didWork;
