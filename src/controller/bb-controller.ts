@@ -35,6 +35,12 @@ export type ControllerEventObservation = {
   error: string | null;
   /** Set while the thread is blocked on a question only the owner can answer. */
   pendingQuestion: ControllerPendingQuestion | null;
+  /** Tool-shaped item starts in this window; the caller accumulates them. */
+  toolCalls: number;
+  /** Non-zero command exits in this window; the caller accumulates them. */
+  commandFailures: number;
+  /** Highest cumulative thread token total in this window, else 0. */
+  totalTokens: number;
 };
 
 export type ControllerAdapter = {
@@ -70,6 +76,16 @@ export type ControllerAdapter = {
 
 const EVENT_PAGE_LIMIT = 100;
 const MAX_EVENT_PAGES = 50;
+
+// Reasoning, plain messages, and plan updates are the model thinking out loud.
+// Everything here reaches outside the model, which is what a budget should bound.
+const TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
+  "commandExecution",
+  "toolCall",
+  "webSearch",
+  "fileChange",
+  "backgroundTask",
+]);
 
 type BbSdk = BbPluginApi["sdk"];
 type ControllerPromptInput = Parameters<BbSdk["threads"]["send"]>[0]["input"];
@@ -226,6 +242,9 @@ export class BbControllerAdapter implements ControllerAdapter {
     let completed = false;
     let error: string | null = null;
     let pendingQuestion: ControllerPendingQuestion | null = null;
+    let toolCalls = 0;
+    let commandFailures = 0;
+    let totalTokens = 0;
     for (let page = 0; page < MAX_EVENT_PAGES; page += 1) {
       const rows = await this.dependencies.sdk.threads.events.list({
         threadId,
@@ -238,6 +257,15 @@ export class BbControllerAdapter implements ControllerAdapter {
         if (row.type === "turn/input/accepted") inputAccepted = true;
         if (row.type === "item/agentMessage/delta") assistantDelta += row.data.delta;
         if (row.type === "turn/completed") completed = true;
+        if (row.type === "item/started" && TOOL_ITEM_TYPES.has(row.data.item.type)) toolCalls += 1;
+        if (row.type === "item/completed" && row.data.item.type === "commandExecution") {
+          const exitCode = row.data.item.exitCode;
+          if (typeof exitCode === "number" && exitCode !== 0) commandFailures += 1;
+        }
+        if (row.type === "thread/tokenUsage/updated") {
+          const total = row.data.tokenUsage.total.totalTokens;
+          if (Number.isFinite(total) && total > totalTokens) totalTokens = total;
+        }
         if (row.type === "system/error" || row.type === "provider/error") {
           error = "Controller provider turn failed";
         }
@@ -252,7 +280,17 @@ export class BbControllerAdapter implements ControllerAdapter {
       }
       if (rows.length < EVENT_PAGE_LIMIT) break;
     }
-    return { latestSeq, inputAccepted, assistantDelta, completed, error, pendingQuestion };
+    return {
+      latestSeq,
+      inputAccepted,
+      assistantDelta,
+      completed,
+      error,
+      pendingQuestion,
+      toolCalls,
+      commandFailures,
+      totalTokens,
+    };
   }
 
   public async findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null> {

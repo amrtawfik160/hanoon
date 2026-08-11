@@ -9,7 +9,7 @@ describe("controller stream projection", () => {
       assistantDelta: "Hello world",
       completed: false,
       error: null,
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 10,
       text: "",
@@ -30,7 +30,7 @@ describe("controller stream projection", () => {
       assistantDelta: " duplicate",
       completed: false,
       error: null,
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 13,
       text: "Hello world",
@@ -51,7 +51,7 @@ describe("controller stream projection", () => {
       assistantDelta: `${"a".repeat(3_900)}🙂tail`,
       completed: false,
       error: null,
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 0,
       text: "",
