@@ -693,7 +693,7 @@ it("rejects a conflicting duplicate split across two event pages", async () => {
   expect(currentTurn(fixture.store, fixture.turn.id).evidenceEventSeq).toBe(0);
 });
 
-it("preflights persisted native identities across replay and restart", async () => {
+it("surfaces repository identity decisions across replay and restart", async () => {
   const firstEvent = completedEvent(1, commandItem({ id: "restart_item", aggregatedOutput: "same" }));
   const fixture = readyProjectorFixture({ rows: [firstEvent], maxSeq: 1 });
   await fixture.projector.reconcile(

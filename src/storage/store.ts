@@ -92,6 +92,7 @@ import {
   type ControllerEvidenceRecord,
   type ControllerEvidenceWrite,
   type ControllerNativeEvidenceInput,
+  type ControllerNativeEvidenceWrite,
 } from "./controller-evidence-repository";
 
 export { VersionConflictError, assertSafeExternalHttpsUrl };
@@ -1662,7 +1663,7 @@ export interface TelegramAgentStore {
   recordControllerEvidence(input: ControllerEvidenceInput): ControllerEvidenceWrite;
   recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
-  ): "recorded" | "stale" | "cursor_changed" | "limit_exceeded";
+  ): ControllerNativeEvidenceWrite;
   listControllerEvidence(turnId: string, limit: number): ControllerEvidenceRecord[];
   getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null;
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
@@ -3137,7 +3138,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
-  ): "recorded" | "stale" | "cursor_changed" | "limit_exceeded" {
+  ): ControllerNativeEvidenceWrite {
     return this.controllerEvidenceRepository.recordNativeBatch(input);
   }
 

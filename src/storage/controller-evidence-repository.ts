@@ -67,10 +67,15 @@ export type ControllerNativeEvidenceInput = ControllerLeaseFence & Readonly<{
   items: readonly ControllerNativeEvidenceCandidate[];
 }>;
 
+export type ControllerNativeEvidenceWrite =
+  | "recorded"
+  | "stale"
+  | "cursor_changed"
+  | "limit_exceeded"
+  | "native_identity_conflict";
+
 export interface ControllerNativeEvidenceWriter {
-  recordNativeBatch(
-    input: ControllerNativeEvidenceInput,
-  ): "recorded" | "stale" | "cursor_changed" | "limit_exceeded";
+  recordNativeBatch(input: ControllerNativeEvidenceInput): ControllerNativeEvidenceWrite;
 }
 
 type ControllerEvidenceRow = {
@@ -159,12 +164,13 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
 
   public recordNativeBatch(
     input: ControllerNativeEvidenceInput,
-  ): "recorded" | "stale" | "cursor_changed" | "limit_exceeded" {
+  ): ControllerNativeEvidenceWrite {
     const validated = validatedNativeInput(input);
     return this.db.transaction(() => {
       const turn = this.fencedTurn(validated);
       if (!turn) return "stale" as const;
       if (turn.evidence_event_seq !== validated.fromSeq) return "cursor_changed" as const;
+      if (this.nativeBatchHasIdentityConflict(validated)) return "native_identity_conflict" as const;
       if (this.nativeBatchCrossesCap(validated)) {
         this.markLimitExceeded(validated);
         return "limit_exceeded" as const;
@@ -257,6 +263,24 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       if (!existing.get(input.turnId, candidate.sourceItemId)) newRows += 1;
     }
     return this.evidenceCount(input.turnId) + newRows > MAX_EVIDENCE_ROWS;
+  }
+
+  private nativeBatchHasIdentityConflict(input: ControllerNativeEvidenceInput): boolean {
+    const batchIdentities = new Map<string, ControllerNativeEvidenceCandidate>();
+    const persistedIdentity = this.db.prepare(
+      `SELECT * FROM controller_evidence
+        WHERE turn_id = ? AND source_kind = 'bb_item' AND source_item_id = ?`,
+    );
+    for (const candidate of input.items) {
+      const batchIdentity = batchIdentities.get(candidate.sourceItemId);
+      if (batchIdentity && !sameNativeSemantics(batchIdentity, candidate)) return true;
+      if (batchIdentity) continue;
+      batchIdentities.set(candidate.sourceItemId, candidate);
+      const persisted = persistedIdentity.get(input.turnId, candidate.sourceItemId) as
+        ControllerEvidenceRow | undefined;
+      if (persisted && !sameNativeSemantics(parseEvidenceRow(persisted), candidate)) return true;
+    }
+    return false;
   }
 
   private insertNativeEvidence(
@@ -457,6 +481,23 @@ function parsedSourceItemId(
   return sourceItemId === null
     ? null
     : validatedBoundedString(sourceItemId, "persisted sourceItemId");
+}
+
+function sameNativeSemantics(
+  known: Pick<
+    ControllerNativeEvidenceCandidate,
+    "sourceName" | "outcome" | "argsSha256" | "resultSha256" | "proofKinds" | "subjectRefs"
+  >,
+  candidate: ControllerNativeEvidenceCandidate,
+): boolean {
+  return known.sourceName === candidate.sourceName && known.outcome === candidate.outcome &&
+    known.argsSha256 === candidate.argsSha256 && known.resultSha256 === candidate.resultSha256 &&
+    sameOrderedValues(known.proofKinds, candidate.proofKinds) &&
+    sameOrderedValues(known.subjectRefs, candidate.subjectRefs);
+}
+
+function sameOrderedValues<T>(left: readonly T[], right: readonly T[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function assertFence(input: ControllerLeaseFence & Readonly<{ turnId: string }>): void {

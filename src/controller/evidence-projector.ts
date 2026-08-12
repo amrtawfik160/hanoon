@@ -2,7 +2,6 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { posix, win32 } from "node:path";
 import type { TelegramAgentStore } from "../storage/store";
 import type {
-  ControllerEvidenceRecord,
   ControllerEvidenceOutcome,
   ControllerNativeEvidenceCandidate,
 } from "../storage/controller-evidence-repository";
@@ -152,7 +151,6 @@ type ScannedPage = Readonly<{
 
 const DEFAULT_HANOON_TOOL_NAMES: ReadonlySet<string> = new Set(SLICE_1_CONTROLLER_TOOL_NAMES);
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
-const MAX_EVIDENCE_ROWS = 128;
 const MAX_NATIVE_ID_BYTES = 256;
 const MAX_SUBJECT_BYTES = 256;
 const MAX_SUBJECTS = 16;
@@ -394,37 +392,6 @@ function evidenceIdentity(candidate: ControllerNativeEvidenceCandidate): string 
   });
 }
 
-function persistedNativeIdentities(rows: readonly ControllerEvidenceRecord[]): Map<string, string> {
-  const identities = new Map<string, string>();
-  for (const row of rows) {
-    if (row.sourceKind !== "bb_item" || row.sourceItemId === null) continue;
-    identities.set(row.sourceItemId, evidenceIdentity({
-      sourceName: row.sourceName,
-      sourceItemId: row.sourceItemId,
-      outcome: row.outcome,
-      argsSha256: row.argsSha256,
-      resultSha256: row.resultSha256,
-      proofKinds: row.proofKinds,
-      subjectRefs: row.subjectRefs,
-    }));
-  }
-  return identities;
-}
-
-function assertNoPersistedConflict(
-  store: TelegramAgentStore,
-  turnId: string,
-  candidates: readonly ControllerNativeEvidenceCandidate[],
-): void {
-  const persisted = persistedNativeIdentities(store.listControllerEvidence(turnId, MAX_EVIDENCE_ROWS));
-  for (const candidate of candidates) {
-    const identity = persisted.get(candidate.sourceItemId);
-    if (identity !== undefined && identity !== evidenceIdentity(candidate)) {
-      throw new ControllerEvidenceProjectorError("native_identity_conflict");
-    }
-  }
-}
-
 function addCandidate(
   candidates: Map<string, ControllerNativeEvidenceCandidate>,
   candidate: ControllerNativeEvidenceCandidate,
@@ -599,6 +566,9 @@ export class ControllerEvidenceProjector {
     request: ReconciliationTarget,
     attempt: ReconciliationAttempt,
   ): ControllerEvidenceReconciliation {
+    if (attempt.write === "native_identity_conflict") {
+      throw new ControllerEvidenceProjectorError("native_identity_conflict");
+    }
     if (attempt.write === "limit_exceeded") {
       return this.writeResult("limit_exceeded", attempt.batch, request.targetSeq);
     }
@@ -702,8 +672,6 @@ export class ControllerEvidenceProjector {
   private commitBatch(
     request: CommitRequest,
   ): ReturnType<TelegramAgentStore["recordControllerNativeEvidence"]> {
-    request.signal.throwIfAborted();
-    assertNoPersistedConflict(this.dependencies.store, request.turn.id, request.batch.candidates);
     request.signal.throwIfAborted();
     return this.dependencies.store.recordControllerNativeEvidence({
       ownerId: request.fence.ownerId,
