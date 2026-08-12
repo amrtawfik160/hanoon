@@ -195,7 +195,10 @@ describe("strict structural bounds", () => {
   it("accepts all structural maxima when their semantics are valid", () => {
     const evidence = evidenceRow("evidence:1", "project_state");
     const twelveClaims = Array.from({ length: 12 }, () => claimFinalization().segments[0]);
-    const twelveTexts = Array.from({ length: 12 }, () => ({ type: "text" as const, text: "x" }));
+    const twelveTexts = [
+      { type: "text" as const, text: "I'll follow up with the measured result." },
+      ...Array.from({ length: 11 }, () => ({ type: "text" as const, text: "x" })),
+    ];
     const candidate: ControllerFinalization = {
       disposition: "deferred",
       segments: [...twelveClaims, ...twelveTexts],
@@ -215,6 +218,18 @@ describe("strict structural bounds", () => {
       segments: Array.from({ length: 13 }, () => claimFinalization().segments[0]),
       obligationRefs: [],
     }).success).toBe(false);
+  });
+
+  it("enforces segment bounds in Unicode code points through the schema and validator", () => {
+    const maximum = textFinalization("😀".repeat(4_000));
+    const overLimit = textFinalization("😀".repeat(4_001));
+
+    expect(controllerFinalizationSchema.safeParse(maximum).success).toBe(true);
+    expect(validateControllerFinalization(maximum, emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+    expect(controllerFinalizationSchema.safeParse(overLimit).success).toBe(false);
+    expect(validateControllerFinalization(overLimit, emptyFinalizationContext()))
+      .toMatchObject({ outcome: "rejected", code: "invalid_contract" });
   });
 });
 
@@ -282,6 +297,41 @@ describe("unsafe candidate redaction", () => {
       storedCandidate: textFinalization("[redacted]"),
     });
     expect(JSON.stringify(validation)).not.toContain("SECRET_12345");
+  });
+
+  it.each([
+    ["raw callback across text/text", [
+      { type: "text", text: "m:" },
+      { type: "text", text: "a".repeat(32) },
+    ], `m:${"a".repeat(32)}`],
+    ["encoded callback across text/claim", [
+      { type: "text", text: "encoded-prefix m" },
+      claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: `%3A${"b".repeat(32)}` }).segments[0],
+    ], `encoded-prefix m%3A${"b".repeat(32)}`],
+    ["repeatedly encoded callback across claim/text", [
+      claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: "repeated-prefix m" }).segments[0],
+      { type: "text", text: `%25253A${"c".repeat(32)}` },
+    ], `repeated-prefix m%25253A${"c".repeat(32)}`],
+    ["credential assignment across text/claim", [
+      { type: "text", text: "api_key" },
+      claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: "=TOP_SECRET_VALUE_12345" }).segments[0],
+    ], "api_key=TOP_SECRET_VALUE_12345"],
+  ])("rejects and fully redacts %s", (_label, segments, assembledUnsafeText) => {
+    const candidate = { disposition: "answered", segments, obligationRefs: [] };
+    const validation = validateControllerFinalization(candidate, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state"),
+    ));
+    const serialized = JSON.stringify(validation);
+
+    expect(validation).toMatchObject({
+      outcome: "rejected",
+      code: "invalid_contract",
+      storedCandidate: {
+        segments: segments.map((segment) => ({ ...segment, text: "[redacted]" })),
+      },
+    });
+    expect(serialized).not.toContain(assembledUnsafeText);
+    for (const segment of segments) expect(serialized).not.toContain(segment.text);
   });
 });
 
@@ -371,7 +421,7 @@ describe("ordered rejection branches", () => {
   it("requires every deferred obligation to be live", () => {
     const candidate: ControllerFinalization = {
       disposition: "deferred",
-      segments: [{ type: "text", text: "The next check is pending." }],
+      segments: [{ type: "text", text: "I'll follow up with the measured result." }],
       obligationRefs: ["obligation:1", "obligation:2"],
     };
     expectRejection(
@@ -409,6 +459,59 @@ describe("ordered rejection branches", () => {
     }), "revision_limit");
     expectRejection(missingEvidence, emptyFinalizationContext({ evidenceLimitExceeded: true }), "evidence_limit_exceeded");
     expectRejection(missingEvidence, emptyFinalizationContext(), "evidence_missing");
+  });
+
+  it("pins every coexisting rejection-stage boundary", () => {
+    const duplicateMissing = claimFinalization({ evidenceRefs: ["evidence:2", "evidence:2"] });
+    const missingAndWrongSubject = claimFinalization({ evidenceRefs: ["evidence:1", "evidence:2"] });
+    const wrongSubjectAndProof = claimFinalization({ kind: "execution_result" });
+    const proofAndOwnerBoundary = {
+      ...claimFinalization({ kind: "execution_result" }),
+      disposition: "needs_owner" as const,
+    };
+    const ownerBoundaryAndObligation: ControllerFinalization = {
+      disposition: "needs_owner",
+      segments: [{ type: "text", text: "Choose the deployment region." }],
+      obligationRefs: ["obligation:1"],
+    };
+    const nonLiveProcessOnly: ControllerFinalization = {
+      disposition: "deferred",
+      segments: [{ type: "text", text: "I'll investigate." }],
+      obligationRefs: ["obligation:1"],
+    };
+
+    expectRejection(ordinary, emptyFinalizationContext({ acceptedAlready: true, revisionCount: 8 }), "accepted_already");
+    expectRejection(ordinary, emptyFinalizationContext({ acceptedAlready: true, evidenceLimitExceeded: true }), "accepted_already");
+    expectRejection(ordinary, emptyFinalizationContext({ revisionCount: 8, evidenceLimitExceeded: true }), "revision_limit");
+    expectRejection(duplicateMissing, emptyFinalizationContext({ evidenceLimitExceeded: true }), "evidence_limit_exceeded");
+    expectRejection(duplicateMissing, emptyFinalizationContext(), "duplicate_evidence_reference");
+    expectRejection(missingAndWrongSubject, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state", "observed", "job:someone_else"),
+    ), "evidence_missing");
+    expectRejection(wrongSubjectAndProof, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state", "observed", "job:someone_else"),
+    ), "subject_mismatch");
+    expectRejection(proofAndOwnerBoundary, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state"),
+    ), "proof_incompatible");
+    expectRejection(ownerBoundaryAndObligation, emptyFinalizationContext({
+      liveObligationRefs: new Set(["obligation:1"]),
+    }), "owner_boundary_missing");
+    expectRejection(nonLiveProcessOnly, emptyFinalizationContext(), "obligation_not_live");
+  });
+
+  it("keeps mutually exclusive disposition failures on direct boundaries", () => {
+    // answered/needs_owner obligation failures cannot coexist with deferred missing/non-live failures.
+    expectRejection({
+      disposition: "answered",
+      segments: [{ type: "text", text: "The answer is complete." }],
+      obligationRefs: ["obligation:1"],
+    }, emptyFinalizationContext(), "obligation_forbidden");
+    expectRejection({
+      disposition: "deferred",
+      segments: [{ type: "text", text: "I'll follow up with the measured result." }],
+      obligationRefs: [],
+    }, emptyFinalizationContext(), "obligation_missing");
   });
 });
 
@@ -552,6 +655,8 @@ describe("bounded text heuristics", () => {
     "I'll check the logs.",
     "I'll look into the current job.",
     "I'll work on the migration.",
+    "I’ll investigate and get back to you.",
+    "I'll investigate. I'll get back to you.",
   ])("rejects process-only statement: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "process_only");
   });
@@ -561,6 +666,8 @@ describe("bounded text heuristics", () => {
     "I checked the options; SQLite is the simplest choice.",
     "Should I investigate the deployment history?",
     "I can investigate if you want me to.",
+    "I'll investigate. SQLite is the simplest choice.",
+    "I'll investigate. Should I follow up?",
   ])("does not broaden process-only detection to: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
@@ -577,6 +684,46 @@ describe("bounded text heuristics", () => {
     }))).toMatchObject({ outcome: "accepted" });
   });
 
+  it("recognizes a concrete deferred follow-up after a condition", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "deferred",
+      segments: [{ type: "text", text: "I'll get back to you when the monitor fires." }],
+      obligationRefs: ["obligation:1"],
+    };
+    expect(validateControllerFinalization(candidate, emptyFinalizationContext({
+      liveObligationRefs: new Set(["obligation:1"]),
+    }))).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "I'll try.",
+    "I'll investigate and follow up.",
+    "I'll get back to you.",
+  ])("rejects deferred process intent without concrete follow-up: %s", (text) => {
+    const candidate: ControllerFinalization = {
+      disposition: "deferred",
+      segments: [{ type: "text", text }],
+      obligationRefs: ["obligation:1"],
+    };
+    expectRejection(
+      candidate,
+      emptyFinalizationContext({ liveObligationRefs: new Set(["obligation:1"]) }),
+      "process_only",
+    );
+  });
+
+  it("rejects process-only intent split across adjacent segments", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "I'll investigate." },
+        { type: "text", text: " I'll get back to you." },
+      ],
+      obligationRefs: [],
+    };
+    expectRejection(candidate, emptyFinalizationContext(), "process_only");
+  });
+
   it.each([
     "I implemented the fix.",
     "The tests passed.",
@@ -589,6 +736,17 @@ describe("bounded text heuristics", () => {
     "I spent five hundred dollars on the migration.",
     "I deployed production, and I will monitor it.",
     "I did not deploy staging, but I deployed production.",
+    "I deployed production, which I will monitor.",
+    "The fix is implemented.",
+    "The test suite was passed.",
+    "We approved the review.",
+    "The branch was merged.",
+    "Production was deployed.",
+    "We deleted the stale records.",
+    "The package was installed.",
+    "We rotated the credentials.",
+    "We paid USD 500 for the service.",
+    "We purchased the deployment service.",
   ])("rejects unclaimed high-impact assertion: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
@@ -602,9 +760,40 @@ describe("bounded text heuristics", () => {
     "We could install the package later.",
     "Please do not delete those records.",
     "The review is not complete.",
+    "I removed ambiguity from the explanation.",
+    "We paid attention to the details.",
+    "Should the package be installed?",
+    "The records were not deleted.",
+    "We will purchase the service after approval.",
   ])("does not treat non-success text as a high-impact success: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
+  });
+
+  it("rejects a completed assertion split across adjacent text segments", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "The fix is imple" },
+        { type: "text", text: "mented." },
+      ],
+      obligationRefs: [],
+    };
+    expectRejection(candidate, emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it("stops plain-text assertion concatenation at claim boundaries", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "The fix is imple" },
+        claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: "mented." }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+    expect(validateControllerFinalization(candidate, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state"),
+    ))).toMatchObject({ outcome: "accepted" });
   });
 
   it("allows a high-impact assertion when it is carried by a compatible claim segment", () => {
@@ -636,5 +825,61 @@ describe("fixed corrections", () => {
     expect(first.correction).toBe(second.correction);
     expect(first.correction.length).toBeLessThanOrEqual(256);
     expect(first.correction).not.toMatch(/private_subject|987654/);
+  });
+
+  it("returns a distinct bounded correction for every rejection code", () => {
+    const ordinary = textFinalization("candidate-marker");
+    const wrongSubject = evidenceRow("evidence:1", "project_state", "observed", "evidence-marker");
+    const cases: readonly [string, ReturnType<typeof validateControllerFinalization>][] = [
+      ["invalid_contract", validateControllerFinalization({ invalid: "candidate-marker" }, emptyFinalizationContext())],
+      ["accepted_already", validateControllerFinalization(ordinary, emptyFinalizationContext({ acceptedAlready: true }))],
+      ["revision_limit", validateControllerFinalization(ordinary, emptyFinalizationContext({ revisionCount: 8 }))],
+      ["evidence_limit_exceeded", validateControllerFinalization(ordinary, emptyFinalizationContext({ evidenceLimitExceeded: true }))],
+      ["duplicate_evidence_reference", validateControllerFinalization(
+        claimFinalization({ evidenceRefs: ["evidence:1", "evidence:1"] }),
+        contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      )],
+      ["evidence_missing", validateControllerFinalization(claimFinalization(), emptyFinalizationContext())],
+      ["subject_mismatch", validateControllerFinalization(claimFinalization(), contextWithEvidence(wrongSubject))],
+      ["proof_incompatible", validateControllerFinalization(
+        claimFinalization({ kind: "execution_result" }),
+        contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      )],
+      ["owner_boundary_missing", validateControllerFinalization({
+        disposition: "needs_owner",
+        segments: [{ type: "text", text: "Choose a region." }],
+        obligationRefs: [],
+      }, emptyFinalizationContext())],
+      ["obligation_forbidden", validateControllerFinalization({
+        disposition: "answered",
+        segments: [{ type: "text", text: "The answer is complete." }],
+        obligationRefs: ["obligation:1"],
+      }, emptyFinalizationContext())],
+      ["obligation_missing", validateControllerFinalization({
+        disposition: "deferred",
+        segments: [{ type: "text", text: "I'll follow up with the result." }],
+        obligationRefs: [],
+      }, emptyFinalizationContext())],
+      ["obligation_not_live", validateControllerFinalization({
+        disposition: "deferred",
+        segments: [{ type: "text", text: "I'll follow up with the result." }],
+        obligationRefs: ["obligation:1"],
+      }, emptyFinalizationContext())],
+      ["process_only", validateControllerFinalization(textFinalization("I'll investigate."), emptyFinalizationContext())],
+      ["high_impact_text_unclaimed", validateControllerFinalization(
+        textFinalization("The fix is implemented."),
+        emptyFinalizationContext(),
+      )],
+    ];
+
+    const corrections = cases.map(([expectedCode, validation]) => {
+      expect(validation).toMatchObject({ outcome: "rejected", code: expectedCode });
+      if (validation.outcome !== "rejected") throw new Error("expected rejection");
+      expect(validation.correction.length).toBeGreaterThan(0);
+      expect(validation.correction.length).toBeLessThanOrEqual(256);
+      expect(validation.correction).not.toMatch(/candidate-marker|evidence-marker/);
+      return validation.correction;
+    });
+    expect(new Set(corrections).size).toBe(FINALIZATION_REJECTION_CODES.length);
   });
 });
