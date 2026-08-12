@@ -34,8 +34,9 @@ import {
 } from "./services/worker-liveness";
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
-import { registerControllerTools } from "./controller/tools";
+import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
 import { BbControllerAdapter, ControllerImagePreparationError } from "./controller/bb-controller";
+import { ControllerEvidenceProjector } from "./controller/evidence-projector";
 import {
   CONTROLLER_MODELS,
   CONTROLLER_PERMISSION_MODES,
@@ -152,9 +153,16 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     pluginId: bb.pluginId,
     clock: { now: clock },
   });
+  const evidenceProjector = new ControllerEvidenceProjector({
+    sdk: bb.sdk,
+    store,
+    clock: { now: clock },
+    hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
+  });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
+    evidenceProjector,
     threadOperations,
     health: (now) => buildHealthReport(
       bb.storage.database(),
@@ -463,6 +471,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const controller = new LunaControllerService({
     store,
+    evidenceProjector,
     adapter: new BbControllerAdapter({
       sdk: bb.sdk,
       pluginId: bb.pluginId,

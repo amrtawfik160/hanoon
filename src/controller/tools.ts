@@ -37,7 +37,9 @@ import {
   visibleThreadStatus,
 } from "./thread-observer";
 import {
+  authorizeControllerCapability,
   canonicalControllerJson,
+  ControllerCapabilityAuthorizationError,
   registerControllerCapabilityTool,
   sha256ControllerJson,
   type AuthorizedControllerCapability,
@@ -45,7 +47,17 @@ import {
   type ControllerCapabilityScopeResolution,
   type ControllerJsonObject,
 } from "./capability-executor";
-import { CONTROLLER_CAPABILITIES, type ControllerToolName } from "./capability-policy";
+import {
+  CONTROLLER_CAPABILITIES,
+  type ControllerCapabilityDescriptor,
+  type ControllerToolName,
+} from "./capability-policy";
+import type {
+  ControllerEvidenceReconciler,
+  ControllerEvidenceReconciliation,
+  ControllerEvidenceReconciliationIncomplete,
+} from "./evidence-projector";
+import type { ControllerEvidenceRecord } from "../storage/controller-evidence-repository";
 
 export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_list_projects",
@@ -69,16 +81,147 @@ export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_delegate",
   "telegram_agent_scorecard",
   "telegram_agent_set_working_style",
+  "telegram_agent_turn_evidence",
 ] as const;
 
 type ToolDependencies = {
   store: TelegramAgentStore;
   sdk: BbPluginApi["sdk"];
+  evidenceProjector?: ControllerEvidenceReconciler;
   threadOperations: Pick<ThreadOperationService, "request">;
   health(now: number): unknown;
   notify(): void;
   now(): number;
 };
+
+type EvidenceIndexDescriptor = Readonly<{
+  ref: `evidence:${number}`;
+  source: string;
+  outcome: ControllerEvidenceRecord["outcome"];
+  proofKinds: ControllerEvidenceRecord["proofKinds"];
+  subjectRefs: ControllerEvidenceRecord["subjectRefs"];
+  observedAt: number;
+}>;
+
+type EvidenceIndexState = Readonly<{
+  turnId: string;
+  evidenceLimitExceeded: boolean;
+  reconciliationIncomplete: ControllerEvidenceReconciliationIncomplete | null;
+}>;
+
+type EvidenceToolExecution = Readonly<{
+  dependencies: ToolDependencies;
+  descriptor: ControllerCapabilityDescriptor;
+  afterEvidenceId: number;
+  context: PluginAgentToolContext;
+}>;
+
+function evidenceIndexDescriptor(row: ControllerEvidenceRecord): EvidenceIndexDescriptor {
+  return {
+    ref: row.ref,
+    source: row.sourceName,
+    outcome: row.outcome,
+    proofKinds: row.proofKinds,
+    subjectRefs: row.subjectRefs,
+    observedAt: row.observedAt,
+  };
+}
+
+function evidenceIndexEnvelope(
+  state: EvidenceIndexState,
+  evidence: readonly EvidenceIndexDescriptor[],
+  truncated: boolean,
+) {
+  const last = evidence.at(-1);
+  return {
+    ...state,
+    truncated,
+    nextEvidenceId: truncated && last
+      ? Number(last.ref.slice("evidence:".length))
+      : null,
+    evidence,
+  };
+}
+
+function boundedEvidenceIndex(
+  state: EvidenceIndexState,
+  rows: readonly ControllerEvidenceRecord[],
+  resultLimit: number,
+): string {
+  const descriptors = rows.map(evidenceIndexDescriptor);
+  if (descriptors.length === 0) return canonicalControllerJson(evidenceIndexEnvelope(state, [], false));
+  let largest: string | null = null;
+  for (let count = 1; count <= descriptors.length; count += 1) {
+    const candidate = canonicalControllerJson(evidenceIndexEnvelope(
+      state,
+      descriptors.slice(0, count),
+      count < descriptors.length,
+    ));
+    if (Buffer.byteLength(candidate, "utf8") > resultLimit) break;
+    largest = candidate;
+  }
+  if (largest === null) throw new Error(`One complete evidence descriptor cannot fit within ${resultLimit} bytes`);
+  return largest;
+}
+
+function evidenceAuthorization(
+  dependencies: ToolDependencies,
+  descriptor: ControllerCapabilityDescriptor,
+  context: PluginAgentToolContext,
+) {
+  return authorizeControllerCapability({
+    store: dependencies.store,
+    now: dependencies.now,
+    credential: { credential: "none", audience: "none" },
+  }, {
+    descriptor,
+    context,
+    scope: { kind: "exact_entity", entityRefs: [], matches: true },
+  });
+}
+
+function readableReconciliation(
+  reconciliation: ControllerEvidenceReconciliation,
+): void {
+  if (reconciliation.outcome === "stale" || reconciliation.outcome === "finalized") {
+    throw new ControllerCapabilityAuthorizationError("turn_missing");
+  }
+}
+
+function currentEvidenceIndex(
+  request: EvidenceToolExecution,
+  authorized: AuthorizedControllerCapability,
+  reconciliation: ControllerEvidenceReconciliation,
+): string {
+  const current = evidenceAuthorization(request.dependencies, request.descriptor, request.context);
+  if (current.turn.id !== authorized.turn.id) {
+    throw new ControllerCapabilityAuthorizationError("turn_missing");
+  }
+  const rows = request.dependencies.store.listControllerEvidence(current.turn.id, 128)
+    .filter((row) => row.id > request.afterEvidenceId);
+  return boundedEvidenceIndex({
+    turnId: current.turn.id,
+    evidenceLimitExceeded: current.turn.evidenceLimitExceededAt !== null ||
+      reconciliation.outcome === "limit_exceeded",
+    reconciliationIncomplete: reconciliation.reconciliationIncomplete,
+  }, rows, request.descriptor.result_limit);
+}
+
+async function executeEvidenceIndex(request: EvidenceToolExecution): Promise<string> {
+  const { dependencies, descriptor, context } = request;
+  const authorized = evidenceAuthorization(dependencies, descriptor, context);
+  if (!dependencies.evidenceProjector) {
+    throw new ControllerCapabilityAuthorizationError("policy_unreadable");
+  }
+  const reconciliation = await dependencies.evidenceProjector.reconcile(
+    authorized.controller,
+    authorized.turn,
+    authorized.fence,
+    context.signal,
+  );
+  readableReconciliation(reconciliation);
+  return currentEvidenceIndex(request, authorized, reconciliation);
+}
 
 function authorizedController(
   store: TelegramAgentStore,
@@ -1400,6 +1543,21 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         }),
       };
     },
+  });
+
+  const evidenceDescriptor = CONTROLLER_CAPABILITIES.telegram_agent_turn_evidence;
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[21],
+    description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
+    parameters: z.object({
+      afterEvidenceId: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
+    }).strict(),
+    execute: (params, context) => executeEvidenceIndex({
+      dependencies,
+      descriptor: evidenceDescriptor,
+      afterEvidenceId: params.afterEvidenceId,
+      context,
+    }),
   });
 
   bb.agents.configure((context) => {

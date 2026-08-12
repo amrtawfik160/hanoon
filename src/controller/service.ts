@@ -10,10 +10,12 @@ import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { projectControllerStream } from "./stream";
 import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
+import type { ControllerEvidenceReconciler } from "./evidence-projector";
 
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
   adapter: ControllerAdapter;
+  evidenceProjector?: ControllerEvidenceReconciler;
   clock: { now(): number };
 };
 

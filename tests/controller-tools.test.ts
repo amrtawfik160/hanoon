@@ -9,6 +9,7 @@ import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../src/controller/tools";
 import { canonicalControllerJson, sha256ControllerJson } from "../src/controller/capability-executor";
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
+import { ControllerEvidenceProjector } from "../src/controller/evidence-projector";
 
 type ThreadListEntry = Awaited<ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["sdk"]["threads"]["list"]>>[number];
 
@@ -194,7 +195,7 @@ function fixture(options: { active?: boolean } = {}) {
   return { bb, harness, store, turn, activate, deactivate };
 }
 
-it("preserves the exact 21-tool provider metadata and schema defaults", () => {
+it("preserves the exact Task 6 metadata and adds the bounded evidence-index schema", () => {
   const { bb, harness, store } = fixture({ active: true });
   registerControllerTools(bb, {
     store,
@@ -213,9 +214,27 @@ it("preserves the exact 21-tool provider metadata and schema defaults", () => {
   }));
   const providerJson = JSON.parse(JSON.stringify(metadata));
   const digest = createHash("sha256")
-    .update(canonicalControllerJson(providerJson), "utf8")
+    .update(canonicalControllerJson(providerJson.slice(0, 21)), "utf8")
     .digest("hex");
   expect(digest).toBe("c6be7f690b30281c7c3279b7e08276371d9c2474f52e407936faa034a56064a8");
+  expect(metadata[21]).toEqual({
+    name: "telegram_agent_turn_evidence",
+    description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
+    statusLabels: null,
+    schema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {
+        afterEvidenceId: {
+          default: 0,
+          type: "integer",
+          minimum: 0,
+          maximum: Number.MAX_SAFE_INTEGER,
+        },
+      },
+      additionalProperties: false,
+    },
+  });
 
   const byName = new Map(registrations.map((tool) => [tool.name, tool]));
   const parsed = (name: string, params: unknown) => {
@@ -259,7 +278,8 @@ it("matches the exact trusted 21-tool projection permission matrix", () => {
     ["telegram_agent_set_working_style", ["memory_state"]],
   ] as const;
 
-  expect(expected.map(([name]) => name)).toEqual(CONTROLLER_TOOL_NAMES);
+  expect(expected.map(([name]) => name)).toEqual(CONTROLLER_TOOL_NAMES.slice(0, 21));
+  expect(CONTROLLER_TOOL_NAMES[21]).toBe("telegram_agent_turn_evidence");
   for (const [name, proofKinds] of expected) {
     expect(CONTROLLER_CAPABILITIES[name].proof_kinds).toEqual(proofKinds);
   }
@@ -547,7 +567,7 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
     },
   ];
 
-  expect(rows.map((row) => row.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  expect(rows.map((row) => row.name)).toEqual(CONTROLLER_TOOL_NAMES.slice(0, 21));
   for (const row of rows) {
     const params = row.params();
     const result = parseToolWithEvidence(await harness.behavior.callAgentTool(
@@ -1898,4 +1918,318 @@ it("tells the agent a confirmed job is queued rather than waiting on the owner",
   )) as { job: { queue: string | null; awaitingOwner: boolean } };
 
   expect(status.job).toMatchObject({ queue: "queued", awaitingOwner: false });
+});
+
+type EvidenceIndex = Readonly<{
+  turnId: string;
+  evidenceLimitExceeded: boolean;
+  reconciliationIncomplete: null | "page_cap" | "source_gap";
+  truncated: boolean;
+  nextEvidenceId: number | null;
+  evidence: Array<{
+    ref: `evidence:${number}`;
+    source: string;
+    outcome: string;
+    proofKinds: string[];
+    subjectRefs: string[];
+    observedAt: number;
+  }>;
+}>;
+
+function evidenceIndex(value: unknown): EvidenceIndex {
+  if (typeof value !== "string") throw new Error("evidence index did not return canonical JSON text");
+  return JSON.parse(value) as EvidenceIndex;
+}
+
+function activeControllerTrustState(store: TelegramAgentStore) {
+  const controller = store.getControllerByThreadId("thr_controller");
+  if (!controller?.threadId || !controller.projectId || !controller.hostId) {
+    throw new Error("active controller is missing its BB identity");
+  }
+  const turn = store.getPendingControllerTurn(controller.controllerKey);
+  if (!turn || turn.state !== "submitted" || !turn.leaseOwner || turn.leaseGeneration === null) {
+    throw new Error("active controller is missing its submitted turn fence");
+  }
+  return {
+    controller,
+    turn,
+    fence: { ownerId: turn.leaseOwner, generation: turn.leaseGeneration, now: 10_100 },
+  };
+}
+
+function stubControllerEvidenceSdk(
+  harness: ReturnType<typeof fixture>["harness"],
+  rows: readonly Record<string, unknown>[] = [],
+  maxSeq = rows.reduce((maximum, row) => Math.max(maximum, Number(row.seq)), 0),
+): void {
+  harness.sdk.stub("threads.get", async () => ({
+    id: "thr_controller",
+    projectId: "proj_personal",
+    environmentId: "env_personal",
+  }));
+  harness.sdk.stub("environments.get", async () => ({
+    id: "env_personal",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    path: "/private/controller-root",
+    status: "ready",
+    workspaceProvisionType: "personal",
+  }));
+  harness.sdk.stub("threads.timeline", async () => ({ maxSeq }));
+  harness.sdk.stub("threads.events.list", async ({ afterSeq = "0", limit = "100" }) => rows
+    .filter((row) => Number(row.seq) > Number(afterSeq))
+    .slice(0, Number(limit)));
+}
+
+function controllerProjector(value: ReturnType<typeof fixture>): ControllerEvidenceProjector {
+  return new ControllerEvidenceProjector({
+    sdk: value.bb.sdk,
+    store: value.store,
+    clock: { now: () => 10_100 },
+    hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
+  });
+}
+
+function registerEvidenceTools(
+  value: ReturnType<typeof fixture>,
+  evidenceProjector: Pick<ControllerEvidenceProjector, "reconcile">,
+): void {
+  registerControllerTools(value.bb, {
+    store: value.store,
+    sdk: value.bb.sdk,
+    evidenceProjector,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+}
+
+function recordIndexEvidence(
+  store: TelegramAgentStore,
+  turn: ReturnType<typeof activeControllerTrustState>["turn"],
+  fence: ReturnType<typeof activeControllerTrustState>["fence"],
+  index: number,
+  subjectRefs: readonly string[],
+): void {
+  const written = store.recordControllerEvidence({
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    sourceKind: "hanoon_tool",
+    sourceName: `seed_${index}`,
+    sourceItemId: null,
+    outcome: "observed",
+    argsSha256: index.toString(16).padStart(64, "0"),
+    resultSha256: (index + 1).toString(16).padStart(64, "0"),
+    proofKinds: ["project_state"],
+    subjectRefs,
+    ...fence,
+  });
+  expect(written.outcome).toBe("recorded");
+}
+
+it("authorizes, reconciles before listing, and uses the injected projector without self-evidence", async () => {
+  const value = fixture({ active: true });
+  const trust = activeControllerTrustState(value.store);
+  const reconcile = vi.fn(async (
+    controller: typeof trust.controller,
+    turn: typeof trust.turn,
+    fence: typeof trust.fence,
+    _signal: AbortSignal,
+  ) => {
+    expect(controller).toEqual(trust.controller);
+    expect(turn).toEqual(trust.turn);
+    recordIndexEvidence(value.store, turn, fence, 1, ["project:proj_1"]);
+    return {
+      outcome: "reconciled" as const,
+      reconciliationIncomplete: "page_cap" as const,
+      fromSeq: 0,
+      throughSeq: 0,
+      targetSeq: 1,
+    };
+  });
+  registerEvidenceTools(value, { reconcile });
+  const signal = new AbortController().signal;
+
+  const listed = evidenceIndex(await value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    { ...controllerToolContext, signal },
+  ));
+
+  expect(reconcile).toHaveBeenCalledOnce();
+  expect(reconcile.mock.calls[0]?.[3]).toBe(signal);
+  expect(listed).toMatchObject({
+    turnId: trust.turn.id,
+    evidenceLimitExceeded: false,
+    reconciliationIncomplete: "page_cap",
+    truncated: false,
+    nextEvidenceId: null,
+    evidence: [{ source: "seed_1", subjectRefs: ["project:proj_1"] }],
+  });
+  expect(value.store.listControllerEvidence(trust.turn.id, 128).map((row) => row.sourceName))
+    .toEqual(["seed_1"]);
+
+  await expect(value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    { threadId: "thr_unrelated", projectId: "proj_personal" },
+  )).rejects.toThrow(/identity|authorized/i);
+  expect(reconcile).toHaveBeenCalledOnce();
+});
+
+it("reconciles a Hanoon native tool item without recording it a second time", async () => {
+  const value = fixture({ active: true });
+  const row = {
+    id: "event_1",
+    scope: { kind: "thread" },
+    threadId: "thr_controller",
+    seq: 1,
+    createdAt: 10_050,
+    type: "item/completed",
+    data: {
+      providerThreadId: "provider_thread",
+      item: {
+        type: "toolCall",
+        id: "hanoon_item",
+        tool: "telegram_agent_turn_evidence",
+        status: "completed",
+        result: { secret: "must-not-be-evidence" },
+      },
+    },
+  };
+  stubControllerEvidenceSdk(value.harness, [row]);
+  registerEvidenceTools(value, controllerProjector(value));
+
+  const listed = evidenceIndex(await value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    controllerToolContext,
+  ));
+
+  expect(listed.evidence).toEqual([]);
+  expect(value.store.listControllerEvidence(listed.turnId, 128)).toEqual([]);
+  expect(value.store.getControllerTurn(listed.turnId)?.evidenceEventSeq).toBe(1);
+});
+
+it("paginates the largest complete canonical prefix under 8,000 UTF-8 bytes", async () => {
+  const value = fixture({ active: true });
+  const trust = activeControllerTrustState(value.store);
+  stubControllerEvidenceSdk(value.harness);
+  registerEvidenceTools(value, controllerProjector(value));
+  for (let index = 1; index <= 20; index += 1) {
+    recordIndexEvidence(value.store, trust.turn, trust.fence, index, [
+      `project:${index}:${"é".repeat(230)}`,
+    ]);
+  }
+
+  const firstRaw = await value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    controllerToolContext,
+  );
+  const first = evidenceIndex(firstRaw);
+  expect(Buffer.byteLength(firstRaw as string, "utf8")).toBeLessThanOrEqual(8_000);
+  expect(first).toMatchObject({ truncated: true });
+  expect(first.nextEvidenceId).toBe(first.evidence.at(-1)?.ref === undefined
+    ? null
+    : Number(first.evidence.at(-1)!.ref.slice("evidence:".length)));
+
+  const secondRaw = await value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    { afterEvidenceId: first.nextEvidenceId },
+    controllerToolContext,
+  );
+  const second = evidenceIndex(secondRaw);
+  expect(Buffer.byteLength(secondRaw as string, "utf8")).toBeLessThanOrEqual(8_000);
+  expect(second.truncated).toBe(false);
+  expect([...first.evidence, ...second.evidence].map((row) => row.ref))
+    .toEqual(value.store.listControllerEvidence(trust.turn.id, 128).map((row) => row.ref));
+
+  const firstUnreturned = second.evidence[0];
+  if (!firstUnreturned) throw new Error("pagination fixture did not produce a second page");
+  const expanded = canonicalControllerJson({
+    ...first,
+    evidence: [...first.evidence, firstUnreturned],
+    truncated: true,
+    nextEvidenceId: Number(firstUnreturned.ref.slice("evidence:".length)),
+  });
+  expect(Buffer.byteLength(expanded, "utf8")).toBeGreaterThan(8_000);
+});
+
+it("fails closed when one complete valid evidence descriptor cannot fit", async () => {
+  const value = fixture({ active: true });
+  const trust = activeControllerTrustState(value.store);
+  stubControllerEvidenceSdk(value.harness);
+  registerEvidenceTools(value, controllerProjector(value));
+  recordIndexEvidence(
+    value.store,
+    trust.turn,
+    trust.fence,
+    1,
+    Array.from({ length: 16 }, (_, index) => `project:${index}:${"😀".repeat(120)}`),
+  );
+
+  await expect(value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    controllerToolContext,
+  )).rejects.toThrow(/8,000|8000|fit|limit/i);
+});
+
+it("reports source-gap reconciliation and the durable evidence cap without claiming catch-up", async () => {
+  const sourceGap = fixture({ active: true });
+  stubControllerEvidenceSdk(sourceGap.harness, [], 1);
+  registerEvidenceTools(sourceGap, controllerProjector(sourceGap));
+  expect(evidenceIndex(await sourceGap.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    controllerToolContext,
+  ))).toMatchObject({
+    reconciliationIncomplete: "source_gap",
+    evidenceLimitExceeded: false,
+  });
+
+  const capped = fixture({ active: true });
+  const trust = activeControllerTrustState(capped.store);
+  for (let index = 1; index <= 128; index += 1) {
+    recordIndexEvidence(capped.store, trust.turn, trust.fence, index, [`project:proj_${index}`]);
+  }
+  expect(capped.store.recordControllerEvidence({
+    turnId: trust.turn.id,
+    controllerKey: trust.turn.controllerKey,
+    sourceKind: "hanoon_tool",
+    sourceName: "over_cap",
+    sourceItemId: null,
+    outcome: "observed",
+    argsSha256: "e".repeat(64),
+    resultSha256: "f".repeat(64),
+    proofKinds: [],
+    subjectRefs: [],
+    ...trust.fence,
+  })).toEqual({ outcome: "limit_exceeded" });
+  registerEvidenceTools(capped, controllerProjector(capped));
+  expect(evidenceIndex(await capped.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    controllerToolContext,
+  ))).toMatchObject({
+    evidenceLimitExceeded: true,
+    reconciliationIncomplete: null,
+    truncated: true,
+  });
+  expect(capped.harness.inspection.sdk.calls).toEqual([]);
+});
+
+it("rejects unknown evidence-index parameters before authorization or reconciliation", async () => {
+  const value = fixture({ active: true });
+  const reconcile = vi.fn();
+  registerEvidenceTools(value, { reconcile });
+
+  await expect(value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    { unexpected: true },
+    controllerToolContext,
+  )).rejects.toThrow(/invalid|unrecognized|parameter/i);
+  expect(reconcile).not.toHaveBeenCalled();
 });

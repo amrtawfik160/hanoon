@@ -14,6 +14,8 @@ import {
 } from "../src/controller/execution-profile";
 import { LunaControllerService } from "../src/controller/service";
 
+const evidenceProjector = { reconcile: vi.fn() };
+
 function personalProject(overrides: Record<string, unknown> = {}) {
   return {
     id: "proj_personal",
@@ -445,6 +447,7 @@ function serviceFixture() {
 }
 
 it("dispatches FIFO, waits for idle output, and then sends the next turn with mode start", async () => {
+  evidenceProjector.reconcile.mockClear();
   const { store, fence } = serviceFixture();
   store.enqueueControllerTurn({ ...turnRecord({ updateId: 11, inputText: "first" }), telegramUserId: "7", telegramChatId: "7", now: 2_000 });
   store.enqueueControllerTurn({ ...turnRecord({ updateId: 12, inputText: "second" }), telegramUserId: "7", telegramChatId: "7", now: 2_001 });
@@ -460,7 +463,7 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(false);
@@ -468,6 +471,7 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
 
   status = "idle";
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(evidenceProjector.reconcile).not.toHaveBeenCalled();
   expect(store.getOutbox("controller:controller-turn-11:reply")?.payload.text).toBe("First answer.");
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.send).toHaveBeenCalledWith("thr_controller", "second", fence.signal);
@@ -516,7 +520,7 @@ it("keeps a queued image durable until the active turn finishes", async () => {
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.steer).not.toHaveBeenCalled();
@@ -559,7 +563,7 @@ it("requeues a transient image preparation failure without adopting a late spawn
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate,
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
@@ -604,7 +608,7 @@ it("requeues an aborted image preparation without consuming a retry", async () =
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate,
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
@@ -671,7 +675,7 @@ it("requeues a turn while the controller thread is still busy instead of failing
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
@@ -729,7 +733,7 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
   };
   const wedgedAt = 2_001 + 15 * 60_000;
   expect(store.renewExecutorLease(fence.ownerId, fence.generation, 2_100, 30 * 60_000)).toBe(true);
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => wedgedAt } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => wedgedAt } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
@@ -783,7 +787,7 @@ it("delivers a completed answer even when the controller thread ends in error", 
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
@@ -808,7 +812,7 @@ it("reports a streaming turn only while its answer is still arriving", async () 
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
   expect(service.isStreaming()).toBe(false);
 
   const turn = store.enqueueControllerTurn({
@@ -849,7 +853,7 @@ it("fails an uncertain send closed and never submits it twice", async () => {
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).not.toBeNull();
   expect(store.markControllerSpawned({
     turnId: "controller-turn-21",
@@ -910,7 +914,7 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
 
   await expect(service.reconcile(fence, fence.signal)).rejects.toThrow("temporary BB output failure");
 
@@ -965,7 +969,7 @@ it("projects active Luna assistant deltas into the durable controller reply", as
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
@@ -1026,7 +1030,7 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 22_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 22_000 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
@@ -1083,7 +1087,7 @@ it("retires an errored controller so a later queued message can start a fresh ge
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
@@ -1146,7 +1150,7 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_003 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_003 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
@@ -1195,7 +1199,7 @@ it("retires an errored controller generation even when no turn remains submitted
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
@@ -1254,7 +1258,7 @@ it("retries one controller generation when BB proves the input was never accepte
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 

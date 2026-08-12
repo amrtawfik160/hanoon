@@ -74,8 +74,8 @@ export type ControllerAdapter = {
   findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null>;
 };
 
-const EVENT_PAGE_LIMIT = 100;
-const MAX_EVENT_PAGES = 50;
+export const CONTROLLER_EVENT_PAGE_LIMIT = 100;
+export const MAX_CONTROLLER_EVENT_PAGES = 50;
 
 // Reasoning, plain messages, and plan updates are the model thinking out loud.
 // Everything here reaches outside the model, which is what a budget should bound.
@@ -245,11 +245,11 @@ export class BbControllerAdapter implements ControllerAdapter {
     let toolCalls = 0;
     let commandFailures = 0;
     let totalTokens = 0;
-    for (let page = 0; page < MAX_EVENT_PAGES; page += 1) {
+    for (let page = 0; page < MAX_CONTROLLER_EVENT_PAGES; page += 1) {
       const rows = await this.dependencies.sdk.threads.events.list({
         threadId,
         afterSeq: String(latestSeq),
-        limit: String(EVENT_PAGE_LIMIT),
+        limit: String(CONTROLLER_EVENT_PAGE_LIMIT),
         signal,
       });
       for (const row of rows) {
@@ -278,7 +278,7 @@ export class BbControllerAdapter implements ControllerAdapter {
             : null;
         }
       }
-      if (rows.length < EVENT_PAGE_LIMIT) break;
+      if (rows.length < CONTROLLER_EVENT_PAGE_LIMIT) break;
     }
     return {
       latestSeq,
