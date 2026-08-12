@@ -1,6 +1,6 @@
 # Hanoon Agent Operating System Design
 
-Status: architecture approved; written specification awaiting owner review
+Status: research-amended specification awaiting owner review
 
 Date: 2026-08-12
 
@@ -8,13 +8,15 @@ Package: `bb-plugin-telegram-agent`
 
 Plugin id: `telegram-agent`
 
+Research basis: [Hanoon Harness Research Review](hanoon-agent-operating-system-research.md)
+
 ## Outcome
 
 Hanoon becomes a BB-native agent operating system: a durable controller that can answer, investigate, coordinate workers, run reviewed delivery pipelines, recover from failures, learn from evidence, execute bounded workflows, and handle rich artifacts without claiming work it cannot prove.
 
 The existing Hanoon kernel remains authoritative. BB owns provider sessions, threads, interactions, hosts, environments, worktrees, and provider discovery. The plugin owns Telegram identity, durable controller state, scheduling, resource claims, effects, receipts, approvals, memory, evidence, and delivery. SQLite remains the single transactional control plane.
 
-This document defines the common architecture, release decomposition, and the complete Slice 1 trust contract. Each later slice receives a focused design and implementation plan before its code is changed.
+This document defines the common architecture, release decomposition, and the complete Slice 1 trust and measurement contract. Each later slice receives a focused design and implementation plan before its code is changed.
 
 ## Existing foundation to preserve
 
@@ -47,6 +49,8 @@ No slice may bypass or weaken these contracts.
 8. **Fail closed at irreversible boundaries.** Unknown, stale, expired, or contradictory evidence blocks; it never becomes success.
 9. **Quiet when healthy.** Milestones and incidents are delivered; ordinary polling and clean maintenance runs are not narrated.
 10. **Incremental replacement.** New focused repositories and services take ownership as their slices land. There is no flag-day rewrite of `src/storage/store.ts` or the delivery state machine.
+11. **Measure before optimizing.** A new model, router, context strategy, evaluator, or orchestration layer controls work only after a disclosed baseline and realistic outcome evaluation show the required lift.
+12. **Use the smallest sufficient interface.** Tools stay distinct, bounded, and well described. Deterministic workflows own predictable transitions; the model owns decisions that genuinely require flexible reasoning.
 
 ## Non-goals
 
@@ -56,6 +60,8 @@ No slice may bypass or weaken these contracts.
 - Approval-free merge, deployment, destructive cleanup, credential mutation, spending, or connector installation.
 - Automatic production rollback.
 - Allowing an evaluation judge to edit live prompts or settings directly.
+- Treating an answer or trace grader as authoritative when deterministic outcome evidence disagrees.
+- Adding semantic retrieval, adaptive routing, extra agents, or retries without measured improvement under a disclosed budget.
 - Storing raw provider transcripts, raw private Telegram messages, credentials, unbounded command output, or absolute worktree paths in telemetry.
 - Generalizing the reviewed delivery pipeline before an equivalence suite proves the replacement preserves every safety invariant.
 
@@ -68,7 +74,7 @@ Telegram / BB / artifacts / approved signals
           durable intake and identity
                     |
                     v
-       context compiler + capability router
+       context compiler + capability policy
                     |
                     v
               BB agent thread
@@ -95,15 +101,15 @@ The controller never writes an authoritative outcome directly. It invokes a capa
 
 ## Power target
 
-Hanoon reaches Valor-class breadth through context compaction, durable memory, runtime provider/model routing, fallback and health circuits, reusable workflow graphs, capability metadata, rich artifacts, trace replay, evaluations, and adaptive orchestration.
+Hanoon targets Valor-class breadth through context rollover, durable memory, evaluated provider/model routing, fallback and health circuits, reusable workflow graphs, capability policy, rich artifacts, trace replay, outcome evaluations, and adaptive orchestration.
 
-Hanoon exceeds a process-centric harness where its existing architecture is stronger: the owner can operate it remotely from Telegram; BB supplies native provider sessions, interactions, hosts, environments, and worktrees; and the plugin binds autonomous work to transactional effects, resource claims, exact-head review, one-use approvals, deployment receipts, and duplicate-safe delivery. Power is measured by recoverable completed outcomes and evidence, not by the number of subprocess or prompt-management features copied into the plugin.
+Hanoon is designed to exceed a process-centric harness where its existing architecture is stronger: the owner can operate it remotely from Telegram; BB supplies native provider sessions, interactions, hosts, environments, and worktrees; and the plugin binds autonomous work to transactional effects, resource claims, exact-head review, one-use approvals, deployment receipts, and duplicate-safe delivery. This is a design target, not a measured superiority claim. Power is measured by recoverable completed outcomes, safety, cost per successful outcome, and evidence under a disclosed harness and budget—not by the number of subprocess or prompt-management features copied into the plugin.
 
 ## Release decomposition
 
 ### Slice 1: controller trust contract
 
-Ship one controller instruction path, evidence-bearing controller tools, structured finalization, a completion gate, hidden-controller interaction bridging, and `auto` as the default permission mode. This is the prerequisite for every broader autonomy feature.
+Ship one controller instruction path, an enforceable descriptor for every Hanoon controller capability, blocking pre-execution policy, evidence-bearing controller tools, structured finalization, a completion gate, hidden-controller interaction bridging, `auto` as the default permission mode, and a minimum outcome-evaluation baseline. This is the prerequisite for every broader autonomy feature.
 
 ### Slice 2: proven autonomy
 
@@ -111,25 +117,39 @@ Persist skill receipts, idempotent milestone notices, executable acceptance runs
 
 ### Slice 3: trace ledger, cockpit, and evaluation lab
 
-Add an append-only correlation ledger, bounded rollups, native BB RPC/realtime UI, deterministic trace replay, a broad scenario corpus, nightly differential evaluation, and isolated prompt experiments that may only propose a reviewed job.
+Expand the Slice 1 evaluation baseline with an append-only correlation ledger, bounded rollups, native BB RPC/realtime UI, deterministic trace replay, a broad scenario corpus, nightly differential evaluation, controlled-versus-strong-elicitation reports, and verified-isolated prompt experiments that may only propose a reviewed job.
 
 ### Slice 4: context and memory v2
 
-Add durable context capsules, proactive controller-generation rollover, task-specific context packs, project-aware recall, progressive-disclosure memory, optional semantic retrieval, document references, provenance, and outcome attribution.
+Add durable context capsules, proactive reset-first controller-generation rollover, task-specific context packs, project-aware recall, progressive-disclosure memory, evaluated lexical/vector fusion with lexical fallback, document references, repository knowledge maps, provenance, and outcome attribution.
 
 ### Slice 5: provider resilience and adaptive routing
 
-Discover live BB providers and models, route by declared role requirements, record immutable execution choices, add health circuits and controlled recovery, enforce concurrency/spend budgets, fingerprint repeated failures, and adapt orchestration intensity from durable task-type outcomes.
+Discover live BB providers and models, establish the most-capable eligible baseline, route by declared role requirements only after shadow evaluation, record immutable execution choices, add health circuits and controlled recovery, enforce concurrency/spend budgets, fingerprint repeated failures, and adapt orchestration intensity from durable task-type outcomes.
 
 ### Slice 6: durable workflow recipes and maintenance
 
-Add validated workflow recipes with dependencies, artifacts, gates, effects, fan-out/join, and checkpoints. Add a leased maintenance registry with schedules, cost caps, run history, deduplication, and quiet notification policy. The existing delivery pipeline remains unchanged until recipe equivalence is proved.
+Add validated deterministic workflow recipes with dependencies, artifacts, gates, fenced nondeterministic effects, fan-out/join, approval signals, checkpoints, and history rollover. Add a leased maintenance registry with schedules, cost caps, run history, deduplication, and quiet notification policy. The existing delivery pipeline remains unchanged until recipe equivalence is proved.
 
 ### Slice 7: artifact and capability fabric
 
-Add bounded Telegram voice, audio, document, URL, reply-chain, and outbound artifact support. Add a registry describing each tool, skill, connector, and recipe's schema, risk, idempotency, credential needs, host reach, cost class, and receipt type.
+Add bounded Telegram voice, audio, document, URL, reply-chain, and outbound artifact support. Generalize the Slice 1 capability descriptors into a discoverable registry for every tool, skill, connector, and recipe, including schema, risk, data class, idempotency, credential scope, egress, host reach, cost class, and receipt type.
 
 Each slice produces working software and an independently reviewable release. Slices execute in order because later decisions depend on the trust, evidence, and telemetry laid down earlier.
+
+## Research-adjusted execution strategy
+
+The external research and Valor audit select a thin-kernel sequence:
+
+1. **Trust and measure.** Slice 1 makes every Hanoon capability explicit, gates side effects before execution, validates the only owner-visible final action, and records a before/after outcome baseline.
+2. **Prove existing autonomy.** Slice 2 turns the current skill, milestone, acceptance, and scorecard contracts into durable evidence.
+3. **Make behavior legible.** Slice 3 correlates outcomes, traces, costs, fallbacks, and experiments without making trace narration authoritative.
+4. **Reset and retrieve deliberately.** Slice 4 uses fresh provider generations, typed handoffs, small context packs, and evaluated hybrid recall instead of relying on compaction or vector search alone.
+5. **Optimize under gates.** Slice 5 changes models, reasoning, or retry intensity only after a shadow comparison against the most-capable eligible baseline.
+6. **Generalize deterministic execution.** Slice 6 moves predictable transitions into recipes while keeping provider and external calls as fenced effects.
+7. **Expand the surface.** Slice 7 adds artifacts and connectors only through the capability, approval, credential, evidence, and evaluation contracts established earlier.
+
+The roadmap borrows Valor's schema-first exits, context fidelity modes, bounded recovery, hybrid-retrieval hypothesis, telemetry, and budgets. It deliberately does not copy Valor's bridge/Redis/worker/process topology, fail-open completion cases, regex or prefixless answer delivery, raw unknown telemetry payloads, or active-checkout prompt experiments.
 
 ## Common data and module boundaries
 
@@ -162,6 +182,8 @@ Each slice begins with `bb plugin types --check`. Stale generated declarations a
 - Stop using unrestricted `full` permission as the workaround for invisible BB prompts.
 - Let the Telegram owner answer controller questions and BB command/file approvals without opening BB.
 - Preserve ordinary conversational answers that need no tool or external proof.
+- Declare and enforce the risk, authority, approval, evidence, and result contract of every Hanoon-managed controller capability.
+- Record a reproducible before/after baseline that distinguishes answer form, trace behavior, and durable outcome.
 
 ### Non-goals
 
@@ -169,8 +191,20 @@ Each slice begins with `bb plugin types --check`. Stale generated declarations a
 - Automatic approval of arbitrary shell commands based on command-text parsing.
 - Intercepting a third-party MCP write when BB itself emits no interaction for it.
 - Giving the controller direct authority over job implementation worktrees; reviewed code delivery remains routed through durable jobs.
-- Skill outcome receipts, CLI-managed live-acceptance sessions, the BB cockpit, embeddings, provider fallback, workflow recipes, or new media types; those belong to later slices.
+- Skill outcome receipts, CLI-managed live-acceptance sessions, the full trace/evaluation lab, embeddings, provider fallback, workflow recipes, or new media types; those belong to later slices.
+- Dynamically classifying owner intent to hide or expose tools inside an already-running provider session.
+- Treating an LLM judge as proof that an external mutation or operational result occurred.
 - Changing reviewed job, merge, deployment, or canary transitions.
+
+### Slice 1 delivery checkpoints
+
+Slice 1 is one release contract but lands through three independently green checkpoints:
+
+1. **Baseline.** Add the versioned outcome-scenario/report contract, verify all current-source claims, record the compatible current-controller baseline, and change no owner-facing production behavior.
+2. **Kernel.** Add the complete capability manifest, blocking wrapper, evidence projection, finalization validator, and deterministic fake-host coverage. Exercise the new path only in tests and a disposable acceptance profile while the production default remains unchanged.
+3. **Cutover.** Add the Telegram interaction bridge, change fresh defaults from `full` to `auto`, make accepted finalization the sole owner-visible answer path, rerun the fixed-harness comparison, and remove the temporary compatibility path after acceptance.
+
+These checkpoints are review and rollback boundaries, not permanent operating modes. No long-lived dual delivery path or dual authority survives the Slice 1 release.
 
 ### One controller instruction path
 
@@ -187,6 +221,34 @@ The controller instructions also change in three ways:
 - the final action for every owner turn is `telegram_agent_respond`;
 - installations, credential changes, spending, destructive external actions, and irreversible external writes require an explicit owner decision;
 - the controller no longer claims it can silently install or configure integrations.
+
+### Core capability policy
+
+Slice 1 adds one static `ControllerCapabilityDescriptor` for every Hanoon-managed controller tool, including `telegram_agent_turn_evidence` and `telegram_agent_respond`. A descriptor declares:
+
+| Field | Contract |
+| --- | --- |
+| `capability_id` | Stable namespaced id; equal to the registered tool name for Slice 1. |
+| `schema_version` | Version of the advertised parameters and result projection. |
+| `effect_class` | `read`, `durable_local_write`, `reversible_external_write`, or `irreversible_external_write`. |
+| `risk_class` | `low`, `medium`, `high`, or `critical`; derived from impact, not model confidence. |
+| `data_class` | Bounded data categories the tool may read and return. |
+| `reversibility` | Whether and how the effect can be reversed or compensated. |
+| `idempotency` | `read`, receipt key, effect key, or explicit reconciliation strategy. |
+| `approval` | `none`, exact BB interaction, existing Hanoon confirmation, or existing pipeline approval. |
+| `allowed_roles` | Durable controller or worker roles allowed to receive and invoke it. |
+| `project_scope` | Whether the call is controller-global, current-project, or bound to an exact durable entity. |
+| `credential_scope` | Required credential class and audience; `none` for capabilities without credentials. |
+| `egress` | Allowed external service class or `none`. |
+| `proof_kinds` | Evidence kinds a successful result may produce. |
+| `receipt_kind` | Durable receipt or observation type, if any. |
+| `result_limit` | Maximum bounded result projection returned to the provider. |
+
+Registration fails closed when the descriptor set and registered Hanoon tool set differ. The common execution wrapper validates the durable controller identity, current pending turn, role/project/entity scope, descriptor policy, exact approval state when required, and current executor fence before it invokes a side-effecting domain operation. A missing descriptor, unknown effect class, stale approval, or policy-read failure denies the call before the side effect.
+
+BB-native command and file-change tools remain under BB's permission engine and the Telegram interaction bridge. Slice 1 does not pretend to wrap opaque third-party tools that BB does not surface through an interaction. The descriptor contract applies to everything Hanoon itself registers; Slice 7 generalizes it to Hanoon-managed connectors, artifacts, skills, and recipes.
+
+Tool selection remains based on stable durable identity and feature configuration through `bb.agents.configure`. Slice 1 does not add a model intent router. A later slice may split the controller tool set only when evaluation shows ambiguous or overlapping tools are causing errors.
 
 ### Evidence records
 
@@ -324,7 +386,7 @@ The default controller execution profile constant and plugin setting descriptor 
 
 BB's own permission engine remains authoritative. Hanoon does not infer that a command is safe by parsing shell text, and it never approves an interaction on the owner's behalf. The bridge only moves BB's exact decision to Telegram.
 
-This slice cannot mechanically intercept a third-party MCP capability when BB does not produce an interaction. Therefore the controller instruction contract still requires an owner decision before connector installation, credential mutation, spending, destructive external actions, or irreversible external writes. Slice 7 adds explicit capability risk metadata and receipts for Hanoon-managed connectors; it does not claim control over opaque third-party behavior.
+This slice cannot mechanically intercept a third-party MCP capability when BB does not produce an interaction. Therefore the controller instruction contract still requires an owner decision before connector installation, credential mutation, spending, destructive external actions, or irreversible external writes. Slice 1 enforces descriptors for Hanoon's own tools; Slice 7 extends the same policy and receipt contract to Hanoon-managed connectors. Neither slice claims control over opaque third-party behavior.
 
 ### Safety and privacy
 
@@ -332,6 +394,8 @@ This slice cannot mechanically intercept a third-party MCP capability when BB do
 - Native paths are normalized relative to the known project root; paths outside it contribute no path subject.
 - Finalizations and interaction payloads use the existing credential-like-text and output-redaction boundaries before durable storage or Telegram delivery.
 - Approval summaries clip commands and paths; they never include environment variables or command output.
+- Capability policy treats connector and retrieved content as untrusted data; content cannot alter tool risk, approval, role, credential, or egress policy.
+- Hanoon-managed connectors use the narrowest available credential scope, bind tokens to their intended audience where supported, and never pass an inbound connector token through to another service.
 - Controller evidence is visible only to the paired owner, plugin CLI, and future authenticated BB cockpit RPC.
 - A stale executor generation cannot accept a finalization, resolve an interaction, complete a turn, or enqueue its response.
 - Hidden controller threads remain hidden and are addressed only through their exact durable controller mapping.
@@ -341,9 +405,14 @@ This slice cannot mechanically intercept a third-party MCP capability when BB do
 
 Planned focused units:
 
+- `src/controller/capability-policy.ts`: complete descriptor manifest, risk/proof vocabulary, and pure pre-execution policy decisions.
+- `src/controller/capability-executor.ts`: common authorization, approval, fence, evidence, and result-bounding wrapper for Hanoon-managed controller tools.
 - `src/controller/finalization-contract.ts`: schemas, bounds, claim/proof compatibility, process-only detection, and stable rejection codes; no I/O.
 - `src/controller/evidence-projector.ts`: Hanoon-tool envelopes, native BB item projection, evidence-index projection, and proof-kind definitions.
 - `src/controller/interaction-service.ts`: controller interaction reconciliation and BB delivery.
+- `src/eval/controller-scenario-contract.ts`: versioned scenario, harness metadata, grader, trial, outcome, and report schemas; no production I/O.
+- `scripts/eval-controller-outcomes.mjs`: opt-in multi-trial runner that extends the existing answer-form evaluation and emits a bounded report.
+- `evals/controller-scenarios.json`: secret-free scenario definitions and deterministic outcome assertions.
 - `src/storage/controller-evidence-repository.ts`: evidence and finalization transactions.
 - `src/storage/controller-interaction-repository.ts`: generic controller interaction persistence and migration reads.
 - `src/controller/service.ts`: orchestration only—observe, validate completion state, issue one continuation, and finish/fail.
@@ -355,6 +424,7 @@ The implementation plan must not grow new multi-hundred-line storage domains ins
 ### Slice 1 failure behavior
 
 - Missing pending turn during a Hanoon tool call fails authorization and records no evidence.
+- A missing or inconsistent capability descriptor prevents registration; a policy-read failure, stale approval, or fence loss denies execution before the side effect.
 - Evidence persistence failure makes the tool call fail; the model cannot receive an unreceipted success result.
 - Native evidence projection failure leaves the event cursor unadvanced and the turn non-finalizable until reconciliation succeeds.
 - Finalization validation loss of fence returns a tool error and cannot complete the turn.
@@ -363,6 +433,30 @@ The implementation plan must not grow new multi-hundred-line storage domains ins
 - Telegram delivery failure remains in the durable outbox.
 - One failed completion continuation retires the controller generation so the next owner message starts from durable digest, memory, and receipts.
 - Migration failure aborts plugin activation without modifying later migration indices.
+
+### Slice 1 evaluation baseline
+
+The current `npm run eval:answers` suite remains the calibration-gated judge for answer form. It intentionally cannot see the external world and therefore never becomes an outcome grader. Slice 1 adds a versioned scenario contract with three separate result layers:
+
+1. **Outcome graders** inspect durable Hanoon state, receipts, BB item state, the Telegram outbox, and controlled fake external systems. These are authoritative for task success and safety.
+2. **Trace graders** inspect bounded typed events for required or forbidden behavior, such as one continuation, one approval resolution, or no replayed effect. They diagnose how the outcome occurred.
+3. **Answer graders** apply the existing calibration-gated form rubric and any scenario-specific communication rubric. They cannot turn a failed outcome into a pass.
+
+Every evaluation report records:
+
+- scenario and scenario-schema version;
+- Hanoon commit and dirty-state flag;
+- provider, model, reasoning level, service tier, and permission mode;
+- controller instruction, overlay, capability-manifest, policy, and context-capsule digests;
+- advertised tool names and parameter-schema digests;
+- per-trial context/token/spend/turn/retry budgets;
+- trial seed when the provider supports one;
+- outcome, trace, and answer grader versions;
+- wall time, tokens, provider cost when available, terminal failure class, and proof references.
+
+Before implementation changes the answer path, the runner records the current controller baseline on the compatible scenario subset. After implementation it reruns the same fixed harness and budget. Nondeterministic provider scenarios use multiple independent trials and always report the denominator; a one-off live run is labeled smoke evidence, not a capability rate. Deterministic safety invariants must all pass. Unsupported success, duplicate irreversible effect, stale approval acceptance, or capability-policy bypass fails the release on any trial rather than being averaged away.
+
+Direct provider/model comparisons use the same tasks, tools, graders, and budgets. A separate strong-elicitation report may vary the harness or budget, but it must name every difference and report cost per successful outcome. No Slice 1 schema or owner-facing path depends on an online judge, and the ordinary deterministic suite stays offline and cost-free.
 
 ### Slice 1 deterministic verification
 
@@ -373,6 +467,16 @@ Implementation follows test-driven development. Required tests include:
 - The initial owner input plus resolved configuration contains exactly one controller instruction sentinel.
 - The working-style overlay appears once and remains after the fixed boundary instructions.
 - Fresh/default profiles resolve `permissionMode: "auto"`; an explicit existing setting remains unchanged.
+
+#### Capability policy
+
+- The descriptor manifest and registered Hanoon controller tool names are exactly equal.
+- Every descriptor has a valid schema version, effect/risk/data class, idempotency strategy, approval rule, role/scope, credential/egress policy, proof kinds, receipt kind, and result bound.
+- A read capability may run without a mutation receipt but still records a current-turn observation.
+- A side-effecting capability is denied before invocation when identity, pending turn, role, project/entity scope, approval, policy, or fence validation fails.
+- A denied capability produces no success evidence and no domain side effect.
+- Connector or retrieved text that asks to change policy cannot change the descriptor or approval decision.
+- A credential audience/scope mismatch is denied, and an inbound connector token is never forwarded as an upstream credential.
 
 #### Evidence and finalization
 
@@ -422,6 +526,9 @@ Implementation follows test-driven development. Required tests include:
 #### Regression gate
 
 - Existing supervisor, image, memory, tool-receipt, thread-notice, job, merge, deployment, and end-to-end suites remain green. Controller streaming assertions are intentionally replaced with phase-only draft and accepted-finalization delivery tests.
+- Scenario schema and report parsing fail closed on unknown versions, missing graders, missing harness metadata, duplicate trials, or an unparseable judge result.
+- Outcome failure cannot be overridden by trace or answer scores.
+- The current answer-form judge passes its golden-case calibration gate, and the fixed-harness before/after report includes all required scenario denominators and budgets.
 - TypeScript typecheck, skill verification, plugin build, `git diff --check`, and bundle metadata checks pass.
 - The fake BB host test uses real temporary SQLite and exercises the registered finalization tool and a pending approval end to end.
 
@@ -437,7 +544,9 @@ A disposable installed-plugin run must separately prove:
 6. restart between tap persistence and BB resolution resolves once;
 7. a durable monitor permits a deferred response;
 8. unsupported success claims remain zero;
-9. no merge, deployment, credential, spending, or destructive external action is performed by the acceptance profile.
+9. a deliberately stale or mismatched capability approval is denied before execution;
+10. the evaluation report names its harness, tool manifest, budgets, trials, outcomes, and cost when available;
+11. no merge, deployment, credential, spending, or destructive external action is performed by the acceptance profile.
 
 Live evidence is reported separately from deterministic tests. An incomplete scenario remains `incomplete`, never `passed`.
 
@@ -450,9 +559,11 @@ Live evidence is reported separately from deterministic tests. An incomplete sce
 - Every referenced claim is bound to compatible evidence from the same turn.
 - Every deferred promise names a live durable obligation.
 - Process narration alone cannot complete a turn.
+- Every registered Hanoon controller tool has one enforced capability descriptor, and no side effect runs after a failed pre-execution policy decision.
 - Hidden controller questions and supported approvals can be answered entirely from Telegram.
 - The controller cannot grant itself session-wide approval from Telegram.
 - No merge, production, effect-fencing, resource-claim, or one-use approval invariant changes.
+- The fixed-harness baseline and after report keep outcome, trace, and answer grades separate and disclose all trial denominators and budgets.
 - Focused, full deterministic, build, and disposable live gates pass with separate evidence.
 
 ## Later-slice contracts
@@ -471,21 +582,26 @@ The following decisions are fixed by this umbrella design; their detailed schema
 
 - `harness_events` is append-only and correlated from Telegram intake through delivery and production receipts.
 - Authoritative transition events are inserted in the same transaction as the transition.
-- Raw event retention defaults to 30 days; bounded daily rollups retain 180 days.
+- Fine-grained typed event retention defaults to 30 days; bounded daily rollups retain 180 days.
+- Unknown BB/provider event shapes are counted and reduced to a typed redacted marker; their raw payload is not persisted.
 - The BB app uses `bb.rpc` for validated reads and `bb.realtime` only as an ephemeral refetch signal.
 - The frontend registers a native `navPanel` cockpit and a thread panel action; it does not start an HTTP server.
-- Eval scenarios combine deterministic invariants, recorded event replay, and optional LLM judgment.
-- Prompt experiments run in isolated branches with cost caps and may only create a reviewed Hanoon job or issue; they cannot apply live changes.
+- The Slice 1 scenario contract expands into capability and regression corpora with deterministic outcome assertions, recorded event replay, multiple live trials, calibration-gated optional LLM judgment, and periodic human spot checks.
+- Reports distinguish fixed-harness comparisons from strong-elicitation comparisons and include harness/tool/policy versions, budgets, success rate, and cost per successful outcome.
+- Prompt experiments verify an isolated BB worktree and branch before editing, use cost caps and multiple trials, and may only create a reviewed Hanoon job or issue; they cannot apply live changes.
 
 ### Slice 4 fixed contracts
 
 - A context capsule records intent, goals, unresolved questions, commitments, decisions, active entity references, and completed mutations; it excludes raw transcripts and secrets.
-- Controller rollover is proactive at bounded age, turn, or token thresholds and seeds the next generation from the capsule, relevant memories, and receipts.
+- Controller rollover is proactive at bounded age, turn, or token thresholds and starts a fresh provider generation from the capsule, current durable/repository state, relevant memories, receipts, and one bounded next objective.
+- In-place compaction may reduce context inside one generation but is never the durable cross-generation handoff.
 - Context packs are role-specific (`full`, `compact`, `minimal`, `steering`) and have explicit byte/token budgets.
 - Project memory is included automatically when project identity is durable.
 - Memory retrieval remains lexical when semantic retrieval is unavailable.
 - Semantic vectors are rebuildable cache data, never the authoritative memory record.
+- Lexical and vector candidates are fused deterministically only after a held-out recall corpus shows lift over the current SQLite lexical/recency/importance/confidence baseline.
 - Progressive disclosure injects stubs; full bodies require an exact memory/document reference.
+- Project knowledge begins with a short checked map into source-of-truth documents and machine-readable state, not a copied manual in the controller prompt.
 - Recall effectiveness is scored from linked claims and outcomes, not mere absence of an immediate correction.
 
 ### Slice 5 fixed contracts
@@ -494,6 +610,7 @@ The following decisions are fixed by this umbrella design; their detailed schema
 - Each role declares required capabilities, acceptable latency/cost classes, and fallback order.
 - Every attempt records the selected provider, model, reasoning, service tier, permission mode, and selection reason before spawn.
 - An attempt never switches provider or model in place.
+- The most-capable eligible model establishes each task-class baseline; smaller models, reduced reasoning, lower context fidelity, or shorter retry budgets begin in shadow mode and control dispatch only after meeting explicit outcome and safety thresholds.
 - Circuit state, throttles, and recovery flags are durable and provider/host scoped.
 - Recovery admits work gradually and never duplicates a job/effect.
 - Adaptive task maturity may alter context fidelity, reasoning, model class, reviewer count, and retry budget; it may not weaken approval, review, validation, merge, deployment, security, or evidence gates.
@@ -501,8 +618,12 @@ The following decisions are fixed by this umbrella design; their detailed schema
 ### Slice 6 fixed contracts
 
 - A recipe is a versioned validated graph of steps, dependencies, artifacts, gates, effects, and optional compensations.
-- Only the fenced executor advances runs and leases effects.
+- Recipe transition logic is deterministic. Provider calls, shell work, connectors, and external mutations execute only as fenced effects with durable typed results.
+- Only the fenced executor advances runs, consumes approval decisions, and leases effects.
 - Fan-out joins only after every required child has a durable terminal result.
+- A bounded work unit has an acceptance contract before execution and leaves a typed checkpoint for the next unit.
+- Human decisions are durable exact-call signals; resume revalidates current identity, authorization, descriptor policy, and fence before continuing.
+- Long histories roll over at typed checkpoints, while committed effect results remain referenced and are never replayed from narration.
 - Irreversible effects still use explicit capability approval and idempotency/reconciliation.
 - The reviewed delivery state machine remains authoritative until an equivalence suite proves a recipe implementation against every current transition and failure invariant.
 - Maintenance definitions declare schedule, lease, timeout, cost cap, notification policy, and dedupe key; clean runs are silent.
@@ -510,10 +631,11 @@ The following decisions are fixed by this umbrella design; their detailed schema
 ### Slice 7 fixed contracts
 
 - Artifacts are content-addressed, MIME-sniffed, size-bounded, and stored through BB project attachments or a confined plugin-owned directory.
-- Image limits remain 10 MiB and non-image attachment limits remain 25 MiB unless BB exposes stricter limits.
+- Images preserve the existing 10 MiB bound. Each new non-image artifact type receives an explicit product bound in its slice design and obeys any stricter BB or Telegram limit.
 - Extraction and transcription produce bounded derived artifacts with provider, model, timestamp, source hash, and failure state.
 - Unsupported or failed enrichment preserves the original owner message and reports the bounded limitation.
-- Capability descriptors declare schema, read/write class, reversibility, idempotency, approval requirement, credentials, host reach, cost class, and receipt kind.
+- The Slice 1 descriptors generalize into a registry for tools, skills, connectors, and recipes; the registry declares schema, effect/risk/data class, reversibility, idempotency, approval requirement, credential scope and audience, egress, host reach, cost class, proof kinds, receipt kind, and result bounds.
+- Hanoon-managed connector credentials are least-scope, audience-bound where supported, securely referenced rather than copied into context, and never passed through from one service to another.
 - Connector content is untrusted context and cannot modify capability policy.
 
 ## Program-level acceptance
@@ -521,9 +643,11 @@ The following decisions are fixed by this umbrella design; their detailed schema
 The roadmap is complete only when all seven slice gates pass and a release report proves:
 
 - one durable answer path with zero unsupported success claims in the acceptance corpus;
+- complete capability-policy coverage for every Hanoon-managed tool, skill, connector, and recipe, with zero policy bypasses in the acceptance corpus;
 - Telegram-visible owner decisions for every representable controller permission boundary;
 - correlated traces from intake to durable delivery and, for jobs, through exact-head production evidence;
 - deterministic replay and nightly regression comparison;
+- fixed-harness and strong-elicitation reports that disclose tool/policy/model/context versions, trial counts, budgets, success rates, and cost per successful outcome;
 - proactive context rollover without repeated owner context;
 - lexical memory operation during semantic-provider failure;
 - runtime provider discovery, circuit pause, and duplicate-safe drip recovery;
@@ -538,10 +662,13 @@ The roadmap is complete only when all seven slice gates pass and a release repor
 - Every schema change is additive and lands before code that requires it.
 - New behavior is enabled slice by slice after deterministic and disposable live acceptance.
 - A slice may use a bounded compatibility read during one release, but no unbounded dual-write period is allowed.
-- Provider routing and workflow recipes begin in observation/shadow mode before they control dispatch.
-- Semantic retrieval, cockpit UI, and enrichment degrade independently without stopping the core controller or delivery pipeline.
+- Provider routing, reduced reasoning/context/retry policies, and workflow recipes begin in observation/shadow mode and control dispatch only after their declared evaluation threshold passes.
+- Semantic retrieval begins as a shadow ranker against a held-out corpus; lexical retrieval remains the fallback and rollback path.
+- Semantic retrieval, cockpit UI, evaluation judgment, and enrichment degrade independently without stopping the core controller or delivery pipeline.
 - Rollback disables the new reader/dispatcher while retaining additive evidence rows; it never deletes or rewrites durable history.
 
 ## Documentation obligations
 
 Each implementation slice updates the README capability summary, architecture, configuration, operations, security, and live-acceptance surfaces that its behavior changes. Planned APIs are documented as planned until their implementation and tests land. No release documentation may describe a live capability solely because it appears in this design.
+
+The research review remains the rationale and source register for this roadmap. Implementation documents link to it instead of copying external guidance into prompts or public operator instructions.
