@@ -736,6 +736,20 @@ export const TURN_ORIGIN_MIGRATIONS = [String.raw`
 ALTER TABLE controller_turns ADD COLUMN origin TEXT NOT NULL DEFAULT 'owner';
 `] as const;
 
+export const PRODUCTION_HEALTH_MIGRATIONS = [String.raw`
+CREATE TABLE production_health (
+  project_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('unknown', 'ok', 'failing')),
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_summary TEXT,
+  last_checked_at INTEGER,
+  reported_state TEXT,
+  reported_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -764,4 +778,5 @@ export const ALL_MIGRATIONS = [
   ...TURN_TOKEN_BASELINE_MIGRATIONS,
   ...DELEGATION_SEAL_MIGRATIONS,
   ...TURN_ORIGIN_MIGRATIONS,
+  ...PRODUCTION_HEALTH_MIGRATIONS,
 ] as const;

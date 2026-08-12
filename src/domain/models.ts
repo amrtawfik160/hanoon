@@ -24,6 +24,12 @@ export const productionPolicySchema = z
   .object({
     deployCommands: z.array(policyCommandSchema).min(1).max(20),
     canaryCommands: z.array(policyCommandSchema).min(1).max(20),
+    // Canary commands run once, immediately after a deploy. Between deploys
+    // nothing looks at production at all, which is how a crash loop can run for
+    // days unnoticed. These run on a timer instead, so they must be cheap and
+    // read-only — a canary is allowed to be neither.
+    healthCommands: z.array(policyCommandSchema).min(1).max(5).optional(),
+    healthIntervalMs: z.number().int().min(60_000).max(86_400_000).optional(),
     rollbackCommand: policyCommandSchema.optional(),
     targetKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/).optional(),
     convexDeployRequired: z.boolean().default(false),

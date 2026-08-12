@@ -54,6 +54,9 @@ export type JobExecutorDependencies = {
   memoryCuration?: {
     processDue(): boolean;
   };
+  productionHealth?: {
+    processDue(): Promise<boolean>;
+  };
   systemMonitors?: {
     install(): void;
   };
@@ -478,6 +481,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
         if (deps.memoryCuration) {
           didWork = deps.memoryCuration.processDue() || didWork;
+        }
+        if (deps.productionHealth) {
+          didWork = await deps.productionHealth.processDue() || didWork;
         }
         // Idempotent, and deliberately not a one-shot at activation: pairing
         // can happen long after the executor starts.

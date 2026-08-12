@@ -269,6 +269,19 @@ export type JobMemoryExtractionRecord = {
   updatedAt: number;
 };
 
+export type ProductionHealthState = "unknown" | "ok" | "failing";
+
+export type ProductionHealthRecord = {
+  projectId: string;
+  state: ProductionHealthState;
+  consecutiveFailures: number;
+  lastSummary: string | null;
+  lastCheckedAt: number | null;
+  /** The last state the owner was actually told about. */
+  reportedState: ProductionHealthState | null;
+  reportedAt: number | null;
+};
+
 export type DelegationState = "open" | "fired" | "cancelled" | "failed";
 export type DelegationThreadState = "running" | "finished" | "failed" | "missing";
 
@@ -1748,6 +1761,19 @@ export interface TelegramAgentStore {
     dueAt: number | null;
     now: number;
   }): MonitorRecord;
+  getProductionHealth(projectId: string): ProductionHealthRecord | null;
+  recordProductionHealth(input: {
+    projectId: string;
+    ok: boolean;
+    summary: string;
+    failureThreshold: number;
+    now: number;
+  }): ProductionHealthRecord;
+  recordProductionHealthReported(input: {
+    projectId: string;
+    state: ProductionHealthState;
+    now: number;
+  }): boolean;
   listSystemMonitors(): MonitorRecord[];
   cancelSystemMonitors(now: number): number;
   ensureSystemMonitor(input: {
@@ -2342,6 +2368,25 @@ function parseDelegation(row: DelegationRow, threads: readonly DelegationThreadR
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function parseProductionHealth(row: Record<string, unknown>): ProductionHealthRecord {
+  const state = String(row.state);
+  if (!["unknown", "ok", "failing"].includes(state)) {
+    throw new Error(`Unknown persisted production health state: ${state}`);
+  }
+  const reported = row.reported_state === null || row.reported_state === undefined
+    ? null
+    : String(row.reported_state) as ProductionHealthState;
+  return {
+    projectId: String(row.project_id),
+    state: state as ProductionHealthState,
+    consecutiveFailures: Number(row.consecutive_failures),
+    lastSummary: row.last_summary === null || row.last_summary === undefined ? null : String(row.last_summary),
+    lastCheckedAt: row.last_checked_at === null || row.last_checked_at === undefined ? null : Number(row.last_checked_at),
+    reportedState: reported,
+    reportedAt: row.reported_at === null || row.reported_at === undefined ? null : Number(row.reported_at),
   };
 }
 
@@ -4218,6 +4263,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.prepare(
       "UPDATE monitors SET state = 'cancelled', updated_at = ? WHERE system_key IS NOT NULL AND state = 'armed'",
     ).run(now).changes;
+  }
+
+  public getProductionHealth(projectId: string): ProductionHealthRecord | null {
+    const row = this.db.prepare("SELECT * FROM production_health WHERE project_id = ?")
+      .get(projectId) as Record<string, unknown> | undefined;
+    return row ? parseProductionHealth(row) : null;
+  }
+
+  /**
+   * One reading. A fault is only declared after enough consecutive failures to
+   * rule out a blip, and a single success clears the count immediately.
+   */
+  public recordProductionHealth(input: {
+    projectId: string;
+    ok: boolean;
+    summary: string;
+    failureThreshold: number;
+    now: number;
+  }): ProductionHealthRecord {
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertNonNegativeInteger(input.now, "now");
+    if (!Number.isInteger(input.failureThreshold) || input.failureThreshold < 1) {
+      throw new TypeError("failureThreshold must be a positive integer");
+    }
+    const summary = assertMemoryText(input.summary || "no output", 400, "health summary");
+    return this.db.transaction((): ProductionHealthRecord => {
+      const previous = this.getProductionHealth(input.projectId);
+      const failures = input.ok ? 0 : (previous?.consecutiveFailures ?? 0) + 1;
+      const state: ProductionHealthState = input.ok
+        ? "ok"
+        : failures >= input.failureThreshold ? "failing" : (previous?.state ?? "unknown");
+      this.db.prepare(
+        `INSERT INTO production_health (
+           project_id, state, consecutive_failures, last_summary, last_checked_at,
+           reported_state, reported_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+         ON CONFLICT(project_id) DO UPDATE SET
+           state = excluded.state,
+           consecutive_failures = excluded.consecutive_failures,
+           last_summary = excluded.last_summary,
+           last_checked_at = excluded.last_checked_at,
+           updated_at = excluded.updated_at`,
+      ).run(input.projectId, state, failures, summary, input.now, input.now, input.now);
+      const stored = this.getProductionHealth(input.projectId);
+      if (!stored) throw new Error("Production health was not stored");
+      return stored;
+    }).immediate();
+  }
+
+  /** Claims a transition so a crash cannot report the same change twice. */
+  public recordProductionHealthReported(input: {
+    projectId: string;
+    state: ProductionHealthState;
+    now: number;
+  }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE production_health SET reported_state = ?, reported_at = ?, updated_at = ?
+        WHERE project_id = ? AND (reported_state IS NULL OR reported_state != ?)`,
+    ).run(input.state, input.now, input.now, input.projectId, input.state).changes === 1;
   }
 
   public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {

@@ -52,6 +52,7 @@ import { ThreadNoticeService } from "./services/thread-notice-service";
 import { JobMemoryService } from "./services/job-memory-service";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { installSystemMonitors } from "./services/system-monitors";
+import { ProductionHealthService } from "./services/production-health-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -540,6 +541,34 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
+  // Health ids share the monitor id space, which is derived from the clock and
+  // kept above real Telegram update ids.
+  let healthUpdateId = 0;
+  const productionHealth = new ProductionHealthService({
+    store,
+    commands: {
+      run: async ({ projectId, command }) => {
+        const projects = await bb.sdk.projects.list({});
+        const project = projects.find((candidate) => candidate.id === projectId);
+        const source = project?.sources.find((candidate) => candidate.isDefault) ?? project?.sources[0];
+        if (!source?.hostId) throw new Error("Project has no host to run a health check on");
+        const result = await terminal.run({
+          scope: { kind: "host_path", hostId: source.hostId, cwd: source.path ?? null },
+          title: `Telegram production health: ${command.name.slice(0, 40)}`,
+          command: command.command,
+          timeoutMs: command.timeoutMs,
+        });
+        if (result.outcome !== "exited") return { ok: false, summary: `check ${result.outcome}` };
+        return { ok: result.exitCode === 0, summary: result.output || `exit ${result.exitCode}` };
+      },
+    },
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    warn: (message) => bb.log.warn(message),
+  });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
   let systemMonitorsInstalled = false;
   const systemMonitors = {
@@ -893,6 +922,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       threadNotices,
       jobMemory,
       memoryCuration,
+      productionHealth,
       systemMonitors,
       presence,
       laneSnapshots,
