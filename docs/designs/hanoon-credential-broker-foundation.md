@@ -178,11 +178,13 @@ export type BrokerResponseEnvelope = Readonly<{
 
 Unknown fields, schema versions, operations, result values, failure classes, health fields, or binding fields fail response validation. A successful `broker.health` response has `outcome: "succeeded"`, `result: "ready"`, one health snapshot, a non-null receipt, and every secret-free binding for the authenticated installation. The foundation caps an installation at 100 bindings, so reconciliation is complete rather than silently truncated. The broker reads those bindings from its policy store; it does not search or list the external vault. Hanoon reconciles the returned metadata into its local projection.
 
-A valid verification has `outcome: "succeeded"`, `result: "valid"`, and a non-null receipt. A missing item or field, empty value, or value outside the configured bound has `outcome: "failed"`, `result: "invalid"`, `failureClass: "credential_invalid"`, `retryable: false`, and a non-null audit receipt. Transport, policy, provider, authentication, and persistence failures have `result: null`. `retryAfterMs` is non-null only for a retryable provider rate limit or outage, and is bounded from 1,000 through 300,000 milliseconds. Every non-health response carries `health: null` and `bindings: []`; a failed health response does too. A timeout or unparseable response maps to `result_ambiguous`; Hanoon never retries it blindly under a new idempotency key.
+A valid verification has `outcome: "succeeded"`, `result: "valid"`, and a non-null receipt. A missing item or field, empty value, or value outside the configured bound has `outcome: "failed"`, `result: "invalid"`, `failureClass: "credential_invalid"`, `retryable: false`, and a non-null audit receipt. Transport, policy, provider, authentication, and persistence failures have `result: null`. `retryAfterMs` is non-null only for a retryable provider rate limit or outage, and is bounded from 1,000 through 300,000 milliseconds. Every non-health response carries `health: null` and `bindings: []`; a failed health response does too. An active duplicate may return `result_ambiguous` without a receipt; a startup-reconciled interrupted claim returns it with an audit receipt. A local timeout or unparseable response is also treated as ambiguous, but is not itself a broker receipt. Hanoon never retries it blindly under a new idempotency key.
 
 ### Idempotency and audit
 
-The broker durably claims `(installationId, idempotencyKey)` before adapter work. A completed duplicate returns the original secret-free response. An in-progress duplicate returns `result_ambiguous` until reconciliation establishes whether the adapter call completed. The same idempotency key with a different request digest is rejected.
+The broker durably claims `(installationId, idempotencyKey)` before adapter work. A completed duplicate returns the original secret-free response. A duplicate that is still executing returns a transient `result_ambiguous` with no receipt. On restart, the broker cannot prove whether an uncompleted 1Password SDK read happened; it therefore finalizes the original claim as an audited `result_ambiguous` without invoking the adapter again. The same idempotency key with a different request digest is rejected without changing the original claim.
+
+Hanoon reconciles a local timeout by resending the exact stored envelope. A completed broker result is replayed; an active claim remains pending; a restart-interrupted claim eventually returns the audited ambiguous receipt. Hanoon never retries under a new key automatically. After an audited ambiguity, only a new explicit owner verification request in a later turn may create a new key. This foundation does not claim provider-side exactly-once observability that the 1Password read API cannot supply.
 
 The broker audit row stores:
 
@@ -201,7 +203,7 @@ It stores none of the excluded secret or raw diagnostic fields. A successful ver
 Enrollment occurs on the protected broker host, not through a model tool:
 
 1. The owner creates a dedicated vault and service account in 1Password.
-2. The owner installs the service-account token into the broker's OS secret store using the broker administrative CLI's interactive stdin or provider-native handoff. The value never appears in argv or command output.
+2. The owner installs the service-account token into the broker's OS secret store using the protected host's native credential prompt or provider-native handoff. The value never appears in argv, an agent environment, or command output retained by Hanoon.
 3. The broker runs a live service-account identity probe and displays only the account, vault scope, and status.
 4. The owner registers an exact vault item and field in the broker. The broker creates a random `bindingId` and stores the external reference broker-side.
 5. The owner assigns a label, future capability ids, risk, MFA mode, and approval mode. The foundation accepts only inactive future capability ids because no application connector exists yet, and rejects enrollment when the installation already has 100 binding records, including tombstones. This keeps every health reconciliation complete in protocol version 1.
@@ -255,7 +257,7 @@ The broker separately configures its service-account token and external item ref
 ## Failure and recovery
 
 - **Broker unavailable before adapter work:** retry with the same idempotency key under bounded backoff while the current Hanoon fence remains valid.
-- **Timeout after dispatch:** record `result_ambiguous`, query the same request id after recovery, and do not create a new verification request until the broker resolves it.
+- **Timeout after dispatch:** record local ambiguity and resend the exact stored envelope after recovery. Do not create a new verification request until the broker replays a completion or returns an audited ambiguous receipt; after the latter, only a new explicit owner request may try again.
 - **Vault unavailable or rate limited:** return the stable class and provider retry-after bound; Hanoon may create a durable retry obligation within policy.
 - **Binding generation changed:** deny immediately, refresh metadata, and require the controller to select the current binding.
 - **Audit commit failed:** return `receipt_persistence_failed` even if the item was resolved; no success reaches Hanoon.
@@ -276,7 +278,7 @@ Resolved secret values have operation lifetime only. The adapter drops reference
 
 - Every protocol enum, bound, nullability rule, and schema version accepts canonical input and rejects unknown or oversized input.
 - Tenant, installation, certificate, binding, generation, policy digest, operation, deadline, nonce, request digest, and idempotency mismatches deny before adapter invocation.
-- A duplicate completed request returns the original response; a changed digest under the same key denies; an interrupted request reconciles without a second adapter call.
+- A duplicate completed request returns the original response; a changed digest under the same key denies; an interrupted request becomes an audited ambiguity without a second adapter call.
 - Hanoon SQLite, broker audit rows, plugin logs, broker logs, tool results, error strings, and serialized test artifacts do not contain injected canary secret values or their prefixes.
 - Controller and worker process fixtures receive no broker or vault variables.
 - An agent-originated endpoint, external reference, operation, arbitrary URL, or raw provider argument cannot enter a request envelope.
