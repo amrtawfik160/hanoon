@@ -963,3 +963,35 @@ it("refuses to delegate for a thread that is not the durable controller", async 
   }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/not authorized/);
   expect(store.listOpenDelegations(10)).toEqual([]);
 });
+
+it("tells the agent a confirmed job is queued rather than waiting on the owner", async () => {
+  const { bb, harness, store } = fixture();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+  // The path the agent itself uses: creation already confirms and queues it.
+  const created = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_start_job",
+    { projectId: "proj_1", task: "fix the guardian import" },
+    controllerToolContext,
+  )) as { job: { id: string; state: string; queue: string | null; awaitingOwner: boolean } };
+
+  expect(created.job.state).toBe("awaiting_confirmation");
+  // The state name alone reads as "the owner must tap approve" — which is false
+  // here, and is exactly what made the agent promise a button that never came.
+  expect(created.job.queue).toBe("queued");
+  expect(created.job.awaitingOwner).toBe(false);
+
+  const status = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    { jobId: created.job.id },
+    controllerToolContext,
+  )) as { job: { queue: string | null; awaitingOwner: boolean } };
+
+  expect(status.job).toMatchObject({ queue: "queued", awaitingOwner: false });
+});

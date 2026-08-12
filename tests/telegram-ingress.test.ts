@@ -454,7 +454,7 @@ it("binds the selected policy version and queues without spawning", async () => 
   expect(fixture.store.listEffectsForJob(jobId).map((effect) => effect.kind)).toEqual(["render_status"]);
   const rendered = fixture.telegram.edited.at(-1)?.payload ?? fixture.telegram.sent.at(-1)?.payload;
   const buttons = rendered?.reply_markup?.inline_keyboard.flat().map((button) => button.text);
-  expect(rendered?.text).toContain("Queue: queued");
+  expect(rendered?.text).toContain("starts on its own, nothing to approve");
   expect(buttons).not.toContain("Start");
   expect(buttons).toContain("Cancel");
 });

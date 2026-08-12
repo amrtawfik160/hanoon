@@ -197,11 +197,21 @@ async function once(
   }
 }
 
-function jobProjection(job: Job) {
+/**
+ * `awaiting_confirmation` names a state machine step, not an owner obligation.
+ * A job the agent started is confirmed on creation and merely waits for a free
+ * slot, so the projection says outright whether anyone is waiting on the owner
+ * — otherwise the agent reads the state name and invents an approval tap that
+ * has no button and never comes.
+ */
+function jobProjection(job: Job, admission?: { state: string } | null) {
+  const queue = admission?.state ?? null;
   return {
     job: {
       id: job.id,
       state: job.state,
+      queue,
+      awaitingOwner: job.state === "awaiting_confirmation" && queue === null,
       projectId: job.projectId,
       implementationThreadId: job.implementationThreadId,
       reviewThreadId: job.reviewThreadId,
@@ -320,7 +330,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           now: dependencies.now(),
         });
         dependencies.notify();
-        return json(jobProjection(job));
+        return json(jobProjection(job, dependencies.store.getAdmission(job.id)));
       });
     },
   });
@@ -333,7 +343,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       authorizedController(dependencies.store, context);
       const resolution = resolveJob(dependencies.store, "status", params.jobId);
       return json(resolution.outcome === "job"
-        ? jobProjection(resolution.job)
+        ? jobProjection(resolution.job, dependencies.store.getAdmission(resolution.job.id))
         : resolutionProjection(resolution));
     },
   });
@@ -353,7 +363,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         }
         const updated = dependencies.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, dependencies.now());
         dependencies.notify();
-        return json(jobProjection(updated));
+        return json(jobProjection(updated, dependencies.store.getAdmission(updated.id)));
       });
     },
   });
@@ -371,13 +381,13 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         if (["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) {
           throw new Error("The requested job cannot be cancelled");
         }
-        if (job.cancelRequestedAt !== null) return json(jobProjection(job));
+        if (job.cancelRequestedAt !== null) return json(jobProjection(job, dependencies.store.getAdmission(job.id)));
         const updated = dependencies.store.applyJobEvent(job.id, job.version, {
           type: "CANCEL_REQUESTED",
           activeWorker: dependencies.store.getWorkerLiveness(job.id),
         }, dependencies.now());
         dependencies.notify();
-        return json(jobProjection(updated));
+        return json(jobProjection(updated, dependencies.store.getAdmission(updated.id)));
       });
     },
   });

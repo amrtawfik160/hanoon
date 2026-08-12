@@ -239,15 +239,45 @@ describe("deterministic Telegram views", () => {
       releaseReason: null,
     };
 
+    // Already confirmed: it has no Start button because there is nothing to
+    // approve, so the card must not read as though the owner is holding it up.
     const queued = renderJobStatus({ job, admission: queuedAdmission });
     const queuedButtons = queued.reply_markup?.inline_keyboard.flat().map((button) => button.text);
-    expect(queued.text).toContain("Queue: queued");
+    expect(queued.text).toContain("<b>Job queued</b>");
+    expect(queued.text).toContain("starts on its own, nothing to approve");
+    expect(queued.text).not.toContain("awaiting_confirmation");
+    expect(queued.text).not.toContain("Waiting for you to start it");
     expect(queuedButtons).not.toContain("Start");
 
+    // Genuinely unconfirmed: it does need the owner, and says so with a button.
     const unqueued = renderJobStatus(job);
     const unqueuedButtons = unqueued.reply_markup?.inline_keyboard.flat().map((button) => button.text);
-    expect(unqueued.text).not.toContain("Queue: queued");
+    expect(unqueued.text).toContain("Waiting for you to start it");
+    expect(unqueued.text).not.toContain("nothing to approve");
     expect(unqueuedButtons).toContain("Start");
+  });
+
+  it("never shows a card that demands a tap it does not offer", () => {
+    const job = jobFixture({ id: telegramJobId, state: "awaiting_confirmation" });
+    const admission: JobAdmission = {
+      jobId: job.id,
+      projectId: "proj_1",
+      queueSeq: 4,
+      state: "queued",
+      resumeEvent: "CONFIRMED",
+      queuedAt: 2_000,
+      admittedAt: null,
+      drainingAt: null,
+      releasedAt: null,
+      releaseReason: null,
+    };
+
+    for (const rendered of [renderJobStatus(job), renderJobStatus({ job, admission })]) {
+      const offersStart = (rendered.reply_markup?.inline_keyboard.flat() ?? [])
+        .some((button) => button.text === "Start");
+      const demandsStart = rendered.text.includes("Waiting for you to start it");
+      expect(demandsStart).toBe(offersStart);
+    }
   });
 
   it("shows one worker resource, liveness state, and source observation age", () => {

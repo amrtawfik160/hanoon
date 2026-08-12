@@ -529,21 +529,31 @@ export function renderJobStatus(
   assertJobId(job.id);
   const policy = context.project ?? job.policy;
   const ready = context.ready ?? job.state === "awaiting_merge_approval";
+  // A confirmed job waiting for a slot has no button and needs nothing from the
+  // owner, so titling it "awaiting_confirmation" reads as a demand for a tap
+  // that does not exist.
+  const queuedConfirmed = job.state === "awaiting_confirmation" &&
+    context.admission?.jobId === job.id &&
+    context.admission.state === "queued";
   const title = ready
     ? "Ready to merge and deploy"
     : job.state === "production_failed"
       ? "PRODUCTION INCIDENT"
       : job.state === "complete"
         ? "Merged, deployed, and verified"
-        : `Job ${displayText(job.state, 80)}`;
+        : queuedConfirmed
+          ? "Job queued"
+          : `Job ${displayText(job.state, 80)}`;
   const lines = [
     `<b>${escapeHtml(title)}</b>`,
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,
   ];
   if (policy) lines.push(`Base: <code>${html(policy.baseBranch, 120)}</code>`);
   lines.push(`Task: <code>${html(job.requestText, 500)}</code>`);
-  if (job.state === "awaiting_confirmation" && context.admission?.jobId === job.id && context.admission.state === "queued") {
-    lines.push("Queue: queued");
+  if (queuedConfirmed) {
+    lines.push("Queue: waiting for a free slot — starts on its own, nothing to approve");
+  } else if (job.state === "awaiting_confirmation") {
+    lines.push("Waiting for you to start it");
   }
   const resourceWait = (context.resourceWait ?? [])
     .filter((entry) => entry.kind === "repository_merge" || entry.kind === "production_target")
