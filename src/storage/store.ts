@@ -942,7 +942,7 @@ const MAX_DELEGATION_THREADS = 4;
 const MAX_OPEN_DELEGATIONS = 2;
 const MAX_DELEGATION_SUMMARY = 600;
 const MAX_DELEGATION_TITLE = 120;
-const MAX_RECEIPT_RESULT = 4_000;
+const MAX_RECEIPT_RESULT_BYTES = 8_000;
 const MAX_EFFECT_KEY = 256;
 const MAX_PIPELINE_OUTPUT_BYTES = 65_536;
 const SAFE_MERGE_FAILURE_REASON = "Merge effect failed safely";
@@ -1821,6 +1821,8 @@ export interface TelegramAgentStore {
   setControllerOverlay(input: { text: string; now: number }): string | null;
   listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[];
   listArmedMonitors(limit: number): MonitorRecord[];
+  getControllerMonitor(controllerKey: string, id: string): MonitorRecord | null;
+  cancelControllerMonitor(controllerKey: string, id: string, now: number): boolean;
   cancelMonitor(id: string, now: number): boolean;
   recordMonitorFired(input: { id: string; nextDueAt: number | null; now: number }): boolean;
   failMonitor(input: { id: string; error: string; now: number }): boolean;
@@ -1921,6 +1923,7 @@ export interface TelegramAgentStore {
     task: string;
     now: number;
   }): Job;
+  getJobBySourceUpdateId(sourceUpdateId: number): Job | null;
   selectProjectAndQueueAdmission(input: {
     jobId: string;
     expectedVersion: number;
@@ -4123,11 +4126,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   public completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void {
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerIdentifier(input.toolName, "toolName");
+    assertSha256Hex(input.argsSha256);
+    if (typeof input.result !== "string" || Buffer.byteLength(input.result, "utf8") > MAX_RECEIPT_RESULT_BYTES) {
+      throw new TypeError("tool receipt result must be at most 8000 UTF-8 bytes");
+    }
     assertNonNegativeInteger(input.now, "now");
-    this.db.prepare(
+    const completed = this.db.prepare(
       `UPDATE tool_receipts SET state = 'completed', result_text = ?, last_error = NULL, updated_at = ?
         WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'`,
-    ).run(input.result.slice(0, MAX_RECEIPT_RESULT), input.now, input.turnId, input.toolName, input.argsSha256);
+    ).run(input.result, input.now, input.turnId, input.toolName, input.argsSha256);
+    if (completed.changes !== 1) throw new Error("exact started tool receipt was not completed");
   }
 
   public failToolReceipt(input: ToolReceiptKey & { error: string; now: number }): void {
@@ -4453,6 +4463,23 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       "SELECT * FROM monitors WHERE state = 'armed' ORDER BY created_at ASC LIMIT ?",
     ).all(limit) as MonitorRow[];
     return rows.map(parseMonitor);
+  }
+
+  public getControllerMonitor(controllerKey: string, id: string): MonitorRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      "SELECT * FROM monitors WHERE controller_key = ? AND id = ? AND system_key IS NULL",
+    ).get(controllerKey, id) as MonitorRow | undefined;
+    return row ? parseMonitor(row) : null;
+  }
+
+  public cancelControllerMonitor(controllerKey: string, id: string, now: number): boolean {
+    assertControllerKey(controllerKey);
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      `UPDATE monitors SET state = 'cancelled', updated_at = ?
+        WHERE controller_key = ? AND id = ? AND system_key IS NULL AND state = 'armed'`,
+    ).run(now, controllerKey, id).changes === 1;
   }
 
   public cancelMonitor(id: string, now: number): boolean {
@@ -5548,6 +5575,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       });
       return selected.job;
     }).immediate();
+  }
+
+  public getJobBySourceUpdateId(sourceUpdateId: number): Job | null {
+    assertNonNegativeInteger(sourceUpdateId, "sourceUpdateId");
+    return this.readJobBySourceUpdate(sourceUpdateId);
   }
 
   public selectProjectAndQueueAdmission(input: {

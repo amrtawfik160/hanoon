@@ -1,8 +1,10 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 import { hashSecret } from "../../src/crypto";
 import type { ControllerTurnRecord } from "../../src/controller/models";
+import { registerControllerTools } from "../../src/controller/tools";
 import { openStore } from "../../src/storage/store";
+import { policyFixture } from "../helpers";
 
 let fixtureNumber = 0;
 
@@ -116,5 +118,40 @@ export function validEvidenceInput(turn: ControllerTurnRecord) {
     resultSha256: "b".repeat(64),
     proofKinds: ["project_state"] as const,
     subjectRefs: ["project:proj_1"] as const,
+  };
+}
+
+export function registeredControllerFixture(options: { staleLease?: boolean } = {}) {
+  const fixture = submittedControllerFixture({ releaseLease: options.staleLease });
+  fixture.store.upsertProjectPolicy(policyFixture(), 1_500);
+  const controller = fixture.store.getControllerForOwner("7", "7");
+  if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
+  const request = vi.fn(async () => ({
+    id: "operation_1",
+    kind: "stop_thread" as const,
+    threadId: "thr_visible",
+    state: "awaiting_confirmation" as const,
+    expiresAt: 62_000,
+  }));
+  const notify = vi.fn();
+  const health = vi.fn(() => ({ ok: true }));
+  registerControllerTools(fixture.bb, {
+    store: fixture.store,
+    sdk: fixture.bb.sdk,
+    threadOperations: { request },
+    health,
+    notify,
+    now: () => 2_000,
+  });
+  return {
+    ...fixture,
+    request,
+    notify,
+    health,
+    toolContext: {
+      threadId: controller.threadId,
+      projectId: controller.projectId,
+      signal: new AbortController().signal,
+    },
   };
 }

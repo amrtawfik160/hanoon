@@ -73,7 +73,9 @@ function backgroundCommand() {
 
 function parseToolJson(value: unknown): unknown {
   if (typeof value !== "string") throw new Error("controller tool did not return JSON text");
-  return JSON.parse(value);
+  const parsed = JSON.parse(value) as Record<string, unknown>;
+  delete parsed._hanoonEvidence;
+  return parsed;
 }
 
 function queueControllerCandidate(
@@ -118,7 +120,7 @@ function queueControllerCandidate(
 const controllerToolContext = { threadId: "thr_controller", projectId: "proj_personal" };
 
 let fixtureNumber = 0;
-function fixture() {
+function fixture(options: { active?: boolean } = {}) {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-controller-tools-${fixtureNumber++}`,
     agentSkillIds: [...BUNDLED_SKILL_IDS],
@@ -154,8 +156,20 @@ function fixture() {
     generation: lease.generation,
     now: 10_000,
   })).toBe(true);
-  expect(store.releaseExecutorLease("executor", lease.generation, 10_000)).toBe(true);
-  return { bb, harness, store, turn };
+  let activeFence = { ownerId: "executor", generation: lease.generation, now: 10_000 };
+  const deactivate = () => {
+    if (store.isExecutorLeaseCurrent(activeFence.ownerId, activeFence.generation, activeFence.now)) {
+      expect(store.releaseExecutorLease(activeFence.ownerId, activeFence.generation, activeFence.now)).toBe(true);
+    }
+  };
+  const activate = () => {
+    const acquired = store.acquireExecutorLease("executor", 10_000, 30_000);
+    if (!acquired.acquired) throw new Error("missing replacement controller lease");
+    activeFence = { ownerId: "executor", generation: acquired.generation, now: 10_000 };
+    expect(store.adoptSubmittedControllerTurnFence({ ...activeFence, turnId: turn.id })).toBe(true);
+  };
+  if (!options.active) deactivate();
+  return { bb, harness, store, turn, activate, deactivate };
 }
 
 function workerContext(
@@ -337,7 +351,7 @@ it("rejects unmapped controllers and disabled projects while allowing another qu
 });
 
 it("registers the exact controller tools and keeps them off unrelated sessions", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   const notify = vi.fn();
   const requestThreadOperation = vi.fn(async () => ({
     id: "operation_1",
@@ -456,7 +470,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     "telegram_agent_thread_status",
     { threadId: "thr_hidden" },
     { threadId: "thr_controller", projectId: "proj_personal" },
-  )).rejects.toThrow(/not visible/i);
+  )).rejects.toThrow(/scope|not visible/i);
 
   const operation = await harness.behavior.callAgentTool(
     "telegram_agent_request_thread_operation",
@@ -628,7 +642,7 @@ it("fails closed for forged durable worker and controller identities", async () 
 });
 
 it("returns bounded choices for ambiguous status, retry, and cancel without mutation", async () => {
-  const { bb, harness, store, turn } = fixture();
+  const { bb, harness, store, turn, activate, deactivate } = fixture({ active: true });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,
@@ -643,13 +657,17 @@ it("returns bounded choices for ambiguous status, retry, and cancel without muta
     {},
     controllerToolContext,
   ))).toEqual({ outcome: "none", candidates: [] });
+  deactivate();
   queueControllerCandidate(store, "controller_job_a", "proj_a", "failed");
+  activate();
   expect(parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_job_status",
     {},
     controllerToolContext,
   ))).toMatchObject({ job: { id: "controller_job_a", projectId: "proj_a", state: "failed" } });
+  deactivate();
   queueControllerCandidate(store, "controller_job_b", "proj_b", "failed");
+  activate();
 
   const expected = {
     outcome: "choose_job",
@@ -703,7 +721,7 @@ it("returns bounded choices for ambiguous status, retry, and cancel without muta
 });
 
 it("reads what a thread is doing so slowness can be explained rather than deflected", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   harness.sdk.stub("threads.get", async () => ({ ...visibleThread(), canSpawnChild: true }));
   harness.sdk.stub("threads.timeline", async () => ({
     rows: [],
@@ -768,7 +786,7 @@ it("reads what a thread is doing so slowness can be explained rather than deflec
 });
 
 it("opens and messages visible threads, and refuses hidden ones", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   const spawn = vi.fn(async () => ({ id: "thr_new", environmentId: "env_new" }));
   const send = vi.fn(async () => ({ ok: true }));
   harness.sdk.stub("projects.list", async () => [{
@@ -792,7 +810,9 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
   harness.sdk.stub("threads.spawn", spawn);
   harness.sdk.stub("threads.send", send);
   harness.sdk.stub("threads.get", async ({ threadId }) => ({
-    ...visibleThread(threadId === "thr_hidden" ? { id: "thr_hidden", visibility: "hidden" } : {}),
+    ...visibleThread(threadId === "thr_hidden"
+      ? { id: "thr_hidden", visibility: "hidden" }
+      : { id: threadId }),
     canSpawnChild: true,
   }));
   registerControllerTools(bb, {
@@ -831,7 +851,7 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     "telegram_agent_send_to_thread",
     { threadId: "thr_hidden", text: "leak" },
     { threadId: "thr_controller", projectId: "proj_personal" },
-  )).rejects.toThrow(/not visible/i);
+  )).rejects.toThrow(/scope|not visible/i);
 });
 
 function delegationProjects() {
@@ -856,7 +876,10 @@ function delegationProjects() {
 }
 
 it("fans work out to one thread per task and records them against one delegation", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
+  for (const projectId of ["proj_a", "proj_b"]) {
+    store.upsertProjectPolicy(policyFixture({ projectId, alias: projectId.replace("_", "-") }), 10_000);
+  }
   const spawned: string[] = [];
   harness.sdk.stub("projects.list", async () => delegationProjects());
   harness.sdk.stub("threads.spawn", async ({ title }: { title: string }) => {
@@ -893,7 +916,10 @@ it("fans work out to one thread per task and records them against one delegation
 });
 
 it("keeps the threads that did start when a later spawn fails", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
+  for (const projectId of ["proj_a", "proj_b"]) {
+    store.upsertProjectPolicy(policyFixture({ projectId, alias: projectId.replace("_", "-") }), 10_000);
+  }
   let spawnCount = 0;
   harness.sdk.stub("projects.list", async () => delegationProjects());
   harness.sdk.stub("threads.spawn", async () => {
@@ -927,7 +953,9 @@ it("keeps the threads that did start when a later spawn fails", async () => {
 });
 
 it("opens no delegation when the very first spawn fails", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
+  store.upsertProjectPolicy(policyFixture({ projectId: "proj_a", alias: "proj-a" }), 10_000);
+  harness.sdk.stub("projects.list", async () => delegationProjects().slice(0, 1));
   harness.sdk.stub("threads.spawn", async () => { throw new Error("BB refused the spawn"); });
   registerControllerTools(bb, {
     store,
@@ -960,12 +988,12 @@ it("refuses to delegate for a thread that is not the durable controller", async 
   await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
     instruction: "compare them",
     tasks: [{ projectId: "proj_a", title: "only", prompt: "only task" }],
-  }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/not authorized/);
+  }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/identity|not authorized/);
   expect(store.listOpenDelegations(10)).toEqual([]);
 });
 
 it("tells the agent a confirmed job is queued rather than waiting on the owner", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
