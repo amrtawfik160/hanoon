@@ -77,6 +77,23 @@ Changing the model to one owned by the other provider retires the live BB conver
 
 Saved values apply when the next controller turn starts, including later turns in the existing durable conversation. They do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode.
 
+### Background work
+
+Two settings govern what the agent does when you have not asked it anything:
+
+| Setting | Options | Default | Purpose |
+| --- | --- | --- | --- |
+| Background learning model | `inherit` or any controller model | `inherit` | Model used to learn lessons from finished jobs. `inherit` leaves it to the project default, which is the only safe answer when the installation's providers are unknown; naming a cheaper model keeps background work off your conversational tier. |
+| Self-maintenance | `enabled`, `disabled` | `enabled` | Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard. |
+
+Turning self-maintenance off stops the agent installing its own monitors. It does not touch monitors you set yourself, and it does not stop the agent learning from finished jobs.
+
+The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
+
+### How the agent works for you
+
+How the agent should behave — terser answers, always leading with the pull-request link — is not a setting. Tell it in the chat and it records a single standing instruction that is applied to every later turn, replaced whenever you restate it, and cleared when you tell it to stop. It is layered after the fixed instructions, so it can change tone and habits but never a safety boundary.
+
 ### Why the default is `full`
 
 The owner works from Telegram and is not watching the BB app, so an approval prompt rendered there stalls the agent with nobody to answer it. `full` lets it use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without that dead end.

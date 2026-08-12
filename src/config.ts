@@ -28,6 +28,7 @@ const globalConfigSchema = z.object({
   controllerPermissionMode: z.enum(CONTROLLER_PERMISSION_MODES)
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode),
   extractionModel: z.enum(EXTRACTION_MODELS).default("inherit"),
+  systemUpkeep: z.enum(["enabled", "disabled"]).default("enabled"),
 });
 
 export type GlobalConfig = z.infer<typeof globalConfigSchema>;
@@ -44,6 +45,7 @@ export function parseGlobalConfig(values: {
   controllerServiceTier?: string;
   controllerPermissionMode?: string;
   extractionModel?: string;
+  systemUpkeep?: string;
 }): GlobalConfigResult {
   if (!values.botToken) {
     return {
@@ -65,6 +67,12 @@ export function parseGlobalConfig(values: {
  *  answer when we cannot know which providers this installation has. */
 export function extractionModel(config: GlobalConfig): string | null {
   return config.extractionModel === "inherit" ? null : config.extractionModel;
+}
+
+/** The agent's own daily and weekly upkeep. Owners who do not want unprompted
+ *  messages can turn it off without losing anything they set themselves. */
+export function systemUpkeepEnabled(config: GlobalConfig): boolean {
+  return config.systemUpkeep === "enabled";
 }
 
 export function controllerExecutionProfile(config: GlobalConfig): ControllerExecutionProfile {

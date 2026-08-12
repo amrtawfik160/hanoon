@@ -7,8 +7,10 @@ The installed plugin and CLI namespace remain `telegram-agent`.
 ## Why Hanoon?
 
 - **Run BB from Telegram, not from BB.** Hanoon has the shell, the `bb` CLI, installed skills and MCP servers, and reach across every connected machine. Nothing waits for a click in the BB app.
-- **It remembers.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall, and the relevant ones are in front of the agent on every turn.
-- **It follows up by itself.** Set a monitor to watch a thread or run on a schedule; when it fires, Hanoon does the work and messages you.
+- **It remembers, and keeps it honest.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall. Correcting Hanoon devalues whatever misled it, notes it never uses fade, and a correction retires the belief it contradicts.
+- **It learns from finished work.** When a job ends, Hanoon works out what is worth knowing about that repository next time — a check that always fails for a known reason, a convention it enforces — and keeps it per project.
+- **It follows up by itself.** Set a monitor to watch a thread or run on a schedule; when it fires, Hanoon does the work and messages you. It also runs its own daily and weekly upkeep, and stays quiet when nothing needs you.
+- **It works in parallel.** Independent questions go out to several BB threads at once and come back as one answer.
 - **Conversations survive failures.** A dead provider session retires a BB thread, not the conversation. The replacement resumes with what was said and what was already done.
 - **Mutations happen once.** Every mutating tool call is receipted by turn and argument hash, so a recovered agent replays the result instead of repeating the action.
 - **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, approval is one-use and expiring, and GitHub repository rules still apply.
@@ -36,10 +38,14 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Live thread insight | "Why is this taking so long?" answers from the thread's current step, todo list, running commands, and latest message — not just its status. |
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
+| Working style | "Be terser" or "always show me the PR link" sticks, without a code change. It can shape tone and habits, never a safety boundary. |
+| Parallel work | "Compare the invoice spike and the billing latency" opens both at once and answers from what comes back. |
+| Self-maintenance | A daily sweep for work needing your decision, a weekly memory audit, and a weekly scorecard of what actually happened. Off by one setting. |
 | Monitors | "Tell me when this finishes and open a PR", or "every weekday at 9, summarise the overnight runs." |
 | Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. A block it cannot render is still reported, so nothing waits on you in silence. |
 | Reviewed delivery | A guarded job takes a change from plan to merge; merging and production still ask you in Telegram. |
 | Self-diagnosis | `/health` reports the executor, queued work, undelivered messages, monitors, memory, and database integrity — even when the agent is the stuck part. |
+| Bounded turns | A question that runs away is nudged once to land the answer, then stopped before it burns your budget out of sight. |
 
 ## Architecture
 
@@ -163,6 +169,8 @@ hanoon/
 │   ├── storage/      # SQLite migrations and transactional store
 │   └── telegram/     # Telegram API client, ingress, errors, and bounded rendering
 ├── tests/            # Unit, integration, state-machine, and mocked end-to-end coverage
+├── skills/           # Vendored skill bundle: workflow kit, guards, and pr-writer
+├── evals/            # Golden answers for the opt-in response-quality check
 ├── docs/             # Public guides plus design/implementation history
 ├── server.ts         # BB plugin entry point
 └── package.json      # Plugin manifest and verification scripts

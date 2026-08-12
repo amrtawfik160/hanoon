@@ -1,5 +1,5 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { controllerExecutionProfile, extractionModel, parseGlobalConfig } from "./config";
+import { controllerExecutionProfile, extractionModel, parseGlobalConfig, systemUpkeepEnabled } from "./config";
 import { BbRunner } from "./bb/runner";
 import { resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
@@ -106,6 +106,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       description: "Model for learning lessons from finished jobs. Inherit uses the project default; a cheaper model keeps background work off your conversational tier.",
       options: [...EXTRACTION_MODELS],
       default: "inherit",
+    },
+    systemUpkeep: {
+      type: "select",
+      label: "Self-maintenance",
+      description: "Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard, and message you when something needs a decision. Turning this off does not touch monitors you set yourself.",
+      options: ["enabled", "disabled"],
+      default: "enabled",
     },
   });
   const store = openStore(bb.storage);
@@ -538,6 +545,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const systemMonitors = {
     install: () => {
       if (systemMonitorsInstalled) return;
+      if (!config.ok || !systemUpkeepEnabled(config.value)) return;
       const installed = installSystemMonitors({
         store,
         clock: { now: clock },

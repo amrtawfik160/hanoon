@@ -8,7 +8,7 @@ import {
   MAX_CONTROLLER_OVERLAY,
   composeControllerInstructions,
 } from "../src/controller/instructions";
-import { extractionModel, parseGlobalConfig } from "../src/config";
+import { extractionModel, parseGlobalConfig, systemUpkeepEnabled } from "../src/config";
 
 let fixtureNumber = 0;
 
@@ -79,4 +79,22 @@ it("uses a chosen background model when one is configured", () => {
 
 it("rejects a background model this plugin does not know", () => {
   expect(parseGlobalConfig({ botToken: "t", bbAppBaseUrl: "", extractionModel: "gpt-nonsense" }).ok).toBe(false);
+});
+
+it("keeps self-maintenance on unless the owner turns it off", () => {
+  const parsed = parseGlobalConfig({ botToken: "t", bbAppBaseUrl: "" });
+  if (!parsed.ok) throw new Error(parsed.message);
+
+  expect(systemUpkeepEnabled(parsed.value)).toBe(true);
+});
+
+it("lets the owner turn self-maintenance off", () => {
+  const parsed = parseGlobalConfig({ botToken: "t", bbAppBaseUrl: "", systemUpkeep: "disabled" });
+  if (!parsed.ok) throw new Error(parsed.message);
+
+  expect(systemUpkeepEnabled(parsed.value)).toBe(false);
+});
+
+it("rejects a self-maintenance value that is neither on nor off", () => {
+  expect(parseGlobalConfig({ botToken: "t", bbAppBaseUrl: "", systemUpkeep: "sometimes" }).ok).toBe(false);
 });
