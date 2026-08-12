@@ -176,23 +176,25 @@ function applyCancellation(
   now: number,
 ): TransitionResult {
   if (["cancelled", "merged", "deploying", "verifying_production", "production_failed", "complete"].includes(job.state)) illegal(job, event);
+  const worker = event.activeWorker;
+  const workerActive = !!worker && worker.jobId === job.id && ACTIVE_WORKER_STATES.has(worker.state);
   if (job.cancelRequestedAt === null) {
     job.cancelRequestedAt = now;
     emitEffect(job, effects, "revoke_approvals");
-    const worker = event.activeWorker;
-    const workerActive = !!worker && worker.jobId === job.id && ACTIVE_WORKER_STATES.has(worker.state);
-    if (workerActive) {
-      stopActiveWorker(job, effects, worker);
-    } else if (worker !== undefined) {
-      // Nothing to stop, and CANCEL_CONFIRMED is otherwise applied only by the
-      // stop_thread effect that an idle job never emits. Without this a
-      // cancelled-but-idle job sits in "cancel requested" forever: every later
-      // event is swallowed below, so it can never reach a terminal state.
-      // `undefined` means the caller supplied no evidence either way, so it
-      // keeps the conservative wait rather than orphaning a live worker.
-      job.state = "cancelled";
-      emitEffect(job, effects, "render_status");
-    }
+    if (workerActive) stopActiveWorker(job, effects, worker);
+  }
+  // Nothing to stop, and CANCEL_CONFIRMED is otherwise applied only by the
+  // stop_thread effect that an idle job never emits — so without this a
+  // cancelled-but-idle job sits in "cancel requested" forever, with every later
+  // event swallowed below and no way to reach a terminal state.
+  //
+  // Deliberately outside the first-request branch: asking again is how an
+  // already-stuck job recovers, and it makes cancelling twice harmless.
+  // `undefined` means the caller offered no evidence either way, so it keeps
+  // the conservative wait rather than orphaning a live worker.
+  if (!workerActive && worker !== undefined) {
+    job.state = "cancelled";
+    emitEffect(job, effects, "render_status");
   }
   return finish(job, effects, now);
 }

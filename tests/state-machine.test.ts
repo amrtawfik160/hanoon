@@ -412,3 +412,14 @@ it("keeps waiting when the caller supplied no worker evidence at all", () => {
   expect(result.job.state).toBe("implementing");
   expect(result.job.cancelRequestedAt).toBe(5_000);
 });
+
+it("completes a cancellation that was already requested but never confirmed", () => {
+  // The state this fix exists to rescue: requested while the worker was still
+  // reported active, then the worker went away and nothing ever confirmed it.
+  const stuck = stateJob("failed", { cancelRequestedAt: 4_000 });
+
+  const result = transition(stuck, { type: "CANCEL_REQUESTED", activeWorker: null }, 9_000);
+
+  expect(result.job.state).toBe("cancelled");
+  expect(result.job.cancelRequestedAt).toBe(4_000);
+});
