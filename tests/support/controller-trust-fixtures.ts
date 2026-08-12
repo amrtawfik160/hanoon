@@ -1,4 +1,5 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import type Database from "better-sqlite3";
 import { expect, vi } from "vitest";
 import { hashSecret } from "../../src/crypto";
 import type { ControllerTurnRecord } from "../../src/controller/models";
@@ -119,6 +120,45 @@ export function validEvidenceInput(turn: ControllerTurnRecord) {
     proofKinds: ["project_state"] as const,
     subjectRefs: ["project:proj_1"] as const,
   };
+}
+
+export function insertControllerTestJob(
+  db: Database.Database,
+  input: Readonly<{
+    id: string;
+    state: string;
+    sourceUpdateId?: number;
+    projectId?: string;
+    version?: number;
+    prHeadSha?: string | null;
+    admissionState?: "queued" | "admitted" | "draining" | "released";
+  }>,
+): void {
+  db.prepare(
+    `INSERT INTO jobs (
+       id, source_update_id, request_text, state, project_id, pr_head_sha,
+       version, created_at, updated_at
+     ) VALUES (?, ?, 'Controller trust fixture', ?, ?, ?, ?, 1, 1)`,
+  ).run(
+    input.id,
+    input.sourceUpdateId ?? 50_000 + fixtureNumber,
+    input.state,
+    input.projectId ?? "proj_1",
+    input.prHeadSha ?? null,
+    input.version ?? 1,
+  );
+  if (input.admissionState) {
+    db.prepare(
+      `INSERT INTO job_admissions (
+         job_id, project_id, queue_seq, state, resume_event, queued_at
+       ) VALUES (?, ?, ?, ?, 'CONFIRMED', 1)`,
+    ).run(
+      input.id,
+      input.projectId ?? "proj_1",
+      50_000 + fixtureNumber,
+      input.admissionState,
+    );
+  }
 }
 
 export function registeredControllerFixture(options: { staleLease?: boolean } = {}) {

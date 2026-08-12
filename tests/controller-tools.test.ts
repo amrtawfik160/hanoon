@@ -10,6 +10,7 @@ import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../src/controlle
 import { canonicalControllerJson, sha256ControllerJson } from "../src/controller/capability-executor";
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
 import { ControllerEvidenceProjector } from "../src/controller/evidence-projector";
+import { controllerFinalizationJsonSchema } from "../src/controller/finalization-contract";
 
 type ThreadListEntry = Awaited<ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["sdk"]["threads"]["list"]>>[number];
 
@@ -235,6 +236,13 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
       additionalProperties: false,
     },
   });
+  expect(metadata[22]).toEqual({
+    name: "telegram_agent_respond",
+    description: "Submit one bounded evidence-backed final response for the current controller turn.",
+    statusLabels: null,
+    schema: controllerFinalizationJsonSchema,
+  });
+  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(23);
 
   const byName = new Map(registrations.map((tool) => [tool.name, tool]));
   const parsed = (name: string, params: unknown) => {
@@ -1986,7 +1994,7 @@ function controllerProjector(value: ReturnType<typeof fixture>): ControllerEvide
     sdk: value.bb.sdk,
     store: value.store,
     clock: { now: () => 10_100 },
-    hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
+    hanoonToolNames: CONTROLLER_TOOL_NAMES,
   });
 }
 
@@ -2004,6 +2012,157 @@ function registerEvidenceTools(
     now: () => 10_100,
   });
 }
+
+function plainFinalization(text = "The answer is complete.") {
+  return {
+    disposition: "answered",
+    segments: [{ type: "text", text }],
+    obligationRefs: [],
+  };
+}
+
+it("routes malformed finalizer input through durable validation without storing unsafe text", async () => {
+  const value = fixture({ active: true });
+  const reconcile = vi.fn(async () => ({
+    outcome: "reconciled" as const,
+    reconciliationIncomplete: null,
+    fromSeq: 0,
+    throughSeq: 0,
+    targetSeq: 0,
+  }));
+  registerEvidenceTools(value, { reconcile });
+
+  const response = JSON.parse(await value.harness.behavior.callAgentTool(
+    "telegram_agent_respond",
+    { unsafe: "password=DO_NOT_STORE_FINALIZER_SECRET" },
+    controllerToolContext,
+  ) as string);
+
+  expect(response).toMatchObject({ outcome: "rejected", revision: 1, code: "invalid_contract" });
+  expect(reconcile).toHaveBeenCalledOnce();
+  const stored = value.bb.storage.database().prepare(
+    "SELECT payload_json FROM controller_finalizations WHERE turn_id = ?",
+  ).get(value.turn.id) as { payload_json: string };
+  expect(stored.payload_json).not.toContain("DO_NOT_STORE_FINALIZER_SECRET");
+});
+
+it("accepts through the special finalizer and makes retries projector-free", async () => {
+  const value = fixture({ active: true });
+  const reconcile = vi.fn(async () => ({
+    outcome: "reconciled" as const,
+    reconciliationIncomplete: null,
+    fromSeq: 0,
+    throughSeq: 0,
+    targetSeq: 0,
+  }));
+  registerEvidenceTools(value, { reconcile });
+
+  expect(JSON.parse(await value.harness.behavior.callAgentTool(
+    "telegram_agent_respond",
+    plainFinalization("Done 😀"),
+    controllerToolContext,
+  ) as string)).toEqual({ outcome: "accepted", ref: "finalization:1", renderedCharacters: 6 });
+  expect(reconcile).toHaveBeenCalledOnce();
+
+  expect(JSON.parse(await value.harness.behavior.callAgentTool(
+    "telegram_agent_respond",
+    plainFinalization("Changed"),
+    controllerToolContext,
+  ) as string)).toMatchObject({ outcome: "rejected", code: "accepted_already" });
+  expect(reconcile).toHaveBeenCalledOnce();
+  await expect(value.harness.behavior.callAgentTool(
+    "telegram_agent_list_projects",
+    {},
+    controllerToolContext,
+  )).rejects.toThrow(/turn_finalized/);
+  expect(value.store.listControllerEvidence(value.turn.id, 128)).toEqual([]);
+});
+
+it.each(["page_cap", "source_gap"] as const)(
+  "does not consume a revision when finalizer reconciliation ends at %s",
+  async (reconciliationIncomplete) => {
+    const value = fixture({ active: true });
+    registerEvidenceTools(value, { reconcile: vi.fn(async () => ({
+      outcome: "reconciled" as const,
+      reconciliationIncomplete,
+      fromSeq: 0,
+      throughSeq: 0,
+      targetSeq: 1,
+    })) });
+
+    await expect(value.harness.behavior.callAgentTool(
+      "telegram_agent_respond",
+      plainFinalization(),
+      controllerToolContext,
+    )).rejects.toThrow(new RegExp(reconciliationIncomplete));
+    expect(value.bb.storage.database().prepare(
+      "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = ?",
+    ).get(value.turn.id)).toEqual({ count: 0 });
+  },
+);
+
+it("does not consume a revision when reconciliation throws", async () => {
+  const value = fixture({ active: true });
+  registerEvidenceTools(value, { reconcile: vi.fn(async () => {
+    throw new Error("projector failed closed");
+  }) });
+
+  await expect(value.harness.behavior.callAgentTool(
+    "telegram_agent_respond",
+    plainFinalization(),
+    controllerToolContext,
+  )).rejects.toThrow(/projector failed closed/);
+  expect(value.bb.storage.database().prepare(
+    "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = ?",
+  ).get(value.turn.id)).toEqual({ count: 0 });
+});
+
+it("does not consume a revision when the executor fence is lost during reconciliation", async () => {
+  const value = fixture({ active: true });
+  registerEvidenceTools(value, { reconcile: vi.fn(async () => {
+    value.deactivate();
+    return {
+      outcome: "reconciled" as const,
+      reconciliationIncomplete: null,
+      fromSeq: 0,
+      throughSeq: 0,
+      targetSeq: 0,
+    };
+  }) });
+
+  await expect(value.harness.behavior.callAgentTool(
+    "telegram_agent_respond",
+    plainFinalization(),
+    controllerToolContext,
+  )).rejects.toThrow(/fence_lost/);
+  expect(value.bb.storage.database().prepare(
+    "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = ?",
+  ).get(value.turn.id)).toEqual({ count: 0 });
+});
+
+it("persists the evidence-limit rejection after limit-exceeded reconciliation", async () => {
+  const value = fixture({ active: true });
+  value.bb.storage.database().prepare(
+    "UPDATE controller_turns SET evidence_limit_exceeded_at = ? WHERE id = ?",
+  ).run(10_100, value.turn.id);
+  registerEvidenceTools(value, { reconcile: vi.fn(async () => ({
+    outcome: "limit_exceeded" as const,
+    reconciliationIncomplete: null,
+    fromSeq: 0,
+    throughSeq: 0,
+    targetSeq: 1,
+  })) });
+
+  expect(JSON.parse(await value.harness.behavior.callAgentTool(
+    "telegram_agent_respond",
+    plainFinalization(),
+    controllerToolContext,
+  ) as string)).toMatchObject({
+    outcome: "rejected",
+    revision: 1,
+    code: "evidence_limit_exceeded",
+  });
+});
 
 function recordIndexEvidence(
   store: TelegramAgentStore,

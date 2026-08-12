@@ -9,7 +9,7 @@ import {
   canonicalControllerJson,
   sha256ControllerJson,
 } from "./capability-executor";
-import { SLICE_1_CONTROLLER_TOOL_NAMES } from "./capability-policy";
+import { CONTROLLER_TOOL_NAMES } from "./capability-policy";
 import {
   CONTROLLER_EVENT_PAGE_LIMIT,
   MAX_CONTROLLER_EVENT_PAGES,
@@ -45,7 +45,7 @@ export type ControllerProjectionRoots = Readonly<{
 export type ControllerEvidenceReconciliationIncomplete = "page_cap" | "source_gap";
 
 export type ControllerEvidenceReconciliation = Readonly<{
-  outcome: "reconciled" | "limit_exceeded" | "stale" | "finalized";
+  outcome: "reconciled" | "limit_exceeded" | "stale";
   reconciliationIncomplete: ControllerEvidenceReconciliationIncomplete | null;
   fromSeq: number;
   throughSeq: number;
@@ -80,7 +80,7 @@ type ReadyTurn = Readonly<{
 }>;
 
 type UnavailableTurn = Readonly<{
-  outcome: "limit_exceeded" | "stale" | "finalized";
+  outcome: "limit_exceeded" | "stale";
   turn: ControllerTurnRecord | null;
 }>;
 
@@ -149,7 +149,7 @@ type ScannedPage = Readonly<{
   rowCount: number;
 }>;
 
-const DEFAULT_HANOON_TOOL_NAMES: ReadonlySet<string> = new Set(SLICE_1_CONTROLLER_TOOL_NAMES);
+const DEFAULT_HANOON_TOOL_NAMES: ReadonlySet<string> = new Set(CONTROLLER_TOOL_NAMES);
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
 const MAX_NATIVE_ID_BYTES = 256;
 const MAX_SUBJECT_BYTES = 256;
@@ -470,7 +470,6 @@ export class ControllerEvidenceProjector {
     if (!sameControllerIdentity(controller, durableController)) return { outcome: "stale", turn: null };
     const turn = this.dependencies.store.getControllerTurn(turnId);
     if (!turn || turn.controllerKey !== controller.controllerKey) return { outcome: "stale", turn };
-    if (turn.acceptedFinalizationId !== null) return { outcome: "finalized", turn };
     if (turn.evidenceLimitExceededAt !== null) return { outcome: "limit_exceeded", turn };
     const pending = this.dependencies.store.getPendingControllerTurn(controller.controllerKey);
     if (pending?.id !== turn.id || !this.matchesSubmittedTurn(turn, controller, fence)) {

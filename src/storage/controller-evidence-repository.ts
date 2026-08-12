@@ -4,6 +4,16 @@ import {
   type ControllerLeaseFence,
   type ControllerProofKind,
 } from "../controller/models";
+import {
+  controllerFinalizationCorrection,
+  controllerFinalizationSchema,
+  renderControllerFinalization,
+  validateControllerFinalization,
+  type ControllerFinalization,
+  type ControllerFinalizationValidationContext,
+  type PersistedFinalizationRejectionCode,
+} from "../controller/finalization-contract";
+import { formattedMessage } from "../telegram/markdown";
 
 type SqliteDatabase = Database.Database;
 
@@ -35,6 +45,51 @@ export type ControllerEvidenceWrite =
   | { outcome: "duplicate"; evidence: ControllerEvidenceRecord }
   | { outcome: "limit_exceeded" }
   | { outcome: "stale" };
+
+export type AcceptedControllerFinalization = Readonly<{
+  id: number;
+  ref: `finalization:${number}`;
+  turnId: string;
+  revision: number;
+  candidate: ControllerFinalization;
+  renderedMessage: string;
+  evidenceHighWaterId: number;
+  createdAt: number;
+  validatedAt: number;
+  consumedAt: number | null;
+}>;
+
+export type ControllerFinalizationProposalResult =
+  | { outcome: "accepted"; finalization: AcceptedControllerFinalization }
+  | {
+      outcome: "rejected";
+      revision: number;
+      code: PersistedFinalizationRejectionCode;
+      correction: string;
+    }
+  | {
+      outcome: "rejected";
+      code: "accepted_already" | "revision_limit";
+      correction: string;
+    }
+  | { outcome: "stale" };
+
+export type ControllerFinalizationProposalInput = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+  candidate: unknown;
+}>;
+
+export type ControllerCompletionContinuationInput = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+  bbHighWaterSeq: number;
+}>;
+
+export type ControllerFinalizationCompletionInput = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+}>;
 
 export type ControllerEvidenceInput = ControllerLeaseFence & Readonly<{
   turnId: string;
@@ -93,6 +148,36 @@ type ControllerEvidenceRow = {
   observed_at: number;
 };
 
+type ControllerFinalizationRow = {
+  id: number;
+  turn_id: string;
+  revision: number;
+  payload_json: string;
+  rendered_message: string;
+  evidence_high_water_id: number;
+  state: string;
+  rejection_code: string | null;
+  created_at: number;
+  validated_at: number;
+  consumed_at: number | null;
+};
+
+type FinalizationTurnRow = FencedTurnRow & {
+  accepted_finalization_id: number | null;
+  evidence_limit_exceeded_at: number | null;
+  telegram_user_id: string;
+  telegram_chat_id: string;
+};
+
+type CompletionTurnRow = {
+  controller_key: string;
+  ordinal: number;
+  input_text: string;
+  accepted_finalization_id: number;
+  evidence_limit_exceeded_at: number | null;
+  telegram_chat_id: string;
+};
+
 type FencedTurnRow = {
   evidence_event_seq: number;
 };
@@ -114,6 +199,8 @@ type EvidenceInsertFields = Readonly<{
 const MAX_EVIDENCE_ROWS = 128;
 const MAX_PROOF_KINDS = 8;
 const MAX_SUBJECT_REFS = 16;
+const MAX_DIGEST_TURNS = 12;
+const MAX_DIGEST_TEXT = 600;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 const PROOF_KINDS: ReadonlySet<string> = new Set(CONTROLLER_PROOF_KINDS);
 const EVIDENCE_OUTCOMES: ReadonlySet<string> = new Set([
@@ -167,7 +254,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
   ): ControllerNativeEvidenceWrite {
     const validated = validatedNativeInput(input);
     return this.db.transaction(() => {
-      const turn = this.fencedTurn(validated);
+      const turn = this.fencedTurn(validated, true);
       if (!turn) return "stale" as const;
       if (turn.evidence_event_seq !== validated.fromSeq) return "cursor_changed" as const;
       if (this.nativeBatchHasIdentityConflict(validated)) return "native_identity_conflict" as const;
@@ -200,6 +287,158 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     return row ? parseEvidenceRow(row) : null;
   }
 
+  public proposeFinalization(
+    input: ControllerFinalizationProposalInput,
+  ): ControllerFinalizationProposalResult {
+    assertFence(input);
+    assertBoundedString(input.controllerKey, "controllerKey");
+    return this.db.transaction((): ControllerFinalizationProposalResult => {
+      const turn = this.finalizationTurn(input);
+      if (!turn) return { outcome: "stale" };
+      if (turn.accepted_finalization_id !== null) return rejectedWithoutRevision("accepted_already");
+      const revisionCount = this.finalizationRevisionCount(input.turnId);
+      if (revisionCount >= 8) return rejectedWithoutRevision("revision_limit");
+      const evidenceHighWaterId = this.evidenceHighWaterId(input.turnId);
+      const context = this.finalizationValidationContext(input, turn, revisionCount);
+      const validation = validateControllerFinalization(input.candidate, context);
+      const revision = revisionCount + 1;
+      if (validation.outcome === "rejected") {
+        const code = persistedRejectionCode(validation.code);
+        this.insertFinalizationRevision({
+          input,
+          revision,
+          payload: validation.storedCandidate,
+          renderedMessage: "",
+          evidenceHighWaterId,
+          state: "rejected",
+          rejectionCode: code,
+        });
+        return { outcome: "rejected", revision, code, correction: validation.correction };
+      }
+      const id = this.insertFinalizationRevision({
+        input,
+        revision,
+        payload: validation.candidate,
+        renderedMessage: validation.renderedMessage,
+        evidenceHighWaterId,
+        state: "accepted",
+        rejectionCode: null,
+      });
+      const pointed = this.db.prepare(
+        `UPDATE controller_turns SET accepted_finalization_id = ?, updated_at = ?
+          WHERE id = ? AND accepted_finalization_id IS NULL`,
+      ).run(id, input.now, input.turnId);
+      if (pointed.changes !== 1) throw new Error("Controller finalization pointer changed during acceptance");
+      return { outcome: "accepted", finalization: this.requiredAcceptedFinalization(input.turnId) };
+    }).immediate();
+  }
+
+  public getAcceptedFinalization(turnId: string): AcceptedControllerFinalization | null {
+    assertBoundedString(turnId, "turnId");
+    const pointer = this.db.prepare(
+      "SELECT accepted_finalization_id FROM controller_turns WHERE id = ?",
+    ).get(turnId) as { accepted_finalization_id: number | null } | undefined;
+    if (!pointer || pointer.accepted_finalization_id === null) return null;
+    assertPositiveInteger(pointer.accepted_finalization_id, "persisted accepted finalization pointer");
+    const row = this.db.prepare(
+      "SELECT * FROM controller_finalizations WHERE id = ?",
+    ).get(pointer.accepted_finalization_id) as ControllerFinalizationRow | undefined;
+    if (!row || row.turn_id !== turnId) throw new Error("Accepted controller finalization pointer is inconsistent");
+    const accepted = parseAcceptedFinalization(row);
+    if (accepted.evidenceHighWaterId > 0 && !this.db.prepare(
+      "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id = ?",
+    ).get(turnId, accepted.evidenceHighWaterId)) {
+      throw new Error("Accepted controller finalization evidence high-water is inconsistent");
+    }
+    return accepted;
+  }
+
+  public claimCompletionContinuation(
+    input: ControllerCompletionContinuationInput,
+  ): "claimed" | "already_claimed" | "stale" {
+    assertFence(input);
+    assertBoundedString(input.controllerKey, "controllerKey");
+    assertNonNegativeInteger(input.bbHighWaterSeq, "bbHighWaterSeq");
+    return this.db.transaction(() => {
+      if (!this.executorLeaseIsCurrent(input)) return "stale" as const;
+      const turn = this.db.prepare(
+        `SELECT completion_continuations FROM controller_turns
+          WHERE id = ? AND controller_key = ? AND state = 'submitted'
+            AND lease_owner = ? AND lease_generation = ?
+            AND accepted_finalization_id IS NULL AND evidence_event_seq = ?`,
+      ).get(
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        input.bbHighWaterSeq,
+      ) as { completion_continuations: number } | undefined;
+      if (!turn) return "stale" as const;
+      if (turn.completion_continuations !== 0) return "already_claimed" as const;
+      const claimed = this.db.prepare(
+        `UPDATE controller_turns
+            SET completion_continuations = 1, dispatch_after_seq = ?, bb_event_seq = ?,
+                evidence_event_seq = ?, stream_text = '', stream_phase = 'thinking', updated_at = ?
+          WHERE id = ? AND controller_key = ? AND state = 'submitted'
+            AND lease_owner = ? AND lease_generation = ?
+            AND accepted_finalization_id IS NULL AND completion_continuations = 0
+            AND evidence_event_seq = ?`,
+      ).run(
+        input.bbHighWaterSeq,
+        input.bbHighWaterSeq,
+        input.bbHighWaterSeq,
+        input.now,
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        input.bbHighWaterSeq,
+      );
+      return claimed.changes === 1 ? "claimed" as const : "stale" as const;
+    }).immediate();
+  }
+
+  public completeFromFinalization(
+    input: ControllerFinalizationCompletionInput,
+  ): "completed" | "stale" | "evidence_advanced" {
+    assertFence(input);
+    assertBoundedString(input.controllerKey, "controllerKey");
+    return this.db.transaction(() => {
+      if (!this.executorLeaseIsCurrent(input)) return "stale" as const;
+      const turn = this.completionTurn(input);
+      if (!turn) return "stale" as const;
+      const accepted = this.getAcceptedFinalization(input.turnId);
+      if (!accepted || accepted.id !== turn.accepted_finalization_id || accepted.consumedAt !== null) {
+        return "stale" as const;
+      }
+      const laterEvidence = this.db.prepare(
+        "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id > ? LIMIT 1",
+      ).get(input.turnId, accepted.evidenceHighWaterId);
+      if (turn.evidence_limit_exceeded_at !== null || laterEvidence) return "evidence_advanced" as const;
+      const completed = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'completed', response_text = ?, stream_text = ?,
+                stream_phase = 'complete', last_error = NULL, completed_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'submitted' AND accepted_finalization_id = ?`,
+      ).run(
+        accepted.renderedMessage,
+        accepted.renderedMessage,
+        input.now,
+        input.now,
+        input.turnId,
+        accepted.id,
+      );
+      if (completed.changes !== 1) return "stale" as const;
+      this.appendCompletionDigest(turn, accepted, input.now);
+      const consumed = this.db.prepare(
+        "UPDATE controller_finalizations SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+      ).run(input.now, accepted.id);
+      if (consumed.changes !== 1) throw new Error("Accepted controller finalization consumption raced");
+      this.persistCompletionOutbox(input.turnId, turn.telegram_chat_id, accepted.renderedMessage, input.now);
+      return "completed" as const;
+    }).immediate();
+  }
+
   private executorLeaseIsCurrent(input: ControllerLeaseFence): boolean {
     return this.db.prepare(
       `SELECT 1 FROM executor_lease
@@ -208,20 +447,245 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     ).get(input.ownerId, input.generation, input.now) !== undefined;
   }
 
+  private finalizationTurn(input: ControllerFinalizationProposalInput): FinalizationTurnRow | undefined {
+    if (!this.executorLeaseIsCurrent(input)) return undefined;
+    return this.db.prepare(
+      `SELECT turn.evidence_event_seq, turn.accepted_finalization_id,
+              turn.evidence_limit_exceeded_at, controller.telegram_user_id,
+              controller.telegram_chat_id
+         FROM controller_turns AS turn
+         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+        WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+          AND turn.lease_owner = ? AND turn.lease_generation = ?`,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+    ) as FinalizationTurnRow | undefined;
+  }
+
+  private completionTurn(input: ControllerFinalizationCompletionInput): CompletionTurnRow | undefined {
+    return this.db.prepare(
+      `SELECT turn.controller_key, turn.ordinal, turn.input_text,
+              turn.accepted_finalization_id, turn.evidence_limit_exceeded_at,
+              controller.telegram_chat_id
+         FROM controller_turns AS turn
+         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+         JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+          AND owners.telegram_user_id = controller.telegram_user_id
+          AND owners.telegram_chat_id = controller.telegram_chat_id
+        WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.accepted_finalization_id IS NOT NULL`,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+    ) as CompletionTurnRow | undefined;
+  }
+
+  private appendCompletionDigest(
+    turn: CompletionTurnRow,
+    accepted: AcceptedControllerFinalization,
+    now: number,
+  ): void {
+    this.db.prepare(
+      `INSERT INTO controller_digest (controller_key, ordinal, owner_text, agent_text, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (controller_key, ordinal) DO UPDATE
+         SET owner_text = excluded.owner_text, agent_text = excluded.agent_text`,
+    ).run(
+      turn.controller_key,
+      turn.ordinal,
+      turn.input_text.slice(0, MAX_DIGEST_TEXT),
+      accepted.renderedMessage.slice(0, MAX_DIGEST_TEXT),
+      now,
+    );
+    this.db.prepare(
+      `DELETE FROM controller_digest
+        WHERE controller_key = ? AND ordinal <= (
+          SELECT MAX(ordinal) - ? FROM controller_digest WHERE controller_key = ?
+        )`,
+    ).run(turn.controller_key, MAX_DIGEST_TURNS, turn.controller_key);
+  }
+
+  private persistCompletionOutbox(
+    turnId: string,
+    chatId: string,
+    renderedMessage: string,
+    now: number,
+  ): void {
+    const payloadJson = JSON.stringify({
+      ...formattedMessage(renderedMessage),
+      disable_web_page_preview: true,
+    });
+    this.db.prepare(
+      `INSERT INTO outbox (
+         logical_key, chat_id, message_id, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)
+       ON CONFLICT(logical_key) DO UPDATE SET
+         chat_id = excluded.chat_id,
+         payload_json = excluded.payload_json,
+         status = 'pending', attempts = 0,
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = NULL, updated_at = excluded.updated_at`,
+    ).run(`controller:${turnId}:reply`, chatId, payloadJson, now, now, now);
+  }
+
+  private finalizationRevisionCount(turnId: string): number {
+    return (this.db.prepare(
+      "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = ?",
+    ).get(turnId) as { count: number }).count;
+  }
+
+  private evidenceHighWaterId(turnId: string): number {
+    const row = this.db.prepare(
+      "SELECT COALESCE(MAX(id), 0) AS id FROM controller_evidence WHERE turn_id = ?",
+    ).get(turnId) as { id: number };
+    assertNonNegativeInteger(row.id, "controller evidence high-water id");
+    return row.id;
+  }
+
+  private finalizationValidationContext(
+    input: ControllerFinalizationProposalInput,
+    turn: FinalizationTurnRow,
+    revisionCount: number,
+  ): ControllerFinalizationValidationContext {
+    const evidence = this.list(input.turnId, MAX_EVIDENCE_ROWS);
+    const evidenceByRef = new Map(evidence.map((row) => [row.ref, {
+      ref: row.ref,
+      outcome: row.outcome,
+      proofKinds: row.proofKinds,
+      subjectRefs: row.subjectRefs,
+    }]));
+    const ownerBoundaryPresent = this.ownerBoundaryPresent(input, turn);
+    return {
+      acceptedAlready: false,
+      revisionCount,
+      evidenceLimitExceeded: turn.evidence_limit_exceeded_at !== null,
+      evidenceByRef,
+      ownerBoundaryPresent,
+      liveObligationRefs: this.liveObligationRefs(input.controllerKey),
+    };
+  }
+
+  private ownerBoundaryPresent(
+    input: ControllerFinalizationProposalInput,
+    turn: FinalizationTurnRow,
+  ): boolean {
+    const question = this.db.prepare(
+      `SELECT 1 FROM controller_questions
+        WHERE turn_id = ? AND controller_key = ? AND state = 'pending' LIMIT 1`,
+    ).get(input.turnId, input.controllerKey);
+    if (question) return true;
+    const operation = this.db.prepare(
+      `SELECT 1 FROM thread_operations
+        WHERE owner_user_id = ? AND owner_chat_id = ?
+          AND state = 'awaiting_confirmation' AND expires_at > ? LIMIT 1`,
+    ).get(turn.telegram_user_id, turn.telegram_chat_id, input.now);
+    if (operation) return true;
+    const awaitingJob = this.db.prepare(
+      `SELECT 1 FROM jobs AS job
+        WHERE job.state = 'awaiting_confirmation'
+          AND NOT EXISTS (
+            SELECT 1 FROM job_admissions AS admission
+             WHERE admission.job_id = job.id
+          )
+        LIMIT 1`,
+    ).get();
+    if (awaitingJob) return true;
+    return this.db.prepare(
+      `SELECT 1 FROM approvals AS approval
+         JOIN jobs AS job ON job.id = approval.job_id
+        WHERE job.state = 'awaiting_merge_approval'
+          AND job.pr_head_sha = approval.head_sha
+          AND approval.job_version = job.version
+          AND approval.consumed_at IS NULL AND approval.expires_at > ?
+          AND approval.owner_user_id = ? AND approval.owner_chat_id = ?
+        LIMIT 1`,
+    ).get(input.now, turn.telegram_user_id, turn.telegram_chat_id) !== undefined;
+  }
+
+  private liveObligationRefs(controllerKey: string): ReadonlySet<string> {
+    const refs = new Set<string>();
+    const jobs = this.db.prepare(
+      `SELECT id FROM jobs
+        WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')`,
+    ).all() as { id: string }[];
+    for (const job of jobs) refs.add(`job:${job.id}`);
+    const monitors = this.db.prepare(
+      `SELECT id FROM monitors
+        WHERE controller_key = ? AND state = 'armed' AND system_key IS NULL`,
+    ).all(controllerKey) as { id: string }[];
+    for (const monitor of monitors) refs.add(`monitor:${monitor.id}`);
+    const delegations = this.db.prepare(
+      `SELECT delegation.id FROM delegations AS delegation
+        WHERE delegation.controller_key = ? AND delegation.state = 'open'
+          AND delegation.sealed_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM delegation_threads AS member
+             WHERE member.delegation_id = delegation.id AND member.state = 'running'
+          )`,
+    ).all(controllerKey) as { id: string }[];
+    for (const delegation of delegations) refs.add(`delegation:${delegation.id}`);
+    return refs;
+  }
+
+  private insertFinalizationRevision(input: Readonly<{
+    input: ControllerFinalizationProposalInput;
+    revision: number;
+    payload: ControllerFinalization;
+    renderedMessage: string;
+    evidenceHighWaterId: number;
+    state: "accepted" | "rejected";
+    rejectionCode: PersistedFinalizationRejectionCode | null;
+  }>): number {
+    const inserted = this.db.prepare(
+      `INSERT INTO controller_finalizations (
+         turn_id, revision, payload_json, rendered_message, evidence_high_water_id,
+         state, rejection_code, created_at, validated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.input.turnId,
+      input.revision,
+      JSON.stringify(input.payload),
+      input.renderedMessage,
+      input.evidenceHighWaterId,
+      input.state,
+      input.rejectionCode,
+      input.input.now,
+      input.input.now,
+    );
+    const id = Number(inserted.lastInsertRowid);
+    assertPositiveInteger(id, "inserted finalization id");
+    return id;
+  }
+
+  private requiredAcceptedFinalization(turnId: string): AcceptedControllerFinalization {
+    const accepted = this.getAcceptedFinalization(turnId);
+    if (!accepted) throw new Error("Accepted controller finalization disappeared after insert");
+    return accepted;
+  }
+
   private fencedTurn(
     input: ControllerLeaseFence & Readonly<{ turnId: string; controllerKey: string }>,
+    allowAcceptedFinalization = false,
   ): FencedTurnRow | undefined {
     if (!this.executorLeaseIsCurrent(input)) return undefined;
     return this.db.prepare(
       `SELECT evidence_event_seq FROM controller_turns
         WHERE id = ? AND controller_key = ? AND state = 'submitted'
           AND lease_owner = ? AND lease_generation = ?
-          AND accepted_finalization_id IS NULL`,
+          AND (? = 1 OR accepted_finalization_id IS NULL)`,
     ).get(
       input.turnId,
       input.controllerKey,
       input.ownerId,
       input.generation,
+      allowAcceptedFinalization ? 1 : 0,
     ) as FencedTurnRow | undefined;
   }
 
@@ -238,7 +702,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       `UPDATE controller_turns
           SET evidence_limit_exceeded_at = COALESCE(evidence_limit_exceeded_at, ?), updated_at = ?
         WHERE id = ? AND controller_key = ? AND state = 'submitted'
-          AND lease_owner = ? AND lease_generation = ? AND accepted_finalization_id IS NULL`,
+          AND lease_owner = ? AND lease_generation = ?`,
     ).run(
       input.now,
       input.now,
@@ -336,7 +800,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       `UPDATE controller_turns SET evidence_event_seq = ?, updated_at = ?
         WHERE id = ? AND controller_key = ? AND state = 'submitted'
           AND lease_owner = ? AND lease_generation = ?
-          AND accepted_finalization_id IS NULL AND evidence_event_seq = ?`,
+          AND evidence_event_seq = ?`,
     ).run(
       input.throughSeq,
       input.now,
@@ -452,6 +916,57 @@ function parseEvidenceRow(row: ControllerEvidenceRow): ControllerEvidenceRecord 
     subjectRefs: validatedFields.subjectRefs,
     observedAt: row.observed_at,
   };
+}
+
+function parseAcceptedFinalization(row: ControllerFinalizationRow): AcceptedControllerFinalization {
+  assertPositiveInteger(row.id, "persisted finalization id");
+  assertBoundedString(row.turn_id, "persisted finalization turnId");
+  assertPositiveInteger(row.revision, "persisted finalization revision");
+  assertNonNegativeInteger(row.evidence_high_water_id, "persisted finalization evidence high-water id");
+  assertNonNegativeInteger(row.created_at, "persisted finalization createdAt");
+  assertNonNegativeInteger(row.validated_at, "persisted finalization validatedAt");
+  if (row.consumed_at !== null) assertNonNegativeInteger(row.consumed_at, "persisted finalization consumedAt");
+  if (row.state !== "accepted" || row.rejection_code !== null) {
+    throw new Error("Accepted controller finalization has an inconsistent state");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.payload_json);
+  } catch {
+    throw new Error("Accepted controller finalization payload is malformed");
+  }
+  const candidate = controllerFinalizationSchema.safeParse(parsed);
+  if (!candidate.success) throw new Error("Accepted controller finalization payload is invalid");
+  if (renderControllerFinalization(candidate.data) !== row.rendered_message) {
+    throw new Error("Accepted controller finalization rendered text is inconsistent");
+  }
+  return {
+    id: row.id,
+    ref: `finalization:${row.id}`,
+    turnId: row.turn_id,
+    revision: row.revision,
+    candidate: candidate.data,
+    renderedMessage: row.rendered_message,
+    evidenceHighWaterId: row.evidence_high_water_id,
+    createdAt: row.created_at,
+    validatedAt: row.validated_at,
+    consumedAt: row.consumed_at,
+  };
+}
+
+function rejectedWithoutRevision(
+  code: "accepted_already" | "revision_limit",
+): ControllerFinalizationProposalResult {
+  return { outcome: "rejected", code, correction: controllerFinalizationCorrection(code) };
+}
+
+function persistedRejectionCode(
+  code: Parameters<typeof controllerFinalizationCorrection>[0],
+): PersistedFinalizationRejectionCode {
+  if (code === "accepted_already" || code === "revision_limit") {
+    throw new Error("Non-persisted finalization rejection escaped repository prechecks");
+  }
+  return code;
 }
 
 function parsedSourceKind(value: string): ControllerEvidenceRecord["sourceKind"] {

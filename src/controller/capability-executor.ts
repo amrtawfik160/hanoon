@@ -229,7 +229,7 @@ export function authorizeControllerCapability(
   const fenceCurrent = submittedTurn && turn.leaseOwner !== null && turn.leaseGeneration !== null
     ? dependencies.store.isExecutorLeaseCurrent(turn.leaseOwner, turn.leaseGeneration, now)
     : false;
-  const decision = decideControllerCapability({
+  const authority = {
     policyReadable: input.policyReadable ?? true,
     durableController: controller !== null && controller.state === "active",
     currentTurn: submittedTurn,
@@ -241,8 +241,15 @@ export function authorizeControllerCapability(
     approval: input.approval ?? "not_required",
     credentialAudienceMatches: input.credentialAudienceMatches ?? credentialMatches(dependencies, input.descriptor),
     fenceCurrent,
-  }, input.descriptor);
-  if (decision.outcome === "denied") throw new ControllerCapabilityAuthorizationError(decision.code);
+  } as const;
+  const preliminaryDecision = decideControllerCapability(authority, input.descriptor);
+  if (preliminaryDecision.outcome === "denied") {
+    throw new ControllerCapabilityAuthorizationError(preliminaryDecision.code);
+  }
+  const turnFinalized = turn !== null &&
+    dependencies.store.getAcceptedControllerFinalization(turn.id) !== null;
+  const finalDecision = decideControllerCapability({ ...authority, turnFinalized }, input.descriptor);
+  if (finalDecision.outcome === "denied") throw new ControllerCapabilityAuthorizationError(finalDecision.code);
   if (!controller || !turn || !turn.leaseOwner || turn.leaseGeneration === null) {
     throw new ControllerCapabilityAuthorizationError("turn_missing");
   }
