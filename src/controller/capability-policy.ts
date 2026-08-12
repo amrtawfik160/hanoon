@@ -623,7 +623,6 @@ function validateManifest(): void {
   }
 }
 
-Object.freeze(CONTROLLER_PROOF_KINDS);
 validateManifest();
 
 export function controllerCapability(name: ControllerToolName): ControllerCapabilityDescriptor {

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   CONTROLLER_CAPABILITIES,
@@ -425,6 +426,29 @@ function authorityWith(
 }
 
 describe("controller capability manifest", () => {
+  it("does not mutate the proof vocabulary owned by controller models", () => {
+    const inspection = JSON.parse(execFileSync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `const models = await import("./src/controller/models.ts");
+       const proofKinds = models.CONTROLLER_PROOF_KINDS;
+       const frozenBefore = Object.isFrozen(proofKinds);
+       const valueBefore = JSON.stringify(proofKinds);
+       await import("./src/controller/capability-policy.ts");
+       process.stdout.write(JSON.stringify({
+         frozenBefore,
+         frozenAfter: Object.isFrozen(proofKinds),
+         valueUnchanged: JSON.stringify(proofKinds) === valueBefore,
+       }));`,
+    ], { encoding: "utf8" }));
+
+    expect(inspection).toEqual({
+      frozenBefore: false,
+      frozenAfter: false,
+      valueUnchanged: true,
+    });
+  });
+
   it("pins the complete Slice 1 tool and data-class vocabularies", () => {
     expect(SLICE_1_CONTROLLER_TOOL_NAMES).toEqual([
       "telegram_agent_list_projects",
