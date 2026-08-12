@@ -2,6 +2,22 @@ import type { SupervisorReason } from "./supervisor";
 
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
+export const CONTROLLER_PROOF_KINDS = [
+  "project_state",
+  "job_state",
+  "thread_state",
+  "monitor_state",
+  "memory_state",
+  "command_result",
+  "tool_result",
+  "workspace_change",
+  "external_mutation",
+  "pipeline_outcome",
+  "obligation",
+  "retrieved_content",
+  "health_snapshot",
+] as const;
+export type ControllerProofKind = (typeof CONTROLLER_PROOF_KINDS)[number];
 export const CONTROLLER_IMAGE_MIME_TYPES = [
   "image/jpeg",
   "image/png",
@@ -52,6 +68,10 @@ export type ControllerTurnRecord = {
   dispatchAfterSeq: number;
   retryCount: number;
   bbEventSeq: number;
+  evidenceEventSeq?: number;
+  completionContinuations?: number;
+  acceptedFinalizationId?: number | null;
+  evidenceLimitExceededAt?: number | null;
   streamText: string;
   telegramMessageId: number | null;
   streamPhase: ControllerStreamPhase;

@@ -750,6 +750,55 @@ CREATE TABLE production_health (
 );
 `] as const;
 
+export const CONTROLLER_TRUST_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN evidence_event_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN completion_continuations INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN accepted_finalization_id INTEGER;
+ALTER TABLE controller_turns ADD COLUMN evidence_limit_exceeded_at INTEGER;
+
+CREATE TABLE controller_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('hanoon_tool', 'bb_item')),
+  source_name TEXT NOT NULL,
+  source_item_id TEXT,
+  outcome TEXT NOT NULL CHECK (outcome IN ('observed', 'succeeded', 'failed', 'interrupted', 'denied')),
+  args_sha256 TEXT NOT NULL,
+  result_sha256 TEXT NOT NULL,
+  proof_kinds_json TEXT NOT NULL,
+  subject_refs_json TEXT NOT NULL,
+  observed_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX controller_evidence_native_item
+  ON controller_evidence(turn_id, source_kind, source_item_id)
+  WHERE source_kind = 'bb_item' AND source_item_id IS NOT NULL;
+CREATE INDEX controller_evidence_turn_id ON controller_evidence(turn_id, id);
+
+CREATE TABLE controller_finalizations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  revision INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  rendered_message TEXT NOT NULL,
+  evidence_high_water_id INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('accepted', 'rejected')),
+  rejection_code TEXT,
+  created_at INTEGER NOT NULL,
+  validated_at INTEGER NOT NULL,
+  consumed_at INTEGER,
+  UNIQUE(turn_id, revision),
+  CHECK (
+    (state = 'accepted' AND rejection_code IS NULL) OR
+    (state = 'rejected' AND rejection_code IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX one_accepted_controller_finalization
+  ON controller_finalizations(turn_id) WHERE state = 'accepted';
+CREATE INDEX controller_finalizations_turn
+  ON controller_finalizations(turn_id, revision);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -779,4 +828,5 @@ export const ALL_MIGRATIONS = [
   ...DELEGATION_SEAL_MIGRATIONS,
   ...TURN_ORIGIN_MIGRATIONS,
   ...PRODUCTION_HEALTH_MIGRATIONS,
+  ...CONTROLLER_TRUST_MIGRATIONS,
 ] as const;
