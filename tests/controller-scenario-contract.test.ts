@@ -86,6 +86,14 @@ describe("controller scenario contract", () => {
     })).toThrow(/duplicate/i);
   });
 
+  it("rejects a leap day that does not exist in the generatedAt calendar", () => {
+    expect(() => aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-02-29T00:00:00Z",
+      trials: [baseTrial],
+    })).toThrow(/generatedAt/);
+  });
+
   it("reports hand-derived scenario summaries and keeps diagnostic failures non-authoritative", () => {
     const report = aggregateControllerEvaluation({
       label: "fixed",
