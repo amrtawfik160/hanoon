@@ -298,7 +298,7 @@ it("keeps one durable Telegram message id from controller placeholder through li
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     messageId: 501,
     status: "pending",
-    payload: { text: "Hello" },
+    payload: { text: "Luna Max is responding…" },
   });
   const edit = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
   expect(edit).toHaveLength(1);
@@ -372,6 +372,33 @@ it("rejects credential-shaped controller failure text", () => {
     error: "token=do-not-persist",
   })).toThrow(/credential/i);
   expect(store.listControllerTurns("owner-7-controller", 10)[0]?.state).toBe("dispatching");
+});
+
+it("fails and retires a submitted controller turn in one fenced operation", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(402));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_atomic_failure",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
+
+  expect(store.failAndRetireControllerTurn({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_atomic_failure",
+    error: "Controller evidence could not be sealed",
+  })).toBe(true);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
+    .toBe("I couldn't complete that controller turn safely. Please resend your request.");
 });
 
 it("sends a controller answer as Telegram HTML so its formatting renders", () => {

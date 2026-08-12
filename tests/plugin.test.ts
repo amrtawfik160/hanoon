@@ -182,17 +182,42 @@ it("wires submitted controller turns through the leased job executor", async () 
     threadId: "thr_controller",
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: "setup", generation: lease.generation, now: Date.now() })).toBe(true);
+  const accepted = store.proposeControllerFinalization({
+    ownerId: "setup",
+    generation: lease.generation,
+    now: Date.now(),
+    turnId: turn.id,
+    controllerKey: "owner-7-controller",
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "Hello from Luna." }],
+      obligationRefs: [],
+    },
+  });
+  expect(accepted.outcome).toBe("accepted");
   expect(store.releaseExecutorLease("setup", lease.generation, Date.now())).toBe(true);
   harness.sdk.stub("threads.get", async () => makeThreadResponse({
     id: "thr_controller",
     projectId: "proj_personal",
+    environmentId: "env_personal",
     status: "idle",
     providerId: "claude-code",
   }));
-  harness.sdk.stub("threads.output", async () => ({ output: "Hello from Luna." }));
+  harness.sdk.stub("environments.get", async () => ({
+    id: "env_personal",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    status: "ready",
+    workspaceProvisionType: "personal",
+    path: "/personal",
+  }));
+  harness.sdk.stub("threads.timeline", async () => ({ maxSeq: 0 }));
+  harness.sdk.stub("threads.events.list", async () => []);
 
   const run = harness.behavior.runService("job-executor");
-  await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe("Hello from Luna."));
+  await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe(
+    accepted.outcome === "accepted" ? accepted.finalization.renderedMessage : undefined,
+  ));
   run.controller.abort();
   await run.done;
   vi.unstubAllGlobals();

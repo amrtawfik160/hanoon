@@ -40,6 +40,7 @@ import { ALL_MIGRATIONS } from "./migrations";
 import {
   CONTROLLER_IMAGE_MIME_TYPES,
   MAX_CONTROLLER_IMAGE_BYTES,
+  CONTROLLER_PHASE_TEXT,
   type ControllerImage,
   type ControllerLeaseFence,
   type ControllerThreadRecord,
@@ -1706,12 +1707,11 @@ export interface TelegramAgentStore {
   updateControllerStream(input: ControllerLeaseFence & {
     turnId: string;
     cursor: number;
-    text: string;
     phase: ControllerTurnRecord["streamPhase"];
     toolCalls?: number;
     commandFailures?: number;
     totalTokens?: number;
-  }): boolean;
+  } & Record<string, unknown>): boolean;
   recordControllerSupervisorSteer(input: ControllerLeaseFence & {
     turnId: string;
     reason: SupervisorReason;
@@ -1770,6 +1770,13 @@ export interface TelegramAgentStore {
     controllerKey: string;
     expectedThreadId: string;
     reason?: string;
+  }): boolean;
+  failAndRetireControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+    error: string;
+    ownerMessage?: string;
   }): boolean;
   completeControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
@@ -2247,7 +2254,7 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     completionContinuations,
     acceptedFinalizationId,
     evidenceLimitExceededAt,
-    streamText: row.stream_text,
+    streamText: CONTROLLER_PHASE_TEXT[row.stream_phase],
     telegramMessageId: row.telegram_message_id,
     streamPhase: row.stream_phase,
     responseText: row.response_text,
@@ -3188,7 +3195,81 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     turnId: string;
     controllerKey: string;
   }): "completed" | "stale" | "evidence_advanced" {
-    return this.controllerEvidenceRepository.completeFromFinalization(input);
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    return this.db.transaction(() => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale" as const;
+      const turn = this.db.prepare(
+        `SELECT turn.controller_key, turn.ordinal, turn.input_text,
+                turn.accepted_finalization_id, turn.evidence_limit_exceeded_at,
+                controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+            AND turn.lease_owner = ? AND turn.lease_generation = ?
+            AND turn.accepted_finalization_id IS NOT NULL
+            AND controller.state = 'active'`,
+      ).get(
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+      ) as {
+        controller_key: string;
+        ordinal: number;
+        input_text: string;
+        accepted_finalization_id: number;
+        evidence_limit_exceeded_at: number | null;
+        telegram_chat_id: string;
+      } | undefined;
+      if (!turn) return "stale" as const;
+      const accepted = this.controllerEvidenceRepository.getAcceptedFinalization(input.turnId);
+      if (!accepted || accepted.id !== turn.accepted_finalization_id || accepted.consumedAt !== null) {
+        return "stale" as const;
+      }
+      const laterEvidence = this.db.prepare(
+        "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id > ? LIMIT 1",
+      ).get(input.turnId, accepted.evidenceHighWaterId);
+      if (turn.evidence_limit_exceeded_at !== null || laterEvidence) return "evidence_advanced" as const;
+      const completed = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'completed', response_text = ?, stream_text = '',
+                stream_phase = 'complete', last_error = NULL, completed_at = ?, updated_at = ?
+          WHERE id = ? AND controller_key = ? AND state = 'submitted'
+            AND lease_owner = ? AND lease_generation = ?
+            AND accepted_finalization_id = ?`,
+      ).run(
+        accepted.renderedMessage,
+        input.now,
+        input.now,
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        accepted.id,
+      );
+      if (completed.changes !== 1) return "stale" as const;
+      this.appendControllerDigestRow({
+        controllerKey: turn.controller_key,
+        ordinal: turn.ordinal,
+        ownerText: turn.input_text,
+        agentText: accepted.renderedMessage,
+        now: input.now,
+      });
+      const consumed = this.db.prepare(
+        "UPDATE controller_finalizations SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+      ).run(input.now, accepted.id);
+      if (consumed.changes !== 1) throw new Error("Accepted controller finalization consumption raced");
+      persistControllerOutbox(this.db, {
+        logicalKey: `controller:${input.turnId}:reply`,
+        chatId: turn.telegram_chat_id,
+        payload: { text: accepted.renderedMessage, disable_web_page_preview: true },
+      }, input.now);
+      return "completed" as const;
+    }).immediate();
   }
 
   public claimNextControllerTurn(
@@ -3380,7 +3461,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const outbox: OutboxInput = {
         logicalKey: `controller:${row.id}:reply`,
         chatId: row.telegram_chat_id,
-        payload: { text: "Connecting to Luna Max…", disable_web_page_preview: true },
+        payload: { text: CONTROLLER_PHASE_TEXT.connecting, disable_web_page_preview: true },
       };
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
@@ -3421,6 +3502,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE controller_key = ? AND bb_thread_id = ? AND state = 'active'`,
       ).run(input.now, input.controllerKey, input.expectedThreadId);
       if (controller.changes !== 1) throw new Error("Controller generation changed during unaccepted retry");
+      const chat = this.db.prepare(
+        `SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?`,
+      ).get(input.controllerKey) as { telegram_chat_id: string } | undefined;
+      if (!chat) throw new Error("Controller mapping disappeared during unaccepted retry");
+      persistControllerOutbox(this.db, {
+        logicalKey: `controller:${input.turnId}:reply`,
+        chatId: chat.telegram_chat_id,
+        payload: { text: CONTROLLER_PHASE_TEXT.connecting, disable_web_page_preview: true },
+      }, input.now);
       return true;
     }).immediate();
   }
@@ -3428,18 +3518,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public updateControllerStream(input: ControllerLeaseFence & {
     turnId: string;
     cursor: number;
-    text: string;
     phase: ControllerTurnRecord["streamPhase"];
     toolCalls?: number;
     commandFailures?: number;
     totalTokens?: number;
-  }): boolean {
+  } & Record<string, unknown>): boolean {
     this.assertControllerMutation(input);
     assertNonNegativeInteger(input.cursor, "cursor");
     assertNonNegativeInteger(input.toolCalls ?? 0, "toolCalls");
     assertNonNegativeInteger(input.commandFailures ?? 0, "commandFailures");
     assertNonNegativeInteger(input.totalTokens ?? 0, "totalTokens");
-    assertControllerText(input.text || "Controller stream is empty", "controller stream");
     const phases = new Set<ControllerTurnRecord["streamPhase"]>([
       "queued", "connecting", "thinking", "using_tools", "responding", "complete", "failed",
     ]);
@@ -3470,7 +3558,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE id = ? AND state = 'submitted' AND bb_event_seq < ?`,
       ).run(
         input.cursor,
-        input.text,
+        CONTROLLER_PHASE_TEXT[input.phase],
         input.phase,
         input.now,
         input.toolCalls ?? 0,
@@ -3481,7 +3569,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.cursor,
       );
       if (updated.changes !== 1) return false;
-      const displayText = input.text || (input.phase === "thinking" ? "Luna Max is thinking…" : "Connecting to Luna Max…");
+      const displayText = CONTROLLER_PHASE_TEXT[input.phase];
       const outbox: OutboxInput = {
         logicalKey: `controller:${input.turnId}:reply`,
         chatId: row.telegram_chat_id,
@@ -4022,6 +4110,87 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         ).run(input.now, (input.reason ?? "retired").slice(0, 200), input.controllerKey, input.expectedThreadId);
       }
       return retired;
+    }).immediate();
+  }
+
+  public failAndRetireControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+    error: string;
+    ownerMessage?: string;
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    assertSafeFailureSummary(input.error);
+    assertNoRawMergeCallback(input.error, "controller error");
+    if (input.ownerMessage !== undefined) {
+      assertControllerText(input.ownerMessage, "controller failure message");
+      assertNoRawMergeCallback(input.ownerMessage, "controller failure message");
+    }
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.*, controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ? AND turn.controller_key = ?
+            AND turn.state IN ('dispatching', 'submitted')
+            AND turn.lease_owner = ? AND turn.lease_generation = ?
+            AND controller.bb_thread_id = ?` ,
+      ).get(
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        input.expectedThreadId,
+      ) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
+      if (!row) return false;
+      const failed = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
+                completed_at = ?, updated_at = ?
+          WHERE id = ? AND controller_key = ?
+            AND state IN ('dispatching', 'submitted')
+            AND lease_owner = ? AND lease_generation = ?`,
+      ).run(
+        input.error,
+        input.now,
+        input.now,
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+      );
+      if (failed.changes !== 1) return false;
+      const retired = this.db.prepare(
+        `UPDATE controller_threads
+            SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+                state = 'pending_spawn', pending_spawn_token = NULL,
+                last_error = NULL, updated_at = ?
+          WHERE controller_key = ? AND bb_thread_id = ?`,
+      ).run(input.now, input.controllerKey, input.expectedThreadId);
+      if (retired.changes !== 1) throw new Error("Controller generation changed during failure retirement");
+      const ended = this.db.prepare(
+        `UPDATE controller_generations SET ended_at = ?, end_reason = ?
+          WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL`,
+      ).run(
+        input.now,
+        input.error.slice(0, 200),
+        input.controllerKey,
+        input.expectedThreadId,
+      );
+      if (ended.changes !== 1) throw new Error("Controller generation disappeared during failure retirement");
+      persistControllerOutbox(
+        this.db,
+        controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.ownerMessage),
+        input.now,
+      );
+      return true;
     }).immediate();
   }
 

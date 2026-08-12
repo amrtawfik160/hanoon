@@ -41,6 +41,16 @@ export type ControllerStreamPhase =
   | "complete"
   | "failed";
 
+export const CONTROLLER_PHASE_TEXT: Readonly<Record<ControllerStreamPhase, string>> = {
+  queued: "",
+  connecting: "Connecting to Luna Max…",
+  thinking: "Luna Max is thinking…",
+  using_tools: "Luna Max is using tools…",
+  responding: "Luna Max is responding…",
+  complete: "",
+  failed: "",
+};
+
 export type ControllerThreadRecord = {
   controllerKey: string;
   telegramUserId: string;

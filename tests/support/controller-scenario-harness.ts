@@ -69,7 +69,7 @@ export function loadControllerScenarioCorpus(): ReturnType<typeof parseControlle
 
 function scriptedAdapter(
   observeToolCall: () => Promise<boolean>,
-  reply: () => Promise<string>,
+  finalizeTurn: () => Promise<void>,
 ): ControllerAdapter {
   return {
     spawn: async () => ({ threadId: "thr_fixed_controller", projectId: "proj_fixed", hostId: "host_fixed" }),
@@ -77,14 +77,15 @@ function scriptedAdapter(
     steer: async () => undefined,
     answerQuestion: async () => undefined,
     status: async () => "idle",
-    output: reply,
     latestSeq: async () => 0,
     events: async () => {
       const toolCalls = await observeToolCall() ? 1 : 0;
+      await finalizeTurn();
       return {
         latestSeq: 1,
         inputAccepted: true,
-        assistantDelta: "",
+        assistantOutputObserved: true,
+        toolActivityObserved: toolCalls > 0,
         completed: true,
         error: null,
         pendingQuestion: null,
@@ -146,7 +147,8 @@ async function runScenario(
   store.createPairingCode(hashSecret(`pair:${fixtureId}`), 1, 10_000);
   const paired = store.pairOwnerWithCode(hashSecret(`pair:${fixtureId}`), OWNER_ID, OWNER_ID, 2);
   if (!paired.ok) throw new Error("fixed scenario owner could not be paired");
-  const lease = store.acquireExecutorLease(`eval-${fixtureId}`, FIXTURE_NOW, 30_000);
+  const executionOwnerId = `eval-${fixtureId}`;
+  const lease = store.acquireExecutorLease(executionOwnerId, FIXTURE_NOW, 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
   const signal = AbortSignal.timeout(2_000);
   registerControllerTools(bb, {
@@ -166,6 +168,8 @@ async function runScenario(
   const effectsBefore = queuedJob ? store.listEffectsForJob(JOB_ID) : [];
   const observed = { jobStatus: null as JobStatusProjection | null };
   let response = "Hello from Hanoon.";
+  let activeTurnId: string | null = null;
+  let finalizationAccepted = false;
   const observeToolCall = async () => {
     if (!queuedJob) return false;
     observed.jobStatus = parseJobStatusProjection(await harness.behavior.callAgentTool(
@@ -176,7 +180,25 @@ async function runScenario(
     response = `Job ${observed.jobStatus.id} is currently ${observed.jobStatus.state}.`;
     return true;
   };
-  const adapter = scriptedAdapter(observeToolCall, async () => response);
+  const finalizeTurn = async () => {
+    if (finalizationAccepted) return;
+    if (activeTurnId === null) throw new Error("fixed scenario turn was not created before finalization");
+    const accepted = store.proposeControllerFinalization({
+      ownerId: executionOwnerId,
+      generation: lease.generation,
+      now: FIXTURE_NOW,
+      turnId: activeTurnId,
+      controllerKey: CONTROLLER_KEY,
+      candidate: {
+        disposition: "answered",
+        segments: [{ type: "text", text: response }],
+        obligationRefs: [],
+      },
+    });
+    if (accepted.outcome !== "accepted") throw new Error("fixed scenario finalization was not accepted");
+    finalizationAccepted = true;
+  };
+  const adapter = scriptedAdapter(observeToolCall, finalizeTurn);
   const service = new LunaControllerService({ store, adapter, clock: { now: () => FIXTURE_NOW } });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY,
@@ -186,7 +208,8 @@ async function runScenario(
     inputText: scenarioCase.ownerMessage,
     now: FIXTURE_NOW,
   });
-  const fence = { ownerId: `eval-${fixtureId}`, generation: lease.generation, signal };
+  activeTurnId = turn.id;
+  const fence = { ownerId: executionOwnerId, generation: lease.generation, signal };
 
   await service.processOne(fence, signal);
   await service.reconcile(fence, signal);

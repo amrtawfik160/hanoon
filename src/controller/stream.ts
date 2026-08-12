@@ -1,5 +1,5 @@
-import type { ControllerEventObservation } from "./bb-controller";
-import type { ControllerStreamPhase } from "./models";
+import type { ControllerEventObservation, ControllerEventResult } from "./bb-controller";
+import { CONTROLLER_PHASE_TEXT, type ControllerStreamPhase } from "./models";
 
 export type ControllerStreamState = {
   cursor: number;
@@ -13,9 +13,43 @@ function nextStreamPhase(
 ): ControllerStreamPhase {
   if (observation.error !== null) return "failed";
   if (observation.completed) return "complete";
-  if (observation.assistantDelta.length > 0) return "responding";
+  if (observation.assistantOutputObserved) return "responding";
+  if (observation.toolActivityObserved) return "using_tools";
   if (observation.inputAccepted) return "thinking";
   return prior;
+}
+
+export function normalizeControllerEventObservation(
+  observation: ControllerEventResult,
+): ControllerEventObservation {
+  if ("assistantOutputObserved" in observation && "toolActivityObserved" in observation &&
+      typeof observation.assistantOutputObserved === "boolean" &&
+      typeof observation.toolActivityObserved === "boolean") {
+    return {
+      latestSeq: observation.latestSeq,
+      inputAccepted: observation.inputAccepted,
+      assistantOutputObserved: observation.assistantOutputObserved,
+      toolActivityObserved: observation.toolActivityObserved,
+      completed: observation.completed,
+      error: observation.error,
+      pendingQuestion: observation.pendingQuestion,
+      toolCalls: observation.toolCalls,
+      commandFailures: observation.commandFailures,
+      totalTokens: observation.totalTokens,
+    };
+  }
+  return {
+    latestSeq: observation.latestSeq,
+    inputAccepted: observation.inputAccepted,
+    assistantOutputObserved: false,
+    toolActivityObserved: false,
+    completed: observation.completed,
+    error: observation.error,
+    pendingQuestion: observation.pendingQuestion,
+    toolCalls: observation.toolCalls,
+    commandFailures: observation.commandFailures,
+    totalTokens: observation.totalTokens,
+  };
 }
 
 export function projectControllerStream(
@@ -23,14 +57,10 @@ export function projectControllerStream(
   prior: ControllerStreamState,
 ): ControllerStreamState {
   if (observation.latestSeq <= prior.cursor) return prior;
-  const combined = `${prior.text}${observation.assistantDelta}`;
-  const characters = Array.from(combined);
-  const text = characters.length <= 3_900
-    ? combined
-    : characters.slice(characters.length - 3_900).join("");
+  const phase = nextStreamPhase(observation, prior.phase);
   return {
     cursor: observation.latestSeq,
-    text,
-    phase: nextStreamPhase(observation, prior.phase),
+    text: CONTROLLER_PHASE_TEXT[phase],
+    phase,
   };
 }

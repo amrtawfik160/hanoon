@@ -210,12 +210,13 @@ function deferredFinalization(ref: string) {
 
 function acceptPlainFinalization(
   fixture: ReturnType<typeof submittedControllerFixture>,
+  text = "The answer is complete.",
 ) {
   const accepted = fixture.store.proposeControllerFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
-    candidate: plainFinalization(),
+    candidate: plainFinalization(text),
   });
   if (accepted.outcome !== "accepted") throw new Error("finalization fixture was not accepted");
   return accepted.finalization;
@@ -335,7 +336,7 @@ it("claims one completion continuation only at the observed native cursor", () =
     dispatchAfterSeq: 7,
     bbEventSeq: 7,
     evidenceEventSeq: 7,
-    streamText: "",
+    streamText: "Luna Max is thinking…",
     streamPhase: "thinking",
   });
 });
@@ -388,7 +389,7 @@ it("completes from accepted rendered text exactly once", () => {
   expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
     state: "completed",
     responseText: accepted.renderedMessage,
-    streamText: accepted.renderedMessage,
+    streamText: "",
     streamPhase: "complete",
   });
   expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([{
@@ -401,6 +402,26 @@ it("completes from accepted rendered text exactly once", () => {
   });
   expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
     consumedAt: fixture.fence.now,
+  });
+});
+
+it("uses the rendered finalization text verbatim for completion delivery", () => {
+  const fixture = submittedControllerFixture();
+  const accepted = acceptPlainFinalization(fixture, "**Accepted** answer");
+
+  expect(fixture.store.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+  })).toBe("completed");
+  expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
+    responseText: accepted.renderedMessage,
+    streamText: "",
+  });
+  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)[0]?.agentText)
+    .toBe(accepted.renderedMessage);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({
+    payload: { text: accepted.renderedMessage },
   });
 });
 

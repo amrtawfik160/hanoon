@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 import { projectControllerStream } from "../src/controller/stream";
 
 describe("controller stream projection", () => {
-  it("appends only new assistant output and advances from thinking to responding", () => {
+  it("records assistant output as phase evidence without retaining provider prose", () => {
     const projected = projectControllerStream({
       latestSeq: 13,
       inputAccepted: true,
-      assistantDelta: "Hello world",
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
       completed: false,
       error: null,
       pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
@@ -18,7 +19,7 @@ describe("controller stream projection", () => {
 
     expect(projected).toEqual({
       cursor: 13,
-      text: "Hello world",
+      text: "Luna Max is responding…",
       phase: "responding",
     });
   });
@@ -27,7 +28,8 @@ describe("controller stream projection", () => {
     const projected = projectControllerStream({
       latestSeq: 13,
       inputAccepted: true,
-      assistantDelta: " duplicate",
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
       completed: false,
       error: null,
       pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
@@ -44,11 +46,12 @@ describe("controller stream projection", () => {
     });
   });
 
-  it("bounds preview text on Unicode character boundaries and preserves the newest output", () => {
+  it("uses deterministic tool phase text instead of provider output", () => {
     const projected = projectControllerStream({
       latestSeq: 2,
       inputAccepted: true,
-      assistantDelta: `${"a".repeat(3_900)}🙂tail`,
+      assistantOutputObserved: false,
+      toolActivityObserved: true,
       completed: false,
       error: null,
       pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
@@ -58,7 +61,10 @@ describe("controller stream projection", () => {
       phase: "thinking",
     });
 
-    expect(Array.from(projected.text)).toHaveLength(3_900);
-    expect(projected.text.endsWith("🙂tail")).toBe(true);
+    expect(projected).toEqual({
+      cursor: 2,
+      text: "Luna Max is using tools…",
+      phase: "using_tools",
+    });
   });
 });

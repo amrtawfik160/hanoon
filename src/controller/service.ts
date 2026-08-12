@@ -7,10 +7,14 @@ import {
   type ControllerStatus,
 } from "./bb-controller";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
-import { projectControllerStream } from "./stream";
+import { normalizeControllerEventObservation, projectControllerStream } from "./stream";
+import type { ControllerEventObservation } from "./bb-controller";
 import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
-import type { ControllerEvidenceReconciler } from "./evidence-projector";
+import {
+  ControllerEvidenceProjectorError,
+  type ControllerEvidenceReconciler,
+} from "./evidence-projector";
 
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
@@ -35,12 +39,8 @@ const CONTROLLER_IMAGE_FAILURE_MESSAGE =
 export const CONTROLLER_STALL_MS = 8 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
 const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
-
-function boundedResponse(value: string): string | null {
-  const text = value.trim();
-  if (text.length === 0) return null;
-  return text.length <= 4_000 ? text : text.slice(0, 3_999) + "…";
-}
+const CONTROLLER_RECOVERY_PROMPT =
+  "Your previous controller turn ended without an accepted finalization. Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";
 
 function retireReason(status: ControllerStatus): string {
   if (status === "missing") return "Thread was deleted or archived";
@@ -164,7 +164,7 @@ export class LunaControllerService {
     )) return true;
     const owner = this.dependencies.store.getOwner();
     if (!owner) return false;
-    const controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    let controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!controller?.threadId) return false;
     const pending = this.dependencies.store.getPendingControllerTurn(controller.controllerKey);
     const submitted = pending?.state === "submitted" ? pending : null;
@@ -184,26 +184,28 @@ export class LunaControllerService {
       });
     }
 
-    // An answer the owner already gave outranks anything else: until BB hears
-    // it, the thread cannot make progress and every other check is noise.
-    const ownerAnswer = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey);
-    if (ownerAnswer) {
-      try {
-        await this.dependencies.adapter.answerQuestion(
-          controller.threadId,
-          ownerAnswer.interactionId,
-          ownerAnswer.answers,
-          signal,
-        );
-      } catch {
-        return false;
-      }
-      this.dependencies.store.markControllerQuestionDelivered({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        interactionId: ownerAnswer.interactionId,
-      });
+    if (!this.dependencies.store.adoptSubmittedControllerTurnFence({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: submitted.id,
+    })) return true;
+    let turn = this.dependencies.store.getControllerTurn(submitted.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+
+    const evidenceOutcome = await this.reconcileEvidence(controller, turn, fence, signal);
+    if (evidenceOutcome === "retry") return this.handleEvidenceRetry(turn, controller, fence, signal);
+    if (evidenceOutcome === "stale") return true;
+    if (evidenceOutcome === "fatal") {
+      this.failAndRetire(turn, controller, fence, "Controller evidence could not be reconciled safely");
       return true;
     }
+    turn = this.dependencies.store.getControllerTurn(turn.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+
+    const ownerAnswer = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey);
+    if (ownerAnswer) return this.deliverOwnerAnswer(ownerAnswer, controller, fence, signal);
+    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey)) return true;
 
     let status: ControllerStatus;
     try {
@@ -211,24 +213,24 @@ export class LunaControllerService {
     } catch {
       return false;
     }
-    let observation: Awaited<ReturnType<ControllerAdapter["events"]>> | null = null;
+    let observation: ControllerEventObservation | null = null;
     try {
-      observation = await this.dependencies.adapter.events(
+      observation = normalizeControllerEventObservation(await this.dependencies.adapter.events(
         controller.threadId,
-        submitted.bbEventSeq,
+        turn.bbEventSeq,
         signal,
-      );
+      ));
+      if (!Number.isSafeInteger(observation.latestSeq) || observation.latestSeq < turn.bbEventSeq) return true;
       const projected = projectControllerStream(observation, {
-        cursor: submitted.bbEventSeq,
-        text: submitted.streamText,
-        phase: submitted.streamPhase,
+        cursor: turn.bbEventSeq,
+        text: turn.streamText,
+        phase: turn.streamPhase,
       });
-      if (projected.cursor > submitted.bbEventSeq) {
+      if (projected.cursor > turn.bbEventSeq) {
         this.dependencies.store.updateControllerStream({
           ...fenceAt(fence, this.dependencies.clock.now()),
-          turnId: submitted.id,
+          turnId: turn.id,
           cursor: projected.cursor,
-          text: projected.text,
           phase: projected.phase,
           toolCalls: observation.toolCalls,
           commandFailures: observation.commandFailures,
@@ -238,26 +240,35 @@ export class LunaControllerService {
     } catch {
       observation = null;
     }
+    if (observation === null) return false;
     if (observation?.pendingQuestion) {
       this.dependencies.store.recordControllerQuestion({
         ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId: submitted.id,
+        turnId: turn.id,
         interactionId: observation.pendingQuestion.interactionId,
         questions: observation.pendingQuestion.questions,
       });
     }
     const refreshedAt = this.dependencies.clock.now();
-    // A turn parked on a question is waiting on a person. Redrawing its draft
-    // would only replace the question with stale half-written output.
-    const parked = this.dependencies.store.getControllerTurn(submitted.id)?.awaitingInteractionId ?? null;
-    if (parked === null) {
-      this.dependencies.store.refreshControllerDraft({
-        ...fenceAt(fence, refreshedAt),
-        turnId: submitted.id,
-        sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
-      });
+    turn = this.dependencies.store.getControllerTurn(turn.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey)) return true;
+
+    const accepted = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
+    const parked = turn.awaitingInteractionId;
+    if (parked !== null) return true;
+    const answeredAfterObservation = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey);
+    if (answeredAfterObservation) {
+      return this.deliverOwnerAnswer(answeredAfterObservation, controller, fence, signal);
     }
     if (status === "active" || status === "starting" || status === "stopping") {
+      if (accepted) return true;
+      this.dependencies.store.refreshControllerDraft({
+        ...fenceAt(fence, refreshedAt),
+        turnId: turn.id,
+        sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
+      });
       // Anything the owner says while an answer is being written belongs to that
       // answer. Holding it back until the turn ends is how a correction arrives
       // too late to correct anything.
@@ -285,21 +296,13 @@ export class LunaControllerService {
       // The owner's own words outrank a budget nudge, so this runs only once
       // nothing of theirs is waiting. A turn parked on a question is waiting on
       // a person, and no budget should fire against their thinking time.
-      if (parked === null && await this.superviseBudget(submitted.id, controller, fence, signal)) {
+      if (parked === null && await this.superviseBudget(turn.id, controller, fence, signal)) {
         return true;
       }
-      if (parked === null && refreshedAt - submitted.updatedAt >= CONTROLLER_STALL_MS) {
-        // Retiring the thread is the half that matters. Failing only the turn
-        // leaves the wedge in place, and every later message then waits out the
-        // busy timeout against a thread that will never go idle.
-        this.dependencies.store.resetControllerThread({
-          ...fenceAt(fence, this.dependencies.clock.now()),
-          controllerKey: controller.controllerKey,
-          expectedThreadId: controller.threadId,
-          reason: "Thread stopped producing events mid-answer",
-        });
-        this.fail(
-          submitted,
+      if (parked === null && refreshedAt - turn.updatedAt >= CONTROLLER_STALL_MS) {
+        this.failAndRetire(
+          turn,
+          controller,
           fence,
           "Controller turn stopped producing events",
           "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
@@ -307,79 +310,209 @@ export class LunaControllerService {
       }
       return true;
     }
-    if (status === "missing") {
-      this.dependencies.store.resetControllerThread({
+    const providerError = status === "error" || observation.error !== null;
+    if (accepted && (providerError || status === "idle" || observation.completed)) {
+      return this.completeAccepted(turn, controller, fence, providerError);
+    }
+    if (providerError) {
+      if (!observation.inputAccepted && turn.retryCount === 0 && this.dependencies.store.retryUnacceptedControllerTurn({
         ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
         controllerKey: controller.controllerKey,
         expectedThreadId: controller.threadId,
-        reason: "Thread disappeared mid-answer",
-      });
-      this.fail(submitted, fence, "Controller conversation became unavailable");
+      })) return true;
+      this.failAndRetire(turn, controller, fence, "Controller provider turn failed");
       return true;
     }
-    if (status === "error") {
-      if (observation === null || submitted.bbEventSeq !== submitted.dispatchAfterSeq) {
-        try {
-          observation = await this.dependencies.adapter.events(
-            controller.threadId,
-            submitted.dispatchAfterSeq,
-            signal,
-          );
-        } catch {
-          observation = null;
-        }
-      }
-      if (observation !== null) {
-        if (!observation.inputAccepted && submitted.retryCount === 0) {
-          if (this.dependencies.store.retryUnacceptedControllerTurn({
-            ...fenceAt(fence, this.dependencies.clock.now()),
-            turnId: submitted.id,
-            controllerKey: controller.controllerKey,
-            expectedThreadId: controller.threadId,
-          })) return true;
-        }
-        // The turn window spans the whole answer here, so an answer BB already
-        // finished is delivered even though the thread itself is now unusable.
-        const answered = observation.completed && observation.error === null
-          ? boundedResponse(observation.assistantDelta)
-          : null;
-        if (answered && this.dependencies.store.completeControllerTurn({
-          ...fenceAt(fence, this.dependencies.clock.now()),
-          turnId: submitted.id,
-          responseText: answered,
-        })) {
-          this.dependencies.store.resetControllerThread({
-            ...fenceAt(fence, this.dependencies.clock.now()),
-            controllerKey: controller.controllerKey,
-            expectedThreadId: controller.threadId,
-            reason: "Answered, then the provider session errored",
-          });
-          return true;
-        }
-      }
-      this.dependencies.store.resetControllerThread({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        controllerKey: controller.controllerKey,
-        expectedThreadId: controller.threadId,
-        reason: "Provider turn failed",
-      });
-      this.fail(submitted, fence, "Controller provider turn failed");
+    if (status === "missing" || status === "incompatible") {
+      this.failAndRetire(
+        turn,
+        controller,
+        fence,
+        status === "missing" ? "Controller conversation became unavailable" : "Controller conversation uses an incompatible provider",
+      );
       return true;
     }
+    if (status === "idle" || observation.completed) return this.requestCompletionContinuation(turn, controller, fence, signal);
+    return true;
+  }
 
-    const response = boundedResponse(await this.dependencies.adapter.output(controller.threadId, signal));
-    if (!response) {
-      this.fail(submitted, fence, "Controller completed without a usable response");
+  private async reconcileEvidence(
+    controller: ControllerThreadRecord,
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<"ready" | "retry" | "stale" | "fatal"> {
+    let highWater: number;
+    try {
+      highWater = await this.dependencies.adapter.latestSeq(controller.threadId!, signal);
+    } catch {
+      return "retry";
+    }
+    if (!Number.isSafeInteger(highWater) || highWater < 0) return "fatal";
+    if (highWater < turn.evidenceEventSeq) return "stale";
+    if (!this.dependencies.evidenceProjector) return "ready";
+    try {
+      const reconciliation = await this.dependencies.evidenceProjector.reconcile(
+        controller,
+        turn,
+        fenceAt(fence, this.dependencies.clock.now()),
+        signal,
+      );
+      if (!reconciliation) return "ready";
+      if (reconciliation.outcome === "stale") return "stale";
+      if (reconciliation.outcome === "limit_exceeded" || reconciliation.reconciliationIncomplete !== null) {
+        return "fatal";
+      }
+      return "ready";
+    } catch (error) {
+      if (signal.aborted) return "stale";
+      if (error instanceof ControllerEvidenceProjectorError) {
+        return error.code === "cursor_conflict" ? "stale" : "fatal";
+      }
+      return "retry";
+    }
+  }
+
+  private async handleEvidenceRetry(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey) ||
+        this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey)) return true;
+    let status: ControllerStatus;
+    try {
+      status = await this.dependencies.adapter.status(controller.threadId!, signal);
+    } catch {
+      return false;
+    }
+    if (status === "missing" || status === "incompatible") {
+      this.failAndRetire(
+        turn,
+        controller,
+        fence,
+        status === "missing" ? "Controller conversation became unavailable" : "Controller conversation uses an incompatible provider",
+      );
       return true;
     }
-    if (!this.dependencies.store.completeControllerTurn({
+    const current = this.dependencies.store.getControllerTurn(turn.id);
+    if (current?.state === "submitted" && current.awaitingInteractionId === null &&
+        this.dependencies.clock.now() - current.updatedAt >= CONTROLLER_STALL_MS) {
+      this.failAndRetire(
+        current,
+        controller,
+        fence,
+        "Controller evidence reconciliation stalled",
+        "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
+      );
+      return true;
+    }
+    return false;
+  }
+
+  private async deliverOwnerAnswer(
+    ownerAnswer: NonNullable<ReturnType<TelegramAgentStore["getAnsweredControllerQuestion"]>>,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!controller.threadId) return true;
+    try {
+      await this.dependencies.adapter.answerQuestion(
+        controller.threadId,
+        ownerAnswer.interactionId,
+        ownerAnswer.answers,
+        signal,
+      );
+    } catch {
+      return false;
+    }
+    this.dependencies.store.markControllerQuestionDelivered({
       ...fenceAt(fence, this.dependencies.clock.now()),
-      turnId: submitted.id,
-      responseText: response,
-    })) {
-      throw new Error("Controller turn changed before its response was recorded");
+      interactionId: ownerAnswer.interactionId,
+    });
+    return true;
+  }
+
+  private completeAccepted(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    providerError: boolean,
+  ): boolean {
+    const outcome = this.dependencies.store.completeControllerTurnFromFinalization({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+    });
+    if (outcome === "completed") {
+      if (providerError && controller.threadId) {
+        this.dependencies.store.resetControllerThread({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          controllerKey: controller.controllerKey,
+          expectedThreadId: controller.threadId,
+          reason: "Accepted answer persisted before provider error",
+        });
+      }
+      return true;
+    }
+    if (outcome === "evidence_advanced") {
+      this.failAndRetire(turn, controller, fence, "Controller evidence advanced after finalization");
     }
     return true;
+  }
+
+  private async requestCompletionContinuation(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!controller.threadId) return true;
+    let highWater: number;
+    try {
+      highWater = await this.dependencies.adapter.latestSeq(controller.threadId, signal);
+    } catch {
+      return false;
+    }
+    const claim = this.dependencies.store.claimControllerCompletionContinuation({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: controller.controllerKey,
+      bbHighWaterSeq: highWater,
+    });
+    if (claim === "stale") return true;
+    if (claim === "already_claimed") {
+      this.failAndRetire(turn, controller, fence, "Controller turn ended without an accepted finalization");
+      return true;
+    }
+    try {
+      await this.dependencies.adapter.send(controller.threadId, CONTROLLER_RECOVERY_PROMPT, signal);
+    } catch {
+      if (signal.aborted) return true;
+      this.failAndRetire(turn, controller, fence, "Controller continuation outcome is uncertain");
+    }
+    return true;
+  }
+
+  private failAndRetire(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    error: string,
+    ownerMessage?: string,
+  ): boolean {
+    if (!controller.threadId) return false;
+    return this.dependencies.store.failAndRetireControllerTurn({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: controller.controllerKey,
+      expectedThreadId: controller.threadId,
+      error,
+      ownerMessage,
+    });
   }
 
   /**
@@ -418,15 +551,13 @@ export class LunaControllerService {
         reason: decision.reason,
       });
     }
-    // Retiring the thread is the half that matters: a turn stopped for cost
-    // that left its thread alive would let the next message resume the loop.
-    this.dependencies.store.resetControllerThread({
-      ...fenceAt(fence, this.dependencies.clock.now()),
-      controllerKey: controller.controllerKey,
-      expectedThreadId: controller.threadId,
-      reason: "Turn exceeded its supervisor budget",
-    });
-    this.fail(turn, fence, "Controller turn exceeded its budget", decision.ownerMessage);
+    this.failAndRetire(
+      turn,
+      controller,
+      fence,
+      "Controller turn exceeded its budget",
+      decision.ownerMessage,
+    );
     return true;
   }
 
