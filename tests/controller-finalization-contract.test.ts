@@ -678,6 +678,7 @@ describe("bounded text heuristics", () => {
     "I'll investigate and follow up with the measured result.",
     "I will get back to you when the monitor fires.",
     "Let me follow up once the job completes.",
+    "After the monitor fires, I'll get back to you with the measured result.",
   ])("accepts controller-owned concrete deferred follow-up: %s", (text) => {
     const candidate: ControllerFinalization = {
       disposition: "deferred",
@@ -749,6 +750,7 @@ describe("bounded text heuristics", () => {
     "The credentials were rotated.",
     "USD 500 was spent on the service.",
     "The tests were completed.",
+    "I can confirm the fix is implemented.",
   ])("rejects unclaimed high-impact assertion: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
