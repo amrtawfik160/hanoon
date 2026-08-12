@@ -13,7 +13,13 @@ import {
 
 type RaceWorker = Readonly<{
   child: ChildProcessWithoutNullStreams;
-  result: Promise<{ outcome: string }>;
+  result: Promise<RaceWorkerResult>;
+}>;
+
+type RaceWorkerResult = Readonly<{
+  outcome: string;
+  code?: string;
+  revision?: number;
 }>;
 
 function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
@@ -53,23 +59,35 @@ while (!existsSync(join(barrierDir, "go"))) {
 writeFileSync(join(barrierDir, "attempting-" + label), "attempting");
 try {
   const fence = { ownerId: "executor", generation: 1, now: 2_000 };
-  const outcome = operation === "proposal"
-    ? repository.proposeFinalization({
+  let raceResult;
+  if (operation === "proposal") {
+    const proposal = repository.proposeFinalization({
+      ...fence,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      candidate: {
+        disposition: "answered",
+        segments: [{ type: "text", text: "The answer is complete." }],
+        obligationRefs: [],
+      },
+    });
+    raceResult = proposal.outcome === "rejected"
+      ? {
+          outcome: proposal.outcome,
+          code: proposal.code,
+          ...("revision" in proposal ? { revision: proposal.revision } : {}),
+        }
+      : { outcome: proposal.outcome };
+  } else {
+    raceResult = {
+      outcome: repository.completeFromFinalization({
         ...fence,
         turnId: "turn_race",
         controllerKey: "controller_race",
-        candidate: {
-          disposition: "answered",
-          segments: [{ type: "text", text: "The answer is complete." }],
-          obligationRefs: [],
-        },
-      }).outcome
-    : repository.completeFromFinalization({
-        ...fence,
-        turnId: "turn_race",
-        controllerKey: "controller_race",
-      });
-  process.stdout.write(JSON.stringify({ outcome }) + "\n");
+      }),
+    };
+  }
+  process.stdout.write(JSON.stringify(raceResult) + "\n");
 } finally {
   db.close();
 }
@@ -128,13 +146,13 @@ function startRaceWorker(
   let stderr = "";
   child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
   child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-  const result = new Promise<{ outcome: string }>((resolveResult, reject) => {
+  const result = new Promise<RaceWorkerResult>((resolveResult, reject) => {
     child.once("error", reject);
     child.once("close", (code) => {
       if (code !== 0) return reject(new Error(`race worker exited ${code}: ${stderr || stdout}`));
       const line = stdout.trim().split("\n").at(-1);
       if (!line) return reject(new Error(`race worker returned no result: ${stderr}`));
-      resolveResult(JSON.parse(line) as { outcome: string });
+      resolveResult(JSON.parse(line) as RaceWorkerResult);
     });
   });
   return { child, result };
@@ -143,7 +161,7 @@ function startRaceWorker(
 async function releaseRace(
   barrierDir: string,
   workers: readonly RaceWorker[],
-): Promise<Array<{ outcome: string }>> {
+): Promise<RaceWorkerResult[]> {
   await Promise.all(workers.map((_, index) => waitForFile(resolve(barrierDir, `ready-${index}`))));
   writeFileSync(resolve(barrierDir, "go"), "go");
   await Promise.all(workers.map((_, index) => waitForFile(resolve(barrierDir, `attempting-${index}`))));
@@ -567,6 +585,70 @@ it("fails closed on an invalid accepted pointer", () => {
     .toThrow(/pointer|positive/i);
 });
 
+const acceptedRetryCorruptions = [
+  {
+    scenario: "a malformed pointer",
+    corrupt: (fixture: ReturnType<typeof submittedControllerFixture>) => {
+      fixture.db.prepare(
+        "UPDATE controller_turns SET accepted_finalization_id = 0 WHERE id = ?",
+      ).run(fixture.turn.id);
+    },
+  },
+  {
+    scenario: "a malformed payload",
+    corrupt: (fixture: ReturnType<typeof submittedControllerFixture>, acceptedId: number) => {
+      fixture.db.prepare(
+        "UPDATE controller_finalizations SET payload_json = '{' WHERE id = ?",
+      ).run(acceptedId);
+    },
+  },
+  {
+    scenario: "a rejected pointed row",
+    corrupt: (fixture: ReturnType<typeof submittedControllerFixture>, acceptedId: number) => {
+      fixture.db.prepare(
+        `UPDATE controller_finalizations
+            SET state = 'rejected', rejection_code = 'invalid_contract'
+          WHERE id = ?`,
+      ).run(acceptedId);
+    },
+  },
+  {
+    scenario: "mismatched rendered text",
+    corrupt: (fixture: ReturnType<typeof submittedControllerFixture>, acceptedId: number) => {
+      fixture.db.prepare(
+        "UPDATE controller_finalizations SET rendered_message = 'changed' WHERE id = ?",
+      ).run(acceptedId);
+    },
+  },
+  {
+    scenario: "an inconsistent evidence seal",
+    corrupt: (fixture: ReturnType<typeof submittedControllerFixture>, acceptedId: number) => {
+      fixture.db.prepare(
+        "UPDATE controller_finalizations SET evidence_high_water_id = 999 WHERE id = ?",
+      ).run(acceptedId);
+    },
+  },
+] as const;
+
+it.each(acceptedRetryCorruptions)(
+  "fails closed when an accepted retry encounters $scenario",
+  ({ corrupt }) => {
+    const fixture = submittedControllerFixture();
+    const accepted = acceptPlainFinalization(fixture);
+    corrupt(fixture, accepted.id);
+
+    expect(() => fixture.store.proposeControllerFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      candidate: plainFinalization("Changed"),
+    })).toThrow(/finalization|pointer|positive/i);
+    expect(fixture.db.prepare(
+      "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = ?",
+    ).get(fixture.turn.id)).toEqual({ count: 1 });
+  },
+);
+
 it.each([
   ["malformed payload", "payload_json", "{"],
   ["rendered mismatch", "rendered_message", "changed"],
@@ -767,6 +849,9 @@ it("persists one accepted row when two SQLite processes race", async () => {
 
     const results = await releaseRace(barrierDir, workers);
     expect(results.map(({ outcome }) => outcome).sort()).toEqual(["accepted", "rejected"]);
+    const loser = results.find(({ outcome }) => outcome === "rejected");
+    expect(loser).toMatchObject({ outcome: "rejected", code: "accepted_already" });
+    expect(loser).not.toHaveProperty("revision");
 
     db = new Database(seeded.databasePath);
     expect(db.prepare(

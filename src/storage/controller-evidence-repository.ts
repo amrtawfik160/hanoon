@@ -295,7 +295,13 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     return this.db.transaction((): ControllerFinalizationProposalResult => {
       const turn = this.finalizationTurn(input);
       if (!turn) return { outcome: "stale" };
-      if (turn.accepted_finalization_id !== null) return rejectedWithoutRevision("accepted_already");
+      if (turn.accepted_finalization_id !== null) {
+        const accepted = this.requiredAcceptedFinalization(input.turnId);
+        if (accepted.id !== turn.accepted_finalization_id) {
+          throw new Error("Accepted controller finalization pointer changed during retry");
+        }
+        return rejectedWithoutRevision("accepted_already");
+      }
       const revisionCount = this.finalizationRevisionCount(input.turnId);
       if (revisionCount >= 8) return rejectedWithoutRevision("revision_limit");
       const evidenceHighWaterId = this.evidenceHighWaterId(input.turnId);
