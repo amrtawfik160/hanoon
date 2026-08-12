@@ -146,14 +146,25 @@ const CONCRETE_FOLLOW_UP = new RegExp(
   `\\b(?:get\\s+back\\s+to\\s+you|follow\\s+up)\\s+(?:with|when|after|once)\\s+${FOLLOW_UP_OBJECT_WORD}(?:\\s+${FOLLOW_UP_OBJECT_WORD}){0,11}\\b`,
   "i",
 );
+const CONTROLLER_COMMITMENT = /^(?:i(?:'ll| will)|let me)\b/i;
+const NON_AFFIRMATIVE_FOLLOW_UP = /\?\s*$|\bif\b|\b(?:not|never|may|might|maybe|possibly|probably|appears?|seems?|uncertain|unsure)\b|\b(?:won't|can't|couldn't|shouldn't|wouldn't)\b/i;
 const DOMAIN_OBJECT = "(?:files?|records?|data|resources?|jobs?|monitors?|projects?|worktrees?|directories|branches|deployments?|credentials?|secrets?)";
 const INSTALL_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?)";
 const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?|deployments?|resources?)";
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
+const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
+const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
+const NON_SUCCESS_CLAUSE = [
+  /\?\s*$/,
+  /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
+  /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
+  /\b(?:will|would|could|should|can|plan to|intend to|propose|after approval|later)\b/i,
+  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
+];
 const HIGH_IMPACT_SUCCESS = [
   /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
   /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
-  /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|was|has been|had been)?\s*(?:passed|succeeded|completed)\b/i,
+  /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
   /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
   /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i,
   /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i,
@@ -161,11 +172,13 @@ const HIGH_IMPACT_SUCCESS = [
   /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
   /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
   new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}\\s+(?:is|was|has been|had been)\\s+(?:deleted|removed|purged)\\b`, "i"),
+  new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:deleted|removed|purged)\\b`, "i"),
   new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}\\s+(?:is|was|has been|had been)\\s+installed\\b`, "i"),
-  /\b(?:i|we)\s+(?:have\s+)?(?:rotated|updated|created|issued|changed)\s+(?:the\s+)?(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)\b/i,
+  new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+installed\\b`, "i"),
+  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
+  new RegExp(`\\b(?:the\\s+)?${CREDENTIAL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:rotated|updated|created|issued|changed)\\b`, "i"),
   new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"),
+  new RegExp(`\\b${MONEY_AMOUNT}\\s+${PASSIVE_AUXILIARY}\\s+(?:spent|paid)\\b`, "i"),
   new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
 ];
 
@@ -291,27 +304,34 @@ function hasProofIncompatibility(
   return candidateClaims.some((claim) => !evidenceSupportsClaim(claim, evidenceRows(claim, context)));
 }
 
-function textClauses(text: string): string[] {
+function normalizedSentences(text: string): string[] {
   const normalized = text.replace(/[’‘]/g, "'").replace(/[\r\n]+/g, ". ");
-  const sentences = normalized.match(/[^.!?]+[.!?]?/g) ?? [normalized];
-  return sentences
-    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|however|which|while)\b\s+|;\s*/i))
+  return (normalized.match(/[^.!?]+[.!?]?/g) ?? [normalized])
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
 
-function isConcreteFollowUp(clause: string): boolean {
-  if (/\?\s*$|\bif\b/i.test(clause)) return false;
-  return CONCRETE_FOLLOW_UP.test(clause);
+function textClauses(text: string): string[] {
+  return normalizedSentences(text)
+    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/i))
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+}
+
+function isConcreteFollowUp(sentence: string): boolean {
+  return CONTROLLER_COMMITMENT.test(sentence)
+    && !NON_AFFIRMATIVE_FOLLOW_UP.test(sentence)
+    && CONCRETE_FOLLOW_UP.test(sentence);
 }
 
 function isProcessOnly(candidate: ControllerFinalization, renderedMessage: string): boolean {
   const clauses = textClauses(renderedMessage);
-  if (candidate.disposition === "deferred") return !clauses.some(isConcreteFollowUp);
+  if (candidate.disposition === "deferred") return !normalizedSentences(renderedMessage).some(isConcreteFollowUp);
   return clauses.length > 0 && clauses.every((clause) => PROCESS_CLAUSE.test(clause));
 }
 
 function clauseHasHighImpactSuccess(clause: string): boolean {
+  if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) return false;
   return HIGH_IMPACT_SUCCESS.some((pattern) => pattern.test(clause));
 }
 
