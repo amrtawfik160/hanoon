@@ -86,6 +86,13 @@ import {
   type ClaimAdoptionInput,
   type AdmissionWriteInput,
 } from "./autonomy-repository";
+import {
+  ControllerEvidenceRepository,
+  type ControllerEvidenceInput,
+  type ControllerEvidenceRecord,
+  type ControllerEvidenceWrite,
+  type ControllerNativeEvidenceInput,
+} from "./controller-evidence-repository";
 
 export { VersionConflictError, assertSafeExternalHttpsUrl };
 
@@ -730,6 +737,10 @@ type ControllerTurnRow = {
   dispatch_after_seq: number;
   retry_count: number;
   bb_event_seq: number;
+  evidence_event_seq: number;
+  completion_continuations: number;
+  accepted_finalization_id: number | null;
+  evidence_limit_exceeded_at: number | null;
   stream_text: string;
   telegram_message_id: number | null;
   stream_phase: ControllerTurnRecord["streamPhase"];
@@ -1645,6 +1656,15 @@ export interface TelegramAgentStore {
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
   getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null;
   getControllerTurn(turnId: string): ControllerTurnRecord | null;
+  adoptSubmittedControllerTurnFence(
+    input: ControllerLeaseFence & Readonly<{ turnId: string }>,
+  ): boolean;
+  recordControllerEvidence(input: ControllerEvidenceInput): ControllerEvidenceWrite;
+  recordControllerNativeEvidence(
+    input: ControllerNativeEvidenceInput,
+  ): "recorded" | "stale" | "cursor_changed" | "limit_exceeded";
+  listControllerEvidence(turnId: string, limit: number): ControllerEvidenceRecord[];
+  getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null;
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
   requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
   recordControllerImagePreparationFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
@@ -2187,6 +2207,10 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     dispatchAfterSeq: row.dispatch_after_seq,
     retryCount: row.retry_count,
     bbEventSeq: row.bb_event_seq,
+    evidenceEventSeq: row.evidence_event_seq,
+    completionContinuations: row.completion_continuations,
+    acceptedFinalizationId: row.accepted_finalization_id,
+    evidenceLimitExceededAt: row.evidence_limit_exceeded_at,
     streamText: row.stream_text,
     telegramMessageId: row.telegram_message_id,
     streamPhase: row.stream_phase,
@@ -2801,6 +2825,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly claimOwner = randomUUID();
   private readonly claimedUpdates = new Map<number, number>();
   private readonly autonomyRepository: AutonomyRepository;
+  private readonly controllerEvidenceRepository: ControllerEvidenceRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -2808,6 +2833,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     private readonly clock: () => number,
   ) {
     this.autonomyRepository = new AutonomyRepository(db);
+    this.controllerEvidenceRepository = new ControllerEvidenceRepository(db);
   }
 
   private currentNow(): number {
@@ -3058,6 +3084,30 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerIdentifier(turnId, "turnId");
     const row = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(turnId) as ControllerTurnRow | undefined;
     return row ? parseControllerTurn(row) : null;
+  }
+
+  public adoptSubmittedControllerTurnFence(
+    input: ControllerLeaseFence & Readonly<{ turnId: string }>,
+  ): boolean {
+    return this.controllerEvidenceRepository.adoptSubmittedTurnFence(input);
+  }
+
+  public recordControllerEvidence(input: ControllerEvidenceInput): ControllerEvidenceWrite {
+    return this.controllerEvidenceRepository.record(input);
+  }
+
+  public recordControllerNativeEvidence(
+    input: ControllerNativeEvidenceInput,
+  ): "recorded" | "stale" | "cursor_changed" | "limit_exceeded" {
+    return this.controllerEvidenceRepository.recordNativeBatch(input);
+  }
+
+  public listControllerEvidence(turnId: string, limit: number): ControllerEvidenceRecord[] {
+    return this.controllerEvidenceRepository.list(turnId, limit);
+  }
+
+  public getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null {
+    return this.controllerEvidenceRepository.get(turnId, evidenceId);
   }
 
   public claimNextControllerTurn(
