@@ -34,7 +34,10 @@ export type ControllerClaimKind = (typeof CONTROLLER_CLAIM_KINDS)[number];
 export type FinalizationRejectionCode = (typeof FINALIZATION_REJECTION_CODES)[number];
 type EvidenceRef = `evidence:${number}`;
 
-const boundedSegmentText = z.string().max(4_000).refine(
+const boundedSegmentText = z.string().refine(
+  (text) => Array.from(text).length <= 4_000,
+  "segment text must be at most 4000 characters",
+).refine(
   (text) => text.trim().length > 0,
   "segment text must be nonempty",
 );
@@ -134,27 +137,36 @@ const CORRECTIONS: Record<FinalizationRejectionCode, string> = {
 
 const PROCESS_OBJECT_WORD = "(?!(?:and|then|if)\\b)[a-z0-9_'/:-]+";
 const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigate|work\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
-const PROCESS_ONLY = new RegExp(
-  `^(?:i(?:'ll| will)|let me)\\s+${PROCESS_ACTION}(?:\\s+(?:and|then)\\s+${PROCESS_ACTION})*[.!]?$`,
+const PROCESS_CLAUSE = new RegExp(
+  `^(?:(?:i(?:'ll| will)|let me)\\s+)?${PROCESS_ACTION}[.!]?$`,
   "i",
 );
-const NON_SUCCESS_TEXT = [
-  /\?\s*$/,
-  /\b(?:not|never|no longer|didn't|did not|hasn't|has not|haven't|have not|wasn't|was not)\b/i,
-  /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
-  /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
-  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears|seems)\b/i,
-];
+const FOLLOW_UP_OBJECT_WORD = "[a-z0-9_'/:-]+";
+const CONCRETE_FOLLOW_UP = new RegExp(
+  `\\b(?:get\\s+back\\s+to\\s+you|follow\\s+up)\\s+(?:with|when|after|once)\\s+${FOLLOW_UP_OBJECT_WORD}(?:\\s+${FOLLOW_UP_OBJECT_WORD}){0,11}\\b`,
+  "i",
+);
+const DOMAIN_OBJECT = "(?:files?|records?|data|resources?|jobs?|monitors?|projects?|worktrees?|directories|branches|deployments?|credentials?|secrets?)";
+const INSTALL_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?)";
+const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?|deployments?|resources?)";
+const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const HIGH_IMPACT_SUCCESS = [
   /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
-  /\btests?\s+(?:passed|succeeded|completed)\b/i,
-  /\breview\s+(?:is|was|has been)?\s*(?:complete|completed|passed|approved)\b/i,
-  /\b(?:merged|merge\s+(?:is|was)?\s*(?:complete|completed|succeeded))\b/i,
-  /\b(?:deployed|deployment\s+(?:succeeded|completed)|production\s+(?:is|was)?\s*(?:live|healthy|verified))\b/i,
-  /\b(?:deleted|removed|purged)\b/i,
-  /\binstalled\b/i,
-  /\b(?:rotated|updated|created|issued|changed)\s+(?:the\s+)?(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)\b/i,
-  /\b(?:i|we)\s+(?:have\s+)?(?:spent|paid|purchased)\b/i,
+  /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
+  /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|was|has been|had been)?\s*(?:passed|succeeded|completed)\b/i,
+  /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
+  /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i,
+  /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i,
+  /\b(?:the\s+)?(?:branch|pull request|change)\s+(?:is|was|has been|had been)\s+merged\b/i,
+  /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
+  /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
+  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
+  new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}\\s+(?:is|was|has been|had been)\\s+(?:deleted|removed|purged)\\b`, "i"),
+  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
+  new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}\\s+(?:is|was|has been|had been)\\s+installed\\b`, "i"),
+  /\b(?:i|we)\s+(?:have\s+)?(?:rotated|updated|created|issued|changed)\s+(?:the\s+)?(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)\b/i,
+  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"),
+  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
 ];
 
 export function renderControllerFinalization(candidate: ControllerFinalization): string {
@@ -211,9 +223,13 @@ function redactedCandidate(candidate: ControllerFinalization): ControllerFinaliz
   };
 }
 
-function unsafeStorageProjection(candidate: ControllerFinalization): ControllerFinalization | null {
+function unsafeStorageProjection(
+  candidate: ControllerFinalization,
+  renderedMessage: string,
+): ControllerFinalization | null {
   if (nonTextCandidateStrings(candidate).some(isUnsafeCandidateString)) return fixedStorageProjection();
-  if (candidate.segments.some((segment) => isUnsafeCandidateString(segment.text))) return redactedCandidate(candidate);
+  if (isUnsafeCandidateString(renderedMessage)
+    || candidate.segments.some((segment) => isUnsafeCandidateString(segment.text))) return redactedCandidate(candidate);
   return null;
 }
 
@@ -275,28 +291,47 @@ function hasProofIncompatibility(
   return candidateClaims.some((claim) => !evidenceSupportsClaim(claim, evidenceRows(claim, context)));
 }
 
-function isProcessOnly(candidate: ControllerFinalization, renderedMessage: string): boolean {
-  if (candidate.disposition === "deferred" && candidate.obligationRefs.length > 0) return false;
-  return PROCESS_ONLY.test(renderedMessage.trim());
-}
-
 function textClauses(text: string): string[] {
-  const sentences = text.match(/[^.!?]+[.!?]?/g) ?? [text];
+  const normalized = text.replace(/[’‘]/g, "'").replace(/[\r\n]+/g, ". ");
+  const sentences = normalized.match(/[^.!?]+[.!?]?/g) ?? [normalized];
   return sentences
-    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|however)\b\s+|;\s*/i))
+    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|however|which|while)\b\s+|;\s*/i))
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
 
+function isConcreteFollowUp(clause: string): boolean {
+  if (/\?\s*$|\bif\b/i.test(clause)) return false;
+  return CONCRETE_FOLLOW_UP.test(clause);
+}
+
+function isProcessOnly(candidate: ControllerFinalization, renderedMessage: string): boolean {
+  const clauses = textClauses(renderedMessage);
+  if (candidate.disposition === "deferred") return !clauses.some(isConcreteFollowUp);
+  return clauses.length > 0 && clauses.every((clause) => PROCESS_CLAUSE.test(clause));
+}
+
 function clauseHasHighImpactSuccess(clause: string): boolean {
-  if (NON_SUCCESS_TEXT.some((pattern) => pattern.test(clause))) return false;
   return HIGH_IMPACT_SUCCESS.some((pattern) => pattern.test(clause));
 }
 
+function plainTextRuns(candidate: ControllerFinalization): string[] {
+  const runs: string[] = [];
+  let currentRun = "";
+  for (const segment of candidate.segments) {
+    if (segment.type === "text") {
+      currentRun += segment.text;
+      continue;
+    }
+    if (currentRun.length > 0) runs.push(currentRun);
+    currentRun = "";
+  }
+  if (currentRun.length > 0) runs.push(currentRun);
+  return runs;
+}
+
 function hasUnclaimedHighImpactText(candidate: ControllerFinalization): boolean {
-  return candidate.segments.some((segment) => (
-    segment.type === "text" && textClauses(segment.text).some(clauseHasHighImpactSuccess)
-  ));
+  return plainTextRuns(candidate).some((run) => textClauses(run).some(clauseHasHighImpactSuccess));
 }
 
 function renderCandidate(candidate: ControllerFinalization): string | null {
@@ -362,7 +397,7 @@ export function validateControllerFinalization(
   const candidate = parsed.data;
   const renderedMessage = renderCandidate(candidate);
   if (renderedMessage === null) return rejected("invalid_contract", fixedStorageProjection());
-  const unsafeProjection = unsafeStorageProjection(candidate);
+  const unsafeProjection = unsafeStorageProjection(candidate, renderedMessage);
   if (unsafeProjection) return rejected("invalid_contract", unsafeProjection);
   const rejectionCode = semanticRejectionCode(candidate, renderedMessage, context);
   if (rejectionCode) return rejected(rejectionCode, candidate);
