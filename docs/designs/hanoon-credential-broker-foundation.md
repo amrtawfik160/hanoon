@@ -203,7 +203,7 @@ Enrollment occurs on the protected broker host, not through a model tool:
 2. The owner installs the service-account token into the broker's OS secret store using the broker administrative CLI's interactive stdin or provider-native handoff. The value never appears in argv or command output.
 3. The broker runs a live service-account identity probe and displays only the account, vault scope, and status.
 4. The owner registers an exact vault item and field in the broker. The broker creates a random `bindingId` and stores the external reference broker-side.
-5. The owner assigns a label, future capability ids, risk, MFA mode, and approval mode. The foundation accepts only inactive future capability ids because no application connector exists yet, and rejects enrollment when the installation already has 100 non-tombstoned bindings.
+5. The owner assigns a label, future capability ids, risk, MFA mode, and approval mode. The foundation accepts only inactive future capability ids because no application connector exists yet, and rejects enrollment when the installation already has 100 binding records, including tombstones. This keeps every health reconciliation complete in protocol version 1.
 6. The broker emits secret-free binding metadata in the authenticated, bounded `broker.health` response; Hanoon reconciles that projection without querying or listing the external vault.
 7. Hanoon records the metadata as `pending` and may run `vault.binding.verify`.
 8. A successful resolve changes the binding to `vault_verified`, not `active`: vault access is proven, application validity is not.
