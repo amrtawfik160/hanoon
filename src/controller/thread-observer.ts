@@ -192,11 +192,11 @@ export async function assertProjectHostScope(input: {
 export async function createProjectThread(input: {
   sdk: BbSdk;
   projectId: string;
+  hostId: string;
   title: string;
   prompt: string;
   signal: AbortSignal;
 }) {
-  const hostId = await assertProjectHostScope(input);
   const thread = await input.sdk.threads.spawn({
     projectId: input.projectId,
     title: input.title,
@@ -204,7 +204,7 @@ export async function createProjectThread(input: {
     input: [{ type: "text", text: input.prompt, mentions: [] }],
     environment: {
       type: "host",
-      hostId,
+      hostId: input.hostId,
       workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
     },
   });

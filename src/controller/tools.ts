@@ -1,4 +1,5 @@
 import type { BbPluginApi, PluginAgentConfigurationContext, PluginAgentToolContext } from "@bb/plugin-sdk";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { redactError } from "../errors";
 import type { Job } from "../domain/models";
@@ -13,6 +14,7 @@ import {
 } from "../storage/store";
 import { nextCronOccurrence } from "../services/monitor-service";
 import { parseProductionStageSnapshot } from "../services/production-runner";
+import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../bb/validation";
 import { CONTROLLER_PROVIDERS } from "./execution-profile";
 import { isControllerThreadTitle } from "./bb-controller";
 import { MAX_CONTROLLER_OVERLAY, composeControllerInstructions } from "./instructions";
@@ -34,6 +36,7 @@ import {
   visibleThreadStatus,
 } from "./thread-observer";
 import {
+  canonicalControllerJson,
   registerControllerCapabilityTool,
   sha256ControllerJson,
   type AuthorizedControllerCapability,
@@ -255,6 +258,12 @@ type TrustedScopeState = {
   beforeJob?: Job | null;
   beforeOverlay?: string | null;
   hostIds?: Readonly<Record<string, string>>;
+  createdJobId?: string;
+  createdThreadId?: string;
+  operationId?: string;
+  memoryId?: string;
+  monitorId?: string;
+  delegationId?: string;
 };
 
 function exactScope(entityRefs: readonly string[], matches: boolean, state: TrustedScopeState = {}): ControllerCapabilityScopeResolution {
@@ -270,7 +279,8 @@ function trustedState(resolution: ControllerCapabilityScopeResolution): TrustedS
 }
 
 function enabledProject(store: TelegramAgentStore, projectId: string): boolean {
-  return store.getProjectPolicy(projectId)?.policy.enabled === true;
+  const stored = store.getProjectPolicy(projectId);
+  return stored?.policy.enabled === true && stored.policy.projectId === projectId;
 }
 
 async function visibleThreadResolution(
@@ -319,12 +329,13 @@ async function resolveTrustedScope(
       const resolution = resolveJob(dependencies.store, kind, params.jobId as string | undefined);
       const jobs = resolution.outcome === "job" ? [resolution.job]
         : resolution.outcome === "choose_job" ? resolution.candidates : [];
-      const matched = resolution.outcome !== "job" ||
+      const matched = (params.jobId === undefined || resolution.outcome === "job") &&
+        (resolution.outcome !== "job" ||
         (request.name === "telegram_agent_retry_job"
           ? resolution.job.state === "failed" && resolution.job.cancelRequestedAt === null
           : request.name === "telegram_agent_cancel_job"
             ? !["merged", "cancelled", "blocked", "complete", "production_failed"].includes(resolution.job.state)
-            : true);
+            : true));
       return exactScope(jobs.map((job) => `job:${job.id}`), matched, {
         jobResolution: resolution,
         beforeJob: resolution.outcome === "job" ? resolution.job : null,
@@ -431,26 +442,105 @@ function terminalPipelineFacts(job: Job): TerminalPipelineFacts | null {
     !((job.state === "merged" && production === undefined) ||
       (job.state === "complete" && production !== undefined) ||
       (job.state === "production_failed" && production !== undefined)) ||
+    !job.environmentId || !Number.isInteger(job.prNumber) || (job.prNumber ?? 0) < 1 ||
     !job.prHeadSha || !job.mergeCommitSha || !job.mergedAt
   ) return null;
   return { headSha: job.prHeadSha, mergeSha: job.mergeCommitSha, mergedAt: job.mergedAt, production };
 }
 
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+}
+
+function exactPersistedOutcome(attempt: NonNullable<ReturnType<TelegramAgentStore["getLatestPipelineStageAttempt"]>>): boolean {
+  if (!attempt.outputText || !attempt.outputSha256 || !attempt.outcome) return false;
+  const digest = createHash("sha256").update(attempt.outputText, "utf8").digest("hex");
+  if (digest !== attempt.outputSha256) return false;
+  try {
+    return canonicalControllerJson(JSON.parse(attempt.outputText)) === canonicalControllerJson(attempt.outcome);
+  } catch {
+    return false;
+  }
+}
+
+function exactIsoDate(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return false;
+  try {
+    return new Date(milliseconds).toISOString() === value;
+  } catch (error) {
+    if (error instanceof RangeError) return false;
+    throw error;
+  }
+}
+
+function validationCommand(entry: NonNullable<Job["policy"]>["validationCommands"][number]): string {
+  return typeof entry === "string" ? entry : entry.command;
+}
+
+function strictPassingCommandReceipt(value: unknown, expectedCommand: string): boolean {
+  const receipt = recordValue(value);
+  return receipt !== null && exactKeys(receipt, ["command", "outcome", "exitCode", "output"]) &&
+    receipt.command === expectedCommand && receipt.outcome === "pass" && receipt.exitCode === 0 &&
+    typeof receipt.output === "string" && receipt.output.length <= 1_000;
+}
+
+function strictPassingRequiredCheck(value: unknown, expectedName: string): boolean {
+  const check = recordValue(value);
+  return check !== null && exactKeys(check, ["name", "bucket", "state", "link"]) &&
+    check.name === expectedName && check.bucket === "pass" && check.state === "SUCCESS" &&
+    (check.link === null || typeof check.link === "string");
+}
+
+function expectedValidationCommands(job: Job): string[] {
+  return [
+    GIT_REMOTE_COMMAND,
+    PR_HEAD_COMMAND(job.prNumber!),
+    ...job.policy!.validationCommands.map(validationCommand),
+    PR_VIEW_COMMAND(job.prNumber!),
+    PR_CHECKS_COMMAND(job.prNumber!),
+    PR_HEAD_COMMAND(job.prNumber!),
+  ];
+}
+
+function terminalIdsMatch(value: unknown, resourceId: string): boolean {
+  return Array.isArray(value) && value.length > 0 && value.length <= 100 &&
+    value.every((id) => typeof id === "string" && id.length > 0 && id.length <= 256) &&
+    value.at(-1) === resourceId;
+}
+
+function validationReceiptsMatch(value: unknown, commands: readonly string[]): boolean {
+  return Array.isArray(value) && value.length === commands.length &&
+    value.every((receipt, index) => strictPassingCommandReceipt(receipt, commands[index]));
+}
+
+function requiredChecksMatch(value: unknown, requiredNames: readonly string[]): boolean {
+  if (!Array.isArray(value) || value.length !== requiredNames.length) return false;
+  const checksByName = new Map(value.map((check) => [recordValue(check)?.name, check]));
+  return checksByName.size === value.length && requiredNames.every((name) =>
+    strictPassingRequiredCheck(checksByName.get(name), name));
+}
+
 function finalTestIsVerified(store: TelegramAgentStore, job: Job, facts: TerminalPipelineFacts): boolean {
   const finalTest = store.getLatestPipelineStageAttempt(job.id, "FINAL_TEST");
-  const validationReceipts = finalTest?.outcome?.commandReceipts;
-  const requiredChecks = finalTest?.outcome?.requiredChecks;
+  if (
+    finalTest?.state !== "completed" || finalTest.completedAt === null || !exactPersistedOutcome(finalTest) ||
+    finalTest.environmentId !== job.environmentId || finalTest.resourceKind !== "bb_terminal" || !finalTest.resourceId ||
+    finalTest.startSha !== facts.headSha || finalTest.endSha !== facts.headSha
+  ) return false;
+  const outcome = finalTest.outcome;
+  if (!outcome || !exactKeys(outcome, [
+    "validationOutcome", "headSha", "originRepository", "terminalIds",
+    "commandReceipts", "requiredChecks", "completedAt",
+  ])) return false;
   return !(
-    finalTest?.state !== "completed" || finalTest.completedAt === null ||
-    finalTest.startSha !== facts.headSha || finalTest.endSha !== facts.headSha ||
-    finalTest.outcome?.validationOutcome !== "pass" || finalTest.outcome.headSha !== facts.headSha ||
-    !Array.isArray(validationReceipts) || validationReceipts.length !== job.policy!.validationCommands.length ||
-    validationReceipts.some((entry) => recordValue(entry)?.outcome !== "pass") ||
-    !Array.isArray(requiredChecks) || requiredChecks.length !== job.policy!.requiredChecks.length ||
-    requiredChecks.some((entry, index) => {
-      const check = recordValue(entry);
-      return check?.name !== job.policy!.requiredChecks[index] || check.bucket !== "pass" || check.state !== "SUCCESS";
-    })
+    outcome.validationOutcome !== "pass" || outcome.headSha !== facts.headSha ||
+    outcome.originRepository !== job.policy!.githubRepository ||
+    !exactIsoDate(outcome.completedAt) ||
+    !terminalIdsMatch(outcome.terminalIds, finalTest.resourceId) ||
+    !validationReceiptsMatch(outcome.commandReceipts, expectedValidationCommands(job)) ||
+    !requiredChecksMatch(outcome.requiredChecks, job.policy!.requiredChecks)
   );
 }
 
@@ -486,36 +576,60 @@ function mergeIsVerified(store: TelegramAgentStore, job: Job, facts: TerminalPip
   );
 }
 
-function successfulProductionStage(
+type ProductionAttemptInput = Readonly<{
+  role: "DEPLOY" | "CANARY";
+  phase: "deploy" | "canary";
+  mergeSha: string;
+}>;
+
+function expectedProductionCommands(job: Job, input: ProductionAttemptInput) {
+  const configured = input.phase === "deploy"
+    ? job.policy!.production!.deployCommands
+    : job.policy!.production!.canaryCommands;
+  return [{
+    name: "verify-merged-checkout",
+    command: `test "$(git rev-parse --verify HEAD)" = '${input.mergeSha}'`,
+  }, ...configured];
+}
+
+function productionSnapshot(
   store: TelegramAgentStore,
   job: Job,
-  input: Readonly<{ role: "DEPLOY" | "CANARY"; phase: "deploy" | "canary"; commandCount: number; mergeSha: string }>,
-): boolean {
+  input: ProductionAttemptInput,
+) {
   const attempt = store.getLatestPipelineStageAttempt(job.id, input.role);
   if (attempt?.state !== "completed" || attempt.completedAt === null ||
-      attempt.startSha !== input.mergeSha || attempt.endSha !== input.mergeSha) return false;
+      attempt.environmentId !== job.environmentId || attempt.resourceKind !== "bb_terminal" || !attempt.resourceId ||
+      attempt.startSha !== input.mergeSha || attempt.endSha !== input.mergeSha ||
+      !exactPersistedOutcome(attempt)) return null;
   try {
     const snapshot = parseProductionStageSnapshot(attempt.outcome, input.phase);
-    return snapshot.outcome === "pass" && snapshot.commandReceipts.length === input.commandCount + 1;
+    return snapshot.terminalIds.includes(attempt.resourceId) ? snapshot : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+function successfulProductionStage(store: TelegramAgentStore, job: Job, input: ProductionAttemptInput): boolean {
+  const snapshot = productionSnapshot(store, job, input);
+  const expected = expectedProductionCommands(job, input);
+  return snapshot?.outcome === "pass" && snapshot.failedCommand === null &&
+    snapshot.commandReceipts.length === expected.length &&
+    snapshot.commandReceipts.every((receipt, index) =>
+      receipt.name === expected[index]?.name && receipt.command === expected[index]?.command &&
+      receipt.outcome === "pass" && receipt.exitCode === 0);
 }
 
 function failedProductionStage(
   store: TelegramAgentStore,
   job: Job,
-  input: Readonly<{ role: "DEPLOY" | "CANARY"; phase: "deploy" | "canary"; mergeSha: string }>,
+  input: ProductionAttemptInput,
 ): boolean {
-  const attempt = store.getLatestPipelineStageAttempt(job.id, input.role);
-  if (!attempt || attempt.completedAt === null || attempt.startSha !== input.mergeSha) return false;
-  if (attempt.state === "failed") return true;
-  if (attempt.state !== "completed" || attempt.endSha !== input.mergeSha) return false;
-  try {
-    return parseProductionStageSnapshot(attempt.outcome, input.phase).outcome === "fail";
-  } catch {
-    return false;
-  }
+  const snapshot = productionSnapshot(store, job, input);
+  const expected = expectedProductionCommands(job, input);
+  return snapshot?.outcome === "fail" && snapshot.commandReceipts.length <= expected.length &&
+    snapshot.commandReceipts.every((receipt, index) =>
+      receipt.name === expected[index]?.name && receipt.command === expected[index]?.command);
 }
 
 export function verifiedPipelineOutcome(store: TelegramAgentStore, job: Job): boolean {
@@ -524,9 +638,9 @@ export function verifiedPipelineOutcome(store: TelegramAgentStore, job: Job): bo
   if (facts.production === undefined) return true;
   if (job.state === "complete") {
     return successfulProductionStage(store, job, {
-      role: "DEPLOY", phase: "deploy", commandCount: facts.production.deployCommands.length, mergeSha: facts.mergeSha,
+      role: "DEPLOY", phase: "deploy", mergeSha: facts.mergeSha,
     }) && successfulProductionStage(store, job, {
-      role: "CANARY", phase: "canary", commandCount: facts.production.canaryCommands.length, mergeSha: facts.mergeSha,
+      role: "CANARY", phase: "canary", mergeSha: facts.mergeSha,
     });
   }
   return failedProductionStage(store, job, { role: "DEPLOY", phase: "deploy", mergeSha: facts.mergeSha }) ||
@@ -539,12 +653,29 @@ function jobProjectionEvidence(
   resolution: ControllerCapabilityScopeResolution,
   mutation: "read" | "retry" | "cancel",
 ): ControllerCapabilityEvidenceProjection {
-  const refs = jobRefsFromDomain(domain);
+  const jobResolution = trustedState(resolution).jobResolution;
+  const refs = jobResolution?.outcome === "job" ? [`job:${jobResolution.job.id}`]
+    : jobResolution?.outcome === "choose_job" ? jobResolution.candidates.map((candidate) => `job:${candidate.id}`)
+    : [];
+  const currentJob = jobResolution?.outcome === "job"
+    ? dependencies.store.getJob(jobResolution.job.id)
+    : null;
+  if (jobResolution?.outcome === "job" && currentJob === null) {
+    throw new Error("authorized job disappeared before evidence projection");
+  }
+  let expectedDomain: ControllerJsonObject | null = null;
+  if (currentJob) expectedDomain = jobProjection(currentJob, dependencies.store.getAdmission(currentJob.id));
+  else if (jobResolution?.outcome === "none" || jobResolution?.outcome === "choose_job") {
+    expectedDomain = resolutionProjection(jobResolution);
+  }
+  if (expectedDomain === null || sha256ControllerJson(expectedDomain) !== sha256ControllerJson(domain)) {
+    throw new Error("job projection is not bound to the authorized resolution");
+  }
   const exactId = refs.length === 1 ? refs[0].slice("job:".length) : null;
   const current = exactId ? dependencies.store.getJob(exactId) : null;
   const before = trustedState(resolution).beforeJob;
   const changed = current !== null && before !== null && before !== undefined && current.version !== before.version;
-  const proofKinds: ("job_state" | "pipeline_outcome" | "obligation")[] = refs.length > 0 ? ["job_state"] : [];
+  const proofKinds: ("job_state" | "pipeline_outcome" | "obligation")[] = ["job_state"];
   if (mutation === "read" && current !== null && verifiedPipelineOutcome(dependencies.store, current)) {
     proofKinds.push("pipeline_outcome");
   }
@@ -560,23 +691,31 @@ async function projectTrustedEvidence(
   request: Readonly<{
     dependencies: ToolDependencies;
     name: ControllerToolName;
+    params: Record<string, unknown>;
     context: PluginAgentToolContext;
     domain: ControllerJsonObject;
     resolution: ControllerCapabilityScopeResolution;
     authorized: AuthorizedControllerCapability;
   }>,
 ): Promise<ControllerCapabilityEvidenceProjection> {
-  const { dependencies, context, domain, resolution, authorized } = request;
+  const { dependencies, params, context, domain, resolution, authorized } = request;
   switch (request.name) {
     case "telegram_agent_list_projects":
       return { outcome: "observed", proofKinds: ["project_state"], subjectRefs: refIds(domain.projects, "project") };
     case "telegram_agent_start_job": {
       const refs = jobRefsFromDomain(domain);
       const job = refs.length === 1 ? dependencies.store.getJob(refs[0].slice(4)) : null;
+      const expectedProjectId = resolution.scope.entityRefs[0]?.slice("project:".length);
+      const capturedId = trustedState(resolution).createdJobId;
+      if (
+        !job || job.id !== refs[0]?.slice("job:".length) || job.projectId !== expectedProjectId ||
+        job.sourceUpdateId !== authorized.turn.updateId ||
+        (capturedId !== undefined && capturedId !== job.id)
+      ) throw new Error("created job is not bound to the authorized project and turn");
       const proofKinds: ("job_state" | "obligation")[] = job ? ["job_state"] : [];
       if (job && !TERMINAL_JOB_STATES.has(job.state)) proofKinds.push("obligation");
       return {
-        outcome: job && trustedState(resolution).beforeJob === null ? "succeeded" : "observed",
+        outcome: capturedId === job.id && trustedState(resolution).beforeJob === null ? "succeeded" : "observed",
         proofKinds,
         subjectRefs: refs,
       };
@@ -596,12 +735,20 @@ async function projectTrustedEvidence(
       const thread = recordValue(domain.thread);
       const threadId = typeof thread?.id === "string" ? thread.id : null;
       const projectId = typeof thread?.projectId === "string" ? thread.projectId : null;
-      if (!threadId || !projectId) return { outcome: "observed", proofKinds: [], subjectRefs: resolution.scope.entityRefs };
+      const expectedProjectId = resolution.scope.entityRefs[0]?.slice("project:".length);
+      const capturedId = trustedState(resolution).createdThreadId;
+      if (
+        !threadId || !projectId || projectId !== expectedProjectId ||
+        (capturedId !== undefined && capturedId !== threadId)
+      ) throw new Error("created thread result is not bound to the authorized project");
       const visible = await assertVisibleThreadScope({ sdk: dependencies.sdk, threadId, signal: context.signal });
+      if (visible.id !== threadId || visible.projectId !== expectedProjectId) {
+        throw new Error("created thread is not durably visible in the authorized project");
+      }
       return {
-        outcome: visible.id === threadId ? "succeeded" : "observed",
-        proofKinds: visible.id === threadId ? ["thread_state", "external_mutation"] : [],
-        subjectRefs: [`thread:${threadId}`, `project:${projectId}`],
+        outcome: "succeeded",
+        proofKinds: ["thread_state", "external_mutation"],
+        subjectRefs: [`thread:${threadId}`, `project:${expectedProjectId}`],
       };
     }
     case "telegram_agent_send_to_thread": {
@@ -618,14 +765,27 @@ async function projectTrustedEvidence(
     case "telegram_agent_request_thread_operation": {
       const operationId = typeof domain.id === "string" ? domain.id : null;
       const operation = operationId ? dependencies.store.getThreadOperation(operationId) : null;
-      const succeeded = operation?.state === "awaiting_confirmation" && operation.expiresAt > dependencies.now();
+      const capturedId = trustedState(resolution).operationId;
+      const succeeded = operation?.state === "awaiting_confirmation" && operation.expiresAt > dependencies.now() &&
+        operation.threadId === params.threadId && operation.kind === params.kind &&
+        operation.ownerUserId === authorized.controller.telegramUserId &&
+        operation.ownerChatId === authorized.controller.telegramChatId &&
+        (capturedId === undefined || capturedId === operation.id);
+      if (!succeeded) throw new Error("thread operation is not bound to the authorized request and controller");
       return { outcome: succeeded ? "succeeded" : "observed", proofKinds: succeeded ? ["obligation"] : [], subjectRefs: resolution.scope.entityRefs };
     }
     case "telegram_agent_remember": {
       const remembered = recordValue(domain.remembered);
       const id = typeof remembered?.id === "string" ? remembered.id : null;
       const memory = id ? dependencies.store.getMemory(id) : null;
-      return { outcome: memory ? "succeeded" : "observed", proofKinds: memory ? ["memory_state"] : [], subjectRefs: memory ? [`memory:${memory.id}`] : [] };
+      const expectedScope = typeof params.projectId === "string" ? params.projectId : OWNER_MEMORY_SCOPE;
+      const capturedId = trustedState(resolution).memoryId;
+      const exact = memory !== null && memory.forgottenAt === null && memory.supersededBy === null &&
+        memory.scope === expectedScope && memory.source === "agent" &&
+        memory.subject === params.subject && memory.body === params.body && memory.kind === params.kind &&
+        (capturedId === undefined || capturedId === memory.id);
+      if (!exact) throw new Error("memory proof is not bound to the exact authorized write");
+      return { outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [`memory:${memory.id}`] };
     }
     case "telegram_agent_recall":
       return { outcome: "observed", proofKinds: ["memory_state"], subjectRefs: refIds(domain.memories, "memory") };
@@ -637,7 +797,13 @@ async function projectTrustedEvidence(
       const watching = recordValue(domain.watching);
       const id = typeof watching?.id === "string" ? watching.id : null;
       const monitor = id ? dependencies.store.getControllerMonitor(authorized.controller.controllerKey, id) : null;
-      const armed = monitor?.state === "armed";
+      const capturedId = trustedState(resolution).monitorId;
+      const armed = monitor?.state === "armed" && monitor.kind === params.kind &&
+        monitor.instruction === params.instruction &&
+        monitor.threadId === (params.kind === "thread_idle" ? params.threadId : null) &&
+        monitor.cron === (params.kind === "schedule" ? params.cron : null) &&
+        (capturedId === undefined || capturedId === monitor.id);
+      if (!armed) throw new Error("monitor proof is not bound to the exact authorized watch");
       return {
         outcome: armed ? "succeeded" : "observed",
         proofKinds: armed ? ["monitor_state", "obligation"] : [],
@@ -646,7 +812,9 @@ async function projectTrustedEvidence(
     }
     case "telegram_agent_list_watches": {
       const refs = refIds(domain.monitors, "monitor");
-      const armed = refs.some((ref) => dependencies.store.getControllerMonitor(authorized.controller.controllerKey, ref.slice(8))?.state === "armed");
+      const armed = objectArray(domain.monitors).some((monitor) =>
+        typeof monitor.id === "string" &&
+        dependencies.store.getControllerMonitor(authorized.controller.controllerKey, monitor.id)?.state === "armed");
       return { outcome: "observed", proofKinds: armed ? ["monitor_state", "obligation"] : ["monitor_state"], subjectRefs: refs };
     }
     case "telegram_agent_cancel_watch":
@@ -658,7 +826,25 @@ async function projectTrustedEvidence(
       const delegationResult = recordValue(domain.delegation);
       const id = typeof delegationResult?.id === "string" ? delegationResult.id : null;
       const delegation = id ? dependencies.store.getDelegation(id) : null;
+      const capturedId = trustedState(resolution).delegationId;
+      const allowedProjects = new Set(resolution.scope.entityRefs.map((ref) => ref.slice("project:".length)));
+      const domainThreads = objectArray(delegationResult?.threads);
       const joined = delegation?.threads ?? [];
+      const exact = delegation !== null && delegation.controllerKey === authorized.controller.controllerKey &&
+        delegation.instruction === params.instruction && delegation.sealedAt !== null &&
+        (capturedId === undefined || capturedId === delegation.id) &&
+        joined.length === domainThreads.length && joined.every((thread, index) => {
+          const returned = domainThreads[index];
+          return allowedProjects.has(thread.projectId) && returned?.threadId === thread.threadId &&
+            returned.projectId === thread.projectId && returned.title === thread.title;
+        });
+      if (!exact) throw new Error("delegation proof is not bound to the controller and authorized projects");
+      for (const thread of joined) {
+        const visible = await assertVisibleThreadScope({ sdk: dependencies.sdk, threadId: thread.threadId, signal: context.signal });
+        if (visible.id !== thread.threadId || visible.projectId !== thread.projectId) {
+          throw new Error("delegated thread provenance does not match its durable project");
+        }
+      }
       const refs = delegation ? [`delegation:${delegation.id}`, ...joined.map((thread) => `thread:${thread.threadId}`)].slice(0, 16) : [];
       const succeeded = joined.length > 0;
       const proofKinds: ("thread_state" | "external_mutation" | "obligation")[] = succeeded
@@ -688,7 +874,11 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     description: string;
     parameters: Schema;
     experimental_statusLabels?: { pending: string; completed: string };
-    execute(params: z.output<Schema>, context: PluginAgentToolContext): unknown | Promise<unknown>;
+    execute(
+      params: z.output<Schema>,
+      context: PluginAgentToolContext,
+      resolution: ControllerCapabilityScopeResolution,
+    ): unknown | Promise<unknown>;
   }>): void => {
     const descriptor = CONTROLLER_CAPABILITIES[registration.name];
     registerControllerCapabilityTool(bb, {
@@ -711,10 +901,11 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         });
         return { ...resolved, state: { ...trustedState(resolved), authorized } };
       },
-      execute: (params, context) => registration.execute(params, context),
+      execute: (params, context, resolution) => registration.execute(params, context, resolution),
       projectEvidence: (_params, context, domain, resolution) => projectTrustedEvidence({
         dependencies,
         name: registration.name,
+        params: _params as Record<string, unknown>,
         context,
         domain,
         resolution,
@@ -749,7 +940,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       projectId: z.string().min(1).max(256),
       task: z.string().trim().min(1).max(4_000),
     }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, resolution) => {
       authorizedController(dependencies.store, context);
       const job = dependencies.store.createConfirmedControllerJob({
         controllerThreadId: context.threadId,
@@ -757,6 +948,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         task: params.task,
         now: dependencies.now(),
       });
+      trustedState(resolution).createdJobId = job.id;
       dependencies.notify();
       return jobProjection(job, dependencies.store.getAdmission(job.id));
     },
@@ -766,12 +958,12 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[2],
     description: "Read one exact durable job status, or return bounded job choices when no id uniquely resolves.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
-    execute: (params, context) => {
+    execute: (_params, context, resolution) => {
       authorizedController(dependencies.store, context);
-      const resolution = resolveJob(dependencies.store, "status", params.jobId);
-      return resolution.outcome === "job"
-        ? jobProjection(resolution.job, dependencies.store.getAdmission(resolution.job.id))
-        : resolutionProjection(resolution);
+      const jobResolution = trustedState(resolution).jobResolution!;
+      return jobResolution.outcome === "job"
+        ? jobProjection(jobResolution.job, dependencies.store.getAdmission(jobResolution.job.id))
+        : resolutionProjection(jobResolution);
     },
   });
 
@@ -779,11 +971,11 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[3],
     description: "Retry a recoverable failed Telegram Agent job through its durable state machine.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
-    execute: (params, context) => {
+    execute: (_params, context, resolution) => {
       authorizedController(dependencies.store, context);
-      const resolution = resolveJob(dependencies.store, "retry", params.jobId);
-      if (resolution.outcome !== "job") return resolutionProjection(resolution);
-      const job = resolution.job;
+      const jobResolution = trustedState(resolution).jobResolution!;
+      if (jobResolution.outcome !== "job") return resolutionProjection(jobResolution);
+      const job = jobResolution.job;
       if (job.state !== "failed" || job.cancelRequestedAt !== null) {
         throw new Error("The requested job is not retryable");
       }
@@ -797,11 +989,11 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[4],
     description: "Request cancellation of a nonterminal Telegram Agent job. Completion remains executor-fenced.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
-    execute: (params, context) => {
+    execute: (_params, context, resolution) => {
       authorizedController(dependencies.store, context);
-      const resolution = resolveJob(dependencies.store, "cancel", params.jobId);
-      if (resolution.outcome !== "job") return resolutionProjection(resolution);
-      const job = resolution.job;
+      const jobResolution = trustedState(resolution).jobResolution!;
+      if (jobResolution.outcome !== "job") return resolutionProjection(jobResolution);
+      const job = jobResolution.job;
       if (["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) {
         throw new Error("The requested job cannot be cancelled");
       }
@@ -878,15 +1070,20 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       title: z.string().trim().min(1).max(120),
       prompt: z.string().trim().min(1).max(4_000),
     }).strict(),
-    execute: async (params, context) => {
+    execute: async (params, context, resolution) => {
       authorizedController(dependencies.store, context);
-      return await createProjectThread({
+      const hostId = trustedState(resolution).hostIds?.[params.projectId];
+      if (!hostId) throw new Error("The authorized project host is unavailable");
+      const created = await createProjectThread({
         sdk: dependencies.sdk,
         projectId: params.projectId,
+        hostId,
         title: params.title,
         prompt: params.prompt,
         signal: context.signal,
       });
+      trustedState(resolution).createdThreadId = created.thread.id;
+      return created;
     },
   });
 
@@ -917,9 +1114,13 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       kind: z.enum(["stop_thread", "retry_thread"]),
       threadId: z.string().min(1).max(256),
     }).strict(),
-    execute: async (params, context) => {
+    execute: async (params, context, resolution) => {
       authorizedController(dependencies.store, context);
-      return await dependencies.threadOperations.request({ ...params, signal: context.signal });
+      const operation = await dependencies.threadOperations.request({ ...params, signal: context.signal });
+      if (recordValue(operation) && typeof (operation as { id?: unknown }).id === "string") {
+        trustedState(resolution).operationId = (operation as { id: string }).id;
+      }
+      return operation;
     },
   });
 
@@ -934,7 +1135,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       projectId: z.string().min(1).max(256).optional(),
       importance: z.number().min(0).max(1).optional(),
     }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, resolution) => {
       authorizedController(dependencies.store, context);
       const memory = dependencies.store.rememberMemory({
         scope: params.projectId ?? OWNER_MEMORY_SCOPE,
@@ -945,6 +1146,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         source: "agent",
         now: dependencies.now(),
       });
+      trustedState(resolution).memoryId = memory.id;
       return { remembered: { id: memory.id, subject: memory.subject, scope: memory.scope } };
     },
   });
@@ -998,7 +1200,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         instruction: z.string().trim().min(1).max(1_000),
       }).strict(),
     ]),
-    execute: (params, context) => {
+    execute: (params, context, resolution) => {
       const controller = authorizedController(dependencies.store, context);
       const now = dependencies.now();
       const dueAt = params.kind === "schedule" ? nextCronOccurrence(params.cron, now) : null;
@@ -1014,6 +1216,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         dueAt,
         now,
       });
+      trustedState(resolution).monitorId = monitor.id;
       dependencies.notify();
       return { watching: monitorProjection(monitor) };
     },
@@ -1073,7 +1276,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         prompt: z.string().trim().min(1).max(4_000),
       }).strict()).min(1).max(4),
     }).strict(),
-    execute: async (params, context) => {
+    execute: async (params, context, resolution) => {
       const controller = authorizedController(dependencies.store, context);
       // The delegation is recorded before anything is spawned, so a failure
       // partway through leaves threads that are still joined and reported
@@ -1083,13 +1286,17 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         instruction: params.instruction,
         now: dependencies.now(),
       });
+      trustedState(resolution).delegationId = delegation.id;
       const started: { threadId: string; title: string; projectId: string }[] = [];
       for (const task of params.tasks) {
         let threadId: string;
         try {
+          const hostId = trustedState(resolution).hostIds?.[task.projectId];
+          if (!hostId) throw new Error("The authorized project host is unavailable");
           const created = await createProjectThread({
             sdk: dependencies.sdk,
             projectId: task.projectId,
+            hostId,
             title: task.title,
             prompt: task.prompt,
             signal: context.signal,

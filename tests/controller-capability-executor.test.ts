@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import {
   canonicalControllerJson,
@@ -7,9 +8,26 @@ import {
   type ControllerCapabilityDependencies,
 } from "../src/controller/capability-executor";
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
-import { verifiedPipelineOutcome } from "../src/controller/tools";
-import { registeredControllerFixture, submittedControllerFixture } from "./support/controller-trust-fixtures";
+import { registerControllerTools, verifiedPipelineOutcome } from "../src/controller/tools";
+import {
+  registeredControllerFixture,
+  submittedControllerFixture,
+  validEvidenceInput,
+} from "./support/controller-trust-fixtures";
 import { policyFixture } from "./helpers";
+import { EffectRunner } from "../src/services/effect-runner";
+import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../src/bb/validation";
+import type { TelegramAgentStore } from "../src/storage/store";
+
+type TelegramAgentStoreWithLegacyLease = TelegramAgentStore & {
+  leaseEffects(
+    ownerId: string,
+    generation: number,
+    now: number,
+    limit: number,
+    leaseMs: number,
+  ): ReturnType<TelegramAgentStore["listEffectsForJob"]>;
+};
 
 function executorFixture() {
   const fixture = submittedControllerFixture();
@@ -240,26 +258,77 @@ it("suppresses success when the evidence insert throws", async () => {
   })).rejects.toThrow();
 });
 
-it.each(["stale", "limit_exceeded", "duplicate"] as const)(
-  "suppresses success for a non-recorded %s evidence result",
-  async (outcome) => {
-    const fixture = executorFixture();
-    vi.spyOn(fixture.store, "recordControllerEvidence").mockReturnValue(outcome === "duplicate"
-      ? { outcome, evidence: {} as never }
-      : { outcome });
+it("suppresses success against a real stale evidence fence", async () => {
+  const fixture = executorFixture();
+  expect(fixture.store.releaseExecutorLease(
+    fixture.fence.ownerId,
+    fixture.fence.generation,
+    fixture.fence.now,
+  )).toBe(true);
+  expect(fixture.store.recordControllerEvidence({
+    ...validEvidenceInput(fixture.turn),
+    ...fixture.fence,
+  })).toEqual({ outcome: "stale" });
 
-    const error = await executeControllerCapability(fixture.dependencies, {
-      descriptor: CONTROLLER_CAPABILITIES.telegram_agent_list_projects,
-      params: {},
-      context: fixture.context,
-      scope: globalScope,
-      run: () => ({ projects: [] }),
-      projectEvidence: () => ({ outcome: "observed", proofKinds: ["project_state"], subjectRefs: [] }),
-    }).catch((caught: unknown) => caught);
+  await expect(executeControllerCapability(fixture.dependencies, {
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_list_projects,
+    params: {},
+    context: fixture.context,
+    scope: globalScope,
+    run: () => ({ projects: [] }),
+    projectEvidence: () => ({ outcome: "observed", proofKinds: ["project_state"], subjectRefs: [] }),
+  })).rejects.toMatchObject({ code: "fence_lost" });
+});
 
-    expect(error).toMatchObject({ code: "evidence_write_failed" });
-  },
-);
+it("suppresses success when real SQLite evidence state reaches its durable cap", async () => {
+  const fixture = executorFixture();
+  for (let index = 0; index < 128; index += 1) {
+    expect(fixture.store.recordControllerEvidence({
+      ...validEvidenceInput(fixture.turn),
+      ...fixture.fence,
+      argsSha256: index.toString(16).padStart(64, "0"),
+    }).outcome).toBe("recorded");
+  }
+
+  await expect(executeControllerCapability(fixture.dependencies, {
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_list_projects,
+    params: {},
+    context: fixture.context,
+    scope: globalScope,
+    run: () => ({ projects: [] }),
+    projectEvidence: () => ({ outcome: "observed", proofKinds: ["project_state"], subjectRefs: [] }),
+  })).rejects.toMatchObject({ code: "evidence_write_failed" });
+});
+
+it("absorbs a real duplicate native source item without creating duplicate evidence", () => {
+  const fixture = executorFixture();
+  const candidate = {
+    sourceName: "tool",
+    sourceItemId: "item_1",
+    outcome: "observed" as const,
+    argsSha256: "a".repeat(64),
+    resultSha256: "b".repeat(64),
+    proofKinds: ["tool_result"] as const,
+    subjectRefs: [] as const,
+  };
+  expect(fixture.store.recordControllerNativeEvidence({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [candidate],
+  })).toBe("recorded");
+  expect(fixture.store.recordControllerNativeEvidence({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    fromSeq: 1,
+    throughSeq: 2,
+    items: [candidate],
+  })).toBe("recorded");
+  expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toHaveLength(1);
+});
 
 it("preserves 16 trusted subjects in order and rejects a seventeenth", async () => {
   const accepted = executorFixture();
@@ -507,7 +576,7 @@ it("isolates owner monitors from system and foreign cancellation", async () => {
   expect(inactive).toMatchObject({ cancelled: false, _hanoonEvidence: { outcome: "observed" } });
 });
 
-it("promotes pipeline outcome only from a fully bound durable terminal chain", () => {
+it("promotes pipeline outcome only from the real validation writer's fully bound terminal chain", async () => {
   const headSha = "a".repeat(40);
   const mergeSha = "b".repeat(40);
   const nonceHash = "c".repeat(64);
@@ -520,11 +589,68 @@ it("promotes pipeline outcome only from a fully bound durable terminal chain", (
   fixture.store.upsertProjectPolicy(policy, 1);
   fixture.store.createJob({ id: "job_verified", sourceUpdateId: 30_000, requestText: "verified chain", now: 1 });
   fixture.db.prepare(
-    `UPDATE jobs SET state = 'merged', project_id = ?, policy_version = 1, policy_json = ?,
+    `UPDATE jobs SET state = 'final_validating', project_id = ?, policy_version = 1, policy_json = ?,
        environment_id = 'env_1', pr_number = 17, pr_url = ?, pr_head_sha = ?,
-       merge_message = 'merged', merge_commit_sha = ?, merged_at = ?, version = 9
+       version = 2
      WHERE id = 'job_verified'`,
-  ).run(policy.projectId, JSON.stringify(policy), "https://github.com/acme/cyndra/pull/17", headSha, mergeSha, mergedAt);
+  ).run(policy.projectId, JSON.stringify(policy), "https://github.com/acme/cyndra/pull/17", headSha);
+  const validationEffectKey = "job_verified:2:run_final_validation";
+  fixture.db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, 'job_verified', 'run_final_validation', ?, 'pending', 0, 1, 1, 1)`,
+  ).run(validationEffectKey, JSON.stringify({ headSha }));
+  const claimed = (fixture.store as TelegramAgentStoreWithLegacyLease).leaseEffects(
+    fixture.fence.ownerId,
+    fixture.fence.generation,
+    2_000,
+    10,
+    30_000,
+  ).find((effect) => effect.idempotencyKey === validationEffectKey);
+  if (!claimed) throw new Error("final validation effect was not leased");
+  const validationCommands = [
+    GIT_REMOTE_COMMAND,
+    PR_HEAD_COMMAND(17),
+    "npm test",
+    PR_VIEW_COMMAND(17),
+    PR_CHECKS_COMMAND(17),
+    PR_HEAD_COMMAND(17),
+  ];
+  await new EffectRunner({
+    store: fixture.store,
+    fence: {
+      ownerId: fixture.fence.ownerId,
+      generation: fixture.fence.generation,
+      signal: new AbortController().signal,
+    },
+    now: () => 2_001,
+    runValidation: async () => ({
+      headSha,
+      originRepository: policy.githubRepository,
+      commandReceipts: validationCommands.map((command) => ({
+        command,
+        outcome: "pass" as const,
+        exitCode: 0,
+        output: "verified",
+      })),
+      requiredChecks: [{ name: "test", bucket: "pass", state: "SUCCESS", link: null }],
+      validationOutcome: "pass" as const,
+      completedAt: mergedAt,
+      terminalIds: ["terminal_validation", "terminal_checks"],
+    }),
+  }).run(claimed);
+  const writtenFinalTest = fixture.store.getLatestPipelineStageAttempt("job_verified", "FINAL_TEST");
+  expect(writtenFinalTest).toMatchObject({
+    state: "completed",
+    resourceKind: "bb_terminal",
+    resourceId: "terminal_checks",
+    outputSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+  });
+  fixture.db.prepare(
+    `UPDATE jobs SET state = 'merged', merge_message = 'merged', merge_commit_sha = ?,
+       merged_at = ?, version = 9 WHERE id = 'job_verified'`,
+  ).run(mergeSha, mergedAt);
   const job = fixture.store.getJob("job_verified");
   if (!job) throw new Error("verified pipeline fixture job disappeared");
   const receipt = {
@@ -559,20 +685,6 @@ it("promotes pipeline outcome only from a fully bound durable terminal chain", (
     pullRequest: { number: 17, url: "https://github.com/acme/cyndra/pull/17", state: "MERGED" },
     confirmedAt: mergedAt,
   };
-  const validationOutcome = {
-    validationOutcome: "pass",
-    headSha,
-    commandReceipts: [{ outcome: "pass" }],
-    requiredChecks: [{ name: "test", bucket: "pass", state: "SUCCESS" }],
-  };
-  fixture.db.prepare(
-    `INSERT INTO pipeline_stage_attempts (
-       id, job_id, role, ordinal, state, environment_id, resource_kind, resource_id,
-       input_sha256, output_text, output_sha256, outcome_json, start_sha, end_sha,
-       created_at, completed_at, updated_at
-     ) VALUES ('final_test_1', ?, 'FINAL_TEST', 1, 'completed', 'env_1', 'bb_terminal',
-       'terminal_1', ?, 'passed', ?, ?, ?, ?, 1, 2, 2)`,
-  ).run(job.id, "d".repeat(64), "e".repeat(64), JSON.stringify(validationOutcome), headSha, headSha);
   fixture.db.prepare(
     `INSERT INTO attempts (
        id, job_id, kind, ordinal, thread_id, head_sha, result_json, created_at, completed_at
@@ -598,8 +710,128 @@ it("promotes pipeline outcome only from a fully bound durable terminal chain", (
   }));
 
   expect(verifiedPipelineOutcome(fixture.store, job)).toBe(true);
-  fixture.db.prepare("DELETE FROM pipeline_stage_attempts WHERE id = 'final_test_1'").run();
+  const finalTest = fixture.store.getLatestPipelineStageAttempt(job.id, "FINAL_TEST");
+  if (!finalTest?.outcome) throw new Error("real final validation outcome disappeared");
+  const originalOutcome = finalTest.outcome;
+  const writeOutcome = (outcome: Record<string, unknown>) => {
+    const outputText = JSON.stringify(outcome);
+    const outputSha256 = createHash("sha256").update(outputText, "utf8").digest("hex");
+    fixture.db.prepare(
+      "UPDATE pipeline_stage_attempts SET output_text = ?, output_sha256 = ?, outcome_json = ? WHERE id = ?",
+    ).run(outputText, outputSha256, outputText, finalTest.id);
+  };
+  writeOutcome({ ...originalOutcome, commandReceipts: [{ command: "npm test", outcome: "pass", exitCode: 0, output: "partial" }] });
   expect(verifiedPipelineOutcome(fixture.store, job)).toBe(false);
+  writeOutcome(originalOutcome);
+  fixture.db.prepare("UPDATE pipeline_stage_attempts SET resource_id = 'terminal_stale' WHERE id = ?").run(finalTest.id);
+  expect(verifiedPipelineOutcome(fixture.store, job)).toBe(false);
+  fixture.db.prepare("UPDATE pipeline_stage_attempts SET resource_id = 'terminal_checks' WHERE id = ?").run(finalTest.id);
+  writeOutcome({ ...originalOutcome, requiredChecks: [{ name: "test", bucket: "pass" }] });
+  expect(verifiedPipelineOutcome(fixture.store, job)).toBe(false);
+  writeOutcome({ ...originalOutcome, completedAt: "not-a-date" });
+  registerControllerTools(fixture.bb, {
+    store: fixture.store,
+    sdk: fixture.bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 2_002,
+  });
+  const controller = fixture.store.getControllerForOwner("7", "7");
+  if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
+  const status = JSON.parse(await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    { jobId: job.id },
+    { threadId: controller.threadId, projectId: controller.projectId },
+  ) as string) as { _hanoonEvidence: { proofKinds: string[] } };
+  expect(status._hanoonEvidence.proofKinds).toContain("job_state");
+  expect(status._hanoonEvidence.proofKinds).not.toContain("pipeline_outcome");
+  writeOutcome(originalOutcome);
+  expect(verifiedPipelineOutcome(fixture.store, job)).toBe(true);
+
+  const productionPolicy = policyFixture();
+  fixture.db.prepare(
+    "UPDATE jobs SET state = 'complete', policy_json = ? WHERE id = ?",
+  ).run(JSON.stringify(productionPolicy), job.id);
+  const writeProductionStage = (
+    id: string,
+    role: "DEPLOY" | "CANARY",
+    snapshot: Record<string, unknown>,
+    resourceId: string,
+  ) => {
+    const outputText = JSON.stringify(snapshot);
+    const outputSha256 = createHash("sha256").update(outputText, "utf8").digest("hex");
+    fixture.db.prepare(
+      `INSERT INTO pipeline_stage_attempts (
+         id, job_id, role, ordinal, state, environment_id, resource_kind, resource_id,
+         input_sha256, output_text, output_sha256, outcome_json, start_sha, end_sha,
+         created_at, completed_at, updated_at
+       ) VALUES (?, ?, ?, 1, 'completed', 'env_1', 'bb_terminal', ?, ?, ?, ?, ?, ?, ?, 3, 4, 4)`,
+    ).run(id, job.id, role, resourceId, "d".repeat(64), outputText, outputSha256, outputText, mergeSha, mergeSha);
+  };
+  const checkout = {
+    name: "verify-merged-checkout",
+    command: `test "$(git rev-parse --verify HEAD)" = '${mergeSha}'`,
+    outcome: "pass",
+    exitCode: 0,
+    output: "verified",
+  };
+  const deploySnapshot = {
+    phase: "deploy",
+    outcome: "pass",
+    summary: "deployed",
+    failedCommand: null,
+    commandReceipts: [checkout, {
+      name: "deploy",
+      command: "./scripts/deploy-production.sh",
+      outcome: "pass",
+      exitCode: 0,
+      output: "deployed",
+    }],
+    terminalIds: ["terminal_deploy"],
+    completedAt: mergedAt,
+  };
+  const canarySnapshot = {
+    phase: "canary",
+    outcome: "pass",
+    summary: "healthy",
+    failedCommand: null,
+    commandReceipts: [checkout, {
+      name: "canary",
+      command: "./scripts/verify-production.sh",
+      outcome: "pass",
+      exitCode: 0,
+      output: "healthy",
+    }],
+    terminalIds: ["terminal_canary"],
+    completedAt: mergedAt,
+  };
+  writeProductionStage("deploy_verified", "DEPLOY", deploySnapshot, "terminal_deploy");
+  writeProductionStage("canary_verified", "CANARY", canarySnapshot, "terminal_canary");
+  const completeJob = fixture.store.getJob(job.id);
+  if (!completeJob) throw new Error("complete pipeline job disappeared");
+  expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(true);
+
+  const mutateProduction = (id: string, snapshot: Record<string, unknown>) => {
+    const outputText = JSON.stringify(snapshot);
+    const outputSha256 = createHash("sha256").update(outputText, "utf8").digest("hex");
+    fixture.db.prepare(
+      "UPDATE pipeline_stage_attempts SET output_text = ?, output_sha256 = ?, outcome_json = ? WHERE id = ?",
+    ).run(outputText, outputSha256, outputText, id);
+  };
+  mutateProduction("deploy_verified", {
+    ...deploySnapshot,
+    commandReceipts: [checkout, { ...deploySnapshot.commandReceipts[1], command: "./wrong-deploy.sh" }],
+  });
+  expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(false);
+  mutateProduction("deploy_verified", deploySnapshot);
+  mutateProduction("canary_verified", {
+    ...canarySnapshot,
+    terminalIds: ["terminal_other"],
+  });
+  expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(false);
+  mutateProduction("canary_verified", canarySnapshot);
+  expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(true);
 });
 
 it("projects the remaining memory, monitor, health, scorecard, and style rows from trusted state", async () => {
@@ -646,9 +878,17 @@ it("projects the remaining memory, monitor, health, scorecard, and style rows fr
   });
 
   const health = await call("telegram_agent_health", {});
-  expect(health._hanoonEvidence).toMatchObject({ outcome: "observed", proofKinds: ["health_snapshot"] });
+  expect(health._hanoonEvidence).toMatchObject({
+    outcome: "observed",
+    proofKinds: ["health_snapshot"],
+    subjectRefs: [`controller:${fixture.turn.controllerKey}`],
+  });
   const scorecard = await call("telegram_agent_scorecard", {});
-  expect(scorecard._hanoonEvidence).toMatchObject({ outcome: "observed", proofKinds: ["health_snapshot"] });
+  expect(scorecard._hanoonEvidence).toMatchObject({
+    outcome: "observed",
+    proofKinds: ["health_snapshot"],
+    subjectRefs: [`controller:${fixture.turn.controllerKey}`],
+  });
 
   const style = await call("telegram_agent_set_working_style", { text: "Lead with the result." });
   expect(style._hanoonEvidence).toMatchObject({ outcome: "succeeded", proofKinds: ["memory_state"] });

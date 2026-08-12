@@ -288,6 +288,13 @@ function safeProjection(
   return { ...projection, proofKinds: [...projection.proofKinds], subjectRefs };
 }
 
+function interruptedSubjectRefs(resolution: ControllerCapabilityScopeResolution): readonly string[] {
+  return resolution.scope.entityRefs.filter((subjectRef) =>
+    typeof subjectRef === "string" &&
+    Buffer.byteLength(subjectRef, "utf8") <= 256 &&
+    SAFE_SUBJECT_REF.test(subjectRef));
+}
+
 function maximumEnvelope(projection: ControllerCapabilityEvidenceProjection): HanoonEvidenceEnvelope {
   return {
     ref: "evidence:9007199254740991",
@@ -425,7 +432,7 @@ export async function executeControllerCapability(
   let projection: ControllerCapabilityEvidenceProjection;
   try {
     const rawProjection = execution.interrupted
-      ? { outcome: "interrupted" as const, proofKinds: [] as const, subjectRefs: resolution.scope.entityRefs }
+      ? { outcome: "interrupted" as const, proofKinds: [] as const, subjectRefs: interruptedSubjectRefs(resolution) }
       : await input.projectEvidence(execution.domainResult, resolution);
     projection = safeProjection(input.descriptor, execution.replay
       ? { ...rawProjection, outcome: "observed" }

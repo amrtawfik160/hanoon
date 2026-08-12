@@ -126,13 +126,34 @@ export function registeredControllerFixture(options: { staleLease?: boolean } = 
   fixture.store.upsertProjectPolicy(policyFixture(), 1_500);
   const controller = fixture.store.getControllerForOwner("7", "7");
   if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
-  const request = vi.fn(async () => ({
-    id: "operation_1",
-    kind: "stop_thread" as const,
-    threadId: "thr_visible",
-    state: "awaiting_confirmation" as const,
-    expiresAt: 62_000,
-  }));
+  let operationNumber = 0;
+  const request = vi.fn(async (input: {
+    kind: "steer_thread" | "stop_thread" | "retry_thread";
+    threadId: string;
+    text?: string;
+  }) => {
+    operationNumber += 1;
+    const id = `operation_${operationNumber}`;
+    fixture.store.createThreadOperation({
+      id,
+      nonceHash: operationNumber.toString(16).padStart(64, "0"),
+      ownerUserId: "7",
+      ownerChatId: "7",
+      kind: input.kind,
+      threadId: input.threadId,
+      text: input.kind === "steer_thread" ? input.text ?? "steer" : null,
+      expiresAt: 62_000,
+      now: 1_900,
+    });
+    const operation = fixture.store.markThreadOperationConfirmationSent(id, operationNumber, 1_901);
+    return {
+      id: operation.id,
+      kind: operation.kind,
+      threadId: operation.threadId,
+      state: operation.state,
+      expiresAt: operation.expiresAt,
+    };
+  });
   const notify = vi.fn();
   const health = vi.fn(() => ({ ok: true }));
   registerControllerTools(fixture.bb, {
