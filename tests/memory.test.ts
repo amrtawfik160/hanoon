@@ -150,3 +150,30 @@ it("records that a recalled memory was used so it decays more slowly", () => {
 
   expect(store.getMemory(memory.id)).toMatchObject({ useCount: 1, lastUsedAt: NOW + DAY_MS });
 });
+
+it.each([
+  ["a spoken password", "the console password is hunter2swordfish"],
+  ["a passphrase colon form", "passphrase: correct-horse-battery"],
+  ["an env-var assignment", "run with GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwx"],
+  ["an OpenAI-style key", "use sk-abcdefghijklmnopqrstuvwxyz01"],
+  ["a private key block", "-----BEGIN RSA PRIVATE KEY----- MIIEpAIB"],
+])("refuses to remember %s", (_label, body) => {
+  const { store } = fixture();
+
+  expect(() => store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "a credential", body,
+    source: "owner", now: 2_000,
+  })).toThrow(/credential/);
+});
+
+it("still remembers ordinary text that merely mentions credentials", () => {
+  const { store } = fixture();
+
+  const stored = store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "where credentials live",
+    body: "The console credentials live in the vault; never paste them into chat.",
+    source: "owner", now: 2_000,
+  });
+
+  expect(stored.subject).toBe("where credentials live");
+});

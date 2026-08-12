@@ -2451,18 +2451,33 @@ function assertMemoryText(value: string, limit: number, field: string): string {
 }
 
 /**
- * Delegated output is arbitrary text from a shell the agent drove, which is a
- * far wider exposure than the agent-authored summaries the shared guard was
- * tuned for. These patterns are additive to it, and deliberately local: they
- * withhold text here without changing what the merge and failure paths reject.
+ * The shared `containsCredentialLikeText` guard was tuned for short
+ * agent-authored failure summaries, so it only catches a bare `secret=` or
+ * `token=`. Anything long-lived — a memory replayed into every turn, or output
+ * captured from a shell the agent drove — needs a wider net: prose phrasings
+ * ("the password is …"), env-var assignments, key blocks, and provider token
+ * shapes all reached storage untouched.
+ *
+ * Additive on purpose: this does not change what the merge and failure paths
+ * reject, only what may be stored and replayed.
  */
-const DELEGATION_SECRET_PATTERNS = [
+const STORED_SECRET_PATTERNS = [
+  // "the password is hunter2", "passphrase: hunter2"
+  /\b(?:password|passphrase|passwd)\b\s*(?:is|are|=|:)\s*\S+/i,
+  /\blogin\s+(?:password|credentials?)\b\s*(?:is|are|=|:)\s*\S+/i,
   // Env-var style assignment: AWS_SECRET_ACCESS_KEY=…, GITHUB_TOKEN: …
   /[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|APIKEY)[A-Z0-9_]*\s*[:=]\s*\S+/i,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
+  /\bsk-[A-Za-z0-9_-]{16,}\b/,
 ];
+
+/** True when text should never be stored verbatim and replayed later. */
+export function looksLikeStoredSecret(text: string): boolean {
+  return containsCredentialLikeText(text) ||
+    STORED_SECRET_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 /**
  * A delegated thread's output is arbitrary text the agent never wrote, so it is
@@ -2472,9 +2487,7 @@ const DELEGATION_SECRET_PATTERNS = [
 function clipDelegationSummary(value: string, limit: number): string | null {
   const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
   if (text.length === 0) return null;
-  const secret = containsCredentialLikeText(text) ||
-    DELEGATION_SECRET_PATTERNS.some((pattern) => pattern.test(text));
-  if (secret) return "(withheld: output looked like it contained a credential)";
+  if (looksLikeStoredSecret(text)) return "(withheld: output looked like it contained a credential)";
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
@@ -4653,7 +4666,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const body = assertMemoryText(input.body, MAX_MEMORY_BODY, "memory body");
     // A memory is long-lived, searchable, and replayed into later conversations,
     // so a pasted secret would outlive the message that carried it.
-    if (containsCredentialLikeText(subject) || containsCredentialLikeText(body)) {
+    // A memory outlives the message that carried it and is replayed into every
+    // later turn, so it gets the wider net rather than the failure-summary one.
+    if (looksLikeStoredSecret(subject) || looksLikeStoredSecret(body)) {
       throw new TypeError("memory must not contain credential-like text");
     }
     const importance = assertUnitInterval(input.importance ?? DEFAULT_MEMORY_IMPORTANCE, "importance");
