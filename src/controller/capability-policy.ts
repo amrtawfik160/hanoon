@@ -627,9 +627,10 @@ Object.freeze(CONTROLLER_PROOF_KINDS);
 validateManifest();
 
 export function controllerCapability(name: ControllerToolName): ControllerCapabilityDescriptor {
-  const descriptor = (CONTROLLER_CAPABILITIES as Readonly<Record<string, ControllerCapabilityDescriptor>>)[name];
-  if (!descriptor) throw new TypeError("unknown controller capability");
-  return descriptor;
+  if (!Object.hasOwn(CONTROLLER_CAPABILITIES, name)) {
+    throw new TypeError("unknown controller capability");
+  }
+  return CONTROLLER_CAPABILITIES[name];
 }
 
 export const CONTROLLER_CAPABILITY_DENIAL_CODES = Object.freeze([

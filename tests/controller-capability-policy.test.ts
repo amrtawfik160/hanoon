@@ -499,6 +499,14 @@ describe("controller capability manifest", () => {
       .toThrow(/unknown.*capability|capability.*unknown/i);
   });
 
+  it.each(["__proto__", "constructor", "toString"] as const)(
+    "rejects inherited Object prototype name %s",
+    (inheritedName) => {
+      expect(() => controllerCapability(inheritedName as ControllerToolName))
+        .toThrow(new TypeError("unknown controller capability"));
+    },
+  );
+
   it("contains none of the forbidden Slice 1 classifications", () => {
     for (const descriptor of Object.values(CONTROLLER_CAPABILITIES)) {
       expect(descriptor.effect_class).not.toBe("irreversible_external_write");
