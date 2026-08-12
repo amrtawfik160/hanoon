@@ -1,10 +1,15 @@
+import Database from "better-sqlite3";
 import { expect, it } from "vitest";
+import {
+  ControllerEvidenceRepository,
+  type ControllerNativeEvidenceCandidate,
+} from "../src/storage/controller-evidence-repository";
 import {
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
 
-function nativeEvidenceCandidate(sourceItemId: string) {
+function nativeEvidenceCandidate(sourceItemId: string): ControllerNativeEvidenceCandidate {
   return {
     sourceName: "command",
     sourceItemId,
@@ -15,6 +20,22 @@ function nativeEvidenceCandidate(sourceItemId: string) {
     subjectRefs: [`command:${sourceItemId}`] as const,
   };
 }
+
+function openEvidenceConnection(databasePath: string) {
+  const db = new Database(databasePath);
+  db.pragma("busy_timeout = 5000");
+  db.pragma("foreign_keys = ON");
+  return { db, repository: new ControllerEvidenceRepository(db) };
+}
+
+const nativeIdentityConflicts = [
+  ["source name", { sourceName: "tool" }],
+  ["outcome", { outcome: "failed" }],
+  ["argument hash", { argsSha256: "e".repeat(64) }],
+  ["result hash", { resultSha256: "f".repeat(64) }],
+  ["proof-kind order", { proofKinds: ["tool_result", "command_result"] }],
+  ["subject-ref order", { subjectRefs: ["project:proj_1", "command:raced_item"] }],
+] as const satisfies ReadonlyArray<readonly [string, Partial<ControllerNativeEvidenceCandidate>]>;
 
 function installAcceptedFinalization(
   db: ReturnType<typeof submittedControllerFixture>["db"],
@@ -184,6 +205,77 @@ it("replays one native item across restart without duplicating its row", () => {
   })).toBe("recorded");
   expect(restarted.listControllerEvidence(turn.id, 128)).toHaveLength(1);
   expect(restarted.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 2 });
+});
+
+it.each(nativeIdentityConflicts)(
+  "rejects a two-connection %s identity conflict without advancing the cursor",
+  (_semanticField, conflictingFields) => {
+    const { store, turn, fence, db } = submittedControllerFixture();
+    const storedCandidate: ControllerNativeEvidenceCandidate = {
+      ...nativeEvidenceCandidate("raced_item"),
+      proofKinds: ["command_result", "tool_result"],
+      subjectRefs: ["command:raced_item", "project:proj_1"],
+    };
+    const competing = openEvidenceConnection(db.name);
+    try {
+      expect(competing.repository.list(turn.id, 128)).toEqual([]);
+      expect(store.recordControllerNativeEvidence({
+        ...fence,
+        turnId: turn.id,
+        controllerKey: turn.controllerKey,
+        fromSeq: 0,
+        throughSeq: 0,
+        items: [storedCandidate],
+      })).toBe("recorded");
+
+      expect(competing.repository.recordNativeBatch({
+        ...fence,
+        now: fence.now + 1,
+        turnId: turn.id,
+        controllerKey: turn.controllerKey,
+        fromSeq: 0,
+        throughSeq: 1,
+        items: [{ ...storedCandidate, ...conflictingFields }],
+      })).toBe("native_identity_conflict");
+      expect(store.listControllerEvidence(turn.id, 128)).toMatchObject([storedCandidate]);
+      expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 0 });
+    } finally {
+      competing.db.close();
+    }
+  },
+);
+
+it("keeps an identical two-connection non-advancing duplicate idempotent", () => {
+  const { store, turn, fence, db } = submittedControllerFixture();
+  const candidate = nativeEvidenceCandidate("identical_non_advancing");
+  const competing = openEvidenceConnection(db.name);
+  try {
+    expect(competing.repository.list(turn.id, 128)).toEqual([]);
+    expect(store.recordControllerNativeEvidence({
+      ...fence,
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      fromSeq: 0,
+      throughSeq: 0,
+      items: [candidate],
+    })).toBe("recorded");
+
+    expect(competing.repository.recordNativeBatch({
+      ...fence,
+      now: fence.now + 1,
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      fromSeq: 0,
+      throughSeq: 0,
+      items: [candidate],
+    })).toBe("recorded");
+    expect(store.listControllerEvidence(turn.id, 128)).toMatchObject([
+      { ...candidate, observedAt: fence.now },
+    ]);
+    expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 0 });
+  } finally {
+    competing.db.close();
+  }
 });
 
 it("advances the native cursor for an empty batch without inserting evidence", () => {
