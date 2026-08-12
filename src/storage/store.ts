@@ -1740,6 +1740,26 @@ export interface TelegramAgentStore {
     dueAt: number | null;
     now: number;
   }): MonitorRecord;
+  ensureSystemMonitor(input: {
+    systemKey: string;
+    controllerKey: string;
+    cron: string;
+    instruction: string;
+    dueAt: number;
+    now: number;
+  }): MonitorRecord;
+  buildAutonomyScorecard(input: { now: number; windowMs: number }): {
+    windowMs: number;
+    jobs: Record<string, number>;
+    blockedJobs: { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    remediationCycles: number;
+    approvalsRequested: number;
+    approvalsConsumed: number;
+    deliveryRetries: number;
+    undeliverable: number;
+    memory: { live: number; tombstoned: number; superseded: number; lowConfidence: number; extracted: number };
+    monitors: { armed: number; system: number; failed: number };
+  };
   listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[];
   listArmedMonitors(limit: number): MonitorRecord[];
   cancelMonitor(id: string, now: number): boolean;
@@ -2206,6 +2226,7 @@ type MonitorRow = {
   last_error: string | null;
   created_at: number;
   updated_at: number;
+  system_key: string | null;
 };
 
 type JobMemoryExtractionRow = {
@@ -4012,6 +4033,117 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       input.now,
     );
     return this.requireMonitor(id);
+  }
+
+  /**
+   * Installs a monitor the plugin owns rather than the owner. Keyed so install
+   * is idempotent across restarts, and exempt from the owner's armed-monitor
+   * cap: the agent's own housekeeping must not be crowded out by watches the
+   * owner set, nor consume slots they were counting on.
+   */
+  public ensureSystemMonitor(input: {
+    systemKey: string;
+    controllerKey: string;
+    cron: string;
+    instruction: string;
+    dueAt: number;
+    now: number;
+  }): MonitorRecord {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.systemKey, "systemKey");
+    const instruction = assertMemoryText(input.instruction, MAX_MONITOR_INSTRUCTION, "monitor instruction");
+    assertNonNegativeInteger(input.dueAt, "dueAt");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): MonitorRecord => {
+      const existing = this.db.prepare(
+        "SELECT * FROM monitors WHERE system_key = ?",
+      ).get(input.systemKey) as MonitorRow | undefined;
+      if (existing) {
+        // Re-arm a system monitor the owner or a failure retired; its schedule
+        // and wording are owned by this release, not by whatever ran before.
+        this.db.prepare(
+          `UPDATE monitors
+              SET cron = ?, instruction = ?, updated_at = ?,
+                  state = CASE WHEN state = 'armed' THEN 'armed' ELSE 'armed' END,
+                  due_at = CASE WHEN state = 'armed' AND due_at IS NOT NULL THEN due_at ELSE ? END
+            WHERE system_key = ?`,
+        ).run(input.cron, instruction, input.now, input.dueAt, input.systemKey);
+        return this.requireMonitor(existing.id);
+      }
+      const id = `mon-${randomUUID()}`;
+      this.db.prepare(
+        `INSERT INTO monitors (
+           id, controller_key, kind, thread_id, cron, instruction, state, due_at,
+           fire_count, last_fired_at, last_error, created_at, updated_at, system_key
+         ) VALUES (?, ?, 'schedule', NULL, ?, ?, 'armed', ?, 0, NULL, NULL, ?, ?, ?)`,
+      ).run(id, input.controllerKey, input.cron, instruction, input.dueAt, input.now, input.now, input.systemKey);
+      return this.requireMonitor(id);
+    }).immediate();
+  }
+
+  /**
+   * Durable counts only. Every number here is read from committed state, so the
+   * agent can report it without inventing a rate the database cannot support.
+   */
+  public buildAutonomyScorecard(input: { now: number; windowMs: number }): {
+    windowMs: number;
+    jobs: Record<string, number>;
+    blockedJobs: { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    remediationCycles: number;
+    approvalsRequested: number;
+    approvalsConsumed: number;
+    deliveryRetries: number;
+    undeliverable: number;
+    memory: { live: number; tombstoned: number; superseded: number; lowConfidence: number; extracted: number };
+    monitors: { armed: number; system: number; failed: number };
+  } {
+    assertNonNegativeInteger(input.now, "now");
+    if (!Number.isSafeInteger(input.windowMs) || input.windowMs < 1) throw new TypeError("windowMs must be positive");
+    const since = Math.max(0, input.now - input.windowMs);
+    const scalar = (sql: string, ...params: unknown[]): number => {
+      const row = this.db.prepare(sql).get(...params) as { value: number } | undefined;
+      return row?.value ?? 0;
+    };
+    const jobRows = this.db.prepare(
+      "SELECT state, COUNT(*) AS value FROM jobs WHERE updated_at >= ? GROUP BY state",
+    ).all(since) as { state: string; value: number }[];
+    const jobs: Record<string, number> = {};
+    for (const row of jobRows) jobs[row.state] = row.value;
+    const blockedJobs = this.db.prepare(
+      `SELECT id, project_id AS projectId, blocked_reason AS reason, updated_at AS updatedAt
+         FROM jobs WHERE state = 'blocked' ORDER BY updated_at DESC LIMIT 10`,
+    ).all() as { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    return {
+      windowMs: input.windowMs,
+      jobs,
+      blockedJobs,
+      remediationCycles: scalar(
+        "SELECT COALESCE(SUM(review_cycle), 0) AS value FROM jobs WHERE updated_at >= ?", since),
+      approvalsRequested: scalar(
+        "SELECT COUNT(*) AS value FROM approvals WHERE expires_at >= ?", since),
+      approvalsConsumed: scalar(
+        "SELECT COUNT(*) AS value FROM approvals WHERE consumed_at IS NOT NULL AND consumed_at >= ?", since),
+      deliveryRetries: scalar(
+        "SELECT COALESCE(SUM(attempts), 0) AS value FROM outbox WHERE updated_at >= ? AND attempts > 1", since),
+      undeliverable: scalar("SELECT COUNT(*) AS value FROM outbox WHERE status = 'dead'"),
+      memory: {
+        live: scalar(
+          "SELECT COUNT(*) AS value FROM memories WHERE forgotten_at IS NULL AND superseded_by IS NULL"),
+        tombstoned: scalar("SELECT COUNT(*) AS value FROM memories WHERE forgotten_at IS NOT NULL"),
+        superseded: scalar("SELECT COUNT(*) AS value FROM memories WHERE superseded_by IS NOT NULL"),
+        lowConfidence: scalar(
+          `SELECT COUNT(*) AS value FROM memories
+            WHERE forgotten_at IS NULL AND superseded_by IS NULL AND confidence < 0.3`),
+        extracted: scalar(
+          `SELECT COUNT(*) AS value FROM memories
+            WHERE origin = 'job_outcome' AND forgotten_at IS NULL AND superseded_by IS NULL`),
+      },
+      monitors: {
+        armed: scalar("SELECT COUNT(*) AS value FROM monitors WHERE state = 'armed'"),
+        system: scalar("SELECT COUNT(*) AS value FROM monitors WHERE system_key IS NOT NULL"),
+        failed: scalar("SELECT COUNT(*) AS value FROM monitors WHERE state = 'failed'"),
+      },
+    };
   }
 
   public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {

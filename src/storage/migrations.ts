@@ -711,6 +711,11 @@ CREATE INDEX memory_recalls_unscored ON memory_recalls (scored_at, recalled_at);
 ALTER TABLE memories ADD COLUMN curated_at INTEGER;
 `] as const;
 
+export const SYSTEM_MONITOR_MIGRATIONS = [String.raw`
+ALTER TABLE monitors ADD COLUMN system_key TEXT;
+CREATE UNIQUE INDEX monitors_system_key ON monitors (system_key) WHERE system_key IS NOT NULL;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -734,4 +739,5 @@ export const ALL_MIGRATIONS = [
   ...DELEGATION_MIGRATIONS,
   ...JOB_MEMORY_MIGRATIONS,
   ...MEMORY_CURATION_MIGRATIONS,
+  ...SYSTEM_MONITOR_MIGRATIONS,
 ] as const;

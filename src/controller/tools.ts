@@ -50,6 +50,7 @@ export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_cancel_watch",
   "telegram_agent_health",
   "telegram_agent_delegate",
+  "telegram_agent_scorecard",
 ] as const;
 
 type ToolDependencies = {
@@ -692,6 +693,22 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           delegation: { id: delegation.id, instruction: delegation.instruction, threads: started },
         });
       });
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[19],
+    description: "Read the durable autonomy scorecard: work completed and blocked, decisions the owner was asked for, remediation cycles, delivery retries, memory health, and monitors. Every number comes from committed state, so report what it says and never a rate it does not support.",
+    experimental_statusLabels: { pending: "Reading the scorecard", completed: "Read the scorecard" },
+    parameters: z.object({
+      windowDays: z.number().int().min(1).max(90).default(7),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      return json(dependencies.store.buildAutonomyScorecard({
+        now: dependencies.now(),
+        windowMs: params.windowDays * 86_400_000,
+      }));
     },
   });
 

@@ -54,6 +54,9 @@ export type JobExecutorDependencies = {
   memoryCuration?: {
     processDue(): boolean;
   };
+  systemMonitors?: {
+    install(): void;
+  };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
     reset(): void;
@@ -476,6 +479,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         if (deps.memoryCuration) {
           didWork = deps.memoryCuration.processDue() || didWork;
         }
+        // Idempotent, and deliberately not a one-shot at activation: pairing
+        // can happen long after the executor starts.
+        deps.systemMonitors?.install();
 
         const configuredCap = validConfiguredCap(deps.maxConcurrentJobs?.());
         if (configuredCap !== null && deps.scheduler) {

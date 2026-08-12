@@ -50,6 +50,7 @@ import { MonitorService } from "./services/monitor-service";
 import { ThreadNoticeService } from "./services/thread-notice-service";
 import { JobMemoryService } from "./services/job-memory-service";
 import { MemoryCurationService } from "./services/memory-curation-service";
+import { installSystemMonitors } from "./services/system-monitors";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -517,6 +518,18 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     warn: (message) => bb.log.warn(message),
   });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
+  let systemMonitorsInstalled = false;
+  const systemMonitors = {
+    install: () => {
+      if (systemMonitorsInstalled) return;
+      const installed = installSystemMonitors({
+        store,
+        clock: { now: clock },
+        warn: (message) => bb.log.warn(message),
+      });
+      if (installed > 0) systemMonitorsInstalled = true;
+    },
+  };
   const threadNotices = new ThreadNoticeService({
     store,
     threads: {
@@ -850,6 +863,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       threadNotices,
       jobMemory,
       memoryCuration,
+      systemMonitors,
       presence,
       laneSnapshots,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),
