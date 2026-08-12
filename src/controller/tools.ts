@@ -13,7 +13,8 @@ import {
   type JobControlKind,
 } from "../storage/store";
 import { nextCronOccurrence } from "../services/monitor-service";
-import { parseProductionStageSnapshot } from "../services/production-runner";
+import { parseProductionStageSnapshot, productionCommandIdentity } from "../services/production-runner";
+import { validationCommandIdentity } from "../services/effect-runner";
 import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../bb/validation";
 import { CONTROLLER_PROVIDERS } from "./execution-profile";
 import { isControllerThreadTitle } from "./bb-controller";
@@ -475,6 +476,16 @@ function exactIsoDate(value: unknown): boolean {
   }
 }
 
+function mergeTimesAreChronological(
+  validationCompletedAt: string,
+  mergedAt: string,
+  confirmedAt: string,
+): boolean {
+  if (!exactIsoDate(mergedAt) || !exactIsoDate(confirmedAt)) return false;
+  return Date.parse(validationCompletedAt) <= Date.parse(mergedAt) &&
+    Date.parse(mergedAt) <= Date.parse(confirmedAt);
+}
+
 function validationCommand(entry: NonNullable<Job["policy"]>["validationCommands"][number]): string {
   return typeof entry === "string" ? entry : entry.command;
 }
@@ -501,7 +512,7 @@ function expectedValidationCommands(job: Job): string[] {
     PR_VIEW_COMMAND(job.prNumber!),
     PR_CHECKS_COMMAND(job.prNumber!),
     PR_HEAD_COMMAND(job.prNumber!),
-  ];
+  ].map(validationCommandIdentity);
 }
 
 function terminalIdsMatch(value: unknown, resourceId: string): boolean {
@@ -522,29 +533,39 @@ function requiredChecksMatch(value: unknown, requiredNames: readonly string[]): 
     strictPassingRequiredCheck(checksByName.get(name), name));
 }
 
-function finalTestIsVerified(store: TelegramAgentStore, job: Job, facts: TerminalPipelineFacts): boolean {
+function verifiedFinalTestCompletedAt(
+  store: TelegramAgentStore,
+  job: Job,
+  facts: TerminalPipelineFacts,
+): string | null {
   const finalTest = store.getLatestPipelineStageAttempt(job.id, "FINAL_TEST");
   if (
     finalTest?.state !== "completed" || finalTest.completedAt === null || !exactPersistedOutcome(finalTest) ||
     finalTest.environmentId !== job.environmentId || finalTest.resourceKind !== "bb_terminal" || !finalTest.resourceId ||
     finalTest.startSha !== facts.headSha || finalTest.endSha !== facts.headSha
-  ) return false;
+  ) return null;
   const outcome = finalTest.outcome;
   if (!outcome || !exactKeys(outcome, [
     "validationOutcome", "headSha", "originRepository", "terminalIds",
     "commandReceipts", "requiredChecks", "completedAt",
-  ])) return false;
-  return !(
+  ])) return null;
+  if (
     outcome.validationOutcome !== "pass" || outcome.headSha !== facts.headSha ||
     outcome.originRepository !== job.policy!.githubRepository ||
     !exactIsoDate(outcome.completedAt) ||
     !terminalIdsMatch(outcome.terminalIds, finalTest.resourceId) ||
     !validationReceiptsMatch(outcome.commandReceipts, expectedValidationCommands(job)) ||
     !requiredChecksMatch(outcome.requiredChecks, job.policy!.requiredChecks)
-  );
+  ) return null;
+  return outcome.completedAt as string;
 }
 
-function mergeIsVerified(store: TelegramAgentStore, job: Job, facts: TerminalPipelineFacts): boolean {
+function mergeIsVerified(
+  store: TelegramAgentStore,
+  job: Job,
+  facts: TerminalPipelineFacts,
+  validationCompletedAt: string,
+): boolean {
   const mergeEffects = store.listEffectsForJob(job.id).filter((effect) => effect.kind === "merge_pr");
   if (mergeEffects.length !== 1) return false;
   let mergeEvidence: ReturnType<typeof parsePersistedMergeEvidence>;
@@ -563,6 +584,8 @@ function mergeIsVerified(store: TelegramAgentStore, job: Job, facts: TerminalPip
   if (mergeEvidence.disposition !== "success") return false;
   const receipt = mergeEvidence.payload.receipt;
   return !(
+    receipt.validationCompletedAt !== validationCompletedAt ||
+    !mergeTimesAreChronological(validationCompletedAt, mergeEvidence.result.mergedAt, mergeEvidence.result.confirmedAt) ||
     receipt.headSha !== facts.headSha ||
     mergeEvidence.result.authoritativeHeadSha !== facts.headSha ||
     mergeEvidence.result.mergeCommit.oid !== facts.mergeSha ||
@@ -589,7 +612,11 @@ function expectedProductionCommands(job: Job, input: ProductionAttemptInput) {
   return [{
     name: "verify-merged-checkout",
     command: `test "$(git rev-parse --verify HEAD)" = '${input.mergeSha}'`,
-  }, ...configured];
+  }, ...configured].map(({ name, command }) => productionCommandIdentity({
+    name,
+    command,
+    outputRedactionPatterns: job.policy!.outputRedactionPatterns,
+  }));
 }
 
 function productionSnapshot(
@@ -634,7 +661,9 @@ function failedProductionStage(
 
 export function verifiedPipelineOutcome(store: TelegramAgentStore, job: Job): boolean {
   const facts = terminalPipelineFacts(job);
-  if (!facts || !finalTestIsVerified(store, job, facts) || !mergeIsVerified(store, job, facts)) return false;
+  if (!facts) return false;
+  const validationCompletedAt = verifiedFinalTestCompletedAt(store, job, facts);
+  if (validationCompletedAt === null || !mergeIsVerified(store, job, facts, validationCompletedAt)) return false;
   if (facts.production === undefined) return true;
   if (job.state === "complete") {
     return successfulProductionStage(store, job, {
