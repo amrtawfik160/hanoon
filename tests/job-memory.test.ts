@@ -184,16 +184,24 @@ it("fails the extraction when its thread ends without an answer", async () => {
   ]);
 });
 
-it("leaves the extraction pending when the thread cannot be spawned", async () => {
+it("gives up on a project that can never be reached instead of retrying forever", async () => {
   const { store } = fixture();
   finishedJob(store, "job_blocked", "blocked");
-  const { service: pass } = service(store, {
-    spawnHidden: async () => { throw new Error("no connected host"); },
+  const { service: pass, spawnHidden } = service(store, {
+    spawnHidden: async () => { throw new Error("HTTP 404: Project not found"); },
   });
 
-  await expect(pass.processDue()).resolves.toBe(false);
+  // A retryable blip stays pending, but the attempt is counted...
+  await pass.processDue();
+  expect(store.listJobMemoryExtractions("pending", 10)).toMatchObject([{ attempts: 1 }]);
 
-  expect(store.listJobMemoryExtractions("pending", 10)).toHaveLength(1);
+  // ...so a permanently unusable project runs out of attempts and stops.
+  await pass.processDue();
+  await pass.processDue();
+
+  expect(store.listJobMemoryExtractions("pending", 10)).toEqual([]);
+  expect(store.listJobMemoryExtractions("failed", 10)).toMatchObject([{ jobId: "job_blocked" }]);
+  expect(spawnHidden.mock.calls.length).toBeLessThanOrEqual(2);
 });
 
 it("refuses to store a lesson that carries a credential", async () => {

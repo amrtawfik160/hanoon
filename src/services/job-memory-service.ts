@@ -35,6 +35,7 @@ export type JobMemoryServiceDependencies = {
     | "enrolFinishedJobsForMemory"
     | "listJobMemoryExtractions"
     | "startJobMemoryExtraction"
+    | "recordJobMemoryExtractionFailure"
     | "completeJobMemoryExtraction"
     | "failJobMemoryExtraction"
     | "getJob"
@@ -160,10 +161,14 @@ export class JobMemoryService {
         }),
       });
     } catch (error) {
-      this.dependencies.warn?.(
-        `Memory extraction for ${extraction.jobId} could not start: ${redactError(error).slice(0, 200)}`,
-      );
-      return false;
+      const detail = redactError(error).slice(0, 200);
+      this.dependencies.warn?.(`Memory extraction for ${extraction.jobId} could not start: ${detail}`);
+      // Counted, so a project that will never come back stops being retried.
+      return this.dependencies.store.recordJobMemoryExtractionFailure({
+        jobId: extraction.jobId,
+        error: `Memory extraction could not start: ${detail}`,
+        now: this.dependencies.clock.now(),
+      });
     }
     return this.dependencies.store.startJobMemoryExtraction({
       jobId: extraction.jobId,

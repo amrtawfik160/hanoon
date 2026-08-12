@@ -1791,6 +1791,7 @@ export interface TelegramAgentStore {
   enrolFinishedJobsForMemory(outcomes: readonly string[], limit: number, now: number): number;
   listJobMemoryExtractions(state: JobMemoryExtractionState, limit: number): JobMemoryExtractionRecord[];
   startJobMemoryExtraction(input: { jobId: string; threadId: string; now: number }): boolean;
+  recordJobMemoryExtractionFailure(input: { jobId: string; error: string; now: number }): boolean;
   completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean;
   failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean;
   rememberMemory(input: MemoryInput): MemoryRecord;
@@ -4396,6 +4397,21 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           SET state = 'running', thread_id = ?, attempts = attempts + 1, updated_at = ?
         WHERE job_id = ? AND state = 'pending'`,
     ).run(input.threadId, input.now, input.jobId).changes === 1;
+  }
+
+  /**
+   * Counts a start that never got off the ground. Without this a permanently
+   * unusable project — deleted, renamed — retries on every executor pass
+   * forever, because attempts were only ever counted on success.
+   */
+  public recordJobMemoryExtractionFailure(input: { jobId: string; error: string; now: number }): boolean {
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET attempts = attempts + 1, last_error = ?, updated_at = ?
+        WHERE job_id = ? AND state = 'pending'`,
+    ).run(input.error, input.now, input.jobId).changes === 1;
   }
 
   public completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean {
