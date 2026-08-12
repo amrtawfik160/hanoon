@@ -72,6 +72,9 @@ export function buildTurnContext(input: {
     query: input.inputText,
     limit: MAX_RECALLED,
     now: input.now,
+    // Linking the recall to its turn is what later lets the owner's reaction
+    // reinforce or demote exactly the memories that shaped this answer.
+    turnId: input.turnId,
   });
   const digest = input.includeDigest
     ? input.store.readControllerDigest(input.controllerKey, MAX_DIGEST_TURNS)

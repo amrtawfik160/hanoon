@@ -118,7 +118,7 @@ it("ignores a lifecycle event that carries no answerable question", async () => 
   });
 
   await expect(adapter.events("thr_controller", 0, AbortSignal.timeout(1_000)))
-    .resolves.toMatchObject({ pendingQuestion: null });
+    .resolves.toMatchObject({ pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 });
 });
 
 it("answers a pending question through the BB interaction resolution", async () => {
@@ -307,7 +307,7 @@ function serviceAdapter(overrides: Partial<ControllerAdapter> = {}): ControllerA
       assistantDelta: "",
       completed: false,
       error: null,
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     findSpawnCandidate: vi.fn(async () => null),
     ...overrides,
@@ -325,6 +325,9 @@ it("parks the turn and asks in Telegram when the thread blocks on a question", a
       completed: false,
       error: null,
       pendingQuestion: { interactionId: INTERACTION_ID, questions: questionPayload().questions },
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
     })),
   });
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });

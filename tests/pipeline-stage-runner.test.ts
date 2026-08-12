@@ -2,6 +2,7 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { BbRunner } from "../src/bb/runner";
+import { parseWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import {
   buildCritiquePacket,
   buildPlanArtifact,
@@ -9,7 +10,7 @@ import {
 } from "../src/bb/pipeline-handoffs";
 import { openStore } from "../src/storage/store";
 import { settlePipelineStageOutput } from "../src/services/pipeline-stage-runner";
-import { jobFixture, policyFixture } from "./helpers";
+import { admitConfirmedJob, jobFixture, policyFixture } from "./helpers";
 
 function pipelineSdk() {
   const spawns: Array<Record<string, unknown>> = [];
@@ -61,19 +62,56 @@ const plannedJob = jobFixture({
   policy: policyFixture(),
 });
 
+function expectForbiddenClause(prompt: string, target: RegExp): void {
+  const clause = prompt.split(/[.!?]/u).find((part) => target.test(part));
+  expect(clause).toBeDefined();
+  if (clause === undefined) return;
+  expect(clause).toMatch(/\b(?:do not|must not|never|without|forbidden|prohibited|disallowed)\b/i);
+  expect(clause).not.toMatch(/\b(?:allowed|permitted|acceptable|okay|optional)\b/i);
+}
+
+function expectCriticPromptContract(prompt: string): void {
+  expect(prompt).toMatch(/\b(?:return|respond|output|requires?)\b[^.!?]{0,120}\bstrict JSON\b/i);
+  expect(prompt).not.toMatch(/\bnon[-\s]?strict JSON\b/i);
+  expect(prompt).not.toMatch(/\bstrict JSON\b[^.!?]{0,80}\b(?:optional|allowed|permitted)\b/i);
+  expect(prompt).toMatch(/\b(?:assess|review|evaluate|inspect)\b[^.!?]{0,120}\bindependent(?:ly)?\b/i);
+  expect(prompt).not.toMatch(/\b(?:do not|must not|never)\b[^.!?]{0,120}\b(?:assess|review|evaluate)\b[^.!?]{0,120}\bindependent(?:ly)?\b/i);
+  expectForbiddenClause(prompt, /\b(?:inspect|read|use)\b[^.!?]{0,120}\bplanner conversation\b/i);
+  expectForbiddenClause(prompt, /\bedit files?\b/i);
+}
+
 describe("pipeline handoffs", () => {
   it("turns bounded planner output into a hashed plan attachment and validates strict critique JSON", () => {
     const plan = buildPlanArtifact("# Plan\n\n1. Add the regression.\n");
     const critique = buildCritiquePacket(plannedJob, plan);
+    const critiquePacket = JSON.parse(new TextDecoder().decode(critique.bytes)) as {
+      kind: string;
+      planSha256: string;
+      rules: Record<string, boolean>;
+      outputContract: { format: string; schema: Record<string, string> };
+    };
 
     expect(plan).toMatchObject({ filename: "plan.md", mimeType: "text/markdown" });
     expect(plan.sha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(new TextDecoder().decode(critique.bytes)).toContain(plan.sha256);
+    expect(critiquePacket).toMatchObject({
+      kind: "telegram-plan-critique",
+      planSha256: plan.sha256,
+      rules: {
+        editSource: false,
+        commit: false,
+        push: false,
+        merge: false,
+        inspectPlannerConversation: false,
+      },
+      outputContract: { format: "strict-json" },
+    });
+    expect(Object.keys(critiquePacket.outputContract.schema)).toEqual(["verdict", "summary"]);
     expect(parseCritiqueResult('{"verdict":"pass","summary":"Complete and testable"}')).toEqual({
       verdict: "pass",
       summary: "Complete and testable",
     });
     expect(() => parseCritiqueResult("```json\n{}\n```")).toThrow(/strict JSON/i);
+    expect(() => parseCritiqueResult('{"verdict":"pass","summary":"Complete and testable","extra":true}')).toThrow();
     expect(() => buildPlanArtifact("  \n")).toThrow(/non-empty/i);
     expect(() => buildPlanArtifact("x".repeat(65_537))).toThrow(/bounded/i);
   });
@@ -84,7 +122,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     const { runner, spawns, uploads } = pipelineSdk();
     await runner.spawnPlanner(
       { ...plannedJob, environmentId: "env_plan", planCycle: 1 },
-      { id: "stage_plan_2", role: "PLAN", ordinal: 2 },
+      { id: "stage:job_1:2:spawn_plan", role: "PLAN", ordinal: 2 },
       '{"verdict":"needs_revision","summary":"Add rollback evidence"}',
     );
 
@@ -102,10 +140,10 @@ describe("fresh planner, critic, and builder conversations", () => {
 
   it("uses Luna Max for fresh plan and critique spawns, then hands only files to the builder", async () => {
     const { runner, spawns, uploads } = pipelineSdk();
-    const planAttempt = { id: "stage_plan_1", role: "PLAN" as const, ordinal: 1 };
+    const planAttempt = { id: "stage:job_1:1:spawn_plan", role: "PLAN" as const, ordinal: 1 };
     const planThread = await runner.spawnPlanner(plannedJob, planAttempt);
     const plan = buildPlanArtifact(await runner.getThreadOutput(planThread.id));
-    const critiqueAttempt = { id: "stage_critique_1", role: "CRITIQUE" as const, ordinal: 1 };
+    const critiqueAttempt = { id: "stage:job_1:1:spawn_critique", role: "CRITIQUE" as const, ordinal: 1 };
     await runner.spawnCritic(
       { ...plannedJob, state: "critiquing", environmentId: "env_plan" },
       critiqueAttempt,
@@ -113,7 +151,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     );
     await runner.spawnBuilderFromPlan(
       { ...plannedJob, state: "creating_implementation", environmentId: "env_plan" },
-      { id: "attempt_impl_1" },
+      { id: "attempt:job_1:1:spawn_implementation" },
       { ...planAttempt, threadId: planThread.id, environmentId: "env_plan", outputText: new TextDecoder().decode(plan.bytes) },
     );
 
@@ -145,6 +183,24 @@ describe("fresh planner, critic, and builder conversations", () => {
         { type: "localFile", path: "attachments/plan.md" },
       ],
     });
+    const criticPrompt = (spawns[1].input as Array<{ type: string; text?: string }>)[0].text ?? "";
+    expectCriticPromptContract(criticPrompt);
+    expect(criticPrompt).not.toContain("```");
+    expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "stage:job_1:1:spawn_plan",
+      role: "planner",
+    });
+    expect(parseWorkerThreadTitle(String(spawns[1].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "stage:job_1:1:spawn_critique",
+      role: "critic",
+    });
+    expect(parseWorkerThreadTitle(String(spawns[2].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "attempt:job_1:1:spawn_implementation",
+      role: "implementation",
+    });
     expect(uploads.map((upload) => upload.filename)).toEqual([
       "work-order.md",
       "work-order.md",
@@ -167,10 +223,10 @@ describe("fresh planner, critic, and builder conversations", () => {
       prHeadSha: "a".repeat(40),
     };
 
-    await runner.spawnDocs(job, { id: "stage_docs_1", role: "DOCS", ordinal: 1 });
+    await runner.spawnDocs(job, { id: "stage:job_1:1:spawn_docs", role: "DOCS", ordinal: 1 });
     await runner.spawnFinalReview(
       { ...job, state: "final_reviewing" },
-      { id: "attempt_final_review_1" },
+      { id: "attempt:job_1:1:spawn_final_review" },
     );
 
     expect(spawns[0]).toMatchObject({
@@ -182,17 +238,37 @@ describe("fresh planner, critic, and builder conversations", () => {
       serviceTier: "fast",
       permissionMode: "auto",
       input: [
-        { type: "text", text: expect.stringMatching(/Docs Guard.*BB CLI/i) },
+        { type: "text", text: expect.stringContaining("docs-guard") },
         { type: "localFile", path: "attachments/work-order.md" },
         { type: "localFile", path: "attachments/docs-packet.json" },
       ],
     });
+    expect((spawns[0].input as Array<{ type: string; text?: string }>)[0].text).toContain(
+      "verification-before-completion",
+    );
+    expect((spawns[0].input as Array<{ type: string; text?: string }>)[0].text).not.toMatch(/Docs Guard|BB CLI|bb-cli/);
+    const docsPacketUpload = uploads.find((upload) => upload.filename === "docs-packet.json");
+    if (!docsPacketUpload) throw new Error("docs packet upload missing");
+    const docsPacket = JSON.parse(new TextDecoder().decode(docsPacketUpload.clientFile)) as {
+      requiredSkills: string[];
+    };
+    expect(docsPacket.requiredSkills).toEqual(["docs-guard", "verification-before-completion"]);
+    expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "stage:job_1:1:spawn_docs",
+      role: "documentation",
+    });
     expect(spawns[1]).toMatchObject({
       parentThreadId: "thr_builder",
-      title: "Telegram job_1 final-review attempt_final_review_1",
+      title: "Telegram job_1 final-review attempt:job_1:1:spawn_final_review",
       environment: { type: "reuse", environmentId: "env_plan" },
     });
     expect(spawns[1]).not.toHaveProperty("sourceThreadId");
+    expect(parseWorkerThreadTitle(String(spawns[1].title))).toEqual({
+      jobId: "job_1",
+      attemptId: "attempt:job_1:1:spawn_final_review",
+      role: "final-review",
+    });
     expect(uploads.map((upload) => upload.filename)).toEqual([
       "work-order.md",
       "docs-packet.json",
@@ -248,13 +324,13 @@ describe("fresh planner, critic, and builder conversations", () => {
     const { bb } = createFakePluginHost({ pluginId: "telegram-agent-pipeline-settlement" });
     const store = openStore(bb.storage);
     const draft = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
-    const selected = store.applyJobEvent(draft.id, draft.version, {
+    store.applyJobEvent(draft.id, draft.version, {
       type: "PROJECT_SELECTED",
       projectId: "proj_1",
       policyVersion: 1,
       policy: policyFixture(),
     }, 1_001);
-    let job = store.applyJobEvent(draft.id, selected.version, { type: "CONFIRMED" }, 1_002);
+    let job = admitConfirmedJob(store, store.getJob(draft.id)!, 1_002);
     const lease = store.acquireExecutorLease("executor", 1_003, 30_000);
     if (!lease.acquired) throw new Error("lease missing");
     const fence = { ownerId: "executor", generation: lease.generation };

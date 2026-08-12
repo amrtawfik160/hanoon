@@ -129,7 +129,7 @@ it("fails closed when persisted project policy JSON is invalid", () => {
   expect(() => store.getProjectPolicy("proj_1")).toThrow();
 });
 
-it("preserves owner and cursor for the same bot, blocks active-job changes, and resets state on an idle bot change", () => {
+it("preserves owner and cursor for the same bot, blocks unreleased-admission changes, and resets state after release", () => {
   const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
   const db = bb.storage.database();
   const store = openStore(bb.storage);
@@ -151,6 +151,9 @@ it("preserves owner and cursor for the same bot, blocks active-job changes, and 
     "INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
   ).run("job-1", 11, "request", "implementing", 2_000, 2_000);
   db.prepare(
+    "INSERT INTO job_admissions (job_id, project_id, queue_seq, state, resume_event, queued_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run("job-1", "proj_1", 1, "queued", "CONFIRMED", 2_000);
+  db.prepare(
     "INSERT INTO approvals (nonce_hash, job_id, head_sha, expires_at) VALUES (?, ?, ?, ?)",
   ).run(hashSecret("approval"), "job-1", "abc123", 10_000);
   db.prepare(
@@ -161,7 +164,8 @@ it("preserves owner and cursor for the same bot, blocks active-job changes, and 
   expect(store.getTelegramIdentity()?.botId).toBe("7");
   expect(db.prepare("SELECT COUNT(*) AS count FROM outbox").get()).toEqual({ count: 1 });
 
-  db.prepare("UPDATE jobs SET state = ? WHERE id = ?").run("merged", "job-1");
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = ? WHERE job_id = ?")
+    .run(2_005, "job_released", "job-1");
   expect(store.bindTelegramIdentity({ botId: "8", username: "other_bot", now: 2_005, hasActiveJob: false })).toBe("changed");
   expect(store.getTelegramIdentity()).toEqual({ botId: "8", username: "other_bot", verifiedAt: 2_005 });
   expect(store.getOwner()).toBeNull();

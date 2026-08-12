@@ -1,5 +1,5 @@
 import type { Job, WorkerLiveness, WorkerLivenessState } from "../domain/models";
-import type { TelegramAgentStore } from "../storage/store";
+import type { ExecutorFence, TelegramAgentStore } from "../storage/store";
 import { persistableJobStatusPayload, renderJobStatus } from "../telegram/view";
 
 export type BbThreadObservation = {
@@ -135,9 +135,9 @@ export function observeTerminalWorker(
 }
 
 type LivenessStore = Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
-  Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>;
+  Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox" | "upsertExecutorWorkerLiveness" | "markExecutorWorkerLivenessNotified" | "enqueueExecutorStatus">>;
 
-function projectObservation(store: LivenessStore, job: Job, observed: WorkerLiveness, now: number): WorkerLiveness {
+function projectObservation(store: LivenessStore, job: Job, observed: WorkerLiveness, now: number, fence?: ExecutorFence): WorkerLiveness {
   const current = store.getWorkerLiveness(job.id);
   const accepted =
     current === null ||
@@ -148,23 +148,46 @@ function projectObservation(store: LivenessStore, job: Job, observed: WorkerLive
       (observed.state === "stale" || observed.state === "unknown")
     ? { ...observed, staleNotifiedAt: current.staleNotifiedAt }
     : observed;
-  if (accepted) store.upsertWorkerLiveness(persistedObservation);
+  if (accepted) {
+    if (fence) {
+      if (!store.upsertExecutorWorkerLiveness || !store.upsertExecutorWorkerLiveness({ value: persistedObservation, ...fence })) {
+        throw new Error("executor lease was lost before worker-liveness persistence");
+      }
+    } else {
+      store.upsertWorkerLiveness(persistedObservation);
+    }
+  }
   if (!accepted) return observed;
   const stored = store.getWorkerLiveness(job.id) ?? observed;
   if ((stored.state === "stale" || stored.state === "unknown") && stored.staleNotifiedAt === null) {
-    if (!store.markWorkerLivenessNotified(job.id, stored.generation, now)) {
+    const marked = fence
+      ? store.markExecutorWorkerLivenessNotified?.({
+        jobId: job.id,
+        workerGeneration: stored.generation,
+        ...fence,
+      }) ?? false
+      : store.markWorkerLivenessNotified(job.id, stored.generation, now);
+    if (!marked) {
+      if (fence) throw new Error("executor lease was lost before worker-liveness notification");
       return store.getWorkerLiveness(job.id) ?? stored;
     }
     const notified = store.getWorkerLiveness(job.id) ?? { ...stored, staleNotifiedAt: now };
     const owner = store.getOwner?.();
-    if (owner && store.enqueueOutbox) {
+    if (owner && (store.enqueueOutbox || store.enqueueExecutorStatus)) {
       const payload = renderJobStatus(job, { workerLiveness: notified, now });
-      store.enqueueOutbox({
+      const outbox = {
         logicalKey: `job:${job.id}:status`,
         chatId: owner.chatId,
         messageId: job.statusMessageId,
         payload: persistableJobStatusPayload(payload),
-      }, now);
+      };
+      if (fence) {
+        if (!store.enqueueExecutorStatus || !store.enqueueExecutorStatus({ outbox, ...fence })) {
+          throw new Error("executor lease was lost before worker status enqueue");
+        }
+      } else {
+        store.enqueueOutbox?.(outbox, now);
+      }
     }
     return notified;
   }
@@ -179,8 +202,9 @@ export function projectUnknownWorker(
   now: number,
   workerKind?: WorkerLiveness["workerKind"],
   generation?: number,
+  fence?: ExecutorFence,
 ): WorkerLiveness {
-  return projectWorkerLiveness(store, job, unknownThreadObservation(resourceId), now, workerKind, generation);
+  return projectWorkerLiveness(store, job, unknownThreadObservation(resourceId), now, workerKind, generation, fence);
 }
 
 export function projectWorkerLiveness(
@@ -191,6 +215,7 @@ export function projectWorkerLiveness(
   now: number,
   workerKind?: WorkerLiveness["workerKind"],
   generation = job.version,
+  fence?: ExecutorFence,
 ): WorkerLiveness {
   const observed = observeThreadWorker(
     job,
@@ -199,7 +224,7 @@ export function projectWorkerLiveness(
     generation,
   );
   if (workerKind) observed.workerKind = workerKind;
-  return projectObservation(store, job, observed, now);
+  return projectObservation(store, job, observed, now, fence);
 }
 
 export function projectTerminalLiveness(
@@ -209,6 +234,7 @@ export function projectTerminalLiveness(
   workerKind: Extract<WorkerLiveness["workerKind"], "validation" | "merge" | "deploy" | "canary">,
   now: number,
   generation = workerRegistrationGeneration(job, workerKind),
+  fence?: ExecutorFence,
 ): WorkerLiveness {
-  return projectObservation(store, job, observeTerminalWorker(job, terminal, workerKind, now, generation), now);
+  return projectObservation(store, job, observeTerminalWorker(job, terminal, workerKind, now, generation), now, fence);
 }

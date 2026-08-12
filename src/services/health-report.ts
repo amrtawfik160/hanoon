@@ -1,6 +1,26 @@
 import type Database from "better-sqlite3";
+import type { MaxConcurrentJobs } from "../autonomy/models";
+import type { JobLaneSnapshot } from "./job-lane-runner";
 
 type SqliteDatabase = Database.Database;
+
+export type AutonomyHealth = {
+  maxConcurrentJobs: MaxConcurrentJobs | null;
+  admittedJobs: number;
+  drainingJobs: number;
+  queuedJobs: number;
+  occupiedJobs: number;
+  availableSlots: number | null;
+  pipelineActive: number;
+  controlActive: number;
+  oldestQueueAgeMs: number | null;
+  heldResources: {
+    total: number;
+    project: number;
+    repositoryMerge: number;
+    productionTarget: number;
+  };
+};
 
 export type HealthReport = {
   observedAt: number;
@@ -11,6 +31,7 @@ export type HealthReport = {
   delivery: { pendingOutbox: number; deadOutbox: number; oldestPendingOutboxAgeMs: number | null };
   telegram: { nextOffset: number; failedUpdates: number };
   controller: { threadId: string | null; state: string | null; generations: number; queuedTurns: number };
+  autonomy: AutonomyHealth;
   monitors: { armed: number; nextDueAt: number | null; failed: number };
   memory: { live: number; searchable: boolean };
   database: { integrity: string };
@@ -30,12 +51,43 @@ function oldestAge(db: SqliteDatabase, sql: string, now: number): number | null 
  * One place the owner can look when something feels wrong. Every check reads
  * durable state directly, so it stays truthful even when the executor is stuck.
  */
-export function buildHealthReport(db: SqliteDatabase, now: number): HealthReport {
+export function buildHealthReport(
+  db: SqliteDatabase,
+  now: number,
+  maxConcurrentJobs: MaxConcurrentJobs | null,
+  lanes: JobLaneSnapshot,
+): HealthReport {
   const lease = db.prepare("SELECT owner_id, generation, lease_expires_at FROM executor_lease WHERE singleton = 1")
     .get() as { owner_id: string | null; generation: number | null; lease_expires_at: number | null } | undefined;
   const controller = db.prepare(
     "SELECT controller_key, bb_thread_id, state FROM controller_threads LIMIT 1",
   ).get() as { controller_key: string; bb_thread_id: string | null; state: string } | undefined;
+  const admissions = db.prepare(
+    `SELECT
+       SUM(CASE WHEN state = 'admitted' THEN 1 ELSE 0 END) AS admitted,
+       SUM(CASE WHEN state = 'draining' THEN 1 ELSE 0 END) AS draining,
+       SUM(CASE WHEN state = 'queued' THEN 1 ELSE 0 END) AS queued
+     FROM job_admissions
+     WHERE state IN ('queued', 'admitted', 'draining')`,
+  ).get() as { admitted: number | null; draining: number | null; queued: number | null };
+  const heldResources = db.prepare(
+    `SELECT
+       COUNT(*) AS total,
+       SUM(CASE WHEN resource_kind = 'project' THEN 1 ELSE 0 END) AS project,
+       SUM(CASE WHEN resource_kind = 'repository_merge' THEN 1 ELSE 0 END) AS repository_merge,
+       SUM(CASE WHEN resource_kind = 'production_target' THEN 1 ELSE 0 END) AS production_target
+     FROM job_resource_claims
+     WHERE state = 'held'`,
+  ).get() as {
+    total: number;
+    project: number | null;
+    repository_merge: number | null;
+    production_target: number | null;
+  };
+  const admittedJobs = admissions.admitted ?? 0;
+  const drainingJobs = admissions.draining ?? 0;
+  const queuedJobs = admissions.queued ?? 0;
+  const occupiedJobs = admittedJobs + drainingJobs;
 
   const report: HealthReport = {
     observedAt: now,
@@ -77,6 +129,27 @@ export function buildHealthReport(db: SqliteDatabase, now: number): HealthReport
         : 0,
       queuedTurns: count(db, "SELECT COUNT(*) AS value FROM controller_turns WHERE state IN ('queued', 'dispatching')"),
     },
+    autonomy: {
+      maxConcurrentJobs,
+      admittedJobs,
+      drainingJobs,
+      queuedJobs,
+      occupiedJobs,
+      availableSlots: maxConcurrentJobs === null ? null : Math.max(0, maxConcurrentJobs - occupiedJobs),
+      pipelineActive: lanes.pipelineActive,
+      controlActive: lanes.controlActive,
+      oldestQueueAgeMs: oldestAge(
+        db,
+        "SELECT MIN(queued_at) AS oldest FROM job_admissions WHERE state = 'queued'",
+        now,
+      ),
+      heldResources: {
+        total: heldResources.total,
+        project: heldResources.project ?? 0,
+        repositoryMerge: heldResources.repository_merge ?? 0,
+        productionTarget: heldResources.production_target ?? 0,
+      },
+    },
     monitors: {
       armed: count(db, "SELECT COUNT(*) AS value FROM monitors WHERE state = 'armed'"),
       nextDueAt: (db.prepare(
@@ -92,6 +165,7 @@ export function buildHealthReport(db: SqliteDatabase, now: number): HealthReport
   };
 
   if (!report.executor.current) report.problems.push("the executor lease is not current");
+  if (maxConcurrentJobs === null) report.problems.push("concurrency configuration is invalid");
   if (report.work.deadEffects > 0) report.problems.push(`${report.work.deadEffects} job step(s) gave up`);
   if (report.delivery.deadOutbox > 0) report.problems.push(`${report.delivery.deadOutbox} message(s) could not be delivered`);
   if (report.telegram.failedUpdates > 0) report.problems.push(`${report.telegram.failedUpdates} Telegram update(s) failed`);

@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi, PluginAgentConfigurationContext } from "@bb/plugin-sdk";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { redactError } from "../errors";
@@ -8,11 +8,19 @@ import {
   type MemoryRecord,
   type MonitorRecord,
   type TelegramAgentStore,
+  type JobControlKind,
 } from "../storage/store";
 import { nextCronOccurrence } from "../services/monitor-service";
 import { CONTROLLER_PROVIDERS } from "./execution-profile";
 import { isControllerThreadTitle } from "./bb-controller";
-import { CONTROLLER_INSTRUCTIONS } from "./instructions";
+import { MAX_CONTROLLER_OVERLAY, composeControllerInstructions } from "./instructions";
+import {
+  parseWorkerThreadTitle,
+  resolveWorkerSkillProfile,
+  type DurableWorkerIdentity,
+  type WorkerSkillRole,
+  type WorkerTitleIdentity,
+} from "../agent-skills/role-resolver";
 import type { ThreadOperationService } from "./operations";
 import {
   createProjectThread,
@@ -41,6 +49,9 @@ export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_list_watches",
   "telegram_agent_cancel_watch",
   "telegram_agent_health",
+  "telegram_agent_delegate",
+  "telegram_agent_scorecard",
+  "telegram_agent_set_working_style",
 ] as const;
 
 type ToolDependencies = {
@@ -61,6 +72,78 @@ function authorizedController(
     throw new Error("This tool call is not authorized for the durable Telegram controller");
   }
   return controller;
+}
+
+const WORKER_ID_PREFIX: Readonly<Record<WorkerSkillRole, "attempt:" | "stage:">> = {
+  implementation: "attempt:",
+  review: "attempt:",
+  "final-review": "attempt:",
+  planner: "stage:",
+  critic: "stage:",
+  documentation: "stage:",
+};
+
+const WORKER_EFFECT_KIND = {
+  implementation: "spawn_implementation",
+  review: "spawn_review",
+  "final-review": "spawn_final_review",
+  planner: "spawn_plan",
+  critic: "spawn_critique",
+  documentation: "spawn_docs",
+} as const;
+
+function workerEffectIdempotencyKey(title: WorkerTitleIdentity): string | null {
+  const prefix = WORKER_ID_PREFIX[title.role];
+  if (!title.attemptId.startsWith(prefix)) return null;
+  const effectIdempotencyKey = title.attemptId.slice(prefix.length);
+  return effectIdempotencyKey || null;
+}
+
+function persistedWorkerThreadId(
+  store: TelegramAgentStore,
+  title: WorkerTitleIdentity,
+): string | null | undefined {
+  if (WORKER_ID_PREFIX[title.role] === "attempt:") {
+    const attempt = store.getAttempt(title.attemptId);
+    const expectedKind = title.role === "implementation" ? "implementation" : "review";
+    return attempt && attempt.jobId === title.jobId && attempt.kind === expectedKind ? attempt.threadId : undefined;
+  }
+  const attempt = store.getPipelineStageAttempt(title.attemptId);
+  const expectedRole = title.role === "planner" ? "PLAN" : title.role === "critic" ? "CRITIQUE" : "DOCS";
+  return attempt && attempt.jobId === title.jobId && attempt.role === expectedRole ? attempt.threadId : undefined;
+}
+
+function durableWorkerIdentity(
+  store: TelegramAgentStore,
+  input: Readonly<{
+    title: WorkerTitleIdentity;
+    context: PluginAgentConfigurationContext;
+    effectIdempotencyKey: string;
+    threadId: string | null;
+  }>,
+): DurableWorkerIdentity | null {
+  const effect = store.getEffect(input.title.jobId, input.effectIdempotencyKey);
+  if (!effect || effect.kind !== WORKER_EFFECT_KIND[input.title.role]) return null;
+  const job = store.getJob(input.title.jobId);
+  if (!job || job.projectId !== input.context.project.id) return null;
+  return {
+    ...input.title,
+    projectId: job.projectId,
+    environmentId: job.environmentId,
+    threadId: input.threadId,
+  };
+}
+
+function resolveDurableWorkerIdentity(
+  store: TelegramAgentStore,
+  title: WorkerTitleIdentity,
+  context: PluginAgentConfigurationContext,
+): DurableWorkerIdentity | null {
+  const effectIdempotencyKey = workerEffectIdempotencyKey(title);
+  if (!effectIdempotencyKey) return null;
+  const threadId = persistedWorkerThreadId(store, title);
+  if (threadId === undefined) return null;
+  return durableWorkerIdentity(store, { title, context, effectIdempotencyKey, threadId });
 }
 
 function canonicalArguments(params: unknown): string {
@@ -114,8 +197,7 @@ async function once(
   }
 }
 
-function jobProjection(job: Job | null) {
-  if (!job) return { job: null };
+function jobProjection(job: Job) {
   return {
     job: {
       id: job.id,
@@ -138,6 +220,36 @@ function jobProjection(job: Job | null) {
       updatedAt: job.updatedAt,
     },
   };
+}
+
+type JobResolution =
+  | { outcome: "job"; job: Job }
+  | { outcome: "none" }
+  | { outcome: "choose_job"; candidates: ReturnType<typeof candidateProjection>[] };
+
+function candidateProjection(job: Job) {
+  return { id: job.id, projectId: job.projectId, state: job.state };
+}
+
+function resolveJob(
+  store: TelegramAgentStore,
+  kind: JobControlKind,
+  jobId: string | undefined,
+): JobResolution {
+  if (jobId !== undefined) {
+    const job = store.getJob(jobId);
+    return job ? { outcome: "job", job } : { outcome: "none" };
+  }
+  const candidates = store.listControlJobs(kind, 8);
+  if (candidates.length === 0) return { outcome: "none" };
+  if (candidates.length === 1) return { outcome: "job", job: candidates[0] };
+  return { outcome: "choose_job", candidates: candidates.map(candidateProjection) };
+}
+
+function resolutionProjection(resolution: Exclude<JobResolution, { outcome: "job" }>) {
+  return resolution.outcome === "none"
+    ? { outcome: "none", candidates: [] }
+    : resolution;
 }
 
 function monitorProjection(monitor: MonitorRecord) {
@@ -201,43 +313,47 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     execute: (params, context) => {
       const controller = authorizedController(dependencies.store, context);
       return once(dependencies, { controllerKey: controller.controllerKey, toolName: CONTROLLER_TOOL_NAMES[1], params }, () => {
-      const job = dependencies.store.createConfirmedControllerJob({
-        controllerThreadId: context.threadId,
-        projectId: params.projectId,
-        task: params.task,
-        now: dependencies.now(),
-      });
-      dependencies.notify();
-      return json(jobProjection(job));
+        const job = dependencies.store.createConfirmedControllerJob({
+          controllerThreadId: context.threadId,
+          projectId: params.projectId,
+          task: params.task,
+          now: dependencies.now(),
+        });
+        dependencies.notify();
+        return json(jobProjection(job));
       });
     },
   });
 
   bb.agents.registerTool({
     name: CONTROLLER_TOOL_NAMES[2],
-    description: "Read a bounded durable status projection for the active, recent, or requested Telegram Agent job.",
+    description: "Read one exact durable job status, or return bounded job choices when no id uniquely resolves.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
     execute: (params, context) => {
       authorizedController(dependencies.store, context);
-      const job = params.jobId
-        ? dependencies.store.getJob(params.jobId)
-        : dependencies.store.getActiveJob() ?? dependencies.store.listJobs(1)[0] ?? null;
-      return json(jobProjection(job));
+      const resolution = resolveJob(dependencies.store, "status", params.jobId);
+      return json(resolution.outcome === "job"
+        ? jobProjection(resolution.job)
+        : resolutionProjection(resolution));
     },
   });
 
   bb.agents.registerTool({
     name: CONTROLLER_TOOL_NAMES[3],
     description: "Retry a recoverable failed Telegram Agent job through its durable state machine.",
-    parameters: z.object({ jobId: z.string().min(1).max(256) }).strict(),
+    parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
     execute: (params, context) => {
       const controller = authorizedController(dependencies.store, context);
       return once(dependencies, { controllerKey: controller.controllerKey, toolName: CONTROLLER_TOOL_NAMES[3], params }, () => {
-      const job = dependencies.store.getJob(params.jobId);
-      if (!job || job.state !== "failed") throw new Error("The requested job is not retryable");
-      const updated = dependencies.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, dependencies.now());
-      dependencies.notify();
-      return json(jobProjection(updated));
+        const resolution = resolveJob(dependencies.store, "retry", params.jobId);
+        if (resolution.outcome !== "job") return json(resolutionProjection(resolution));
+        const job = resolution.job;
+        if (job.state !== "failed" || job.cancelRequestedAt !== null) {
+          throw new Error("The requested job is not retryable");
+        }
+        const updated = dependencies.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, dependencies.now());
+        dependencies.notify();
+        return json(jobProjection(updated));
       });
     },
   });
@@ -245,20 +361,23 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   bb.agents.registerTool({
     name: CONTROLLER_TOOL_NAMES[4],
     description: "Request cancellation of a nonterminal Telegram Agent job. Completion remains executor-fenced.",
-    parameters: z.object({ jobId: z.string().min(1).max(256) }).strict(),
+    parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
     execute: (params, context) => {
       const controller = authorizedController(dependencies.store, context);
       return once(dependencies, { controllerKey: controller.controllerKey, toolName: CONTROLLER_TOOL_NAMES[4], params }, () => {
-      const job = dependencies.store.getJob(params.jobId);
-      if (!job || ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) {
-        throw new Error("The requested job cannot be cancelled");
-      }
-      const updated = dependencies.store.applyJobEvent(job.id, job.version, {
-        type: "CANCEL_REQUESTED",
-        activeWorker: dependencies.store.getWorkerLiveness(job.id),
-      }, dependencies.now());
-      dependencies.notify();
-      return json(jobProjection(updated));
+        const resolution = resolveJob(dependencies.store, "cancel", params.jobId);
+        if (resolution.outcome !== "job") return json(resolutionProjection(resolution));
+        const job = resolution.job;
+        if (["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) {
+          throw new Error("The requested job cannot be cancelled");
+        }
+        if (job.cancelRequestedAt !== null) return json(jobProjection(job));
+        const updated = dependencies.store.applyJobEvent(job.id, job.version, {
+          type: "CANCEL_REQUESTED",
+          activeWorker: dependencies.store.getWorkerLiveness(job.id),
+        }, dependencies.now());
+        dependencies.notify();
+        return json(jobProjection(updated));
       });
     },
   });
@@ -507,6 +626,115 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     },
   });
 
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[18],
+    description: "Send several independent pieces of work out at once and get one combined result back. Each task opens its own BB thread; when they have all finished you are woken with their outputs and the instruction you wrote here. Use this instead of working through independent questions one at a time. Guarded code changes still belong to telegram_agent_start_job.",
+    experimental_statusLabels: { pending: "Delegating work", completed: "Delegated work" },
+    parameters: z.object({
+      instruction: z.string().trim().min(1).max(1_000)
+        .describe("What to do once every task has finished. You will receive only this text and their results."),
+      tasks: z.array(z.object({
+        projectId: z.string().min(1).max(256),
+        title: z.string().trim().min(1).max(120),
+        prompt: z.string().trim().min(1).max(4_000),
+      }).strict()).min(1).max(4),
+    }).strict(),
+    execute: async (params, context) => {
+      const controller = authorizedController(dependencies.store, context);
+      return once(dependencies, {
+        controllerKey: controller.controllerKey,
+        toolName: CONTROLLER_TOOL_NAMES[18],
+        params,
+      }, async () => {
+        // The delegation is recorded before anything is spawned, so a failure
+        // partway through leaves threads that are still joined and reported
+        // rather than orphans nobody is waiting on.
+        const delegation = dependencies.store.createDelegation({
+          controllerKey: controller.controllerKey,
+          instruction: params.instruction,
+          now: dependencies.now(),
+        });
+        const started: { threadId: string; title: string; projectId: string }[] = [];
+        for (const task of params.tasks) {
+          let threadId: string;
+          try {
+            const created = await createProjectThread({
+              sdk: dependencies.sdk,
+              projectId: task.projectId,
+              title: task.title,
+              prompt: task.prompt,
+              signal: context.signal,
+            });
+            threadId = created.thread.id;
+          } catch (error) {
+            if (started.length === 0) {
+              dependencies.store.cancelDelegation(delegation.id, dependencies.now());
+              throw error;
+            }
+            dependencies.notify();
+            return json({
+              outcome: "partial",
+              detail: "Some tasks did not start. The ones that did are still being watched and will report together.",
+              delegation: { id: delegation.id, instruction: delegation.instruction, threads: started },
+              failed: { title: task.title, reason: redactError(error).slice(0, 200) },
+            });
+          }
+          dependencies.store.addDelegationThread({
+            delegationId: delegation.id,
+            threadId,
+            projectId: task.projectId,
+            title: task.title,
+            now: dependencies.now(),
+          });
+          started.push({ threadId, title: task.title, projectId: task.projectId });
+        }
+        dependencies.notify();
+        return json({
+          outcome: "delegated",
+          delegation: { id: delegation.id, instruction: delegation.instruction, threads: started },
+        });
+      });
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[19],
+    description: "Read the durable autonomy scorecard: work completed and blocked, decisions the owner was asked for, remediation cycles, delivery retries, memory health, and monitors. Every number comes from committed state, so report what it says and never a rate it does not support.",
+    experimental_statusLabels: { pending: "Reading the scorecard", completed: "Read the scorecard" },
+    parameters: z.object({
+      windowDays: z.number().int().min(1).max(90).default(7),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      return json(dependencies.store.buildAutonomyScorecard({
+        now: dependencies.now(),
+        windowMs: params.windowDays * 86_400_000,
+      }));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[20],
+    description: "Record how the owner wants you to work — terser answers, always show the PR link, a habit they keep asking for. This is standing behaviour, not a fact: it is applied to every later turn. Replace it wholesale each time; send empty text to clear it. Use telegram_agent_remember for things you need to know rather than ways you should act.",
+    experimental_statusLabels: { pending: "Adjusting how you work", completed: "Adjusted how you work" },
+    parameters: z.object({
+      text: z.string().max(MAX_CONTROLLER_OVERLAY),
+    }).strict(),
+    execute: (params, context) => {
+      const controller = authorizedController(dependencies.store, context);
+      return once(dependencies, {
+        controllerKey: controller.controllerKey,
+        toolName: CONTROLLER_TOOL_NAMES[20],
+        params,
+      }, () => json({
+        workingStyle: dependencies.store.setControllerOverlay({
+          text: params.text,
+          now: dependencies.now(),
+        }),
+      }));
+    },
+  });
+
   bb.agents.configure((context) => {
     const controller = dependencies.store.getControllerByThreadId(context.thread.id);
     const candidate = controller !== null &&
@@ -518,8 +746,24 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       context.project.kind === "personal" &&
       context.environment.workspaceProvisionType === "personal" &&
       isControllerThreadTitle(context.thread.title, controller.controllerKey);
-    return candidate
-      ? { tools: [...CONTROLLER_TOOL_NAMES], skills: [], instructions: CONTROLLER_INSTRUCTIONS }
+    if (candidate) {
+      return {
+        tools: [...CONTROLLER_TOOL_NAMES],
+        skills: [],
+        instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
+      };
+    }
+    const title = parseWorkerThreadTitle(context.thread.title);
+    const durableIdentity = title === null
+      ? null
+      : resolveDurableWorkerIdentity(dependencies.store, title, context);
+    const profile = resolveWorkerSkillProfile({
+      context,
+      pluginId: bb.pluginId,
+      durableIdentity,
+    });
+    return profile
+      ? { tools: [], skills: [...profile.skills], instructions: profile.instructions }
       : { tools: [], skills: [] };
   });
 }

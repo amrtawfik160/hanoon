@@ -13,7 +13,7 @@ import type {
 } from "../src/telegram/types";
 import { encodeCallbackData, persistableJobStatusPayload, renderProjectPicker } from "../src/telegram/view";
 import { VersionConflictError, openStore, type TelegramAgentStore } from "../src/storage/store";
-import { policyFixture } from "./helpers";
+import { admitConfirmedJob, policyFixture } from "./helpers";
 
 type SentMessage = {
   chatId: string;
@@ -23,6 +23,7 @@ type SentMessage = {
 
 class FakeTelegram {
   public readonly sent: SentMessage[] = [];
+  public readonly deliveries: SendMessagePayload[] = [];
   public readonly edited: Array<{
     chatId: string;
     messageId: number;
@@ -36,11 +37,13 @@ class FakeTelegram {
   public async sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }> {
     const message = { chatId, messageId: this.nextMessageId++, payload };
     this.sent.push(message);
+    this.deliveries.push(payload);
     return { message_id: message.messageId };
   }
 
   public async editMessage(chatId: string, messageId: number, payload: SendMessagePayload): Promise<void> {
     this.edited.push({ chatId, messageId, payload });
+    this.deliveries.push(payload);
     if (this.nextEditError) {
       const error = this.nextEditError;
       this.nextEditError = null;
@@ -199,6 +202,75 @@ async function selectProject(
     callbackUpdate(20, callbackId, 7, 70, encodeCallbackData({ type: "project", jobId, alias: "cyndra" })),
     2_100,
   );
+}
+
+function createImplementingJob(
+  fixture: ReturnType<typeof ingressFixture>,
+  jobId: string,
+  updateId: number,
+  threadId: string,
+): string {
+  const projectId = `proj_${updateId}`;
+  const jobPolicy = policy({
+    projectId,
+    alias: `job-${updateId}`,
+    githubRepository: `acme/job-${updateId}`,
+    production: undefined,
+  });
+  fixture.store.upsertProjectPolicy(jobPolicy, 1_900 + updateId);
+  const draft = fixture.store.createJob({
+    id: jobId,
+    sourceUpdateId: updateId,
+    requestText: jobId,
+    now: 2_000,
+  });
+  const selected = fixture.store.applyJobEvent(draft.id, draft.version, {
+    type: "PROJECT_SELECTED",
+    projectId,
+    policyVersion: 1,
+    policy: jobPolicy,
+  }, 2_001);
+  const admitted = admitConfirmedJob(fixture.store, selected, 2_002);
+  const planned = fixture.store.applyJobEvent(
+    admitted.id,
+    admitted.version,
+    { type: "PLAN_READY", attemptId: `${jobId}-plan` },
+    2_003,
+  );
+  const critiqued = fixture.store.applyJobEvent(
+    planned.id,
+    planned.version,
+    { type: "CRITIQUE_PASSED", attemptId: `${jobId}-critique` },
+    2_004,
+  );
+  const implementing = fixture.store.applyJobEvent(
+    critiqued.id,
+    critiqued.version,
+    { type: "IMPLEMENTATION_CREATED", threadId, environmentId: `${jobId}-environment` },
+    2_005,
+  );
+  return fixture.store.setJobStatusMessage(
+    implementing.id,
+    10_000 + updateId,
+    implementing.version,
+    2_006,
+  ).id;
+}
+
+function failJob(fixture: ReturnType<typeof ingressFixture>, jobId: string, updateId: number): string {
+  const implementing = createImplementingJob(fixture, jobId, updateId, `${jobId}-thread`);
+  const current = fixture.store.getJob(implementing);
+  if (!current) throw new Error(`missing ${jobId}`);
+  return fixture.store.applyJobEvent(
+    current.id,
+    current.version,
+    { type: "FAILED", error: `${jobId} failed` },
+    2_007,
+  ).id;
+}
+
+function statusPayload(fixture: ReturnType<typeof ingressFixture>): SendMessagePayload {
+  return fixture.telegram.deliveries.at(-1) ?? { text: "" };
 }
 
 it("reveals no project information to an unauthorized chat", async () => {
@@ -361,7 +433,7 @@ it("uses last project only for deterministic /projects ordering", async () => {
   expect(fixture.telegram.sent[0]?.payload.text).toBe("Enabled projects:\nother-project\ncyndra");
 });
 
-it("binds the selected policy version and renders Start and Cancel without spawning", async () => {
+it("binds the selected policy version and queues without spawning", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const jobId = await createDraft(fixture);
 
@@ -374,14 +446,20 @@ it("binds the selected policy version and renders Start and Cancel without spawn
     policyVersion: 1,
     policy: policy(),
   });
+  expect(fixture.store.getAdmission(jobId)).toMatchObject({
+    projectId: "proj_1",
+    state: "queued",
+    resumeEvent: "CONFIRMED",
+  });
   expect(fixture.store.listEffectsForJob(jobId).map((effect) => effect.kind)).toEqual(["render_status"]);
   const rendered = fixture.telegram.edited.at(-1)?.payload ?? fixture.telegram.sent.at(-1)?.payload;
   const buttons = rendered?.reply_markup?.inline_keyboard.flat().map((button) => button.text);
-  expect(buttons).toContain("Start");
+  expect(rendered?.text).toContain("Queue: queued");
+  expect(buttons).not.toContain("Start");
   expect(buttons).toContain("Cancel");
 });
 
-it("starts only the selected confirmed job with one deterministic effect", async () => {
+it("keeps the legacy Start callback idempotent for an existing queued admission", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const jobId = await createDraft(fixture);
   await selectProject(fixture, jobId);
@@ -393,12 +471,35 @@ it("starts only the selected confirmed job with one deterministic effect", async
 
   const job = fixture.store.getJob(jobId);
   const effects = fixture.store.listEffectsForJob(jobId);
-  expect(job?.state).toBe("planning");
-  expect(effects.filter((effect) => effect.kind === "spawn_plan")).toHaveLength(1);
-  expect(effects.find((effect) => effect.kind === "spawn_plan")?.idempotencyKey).toBe(
-    `${jobId}:4:spawn_plan`,
-  );
+  expect(job?.state).toBe("awaiting_confirmation");
+  expect(fixture.store.getAdmission(jobId)).toMatchObject({ state: "queued", resumeEvent: "CONFIRMED" });
+  expect(effects.filter((effect) => effect.kind === "spawn_plan")).toHaveLength(0);
+  expect(fixture.store.getOutbox("callback:start-callback")?.payload.text).toBe("Job queued.");
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM callbacks").get()).toEqual({ count: 2 });
+});
+
+it("queues a legacy selected row without applying CONFIRMED inline", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const jobId = await createDraft(fixture, 22);
+  const draft = fixture.store.getJob(jobId);
+  if (!draft) throw new Error("missing draft job");
+  const selected = fixture.store.applyJobEvent(draft.id, draft.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policy(),
+  }, 2_150);
+  expect(fixture.store.getAdmission(jobId)).toBeNull();
+
+  await fixture.ingress.handleClaimed(
+    callbackUpdate(23, "legacy-start", 7, 70, encodeCallbackData({ type: "start", jobId })),
+    2_200,
+  );
+
+  expect(selected.state).toBe("awaiting_confirmation");
+  expect(fixture.store.getJob(jobId)?.state).toBe("awaiting_confirmation");
+  expect(fixture.store.getAdmission(jobId)).toMatchObject({ state: "queued", resumeEvent: "CONFIRMED" });
+  expect(fixture.store.listEffectsForJob(jobId).map((effect) => effect.kind)).toEqual(["render_status"]);
 });
 
 it("replays a Start callback after a crash before callback recording without duplicating the transition", async () => {
@@ -428,8 +529,9 @@ it("replays a Start callback after a crash before callback recording without dup
   await ingress.handleClaimed(update, 2_201);
 
   const effects = base.store.listEffectsForJob(jobId);
-  expect(base.store.getJob(jobId)?.state).toBe("planning");
-  expect(effects.filter((effect) => effect.kind === "spawn_plan")).toHaveLength(1);
+  expect(base.store.getJob(jobId)?.state).toBe("awaiting_confirmation");
+  expect(base.store.getAdmission(jobId)).toMatchObject({ state: "queued" });
+  expect(effects.filter((effect) => effect.kind === "spawn_plan")).toHaveLength(0);
   expect(base.db.prepare("SELECT COUNT(*) AS count FROM callbacks").get()).toEqual({ count: 2 });
 });
 
@@ -515,7 +617,7 @@ it("routes standalone text to Luna while a job is active and steers only a statu
     { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policy() },
     4_200,
   );
-  const confirmed = fixture.store.applyJobEvent(jobId, selected.version, { type: "CONFIRMED" }, 4_201);
+  const confirmed = admitConfirmedJob(fixture.store, fixture.store.getJob(jobId)!, 4_201);
   const planned = fixture.store.applyJobEvent(
     jobId,
     confirmed.version,
@@ -552,7 +654,13 @@ it("routes standalone text to Luna while a job is active and steers only a statu
 });
 
 it("requests cancellation once and keeps it replay-safe", async () => {
-  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  let workNotifications = 0;
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => {
+      workNotifications += 1;
+    },
+  });
   const jobId = await createDraft(fixture, 50);
   const job = fixture.store.getJob(jobId);
   if (!job) throw new Error("draft was not created");
@@ -575,6 +683,10 @@ it("requests cancellation once and keeps it replay-safe", async () => {
   expect(fixture.store.getJob(jobId)?.cancelRequestedAt).toBe(5_100);
   expect(fixture.store.listEffectsForJob(jobId).filter((effect) => effect.kind === "revoke_approvals")).toHaveLength(1);
   expect(fixture.store.listEffectsForJob(jobId).filter((effect) => effect.kind === "stop_thread")).toHaveLength(1);
+  const latestStatus = fixture.telegram.edited.at(-1)?.payload;
+  expect(latestStatus?.reply_markup?.inline_keyboard.flat().map((button) => button.text) ?? []).not.toContain("Cancel");
+  expect(fixture.store.getOutbox(`job:${jobId}:status`)?.payload).toEqual(latestStatus);
+  expect(workNotifications).toBe(1);
   expect(fixture.telegram.answered).toEqual([]);
   expect(fixture.store.getOutbox("callback:cancel-callback")).toMatchObject({
     payload: { text: "Cancellation requested." },
@@ -800,4 +912,87 @@ it("records bounded authorization audit metadata without copying ingress payload
     await ingress.handleClaimed(messageUpdate(100 + index, 8, 80, `unauthorized-${index}`), 8_100 + index);
   }
   expect(audit).toHaveLength(256);
+});
+
+it("resolves plural Telegram status and controls by exact ids or status replies", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const runningId = createImplementingJob(fixture, "R".repeat(22), 801, "thread-running");
+  const queuedId = await createDraft(fixture, 802);
+  await selectProject(fixture, queuedId, "queued-project");
+  const failedId = failJob(fixture, "F".repeat(22), 803);
+  const secondFailedId = failJob(fixture, "G".repeat(22), 804);
+  const runningStatusId = fixture.store.getJob(runningId)?.statusMessageId;
+  if (runningStatusId === null || runningStatusId === undefined) throw new Error("missing running status message");
+
+  await fixture.ingress.handleClaimed(messageUpdate(805, 7, 70, "/status"), 2_100);
+  const summary = statusPayload(fixture);
+  expect(summary.text).toContain("Running");
+  expect(summary.text).toContain("Queued");
+  expect(summary.text).toContain("Failed");
+  expect(summary.text).toContain(runningId);
+  expect(summary.text).toContain(queuedId);
+  expect(summary.text).toContain(failedId);
+
+  await fixture.ingress.handleClaimed(messageUpdate(806, 7, 70, `/status ${runningId}`), 2_101);
+  expect(statusPayload(fixture).text).toContain(`Task: <code>${runningId}</code>`);
+  expect(statusPayload(fixture).text).not.toContain(`Task: <code>${failedId}</code>`);
+
+  await fixture.ingress.handleClaimed(messageUpdate(807, 7, 70, "/status", {
+    reply_to_message: { message_id: runningStatusId },
+  }), 2_102);
+  expect(statusPayload(fixture).text).toContain(`Task: <code>${runningId}</code>`);
+
+  const before = new Map([
+    [runningId, fixture.store.getJob(runningId)?.cancelRequestedAt],
+    [queuedId, fixture.store.getJob(queuedId)?.cancelRequestedAt],
+    [failedId, fixture.store.getJob(failedId)?.cancelRequestedAt],
+  ]);
+  await fixture.ingress.handleClaimed(messageUpdate(808, 7, 70, "/cancel"), 2_103);
+  expect(statusPayload(fixture).text).toContain("Choose");
+  expect(new Map([
+    [runningId, fixture.store.getJob(runningId)?.cancelRequestedAt],
+    [queuedId, fixture.store.getJob(queuedId)?.cancelRequestedAt],
+    [failedId, fixture.store.getJob(failedId)?.cancelRequestedAt],
+  ])).toEqual(before);
+
+  await fixture.ingress.handleClaimed(messageUpdate(809, 7, 70, "/retry"), 2_104);
+  expect(statusPayload(fixture).text).toContain("Choose");
+  expect(fixture.store.getJob(failedId)?.state).toBe("failed");
+  expect(fixture.store.getJob(secondFailedId)?.state).toBe("failed");
+
+  await fixture.ingress.handleClaimed(messageUpdate(810, 7, 70, `/cancel ${runningId}`), 2_105);
+  expect(fixture.store.getJob(runningId)?.cancelRequestedAt).toBe(2_105);
+  expect(fixture.store.getJob(queuedId)?.cancelRequestedAt).toBeNull();
+
+  await fixture.ingress.handleClaimed(messageUpdate(811, 7, 70, `/retry ${failedId}`), 2_106);
+  expect(fixture.store.getJob(failedId)?.state).toBe("implementing");
+  expect(fixture.store.getJob(secondFailedId)?.state).toBe("failed");
+});
+
+it("steers only an admitted job with the exact status reply identity", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const runningId = createImplementingJob(fixture, "P".repeat(22), 821, "thread-reply");
+  const queuedId = await createDraft(fixture, 822);
+  await selectProject(fixture, queuedId, "queued-reply-project");
+  const runningStatusId = fixture.store.getJob(runningId)?.statusMessageId;
+  const queuedStatusId = fixture.store.getJob(queuedId)?.statusMessageId;
+  if (runningStatusId === null || runningStatusId === undefined || queuedStatusId === null || queuedStatusId === undefined) {
+    throw new Error("missing status message identity");
+  }
+
+  await fixture.ingress.handleClaimed(messageUpdate(823, 7, 70, "steer running", {
+    reply_to_message: { message_id: runningStatusId },
+  }), 2_200);
+  await fixture.ingress.handleClaimed(messageUpdate(824, 7, 70, "steer queued", {
+    reply_to_message: { message_id: queuedStatusId },
+  }), 2_201);
+  await fixture.ingress.handleClaimed(messageUpdate(825, 7, 70, "not a status reply", {
+    reply_to_message: { message_id: 999_999 },
+  }), 2_202);
+
+  expect(fixture.store.listEffectsForJob(runningId).filter((effect) => effect.kind === "steer_implementation").map((effect) => effect.payload)).toEqual([
+    { text: "steer running", threadId: "thread-reply" },
+  ]);
+  expect(fixture.store.listEffectsForJob(queuedId).filter((effect) => effect.kind === "steer_implementation")).toHaveLength(0);
+  expect(fixture.store.getControllerForOwner("7", "70")).not.toBeNull();
 });

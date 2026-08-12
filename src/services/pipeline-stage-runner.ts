@@ -4,7 +4,7 @@ import {
   buildPlanArtifact,
   parseCritiqueResult,
 } from "../bb/pipeline-handoffs";
-import type { Job } from "../domain/models";
+import type { Job, JobEvent } from "../domain/models";
 import type { PipelineStageAttempt, TelegramAgentStore } from "../storage/store";
 
 export type PipelineStageFence = {
@@ -26,13 +26,28 @@ function invalidStageOutput(
 ): PipelineStageSettlement {
   const label = attempt.role === "PLAN" ? "plan" : attempt.role === "CRITIQUE" ? "critique" : "docs";
   const error = `${label} returned invalid bounded output`;
-  store.failPipelineStageAttempt({ id: attempt.id, error, ...fence, now });
+  if (!store.failPipelineStageAttempt({ id: attempt.id, error, ...fence, now })) {
+    return { outcome: "ignored" };
+  }
   const latest = store.getJob(job.id);
   const expectedState = attempt.role === "PLAN" ? "planning" : attempt.role === "CRITIQUE" ? "critiquing" : "documenting";
   if (latest?.state === expectedState && latest.cancelRequestedAt === null) {
-    store.applyJobEvent(job.id, latest.version, { type: "FAILED", error }, now);
+    if (!applyExecutorEvent(store, job.id, latest.version, { type: "FAILED", error }, fence, now)) {
+      return { outcome: "ignored" };
+    }
   }
   return { outcome: "invalid", error };
+}
+
+function applyExecutorEvent(
+  store: TelegramAgentStore,
+  jobId: string,
+  expectedVersion: number,
+  event: JobEvent,
+  fence: PipelineStageFence,
+  now: number,
+): Job | null {
+  return store.applyExecutorJobEvent({ jobId, expectedVersion, event, ...fence, now });
 }
 
 export function settlePipelineStageOutput(input: {
@@ -68,7 +83,8 @@ export function settlePipelineStageOutput(input: {
     if (!completed) return { outcome: "ignored" };
     const latest = store.getJob(job.id);
     if (!latest || latest.state !== "planning" || latest.cancelRequestedAt !== null) return { outcome: "ignored" };
-    const advanced = store.applyJobEvent(job.id, latest.version, { type: "PLAN_READY", attemptId: attempt.id }, now);
+    const advanced = applyExecutorEvent(store, job.id, latest.version, { type: "PLAN_READY", attemptId: attempt.id }, fence, now);
+    if (!advanced) return { outcome: "ignored" };
     return { outcome: "advanced", nextState: advanced.state as "critiquing" };
   }
 
@@ -90,7 +106,8 @@ export function settlePipelineStageOutput(input: {
     if (!completed) return { outcome: "ignored" };
     const latest = store.getJob(job.id);
     if (!latest || latest.state !== "documenting" || latest.cancelRequestedAt !== null) return { outcome: "ignored" };
-    const advanced = store.applyJobEvent(job.id, latest.version, { type: "DOCS_IDLE" }, now);
+    const advanced = applyExecutorEvent(store, job.id, latest.version, { type: "DOCS_IDLE" }, fence, now);
+    if (!advanced) return { outcome: "ignored" };
     return { outcome: "advanced", nextState: advanced.state as "resolving_docs_head" };
   }
 
@@ -112,9 +129,10 @@ export function settlePipelineStageOutput(input: {
   if (!completed) return { outcome: "ignored" };
   const latest = store.getJob(job.id);
   if (!latest || latest.state !== "critiquing" || latest.cancelRequestedAt !== null) return { outcome: "ignored" };
-  const advanced = store.applyJobEvent(job.id, latest.version, verdict.verdict === "pass"
+  const advanced = applyExecutorEvent(store, job.id, latest.version, verdict.verdict === "pass"
     ? { type: "CRITIQUE_PASSED", attemptId: attempt.id }
-    : { type: "CRITIQUE_NEEDS_REVISION", attemptId: attempt.id, summary: verdict.summary }, now);
+    : { type: "CRITIQUE_NEEDS_REVISION", attemptId: attempt.id, summary: verdict.summary }, fence, now);
+  if (!advanced) return { outcome: "ignored" };
   return {
     outcome: "advanced",
     nextState: advanced.state as "creating_implementation" | "planning" | "blocked",

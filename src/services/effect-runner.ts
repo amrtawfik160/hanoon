@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { Job, JobEffect, ReviewFinding, StoredEffect, WorkerLiveness } from "../domain/models";
+import { buildWorkerThreadTitle } from "../agent-skills/role-resolver";
+import type { Job, JobEffect, JobEvent, ReviewFinding, StoredEffect, WorkerLiveness } from "../domain/models";
 import { ApprovalService } from "./approval-service";
 import { buildWorkOrder } from "../bb/handoffs";
 import { buildPlanArtifact } from "../bb/pipeline-handoffs";
@@ -7,13 +8,16 @@ import type { BbAttempt, EnvironmentSnapshot, PipelineThreadAttempt } from "../b
 import type { TerminalCommandRunner, TerminalObservation } from "../bb/terminal-command";
 import { ValidationError, type ValidationSnapshot } from "../bb/validation";
 import { persistableJobStatusPayload, renderJobStatus } from "../telegram/view";
+import { projectResourceWait } from "../storage/autonomy-repository";
 import type {
   AttemptRecord,
   OutboxInput,
   PipelineStageAttempt,
   PipelineStageRole,
+  ExecutorFence,
   TelegramAgentStore,
 } from "../storage/store";
+import { isSafeControlEffect } from "../autonomy/models";
 import {
   projectTerminalLiveness,
   projectUnknownWorker,
@@ -298,6 +302,55 @@ export class EffectRunner {
     }
   }
 
+  private executorFence(): ExecutorFence {
+    return {
+      ownerId: this.dependencies.fence.ownerId,
+      generation: this.dependencies.fence.generation,
+      now: this.now(),
+    };
+  }
+
+  private applyEvent(jobId: string, expectedVersion: number, event: JobEvent): Job {
+    this.assertFence();
+    const updated = this.dependencies.store.applyExecutorJobEvent({
+      jobId,
+      expectedVersion,
+      event,
+      ...this.executorFence(),
+    });
+    if (!updated) throw new Error("executor lease was lost before job transition");
+    return updated;
+  }
+
+  private updateExecutorAttempt(
+    jobId: string,
+    attemptId: string,
+    patch: Parameters<TelegramAgentStore["updateExecutorAttempt"]>[0]["patch"],
+  ): AttemptRecord {
+    this.assertFence();
+    const updated = this.dependencies.store.updateExecutorAttempt({
+      jobId,
+      attemptId,
+      patch,
+      ...this.executorFence(),
+    });
+    if (!updated) throw new Error("executor lease was lost before attempt mutation");
+    return updated;
+  }
+
+  private renewOperationFence(effect: StoredEffect): void {
+    this.assertFence();
+    const renewed = (isSafeControlEffect(effect.kind)
+      ? this.dependencies.store.renewControlEffectFence
+      : this.dependencies.store.renewJobOperationFences).call(this.dependencies.store, {
+      jobId: effect.jobId,
+      effectIdempotencyKey: effect.idempotencyKey,
+      leaseMs: 30_000,
+      ...this.executorFence(),
+    });
+    if (!renewed) throw new Error("executor lease was lost during long operation");
+  }
+
   private currentEffect(input: StoredEffect): StoredEffect {
     const current = this.dependencies.store.getEffect(input.jobId, input.idempotencyKey);
     if (!current) throw new PermanentEffectError("effect disappeared before execution");
@@ -305,10 +358,13 @@ export class EffectRunner {
       throw new PermanentEffectError("effect identity changed before execution");
     }
     if (current.status === "done" || current.status === "dead" || current.status === "failed") return current;
-    if (current.status === "leased" && (
+    if (current.status !== "leased" ||
       current.leaseOwner !== this.dependencies.fence.ownerId ||
-      current.leaseGeneration !== this.dependencies.fence.generation
-    )) throw new Error("effect lease was lost");
+      current.leaseGeneration !== this.dependencies.fence.generation ||
+      current.leaseExpiresAt === null ||
+      current.leaseExpiresAt <= this.now()) {
+      throw new Error("effect lease was lost");
+    }
     return current;
   }
 
@@ -330,7 +386,7 @@ export class EffectRunner {
     if (!bb) throw new PermanentEffectError("BB runner is not configured");
     const attemptInput = attemptFor(effect, job, kind);
     const existingAttempt = this.dependencies.store.getAttempt(attemptInput.id);
-    const attempt = this.dependencies.store.createAttempt({
+    const attempt = this.dependencies.store.createExecutorAttempt({
       id: attemptInput.id,
       jobId: job.id,
       kind,
@@ -340,10 +396,11 @@ export class EffectRunner {
           : attemptInput.ordinal
       ),
       headSha: attemptInput.headSha,
-      now: this.now(),
+      ...this.executorFence(),
     });
+    if (!attempt) throw new Error("executor lease was lost before attempt creation");
     const titleRole = finalReview ? "final-review" : kind;
-    const expectedTitle = `Telegram ${job.id} ${titleRole} ${attempt.id}`;
+    const expectedTitle = buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: titleRole });
     const list = listThreadsAdapter(bb);
     if (list && job.projectId) {
       const candidates: BbThread[] = [];
@@ -356,6 +413,7 @@ export class EffectRunner {
           limit: 100,
           offset,
         });
+        this.renewOperationFence(effect);
         const threads = Array.isArray(page) ? page : page.threads;
         candidates.push(...threads.filter((thread) => thread.title === expectedTitle));
         if (threads.length < 100) break;
@@ -371,7 +429,7 @@ export class EffectRunner {
         ) throw new PermanentEffectError("matching BB thread has a structurally mismatched owner");
         const environmentId = candidate.environmentId ?? job.environmentId;
         if (!environmentId) throw new PermanentEffectError("matching BB thread has no environment id");
-        this.dependencies.store.updateAttempt(attempt.id, { threadId: candidate.id });
+        this.updateExecutorAttempt(job.id, attempt.id, { threadId: candidate.id });
         return { threadId: candidate.id, environmentId };
       }
     }
@@ -388,10 +446,10 @@ export class EffectRunner {
     if (!spawn) throw new PermanentEffectError(`BB ${kind} runner is not configured`);
     this.assertFence();
     const created = await spawn(job, attempt);
-    this.assertFence();
+    this.renewOperationFence(effect);
     const threadId = threadResultId(created);
     const environmentId = threadResultEnvironment(created);
-    this.dependencies.store.updateAttempt(attempt.id, {
+    this.updateExecutorAttempt(job.id, attempt.id, {
       threadId,
       handoffPath: attempt.handoffPath ?? null,
       handoffSha256: attempt.handoffSha256 ?? null,
@@ -400,14 +458,15 @@ export class EffectRunner {
   }
 
   private async findPipelineStageCandidate(
+    effect: StoredEffect,
     bb: BbEffectAdapter,
     job: Job,
     attempt: PipelineStageAttempt,
   ): Promise<{ threadId: string; environmentId: string } | null> {
     const list = listThreadsAdapter(bb);
     if (!list || !job.projectId) return null;
-    const roleLabel = attempt.role === "PLAN" ? "plan" : attempt.role === "CRITIQUE" ? "critique" : "docs";
-    const expectedTitle = `Telegram ${job.id} ${roleLabel} ${attempt.id}`;
+    const role = attempt.role === "PLAN" ? "planner" : attempt.role === "CRITIQUE" ? "critic" : "documentation";
+    const expectedTitle = buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role });
     const candidates: BbThread[] = [];
     for (let offset = 0; offset < 1_000; offset += 100) {
       this.assertFence();
@@ -418,6 +477,7 @@ export class EffectRunner {
         limit: 100,
         offset,
       });
+      this.renewOperationFence(effect);
       const threads = Array.isArray(page) ? page : page.threads;
       candidates.push(...threads.filter((thread) => thread.title === expectedTitle));
       if (threads.length < 100) break;
@@ -489,23 +549,23 @@ export class EffectRunner {
     const attempt = this.createPipelineAttempt(effect, job, "PLAN", inputSha256);
     let created = attempt.threadId && attempt.environmentId
       ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
-      : await this.findPipelineStageCandidate(bb, job, attempt);
+      : await this.findPipelineStageCandidate(effect, bb, job, attempt);
     if (!created) {
       this.assertFence();
       const result = await bb.spawnPlanner(job, pipelineAttemptForRunner(attempt), previousCritique?.outputText);
-      this.assertFence();
+      this.renewOperationFence(effect);
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
     }
     this.bindPipelineAttempt(attempt, created.threadId, created.environmentId);
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (current?.state === "planning" && current.environmentId === null) {
-      this.dependencies.store.applyJobEvent(job.id, current.version, {
+      this.applyEvent(job.id, current.version, {
         type: "PLAN_CREATED",
         attemptId: attempt.id,
         threadId: created.threadId,
         environmentId: created.environmentId,
-      }, this.now());
+      });
     }
   }
 
@@ -531,11 +591,11 @@ export class EffectRunner {
     );
     let created = attempt.threadId && attempt.environmentId
       ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
-      : await this.findPipelineStageCandidate(bb, job, attempt);
+      : await this.findPipelineStageCandidate(effect, bb, job, attempt);
     if (!created) {
       this.assertFence();
       const result = await bb.spawnCritic(job, pipelineAttemptForRunner(attempt), pipelineAttemptForRunner(plan));
-      this.assertFence();
+      this.renewOperationFence(effect);
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
     }
     if (created.environmentId !== plan.environmentId) {
@@ -558,11 +618,11 @@ export class EffectRunner {
     );
     let created = attempt.threadId && attempt.environmentId
       ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
-      : await this.findPipelineStageCandidate(bb, job, attempt);
+      : await this.findPipelineStageCandidate(effect, bb, job, attempt);
     if (!created) {
       this.assertFence();
       const result = await bb.spawnDocs(job, pipelineAttemptForRunner(attempt));
-      this.assertFence();
+      this.renewOperationFence(effect);
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
     }
     if (created.environmentId !== job.environmentId) {
@@ -572,12 +632,12 @@ export class EffectRunner {
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (current?.state === "documenting" && current.documentationThreadId === null) {
-      this.dependencies.store.applyJobEvent(job.id, current.version, {
+      this.applyEvent(job.id, current.version, {
         type: "DOCS_CREATED",
         attemptId: attempt.id,
         threadId: created.threadId,
         environmentId: created.environmentId,
-      }, this.now());
+      });
     }
   }
 
@@ -587,11 +647,10 @@ export class EffectRunner {
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "creating_implementation") return;
-    this.dependencies.store.applyJobEvent(
+    this.applyEvent(
       job.id,
       current.version,
       { type: "IMPLEMENTATION_CREATED", threadId: created.threadId, environmentId: created.environmentId },
-      this.now(),
     );
   }
 
@@ -601,8 +660,13 @@ export class EffectRunner {
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "reviewing") return;
-    const started = this.dependencies.store.applyJobEvent(job.id, current.version, { type: "REVIEW_STARTED" }, this.now());
-    this.dependencies.store.registerReviewThread(job.id, started.version, created.threadId, this.now());
+    const started = this.applyEvent(job.id, current.version, { type: "REVIEW_STARTED" });
+    if (!this.dependencies.store.registerExecutorReviewThread({
+      jobId: job.id,
+      expectedVersion: started.version,
+      threadId: created.threadId,
+      ...this.executorFence(),
+    })) throw new Error("executor lease was lost before review-thread registration");
   }
 
   private async spawnFinalReview(effect: StoredEffect, job: Job): Promise<void> {
@@ -611,8 +675,13 @@ export class EffectRunner {
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "final_reviewing") return;
-    const started = this.dependencies.store.applyJobEvent(job.id, current.version, { type: "REVIEW_STARTED" }, this.now());
-    this.dependencies.store.registerReviewThread(job.id, started.version, created.threadId, this.now());
+    const started = this.applyEvent(job.id, current.version, { type: "REVIEW_STARTED" });
+    if (!this.dependencies.store.registerExecutorReviewThread({
+      jobId: job.id,
+      expectedVersion: started.version,
+      threadId: created.threadId,
+      ...this.executorFence(),
+    })) throw new Error("executor lease was lost before final review-thread registration");
   }
 
   private enqueueStatus(job: Job, extra: Record<string, unknown> = {}): void {
@@ -621,6 +690,15 @@ export class EffectRunner {
     const payload = renderJobStatus(job, {
       ...extra,
       workerLiveness: this.dependencies.store.getWorkerLiveness(job.id),
+      resourceWait: job.policy === null ? [] : projectResourceWait({
+        jobId: job.id,
+        policy: job.policy,
+        claims: this.dependencies.store.listCurrentHeldMergeResourceClaims({
+          jobId: job.id,
+          policy: job.policy,
+          limit: 100,
+        }),
+      }),
       now: this.now(),
     });
     const outbox: OutboxInput = {
@@ -629,49 +707,52 @@ export class EffectRunner {
       messageId: job.statusMessageId,
       payload: persistableJobStatusPayload(payload),
     };
-    this.dependencies.store.enqueueOutbox(outbox, this.now());
+    if (!this.dependencies.store.enqueueExecutorStatus({ outbox, ...this.executorFence() })) {
+      throw new Error("executor lease was lost before status enqueue");
+    }
   }
 
-  private async inspectImplementation(job: Job): Promise<void> {
+  private async inspectImplementation(effect: StoredEffect, job: Job): Promise<void> {
     const bb = this.dependencies.bb;
     if (!bb?.getEnvironmentSnapshot || !bb.getPullRequestSnapshot || !job.environmentId || !job.policy) {
       throw new PermanentEffectError("implementation inspection requires BB environment and policy context");
     }
     const snapshot = await bb.getEnvironmentSnapshot(job.environmentId, job.policy.baseBranch);
-    this.assertFence();
+    this.renewOperationFence(effect);
     const pullRequest = await bb.getPullRequestSnapshot(job.environmentId) as {
       outcome?: string;
       pullRequest?: { number?: number; url?: string };
     };
+    this.renewOperationFence(effect);
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== job.state) return;
     const pullRequestNumber = pullRequest.pullRequest?.number;
     const pullRequestUrl = pullRequest.pullRequest?.url;
     if (pullRequest.outcome === "available" && Number.isInteger(pullRequestNumber) && typeof pullRequestUrl === "string") {
-      this.dependencies.store.applyJobEvent(job.id, current.version, {
+      this.applyEvent(job.id, current.version, {
         type: "PR_LOCATED",
         number: pullRequestNumber as number,
         url: pullRequestUrl,
-      }, this.now());
+      });
       return;
     }
     if (snapshot.status && typeof snapshot.status === "object" && "outcome" in snapshot.status && snapshot.status.outcome === "unavailable") {
-      this.dependencies.store.applyJobEvent(job.id, current.version, { type: "PR_UNAVAILABLE", reason: "BB environment observation is unavailable" }, this.now());
+      this.applyEvent(job.id, current.version, { type: "PR_UNAVAILABLE", reason: "BB environment observation is unavailable" });
       return;
     }
-    this.dependencies.store.applyJobEvent(job.id, current.version, { type: "PR_MISSING", reason: "No pull request was found for the implementation" }, this.now());
+    this.applyEvent(job.id, current.version, { type: "PR_MISSING", reason: "No pull request was found for the implementation" });
   }
 
   private async resolvePrHead(effect: StoredEffect, job: Job): Promise<void> {
     if (!this.dependencies.resolvePrHead) throw new PermanentEffectError("PR head resolver is not configured");
     const result = await this.dependencies.resolvePrHead(job, effect, this.dependencies.fence.signal);
-    this.assertFence();
+    this.renewOperationFence(effect);
     const current = this.dependencies.store.getJob(job.id);
     if (!current || (current.state !== "resolving_pr_head" && current.state !== "resolving_docs_head")) return;
     if (result.event === "PR_HEAD_RESOLVED" && fullSha(result.headSha)) {
-      this.dependencies.store.applyJobEvent(job.id, current.version, { type: "PR_HEAD_RESOLVED", headSha: result.headSha }, this.now());
+      this.applyEvent(job.id, current.version, { type: "PR_HEAD_RESOLVED", headSha: result.headSha });
     } else {
-      this.dependencies.store.applyJobEvent(job.id, current.version, { type: "PR_UNAVAILABLE", reason: result.reason ?? "PR head could not be resolved" }, this.now());
+      this.applyEvent(job.id, current.version, { type: "PR_UNAVAILABLE", reason: result.reason ?? "PR head could not be resolved" });
     }
   }
 
@@ -686,9 +767,9 @@ export class EffectRunner {
     else if (this.dependencies.bb?.sendSteering && job.implementationThreadId) {
       await this.dependencies.bb.sendSteering(job.implementationThreadId, textPayload(effect, "summary"));
     } else throw new PermanentEffectError("remediation runner is not configured");
-    this.assertFence();
+    this.renewOperationFence(effect);
     const current = this.dependencies.store.getJob(job.id);
-    if (current?.state === "remediating") this.dependencies.store.applyJobEvent(job.id, current.version, { type: "REMEDIATION_SENT" }, this.now());
+    if (current?.state === "remediating") this.applyEvent(job.id, current.version, { type: "REMEDIATION_SENT" });
   }
 
   private async runValidation(effect: StoredEffect, job: Job, final = false): Promise<void> {
@@ -718,30 +799,31 @@ export class EffectRunner {
       }
       const current = this.dependencies.store.getJob(job.id);
       if (!current || current.state !== (final ? "final_validating" : "validating")) return;
-      this.dependencies.store.applyJobEvent(job.id, current.version, validationOutcome === "pass"
+      this.applyEvent(job.id, current.version, validationOutcome === "pass"
         ? { type: "VALIDATION_PASSED", headSha }
-        : { type: "VALIDATION_FAILED", headSha, reason: "Validation did not pass" }, this.now());
+        : { type: "VALIDATION_FAILED", headSha, reason: "Validation did not pass" });
       return;
     }
     let result: ValidationSnapshot;
     try {
       result = await this.dependencies.runValidation(job, effect, this.dependencies.fence.signal);
+      this.renewOperationFence(effect);
     } catch (error) {
       if (!(error instanceof ValidationError)) throw error;
       this.assertFence();
-      this.dependencies.store.failPipelineStageAttempt({
+      if (!this.dependencies.store.failPipelineStageAttempt({
         id: attempt.id,
         error: "Validation infrastructure failed",
         ownerId: this.dependencies.fence.ownerId,
         generation: this.dependencies.fence.generation,
         now: this.now(),
-      });
+      })) throw new Error("executor lease was lost before validation failure persistence");
       const current = this.dependencies.store.getJob(job.id);
       if (current?.state === (final ? "final_validating" : "validating")) {
-        this.dependencies.store.applyJobEvent(job.id, current.version, {
+        this.applyEvent(job.id, current.version, {
           type: "FAILED",
           error: "Validation infrastructure failed",
-        }, this.now());
+        });
       }
       return;
     }
@@ -778,20 +860,20 @@ export class EffectRunner {
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== (final ? "final_validating" : "validating")) return;
     if (result.validationOutcome === "pass" && fullSha(result.headSha)) {
-      this.dependencies.store.applyJobEvent(job.id, current.version, { type: "VALIDATION_PASSED", headSha: result.headSha }, this.now());
+      this.applyEvent(job.id, current.version, { type: "VALIDATION_PASSED", headSha: result.headSha });
     } else {
-      this.dependencies.store.applyJobEvent(job.id, current.version, {
+      this.applyEvent(job.id, current.version, {
         type: "VALIDATION_FAILED",
         headSha: fullSha(result.headSha) ? result.headSha : undefined,
         reason: "Validation did not pass",
-      }, this.now());
+      });
     }
   }
 
   private issueApproval(job: Job): void {
     if (!job.prHeadSha) throw new PermanentEffectError("approval requires an authoritative pull-request head");
     const approvals = this.dependencies.approvals ?? new ApprovalService(this.dependencies.store, { now: this.dependencies.now });
-    const issued = approvals.issue(job.id, job.prHeadSha, this.now());
+    const issued = approvals.issue(job.id, job.prHeadSha, this.now(), this.executorFence());
     this.enqueueStatus(job, {
       mergeNonce: issued.nonce,
       approvalExpiresAt: issued.expiresAt,
@@ -803,14 +885,14 @@ export class EffectRunner {
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== expectedState) return;
     if (result.outcome === "pass") {
-      this.dependencies.store.applyJobEvent(job.id, current.version, phase === "deploy"
+      this.applyEvent(job.id, current.version, phase === "deploy"
         ? { type: "DEPLOY_SUCCEEDED", summary: result.summary }
-        : { type: "CANARY_SUCCEEDED", summary: result.summary }, this.now());
+        : { type: "CANARY_SUCCEEDED", summary: result.summary });
       return;
     }
-    this.dependencies.store.applyJobEvent(job.id, current.version, phase === "deploy"
+    this.applyEvent(job.id, current.version, phase === "deploy"
       ? { type: "DEPLOY_FAILED", reason: result.summary }
-      : { type: "CANARY_FAILED", reason: result.summary }, this.now());
+      : { type: "CANARY_FAILED", reason: result.summary });
   }
 
   private async runProduction(effect: StoredEffect, job: Job, phase: ProductionPhase): Promise<void> {
@@ -822,6 +904,12 @@ export class EffectRunner {
     const role = phase === "deploy" ? "DEPLOY" as const : "CANARY" as const;
     const commands = phase === "deploy" ? job.policy.production.deployCommands : job.policy.production.canaryCommands;
     const expectedReceiptCount = commands.length + 1;
+    if (!this.dependencies.store.assertProductionStageFence({
+      jobId: job.id,
+      effectIdempotencyKey: effect.idempotencyKey,
+      ...this.executorFence(),
+      now: this.now(),
+    })) throw new Error("production claim fence was lost before stage attempt");
     const attempt = this.createPipelineAttempt(
       effect,
       job,
@@ -843,18 +931,18 @@ export class EffectRunner {
     }
     if (effect.attempts > 1) {
       const reason = `Production ${phase} outcome is unknown after executor interruption`;
-      this.dependencies.store.failPipelineStageAttempt({
+      if (!this.dependencies.store.failPipelineStageAttempt({
         id: attempt.id,
         error: reason,
         ownerId: this.dependencies.fence.ownerId,
         generation: this.dependencies.fence.generation,
         now: this.now(),
-      });
+      })) throw new Error("executor lease was lost before production failure persistence");
       const current = this.dependencies.store.getJob(job.id);
       if (current?.state === (phase === "deploy" ? "deploying" : "verifying_production")) {
-        this.dependencies.store.applyJobEvent(job.id, current.version, phase === "deploy"
+        this.applyEvent(job.id, current.version, phase === "deploy"
           ? { type: "DEPLOY_FAILED", reason }
-          : { type: "CANARY_FAILED", reason }, this.now());
+          : { type: "CANARY_FAILED", reason });
       }
       return;
     }
@@ -865,6 +953,7 @@ export class EffectRunner {
     const generationBase = workerRegistrationGeneration(job, workerKind);
     const observe = (observation: TerminalObservation): void => {
       this.assertFence();
+      this.renewOperationFence(effect);
       if (!resourceBound) {
         const bound = this.dependencies.store.bindPipelineStageResource({
           id: attempt.id,
@@ -889,9 +978,17 @@ export class EffectRunner {
           workerKind,
           this.now(),
           terminalGeneration,
+          this.executorFence(),
         );
       }
     };
+    this.assertFence();
+    if (!this.dependencies.store.assertProductionStageFence({
+      jobId: job.id,
+      effectIdempotencyKey: effect.idempotencyKey,
+      ...this.executorFence(),
+      now: this.now(),
+    })) throw new Error("production claim fence was lost before provider mutation");
     const rawResult = await this.dependencies.runProductionStage(
       job,
       effect,
@@ -899,6 +996,7 @@ export class EffectRunner {
       this.dependencies.fence.signal,
       observe,
     );
+    this.renewOperationFence(effect);
     const result = parseProductionStageSnapshot(rawResult, phase);
     if (!productionReceiptCountIsValid(result, expectedReceiptCount)) {
       throw new PermanentEffectError("production stage receipt count is invalid");
@@ -934,7 +1032,7 @@ export class EffectRunner {
       throw new PermanentEffectError("cancellation requires fresh BB worker evidence");
     }
     await bb.stopWorker(worker);
-    this.assertFence();
+    this.renewOperationFence(effect);
     const maxChecks = 4;
     for (let check = 0; check < maxChecks; check += 1) {
       this.assertFence();
@@ -943,7 +1041,7 @@ export class EffectRunner {
       if (!bb.getThread) break;
       try {
         const thread = await bb.getThread(resourceId);
-        this.assertFence();
+        this.renewOperationFence(effect);
         const latest = this.dependencies.store.getJob(job.id);
         if (!latest || latest.cancelRequestedAt === null) return;
         const projected = projectWorkerLiveness(
@@ -953,17 +1051,18 @@ export class EffectRunner {
           this.now(),
           worker.workerKind,
           worker.generation,
+          this.executorFence(),
         );
         if (projected.state === "idle" || projected.state === "failed") {
           this.assertFence();
           const confirmed = this.dependencies.store.getJob(job.id);
           if (confirmed && confirmed.cancelRequestedAt !== null && confirmed.state !== "blocked") {
-            this.dependencies.store.applyJobEvent(confirmed.id, confirmed.version, { type: "CANCEL_CONFIRMED" }, this.now());
+            this.applyEvent(confirmed.id, confirmed.version, { type: "CANCEL_CONFIRMED" });
           }
           return;
         }
       } catch {
-        this.assertFence();
+        this.renewOperationFence(effect);
       }
       if (check + 1 < maxChecks) {
         await new Promise<void>((resolve, reject) => {
@@ -987,16 +1086,17 @@ export class EffectRunner {
     this.assertFence();
     const unresolved = this.dependencies.store.getJob(job.id);
     if (unresolved && unresolved.cancelRequestedAt !== null && unresolved.state !== "blocked" && unresolved.state !== "cancelled") {
-      this.dependencies.store.applyJobEvent(unresolved.id, unresolved.version, {
+      this.applyEvent(unresolved.id, unresolved.version, {
         type: "CANCELLATION_UNCONFIRMED",
         reason: "Cancellation could not be confirmed while the BB worker remained active or stopping",
-      }, this.now());
+      });
     }
   }
 
-  private async reconcile(job: Job): Promise<void> {
+  private async reconcile(effect: StoredEffect, job: Job): Promise<void> {
     if (this.dependencies.reconcileJob) {
       await this.dependencies.reconcileJob(job, this.dependencies.fence.signal, this.dependencies.fence);
+      this.renewOperationFence(effect);
       return;
     }
     const bb = this.dependencies.bb;
@@ -1007,7 +1107,7 @@ export class EffectRunner {
       const current = this.dependencies.store.getJob(job.id) ?? job;
       try {
         const thread = await bb.getThread(resourceId);
-        this.assertFence();
+        this.renewOperationFence(effect);
         const latest = this.dependencies.store.getJob(job.id) ?? current;
         const worker = this.dependencies.store.getWorkerLiveness(job.id);
         projectWorkerLiveness(
@@ -1017,9 +1117,10 @@ export class EffectRunner {
           this.now(),
           worker?.resourceId === resourceId ? worker.workerKind : undefined,
           worker?.resourceId === resourceId ? worker.generation : undefined,
+          this.executorFence(),
         );
       } catch {
-        this.assertFence();
+        this.renewOperationFence(effect);
         const latest = this.dependencies.store.getJob(job.id) ?? current;
         const worker = this.dependencies.store.getWorkerLiveness(job.id);
         projectUnknownWorker(
@@ -1029,6 +1130,7 @@ export class EffectRunner {
           this.now(),
           worker?.resourceId === resourceId ? worker.workerKind : undefined,
           worker?.resourceId === resourceId ? worker.generation : undefined,
+          this.executorFence(),
         );
       }
     }
@@ -1058,7 +1160,7 @@ export class EffectRunner {
         await this.spawnImplementation(effect, job);
         return;
       case "inspect_implementation":
-        await this.inspectImplementation(job);
+        await this.inspectImplementation(effect, job);
         return;
       case "resolve_pr_head":
         await this.resolvePrHead(effect, job);
@@ -1085,7 +1187,11 @@ export class EffectRunner {
         this.issueApproval(job);
         return;
       case "revoke_approvals":
-        this.dependencies.store.revokeApprovals(job.id, "Approval revoked by job reconciliation", this.now());
+        if (this.dependencies.store.revokeExecutorApprovals({
+          jobId: job.id,
+          reason: "Approval revoked by job reconciliation",
+          ...this.executorFence(),
+        }) === null) throw new Error("executor lease was lost before approval revocation");
         return;
       case "merge_pr":
         if (!this.dependencies.mergeHandler) throw new PermanentEffectError("merge handler is not configured");
@@ -1112,7 +1218,7 @@ export class EffectRunner {
         return;
       }
       case "reconcile_job":
-        await this.reconcile(job);
+        await this.reconcile(effect, job);
         return;
       default: {
         const unreachable: never = effect.kind;

@@ -5,7 +5,7 @@ import plugin from "../server";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import type { ProjectPolicy } from "../src/domain/models";
-import { activeWorkerFixture, policyFixture } from "./helpers";
+import { activeWorkerFixture, admitConfirmedJob, policyFixture, productionPolicyFixture } from "./helpers";
 
 let pluginNumber = 0;
 
@@ -188,7 +188,10 @@ it("keeps human output concise and bounds project and job collections", async ()
 it("enables a project from JSON only after live GitHub, source, and base-branch checks", async () => {
   const { harness, store } = await loadPlugin();
   stubProject(harness);
-  const input = { ...policyFixture(), githubRepository: undefined };
+  const input = {
+    ...policyFixture({ production: productionPolicyFixture({ targetKey: "shared.prod" }) }),
+    githubRepository: undefined,
+  };
 
   const result = await harness.behavior.runCli([
     "project",
@@ -204,6 +207,7 @@ it("enables a project from JSON only after live GitHub, source, and base-branch 
   expect(store.getProjectPolicy("proj_1")?.policy).toMatchObject({
     githubRepository: "acme/cyndra",
     baseBranch: "main",
+    production: { targetKey: "shared.prod" },
   });
 });
 
@@ -243,6 +247,8 @@ it("builds and validates individual policy fields including repeatable controls 
     JSON.stringify({ name: "convex", command: "bunx convex deploy --yes", timeoutMs: 600_000 }),
     "--canary-json",
     JSON.stringify({ name: "health", command: "npm run canary", timeoutMs: 120_000 }),
+    "--production-target-key",
+    "shared.prod",
     "--rollback-json",
     JSON.stringify({ name: "rollback", command: "npm run rollback", timeoutMs: 120_000 }),
     "--convex-deploy-required",
@@ -299,12 +305,29 @@ it("builds and validates individual policy fields including repeatable controls 
     requiredChecks: ["unit"],
     outputRedactionPatterns: ["secret"],
     production: {
+      targetKey: "shared.prod",
       deployCommands: [{ name: "convex", command: "bunx convex deploy --yes", timeoutMs: 600_000 }],
       canaryCommands: [{ name: "health", command: "npm run canary", timeoutMs: 120_000 }],
       rollbackCommand: { name: "rollback", command: "npm run rollback", timeoutMs: 120_000 },
       convexDeployRequired: true,
     },
   });
+});
+
+it("rejects a production target flag without complete deploy and canary configuration", async () => {
+  const { harness, store } = await loadPlugin();
+  stubProject(harness);
+
+  const result = await harness.behavior.runCli([
+    "project", "enable", "proj_1",
+    "--alias", "operator-policy",
+    "--base", "main",
+    "--merge-method", "squash",
+    "--production-target-key", "shared.prod",
+  ]);
+
+  expect(result.exitCode).toBe(2);
+  expect(store.getProjectPolicy("proj_1")).toBeNull();
 });
 
 it("rejects Convex production policy flags that do not invoke the Convex CLI", async () => {
@@ -488,7 +511,7 @@ it("shows, retries, cancels, and rejects illegal job state transitions through t
     policyVersion: 1,
     policy: policyFixture(),
   }, 2);
-  const confirmed = store.applyJobEvent(selected.id, selected.version, { type: "CONFIRMED" }, 3);
+  const confirmed = admitConfirmedJob(store, store.getJob(selected.id)!, 3);
   const planned = store.applyJobEvent(confirmed.id, confirmed.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 3);
   const critiqued = store.applyJobEvent(planned.id, planned.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 3);
   const implementing = store.applyJobEvent(critiqued.id, critiqued.version, {
@@ -515,6 +538,41 @@ it("shows, retries, cancels, and rejects illegal job state transitions through t
   const illegal = await harness.behavior.runCli(["job", "retry", active.id]);
   expect(illegal.exitCode).toBe(1);
   expect(store.getJob(active.id)?.state).toBe("merged");
+});
+
+it("projects bounded admission and resource facts without lease ownership details", async () => {
+  const { harness, store } = await loadPlugin();
+  store.upsertProjectPolicy(policyFixture({ production: undefined }), 1);
+  const draft = store.createJob({ id: "job_projection", sourceUpdateId: 41, requestText: "private task text", now: 1 });
+  const selected = store.applyJobEvent(draft.id, draft.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture({ production: undefined }),
+  }, 2);
+  admitConfirmedJob(store, selected, 3);
+
+  const shown = await harness.behavior.runCli(["job", "show", draft.id, "--json"]);
+  expect(shown.exitCode).toBe(0);
+  const projection = parseJson(shown.stdout);
+  expect(projection).toMatchObject({
+    id: draft.id,
+    projectId: "proj_1",
+    admission: {
+      state: "admitted",
+      queueSequence: expect.any(Number),
+      queueAgeMs: expect.any(Number),
+      releaseReason: null,
+    },
+    resources: {
+      held: [{ kind: "project", key: "project:proj_1:pipeline" }],
+      waiting: [],
+    },
+  });
+  expect(JSON.stringify(projection)).not.toMatch(/"(?:ownerId|generation|leaseExpiresAt|requestText)"|private task text/i);
+
+  const listed = await harness.behavior.runCli(["job", "list"]);
+  expect(listed.stdout).toContain(`${draft.id}\tplanning\tadmitted\tproj_1`);
 });
 
 it("cancels through the CLI with an active worker and queues its stop effect", async () => {

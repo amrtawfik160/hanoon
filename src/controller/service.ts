@@ -9,6 +9,7 @@ import {
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { projectControllerStream } from "./stream";
 import { buildTurnContext, composeTurnInput } from "./context";
+import { evaluateSupervisor } from "./supervisor";
 
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
@@ -227,6 +228,9 @@ export class LunaControllerService {
           cursor: projected.cursor,
           text: projected.text,
           phase: projected.phase,
+          toolCalls: observation.toolCalls,
+          commandFailures: observation.commandFailures,
+          totalTokens: observation.totalTokens,
         });
       }
     } catch {
@@ -274,6 +278,12 @@ export class LunaControllerService {
           ...fenceAt(fence, this.dependencies.clock.now()),
           turnId: waiting.id,
         });
+        return true;
+      }
+      // The owner's own words outrank a budget nudge, so this runs only once
+      // nothing of theirs is waiting. A turn parked on a question is waiting on
+      // a person, and no budget should fire against their thinking time.
+      if (parked === null && await this.superviseBudget(submitted.id, controller, fence, signal)) {
         return true;
       }
       if (parked === null && refreshedAt - submitted.updatedAt >= CONTROLLER_STALL_MS) {
@@ -367,6 +377,52 @@ export class LunaControllerService {
     })) {
       throw new Error("Controller turn changed before its response was recorded");
     }
+    return true;
+  }
+
+  /**
+   * Bounds a turn by the work it has actually done. Returns true when the
+   * supervisor acted, so the caller stops reconciling this turn.
+   */
+  private async superviseBudget(
+    turnId: string,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const turn = this.dependencies.store.getControllerTurn(turnId);
+    if (!turn || turn.state !== "submitted" || controller.threadId === null) return false;
+    const decision = evaluateSupervisor({
+      toolCalls: turn.toolCalls,
+      totalTokens: turn.totalTokens,
+      commandFailures: turn.commandFailures,
+      steersIssued: turn.supervisorSteers,
+      steeredReasons: turn.supervisorReasons,
+    });
+    if (decision.kind === "continue") return false;
+    if (decision.kind === "steer") {
+      try {
+        await this.dependencies.adapter.steer(controller.threadId, decision.text, signal);
+      } catch {
+        // A nudge that did not land is not worth failing an answer over. The
+        // hard budget still stops the turn, and the next poll may deliver it.
+        return false;
+      }
+      return this.dependencies.store.recordControllerSupervisorSteer({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId,
+        reason: decision.reason,
+      });
+    }
+    // Retiring the thread is the half that matters: a turn stopped for cost
+    // that left its thread alive would let the next message resume the loop.
+    this.dependencies.store.resetControllerThread({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      controllerKey: controller.controllerKey,
+      expectedThreadId: controller.threadId,
+      reason: "Turn exceeded its supervisor budget",
+    });
+    this.fail(turn, fence, "Controller turn exceeded its budget", decision.ownerMessage);
     return true;
   }
 

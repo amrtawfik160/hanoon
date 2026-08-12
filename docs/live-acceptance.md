@@ -10,6 +10,19 @@ This runbook is for owner-only live acceptance after the automated test suite pa
 - Record identifiers, digests, SHAs, statuses, and bounded summaries only.
 - A live run is not successful unless every required step has evidence. HTTP 200, static tests, or a plugin registration row alone is not live acceptance.
 
+## Evidence boundaries
+
+Keep these proof classes separate in the final record:
+
+| Proof class | What it can establish |
+| --- | --- |
+| Local tests and typecheck | Deterministic code contracts only; they do not prove Telegram, GitHub, deployment, or canary behavior. |
+| Local skill-bundle verification | The committed manifest roots, lock, skill bytes, names, resources, provenance, and bundle digest are internally consistent; it does not prove that a real provider session received or used a role skill. |
+| Real Telegram | Pairing, commands, replies, callbacks, delivery, and owner-visible recovery. |
+| Live BB and GitHub mutation | Thread/environment identity, executor takeover, pull-request head binding, review, approval, and exactly one merge. |
+| Disposable deploy command | Exact merged checkout, production-target exclusion, command receipt, and failure classification. |
+| Disposable canary command | Post-deploy verification and the terminal `complete` decision. |
+
 ## Token configuration pause
 
 Before this runbook begins, the owner must perform exactly this UI action:
@@ -40,9 +53,17 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | review BB thread ids | `<thread id>` per attempt |
 | implementation environment id | `<environment id>` |
 | review environment ids | `<same environment id>` per attempt |
+| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| review skill-provider evidence | real thread id: `<pending>`; role: `review`; selected ids: `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| documentation skill-provider evidence | real thread id: `<pending>`; role: `documentation`; selected ids: `docs-guard`, `verification-before-completion`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| final-review skill-provider evidence | real thread id: `<pending>`; role: `final-review`; selected ids: `clean-code-guard`, `test-guard`, `docs-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | spawn-versus-fork proof | `<spawned=true, forked=false>` |
 | executor owner and generation | `<owner id>`, `<generation>` |
 | losing executor owner/generation result | `<not acquired or fenced>` |
+| configured concurrency cap | `<1-8; use 2 for the concurrency matrix>` |
+| admission/lane observations | `<queued/admitted/draining/released counts and pipeline/control use>` |
+| project/repository/production resource observations | `<bounded kind/key pairs and waiting job ids>` |
+| concurrency fixtures | `<independent projects; same project; shared repository; shared production target>` |
 | liveness source and state | `<bb_thread/bb_terminal>`, `<starting/active/idle/stale/unknown/...>` |
 | pull request number and URL | `<number>`, `<URL>` |
 | first `git ls-remote` OID(s) | `<full SHA>` per lookup |
@@ -92,21 +113,33 @@ Send an ordinary question such as which projects are available. Confirm that BB 
 
 Record only the message ids and bounded answer summary, not the raw private conversation.
 
-### 4. Submit a bounded task through the controller
+### 4. Prove bounded admissions and resource exclusions
 
-Send one small software task from the paired private chat. The controller must use `telegram_agent_list_projects` when project selection is needed and `telegram_agent_start_job` to commit the guarded job. If more than one project matches, answer the controller's project question; there is no deterministic project-picker or Start callback in the conversational path.
+Set **Maximum concurrent jobs** to `2`. Prepare disposable policies and controlled tasks that can pause at known boundaries. The controller must use `telegram_agent_list_projects` when project selection is needed and `telegram_agent_start_job` to commit each guarded job. If more than one project matches, answer the controller's project question; there is no deterministic project-picker or Start callback in the conversational path.
 
-Record the task/status message ids and confirm that only one active job exists:
+Run and record all four cases. Use `job list/show --json` for bounded admission/resource projections and the structured health report for lane counts; do not infer concurrency from timestamps alone.
+
+1. **Independent projects:** queue two jobs whose project ids, repositories, and production targets differ. Both must become `admitted` and make pipeline progress concurrently under cap `2`.
+2. **Same project:** queue two controlled jobs for one project. The earlier queue sequence must be `admitted`; the later must remain `queued` until the first becomes `released`, then admit in FIFO order.
+3. **Shared repository:** use two distinct BB projects that resolve to the same canonical GitHub repository. Pause the first at the disposable merge boundary. It alone may hold the normalized `repository_merge` claim; the other job must report that kind/key as waiting and must not call merge until release.
+4. **Shared production target:** use distinct repositories with the same explicit `production.targetKey`. Pause the first disposable deployment. It alone may hold the `production_target` claim; the other job must report the shared target as waiting and must not run deploy or canary until release.
+
+For each case, record Telegram status ids, admission states, queue sequence, cap/occupied/available fields, live lane counts, held/waiting resource kind/key pairs, and provider/command call counts:
 
 ```bash
 bb telegram-agent job list --json
+bb telegram-agent job show <job-id> --json
 ```
 
-Do not record raw private message text.
+Do not record raw private message text or claim-owner internals. Finish or cancel the extra fixtures and verify their admissions become `released`. Choose one independent-project job for the remaining end-to-end pipeline steps.
 
 ### 5. Capture implementation handoff and worker isolation
 
 Verify that the leased executor creates a visible implementation thread in a managed worktree on the disposable project's exact source host. Record the thread id, environment id, work-order filename/digest, executor owner/generation, and liveness source/state. Confirm the implementation input uses an attachment and a small handoff prompt. Prove that the thread was spawned and not forked. Confirm the hidden controller remains in its personal workspace and cannot see the implementation checkout.
+
+#### Skill-provider observations (pending follow-up slice)
+
+The deterministic `npm run skills:verify` gate proves only the committed bundle's structure, provenance, and bytes. It does not prove provider skill use. In the separately approved receipt/acceptance slice, capture one real BB thread id, the exact role, selected skill ids, the verifier's bundle digest, and the bounded provider-session outcome for each non-empty profile: `implementation`, `review`, `documentation`, and `final-review`. Keep the four evidence rows above **pending** during this slice; persistent skill receipts do not exist yet, so these observations cannot be marked passed or treated as complete live skill-use evidence.
 
 ### 6. Observe the PR and bind its exact head
 
@@ -128,9 +161,11 @@ Run the configured deterministic validation and record command names/outcomes, b
 
 Confirm stale handling resolves the new exact Git-native head, revokes the old approval, and starts a third fresh review attempt. Record its review-packet digest, thread/environment ids, verdict, validation commands, both head OIDs, and the new one-use approval. Do not reuse the old approval callback.
 
-### 11. Race executors and merge once
+### 11. Restart, adopt exact claims, race executors, and merge once
 
-Start or exercise a second executor instance at the merge boundary. Record the winning executor owner/generation and the losing instance’s rejected acquisition or lease-fence result. Accept the fresh **Merge + deploy** approval and record the bounded merge response, one BB merge SDK call, post-merge GitHub confirmation, full merge commit SHA, exact detached production checkout, ordered disposable deployment commands, ordered canary commands, terminal-owned liveness, and separate `DEPLOY`/`CANARY` receipts. A second merge, deploy, or canary call is a failure.
+With the selected job admitted and its controlled merge/production resources held, restart the current plugin service and let a successor executor acquire a new generation. Record that it first reconciles the exact job, then adopts every same-job held claim; no foreign or released claim may change owner/generation. Ordinary pipeline work must remain fenced until that sequence succeeds.
+
+Also start or exercise a losing executor instance at the merge boundary. Record the winning executor owner/generation and the losing instance’s rejected acquisition or lease-fence result. Accept the fresh **Merge + deploy** approval and record the bounded merge response, one BB merge SDK call, post-merge GitHub confirmation, full merge commit SHA, exact detached production checkout, ordered disposable deployment commands, ordered canary commands, terminal-owned liveness, and separate `DEPLOY`/`CANARY` receipts. A second merge, deploy, or canary call is a failure.
 
 ### 12. Fail delivery, restart, and recover completion
 
@@ -147,4 +182,4 @@ Also exercise one recoverable Telegram failure: an expired callback must not rep
 
 ## Final acceptance decision
 
-Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. If the owner did not configure the token, production commands, or a disposable project, report the live acceptance as **not run**, not successful.
+Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Until then, live provider skill-use evidence remains **pending**, not passed or complete. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the live acceptance as **not run**, not successful.

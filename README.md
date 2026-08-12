@@ -7,8 +7,10 @@ The installed plugin and CLI namespace remain `telegram-agent`.
 ## Why Hanoon?
 
 - **Run BB from Telegram, not from BB.** Hanoon has the shell, the `bb` CLI, installed skills and MCP servers, and reach across every connected machine. Nothing waits for a click in the BB app.
-- **It remembers.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall, and the relevant ones are in front of the agent on every turn.
-- **It follows up by itself.** Set a monitor to watch a thread or run on a schedule; when it fires, Hanoon does the work and messages you.
+- **It remembers, and keeps it honest.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall. Correcting Hanoon devalues whatever misled it, notes it never uses fade, and a correction retires the belief it contradicts.
+- **It learns from finished work.** When a job ends, Hanoon works out what is worth knowing about that repository next time — a check that always fails for a known reason, a convention it enforces — and keeps it per project.
+- **It follows up by itself.** Set a monitor to watch a thread or run on a schedule; when it fires, Hanoon does the work and messages you. It also runs its own daily and weekly upkeep, and stays quiet when nothing needs you.
+- **It works in parallel.** Independent questions go out to several BB threads at once and come back as one answer.
 - **Conversations survive failures.** A dead provider session retires a BB thread, not the conversation. The replacement resumes with what was said and what was already done.
 - **Mutations happen once.** Every mutating tool call is receipted by turn and argument hash, so a recovered agent replays the result instead of repeating the action.
 - **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, approval is one-use and expiring, and GitHub repository rules still apply.
@@ -24,7 +26,7 @@ Hanoon has three layers:
 | Durable control | Store owner pairing, project policies, controller turns and conversation digest, memories, monitors, tool receipts, jobs, effects, approvals, liveness, and the outbox in plugin SQLite. |
 | BB execution | Run the hidden controller and visible planning, implementation, review, documentation, validation, merge, deployment, and canary work. |
 
-Ingress never starts a BB session; it claims each Telegram update durably before anything acts on it. One generation-fenced executor owns controller dispatch, monitors, pipeline effects, and Telegram delivery. Reviewers are newly spawned BB threads with fresh provider conversations; they reuse the implementation environment only to inspect the same worktree.
+Ingress never starts a BB session; it claims each Telegram update durably before anything acts on it. One generation-fenced executor owns controller dispatch, monitors, pipeline effects, and Telegram delivery. That executor may run bounded pipeline lanes for independent projects, while durable project claims keep each project serialized. Reviewers are newly spawned BB threads with fresh provider conversations; they reuse the implementation environment only to inspect the same worktree.
 
 Agent sessions run out of process as BB threads and never open the plugin database, so the single-writer SQLite store stays uncontended: state transitions, their effects, memory writes, and the conversation digest all commit in one transaction.
 
@@ -36,10 +38,14 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Live thread insight | "Why is this taking so long?" answers from the thread's current step, todo list, running commands, and latest message — not just its status. |
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
+| Working style | "Be terser" or "always show me the PR link" sticks, without a code change. It can shape tone and habits, never a safety boundary. |
+| Parallel work | "Compare the invoice spike and the billing latency" opens both at once and answers from what comes back. |
+| Self-maintenance | A daily sweep for work needing your decision, a weekly memory audit, and a weekly scorecard of what actually happened. Off by one setting. |
 | Monitors | "Tell me when this finishes and open a PR", or "every weekday at 9, summarise the overnight runs." |
 | Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. A block it cannot render is still reported, so nothing waits on you in silence. |
 | Reviewed delivery | A guarded job takes a change from plan to merge; merging and production still ask you in Telegram. |
 | Self-diagnosis | `/health` reports the executor, queued work, undelivered messages, monitors, memory, and database integrity — even when the agent is the stuck part. |
+| Bounded turns | A question that runs away is nudged once to land the answer, then stopped before it burns your budget out of sight. |
 
 ## Architecture
 
@@ -57,10 +63,36 @@ Read the [architecture guide](docs/architecture.md) for diagrams, state ownershi
 
 Critique can request one replacement plan. Test or review failures return to a bounded patch/test/review cycle. Invalid evidence, stale pull-request heads, exhausted limits, unknown liveness, and expired approvals block instead of silently advancing.
 
-The project policy chooses implementation/review providers and commands. The conversational agent is configured independently and defaults to Claude Opus 5 (1M) at `xhigh` reasoning. Claude and Codex models are both selectable; picking a model selects its provider.
+The project policy chooses implementation/review providers and commands. The conversational agent is configured independently and defaults to Claude Opus 5 (1M) at `xhigh` reasoning. Claude and Codex models are both selectable; picking a model selects its provider. The concurrent-job cap defaults to `5`, accepts `1`–`8`, and applies to later admissions without cancelling work already admitted.
+
+## Bundled worker skills
+
+The plugin bundles its skill files locally in the two manifest roots `skills/workflow-kit` and `skills/guards`; no separate skill plugin installation is required. The workflow kit is pinned to version `6.2.0` from [obra/superpowers](https://github.com/obra/superpowers) under its MIT license. The three guards are independently authored repository-owned skills. The committed catalog contains 17 skills, but a worker receives only the role profile below.
+
+| Verified context | Selected skill ids |
+| --- | --- |
+| controller | none (controller tools and controller instructions only) |
+| planner | none |
+| critic | none |
+| implementation | `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard` |
+| review | `clean-code-guard`, `test-guard` |
+| documentation | `docs-guard`, `verification-before-completion` |
+| final-review | `clean-code-guard`, `test-guard`, `docs-guard` |
+| validation, merge, deploy, canary | none; these stages remain deterministic |
+
+Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1–256 characters from `[A-Za-z0-9_-]`; attempt ids are 1–264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact `attempt:` or `stage:` record must match the title's job, attempt, and role, and its originating effect must be the corresponding `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs` effect. The job project, persisted environment (when present), and persisted thread (when present) must match the current context. A null environment or thread is accepted only for the first start; a later context must match the persisted id. Any mismatch receives no tools and no skills; the hidden controller branch receives no worker skills.
+
+The bundle is checked before it can run. `npm run skills:verify` validates the two registered roots, lock schema/provenance, bounded regular files, frontmatter names, nested local Markdown resources, and every SHA-256 file digest; it emits a bounded `bundleDigest` and skill count. `npm run build` runs this check before `bb plugin build`, and plugin activation runs it before registration. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle stops build/activation. The runtime never downloads or repairs a replacement.
+
+Only a maintainer synchronizes the pinned workflow kit from an already-reviewed local checkout. The source must be an absolute directory for the reviewed `superpowers` `6.2.0` package; synchronization is network-free and rewrites only the local bundle and lock:
+
+```bash
+WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.2.0
+npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.2.0
+```
 
 > [!WARNING]
-> This is a full-trust BB plugin, and the agent runs with full permissions by design, so routine work never stops for an approval in the BB app. Prompts a worker thread does raise are bridged to Telegram; the rare block the plugin cannot render says so and asks you to open BB. It can use the shell, the `bb` CLI, and installed skills and MCP servers on any connected machine. Merging a pull request and promoting to production still require a one-use Telegram approval, and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
+> This is a full-trust BB plugin, and the agent runs with full permissions by design so the owner never has to approve anything inside the BB app. It can use the shell, the `bb` CLI, and installed skills and MCP servers on any connected machine. Merging a pull request and promoting to production still require a one-use Telegram approval, and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
 
 ## Quick start
 
@@ -78,7 +110,7 @@ bb plugin reload telegram-agent
 
 ### 2. Configure and pair
 
-In **Extensions → Plugins → Telegram Agent**, enter the Telegram bot token in the secret setting. The model, reasoning level, service tier, and permission mode are on the same page; the defaults are ready to use.
+In **Extensions → Plugins → Telegram Agent**, enter the Telegram bot token in the secret setting. The model, reasoning level, service tier, permission mode, and maximum concurrent jobs are on the same page; the defaults are ready to use.
 
 ```bash
 bb telegram-agent pair
@@ -96,7 +128,7 @@ bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/po
 bb telegram-agent doctor <project-id>
 ```
 
-The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. See [Configuration](docs/configuration.md) for the complete verified schema and examples.
+The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. Projects that deploy to the same target can share `production.targetKey`, which serializes that target even when their repositories differ. See [Configuration](docs/configuration.md) for the complete verified schema and examples.
 
 ### 4. Talk to Hanoon
 
@@ -111,7 +143,7 @@ always deploy parknwash on weekday mornings
 /health
 ```
 
-Recovery commands remain available without the agent: `/status`, `/projects`, `/health`, `/retry`, `/cancel`. Merging still requires the one-use Telegram approval.
+Recovery commands remain available without the agent: `/status`, `/projects`, `/health`, `/retry [job-id]`, `/cancel [job-id]`. `/status` lists current jobs; replying to a job status message or supplying its id selects that exact job. Merging still requires the one-use Telegram approval.
 
 ## Documentation
 
@@ -137,6 +169,8 @@ hanoon/
 │   ├── storage/      # SQLite migrations and transactional store
 │   └── telegram/     # Telegram API client, ingress, errors, and bounded rendering
 ├── tests/            # Unit, integration, state-machine, and mocked end-to-end coverage
+├── skills/           # Vendored skill bundle: workflow kit, guards, and pr-writer
+├── evals/            # Golden answers for the opt-in response-quality check
 ├── docs/             # Public guides plus design/implementation history
 ├── server.ts         # BB plugin entry point
 └── package.json      # Plugin manifest and verification scripts
@@ -147,6 +181,7 @@ hanoon/
 ```bash
 npm ci
 npm run typecheck
+npm run skills:verify
 npm run build
 bb plugin types --check .
 ```
@@ -160,6 +195,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for change boundaries, documentation chec
 
 ## Project status
 
-Version `0.1.0`, installed directly from a checkout. No package registry or release channel is claimed. Released under the [MIT License](LICENSE).
-
-A license has not been selected. Before publishing the repository as open source, the maintainer must add a license that states the intended reuse terms.
+Version `0.1.0`, installed directly from a checkout. No package registry, release channel, or open-source license is claimed. Before publishing the repository as open source, the maintainer must add a license that states the intended reuse terms.

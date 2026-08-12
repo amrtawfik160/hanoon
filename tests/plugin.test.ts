@@ -60,6 +60,66 @@ it("registers configurable controller execution settings with safe defaults", as
   });
 });
 
+it("registers the bounded concurrent job cap as a select setting", async () => {
+  const { harness } = await loadPlugin();
+
+  expect(harness.registrations.settingsDescriptors.maxConcurrentJobs).toMatchObject({
+    type: "select",
+    description: "Independent projects may run together; each project remains serialized.",
+    options: ["1", "2", "3", "4", "5", "6", "7", "8"],
+    default: "5",
+  });
+});
+
+it("keeps the Telegram polling timeout out of user-facing settings", async () => {
+  const { harness } = await loadPlugin();
+
+  expect(harness.registrations.settingsDescriptors).not.toHaveProperty("pollTimeoutSeconds");
+});
+
+it("applies a changed concurrency cap to later admissions", async () => {
+  const { bb, harness } = await loadPlugin();
+  await harness.behavior.setSettings({ botToken: "123:test-token", maxConcurrentJobs: "1" });
+  const store = openStore(bb.storage);
+  for (let index = 1; index <= 2; index += 1) {
+    const projectPolicy = policyFixture({
+      projectId: `proj_${index}`,
+      alias: `project-${index}`,
+      githubRepository: `acme/project-${index}`,
+      production: undefined,
+    });
+    store.upsertProjectPolicy(projectPolicy, 1_000);
+    const job = store.createJob({
+      id: `plugin-cap-job-${index}`,
+      sourceUpdateId: 100 + index,
+      requestText: `job ${index}`,
+      now: 1_000,
+    });
+    store.selectProjectAndQueueAdmission({
+      jobId: job.id,
+      expectedVersion: job.version,
+      projectId: projectPolicy.projectId,
+      policyVersion: 1,
+      policy: projectPolicy,
+      now: 1_001,
+    });
+  }
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { message_id: 900 } }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(store.listAdmissions(["admitted", "draining"], 10)).toHaveLength(1));
+    await harness.behavior.setSettings({ maxConcurrentJobs: "2" });
+    await vi.waitFor(() => expect(store.listAdmissions(["admitted", "draining"], 10)).toHaveLength(2));
+  } finally {
+    run.controller.abort();
+    await run.done;
+    vi.unstubAllGlobals();
+  }
+});
+
 it("registers both background services and all enqueue-only thread lifecycle handlers", async () => {
   const { bb, harness } = await loadPlugin();
   const serviceNames = harness.registrations.services.map((service) => service.name);
@@ -220,7 +280,7 @@ it("reconciles an authoritative implementation idle observation into the job sta
   await run.done;
 });
 
-it("projects fresh-gate validation terminal observations into liveness", async () => {
+it("does not execute a merge effect without its held project claim", async () => {
   const { bb, harness } = await loadPlugin();
   const store = openStore(bb.storage);
   const db = bb.storage.database();
@@ -236,6 +296,11 @@ it("projects fresh-gate validation terminal observations into liveness", async (
        policy_version = 1, policy_json = ?, environment_id = ?, pr_number = ?,
        pr_url = ?, pr_head_sha = ?, version = 7, updated_at = ? WHERE id = ?`,
   ).run(policy.projectId, JSON.stringify(policy), "env_1", 17, "https://github.com/acme/cyndra/pull/17", headSha, now, job.id);
+  db.prepare(
+    `INSERT INTO job_admissions (
+       job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
+     ) VALUES (?, ?, 1, 'admitted', 'CONFIRMED', ?, ?)`,
+  ).run(job.id, policy.projectId, now, now);
 
   const approvals = new ApprovalService(store, {
     now: () => Date.now(),
@@ -272,11 +337,12 @@ it("projects fresh-gate validation terminal observations into liveness", async (
 
   const run = harness.behavior.runService("job-executor");
   try {
-    await vi.waitFor(() => expect(store.getWorkerLiveness(job.id)).toMatchObject({
-      workerKind: "validation",
-      resourceKind: "bb_terminal",
-      state: "failed",
+    await vi.waitFor(() => expect(store.getEffect(job.id, `${job.id}:8:merge_pr`)).toMatchObject({
+      status: "pending",
+      attempts: 0,
     }));
+    expect(store.getWorkerLiveness(job.id)).toBeNull();
+    expect(commands.size).toBe(0);
   } finally {
     run.controller.abort();
     await run.done;

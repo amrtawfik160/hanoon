@@ -1,16 +1,12 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
-import type { JobState } from "../src/domain/models";
 import { openStore } from "../src/storage/store";
 import {
   resolveTelegramPresenceTarget,
   TelegramPresenceCoordinator,
 } from "../src/services/telegram-presence";
-import {
-  activeWorkerFixture,
-  jobFixture,
-} from "./helpers";
+import type { JobLaneSnapshot } from "../src/services/job-lane-runner";
 
 let fixtureNumber = 0;
 
@@ -33,27 +29,34 @@ function controllerFixture() {
   return { store, turn, fence };
 }
 
-function jobPresenceStore(
-  state: JobState,
-  worker = activeWorkerFixture(),
-) {
-  const job = jobFixture({ state });
+function jobPresenceStore() {
   return {
     getOwner: () => ({ userId: "7", chatId: "70" }),
     getControllerForOwner: () => null,
     getPendingControllerTurn: () => null,
-    getActiveJob: () => job,
-    getWorkerLiveness: () => worker,
   };
 }
+
+function laneSnapshots(overrides: Partial<JobLaneSnapshot> = {}) {
+  return {
+    snapshot: (): JobLaneSnapshot => ({
+      pipelineActive: 0,
+      controlActive: 0,
+      busyJobIds: [],
+      ...overrides,
+    }),
+  };
+}
+
+const emptyLanes = laneSnapshots();
 
 describe("Telegram presence target resolution", () => {
   it("selects dispatching and submitted controller turns but not queued or completed turns", () => {
     const queued = controllerFixture();
-    expect(resolveTelegramPresenceTarget(queued.store)).toBeNull();
+    expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toBeNull();
 
     expect(queued.store.claimNextControllerTurn(queued.fence)).toMatchObject({ state: "dispatching" });
-    expect(resolveTelegramPresenceTarget(queued.store)).toEqual({
+    expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toEqual({
       key: `controller:${queued.turn.id}`,
       chatId: "70",
     });
@@ -66,7 +69,7 @@ describe("Telegram presence target resolution", () => {
       threadId: "thr_controller",
     })).toBe(true);
     expect(queued.store.markControllerTurnSubmitted({ ...queued.fence, turnId: queued.turn.id })).toBe(true);
-    expect(resolveTelegramPresenceTarget(queued.store)).toEqual({
+    expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toEqual({
       key: `controller:${queued.turn.id}`,
       chatId: "70",
     });
@@ -76,7 +79,7 @@ describe("Telegram presence target resolution", () => {
       turnId: queued.turn.id,
       responseText: "Done.",
     })).toBe(true);
-    expect(resolveTelegramPresenceTarget(queued.store)).toBeNull();
+    expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toBeNull();
   });
 
   it("fails closed for failed turns, revoked owners, and missing controller mappings", () => {
@@ -87,67 +90,50 @@ describe("Telegram presence target resolution", () => {
       turnId: failed.turn.id,
       error: "provider failed",
     })).toBe(true);
-    expect(resolveTelegramPresenceTarget(failed.store)).toBeNull();
+    expect(resolveTelegramPresenceTarget(failed.store, emptyLanes)).toBeNull();
 
     const revoked = controllerFixture();
     expect(revoked.store.claimNextControllerTurn(revoked.fence)).toMatchObject({ state: "dispatching" });
     expect(revoked.store.revokeOwner(2_001)).toBe(true);
-    expect(resolveTelegramPresenceTarget(revoked.store)).toBeNull();
+    expect(resolveTelegramPresenceTarget(revoked.store, emptyLanes)).toBeNull();
 
-    const noController = jobPresenceStore("awaiting_project");
-    expect(resolveTelegramPresenceTarget(noController)).toBeNull();
+    const noController = jobPresenceStore();
+    expect(resolveTelegramPresenceTarget(noController, emptyLanes)).toBeNull();
   });
 
   it.each([
-    ["creating_implementation", "implementation", "starting"],
-    ["implementing", "implementation", "active"],
-    ["remediating", "implementation", "active"],
-    ["reviewing", "review", "active"],
-    ["validating", "validation", "active"],
-  ] as const)("selects %s with an authoritative %s worker that is %s", (state, workerKind, workerState) => {
-    const worker = activeWorkerFixture({ workerKind, state: workerState });
-
-    expect(resolveTelegramPresenceTarget(jobPresenceStore(state, worker))).toEqual({
-      key: `job:job_1:${workerKind}:${worker.generation}:${worker.resourceId}`,
+    [1, 0],
+    [0, 1],
+    [2, 3],
+  ] as const)("uses one constant aggregate target for %s pipeline and %s control lanes", (pipelineActive, controlActive) => {
+    expect(resolveTelegramPresenceTarget(
+      jobPresenceStore(),
+      laneSnapshots({ pipelineActive, controlActive, busyJobIds: ["private-job-a", "private-job-b"] }),
+    )).toEqual({
+      key: "jobs:aggregate",
       chatId: "70",
     });
   });
 
-  it.each([
-    ["implementing", "review", "active"],
-    ["reviewing", "implementation", "active"],
-    ["validating", "validation", "stopping"],
-    ["validating", "validation", "idle"],
-    ["validating", "validation", "failed"],
-    ["validating", "validation", "unknown"],
-    ["validating", "validation", "stale"],
-    ["awaiting_merge_approval", "validation", "active"],
-    ["merging", "merge", "active"],
-    ["merged", "implementation", "active"],
-    ["blocked", "implementation", "active"],
-    ["cancelled", "implementation", "active"],
-  ] as const)("does not select %s with worker %s/%s", (state, workerKind, workerState) => {
-    expect(resolveTelegramPresenceTarget(jobPresenceStore(
-      state,
-      activeWorkerFixture({ workerKind, state: workerState }),
-    ))).toBeNull();
+  it("keeps an actively responding controller ahead of aggregate job presence", () => {
+    const active = controllerFixture();
+    expect(active.store.claimNextControllerTurn(active.fence)).toMatchObject({ state: "dispatching" });
+    expect(resolveTelegramPresenceTarget(
+      active.store,
+      laneSnapshots({ pipelineActive: 2, busyJobIds: ["private-job"] }),
+    )).toEqual({ key: `controller:${active.turn.id}`, chatId: "70" });
   });
 });
 
 describe("Telegram presence heartbeat", () => {
   it("sends immediately, throttles the same work, and refreshes at four seconds", async () => {
-    let worker = activeWorkerFixture();
-    let active = true;
-    const store = {
-      getOwner: () => ({ userId: "7", chatId: "70" }),
-      getControllerForOwner: () => null,
-      getPendingControllerTurn: () => null,
-      getActiveJob: () => active ? jobFixture({ state: "implementing" }) : null,
-      getWorkerLiveness: () => worker,
-    };
+    let snapshot: JobLaneSnapshot = { pipelineActive: 1, controlActive: 0, busyJobIds: ["job-a"] };
+    const store = jobPresenceStore();
+    const jobLanes = { snapshot: () => snapshot };
     const sendChatAction = vi.fn(async () => undefined);
     const coordinator = new TelegramPresenceCoordinator({
       store,
+      jobLanes,
       telegram: { sendChatAction },
       warn: vi.fn(),
     });
@@ -158,30 +144,31 @@ describe("Telegram presence heartbeat", () => {
     await expect(coordinator.pulse(5_000, signal)).resolves.toBe(4_000);
     expect(sendChatAction).toHaveBeenCalledTimes(2);
 
-    worker = activeWorkerFixture({ generation: 3, resourceId: "thr_replacement" });
-    await expect(coordinator.pulse(5_100, signal)).resolves.toBe(4_000);
-    expect(sendChatAction).toHaveBeenCalledTimes(3);
+    snapshot = { pipelineActive: 0, controlActive: 1, busyJobIds: ["job-b"] };
+    await expect(coordinator.pulse(5_100, signal)).resolves.toBe(3_900);
+    expect(sendChatAction).toHaveBeenCalledTimes(2);
 
-    active = false;
+    snapshot = { pipelineActive: 0, controlActive: 0, busyJobIds: [] };
     await expect(coordinator.pulse(5_200, signal)).resolves.toBeNull();
-    active = true;
+    snapshot = { pipelineActive: 2, controlActive: 0, busyJobIds: ["job-c", "job-d"] };
     await expect(coordinator.pulse(5_300, signal)).resolves.toBe(4_000);
-    expect(sendChatAction).toHaveBeenCalledTimes(4);
+    expect(sendChatAction).toHaveBeenCalledTimes(3);
 
     coordinator.reset();
     await expect(coordinator.pulse(5_400, signal)).resolves.toBe(4_000);
-    expect(sendChatAction).toHaveBeenCalledTimes(5);
+    expect(sendChatAction).toHaveBeenCalledTimes(4);
     expect(sendChatAction).toHaveBeenLastCalledWith("70", "typing", signal);
   });
 
   it("isolates and redacts a failed typing action without retrying before the deadline", async () => {
-    const store = jobPresenceStore("implementing");
+    const store = jobPresenceStore();
     const sendChatAction = vi.fn(async () => {
       throw new Error("bot123:supersecret rejected presence");
     });
     const warn = vi.fn();
     const coordinator = new TelegramPresenceCoordinator({
       store,
+      jobLanes: laneSnapshots({ pipelineActive: 1, busyJobIds: ["job-a"] }),
       telegram: { sendChatAction },
       warn,
     });

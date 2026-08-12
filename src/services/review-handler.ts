@@ -6,23 +6,30 @@ import {
 import type {
   ReviewAssessment,
   ReviewAttemptResult,
-  ReviewFinding,
   ReviewVerdict,
 } from "../domain/models";
 import { buildReviewFormatCorrectionPrompt } from "../bb/prompts";
 
 export interface ReviewThreadClient {
-  output(threadId: string): Promise<unknown>;
-  send(threadId: string, prompt: string): Promise<void>;
-  create(parentThreadId: string, prompt: string): Promise<{ id: string }>;
+  output(threadId: string, signal?: AbortSignal): Promise<unknown>;
+  send(threadId: string, prompt: string, signal?: AbortSignal): Promise<void>;
+  create(parentThreadId: string, prompt: string, signal?: AbortSignal): Promise<{ id: string }>;
 }
 
+export type ReviewEnvironmentStatusInput = Readonly<{
+  environmentId: string;
+  mergeBaseBranch: string;
+  signal: AbortSignal;
+}>;
+
+export type ReviewEnvironmentStatus = Readonly<{
+  available: boolean;
+  clean: boolean;
+  headSha?: string | null;
+}>;
+
 export interface ReviewEnvironmentClient {
-  status(): Promise<{
-    available: boolean;
-    clean: boolean;
-    headSha?: string | null;
-  }>;
+  status(input: ReviewEnvironmentStatusInput): Promise<ReviewEnvironmentStatus>;
 }
 
 export interface ReviewAttemptState {
@@ -33,17 +40,35 @@ export interface ReviewAttemptState {
   result?: ReviewAttemptResult | null;
 }
 
+export type ReviewAttemptLookup = Readonly<{
+  jobId: string;
+  attemptId: string;
+  signal: AbortSignal;
+}>;
+
+export type ReviewAttemptUpdate = Readonly<ReviewAttemptLookup & {
+  patch: Partial<ReviewAttemptState>;
+}>;
+
+export type ReviewFormatCorrectionClaim = Readonly<ReviewAttemptLookup & {
+  threadId: string;
+  headSha: string;
+}>;
+
 export interface ReviewAttemptStore {
+  get(input: ReviewAttemptLookup): Promise<ReviewAttemptState> | ReviewAttemptState;
+  update(input: ReviewAttemptUpdate): Promise<void> | void;
+  claimFormatCorrection(input: ReviewFormatCorrectionClaim): Promise<boolean> | boolean;
+}
+
+export interface LegacyReviewEnvironmentClient {
+  status(): Promise<ReviewEnvironmentStatus>;
+}
+
+export interface LegacyReviewAttemptStore {
   get(attemptId: string): Promise<ReviewAttemptState> | ReviewAttemptState;
-  update(
-    attemptId: string,
-    patch: Partial<ReviewAttemptState>,
-  ): Promise<void> | void;
-  claimFormatCorrection(
-    attemptId: string,
-    threadId: string,
-    headSha: string,
-  ): Promise<boolean> | boolean;
+  update(attemptId: string, patch: Partial<ReviewAttemptState>): Promise<void> | void;
+  claimFormatCorrection(attemptId: string, threadId: string, headSha: string): Promise<boolean> | boolean;
 }
 
 export interface ReviewHandlerEvent {
@@ -51,13 +76,46 @@ export interface ReviewHandlerEvent {
   payload: Record<string, unknown>;
 }
 
-export interface ReviewHandlerDependencies {
+export interface ReviewHandlerInvocationDependencies {
   threads: ReviewThreadClient;
   environment: ReviewEnvironmentClient;
   attempts: ReviewAttemptStore;
-  emit(event: ReviewHandlerEvent): void;
+  emit?: never;
 }
 
+export interface ReviewHandlerLegacyDependencies {
+  threads: ReviewThreadClient;
+  environment: LegacyReviewEnvironmentClient;
+  attempts: LegacyReviewAttemptStore;
+  emit: (event: ReviewHandlerEvent) => void;
+}
+
+export type ReviewHandlerDependencies = ReviewHandlerInvocationDependencies | ReviewHandlerLegacyDependencies;
+
+export type ReviewInvocation = Readonly<{
+  jobId: string;
+  attemptId: string;
+  reviewThreadId: string;
+  implementationThreadId: string;
+  environmentId: string;
+  mergeBaseBranch: string;
+  expectedSha: string;
+  signal: AbortSignal;
+}>;
+
+export type ReviewHandlerCompletion = Readonly<{
+  result: ReviewHandlerResult;
+  event: ReviewHandlerEvent | null;
+}>;
+
+export class ReviewInvocationStaleError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "ReviewInvocationStaleError";
+  }
+}
+
+/** @deprecated Use ReviewInvocation for executor-owned review reconciliation. */
 export interface ReviewThreadIdleInput {
   attemptId: string;
   reviewThreadId: string;
@@ -66,9 +124,11 @@ export interface ReviewThreadIdleInput {
 }
 
 export interface ReviewCycleInput {
+  jobId?: string;
   attemptId: string;
   implementationThreadId: string;
   expectedSha: string;
+  signal?: AbortSignal;
 }
 
 export type ReviewHandlerResult = ReviewAttemptResult & {
@@ -82,7 +142,7 @@ function resultFromAssessment(
   return { ...assessment, reviewedHeadSha };
 }
 
-function environmentReason(status: Awaited<ReturnType<ReviewEnvironmentClient["status"]>>, expectedSha: string): string | null {
+function environmentReason(status: ReviewEnvironmentStatus, expectedSha: string): string | null {
   if (!status.available) return "review environment status is unavailable";
   if (!status.clean) return "review environment worktree is dirty";
   if (status.headSha !== expectedSha) return "review environment HEAD differs from the pre-review SHA";
@@ -101,14 +161,75 @@ function outputText(rawOutput: unknown): string {
   throw new InvalidReviewOutputError("BB thread output does not contain text");
 }
 
-export class ReviewHandler {
-  public constructor(private readonly dependencies: ReviewHandlerDependencies) {}
+function isInvocation(input: ReviewInvocation | ReviewThreadIdleInput): input is ReviewInvocation {
+  return "jobId" in input && "environmentId" in input && "mergeBaseBranch" in input && "signal" in input;
+}
 
-  public async handleThreadIdle(input: ReviewThreadIdleInput): Promise<ReviewHandlerResult> {
+export class ReviewHandler {
+  private readonly legacy: boolean;
+  private readonly dependencies: ReviewHandlerDependencies;
+
+  public constructor(dependencies: ReviewHandlerInvocationDependencies);
+  public constructor(dependencies: ReviewHandlerLegacyDependencies);
+  public constructor(dependencies: ReviewHandlerDependencies) {
+    this.dependencies = dependencies;
+    this.legacy = typeof dependencies.emit === "function";
+  }
+
+  public async handleThreadIdle(input: ReviewInvocation): Promise<ReviewHandlerCompletion>;
+  /** @deprecated Use the invocation-scoped overload. */
+  public async handleThreadIdle(input: ReviewThreadIdleInput): Promise<ReviewHandlerResult>;
+  public async handleThreadIdle(
+    input: ReviewInvocation | ReviewThreadIdleInput,
+  ): Promise<ReviewHandlerCompletion | ReviewHandlerResult> {
+    const invocation = isInvocation(input) ? input : this.legacyInvocation(input);
+    const completion = await this.handleInvocation(invocation);
+    if (isInvocation(input)) return completion;
+    return completion.result;
+  }
+
+  public async startReviewCycle(input: ReviewCycleInput): Promise<{ reviewThreadId: string }> {
+    const signal = input.signal ?? new AbortController().signal;
+    this.assertActive(signal);
+    const prompt = `Review the implementation at exact head ${input.expectedSha} and return one strict JSON verdict.`;
+    const thread = await this.dependencies.threads.create(input.implementationThreadId, prompt, signal);
+    this.assertActive(signal);
+    if (!this.legacy && !input.jobId) throw new TypeError("review cycle jobId is required");
+    await this.updateAttempt({
+      jobId: input.jobId ?? "legacy-review-job",
+      attemptId: input.attemptId,
+      signal,
+      patch: {
+        threadId: thread.id,
+        headSha: input.expectedSha,
+        formatCorrectionSent: false,
+        requiresNewHead: false,
+        result: null,
+      },
+    });
+    return { reviewThreadId: thread.id };
+  }
+
+  private legacyInvocation(input: ReviewThreadIdleInput): ReviewInvocation {
+    return {
+      jobId: "legacy-review-job",
+      attemptId: input.attemptId,
+      reviewThreadId: input.reviewThreadId,
+      implementationThreadId: input.implementationThreadId,
+      environmentId: "legacy-review-environment",
+      mergeBaseBranch: "legacy-review-branch",
+      expectedSha: input.expectedSha,
+      signal: new AbortController().signal,
+    };
+  }
+
+  private async handleInvocation(input: ReviewInvocation): Promise<ReviewHandlerCompletion> {
+    this.assertActive(input.signal);
     const [status, attempt] = await Promise.all([
-      this.dependencies.environment.status(),
-      this.dependencies.attempts.get(input.attemptId),
+      this.environmentStatus(input),
+      this.getAttempt(input),
     ]);
+    this.assertActive(input.signal);
     const blockedReason = environmentReason(status, input.expectedSha);
     if (blockedReason) return this.block(input, blockedReason);
     if (attempt.threadId !== input.reviewThreadId || attempt.headSha !== input.expectedSha) {
@@ -118,7 +239,9 @@ export class ReviewHandler {
       return this.block(input, "a new head is required after changes were requested");
     }
 
-    const rawOutput = await this.dependencies.threads.output(input.reviewThreadId);
+    this.assertActive(input.signal);
+    const rawOutput = await this.dependencies.threads.output(input.reviewThreadId, input.signal);
+    this.assertActive(input.signal);
     let verdict: ReviewVerdict;
     try {
       verdict = parseReviewVerdict(outputText(rawOutput));
@@ -129,41 +252,73 @@ export class ReviewHandler {
 
     const assessment = assessReview(verdict, input.expectedSha);
     if (assessment.outcome === "pass") return this.pass(input, verdict, assessment);
-    if (assessment.outcome === "changes_requested") {
-      return this.requestChanges(input, verdict, assessment);
-    }
+    if (assessment.outcome === "changes_requested") return this.requestChanges(input, verdict, assessment);
     return this.completeBlocked(input, verdict, assessment);
   }
 
-  public async startReviewCycle(input: ReviewCycleInput): Promise<{ reviewThreadId: string }> {
-    const prompt = `Review the implementation at exact head ${input.expectedSha} and return one strict JSON verdict.`;
-    const thread = await this.dependencies.threads.create(input.implementationThreadId, prompt);
-    await this.dependencies.attempts.update(input.attemptId, {
-      threadId: thread.id,
-      headSha: input.expectedSha,
-      formatCorrectionSent: false,
-      requiresNewHead: false,
-      result: null,
-    });
-    return { reviewThreadId: thread.id };
+  private async environmentStatus(input: ReviewInvocation): Promise<ReviewEnvironmentStatus> {
+    this.assertActive(input.signal);
+    const status = this.legacy
+      ? await (this.dependencies.environment as LegacyReviewEnvironmentClient).status()
+      : await (this.dependencies.environment as ReviewEnvironmentClient).status({
+          environmentId: input.environmentId,
+          mergeBaseBranch: input.mergeBaseBranch,
+          signal: input.signal,
+        });
+    this.assertActive(input.signal);
+    return status;
   }
 
-  private async claimFormatCorrection(input: ReviewThreadIdleInput): Promise<boolean> {
-    return this.dependencies.attempts.claimFormatCorrection(
-      input.attemptId,
-      input.reviewThreadId,
-      input.expectedSha,
-    );
+  private async getAttempt(input: ReviewInvocation): Promise<ReviewAttemptState> {
+    this.assertActive(input.signal);
+    const attempt = this.legacy
+      ? await (this.dependencies.attempts as LegacyReviewAttemptStore).get(input.attemptId)
+      : await (this.dependencies.attempts as ReviewAttemptStore).get({
+          jobId: input.jobId,
+          attemptId: input.attemptId,
+          signal: input.signal,
+        });
+    this.assertActive(input.signal);
+    return attempt;
+  }
+
+  private async updateAttempt(input: ReviewAttemptUpdate): Promise<void> {
+    this.assertActive(input.signal);
+    if (this.legacy) {
+      await (this.dependencies.attempts as LegacyReviewAttemptStore).update(input.attemptId, input.patch);
+    } else {
+      await (this.dependencies.attempts as ReviewAttemptStore).update(input);
+    }
+    this.assertActive(input.signal);
+  }
+
+  private async claimFormatCorrection(input: ReviewFormatCorrectionClaim): Promise<boolean> {
+    this.assertActive(input.signal);
+    const claimed = this.legacy
+      ? await (this.dependencies.attempts as LegacyReviewAttemptStore).claimFormatCorrection(
+          input.attemptId,
+          input.threadId,
+          input.headSha,
+        )
+      : await (this.dependencies.attempts as ReviewAttemptStore).claimFormatCorrection(input);
+    this.assertActive(input.signal);
+    return claimed;
   }
 
   private async handleInvalidOutput(
-    input: ReviewThreadIdleInput,
+    input: ReviewInvocation,
     attempt: ReviewAttemptState,
-  ): Promise<ReviewHandlerResult> {
+  ): Promise<ReviewHandlerCompletion> {
     if (attempt.formatCorrectionSent) {
       return this.block(input, "review output remained invalid after format correction");
     }
-    const claimed = await this.claimFormatCorrection(input);
+    const claimed = await this.claimFormatCorrection({
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      threadId: input.reviewThreadId,
+      headSha: input.expectedSha,
+      signal: input.signal,
+    });
     if (!claimed) return this.block(input, "review output remained invalid after format correction");
     const result: ReviewHandlerResult = {
       outcome: "format_correction_sent",
@@ -172,55 +327,68 @@ export class ReviewHandler {
       reviewedHeadSha: null,
       formatCorrectionSent: true,
     };
+    this.assertActive(input.signal);
     await this.dependencies.threads.send(
       input.reviewThreadId,
       buildReviewFormatCorrectionPrompt(),
+      input.signal,
     );
-    await this.dependencies.attempts.update(input.attemptId, {
-      formatCorrectionSent: true,
-      result,
+    await this.updateAttempt({
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      signal: input.signal,
+      patch: { formatCorrectionSent: true, result },
     });
-    return result;
+    return this.completion(result, null);
   }
 
   private async pass(
-    input: ReviewThreadIdleInput,
+    input: ReviewInvocation,
     verdict: ReviewVerdict,
     assessment: ReviewAssessment,
-  ): Promise<ReviewHandlerResult> {
+  ): Promise<ReviewHandlerCompletion> {
     const result = {
       ...resultFromAssessment(assessment, verdict.reviewedHeadSha),
       verdict,
     };
-    await this.dependencies.attempts.update(input.attemptId, {
-      threadId: input.reviewThreadId,
-      headSha: input.expectedSha,
-      requiresNewHead: false,
-      result,
+    await this.updateAttempt({
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      signal: input.signal,
+      patch: {
+        threadId: input.reviewThreadId,
+        headSha: input.expectedSha,
+        requiresNewHead: false,
+        result,
+      },
     });
-    this.dependencies.emit({
+    return this.completion(result, {
       type: "REVIEW_PASSED",
       payload: { headSha: input.expectedSha, verdict },
     });
-    return result;
   }
 
   private async requestChanges(
-    input: ReviewThreadIdleInput,
+    input: ReviewInvocation,
     verdict: ReviewVerdict,
     assessment: ReviewAssessment,
-  ): Promise<ReviewHandlerResult> {
+  ): Promise<ReviewHandlerCompletion> {
     const result = {
       ...resultFromAssessment(assessment, verdict.reviewedHeadSha),
       verdict,
     };
-    await this.dependencies.attempts.update(input.attemptId, {
-      threadId: input.reviewThreadId,
-      headSha: input.expectedSha,
-      requiresNewHead: true,
-      result,
+    await this.updateAttempt({
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      signal: input.signal,
+      patch: {
+        threadId: input.reviewThreadId,
+        headSha: input.expectedSha,
+        requiresNewHead: true,
+        result,
+      },
     });
-    this.dependencies.emit({
+    return this.completion(result, {
       type: "REVIEW_CHANGES_REQUESTED",
       payload: {
         headSha: input.expectedSha,
@@ -229,47 +397,60 @@ export class ReviewHandler {
         reasons: assessment.reasons,
       },
     });
-    return result;
   }
 
   private async completeBlocked(
-    input: ReviewThreadIdleInput,
+    input: ReviewInvocation,
     verdict: ReviewVerdict,
     assessment: ReviewAssessment,
-  ): Promise<ReviewHandlerResult> {
+  ): Promise<ReviewHandlerCompletion> {
     const result = {
       ...resultFromAssessment(assessment, verdict.reviewedHeadSha),
       verdict,
     };
-    await this.dependencies.attempts.update(input.attemptId, {
-      threadId: input.reviewThreadId,
-      headSha: input.expectedSha,
-      result,
+    await this.updateAttempt({
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      signal: input.signal,
+      patch: {
+        threadId: input.reviewThreadId,
+        headSha: input.expectedSha,
+        result,
+      },
     });
-    this.dependencies.emit({
+    return this.completion(result, {
       type: "REVIEW_BLOCKED",
       payload: { headSha: input.expectedSha, reasons: assessment.reasons, verdict },
     });
-    return result;
   }
 
-  private async block(
-    input: ReviewThreadIdleInput,
-    reason: string,
-  ): Promise<ReviewHandlerResult> {
+  private async block(input: ReviewInvocation, reason: string): Promise<ReviewHandlerCompletion> {
     const result: ReviewHandlerResult = {
       outcome: "blocked",
       reasons: [reason],
       findings: [],
       reviewedHeadSha: null,
     };
-    await this.dependencies.attempts.update(input.attemptId, {
-      result,
+    await this.updateAttempt({
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      signal: input.signal,
+      patch: { result },
     });
-    this.dependencies.emit({
+    return this.completion(result, {
       type: "REVIEW_BLOCKED",
       payload: { headSha: input.expectedSha, reasons: result.reasons },
     });
-    return result;
+  }
+
+  private completion(result: ReviewHandlerResult, event: ReviewHandlerEvent | null): ReviewHandlerCompletion {
+    if (this.legacy && event) this.dependencies.emit?.(event);
+    return { result, event };
+  }
+
+  private assertActive(signal: AbortSignal): void {
+    if (!signal.aborted) return;
+    const reason = signal.reason;
+    throw reason instanceof Error ? reason : new Error("review invocation was aborted");
   }
 }

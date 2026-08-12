@@ -1,3 +1,5 @@
+import type { SupervisorReason } from "./supervisor";
+
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
 export const CONTROLLER_IMAGE_MIME_TYPES = [
@@ -59,6 +61,14 @@ export type ControllerTurnRecord = {
   completedAt: number | null;
   /** Set while the answer is blocked on a question the owner has to settle. */
   awaitingInteractionId: string | null;
+  /** Tool-shaped item starts observed so far on this turn. */
+  toolCalls: number;
+  /** Non-zero command exits observed so far on this turn. */
+  commandFailures: number;
+  /** Highest cumulative thread token total observed on this turn. */
+  totalTokens: number;
+  supervisorSteers: number;
+  supervisorReasons: readonly SupervisorReason[];
   createdAt: number;
   updatedAt: number;
 };

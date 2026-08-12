@@ -1,13 +1,12 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import {
-  ActiveJobConflictError,
   IdempotencyConflictError,
   UpdateClaimConflictError,
   VersionConflictError,
   openStore,
 } from "../src/storage/store";
-import { policyFixture, sha } from "./helpers";
+import { admitConfirmedJob, policyFixture, sha } from "./helpers";
 
 function storeFixture() {
   const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
@@ -68,11 +67,48 @@ it("uses optimistic versions and leaves one durable effect after a stale replay"
   expect(store.listEffectsForJob(job.id)[0]?.kind).toBe("render_status");
 });
 
+it.each([
+  { name: "CONFIRMED", event: { type: "CONFIRMED" as const } },
+  { name: "CONTINUE_REVIEW", event: { type: "CONTINUE_REVIEW" as const } },
+])("rejects admission-only $name events at the public store boundary without mutation", ({ event }) => {
+  const { db, store } = storeFixture();
+  const draft = store.createJob({ id: `job_${event.type.toLowerCase()}`, sourceUpdateId: 101, requestText: "do it", now: 1_000 });
+  const selected = store.applyJobEvent(draft.id, draft.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_100);
+  store.queueAdmission({
+    jobId: selected.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_100,
+  });
+  if (event.type === "CONTINUE_REVIEW") {
+    db.prepare("UPDATE jobs SET state = 'blocked', blocked_reason = 'review_limit' WHERE id = ?").run(selected.id);
+  }
+
+  const beforeJob = store.getJob(selected.id);
+  const beforeAdmission = store.getAdmission(selected.id);
+  const beforeEffects = store.listEffectsForJob(selected.id);
+  const beforeClaims = store.listHeldResourceClaims(selected.id, 10);
+
+  expect(() => store.applyJobEvent(selected.id, selected.version, event, 1_200)).toThrow(/admission/i);
+  expect(store.getJob(selected.id)).toEqual(beforeJob);
+  expect(store.getAdmission(selected.id)).toEqual(beforeAdmission);
+  expect(store.listEffectsForJob(selected.id)).toEqual(beforeEffects);
+  expect(store.listHeldResourceClaims(selected.id, 10)).toEqual(beforeClaims);
+});
+
 it("finds active and thread-owned jobs and returns bounded newest jobs", () => {
   const { db, store } = storeFixture();
   const first = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "first", now: 1_000 });
   store.applyJobEvent(first.id, first.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
-  const planning = store.applyJobEvent(first.id, 2, { type: "CONFIRMED" }, 1_200);
+  const selected = store.getJob(first.id);
+  if (!selected) throw new Error("selected job missing");
+  const planning = admitConfirmedJob(store, selected, 1_200);
   const critiquing = store.applyJobEvent(first.id, planning.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_250);
   const creating = store.applyJobEvent(first.id, critiquing.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_275);
   const implementing = store.applyJobEvent(first.id, creating.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
@@ -220,7 +256,9 @@ it("enqueues one reconcile effect for a known worker thread", () => {
   const { store } = storeFixture();
   const job = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "do it", now: 1_000 });
   store.applyJobEvent(job.id, job.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
-  const planning = store.applyJobEvent(job.id, 2, { type: "CONFIRMED" }, 1_200);
+  const selected = store.getJob(job.id);
+  if (!selected) throw new Error("selected job missing");
+  const planning = admitConfirmedJob(store, selected, 1_200);
   const critiquing = store.applyJobEvent(job.id, planning.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_250);
   const creating = store.applyJobEvent(job.id, critiquing.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_275);
   store.applyJobEvent(job.id, creating.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
@@ -232,24 +270,96 @@ it("enqueues one reconcile effect for a known worker thread", () => {
   expect(store.listEffectsForJob(job.id).find((effect) => effect.kind === "reconcile_job")?.payload).toEqual({ threadId: "thr_i" });
 });
 
-it("rejects continuing a review-limit block while another job is active", () => {
+it("requeues a released review-limit block without a global active-job rejection", () => {
   const { db, store } = storeFixture();
   const blocked = store.createJob({ id: "job_blocked", sourceUpdateId: 101, requestText: "blocked", now: 1_000 });
+  const selected = store.applyJobEvent(blocked.id, blocked.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  store.queueAdmission({
+    jobId: blocked.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_050,
+  });
   db.prepare("UPDATE jobs SET state = 'blocked', blocked_reason = 'review_limit', review_cycle = 3 WHERE id = ?").run(blocked.id);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = 1_100, release_reason = 'review_limit' WHERE job_id = ?").run(blocked.id);
   const active = store.createJob({ id: "job_active", sourceUpdateId: 102, requestText: "active", now: 1_100 });
 
-  expect(() => store.applyJobEvent(blocked.id, 1, { type: "CONTINUE_REVIEW" }, 1_200)).toThrow(
-    ActiveJobConflictError,
-  );
+  const requeued = store.requeueReviewAdmission(blocked.id, selected.version, 1_200);
+
+  expect(requeued).toMatchObject({ outcome: "queued", admission: {
+    state: "queued",
+    resumeEvent: "CONTINUE_REVIEW",
+  } });
+  expect(store.requeueReviewAdmission(blocked.id, selected.version, 1_300)).toEqual(requeued);
   expect(store.getJob(blocked.id)?.state).toBe("blocked");
   expect(store.getJob(active.id)?.state).toBe("awaiting_project");
+});
+
+it("rejects a queued CONFIRMED admission as a review continuation", () => {
+  const { db, store } = storeFixture();
+  const blocked = store.createJob({ id: "job_mismatched_review", sourceUpdateId: 104, requestText: "mismatched", now: 1_000 });
+  const selected = store.applyJobEvent(blocked.id, blocked.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  store.queueAdmission({
+    jobId: blocked.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_050,
+  });
+  db.prepare("UPDATE jobs SET state = 'blocked', blocked_reason = 'review_limit' WHERE id = ?").run(blocked.id);
+  const beforeJob = store.getJob(blocked.id);
+  const beforeAdmission = store.getAdmission(blocked.id);
+  const beforeEffects = store.listEffectsForJob(blocked.id);
+  const beforeClaims = store.listHeldResourceClaims(blocked.id, 10);
+
+  expect(store.requeueReviewAdmission(blocked.id, selected.version, 1_200)).toEqual({ outcome: "unavailable" });
+  expect(store.getJob(blocked.id)).toEqual(beforeJob);
+  expect(store.getAdmission(blocked.id)).toEqual(beforeAdmission);
+  expect(store.listEffectsForJob(blocked.id)).toEqual(beforeEffects);
+  expect(store.listHeldResourceClaims(blocked.id, 10)).toEqual(beforeClaims);
+});
+
+it("reports bounded cleanup while a blocked review admission is draining", () => {
+  const { db, store } = storeFixture();
+  const blocked = store.createJob({ id: "job_draining", sourceUpdateId: 103, requestText: "draining", now: 1_000 });
+  const selected = store.applyJobEvent(blocked.id, blocked.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  store.queueAdmission({
+    jobId: blocked.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_050,
+  });
+  db.prepare("UPDATE jobs SET state = 'blocked', blocked_reason = 'review_limit', review_cycle = 3 WHERE id = ?").run(blocked.id);
+  db.prepare("UPDATE job_admissions SET state = 'draining', admitted_at = 1_060, draining_at = 1_100 WHERE job_id = ?").run(blocked.id);
+
+  const result = store.requeueReviewAdmission(blocked.id, selected.version, 1_200);
+
+  expect(result).toMatchObject({ outcome: "still_cleaning_up", admission: { state: "draining" } });
+  expect(store.getAdmission(blocked.id)?.state).toBe("draining");
 });
 
 it("keeps head receipts guarded by the pure transition before persisting validation", () => {
   const { store } = storeFixture();
   const job = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "do it", now: 1_000 });
   const selected = store.applyJobEvent(job.id, job.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
-  const confirmed = store.applyJobEvent(job.id, selected.version, { type: "CONFIRMED" }, 1_200);
+  const confirmed = admitConfirmedJob(store, selected, 1_200);
   const planned = store.applyJobEvent(job.id, confirmed.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_225);
   const critiqued = store.applyJobEvent(job.id, planned.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_250);
   const created = store.applyJobEvent(job.id, critiqued.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);

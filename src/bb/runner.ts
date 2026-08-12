@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { Job, ProjectPolicy, WorkerLiveness } from "../domain/models";
+import { buildWorkerThreadTitle } from "../agent-skills/role-resolver";
 import { buildReviewPacket, buildWorkOrder, type HandoffArtifact } from "./handoffs";
 import {
   buildCritiqueArtifact,
@@ -161,7 +162,7 @@ export class BbRunner {
     recordHandoff(attempt, artifact, uploaded);
     const request = spawnRequest({
       projectId: project,
-      title: `Telegram ${job.id} implementation ${attempt.id}`,
+      title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "implementation" }),
       visibility: "visible",
       input: [
         { type: "text", text: buildImplementationInstruction(artifact), mentions: [] },
@@ -203,7 +204,7 @@ export class BbRunner {
         };
     const thread = await this.sdk.threads.spawn(spawnRequest({
       projectId: project,
-      title: `Telegram ${job.id} plan ${attempt.id}`,
+      title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "planner" }),
       visibility: "visible",
       input: [
         { type: "text", text: prompt, mentions: [] },
@@ -241,7 +242,7 @@ export class BbRunner {
     const thread = await this.sdk.threads.spawn(spawnRequest({
       projectId: project,
       parentThreadId: planAttempt.threadId,
-      title: `Telegram ${job.id} critique ${attempt.id}`,
+      title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "critic" }),
       visibility: "visible",
       input: [
         {
@@ -284,7 +285,7 @@ export class BbRunner {
     const thread = await this.sdk.threads.spawn(spawnRequest({
       projectId: project,
       parentThreadId: planAttempt.threadId,
-      title: `Telegram ${job.id} implementation ${attempt.id}`,
+      title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "implementation" }),
       visibility: "visible",
       input: [
         {
@@ -320,12 +321,12 @@ export class BbRunner {
     const thread = await this.sdk.threads.spawn(spawnRequest({
       projectId: project,
       parentThreadId,
-      title: `Telegram ${job.id} docs ${attempt.id}`,
+      title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "documentation" }),
       visibility: "visible",
       input: [
         {
           type: "text",
-          text: "Read the attached work order and docs packet. Use the Docs Guard and BB CLI skills exactly as required, update only necessary documentation, verify it, commit and push, then report bounded evidence.",
+          text: "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, commit and push, then report bounded evidence.",
           mentions: [],
         },
         uploadedWorkOrder,
@@ -371,7 +372,7 @@ export class BbRunner {
     const request = spawnRequest({
       projectId: project,
       parentThreadId,
-      title: `Telegram ${job.id} ${role} ${attempt.id}`,
+      title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role }),
       visibility: "visible",
       input: [
         { type: "text", text: buildReviewInstruction(artifact), mentions: [] },

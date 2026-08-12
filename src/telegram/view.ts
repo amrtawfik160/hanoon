@@ -1,6 +1,8 @@
 import { projectPolicySchema, type Job, type ProjectPolicy, type WorkerLiveness } from "../domain/models";
+import type { JobAdmission } from "../autonomy/models";
 import { hashSecret } from "../crypto";
 import { assertSafeExternalHttpsUrl } from "../storage/store";
+import type { ResourceWaitProjection } from "../storage/autonomy-repository";
 import type {
   InlineKeyboardButton,
   InlineKeyboardMarkup,
@@ -53,6 +55,7 @@ export type CheckView = {
 };
 
 export type JobStatusContext = {
+  admission?: JobAdmission | null;
   project?: ProjectPolicy | null;
   bbAppBaseUrl?: string;
   prTitle?: string;
@@ -75,8 +78,80 @@ export type JobStatusContext = {
   mergeNonceHash?: string;
   ready?: boolean;
   workerLiveness?: WorkerLiveness | null;
+  resourceWait?: readonly ResourceWaitProjection[];
   now?: number;
 };
+
+export type JobStatusSummaryItem = Readonly<{
+  job: Job;
+  admission: JobAdmission | null;
+}>;
+
+const STATUS_SUMMARY_LIMIT = 8;
+
+function summaryGroup(item: JobStatusSummaryItem): string {
+  if (item.admission?.state === "queued") return "Queued";
+  if (item.admission?.state === "draining") return "Draining";
+  if (item.job.state === "awaiting_merge_approval") return "Approval waiting";
+  if (item.job.state === "failed") return "Failed";
+  return "Running";
+}
+
+function summaryLine(item: JobStatusSummaryItem): string {
+  const project = item.job.policy?.alias ?? item.job.projectId ?? "unselected";
+  return `• <code>${html(item.job.id, 256)}</code> — <code>${html(project, 80)}</code>`;
+}
+
+export function renderJobStatusSummary(input: {
+  jobs: readonly JobStatusSummaryItem[];
+  total: number;
+}): SendMessagePayload {
+  if (!Number.isSafeInteger(input.total) || input.total < input.jobs.length) {
+    throw new TypeError("status summary total is invalid");
+  }
+  const displayed = input.jobs.slice(0, STATUS_SUMMARY_LIMIT);
+  if (displayed.length === 0) return { text: "No active jobs.", disable_web_page_preview: true };
+  const groups = new Map<string, JobStatusSummaryItem[]>();
+  for (const item of displayed) {
+    const label = summaryGroup(item);
+    groups.set(label, [...(groups.get(label) ?? []), item]);
+  }
+  const order = ["Running", "Approval waiting", "Draining", "Queued", "Failed"];
+  const lines: string[] = ["<b>Jobs</b>"];
+  for (const label of order) {
+    const items = groups.get(label);
+    if (!items) continue;
+    lines.push(`<b>${label}</b>`, ...items.map(summaryLine));
+  }
+  const remaining = Math.max(0, input.total - displayed.length);
+  if (remaining > 0) lines.push(`${remaining} more ${remaining === 1 ? "job" : "jobs"}`);
+  return {
+    text: truncateHtml(lines.join("\n"), MAX_TELEGRAM_TEXT_LENGTH),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+}
+
+export function renderJobChoices(
+  action: "cancel" | "retry",
+  jobs: readonly Job[],
+  total: number,
+): SendMessagePayload {
+  if (!Number.isSafeInteger(total) || total < jobs.length) throw new TypeError("job choice total is invalid");
+  const displayed = jobs.slice(0, STATUS_SUMMARY_LIMIT);
+  const lines = [`<b>Choose a job to ${action}</b>`];
+  for (const job of displayed) {
+    lines.push(summaryLine({ job, admission: null }));
+  }
+  const remaining = Math.max(0, total - displayed.length);
+  if (remaining > 0) lines.push(`${remaining} more ${remaining === 1 ? "job" : "jobs"}`);
+  lines.push(`Use <code>/${action} JOB_ID</code> or reply to its status message.`);
+  return {
+    text: truncateHtml(lines.join("\n"), MAX_TELEGRAM_TEXT_LENGTH),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+}
 
 function containsForbiddenCallbackMaterial(value: string): boolean {
   let candidate = value;
@@ -420,15 +495,19 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
   const bbUrl = safeHttpUrl(context.bbAppBaseUrl);
   if (prUrl) buttons.push({ text: "View PR", url: prUrl });
   if (bbUrl) buttons.push({ text: "Open BB", url: bbUrl });
+  if (job.cancelRequestedAt !== null) return buttons;
 
   const livenessBlocked = context.workerLiveness?.state === "unknown" || context.workerLiveness?.state === "stale";
+  const queuedConfirmation = job.state === "awaiting_confirmation" &&
+    context.admission?.jobId === job.id &&
+    context.admission.state === "queued";
   if (ready && !livenessBlocked) {
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
     if (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce)) {
       const shortSha = job.prHeadSha?.slice(0, 8) ?? "approved";
       buttons.push({ text: `Merge + deploy ${shortSha}`, callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
     }
-  } else if (job.state === "awaiting_confirmation" && !livenessBlocked) {
+  } else if (job.state === "awaiting_confirmation" && !queuedConfirmation && !livenessBlocked) {
     buttons.push({ text: "Start", callback_data: encodeCallbackData({ type: "start", jobId: job.id }) });
   } else if (job.state === "failed" && !livenessBlocked) {
     buttons.push({ text: "Retry", callback_data: encodeCallbackData({ type: "retry", jobId: job.id }) });
@@ -463,6 +542,18 @@ export function renderJobStatus(
   ];
   if (policy) lines.push(`Base: <code>${html(policy.baseBranch, 120)}</code>`);
   lines.push(`Task: <code>${html(job.requestText, 500)}</code>`);
+  if (job.state === "awaiting_confirmation" && context.admission?.jobId === job.id && context.admission.state === "queued") {
+    lines.push("Queue: queued");
+  }
+  const resourceWait = (context.resourceWait ?? [])
+    .filter((entry) => entry.kind === "repository_merge" || entry.kind === "production_target")
+    .slice(0, 3);
+  if (resourceWait.length > 0) {
+    lines.push("Resource wait:");
+    for (const entry of resourceWait) {
+      lines.push(`• ${html(entry.kind, 80)}: <code>${html(entry.key, 240)}</code>`);
+    }
+  }
 
   const pullRequest = context.pullRequest;
   if (job.prNumber !== null) {

@@ -5,8 +5,10 @@ import {
   parseCallbackData,
   persistableJobStatusPayload,
   renderJobStatus,
+  renderJobStatusSummary,
   renderProjectPicker,
 } from "../src/telegram/view";
+import type { JobAdmission } from "../src/autonomy/models";
 import { jobFixture, policyFixture } from "./helpers";
 
 const telegramJobId = "abcdefghijklmnopqrstuv";
@@ -99,6 +101,39 @@ describe("Telegram callback grammar", () => {
 });
 
 describe("deterministic Telegram views", () => {
+  it("renders bounded plural status groups with an exact remaining count", () => {
+    const jobs = Array.from({ length: 10 }, (_, index) => ({
+      job: jobFixture({
+        id: `summary_job_${String(index).padStart(2, "0")}`,
+        state: index === 0 ? "implementing" : index === 1 ? "awaiting_merge_approval" : index === 2 ? "failed" : "awaiting_confirmation",
+        projectId: "proj_1",
+        policy: policyFixture(),
+        requestText: `summary ${index}`,
+      }),
+      admission: index === 3 || index === 4 ? {
+        jobId: `summary_job_${String(index).padStart(2, "0")}`,
+        projectId: "proj_1",
+        queueSeq: index,
+        state: index === 3 ? "queued" as const : "draining" as const,
+        resumeEvent: "CONFIRMED" as const,
+        queuedAt: 1_000,
+        admittedAt: null,
+        drainingAt: index === 4 ? 1_100 : null,
+        releasedAt: null,
+        releaseReason: null,
+      } : null,
+    }));
+
+    const rendered = renderJobStatusSummary({ jobs, total: jobs.length });
+    expect(rendered.text).toContain("Running");
+    expect(rendered.text).toContain("Approval waiting");
+    expect(rendered.text).toContain("Queued");
+    expect(rendered.text).toContain("Draining");
+    expect(rendered.text).toContain("Failed");
+    expect(rendered.text).toContain("2 more jobs");
+    expect(rendered.text.length).toBeLessThanOrEqual(4_096);
+  });
+
   it("renders an escaped bounded project picker", () => {
     const job = jobFixture({ id: telegramJobId, requestText: "<fix & verify>" });
     const rendered = renderProjectPicker(job, [
@@ -187,6 +222,32 @@ describe("deterministic Telegram views", () => {
     expect(callbacks).toContain(`r:${telegramJobId}`);
     expect(callbacks).toContain(`c:${telegramJobId}`);
     expect(rendered.text).toContain("temporary failure");
+  });
+
+  it("distinguishes a queued confirmation from an old selected row without admission", () => {
+    const job = jobFixture({ id: telegramJobId, state: "awaiting_confirmation" });
+    const queuedAdmission: JobAdmission = {
+      jobId: job.id,
+      projectId: "proj_1",
+      queueSeq: 4,
+      state: "queued",
+      resumeEvent: "CONFIRMED",
+      queuedAt: 2_000,
+      admittedAt: null,
+      drainingAt: null,
+      releasedAt: null,
+      releaseReason: null,
+    };
+
+    const queued = renderJobStatus({ job, admission: queuedAdmission });
+    const queuedButtons = queued.reply_markup?.inline_keyboard.flat().map((button) => button.text);
+    expect(queued.text).toContain("Queue: queued");
+    expect(queuedButtons).not.toContain("Start");
+
+    const unqueued = renderJobStatus(job);
+    const unqueuedButtons = unqueued.reply_markup?.inline_keyboard.flat().map((button) => button.text);
+    expect(unqueued.text).not.toContain("Queue: queued");
+    expect(unqueuedButtons).toContain("Start");
   });
 
   it("shows one worker resource, liveness state, and source observation age", () => {

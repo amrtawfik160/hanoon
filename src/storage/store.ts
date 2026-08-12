@@ -11,9 +11,30 @@ import {
   type StoredEffect,
   type WorkerLiveness,
 } from "../domain/models";
+import {
+  admissionAllowsEffect,
+  isReleaseCandidate,
+  isSafeControlEffect,
+  projectResourceKey,
+  productionResourceKey,
+  repositoryMergeResourceKey,
+  type AdmissionState,
+  type JobAdmission,
+  type JobResourceClaim,
+  type ResourceKind,
+} from "../autonomy/models";
 import { reviewVerdictSchema } from "../domain/review";
 import { formattedMessage } from "../telegram/markdown";
-import { ftsQuery, memoryScore } from "./memory-ranking";
+import {
+  adjustedConfidence,
+  decayedConfidence,
+  ftsQuery,
+  memoryScore,
+  subjectsContradict,
+  MEMORY_DEMOTION,
+  MEMORY_REINFORCEMENT,
+  MEMORY_TOMBSTONE_CONFIDENCE,
+} from "./memory-ranking";
 import { assertSafeFailureSummary, containsCredentialLikeText, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
 import {
@@ -26,6 +47,8 @@ import {
   type ControllerTurnRecord,
   type ControllerTurnState,
 } from "../controller/models";
+import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervisor";
+import { MAX_CONTROLLER_OVERLAY } from "../controller/instructions";
 import {
   nextUnansweredQuestion,
   questionOptionToken,
@@ -36,6 +59,35 @@ import {
   type ControllerQuestionAnswers,
   type ThreadInteraction,
 } from "../controller/questions";
+import {
+  JOB_SELECT,
+  MAX_MERGE_RESULT_JSON,
+  VersionConflictError,
+  assertBoundedString,
+  assertNoRawMergeCallback,
+  assertSafeExternalHttpsUrl,
+  parseJobRow as parseJob,
+  parseStoredEffect as parseEffect,
+  persistJobTransition,
+  persistPendingEffects,
+  readJobById,
+  readJobBySourceUpdate,
+  serializeBoundedJson,
+  type EffectRow,
+  type JobRow,
+} from "./job-persistence";
+import {
+  AutonomyAdmissionConflictError,
+  MAX_AUTONOMY_ROWS,
+  AutonomyRepository,
+  queueAdmissionInTransaction,
+  type AdmissionAttempt,
+  type AdmissionAttemptInput,
+  type ClaimAdoptionInput,
+  type AdmissionWriteInput,
+} from "./autonomy-repository";
+
+export { VersionConflictError, assertSafeExternalHttpsUrl };
 
 type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
@@ -55,6 +107,12 @@ type TelegramIdentity = {
   verifiedAt: number;
 };
 export type ProjectPolicyRecord = { policy: ProjectPolicy; version: number };
+export type JobControlKind = "status" | "retry" | "cancel";
+
+export type ReviewAdmissionResult =
+  | { outcome: "queued"; admission: JobAdmission }
+  | { outcome: "still_cleaning_up"; admission: JobAdmission }
+  | { outcome: "unavailable" };
 
 export type ThreadOperationKind = "steer_thread" | "stop_thread" | "retry_thread";
 export type ThreadOperationState =
@@ -189,6 +247,55 @@ export type MonitorRecord = {
   updatedAt: number;
 };
 
+export type JobMemoryExtractionState = "pending" | "running" | "done" | "failed";
+
+/**
+ * One attempt to learn something durable from a finished job. Jobs are the only
+ * place the plugin spends inference of its own, so this is deliberately rare:
+ * a handful a day rather than one per message.
+ */
+export type JobMemoryExtractionRecord = {
+  jobId: string;
+  projectId: string;
+  outcome: string;
+  state: JobMemoryExtractionState;
+  threadId: string | null;
+  attempts: number;
+  savedCount: number;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type DelegationState = "open" | "fired" | "cancelled" | "failed";
+export type DelegationThreadState = "running" | "finished" | "failed" | "missing";
+
+export type DelegationThreadRecord = {
+  threadId: string;
+  projectId: string;
+  title: string;
+  state: DelegationThreadState;
+  /** Bounded excerpt of the thread's final output; null until it settles. */
+  summary: string | null;
+  settledAt: number | null;
+};
+
+/**
+ * A fan-out with a join: several BB threads doing independent work, and one
+ * instruction the agent wrote to its future self for when they all land.
+ */
+export type DelegationRecord = {
+  id: string;
+  controllerKey: string;
+  instruction: string;
+  state: DelegationState;
+  threads: readonly DelegationThreadRecord[];
+  firedAt: number | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type MemoryKind = "preference" | "fact" | "decision" | "correction";
 
 export type MemoryRecord = {
@@ -200,6 +307,8 @@ export type MemoryRecord = {
   importance: number;
   confidence: number;
   source: "owner" | "agent";
+  /** Where an agent-written memory came from, e.g. "job_outcome". */
+  origin: string | null;
   sourceTurnId: string | null;
   useCount: number;
   lastUsedAt: number | null;
@@ -217,6 +326,8 @@ export type MemoryInput = {
   importance?: number;
   confidence?: number;
   source: "owner" | "agent";
+  /** Where an agent-written memory came from, e.g. "job_outcome". */
+  origin?: string;
   sourceTurnId?: string;
   now: number;
 };
@@ -233,6 +344,109 @@ export type AttemptRecord = {
   resultJson: string | null;
   completedAt: number | null;
 };
+
+export type ExecutorFence = Readonly<{
+  ownerId: string;
+  generation: number;
+  now: number;
+}>;
+
+export type ExecutorEventInput = ExecutorFence & Readonly<{
+  jobId: string;
+  expectedVersion: number;
+  event: JobEvent;
+}>;
+
+export type ExecutorAttemptInput = ExecutorFence & Readonly<{
+  id: string;
+  jobId: string;
+  kind: AttemptRecord["kind"];
+  ordinal: number;
+  headSha?: string | null;
+}>;
+
+export type ExecutorAttemptPatch = ExecutorFence & Readonly<{
+  jobId?: string;
+  attemptId: string;
+  patch: {
+    threadId?: string | null;
+    headSha?: string | null;
+    handoffPath?: string | null;
+    handoffSha256?: string | null;
+    result?: Record<string, unknown> | null;
+    completedAt?: number | null;
+  };
+}>;
+
+export type ExecutorReviewThreadInput = ExecutorFence & Readonly<{
+  jobId: string;
+  expectedVersion: number;
+  threadId: string;
+}>;
+
+export type ExecutorReviewFormatCorrectionInput = ExecutorFence & Readonly<{
+  jobId?: string;
+  attemptId: string;
+  threadId: string;
+  headSha: string;
+}>;
+
+export type ExecutorApprovalInput = ExecutorFence & Readonly<{
+  nonceHash: string;
+  jobId: string;
+  headSha: string;
+  expiresAt: number;
+  ownerUserId?: string | null;
+  ownerChatId?: string | null;
+  jobVersion?: number | null;
+}>;
+
+export type ExecutorApprovalRevocationInput = ExecutorFence & Readonly<{
+  jobId: string;
+  reason: string;
+}>;
+
+export type ExecutorStatusOutboxInput = ExecutorFence & Readonly<{
+  outbox: OutboxInput;
+}>;
+
+export type ExecutorWorkerLivenessInput = ExecutorFence & Readonly<{
+  value: WorkerLiveness;
+}>;
+
+export type ControlEffectLeaseInput = ExecutorFence & Readonly<{
+  limit: number;
+  leaseMs: number;
+  busyJobIds?: readonly string[];
+}>;
+
+export type JobEffectLeaseInput = ExecutorFence & Readonly<{
+  jobId: string;
+  leaseMs: number;
+}>;
+
+export type CurrentHeldMergeResourceClaimsInput = Readonly<{
+  jobId: string;
+  policy: ProjectPolicy;
+  limit: number;
+}>;
+
+export type ProductionStageFenceInput = ExecutorFence & Readonly<{
+  jobId: string;
+  effectIdempotencyKey: string;
+}>;
+
+export type JobOperationFenceRenewalInput = ExecutorFence & Readonly<{
+  jobId: string;
+  effectIdempotencyKey: string;
+  leaseMs: number;
+}>;
+
+export type ControlEffectFenceRenewalInput = JobOperationFenceRenewalInput;
+
+export type ReleaseResult =
+  | Readonly<{ outcome: "waiting"; reason: "worker_active" | "worker_unknown" | "safe_cleanup" | "unresolved_effect" }>
+  | Readonly<{ outcome: "released"; admission: JobAdmission }>;
 
 export type PipelineStageRole =
   | "PLAN"
@@ -455,54 +669,6 @@ type CallbackRow = {
   effect_idempotency_key: string | null;
 };
 
-type JobRow = {
-  id: string;
-  source_update_id: number;
-  request_text: string;
-  state: string;
-  resume_state: string | null;
-  project_id: string | null;
-  policy_version: number | null;
-  policy_json: string | null;
-  environment_id: string | null;
-  implementation_thread_id: string | null;
-  review_thread_id: string | null;
-  documentation_thread_id: string | null;
-  pr_number: number | null;
-  pr_url: string | null;
-  pr_head_sha: string | null;
-  merge_message: string | null;
-  merge_commit_sha: string | null;
-  merged_at: string | null;
-  deployment_summary: string | null;
-  canary_summary: string | null;
-  status_message_id: number | null;
-  plan_cycle: number;
-  review_cycle: number;
-  review_block_at: number;
-  cancel_requested_at: number | null;
-  blocked_reason: Job["blockedReason"];
-  last_error: string | null;
-  version: number;
-  created_at: number;
-  updated_at: number;
-};
-
-type EffectRow = {
-  idempotency_key: string;
-  job_id: string;
-  kind: StoredEffect["kind"];
-  payload_json: string;
-  status: StoredEffect["status"];
-  attempts: number;
-  lease_owner: string | null;
-  lease_generation: number | null;
-  lease_expires_at: number | null;
-  next_attempt_at: number;
-  last_error: string | null;
-  created_at: number;
-  updated_at: number;
-};
 type OutboxRow = {
   logical_key: string;
   chat_id: string;
@@ -555,6 +721,11 @@ type ControllerTurnRow = {
   submitted_at: number | null;
   completed_at: number | null;
   awaiting_interaction_id: string | null;
+  tool_calls: number;
+  command_failures: number;
+  total_tokens: number;
+  supervisor_steers: number;
+  supervisor_reasons: string;
   created_at: number;
   updated_at: number;
 };
@@ -663,39 +834,6 @@ type TelegramUpdateRow = {
   claim_expires_at: number | null;
 };
 
-const JOB_STATES: ReadonlySet<JobState> = new Set([
-  "awaiting_project",
-  "awaiting_confirmation",
-  "planning",
-  "critiquing",
-  "creating_implementation",
-  "implementing",
-  "locating_pr",
-  "resolving_pr_head",
-  "reviewing",
-  "remediating",
-  "validating",
-  "documenting",
-  "resolving_docs_head",
-  "final_validating",
-  "final_reviewing",
-  "awaiting_merge_approval",
-  "merging",
-  "deploying",
-  "verifying_production",
-  "production_failed",
-  "complete",
-  "failed",
-  "blocked",
-  "cancelled",
-  "merged",
-]);
-const BLOCKED_REASONS: ReadonlySet<NonNullable<Job["blockedReason"]>> = new Set([
-  "review_limit",
-  "configuration",
-  "cancellation_unconfirmed",
-  "permanent_effect_failure",
-]);
 const THREAD_OPERATION_KINDS: ReadonlySet<ThreadOperationKind> = new Set([
   "steer_thread",
   "stop_thread",
@@ -706,24 +844,10 @@ const PIPELINE_STAGE_ROLES: ReadonlySet<PipelineStageRole> = new Set([
   "FINAL_TEST", "FINAL_REVIEW", "DEPLOY", "CANARY",
 ]);
 
-export class VersionConflictError extends Error {
-  public constructor(jobId: string, expectedVersion: number) {
-    super(`Job ${jobId} changed since version ${expectedVersion}`);
-    this.name = "VersionConflictError";
-  }
-}
-
 export class IdempotencyConflictError extends Error {
   public constructor(sourceUpdateId: number) {
     super(`Telegram update ${sourceUpdateId} was replayed with different job input`);
     this.name = "IdempotencyConflictError";
-  }
-}
-
-export class ActiveJobConflictError extends Error {
-  public constructor(jobId: string) {
-    super(`Job ${jobId} cannot continue while another job is active`);
-    this.name = "ActiveJobConflictError";
   }
 }
 
@@ -734,13 +858,40 @@ export class UpdateClaimConflictError extends Error {
   }
 }
 
+export class AdmissionRequiredError extends Error {
+  public constructor(eventType: "CONFIRMED" | "CONTINUE_REVIEW") {
+    super(`${eventType} must be applied through an admitted autonomy admission`);
+    this.name = "AdmissionRequiredError";
+  }
+}
+
+const FENCED_JOB_EVENT_TYPES: ReadonlySet<JobEvent["type"]> = new Set([
+  "MERGE_SUCCEEDED",
+  "MERGE_FAILED",
+  "DEPLOY_SUCCEEDED",
+  "DEPLOY_FAILED",
+  "CANARY_SUCCEEDED",
+  "CANARY_FAILED",
+]);
+const PRODUCTION_LIFECYCLE_EVENT_TYPES: ReadonlySet<JobEvent["type"]> = new Set([
+  "DEPLOY_SUCCEEDED",
+  "DEPLOY_FAILED",
+  "CANARY_SUCCEEDED",
+  "CANARY_FAILED",
+]);
+
+class ProductionSettlementConflictError extends Error {
+  public constructor() {
+    super("production claim settlement was lost");
+    this.name = "ProductionSettlementConflictError";
+  }
+}
+
 const LAST_PROJECT_KEY = "telegram-agent:last-project";
 
 const CANONICAL_POSITIVE_DECIMAL = /^[1-9][0-9]*$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const FULL_SHA = /^[0-9a-f]{40}$/;
-const RAW_MERGE_CALLBACK = /m:[A-Za-z0-9_-]{32}/;
-const ENCODED_MERGE_CALLBACK = /(?:m|%6d)%3a[A-Za-z0-9_-]{32}/i;
 const TELEGRAM_UPDATE_LEASE_MS = 300_000;
 /** Claims one update may cost before ingress gives up and moves the cursor on. */
 export const MAX_TELEGRAM_UPDATE_ATTEMPTS = 3;
@@ -755,12 +906,14 @@ const MAX_DIGEST_TURNS = 12;
 const MAX_DIGEST_TEXT = 600;
 const MAX_MONITOR_INSTRUCTION = 1_000;
 const MAX_ARMED_MONITORS = 20;
+// Four is what one owner can follow in a chat, and two open fan-outs is already
+// eight threads of work the agent has to reconcile into one answer.
+const MAX_DELEGATION_THREADS = 4;
+const MAX_OPEN_DELEGATIONS = 2;
+const MAX_DELEGATION_SUMMARY = 600;
+const MAX_DELEGATION_TITLE = 120;
 const MAX_RECEIPT_RESULT = 4_000;
-const MAX_RECEIPT_STRING = 512;
 const MAX_EFFECT_KEY = 256;
-const MAX_MERGE_RESULT_JSON = 64_000;
-const MAX_EXTERNAL_URL_LENGTH = 500;
-const MAX_QUERY_DEPTH = 4;
 const MAX_PIPELINE_OUTPUT_BYTES = 65_536;
 const SAFE_MERGE_FAILURE_REASON = "Merge effect failed safely";
 const UNKNOWN_MERGE_OUTCOME_REASON = "Merge outcome is unknown; provider truth requires reconciliation";
@@ -800,9 +953,6 @@ function assertControllerImage(value: ControllerImage): void {
     throw new TypeError("controller image sizeBytes is invalid");
   }
 }
-const CREDENTIAL_QUERY_KEY = /^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|auth(?:orization)?|auth[_-]?(?:token|key)|session[_-]?token|private[_-]?key|credentials?|password|passwd|secret|token|key|jwt|signature|sig)$/i;
-const CREDENTIAL_QUERY_VALUE = /^(?:bearer\s+\S+|(?:sk|rk)-[A-Za-z0-9_-]{10,}|(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|password|secret|token|credential)\s*[:=]|(?:secret|password|token|credential|api[_-]?key)\b)/i;
-
 function assertCanonicalPositiveDecimal(value: string, field: string): void {
   if (typeof value !== "string" || !CANONICAL_POSITIVE_DECIMAL.test(value)) {
     throw new TypeError(`${field} must be a canonical positive decimal string`);
@@ -835,65 +985,10 @@ function assertPositiveInteger(value: number, field: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${field} must be a positive integer`);
 }
 
-function assertBoundedString(value: unknown, field: string, max = MAX_RECEIPT_STRING): asserts value is string {
-  if (typeof value !== "string" || value.length === 0 || value.length > max) {
-    throw new TypeError(`${field} must be a bounded non-empty string`);
-  }
-}
-
 function assertFiniteTimestamp(value: unknown, field: string): asserts value is string {
   assertBoundedString(value, field);
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) throw new TypeError(`${field} must be a valid finite timestamp`);
-}
-
-function decodePercentLayers(value: string, field: string): string {
-  let candidate = value;
-  for (let layer = 0; layer < MAX_QUERY_DEPTH; layer += 1) {
-    if (!candidate.includes("%")) return candidate;
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(candidate);
-    } catch {
-      throw new TypeError(`${field} contains malformed percent encoding`);
-    }
-    if (decoded === candidate) return candidate;
-    candidate = decoded;
-  }
-  throw new TypeError(`${field} contains excessive percent encoding`);
-}
-
-function containsForbiddenCallbackMaterial(value: string): boolean {
-  let candidate = value;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    if (RAW_MERGE_CALLBACK.test(candidate) || ENCODED_MERGE_CALLBACK.test(candidate)) return true;
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(candidate);
-    } catch {
-      return true;
-    }
-    if (decoded === candidate) return false;
-    candidate = decoded;
-  }
-  return RAW_MERGE_CALLBACK.test(candidate) || ENCODED_MERGE_CALLBACK.test(candidate);
-}
-
-function assertNoRawMergeCallback(value: string, field: string): void {
-  if (containsForbiddenCallbackMaterial(value)) throw new TypeError(`${field} must not contain a raw merge callback nonce`);
-}
-
-function serializeBoundedJson(value: unknown, field: string, maxLength: number): string {
-  let json: string | undefined;
-  try {
-    json = JSON.stringify(value);
-  } catch {
-    throw new TypeError(`${field} must be JSON serializable`);
-  }
-  if (json === undefined || json.length > maxLength) throw new TypeError(`${field} must be bounded JSON`);
-  assertPersistedExternalUrls(JSON.parse(json) as unknown, field);
-  assertNoRawMergeCallback(json, field);
-  return json;
 }
 
 function assertExactKeys(value: Record<string, unknown>, allowed: readonly string[], field: string): void {
@@ -907,74 +1002,6 @@ function assertExactObjectKeys(value: Record<string, unknown>, required: readonl
   assertExactKeys(value, required, field);
   for (const key of required) {
     if (!Object.prototype.hasOwnProperty.call(value, key)) throw new TypeError(`${field} is missing ${key}`);
-  }
-}
-
-function assertCredentialFreeQueryMaterial(material: string, field: string, depth: number): void {
-  if (depth >= MAX_QUERY_DEPTH || material.length > MAX_EXTERNAL_URL_LENGTH) {
-    throw new TypeError(`${field} contains excessive nested query material`);
-  }
-  for (const part of material.replace(/^[?&]/, "").split("&")) {
-    if (part.length === 0) continue;
-    const separator = part.indexOf("=");
-    const rawKey = separator < 0 ? part : part.slice(0, separator);
-    const rawValue = separator < 0 ? "" : part.slice(separator + 1);
-    const key = decodePercentLayers(rawKey, `${field} query key`);
-    const queryValue = decodePercentLayers(rawValue, `${field} query value`);
-    if (
-      CREDENTIAL_QUERY_KEY.test(key) ||
-      CREDENTIAL_QUERY_VALUE.test(queryValue) ||
-      containsForbiddenCallbackMaterial(key) ||
-      containsForbiddenCallbackMaterial(queryValue)
-    ) {
-      throw new TypeError(`${field} must not contain credential-bearing query data`);
-    }
-    if (key.includes("=") || key.includes("&") || queryValue.includes("=") || queryValue.includes("&")) {
-      assertCredentialFreeQueryMaterial(key, `${field} nested query key`, depth + 1);
-      assertCredentialFreeQueryMaterial(queryValue, `${field} nested query value`, depth + 1);
-    }
-  }
-}
-
-function assertCredentialFreeQuery(url: URL, field: string): void {
-  const query = url.search.startsWith("?") ? url.search.slice(1) : "";
-  assertCredentialFreeQueryMaterial(query, field, 0);
-}
-
-export function assertSafeExternalHttpsUrl(value: unknown, field = "external URL"): string {
-  assertBoundedString(value, field, MAX_EXTERNAL_URL_LENGTH);
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new TypeError(`${field} must be a valid HTTPS URL`);
-  }
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.hostname.length === 0 ||
-    parsed.username.length > 0 ||
-    parsed.password.length > 0 ||
-    containsForbiddenCallbackMaterial(value) ||
-    containsForbiddenCallbackMaterial(parsed.href)
-  ) {
-    throw new TypeError(`${field} must be a credential-free HTTPS URL without callback material`);
-  }
-  assertCredentialFreeQuery(parsed, field);
-  return value;
-}
-
-function assertPersistedExternalUrls(value: unknown, field: string): void {
-  if (Array.isArray(value)) {
-    value.forEach((entry, index) => assertPersistedExternalUrls(entry, `${field}[${index}]`));
-    return;
-  }
-  if (value === null || typeof value !== "object") return;
-  for (const [key, entry] of Object.entries(value)) {
-    const path = `${field}.${key}`;
-    if (entry !== null && entry !== undefined && /(?:url|uri|href)s?$/i.test(key)) {
-      assertSafeExternalHttpsUrl(entry, path);
-    }
-    assertPersistedExternalUrls(entry, path);
   }
 }
 
@@ -1624,6 +1651,13 @@ export interface TelegramAgentStore {
     cursor: number;
     text: string;
     phase: ControllerTurnRecord["streamPhase"];
+    toolCalls?: number;
+    commandFailures?: number;
+    totalTokens?: number;
+  }): boolean;
+  recordControllerSupervisorSteer(input: ControllerLeaseFence & {
+    turnId: string;
+    reason: SupervisorReason;
   }): boolean;
   refreshControllerDraft(input: ControllerLeaseFence & {
     turnId: string;
@@ -1707,13 +1741,75 @@ export interface TelegramAgentStore {
     dueAt: number | null;
     now: number;
   }): MonitorRecord;
+  ensureSystemMonitor(input: {
+    systemKey: string;
+    controllerKey: string;
+    cron: string;
+    instruction: string;
+    dueAt: number;
+    now: number;
+  }): MonitorRecord;
+  buildAutonomyScorecard(input: { now: number; windowMs: number }): {
+    windowMs: number;
+    jobs: Record<string, number>;
+    blockedJobs: { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    remediationCycles: number;
+    approvalsRequested: number;
+    approvalsConsumed: number;
+    deliveryRetries: number;
+    undeliverable: number;
+    memory: { live: number; tombstoned: number; superseded: number; lowConfidence: number; extracted: number };
+    monitors: { armed: number; system: number; failed: number };
+  };
+  getControllerOverlay(): string | null;
+  setControllerOverlay(input: { text: string; now: number }): string | null;
   listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[];
   listArmedMonitors(limit: number): MonitorRecord[];
   cancelMonitor(id: string, now: number): boolean;
   recordMonitorFired(input: { id: string; nextDueAt: number | null; now: number }): boolean;
   failMonitor(input: { id: string; error: string; now: number }): boolean;
+  createDelegation(input: { controllerKey: string; instruction: string; now: number }): DelegationRecord;
+  addDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    projectId: string;
+    title: string;
+    now: number;
+  }): boolean;
+  listOpenDelegations(limit: number): DelegationRecord[];
+  getDelegation(id: string): DelegationRecord | null;
+  settleDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    state: Exclude<DelegationThreadState, "running">;
+    summary: string | null;
+    now: number;
+  }): boolean;
+  recordDelegationFired(input: { id: string; now: number }): boolean;
+  failDelegation(input: { id: string; error: string; now: number }): boolean;
+  cancelDelegation(id: string, now: number): boolean;
+  enrolFinishedJobsForMemory(outcomes: readonly string[], limit: number, now: number): number;
+  listJobMemoryExtractions(state: JobMemoryExtractionState, limit: number): JobMemoryExtractionRecord[];
+  startJobMemoryExtraction(input: { jobId: string; threadId: string; now: number }): boolean;
+  recordJobMemoryExtractionFailure(input: { jobId: string; error: string; now: number }): boolean;
+  completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean;
+  failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean;
   rememberMemory(input: MemoryInput): MemoryRecord;
-  recallMemories(input: { scope: string; query?: string; limit: number; now: number }): MemoryRecord[];
+  recallMemories(input: {
+    scope: string;
+    query?: string;
+    limit: number;
+    now: number;
+    turnId?: string;
+  }): MemoryRecord[];
+  curateMemories(input: { now: number }): { decayed: number; tombstoned: number };
+  listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[];
+  getControllerTurnAfter(controllerKey: string, ordinal: number): ControllerTurnRecord | null;
+  scoreRecalledMemories(input: {
+    turnId: string;
+    outcome: "reinforced" | "demoted";
+    now: number;
+  }): number;
   getMemory(id: string): MemoryRecord | null;
   forgetMemory(input: { id: string; now: number }): boolean;
   countMemories(scope: string): number;
@@ -1767,6 +1863,17 @@ export interface TelegramAgentStore {
     task: string;
     now: number;
   }): Job;
+  selectProjectAndQueueAdmission(input: {
+    jobId: string;
+    expectedVersion: number;
+    projectId: string;
+    policyVersion: number;
+    policy: ProjectPolicy;
+    now: number;
+  }): Job;
+  queueAdmission(input: AdmissionWriteInput): JobAdmission;
+  requeueAdmission(input: AdmissionWriteInput): JobAdmission;
+  requeueReviewAdmission(jobId: string, expectedVersion: number, now: number): ReviewAdmissionResult;
   createJob(input: {
     id: string;
     sourceUpdateId: number;
@@ -1788,7 +1895,22 @@ export interface TelegramAgentStore {
   getActiveJob(): Job | null;
   findJobByThreadId(threadId: string): Job | null;
   listJobs(limit: number): Job[];
+  listLegacyActiveJobs(limit: number): Job[];
+  listControlJobs(kind: JobControlKind, limit: number): Job[];
+  countControlJobs(kind: JobControlKind): number;
+  hasUnreleasedAdmissions(): boolean;
+  getAdmission(jobId: string): JobAdmission | null;
+  listAdmissions(states: readonly AdmissionState[], limit: number): JobAdmission[];
+  listReleaseCandidates(limit: number): JobAdmission[];
+  listHeldResourceClaims(jobId: string | null, limit: number): JobResourceClaim[];
+  listCurrentHeldResourceClaims(jobId: string, limit: number): JobResourceClaim[];
+  listCurrentHeldMergeResourceClaims(input: CurrentHeldMergeResourceClaimsInput): JobResourceClaim[];
+  adoptHeldClaims(input: ClaimAdoptionInput): boolean;
+  listActiveJobs(limit: number): Job[];
+  findJobByStatusMessageId(messageId: number): Job | null;
+  tryAdmit(input: AdmissionAttemptInput): AdmissionAttempt;
   applyJobEvent(jobId: string, expectedVersion: number, event: JobEvent, now: number): Job;
+  applyExecutorJobEvent(input: ExecutorEventInput): Job | null;
   listEffectsForJob(jobId: string): StoredEffect[];
   getEffect(jobId: string, idempotencyKey: string): StoredEffect | null;
   getAttempt(attemptId: string): AttemptRecord | null;
@@ -1802,6 +1924,7 @@ export interface TelegramAgentStore {
     headSha?: string | null;
     now: number;
   }): AttemptRecord;
+  createExecutorAttempt(input: ExecutorAttemptInput): AttemptRecord | null;
   createPipelineStageAttempt(input: ControllerLeaseFence & {
     id: string;
     jobId: string;
@@ -1844,8 +1967,14 @@ export interface TelegramAgentStore {
     result?: Record<string, unknown> | null;
     completedAt?: number | null;
   }): AttemptRecord;
+  updateExecutorAttempt(input: ExecutorAttemptPatch): AttemptRecord | null;
   claimReviewFormatCorrection(attemptId: string, threadId: string, headSha: string): boolean;
+  claimExecutorReviewFormatCorrection(input: ExecutorReviewFormatCorrectionInput): boolean;
   registerReviewThread(jobId: string, expectedVersion: number, threadId: string, now: number): Job;
+  registerExecutorReviewThread(input: ExecutorReviewThreadInput): Job | null;
+  createExecutorApproval(input: ExecutorApprovalInput): boolean;
+  revokeExecutorApprovals(input: ExecutorApprovalRevocationInput): number | null;
+  enqueueExecutorStatus(input: ExecutorStatusOutboxInput): boolean;
   acquireExecutorLease(
     ownerId: string,
     now: number,
@@ -1854,7 +1983,13 @@ export interface TelegramAgentStore {
   renewExecutorLease(ownerId: string, generation: number, now: number, leaseMs: number): boolean;
   releaseExecutorLease(ownerId: string, generation: number, now: number): boolean;
   isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean;
-  leaseEffects(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredEffect[];
+  leaseControlEffects(input: ControlEffectLeaseInput): StoredEffect[];
+  leaseNextJobEffect(input: JobEffectLeaseInput): StoredEffect | null;
+  renewJobOperationFences(input: JobOperationFenceRenewalInput): boolean;
+  assertProductionStageFence(input: ProductionStageFenceInput): boolean;
+  renewControlEffectFence(input: ControlEffectFenceRenewalInput): boolean;
+  beginDraining(input: ExecutorFence & Readonly<{ jobId: string }>): Job | null;
+  finalizeRelease(input: ExecutorFence & Readonly<{ jobId: string }>): ReleaseResult | null;
   leaseOutbox(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredOutbox[];
   completeEffect(key: string, ownerId: string, generation: number, now: number): boolean;
   completeOutbox(key: string, ownerId: string, generation: number, messageId: number | null, now: number): boolean;
@@ -1883,17 +2018,12 @@ export interface TelegramAgentStore {
   getOutbox(logicalKey: string): StoredOutbox | null;
   listOutbox(limit: number): StoredOutbox[];
   upsertWorkerLiveness(value: WorkerLiveness): void;
+  upsertExecutorWorkerLiveness(input: ExecutorWorkerLivenessInput): boolean;
   getWorkerLiveness(jobId: string): WorkerLiveness | null;
   markWorkerLivenessNotified(jobId: string, generation: number, now: number): boolean;
+  markExecutorWorkerLivenessNotified(input: ExecutorFence & Readonly<{ jobId: string; workerGeneration: number }>): boolean;
   clearWorkerLiveness(jobId: string, generation: number): boolean;
-  leaseMergeEffect(input: {
-    jobId: string;
-    effectIdempotencyKey: string;
-    leaseOwner: string;
-    leaseGeneration: number;
-    now: number;
-    leaseDurationMs: number;
-  }): boolean;
+  clearExecutorWorkerLiveness(input: ExecutorFence & Readonly<{ jobId: string; workerGeneration: number }>): boolean;
   bindMergeEffectReceipt(input: {
     jobId: string;
     effectIdempotencyKey: string;
@@ -2027,9 +2157,20 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     submittedAt: row.submitted_at,
     completedAt: row.completed_at,
     awaitingInteractionId: row.awaiting_interaction_id ?? null,
+    toolCalls: row.tool_calls,
+    commandFailures: row.command_failures,
+    totalTokens: row.total_tokens,
+    supervisorSteers: row.supervisor_steers,
+    supervisorReasons: parseSupervisorReasons(row.supervisor_reasons),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+// Stored as a comma-separated slug list: the vocabulary is closed and tiny, so
+// JSON would only add a parse failure mode to a column that cannot grow.
+function parseSupervisorReasons(value: string): readonly SupervisorReason[] {
+  return value.split(",").filter((slug): slug is SupervisorReason => SUPERVISOR_REASONS.has(slug));
 }
 
 function parseControllerImage(row: ControllerTurnRow): ControllerImage | null {
@@ -2089,7 +2230,105 @@ type MonitorRow = {
   last_error: string | null;
   created_at: number;
   updated_at: number;
+  system_key: string | null;
 };
+
+type JobMemoryExtractionRow = {
+  job_id: string;
+  project_id: string;
+  outcome: string;
+  state: string;
+  thread_id: string | null;
+  attempts: number;
+  saved_count: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+const JOB_MEMORY_EXTRACTION_STATES: ReadonlySet<string> = new Set<JobMemoryExtractionState>([
+  "pending", "running", "done", "failed",
+]);
+
+function parseJobMemoryExtraction(row: JobMemoryExtractionRow): JobMemoryExtractionRecord {
+  if (!JOB_MEMORY_EXTRACTION_STATES.has(row.state)) {
+    throw new Error(`Unknown persisted job memory extraction state: ${row.state}`);
+  }
+  return {
+    jobId: row.job_id,
+    projectId: row.project_id,
+    outcome: row.outcome,
+    state: row.state as JobMemoryExtractionState,
+    threadId: row.thread_id,
+    attempts: row.attempts,
+    savedCount: row.saved_count,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+type DelegationRow = {
+  id: string;
+  controller_key: string;
+  instruction: string;
+  state: string;
+  fired_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type DelegationThreadRow = {
+  delegation_id: string;
+  thread_id: string;
+  project_id: string;
+  title: string;
+  ordinal: number;
+  state: string;
+  summary: string | null;
+  settled_at: number | null;
+};
+
+const DELEGATION_STATES: ReadonlySet<string> = new Set<DelegationState>([
+  "open", "fired", "cancelled", "failed",
+]);
+const DELEGATION_THREAD_STATES: ReadonlySet<string> = new Set<DelegationThreadState>([
+  "running", "finished", "failed", "missing",
+]);
+const SETTLED_DELEGATION_THREAD_STATES: ReadonlySet<string> =
+  new Set<Exclude<DelegationThreadState, "running">>(["finished", "failed", "missing"]);
+
+function parseDelegationThread(row: DelegationThreadRow): DelegationThreadRecord {
+  if (!DELEGATION_THREAD_STATES.has(row.state)) {
+    throw new Error(`Unknown persisted delegation thread state: ${row.state}`);
+  }
+  return {
+    threadId: row.thread_id,
+    projectId: row.project_id,
+    title: row.title,
+    state: row.state as DelegationThreadState,
+    summary: row.summary,
+    settledAt: row.settled_at,
+  };
+}
+
+function parseDelegation(row: DelegationRow, threads: readonly DelegationThreadRecord[]): DelegationRecord {
+  if (!DELEGATION_STATES.has(row.state)) {
+    throw new Error(`Unknown persisted delegation state: ${row.state}`);
+  }
+  return {
+    id: row.id,
+    controllerKey: row.controller_key,
+    instruction: row.instruction,
+    state: row.state as DelegationState,
+    threads,
+    firedAt: row.fired_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 function parseMonitor(row: MonitorRow): MonitorRecord {
   if (row.kind !== "thread_idle" && row.kind !== "schedule") {
@@ -2124,6 +2363,7 @@ type MemoryRow = {
   importance: number;
   confidence: number;
   source: string;
+  origin: string | null;
   source_turn_id: string | null;
   use_count: number;
   last_used_at: number | null;
@@ -2147,6 +2387,34 @@ function assertMemoryText(value: string, limit: number, field: string): string {
   return text;
 }
 
+/**
+ * Delegated output is arbitrary text from a shell the agent drove, which is a
+ * far wider exposure than the agent-authored summaries the shared guard was
+ * tuned for. These patterns are additive to it, and deliberately local: they
+ * withhold text here without changing what the merge and failure paths reject.
+ */
+const DELEGATION_SECRET_PATTERNS = [
+  // Env-var style assignment: AWS_SECRET_ACCESS_KEY=…, GITHUB_TOKEN: …
+  /[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|APIKEY)[A-Z0-9_]*\s*[:=]\s*\S+/i,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+];
+
+/**
+ * A delegated thread's output is arbitrary text the agent never wrote, so it is
+ * clipped rather than rejected — and withheld entirely when it looks like it
+ * carries a credential, because this text is replayed into a later prompt.
+ */
+function clipDelegationSummary(value: string, limit: number): string | null {
+  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (text.length === 0) return null;
+  const secret = containsCredentialLikeText(text) ||
+    DELEGATION_SECRET_PATTERNS.some((pattern) => pattern.test(text));
+  if (secret) return "(withheld: output looked like it contained a credential)";
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+}
+
 function assertUnitInterval(value: number, field: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
     throw new TypeError(`${field} must be between 0 and 1`);
@@ -2168,6 +2436,7 @@ function parseMemory(row: MemoryRow): MemoryRecord {
     importance: row.importance,
     confidence: row.confidence,
     source: row.source,
+    origin: row.origin ?? null,
     sourceTurnId: row.source_turn_id,
     useCount: row.use_count,
     lastUsedAt: row.last_used_at,
@@ -2227,50 +2496,6 @@ function controllerFailureOutbox(turnId: string, chatId: string, ownerMessage?: 
   };
 }
 
-function parseJob(row: JobRow): Job {
-  if (!JOB_STATES.has(row.state as JobState)) throw new Error(`Unknown persisted job state: ${row.state}`);
-  if (row.resume_state !== null && !JOB_STATES.has(row.resume_state as JobState)) {
-    throw new Error(`Unknown persisted resume state: ${row.resume_state}`);
-  }
-  if (row.blocked_reason !== null && !BLOCKED_REASONS.has(row.blocked_reason)) {
-    throw new Error(`Unknown persisted blocked reason: ${row.blocked_reason}`);
-  }
-  return {
-    id: row.id,
-    sourceUpdateId: row.source_update_id,
-    requestText: row.request_text,
-    state: row.state as JobState,
-    resumeState: row.resume_state as JobState | null,
-    projectId: row.project_id,
-    policyVersion: row.policy_version,
-    policy: row.policy_json === null
-      ? null
-      : projectPolicySchema.parse(JSON.parse(row.policy_json)),
-    environmentId: row.environment_id,
-    implementationThreadId: row.implementation_thread_id,
-    reviewThreadId: row.review_thread_id,
-    documentationThreadId: row.documentation_thread_id,
-    prNumber: row.pr_number,
-    prUrl: row.pr_url,
-    prHeadSha: row.pr_head_sha,
-    mergeMessage: row.merge_message,
-    mergeCommitSha: row.merge_commit_sha,
-    mergedAt: row.merged_at,
-    deploymentSummary: row.deployment_summary,
-    canarySummary: row.canary_summary,
-    statusMessageId: row.status_message_id,
-    planCycle: row.plan_cycle,
-    reviewCycle: row.review_cycle,
-    reviewBlockAt: row.review_block_at,
-    cancelRequestedAt: row.cancel_requested_at,
-    blockedReason: row.blocked_reason,
-    lastError: row.last_error,
-    version: row.version,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
 function parsePipelineStageAttempt(row: PipelineStageAttemptRow): PipelineStageAttempt {
   return {
     id: row.id,
@@ -2291,24 +2516,6 @@ function parsePipelineStageAttempt(row: PipelineStageAttemptRow): PipelineStageA
     lastError: row.last_error,
     createdAt: row.created_at,
     completedAt: row.completed_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function parseEffect(row: EffectRow): StoredEffect {
-  return {
-    idempotencyKey: row.idempotency_key,
-    jobId: row.job_id,
-    kind: row.kind,
-    payload: JSON.parse(row.payload_json) as Record<string, unknown>,
-    status: row.status,
-    attempts: row.attempts,
-    leaseOwner: row.lease_owner,
-    leaseGeneration: row.lease_generation,
-    leaseExpiresAt: row.lease_expires_at,
-    nextAttemptAt: row.next_attempt_at,
-    lastError: row.last_error,
-    createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
@@ -2356,96 +2563,6 @@ function parseAttempt(row: {
     completedAt: row.completed_at,
   };
 }
-
-function persistJobTransition(
-  db: SqliteDatabase,
-  jobId: string,
-  expectedVersion: number,
-  transitionedJob: Job,
-): void {
-  if (transitionedJob.lastError !== null) assertNoRawMergeCallback(transitionedJob.lastError, "job error");
-  if (transitionedJob.prUrl !== null) {
-    assertSafeExternalHttpsUrl(transitionedJob.prUrl, "job.prUrl");
-  }
-  const updated = db
-    .prepare(
-      `UPDATE jobs SET
-         request_text = ?, state = ?, resume_state = ?, project_id = ?,
-         policy_version = ?, policy_json = ?, environment_id = ?,
-         implementation_thread_id = ?, review_thread_id = ?, documentation_thread_id = ?, pr_number = ?,
-         pr_url = ?, pr_head_sha = ?, merge_message = ?, merge_commit_sha = ?, merged_at = ?,
-         deployment_summary = ?, canary_summary = ?, status_message_id = ?, plan_cycle = ?, review_cycle = ?,
-         review_block_at = ?, cancel_requested_at = ?, blocked_reason = ?,
-         last_error = ?, version = ?, updated_at = ?
-       WHERE id = ? AND version = ?`,
-    )
-    .run(
-      transitionedJob.requestText,
-      transitionedJob.state,
-      transitionedJob.resumeState,
-      transitionedJob.projectId,
-      transitionedJob.policyVersion,
-      transitionedJob.policy ? JSON.stringify(transitionedJob.policy) : null,
-      transitionedJob.environmentId,
-      transitionedJob.implementationThreadId,
-      transitionedJob.reviewThreadId,
-      transitionedJob.documentationThreadId,
-      transitionedJob.prNumber,
-      transitionedJob.prUrl,
-      transitionedJob.prHeadSha,
-      transitionedJob.mergeMessage,
-      transitionedJob.mergeCommitSha,
-      transitionedJob.mergedAt,
-      transitionedJob.deploymentSummary,
-      transitionedJob.canarySummary,
-      transitionedJob.statusMessageId,
-      transitionedJob.planCycle,
-      transitionedJob.reviewCycle,
-      transitionedJob.reviewBlockAt,
-      transitionedJob.cancelRequestedAt,
-      transitionedJob.blockedReason,
-      transitionedJob.lastError,
-      transitionedJob.version,
-      transitionedJob.updatedAt,
-      jobId,
-      expectedVersion,
-    );
-  if (updated.changes !== 1) throw new VersionConflictError(jobId, expectedVersion);
-}
-
-function persistPendingEffects(
-  db: SqliteDatabase,
-  effects: JobEffect[],
-  now: number,
-): void {
-  const insertEffect = db.prepare(
-    `INSERT OR IGNORE INTO effects (
-       idempotency_key, job_id, kind, payload_json, status, attempts,
-       next_attempt_at, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
-  );
-  for (const effect of effects) {
-    const payloadJson = serializeBoundedJson(effect.payload, "effect payload", MAX_MERGE_RESULT_JSON);
-    insertEffect.run(
-      effect.idempotencyKey,
-      effect.jobId,
-      effect.kind,
-      payloadJson,
-      now,
-      now,
-      now,
-    );
-  }
-}
-
-const JOB_SELECT = `
-  SELECT id, source_update_id, request_text, state, resume_state, project_id,
-         policy_version, policy_json, environment_id, implementation_thread_id,
-         review_thread_id, documentation_thread_id, pr_number, pr_url, pr_head_sha,
-         merge_message, merge_commit_sha, merged_at, deployment_summary, canary_summary, status_message_id,
-         plan_cycle, review_cycle, review_block_at, cancel_requested_at, blocked_reason,
-         last_error, version, created_at, updated_at
-    FROM jobs`;
 
 function serializeOutbox(item: OutboxInput, now: number): string {
   if (!item.logicalKey || !item.chatId) throw new TypeError("outbox identity is required");
@@ -2558,15 +2675,64 @@ function advanceTelegramCursor(db: SqliteDatabase): void {
     .run(nextOffset, nextOffset);
 }
 
+function sqliteErrorCode(error: unknown): unknown {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return (error as { code?: unknown }).code;
+}
+
+class MergeClaimConflictError extends Error {
+  public constructor() {
+    super("merge resource claim is unavailable");
+    this.name = "MergeClaimConflictError";
+  }
+}
+
+type MergeClaimKind = Extract<ResourceKind, "repository_merge" | "production_target">;
+
+type MergeResourceRequirement = Readonly<{
+  resourceKey: string;
+  resourceKind: MergeClaimKind;
+}>;
+
+type HeldMergeClaim = Readonly<{
+  resource_key: string;
+  resource_kind: string;
+  job_id: string;
+  owner_id: string;
+  generation: number;
+  lease_expires_at: number;
+}>;
+
+type AcceptedMergeLease = Readonly<{
+  headSha: string;
+  approvalNonceHash: string;
+  approvalOwnerUserId: string;
+  approvalOwnerChatId: string;
+  approvalJobVersion: number;
+  approvalExpiresAt: number;
+}>;
+
+type ResourceClaimSettlement = Readonly<{
+  jobId: string;
+  ownerId: string;
+  generation: number;
+  now: number;
+  reason: string;
+  resourceKinds: readonly MergeClaimKind[];
+}>;
+
 class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly claimOwner = randomUUID();
   private readonly claimedUpdates = new Map<number, number>();
+  private readonly autonomyRepository: AutonomyRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
     private readonly kv: PluginKv,
     private readonly clock: () => number,
-  ) {}
+  ) {
+    this.autonomyRepository = new AutonomyRepository(db);
+  }
 
   private currentNow(): number {
     const now = this.clock();
@@ -3055,9 +3221,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     cursor: number;
     text: string;
     phase: ControllerTurnRecord["streamPhase"];
+    toolCalls?: number;
+    commandFailures?: number;
+    totalTokens?: number;
   }): boolean {
     this.assertControllerMutation(input);
     assertNonNegativeInteger(input.cursor, "cursor");
+    assertNonNegativeInteger(input.toolCalls ?? 0, "toolCalls");
+    assertNonNegativeInteger(input.commandFailures ?? 0, "commandFailures");
+    assertNonNegativeInteger(input.totalTokens ?? 0, "totalTokens");
     assertControllerText(input.text || "Controller stream is empty", "controller stream");
     const phases = new Set<ControllerTurnRecord["streamPhase"]>([
       "queued", "connecting", "thinking", "using_tools", "responding", "complete", "failed",
@@ -3072,11 +3244,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE turn.id = ? AND turn.state = 'submitted' AND turn.bb_event_seq < ?`,
       ).get(input.turnId, input.cursor) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
       if (!row) return false;
+      // The cursor guard that stops a replayed page from redrawing the draft is
+      // the same guard that stops it from counting its tool calls twice.
       const updated = this.db.prepare(
         `UPDATE controller_turns
-            SET bb_event_seq = ?, stream_text = ?, stream_phase = ?, updated_at = ?
+            SET bb_event_seq = ?, stream_text = ?, stream_phase = ?, updated_at = ?,
+                tool_calls = tool_calls + ?,
+                command_failures = command_failures + ?,
+                total_tokens = MAX(total_tokens, ?)
           WHERE id = ? AND state = 'submitted' AND bb_event_seq < ?`,
-      ).run(input.cursor, input.text, input.phase, input.now, input.turnId, input.cursor);
+      ).run(
+        input.cursor,
+        input.text,
+        input.phase,
+        input.now,
+        input.toolCalls ?? 0,
+        input.commandFailures ?? 0,
+        input.totalTokens ?? 0,
+        input.turnId,
+        input.cursor,
+      );
       if (updated.changes !== 1) return false;
       const displayText = input.text || (input.phase === "thinking" ? "Luna Max is thinking…" : "Connecting to Luna Max…");
       const outbox: OutboxInput = {
@@ -3087,6 +3274,34 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       };
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
+    }).immediate();
+  }
+
+  /**
+   * Records that the supervisor already nudged this turn for one reason. A
+   * tripped budget stays tripped on every later poll, so without this the same
+   * crossing would nudge the model forever.
+   */
+  public recordControllerSupervisorSteer(input: ControllerLeaseFence & {
+    turnId: string;
+    reason: SupervisorReason;
+  }): boolean {
+    this.assertControllerMutation(input);
+    if (!SUPERVISOR_REASONS.has(input.reason)) throw new TypeError("Unknown controller supervisor reason");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const updated = this.db.prepare(
+        `UPDATE controller_turns
+            SET supervisor_steers = supervisor_steers + 1,
+                supervisor_reasons = CASE
+                  WHEN supervisor_reasons = '' THEN ?
+                  ELSE supervisor_reasons || ',' || ?
+                END,
+                updated_at = ?
+          WHERE id = ? AND state = 'submitted'
+            AND instr(',' || supervisor_reasons || ',', ',' || ? || ',') = 0`,
+      ).run(input.reason, input.reason, input.now, input.turnId, input.reason);
+      return updated.changes === 1;
     }).immediate();
   }
 
@@ -3824,6 +4039,146 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.requireMonitor(id);
   }
 
+  /**
+   * Installs a monitor the plugin owns rather than the owner. Keyed so install
+   * is idempotent across restarts, and exempt from the owner's armed-monitor
+   * cap: the agent's own housekeeping must not be crowded out by watches the
+   * owner set, nor consume slots they were counting on.
+   */
+  public ensureSystemMonitor(input: {
+    systemKey: string;
+    controllerKey: string;
+    cron: string;
+    instruction: string;
+    dueAt: number;
+    now: number;
+  }): MonitorRecord {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.systemKey, "systemKey");
+    const instruction = assertMemoryText(input.instruction, MAX_MONITOR_INSTRUCTION, "monitor instruction");
+    assertNonNegativeInteger(input.dueAt, "dueAt");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): MonitorRecord => {
+      const existing = this.db.prepare(
+        "SELECT * FROM monitors WHERE system_key = ?",
+      ).get(input.systemKey) as MonitorRow | undefined;
+      if (existing) {
+        // Re-arm a system monitor the owner or a failure retired; its schedule
+        // and wording are owned by this release, not by whatever ran before.
+        this.db.prepare(
+          `UPDATE monitors
+              SET cron = ?, instruction = ?, updated_at = ?,
+                  state = CASE WHEN state = 'armed' THEN 'armed' ELSE 'armed' END,
+                  due_at = CASE WHEN state = 'armed' AND due_at IS NOT NULL THEN due_at ELSE ? END
+            WHERE system_key = ?`,
+        ).run(input.cron, instruction, input.now, input.dueAt, input.systemKey);
+        return this.requireMonitor(existing.id);
+      }
+      const id = `mon-${randomUUID()}`;
+      this.db.prepare(
+        `INSERT INTO monitors (
+           id, controller_key, kind, thread_id, cron, instruction, state, due_at,
+           fire_count, last_fired_at, last_error, created_at, updated_at, system_key
+         ) VALUES (?, ?, 'schedule', NULL, ?, ?, 'armed', ?, 0, NULL, NULL, ?, ?, ?)`,
+      ).run(id, input.controllerKey, input.cron, instruction, input.dueAt, input.now, input.now, input.systemKey);
+      return this.requireMonitor(id);
+    }).immediate();
+  }
+
+  /**
+   * Durable counts only. Every number here is read from committed state, so the
+   * agent can report it without inventing a rate the database cannot support.
+   */
+  public buildAutonomyScorecard(input: { now: number; windowMs: number }): {
+    windowMs: number;
+    jobs: Record<string, number>;
+    blockedJobs: { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    remediationCycles: number;
+    approvalsRequested: number;
+    approvalsConsumed: number;
+    deliveryRetries: number;
+    undeliverable: number;
+    memory: { live: number; tombstoned: number; superseded: number; lowConfidence: number; extracted: number };
+    monitors: { armed: number; system: number; failed: number };
+  } {
+    assertNonNegativeInteger(input.now, "now");
+    if (!Number.isSafeInteger(input.windowMs) || input.windowMs < 1) throw new TypeError("windowMs must be positive");
+    const since = Math.max(0, input.now - input.windowMs);
+    const scalar = (sql: string, ...params: unknown[]): number => {
+      const row = this.db.prepare(sql).get(...params) as { value: number } | undefined;
+      return row?.value ?? 0;
+    };
+    const jobRows = this.db.prepare(
+      "SELECT state, COUNT(*) AS value FROM jobs WHERE updated_at >= ? GROUP BY state",
+    ).all(since) as { state: string; value: number }[];
+    const jobs: Record<string, number> = {};
+    for (const row of jobRows) jobs[row.state] = row.value;
+    const blockedJobs = this.db.prepare(
+      `SELECT id, project_id AS projectId, blocked_reason AS reason, updated_at AS updatedAt
+         FROM jobs WHERE state = 'blocked' ORDER BY updated_at DESC LIMIT 10`,
+    ).all() as { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    return {
+      windowMs: input.windowMs,
+      jobs,
+      blockedJobs,
+      remediationCycles: scalar(
+        "SELECT COALESCE(SUM(review_cycle), 0) AS value FROM jobs WHERE updated_at >= ?", since),
+      approvalsRequested: scalar(
+        "SELECT COUNT(*) AS value FROM approvals WHERE expires_at >= ?", since),
+      approvalsConsumed: scalar(
+        "SELECT COUNT(*) AS value FROM approvals WHERE consumed_at IS NOT NULL AND consumed_at >= ?", since),
+      deliveryRetries: scalar(
+        "SELECT COALESCE(SUM(attempts), 0) AS value FROM outbox WHERE updated_at >= ? AND attempts > 1", since),
+      undeliverable: scalar("SELECT COUNT(*) AS value FROM outbox WHERE status = 'dead'"),
+      memory: {
+        live: scalar(
+          "SELECT COUNT(*) AS value FROM memories WHERE forgotten_at IS NULL AND superseded_by IS NULL"),
+        tombstoned: scalar("SELECT COUNT(*) AS value FROM memories WHERE forgotten_at IS NOT NULL"),
+        superseded: scalar("SELECT COUNT(*) AS value FROM memories WHERE superseded_by IS NOT NULL"),
+        lowConfidence: scalar(
+          `SELECT COUNT(*) AS value FROM memories
+            WHERE forgotten_at IS NULL AND superseded_by IS NULL AND confidence < 0.3`),
+        extracted: scalar(
+          `SELECT COUNT(*) AS value FROM memories
+            WHERE origin = 'job_outcome' AND forgotten_at IS NULL AND superseded_by IS NULL`),
+      },
+      monitors: {
+        armed: scalar("SELECT COUNT(*) AS value FROM monitors WHERE state = 'armed'"),
+        system: scalar("SELECT COUNT(*) AS value FROM monitors WHERE system_key IS NOT NULL"),
+        failed: scalar("SELECT COUNT(*) AS value FROM monitors WHERE state = 'failed'"),
+      },
+    };
+  }
+
+  /** The owner's standing wording about how this agent should work. */
+  public getControllerOverlay(): string | null {
+    const row = this.db.prepare("SELECT text FROM controller_overlay WHERE singleton = 1")
+      .get() as { text: string } | undefined;
+    const text = row?.text.trim() ?? "";
+    return text.length === 0 ? null : text;
+  }
+
+  /** Passing empty text clears the overlay rather than storing a blank rule. */
+  public setControllerOverlay(input: { text: string; now: number }): string | null {
+    assertNonNegativeInteger(input.now, "now");
+    const text = typeof input.text === "string" ? input.text.replace(/\s+/g, " ").trim() : "";
+    if (text.length > MAX_CONTROLLER_OVERLAY) {
+      throw new TypeError(`controller overlay must be at most ${MAX_CONTROLLER_OVERLAY} characters`);
+    }
+    // The overlay is replayed into every turn's system instructions, so a
+    // pasted credential here would outlive the message that carried it.
+    if (containsCredentialLikeText(text)) throw new TypeError("controller overlay must not contain credential-like text");
+    if (text.length === 0) {
+      this.db.prepare("DELETE FROM controller_overlay WHERE singleton = 1").run();
+      return null;
+    }
+    this.db.prepare(
+      `INSERT INTO controller_overlay (singleton, text, updated_at) VALUES (1, ?, ?)
+       ON CONFLICT(singleton) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at`,
+    ).run(text, input.now);
+    return text;
+  }
+
   public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {
     assertControllerKey(controllerKey);
     const rows = this.db.prepare(
@@ -3870,6 +4225,228 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).run(input.error, input.now, input.id).changes === 1;
   }
 
+  /**
+   * Records the intent to fan out before any thread is spawned, so a crash
+   * partway through leaves a joinable delegation rather than orphan threads
+   * nobody is waiting on.
+   */
+  public createDelegation(input: {
+    controllerKey: string;
+    instruction: string;
+    now: number;
+  }): DelegationRecord {
+    assertControllerKey(input.controllerKey);
+    const instruction = assertMemoryText(input.instruction, MAX_MONITOR_INSTRUCTION, "delegation instruction");
+    assertNonNegativeInteger(input.now, "now");
+    if (this.countOpenDelegations(input.controllerKey) >= MAX_OPEN_DELEGATIONS) {
+      throw new TypeError(`at most ${MAX_OPEN_DELEGATIONS} delegations can be open at once`);
+    }
+    const id = `del-${randomUUID()}`;
+    this.db.prepare(
+      `INSERT INTO delegations (
+         id, controller_key, instruction, state, fired_at, last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, 'open', NULL, NULL, ?, ?)`,
+    ).run(id, input.controllerKey, instruction, input.now, input.now);
+    return this.requireDelegation(id);
+  }
+
+  public addDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    projectId: string;
+    title: string;
+    now: number;
+  }): boolean {
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertControllerIdentifier(input.projectId, "projectId");
+    const title = assertMemoryText(input.title, MAX_DELEGATION_TITLE, "delegation title");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      const delegation = this.db.prepare(
+        "SELECT * FROM delegations WHERE id = ? AND state = 'open'",
+      ).get(input.delegationId) as DelegationRow | undefined;
+      if (!delegation) return false;
+      const existing = this.db.prepare(
+        "SELECT COUNT(*) AS count FROM delegation_threads WHERE delegation_id = ?",
+      ).get(input.delegationId) as { count: number };
+      if (existing.count >= MAX_DELEGATION_THREADS) {
+        throw new TypeError(`a delegation may fan out to at most ${MAX_DELEGATION_THREADS} threads`);
+      }
+      const inserted = this.db.prepare(
+        `INSERT OR IGNORE INTO delegation_threads (
+           delegation_id, thread_id, project_id, title, ordinal, state, summary, settled_at
+         ) VALUES (?, ?, ?, ?, ?, 'running', NULL, NULL)`,
+      ).run(input.delegationId, input.threadId, input.projectId, title, existing.count);
+      if (inserted.changes !== 1) return false;
+      this.db.prepare("UPDATE delegations SET updated_at = ? WHERE id = ?")
+        .run(input.now, input.delegationId);
+      return true;
+    }).immediate();
+  }
+
+  public listOpenDelegations(limit: number): DelegationRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      "SELECT * FROM delegations WHERE state = 'open' ORDER BY created_at ASC LIMIT ?",
+    ).all(limit) as DelegationRow[];
+    return rows.map((row) => parseDelegation(row, this.delegationThreads(row.id)));
+  }
+
+  public getDelegation(id: string): DelegationRecord | null {
+    const row = this.db.prepare("SELECT * FROM delegations WHERE id = ?").get(id) as DelegationRow | undefined;
+    return row ? parseDelegation(row, this.delegationThreads(row.id)) : null;
+  }
+
+  /** Settles one member exactly once; a later poll seeing the same thread is ignored. */
+  public settleDelegationThread(input: {
+    delegationId: string;
+    threadId: string;
+    state: Exclude<DelegationThreadState, "running">;
+    summary: string | null;
+    now: number;
+  }): boolean {
+    // Checked at runtime too: an untyped caller must not park a member back in
+    // 'running', which would make the join wait on a thread already settled.
+    if (!SETTLED_DELEGATION_THREAD_STATES.has(input.state)) {
+      throw new TypeError("a delegation thread settles as finished, failed, or missing");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    const summary = input.summary === null
+      ? null
+      : clipDelegationSummary(input.summary, MAX_DELEGATION_SUMMARY);
+    return this.db.prepare(
+      `UPDATE delegation_threads
+          SET state = ?, summary = ?, settled_at = ?
+        WHERE delegation_id = ? AND thread_id = ? AND state = 'running'`,
+    ).run(input.state, summary, input.now, input.delegationId, input.threadId).changes === 1;
+  }
+
+  public recordDelegationFired(input: { id: string; now: number }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE delegations SET state = 'fired', fired_at = ?, updated_at = ? WHERE id = ? AND state = 'open'",
+    ).run(input.now, input.now, input.id).changes === 1;
+  }
+
+  public failDelegation(input: { id: string; error: string; now: number }): boolean {
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE delegations SET state = 'failed', last_error = ?, updated_at = ? WHERE id = ? AND state = 'open'",
+    ).run(input.error, input.now, input.id).changes === 1;
+  }
+
+  public cancelDelegation(id: string, now: number): boolean {
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      "UPDATE delegations SET state = 'cancelled', updated_at = ? WHERE id = ? AND state = 'open'",
+    ).run(now, id).changes === 1;
+  }
+
+  private delegationThreads(delegationId: string): DelegationThreadRecord[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM delegation_threads WHERE delegation_id = ? ORDER BY ordinal ASC",
+    ).all(delegationId) as DelegationThreadRow[];
+    return rows.map(parseDelegationThread);
+  }
+
+  /**
+   * Enrolls terminal jobs that have never been learned from. Scanning for them
+   * rather than emitting an effect at the transition keeps the job state
+   * machine untouched and makes enrolment self-healing across restarts.
+   */
+  public enrolFinishedJobsForMemory(outcomes: readonly string[], limit: number, now: number): number {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    assertNonNegativeInteger(now, "now");
+    if (outcomes.length === 0) return 0;
+    const placeholders = outcomes.map(() => "?").join(", ");
+    const rows = this.db.prepare(
+      `SELECT id, state, project_id FROM jobs
+        WHERE state IN (${placeholders})
+          AND project_id IS NOT NULL
+          AND id NOT IN (SELECT job_id FROM job_memory_extractions)
+        ORDER BY updated_at ASC LIMIT ?`,
+    ).all(...outcomes, limit) as { id: string; state: string; project_id: string }[];
+    for (const row of rows) {
+      this.db.prepare(
+        `INSERT OR IGNORE INTO job_memory_extractions (
+           job_id, project_id, outcome, state, thread_id, attempts, saved_count,
+           last_error, created_at, updated_at
+         ) VALUES (?, ?, ?, 'pending', NULL, 0, 0, NULL, ?, ?)`,
+      ).run(row.id, row.project_id, row.state, now, now);
+    }
+    return rows.length;
+  }
+
+  public listJobMemoryExtractions(
+    state: JobMemoryExtractionState,
+    limit: number,
+  ): JobMemoryExtractionRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      "SELECT * FROM job_memory_extractions WHERE state = ? ORDER BY created_at ASC LIMIT ?",
+    ).all(state, limit) as JobMemoryExtractionRow[];
+    return rows.map(parseJobMemoryExtraction);
+  }
+
+  public startJobMemoryExtraction(input: { jobId: string; threadId: string; now: number }): boolean {
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET state = 'running', thread_id = ?, attempts = attempts + 1, updated_at = ?
+        WHERE job_id = ? AND state = 'pending'`,
+    ).run(input.threadId, input.now, input.jobId).changes === 1;
+  }
+
+  /**
+   * Counts a start that never got off the ground. Without this a permanently
+   * unusable project — deleted, renamed — retries on every executor pass
+   * forever, because attempts were only ever counted on success.
+   */
+  public recordJobMemoryExtractionFailure(input: { jobId: string; error: string; now: number }): boolean {
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET attempts = attempts + 1, last_error = ?, updated_at = ?
+        WHERE job_id = ? AND state = 'pending'`,
+    ).run(input.error, input.now, input.jobId).changes === 1;
+  }
+
+  public completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean {
+    assertNonNegativeInteger(input.savedCount, "savedCount");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET state = 'done', saved_count = ?, updated_at = ?
+        WHERE job_id = ? AND state = 'running'`,
+    ).run(input.savedCount, input.now, input.jobId).changes === 1;
+  }
+
+  public failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean {
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE job_memory_extractions
+          SET state = 'failed', last_error = ?, updated_at = ?
+        WHERE job_id = ? AND state IN ('pending', 'running')`,
+    ).run(input.error, input.now, input.jobId).changes === 1;
+  }
+
+  private countOpenDelegations(controllerKey: string): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM delegations WHERE controller_key = ? AND state = 'open'",
+    ).get(controllerKey) as { count: number };
+    return row.count;
+  }
+
+  private requireDelegation(id: string): DelegationRecord {
+    const delegation = this.getDelegation(id);
+    if (!delegation) throw new Error("Persisted delegation is unavailable");
+    return delegation;
+  }
+
   private countArmedMonitors(controllerKey: string): number {
     const row = this.db.prepare(
       "SELECT COUNT(*) AS count FROM monitors WHERE controller_key = ? AND state = 'armed'",
@@ -3910,11 +4487,29 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         this.db.prepare("UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?")
           .run(id, input.now, previous.id);
       }
+      // A correction is the owner saying a belief is wrong, so it retires the
+      // beliefs it contradicts rather than sitting alongside them. Only a
+      // correction may do this: an ordinary restatement is not a refutation.
+      if (input.kind === "correction") {
+        const live = this.db.prepare(
+          `SELECT id, subject FROM memories
+            WHERE scope = ? AND id != ? AND forgotten_at IS NULL AND superseded_by IS NULL`,
+        ).all(input.scope, id) as { id: string; subject: string }[];
+        const supersede = this.db.prepare(
+          "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
+        );
+        for (const candidate of live) {
+          if (candidate.id === previous?.id) continue;
+          if (subjectsContradict(candidate.subject, subject)) {
+            supersede.run(id, input.now, candidate.id);
+          }
+        }
+      }
       this.db.prepare(
         `INSERT INTO memories (
-           id, scope, kind, subject, body, importance, confidence, source, source_turn_id,
+           id, scope, kind, subject, body, importance, confidence, source, origin, source_turn_id,
            use_count, last_used_at, superseded_by, forgotten_at, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?)`,
       ).run(
         id,
         input.scope,
@@ -3924,6 +4519,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         importance,
         confidence,
         input.source,
+        input.origin ?? null,
         input.sourceTurnId ?? null,
         input.now,
         input.now,
@@ -3938,6 +4534,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     query?: string;
     limit: number;
     now: number;
+    /** Links what was recalled to the turn it informed, so the answer's
+     *  reception can later reinforce or demote exactly those memories. */
+    turnId?: string;
   }): MemoryRecord[] {
     assertMemoryScope(input.scope);
     if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
@@ -3990,7 +4589,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const use = this.db.prepare(
         "UPDATE memories SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
       );
-      for (const candidate of ranked) use.run(input.now, candidate.row.id);
+      const link = this.db.prepare(
+        `INSERT OR IGNORE INTO memory_recalls (turn_id, memory_id, recalled_at, scored_at, outcome)
+         VALUES (?, ?, ?, NULL, NULL)`,
+      );
+      for (const candidate of ranked) {
+        use.run(input.now, candidate.row.id);
+        if (input.turnId !== undefined) link.run(input.turnId, candidate.row.id, input.now);
+      }
       return ranked.map((candidate) => this.requireMemory(candidate.row.id));
     }).immediate();
   }
@@ -4005,6 +4611,98 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.prepare(
       "UPDATE memories SET forgotten_at = ?, updated_at = ? WHERE id = ? AND forgotten_at IS NULL",
     ).run(input.now, input.now, input.id).changes === 1;
+  }
+
+  /**
+   * Ages out memories that were never useful. Confidence decays on idle time
+   * rather than raw age, and only agent-written memories can be tombstoned:
+   * something the owner said out loud must never vanish on a timer.
+   */
+  public curateMemories(input: { now: number }): { decayed: number; tombstoned: number } {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): { decayed: number; tombstoned: number } => {
+      const live = this.db.prepare(
+        `SELECT id, source, confidence, use_count, last_used_at, created_at FROM memories
+          WHERE forgotten_at IS NULL AND superseded_by IS NULL`,
+      ).all() as Pick<MemoryRow, "id" | "source" | "confidence" | "use_count" | "last_used_at" | "created_at">[];
+      const update = this.db.prepare(
+        "UPDATE memories SET confidence = ?, curated_at = ?, updated_at = ? WHERE id = ?",
+      );
+      const tombstone = this.db.prepare(
+        "UPDATE memories SET forgotten_at = ?, curated_at = ?, updated_at = ? WHERE id = ? AND forgotten_at IS NULL",
+      );
+      let decayed = 0;
+      let tombstoned = 0;
+      for (const row of live) {
+        const idleMs = input.now - (row.last_used_at ?? row.created_at);
+        const next = decayedConfidence(row.confidence, idleMs);
+        if (Math.abs(next - row.confidence) > 1e-9) {
+          update.run(next, input.now, input.now, row.id);
+          decayed += 1;
+        }
+        const expendable = row.source === "agent" && row.use_count === 0;
+        if (expendable && next <= MEMORY_TOMBSTONE_CONFIDENCE) {
+          tombstone.run(input.now, input.now, input.now, row.id);
+          tombstoned += 1;
+        }
+      }
+      return { decayed, tombstoned };
+    }).immediate();
+  }
+
+  /** Turns whose recalled memories have not yet been judged by what came next. */
+  public listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
+    const rows = this.db.prepare(
+      `SELECT DISTINCT recall.turn_id AS turnId, turn.controller_key AS controllerKey, turn.ordinal AS ordinal
+         FROM memory_recalls AS recall
+         JOIN controller_turns AS turn ON turn.id = recall.turn_id
+        WHERE recall.scored_at IS NULL AND turn.state IN ('completed', 'failed')
+        ORDER BY recall.recalled_at ASC LIMIT ?`,
+    ).all(limit) as { turnId: string; controllerKey: string; ordinal: number }[];
+    return rows;
+  }
+
+  /** The owner's next message after a turn, which is how that turn is judged. */
+  public getControllerTurnAfter(controllerKey: string, ordinal: number): ControllerTurnRecord | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT * FROM controller_turns
+        WHERE controller_key = ? AND ordinal > ?
+        ORDER BY ordinal ASC LIMIT 1`,
+    ).get(controllerKey, ordinal) as ControllerTurnRow | undefined;
+    return row ? parseControllerTurn(row) : null;
+  }
+
+  public scoreRecalledMemories(input: {
+    turnId: string;
+    outcome: "reinforced" | "demoted";
+    now: number;
+  }): number {
+    if (input.outcome !== "reinforced" && input.outcome !== "demoted") {
+      throw new TypeError("a recall is scored as reinforced or demoted");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    const delta = input.outcome === "reinforced" ? MEMORY_REINFORCEMENT : -MEMORY_DEMOTION;
+    return this.db.transaction((): number => {
+      const recalls = this.db.prepare(
+        "SELECT memory_id FROM memory_recalls WHERE turn_id = ? AND scored_at IS NULL",
+      ).all(input.turnId) as { memory_id: string }[];
+      if (recalls.length === 0) return 0;
+      const read = this.db.prepare("SELECT confidence FROM memories WHERE id = ?");
+      const update = this.db.prepare(
+        "UPDATE memories SET confidence = ?, updated_at = ? WHERE id = ?",
+      );
+      for (const recall of recalls) {
+        const memory = read.get(recall.memory_id) as { confidence: number } | undefined;
+        if (!memory) continue;
+        update.run(adjustedConfidence(memory.confidence, delta), input.now, recall.memory_id);
+      }
+      this.db.prepare(
+        "UPDATE memory_recalls SET scored_at = ?, outcome = ? WHERE turn_id = ? AND scored_at IS NULL",
+      ).run(input.now, input.outcome, input.turnId);
+      return recalls.length;
+    }).immediate();
   }
 
   public countMemories(scope: string): number {
@@ -4336,7 +5034,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .get() as TelegramIdentityRow | undefined;
 
       if (!current) {
-        if (input.hasActiveJob || this.hasActiveJob()) return "active_job_conflict";
+        if (input.hasActiveJob || this.hasUnreleasedAdmissions()) return "active_job_conflict";
         this.db
           .prepare(
             "INSERT INTO telegram_identity (singleton, bot_id, username, verified_at) VALUES (1, ?, ?, ?)",
@@ -4354,7 +5052,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         return "same";
       }
 
-      if (input.hasActiveJob || this.hasActiveJob()) return "active_job_conflict";
+      if (input.hasActiveJob || this.hasUnreleasedAdmissions()) return "active_job_conflict";
 
       this.revokeControllerAccess(input.now);
       this.db
@@ -4381,11 +5079,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return bind();
   }
 
-  private hasActiveJob(): boolean {
+  public hasUnreleasedAdmissions(): boolean {
     return (
       this.db
         .prepare(
-          "SELECT 1 FROM jobs WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed') LIMIT 1",
+          "SELECT 1 FROM job_admissions WHERE state IN ('queued', 'admitted', 'draining') LIMIT 1",
         )
         .get() !== undefined
     );
@@ -4520,8 +5218,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
       const policyRecord = this.getProjectPolicy(input.projectId);
       if (!policyRecord?.policy.enabled) throw new TypeError("Selected project is not enabled");
-      const active = this.getActiveJob();
-      if (active) throw new ActiveJobConflictError(active.id);
 
       const jobId = createHash("sha256")
         .update(`controller-job:${turn.controller_key}:${turn.telegram_update_id}`, "utf8")
@@ -4544,12 +5240,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }, input.now);
       persistJobTransition(this.db, jobId, created.version, selected.job);
       persistPendingEffects(this.db, selected.effects, input.now);
-
-      const confirmed = transition(selected.job, { type: "CONFIRMED" }, input.now);
-      persistJobTransition(this.db, jobId, selected.job.version, confirmed.job);
-      persistPendingEffects(this.db, confirmed.effects, input.now);
-      return confirmed.job;
+      queueAdmissionInTransaction(this.db, {
+        jobId,
+        expectedVersion: selected.job.version,
+        projectId: policyRecord.policy.projectId,
+        resumeEvent: "CONFIRMED",
+        now: input.now,
+      });
+      return selected.job;
     }).immediate();
+  }
+
+  public selectProjectAndQueueAdmission(input: {
+    jobId: string;
+    expectedVersion: number;
+    projectId: string;
+    policyVersion: number;
+    policy: ProjectPolicy;
+    now: number;
+  }): Job {
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    assertPositiveInteger(input.expectedVersion, "expectedVersion");
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertPositiveInteger(input.policyVersion, "policyVersion");
+    assertNonNegativeInteger(input.now, "now");
+
+    const select = this.db.transaction((): Job => {
+      const current = this.readJobById(input.jobId);
+      if (!current) throw new Error(`Job ${input.jobId} was not found`);
+      if (current.version !== input.expectedVersion) throw new VersionConflictError(input.jobId, input.expectedVersion);
+
+      let selected = current;
+      if (current.state === "awaiting_project") {
+        const transitioned = transition(current, {
+          type: "PROJECT_SELECTED",
+          projectId: input.projectId,
+          policyVersion: input.policyVersion,
+          policy: input.policy,
+        }, input.now);
+        persistJobTransition(this.db, input.jobId, current.version, transitioned.job);
+        persistPendingEffects(this.db, transitioned.effects, input.now);
+        selected = transitioned.job;
+      } else if (
+        current.state !== "awaiting_confirmation" ||
+        current.projectId !== input.projectId ||
+        current.policyVersion !== input.policyVersion ||
+        current.policy?.projectId !== input.projectId
+      ) {
+        throw new AutonomyAdmissionConflictError(input.jobId, "project selection is no longer current");
+      }
+
+      queueAdmissionInTransaction(this.db, {
+        jobId: input.jobId,
+        expectedVersion: selected.version,
+        projectId: input.projectId,
+        resumeEvent: "CONFIRMED",
+        now: input.now,
+      });
+      return selected;
+    });
+    return select.immediate();
   }
 
   public createJob(input: {
@@ -4736,8 +5486,146 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!Number.isInteger(limit) || limit < 1) throw new TypeError("limit must be a positive integer");
     const rows = this.db
       .prepare(`${JOB_SELECT} ORDER BY updated_at DESC, id DESC LIMIT ?`)
-      .all(limit) as JobRow[];
+      .all(Math.min(limit, MAX_AUTONOMY_ROWS)) as JobRow[];
     return rows.map(parseJob);
+  }
+
+  public listLegacyActiveJobs(limit: number): Job[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("limit must be a positive safe integer");
+    const rows = this.db
+      .prepare(
+        `${JOB_SELECT}
+          WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+            AND NOT EXISTS (SELECT 1 FROM job_admissions WHERE job_id = jobs.id)
+          ORDER BY updated_at ASC, id ASC
+          LIMIT ?`,
+      )
+      .all(Math.min(limit, MAX_AUTONOMY_ROWS)) as JobRow[];
+    return rows.map(parseJob);
+  }
+
+  public listControlJobs(kind: JobControlKind, limit: number): Job[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("limit must be a positive safe integer");
+    const predicate = this.controlJobPredicate(kind);
+    const rows = this.db
+      .prepare(
+        `SELECT job.*
+           FROM (${JOB_SELECT}) AS job
+           JOIN job_admissions AS admission ON admission.job_id = job.id
+          WHERE admission.state IN ('queued', 'admitted', 'draining') AND ${predicate}
+          ORDER BY admission.queue_seq ASC, admission.job_id ASC
+          LIMIT ?`,
+      )
+      .all(Math.min(limit, MAX_AUTONOMY_ROWS)) as JobRow[];
+    return rows.map(parseJob);
+  }
+
+  public countControlJobs(kind: JobControlKind): number {
+    const predicate = this.controlJobPredicate(kind);
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+           FROM jobs AS job
+           JOIN job_admissions AS admission ON admission.job_id = job.id
+          WHERE admission.state IN ('queued', 'admitted', 'draining') AND ${predicate}`,
+      )
+      .get() as { count: number };
+    return row.count;
+  }
+
+  private controlJobPredicate(kind: JobControlKind): string {
+    if (kind === "status") return "1 = 1";
+    if (kind === "retry") return "job.state = 'failed' AND job.cancel_requested_at IS NULL";
+    if (kind === "cancel") {
+      return "job.state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed') AND job.cancel_requested_at IS NULL";
+    }
+    throw new TypeError("unknown job control kind");
+  }
+
+  public getAdmission(jobId: string): JobAdmission | null {
+    return this.autonomyRepository.getAdmission(jobId);
+  }
+
+  public queueAdmission(input: AdmissionWriteInput): JobAdmission {
+    return this.autonomyRepository.queueAdmission(input);
+  }
+
+  public requeueAdmission(input: AdmissionWriteInput): JobAdmission {
+    return this.autonomyRepository.requeueAdmission(input);
+  }
+
+  public requeueReviewAdmission(jobId: string, expectedVersion: number, now: number): ReviewAdmissionResult {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    assertPositiveInteger(expectedVersion, "expectedVersion");
+    assertNonNegativeInteger(now, "now");
+
+    const job = this.readJobById(jobId);
+    const admission = this.autonomyRepository.getAdmission(jobId);
+    if (!job || job.version !== expectedVersion || job.state !== "blocked" || job.blockedReason !== "review_limit" || !admission) {
+      return { outcome: "unavailable" };
+    }
+    if (job.projectId !== admission.projectId || job.policy?.projectId !== admission.projectId) {
+      return { outcome: "unavailable" };
+    }
+    if (admission.state === "draining") return { outcome: "still_cleaning_up", admission };
+    if (admission.state === "queued") {
+      return admission.resumeEvent === "CONTINUE_REVIEW"
+        ? { outcome: "queued", admission }
+        : { outcome: "unavailable" };
+    }
+    if (admission.state !== "released") return { outcome: "unavailable" };
+
+    try {
+      return {
+        outcome: "queued",
+        admission: this.autonomyRepository.requeueAdmission({
+          jobId,
+          expectedVersion,
+          projectId: admission.projectId,
+          resumeEvent: "CONTINUE_REVIEW",
+          now,
+        }),
+      };
+    } catch (error) {
+      if (error instanceof AutonomyAdmissionConflictError) return { outcome: "unavailable" };
+      throw error;
+    }
+  }
+
+  public listAdmissions(states: readonly AdmissionState[], limit: number): JobAdmission[] {
+    return this.autonomyRepository.listAdmissions(states, limit);
+  }
+
+  public listReleaseCandidates(limit: number): JobAdmission[] {
+    return this.autonomyRepository.listReleaseCandidates(limit);
+  }
+
+  public listHeldResourceClaims(jobId: string | null, limit: number): JobResourceClaim[] {
+    return this.autonomyRepository.listHeldClaims(jobId, limit);
+  }
+
+  public listCurrentHeldResourceClaims(jobId: string, limit: number): JobResourceClaim[] {
+    return this.autonomyRepository.listCurrentHeldClaims(jobId, limit);
+  }
+
+  public listCurrentHeldMergeResourceClaims(input: CurrentHeldMergeResourceClaimsInput): JobResourceClaim[] {
+    return this.autonomyRepository.listCurrentHeldMergeClaims(input);
+  }
+
+  public adoptHeldClaims(input: ClaimAdoptionInput): boolean {
+    return this.autonomyRepository.adoptHeldClaims(input);
+  }
+
+  public listActiveJobs(limit: number): Job[] {
+    return this.autonomyRepository.listActiveJobs(limit);
+  }
+
+  public findJobByStatusMessageId(messageId: number): Job | null {
+    return this.autonomyRepository.findJobByStatusMessageId(messageId);
+  }
+
+  public tryAdmit(input: AdmissionAttemptInput): AdmissionAttempt {
+    return this.autonomyRepository.tryAdmit(input);
   }
 
   public applyJobEvent(
@@ -4746,20 +5634,167 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     event: JobEvent,
     now: number,
   ): Job {
+    if (event.type === "CONFIRMED" || event.type === "CONTINUE_REVIEW") {
+      throw new AdmissionRequiredError(event.type);
+    }
+    if (FENCED_JOB_EVENT_TYPES.has(event.type)) {
+      throw new Error(`${event.type} must be applied through its fenced executor API`);
+    }
     const apply = this.db.transaction((): Job => {
       const current = this.readJobById(jobId);
       if (!current) throw new Error(`Job ${jobId} was not found`);
       if (current.version !== expectedVersion) throw new VersionConflictError(jobId, expectedVersion);
-      if (current.state === "blocked" && event.type === "CONTINUE_REVIEW" && this.hasActiveJobExcluding(jobId)) {
-        throw new ActiveJobConflictError(jobId);
-      }
 
       const transitioned = transition(current, event, now);
       persistJobTransition(this.db, jobId, expectedVersion, transitioned.job);
       persistPendingEffects(this.db, transitioned.effects, now);
+      this.markAdmissionDrainingForTerminal(transitioned.job, now);
       return transitioned.job;
     });
     return apply();
+  }
+
+  public applyExecutorJobEvent(input: ExecutorEventInput): Job | null {
+    this.assertExecutorFence(input);
+    if (input.event.type === "CONFIRMED" || input.event.type === "CONTINUE_REVIEW") {
+      throw new AdmissionRequiredError(input.event.type);
+    }
+    const apply = this.db.transaction((): Job | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      const current = this.readJobById(input.jobId);
+      if (!current || current.version !== input.expectedVersion) return null;
+
+      const transitioned = transition(current, input.event, input.now);
+      const terminalProductionState = current.policy?.production !== undefined &&
+        PRODUCTION_LIFECYCLE_EVENT_TYPES.has(input.event.type) &&
+        (transitioned.job.state === "complete" || transitioned.job.state === "production_failed");
+      const productionClaimId = terminalProductionState
+        ? this.currentProductionClaimIdInTransaction(current, input.ownerId, input.generation, input.now)
+        : null;
+      if (terminalProductionState && productionClaimId === null) return null;
+      persistJobTransition(this.db, input.jobId, input.expectedVersion, transitioned.job);
+      persistPendingEffects(this.db, transitioned.effects, input.now);
+      if (terminalProductionState) {
+        const settled = this.db
+          .prepare(
+            `UPDATE job_resource_claims
+                SET state = 'released', lease_expires_at = 0, released_at = ?, release_reason = ?
+              WHERE claim_id = ? AND job_id = ? AND resource_kind = 'production_target'
+                AND state = 'held' AND owner_id = ? AND generation = ? AND lease_expires_at > ?`,
+          )
+          .run(
+            input.now,
+            transitioned.job.state === "complete" ? "complete" : "production_failed",
+            productionClaimId,
+            current.id,
+            input.ownerId,
+            input.generation,
+            input.now,
+          );
+        if (settled.changes !== 1) throw new ProductionSettlementConflictError();
+      }
+      this.markAdmissionDrainingForTerminal(transitioned.job, input.now);
+      return transitioned.job;
+    });
+    try {
+      return apply.immediate();
+    } catch (error) {
+      if (error instanceof ProductionSettlementConflictError) return null;
+      throw error;
+    }
+  }
+
+  public beginDraining(input: ExecutorFence & Readonly<{ jobId: string }>): Job | null {
+    this.assertExecutorFence(input);
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    const begin = this.db.transaction((): Job | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      const job = this.readJobById(input.jobId);
+      const admission = this.autonomyRepository.getAdmission(input.jobId);
+      const queuedCancellation = admission?.state === "queued" && job !== null && job.cancelRequestedAt !== null;
+      if (!job || (!isReleaseCandidate(job.state) && !queuedCancellation)) return null;
+      this.autonomyRepository.markDrainingInTransaction(input.jobId, input.now);
+      return job;
+    });
+    return begin.immediate();
+  }
+
+  public finalizeRelease(input: ExecutorFence & Readonly<{ jobId: string }>): ReleaseResult | null {
+    this.assertExecutorFence(input);
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    const finalize = this.db.transaction((): ReleaseResult | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      const job = this.readJobById(input.jobId);
+      const admission = this.autonomyRepository.getAdmission(input.jobId);
+      if (!job || !admission) return null;
+      if (admission.state === "released") return { outcome: "released", admission };
+      const queuedCancellation = admission.state === "queued" && job.cancelRequestedAt !== null;
+      if (!isReleaseCandidate(job.state) && !queuedCancellation) return null;
+
+      const liveness = this.getWorkerLiveness(input.jobId);
+      if (liveness && ["active", "starting", "stopping"].includes(liveness.state)) {
+        return { outcome: "waiting", reason: "worker_active" };
+      }
+      if (liveness && ["unknown", "stale"].includes(liveness.state)) {
+        return { outcome: "waiting", reason: "worker_unknown" };
+      }
+
+      const unsettledControls = this.db
+        .prepare(
+          `SELECT 1 FROM effects
+             WHERE job_id = ? AND kind IN ('render_status', 'revoke_approvals')
+               AND status NOT IN ('done', 'dead')
+             LIMIT 1`,
+        )
+        .get(input.jobId);
+      if (unsettledControls) return { outcome: "waiting", reason: "safe_cleanup" };
+
+      const unresolvedEffects = this.db
+        .prepare(
+          `SELECT 1 FROM effects
+             WHERE job_id = ? AND kind IN ('merge_pr', 'deploy_production', 'verify_production')
+               AND (
+                 status IN ('pending', 'failed')
+                 OR (status = 'leased' AND lease_expires_at > ?)
+               )
+             LIMIT 1`,
+        )
+        .get(input.jobId, input.now);
+      if (unresolvedEffects) return { outcome: "waiting", reason: "unresolved_effect" };
+
+      if (queuedCancellation && job.state !== "cancelled") {
+        const transitioned = transition(job, { type: "CANCEL_CONFIRMED" }, input.now);
+        persistJobTransition(this.db, input.jobId, job.version, transitioned.job);
+        persistPendingEffects(this.db, transitioned.effects, input.now);
+        return { outcome: "waiting", reason: "safe_cleanup" };
+      }
+
+      this.autonomyRepository.markDrainingInTransaction(input.jobId, input.now);
+      this.db
+        .prepare(
+          `UPDATE effects
+              SET status = 'done', lease_owner = NULL, lease_generation = NULL,
+                  lease_expires_at = NULL, last_error = 'superseded:job_released', updated_at = ?
+            WHERE job_id = ?
+              AND kind NOT IN ('render_status', 'revoke_approvals')
+              AND (
+                status IN ('pending', 'failed')
+                OR (status = 'leased' AND lease_expires_at <= ?)
+              )`,
+        )
+        .run(input.now, input.jobId, input.now);
+      this.db
+        .prepare(
+          `UPDATE job_resource_claims
+              SET state = 'released', lease_expires_at = 0, released_at = ?, release_reason = ?
+            WHERE job_id = ? AND state = 'held'`,
+        )
+        .run(input.now, "job_released", input.jobId);
+      const released = this.autonomyRepository.releaseInTransaction(input.jobId, input.now, "job_released");
+      if (!released) return null;
+      return { outcome: "released", admission: released };
+    });
+    return finalize.immediate();
   }
 
   public listEffectsForJob(jobId: string): StoredEffect[] {
@@ -4881,6 +5916,32 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return stored;
   }
 
+  public createExecutorAttempt(input: ExecutorAttemptInput): AttemptRecord | null {
+    this.assertExecutorFence(input);
+    if (!input.id || !input.jobId) throw new TypeError("attempt identity is required");
+    if (!Number.isInteger(input.ordinal) || input.ordinal < 1) {
+      throw new TypeError("attempt ordinal must be a positive integer");
+    }
+    if (input.headSha !== undefined && input.headSha !== null) assertFullSha(input.headSha, "headSha");
+    const create = this.db.transaction((): AttemptRecord | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO attempts (
+             id, job_id, kind, ordinal, head_sha, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.id, input.jobId, input.kind, input.ordinal, input.headSha ?? null, input.now);
+      const stored = this.getAttempt(input.id);
+      if (!stored) throw new Error("Attempt was not stored");
+      if (stored.jobId !== input.jobId || stored.kind !== input.kind || stored.ordinal !== input.ordinal) {
+        throw new IdempotencyConflictError(input.ordinal);
+      }
+      return stored;
+    });
+    return create.immediate();
+  }
+
   public updateAttempt(attemptId: string, patch: {
     threadId?: string | null;
     headSha?: string | null;
@@ -4913,6 +5974,28 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return stored;
   }
 
+  public updateExecutorAttempt(input: ExecutorAttemptPatch): AttemptRecord | null {
+    this.assertExecutorFence(input);
+    if (!input.attemptId) throw new TypeError("attemptId must not be empty");
+    this.validateAttemptPatch(input.patch);
+    const update = this.db.transaction((): AttemptRecord | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      if (!input.jobId) return null;
+      const attempt = this.getAttempt(input.attemptId);
+      if (!attempt || attempt.jobId !== input.jobId) return null;
+      const fields: string[] = [];
+      const values: unknown[] = [];
+      this.appendAttemptPatch(fields, values, input.patch);
+      if (fields.length > 0) {
+        values.push(input.attemptId, input.jobId);
+        this.db.prepare(`UPDATE attempts SET ${fields.join(", ")} WHERE id = ? AND job_id = ?`).run(...values);
+      }
+      const updated = this.getAttempt(input.attemptId);
+      return updated?.jobId === input.jobId ? updated : null;
+    });
+    return update.immediate();
+  }
+
   public createPipelineStageAttempt(input: ControllerLeaseFence & {
     id: string;
     jobId: string;
@@ -4931,6 +6014,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction((): PipelineStageAttempt => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) {
         throw new Error("executor lease was lost");
+      }
+      if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) {
+        throw new Error("production claim fence was lost");
       }
       this.db.prepare(
         `INSERT OR IGNORE INTO pipeline_stage_attempts (
@@ -4956,6 +6042,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
       const current = this.getPipelineStageAttempt(input.id);
       if (!current) return false;
       if (current.threadId !== null || current.environmentId !== null) {
@@ -4995,6 +6082,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
       const current = this.getPipelineStageAttempt(input.id);
       if (!current) return false;
       if (current.resourceKind !== null || current.resourceId !== null) {
@@ -5048,6 +6136,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         return current.outputText === input.outputText && current.outputSha256 === input.outputSha256 &&
           JSON.stringify(current.outcome) === outcomeJson;
       }
+      if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
       return this.db.prepare(
         `UPDATE pipeline_stage_attempts
            SET state = 'completed', output_text = ?, output_sha256 = ?, outcome_json = ?,
@@ -5075,21 +6164,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!input.id) throw new TypeError("pipeline stage id is required");
     assertSafeFailureSummary(input.error);
     assertNonNegativeInteger(input.now, "now");
-    return this.db.prepare(
-      `UPDATE pipeline_stage_attempts
-         SET state = 'failed', last_error = ?, completed_at = ?, updated_at = ?
-       WHERE id = ? AND state IN ('spawning', 'running')
-         AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
-           AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
-    ).run(
-      input.error,
-      input.now,
-      input.now,
-      input.id,
-      input.ownerId,
-      input.generation,
-      input.now,
-    ).changes === 1;
+    const fail = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        `UPDATE pipeline_stage_attempts
+           SET state = 'failed', last_error = ?, completed_at = ?, updated_at = ?
+         WHERE id = ? AND state IN ('spawning', 'running')
+           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+      ).run(
+        input.error,
+        input.now,
+        input.now,
+        input.id,
+        input.ownerId,
+        input.generation,
+        input.now,
+      ).changes === 1;
+    });
+    return fail.immediate();
   }
 
   public getPipelineStageAttempt(id: string): PipelineStageAttempt | null {
@@ -5125,26 +6219,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public claimReviewFormatCorrection(attemptId: string, threadId: string, headSha: string): boolean {
     if (!attemptId || !threadId) throw new TypeError("review correction identity is required");
     assertFullSha(headSha, "headSha");
-    const claim = this.db.transaction((): boolean => {
-      const attempt = this.getAttempt(attemptId);
-      if (!attempt || attempt.kind !== "review" || attempt.threadId !== threadId || attempt.headSha !== headSha) return false;
-      let current: Record<string, unknown> = {};
-      if (attempt.resultJson !== null) {
-        try {
-          const parsed = JSON.parse(attempt.resultJson);
-          if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-          current = parsed as Record<string, unknown>;
-        } catch {
-          return false;
-        }
-      }
-      if (current.formatCorrectionSent === true) return false;
-      const updated = this.db
-        .prepare("UPDATE attempts SET result_json = ? WHERE id = ? AND thread_id = ? AND head_sha = ?")
-        .run(serializeBoundedJson({ ...current, formatCorrectionSent: true }, "attempt result", MAX_MERGE_RESULT_JSON), attemptId, threadId, headSha);
-      return updated.changes === 1;
-    });
+    const claim = this.db.transaction(() => this.claimReviewFormatCorrectionInTransaction(attemptId, threadId, headSha));
     return claim();
+  }
+
+  public claimExecutorReviewFormatCorrection(input: ExecutorReviewFormatCorrectionInput): boolean {
+    this.assertExecutorFence(input);
+    if (!input.attemptId || !input.threadId) throw new TypeError("review correction identity is required");
+    assertFullSha(input.headSha, "headSha");
+    const claim = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      if (!input.jobId) return false;
+      return this.claimReviewFormatCorrectionInTransaction(input.attemptId, input.threadId, input.headSha, input.jobId);
+    });
+    return claim.immediate();
   }
 
   public registerReviewThread(jobId: string, expectedVersion: number, threadId: string, now: number): Job {
@@ -5161,6 +6249,65 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const stored = this.readJobById(jobId);
     if (!stored) throw new Error(`Job ${jobId} was not found after review-thread registration`);
     return stored;
+  }
+
+  public registerExecutorReviewThread(input: ExecutorReviewThreadInput): Job | null {
+    this.assertExecutorFence(input);
+    if (!input.jobId || !input.threadId) throw new TypeError("jobId and threadId are required");
+    if (!Number.isInteger(input.expectedVersion) || input.expectedVersion < 1) {
+      throw new TypeError("expectedVersion must be a positive integer");
+    }
+    const register = this.db.transaction((): Job | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      const updated = this.db
+        .prepare(
+          `UPDATE jobs SET review_thread_id = ?, version = ?, updated_at = ?
+             WHERE id = ? AND version = ?`,
+        )
+        .run(input.threadId, input.expectedVersion + 1, input.now, input.jobId, input.expectedVersion);
+      if (updated.changes !== 1) return null;
+      return this.readJobById(input.jobId);
+    });
+    return register.immediate();
+  }
+
+  public createExecutorApproval(input: ExecutorApprovalInput): boolean {
+    this.assertExecutorFence(input);
+    this.validateApprovalInput(input);
+    const create = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      this.createApprovalInTransaction(input);
+      return true;
+    });
+    return create.immediate();
+  }
+
+  public revokeExecutorApprovals(input: ExecutorApprovalRevocationInput): number | null {
+    this.assertExecutorFence(input);
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    assertSafeFailureSummary(input.reason);
+    assertNoRawMergeCallback(input.reason, "approval outcome");
+    const revoke = this.db.transaction((): number | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      return this.db
+        .prepare(
+          `UPDATE approvals SET consumed_at = ?, outcome = ?
+             WHERE job_id = ? AND consumed_at IS NULL`,
+        )
+        .run(input.now, input.reason, input.jobId).changes;
+    });
+    return revoke.immediate();
+  }
+
+  public enqueueExecutorStatus(input: ExecutorStatusOutboxInput): boolean {
+    this.assertExecutorFence(input);
+    const payloadJson = serializeOutbox(input.outbox, input.now);
+    const enqueue = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      persistOutbox(this.db, input.outbox, payloadJson, input.now);
+      return true;
+    });
+    return enqueue.immediate();
   }
 
   public acquireExecutorLease(
@@ -5216,23 +6363,364 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.executorLeaseIsCurrent(ownerId, generation, now);
   }
 
+  public leaseControlEffects(input: ControlEffectLeaseInput): StoredEffect[] {
+    this.assertLeaseInput(input.ownerId, input.now, input.leaseMs);
+    assertPositiveInteger(input.generation, "generation");
+    assertPositiveInteger(input.limit, "limit");
+    if (input.limit > MAX_AUTONOMY_ROWS) throw new TypeError("limit must not exceed 100");
+    const limit = Math.min(input.limit, 8);
+    const rawBusyJobIds = input.busyJobIds ?? [];
+    if (!Array.isArray(rawBusyJobIds) || rawBusyJobIds.length > MAX_AUTONOMY_ROWS) {
+      throw new TypeError("busyJobIds must contain at most 100 job ids");
+    }
+    for (const jobId of rawBusyJobIds) {
+      if (typeof jobId !== "string" || !jobId || jobId.length > 256) {
+        throw new TypeError("busy job id is invalid");
+      }
+    }
+    const busyJobIds = [...new Set(rawBusyJobIds)];
+    const lease = this.db.transaction((): StoredEffect[] => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return [];
+      const exclusion = busyJobIds.length === 0
+        ? ""
+        : ` AND e.job_id NOT IN (${busyJobIds.map(() => "?").join(", ")})`;
+      const rows = this.db
+        .prepare(
+          `SELECT e.* FROM effects AS e
+             JOIN job_admissions AS admission ON admission.job_id = e.job_id
+             JOIN jobs AS job ON job.id = e.job_id
+            WHERE (
+                admission.state IN ('queued', 'admitted', 'draining')
+                OR (
+                  admission.state = 'released'
+                  AND job.state IN ('blocked', 'cancelled', 'merged', 'production_failed', 'complete')
+                  AND e.idempotency_key = e.job_id || ':' || job.version || ':render_status'
+                )
+              )
+              AND e.kind IN ('render_status', 'revoke_approvals')
+              AND (
+                (e.status IN ('pending', 'failed') AND e.next_attempt_at <= ?)
+                OR (e.status = 'leased' AND e.lease_expires_at <= ?)
+              )${exclusion}
+            ORDER BY e.created_at ASC, e.idempotency_key ASC
+            LIMIT ?`,
+        )
+        .all(input.now, input.now, ...busyJobIds, limit) as EffectRow[];
+      const leased: StoredEffect[] = [];
+      for (const row of rows) {
+        if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) break;
+        const effect = parseEffect(row);
+        const admission = this.autonomyRepository.getAdmission(effect.jobId);
+        if (!admission || !isSafeControlEffect(effect.kind)) continue;
+        const updated = this.db
+          .prepare(
+            `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+               lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+             WHERE idempotency_key = ? AND (
+               (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+               OR (status = 'leased' AND lease_expires_at <= ?)
+             )`,
+          )
+          .run(
+            input.ownerId,
+            input.generation,
+            input.now + input.leaseMs,
+            input.now,
+            effect.idempotencyKey,
+            input.now,
+            input.now,
+          );
+        if (updated.changes !== 1) continue;
+        const claimed = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?").get(effect.idempotencyKey) as EffectRow;
+        leased.push(parseEffect(claimed));
+      }
+      return leased;
+    });
+    return lease.immediate();
+  }
+
+  public leaseNextJobEffect(input: JobEffectLeaseInput): StoredEffect | null {
+    this.assertLeaseInput(input.ownerId, input.now, input.leaseMs);
+    assertPositiveInteger(input.generation, "generation");
+    if (!input.jobId || input.jobId.length > 256) throw new TypeError("jobId is invalid");
+    const lease = this.db.transaction((): StoredEffect | null => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      const admission = this.autonomyRepository.getAdmission(input.jobId);
+      if (!admission || admission.state === "queued" || admission.state === "released") return null;
+      const requiredProjectClaim = this.db
+        .prepare(
+          `SELECT 1 FROM job_resource_claims
+             WHERE job_id = ? AND resource_key = ? AND resource_kind = 'project'
+               AND state = 'held' AND owner_id = ? AND generation = ?
+               AND lease_expires_at > ?
+             LIMIT 1`,
+        )
+        .get(
+          input.jobId,
+          projectResourceKey(admission.projectId),
+          input.ownerId,
+          input.generation,
+          input.now,
+        );
+      if (!requiredProjectClaim) return null;
+      const tracked = this.db
+        .prepare(
+          `SELECT 1 FROM effects
+            WHERE job_id = ? AND status = 'leased' AND lease_expires_at > ?
+            LIMIT 1`,
+        )
+        .get(input.jobId, input.now);
+      if (tracked) return null;
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM effects
+             WHERE job_id = ? AND (
+               (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+               OR (status = 'leased' AND lease_expires_at <= ?)
+             )
+            ORDER BY created_at ASC, idempotency_key ASC
+            LIMIT 100`,
+        )
+        .all(input.jobId, input.now, input.now) as EffectRow[];
+      const worker = this.getWorkerLiveness(input.jobId);
+      for (const row of rows) {
+        const effect = parseEffect(row);
+        if (!admissionAllowsEffect(admission, effect, worker)) continue;
+        if (effect.kind === "merge_pr" || effect.kind === "deploy_production" || effect.kind === "verify_production") {
+          const job = this.readJobById(effect.jobId);
+          if (!job || !this.admissionJobPolicyIdentityIsValid(admission, job)) return null;
+          if (effect.kind === "merge_pr") {
+            this.acquireMergeResourceClaimsInTransaction(input, effect, job);
+          } else if (!this.productionClaimIsCurrentInTransaction(job, input.ownerId, input.generation, input.now)) {
+            continue;
+          }
+        }
+        const updated = this.db
+          .prepare(
+            `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+               lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+             WHERE idempotency_key = ? AND job_id = ? AND (
+               (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+               OR (status = 'leased' AND lease_expires_at <= ?)
+             )`,
+          )
+          .run(
+            input.ownerId,
+            input.generation,
+            input.now + input.leaseMs,
+            input.now,
+            effect.idempotencyKey,
+            input.jobId,
+            input.now,
+            input.now,
+          );
+        if (updated.changes !== 1) {
+          if (effect.kind === "merge_pr") throw new MergeClaimConflictError();
+          continue;
+        }
+        const claimed = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?").get(effect.idempotencyKey) as EffectRow;
+        return parseEffect(claimed);
+      }
+      return null;
+    });
+    try {
+      return lease.immediate();
+    } catch (error) {
+      if (error instanceof MergeClaimConflictError) return null;
+      throw error;
+    }
+  }
+
+  public renewJobOperationFences(input: JobOperationFenceRenewalInput): boolean {
+    this.assertLeaseInput(input.ownerId, input.now, input.leaseMs);
+    assertPositiveInteger(input.generation, "generation");
+    if (!input.jobId || !input.effectIdempotencyKey) throw new TypeError("job operation identity is required");
+    const renew = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const effect = this.db
+        .prepare(
+          `SELECT kind, status, lease_owner, lease_generation, lease_expires_at
+             FROM effects WHERE job_id = ? AND idempotency_key = ?`,
+        )
+        .get(input.jobId, input.effectIdempotencyKey) as {
+          kind: string;
+          status: string;
+          lease_owner: string | null;
+          lease_generation: number | null;
+          lease_expires_at: number | null;
+        } | undefined;
+      if (!effect || effect.status !== "leased" || effect.lease_owner !== input.ownerId ||
+        effect.lease_generation !== input.generation || effect.lease_expires_at === null || effect.lease_expires_at <= input.now) {
+        return false;
+      }
+      if (effect.kind === "deploy_production" || effect.kind === "verify_production") {
+        const job = this.readJobById(input.jobId);
+        const admission = this.autonomyRepository.getAdmission(input.jobId);
+        if (!job || !admission || !this.admissionJobPolicyIdentityIsValid(admission, job) ||
+          !this.productionClaimIsCurrentInTransaction(job, input.ownerId, input.generation, input.now)) return false;
+      }
+      const claims = this.db
+        .prepare(
+          `SELECT claim_id, owner_id, generation FROM job_resource_claims
+             WHERE job_id = ? AND state = 'held'`,
+        )
+        .all(input.jobId) as Array<{ claim_id: number; owner_id: string; generation: number }>;
+      if (claims.some((claim) => claim.owner_id !== input.ownerId || claim.generation !== input.generation)) return false;
+      const updatedEffect = this.db
+        .prepare(
+          `UPDATE effects SET lease_expires_at = ?, updated_at = ?
+             WHERE job_id = ? AND idempotency_key = ? AND status = 'leased'
+               AND lease_owner = ? AND lease_generation = ? AND lease_expires_at > ?
+               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+                 AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+        )
+        .run(
+          input.now + input.leaseMs,
+          input.now,
+          input.jobId,
+          input.effectIdempotencyKey,
+          input.ownerId,
+          input.generation,
+          input.now,
+          input.ownerId,
+          input.generation,
+          input.now,
+        );
+      if (updatedEffect.changes !== 1) return false;
+      if (claims.length === 0) return true;
+      const renewedClaims = this.db
+        .prepare(
+          `UPDATE job_resource_claims SET lease_expires_at = ?, renewed_at = ?
+             WHERE job_id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+                 AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+        )
+        .run(
+          input.now + input.leaseMs,
+          input.now,
+          input.jobId,
+          input.ownerId,
+          input.generation,
+          input.ownerId,
+          input.generation,
+          input.now,
+        );
+      return renewedClaims.changes === claims.length;
+    });
+    return renew.immediate();
+  }
+
+  public assertProductionStageFence(input: ProductionStageFenceInput): boolean {
+    this.assertExecutorFence(input);
+    if (!input.jobId || !input.effectIdempotencyKey) throw new TypeError("production stage identity is required");
+    const check = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const effect = this.db
+        .prepare(
+          `SELECT job_id, kind, status, lease_owner, lease_generation, lease_expires_at
+             FROM effects WHERE job_id = ? AND idempotency_key = ?`,
+        )
+        .get(input.jobId, input.effectIdempotencyKey) as {
+          job_id: string;
+          kind: string;
+          status: string;
+          lease_owner: string | null;
+          lease_generation: number | null;
+          lease_expires_at: number | null;
+        } | undefined;
+      if (!effect || effect.job_id !== input.jobId ||
+        (effect.kind !== "deploy_production" && effect.kind !== "verify_production") ||
+        effect.status !== "leased" || effect.lease_owner !== input.ownerId ||
+        effect.lease_generation !== input.generation || effect.lease_expires_at === null ||
+        effect.lease_expires_at <= input.now) return false;
+      const job = this.readJobById(input.jobId);
+      const admission = this.autonomyRepository.getAdmission(input.jobId);
+      if (!job || !admission || !this.admissionJobPolicyIdentityIsValid(admission, job)) return false;
+      const expectedState = effect.kind === "deploy_production" ? "deploying" : "verifying_production";
+      return job.state === expectedState &&
+        this.productionClaimIsCurrentInTransaction(job, input.ownerId, input.generation, input.now);
+    });
+    return check.immediate();
+  }
+
+  public renewControlEffectFence(input: ControlEffectFenceRenewalInput): boolean {
+    this.assertLeaseInput(input.ownerId, input.now, input.leaseMs);
+    assertPositiveInteger(input.generation, "generation");
+    if (!input.jobId || !input.effectIdempotencyKey) throw new TypeError("job operation identity is required");
+    const renew = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const effect = this.db
+        .prepare(
+          `SELECT kind, status, lease_owner, lease_generation, lease_expires_at
+             FROM effects WHERE job_id = ? AND idempotency_key = ?`,
+        )
+        .get(input.jobId, input.effectIdempotencyKey) as {
+          kind: string;
+          status: string;
+          lease_owner: string | null;
+          lease_generation: number | null;
+          lease_expires_at: number | null;
+        } | undefined;
+      if (!effect || !isSafeControlEffect(effect.kind as JobEffect["kind"]) || effect.status !== "leased" ||
+        effect.lease_owner !== input.ownerId || effect.lease_generation !== input.generation ||
+        effect.lease_expires_at === null || effect.lease_expires_at <= input.now) {
+        return false;
+      }
+      const updated = this.db
+        .prepare(
+          `UPDATE effects SET lease_expires_at = ?, updated_at = ?
+             WHERE job_id = ? AND idempotency_key = ? AND status = 'leased'
+               AND lease_owner = ? AND lease_generation = ? AND lease_expires_at > ?
+               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+                 AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+        )
+        .run(
+          input.now + input.leaseMs,
+          input.now,
+          input.jobId,
+          input.effectIdempotencyKey,
+          input.ownerId,
+          input.generation,
+          input.now,
+          input.ownerId,
+          input.generation,
+          input.now,
+        );
+      return updated.changes === 1;
+    });
+    return renew.immediate();
+  }
+
+  /** @deprecated Test-only compatibility wrapper; executor production code uses state-aware leasing. */
   public leaseEffects(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredEffect[] {
     this.assertLeaseInput(ownerId, now, leaseMs);
     assertPositiveInteger(generation, "generation");
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
-    return this.db.transaction((): StoredEffect[] => {
-      if (!this.executorLeaseIsCurrent(ownerId, generation, now)) return [];
-      const rows = this.db
-        .prepare(
-          `SELECT * FROM effects
-             WHERE (status IN ('pending', 'failed') AND next_attempt_at <= ?)
-                OR (status = 'leased' AND lease_expires_at <= ?)
-             ORDER BY created_at ASC, idempotency_key ASC LIMIT ?`,
-        )
-        .all(now, now, limit) as EffectRow[];
-      const result: StoredEffect[] = [];
-      for (const row of rows) {
-        if (!this.executorLeaseIsCurrent(ownerId, generation, now)) break;
+    if (!this.executorLeaseIsCurrent(ownerId, generation, now)) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM effects
+           WHERE (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+              OR (status = 'leased' AND lease_expires_at <= ?)
+           ORDER BY created_at ASC, idempotency_key ASC LIMIT ?`,
+      )
+      .all(now, now, limit) as EffectRow[];
+    const result: StoredEffect[] = [];
+    for (const row of rows) {
+      if (!this.executorLeaseIsCurrent(ownerId, generation, now)) break;
+      if (row.kind === "merge_pr" || row.kind === "deploy_production" || row.kind === "verify_production") {
+        const claimed = this.leaseNextJobEffect({
+          jobId: row.job_id,
+          ownerId,
+          generation,
+          now,
+          leaseMs,
+        });
+        if (claimed?.idempotencyKey === row.idempotency_key) result.push(claimed);
+        continue;
+      }
+      const claimed = this.db.transaction((): StoredEffect | null => {
+        if (!this.executorLeaseIsCurrent(ownerId, generation, now)) return null;
         const updated = this.db
           .prepare(
             `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
@@ -5243,12 +6731,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
              )`,
           )
           .run(ownerId, generation, now + leaseMs, now, row.idempotency_key, now, now);
-        if (updated.changes !== 1) continue;
-        const claimed = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?").get(row.idempotency_key) as EffectRow;
-        result.push(parseEffect(claimed));
-      }
-      return result;
-    }).immediate();
+        if (updated.changes !== 1) return null;
+        const stored = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?").get(row.idempotency_key) as EffectRow;
+        return parseEffect(stored);
+      }).immediate();
+      if (claimed) result.push(claimed);
+    }
+    return result;
   }
 
   public leaseOutbox(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredOutbox[] {
@@ -5288,7 +6777,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public completeEffect(key: string, ownerId: string, generation: number, now: number): boolean {
     this.assertLeaseIdentity(key, ownerId, generation, now);
-    return this.db
+    const complete = this.db.transaction(() => this.db
       .prepare(
         `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
            lease_expires_at = NULL, last_error = NULL, updated_at = ?
@@ -5297,7 +6786,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
              AND generation = ? AND lease_expires_at > ?)`,
       )
-      .run(now, key, ownerId, generation, now, ownerId, generation, now).changes === 1;
+      .run(now, key, ownerId, generation, now, ownerId, generation, now).changes === 1);
+    return complete.immediate();
   }
 
   public completeOutbox(key: string, ownerId: string, generation: number, messageId: number | null, now: number): boolean {
@@ -5517,6 +7007,45 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       );
   }
 
+  public upsertExecutorWorkerLiveness(input: ExecutorWorkerLivenessInput): boolean {
+    this.assertExecutorFence(input);
+    this.validateWorkerLiveness(input.value);
+    const upsert = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const value = input.value;
+      const updated = this.db
+        .prepare(
+          `INSERT INTO worker_liveness (
+             job_id, worker_kind, resource_kind, resource_id, generation, state,
+             source_updated_at, observed_at, stale_notified_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(job_id) DO UPDATE SET
+             worker_kind = excluded.worker_kind,
+             resource_kind = excluded.resource_kind,
+             resource_id = excluded.resource_id,
+             generation = excluded.generation,
+             state = excluded.state,
+             source_updated_at = excluded.source_updated_at,
+             observed_at = excluded.observed_at,
+             stale_notified_at = excluded.stale_notified_at
+           WHERE worker_liveness.generation <= excluded.generation`,
+        )
+        .run(
+          value.jobId,
+          value.workerKind,
+          value.resourceKind,
+          value.resourceId,
+          value.generation,
+          value.state,
+          value.sourceUpdatedAt,
+          value.observedAt,
+          value.staleNotifiedAt,
+        );
+      return updated.changes === 1;
+    });
+    return upsert.immediate();
+  }
+
   public getWorkerLiveness(jobId: string): WorkerLiveness | null {
     if (!jobId) throw new TypeError("jobId must not be empty");
     const row = this.db
@@ -5563,6 +7092,24 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       .run(now, jobId, generation).changes === 1;
   }
 
+  public markExecutorWorkerLivenessNotified(input: ExecutorFence & Readonly<{ jobId: string; workerGeneration: number }>): boolean {
+    this.assertExecutorFence(input);
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    assertPositiveInteger(input.workerGeneration, "workerGeneration");
+    const mark = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db
+        .prepare(
+          `UPDATE worker_liveness SET stale_notified_at = ?
+             WHERE job_id = ? AND generation = ? AND state IN ('stale', 'unknown') AND stale_notified_at IS NULL
+               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+                 AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+        )
+        .run(input.now, input.jobId, input.workerGeneration, input.ownerId, input.generation, input.now).changes === 1;
+    });
+    return mark.immediate();
+  }
+
   public clearWorkerLiveness(jobId: string, generation: number): boolean {
     if (!jobId) throw new TypeError("jobId must not be empty");
     assertPositiveInteger(generation, "generation");
@@ -5571,51 +7118,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       .run(jobId, generation).changes === 1;
   }
 
-  public leaseMergeEffect(input: {
-    jobId: string;
-    effectIdempotencyKey: string;
-    leaseOwner: string;
-    leaseGeneration: number;
-    now: number;
-    leaseDurationMs: number;
-  }): boolean {
-    if (!input.jobId || !input.effectIdempotencyKey || !input.leaseOwner) {
-      throw new TypeError("merge effect lease identity is required");
-    }
-    assertPositiveInteger(input.leaseGeneration, "leaseGeneration");
-    assertNonNegativeInteger(input.now, "now");
-    if (!Number.isInteger(input.leaseDurationMs) || input.leaseDurationMs < 1) {
-      throw new TypeError("leaseDurationMs must be a positive integer");
-    }
-    const lease = this.db.transaction(() => {
-      const row = this.readEffect(input.jobId, input.effectIdempotencyKey);
-      if (!row || row.kind !== "merge_pr") return false;
-      if (!["pending", "leased"].includes(row.status)) return false;
-      if (row.status === "leased" && row.lease_expires_at !== null && row.lease_expires_at > input.now) {
-        return false;
-      }
-      const updated = this.db
+  public clearExecutorWorkerLiveness(input: ExecutorFence & Readonly<{ jobId: string; workerGeneration: number }>): boolean {
+    this.assertExecutorFence(input);
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    assertPositiveInteger(input.workerGeneration, "workerGeneration");
+    const clear = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db
         .prepare(
-          `UPDATE effects
-              SET status = 'leased', attempts = attempts + 1,
-                  lease_owner = ?, lease_generation = ?, lease_expires_at = ?,
-                  next_attempt_at = ?, updated_at = ?
-            WHERE job_id = ? AND idempotency_key = ?
-              AND (status = 'pending' OR (status = 'leased' AND lease_expires_at <= ?))`,
+          `DELETE FROM worker_liveness
+             WHERE job_id = ? AND generation = ?
+               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+                 AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
         )
-        .run(
-          input.leaseOwner,
-          input.leaseGeneration,
-          input.now + input.leaseDurationMs,
-          input.now,
-          input.now,
-          input.jobId,
-          input.effectIdempotencyKey,
-          input.now,
-        );
-      return updated.changes === 1;
+        .run(input.jobId, input.workerGeneration, input.ownerId, input.generation, input.now).changes === 1;
     });
-    return lease();
+    return clear.immediate();
   }
 
   public bindMergeEffectReceipt(input: {
@@ -5633,6 +7151,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     const receipt = parseDurableMergeReceipt(input.receipt);
     const bind = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.leaseOwner, input.leaseGeneration, input.now)) return false;
       const boundaryNow = this.currentNow();
       const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
       if (!effect || effect.kind !== "merge_pr" || !this.effectLeaseIsActive(effect, input.leaseOwner, input.leaseGeneration, boundaryNow)) return false;
@@ -5674,7 +7193,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         );
       return updated.changes === 1;
     });
-    return bind();
+    return bind.immediate();
   }
 
   public prepareMergeCall(input: {
@@ -5691,6 +7210,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
 
     const prepare = this.db.transaction((): MergeCallPreparation => {
+      if (!this.executorLeaseIsCurrent(input.leaseOwner, input.leaseGeneration, input.now)) {
+        return { ok: false, reason: "executor lease is missing, stale, or expired" };
+      }
       const boundaryNow = this.currentNow();
       const row = this.readEffect(input.jobId, input.effectIdempotencyKey);
       if (!row) return { ok: false, reason: "durable merge effect was not found" };
@@ -5716,6 +7238,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const approval = this.readApproval(payload.receipt.approvalNonceHash);
       const bindingError = this.mergeReceiptBindingError(row, payload, job, approval, boundaryNow);
       if (bindingError) return { ok: false, reason: bindingError };
+      if (!this.mergeClaimsAreCurrentInTransaction(job, input.leaseOwner, input.leaseGeneration, boundaryNow)) {
+        return { ok: false, reason: "merge resource claim is missing, stale, or owned by another job" };
+      }
 
       if (payload.mergeCallStartedAt !== undefined) {
         return {
@@ -5759,7 +7284,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         receipt: payload.receipt,
       };
     });
-    return prepare();
+    return prepare.immediate();
   }
 
   public rejectApprovalAndRecordCallback(input: {
@@ -5839,56 +7364,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ownerChatId?: string | null;
     jobVersion?: number | null;
   }): void {
-    assertSha256Hex(input.nonceHash);
-    assertFullSha(input.headSha, "headSha");
-    assertNonNegativeInteger(input.now, "now");
-    assertNonNegativeInteger(input.expiresAt, "expiresAt");
-    if (input.expiresAt <= input.now) throw new TypeError("expiresAt must be after now");
-    if (!input.jobId) throw new TypeError("jobId must not be empty");
-    if (input.jobVersion !== null && input.jobVersion !== undefined) {
-      if (!Number.isInteger(input.jobVersion) || input.jobVersion < 1) {
-        throw new TypeError("jobVersion must be a positive integer");
-      }
-    }
-
-    const create = this.db.transaction(() => {
-      const job = this.readJobById(input.jobId);
-      if (!job) throw new Error(`Job ${input.jobId} was not found`);
-      if (job.prHeadSha !== input.headSha) throw new VersionConflictError(input.jobId, job.version);
-
-      const owner = this.getOwner();
-      const ownerUserId = input.ownerUserId ?? owner?.userId ?? null;
-      const ownerChatId = input.ownerChatId ?? owner?.chatId ?? null;
-      if ((ownerUserId === null) !== (ownerChatId === null)) {
-        throw new TypeError("Approval owner identity must include both user and chat ids");
-      }
-      if (ownerUserId !== null) assertCanonicalPositiveDecimal(ownerUserId, "ownerUserId");
-      if (ownerChatId !== null) assertCanonicalPositiveDecimal(ownerChatId, "ownerChatId");
-
-      this.db
-        .prepare(
-          `UPDATE approvals
-              SET consumed_at = ?, outcome = 'superseded'
-            WHERE job_id = ? AND consumed_at IS NULL`,
-        )
-        .run(input.now, input.jobId);
-      this.db
-        .prepare(
-          `INSERT INTO approvals (
-             nonce_hash, job_id, head_sha, expires_at, consumed_at, outcome,
-             owner_user_id, owner_chat_id, job_version
-           ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
-        )
-        .run(
-          input.nonceHash,
-          input.jobId,
-          input.headSha,
-          input.expiresAt,
-          ownerUserId,
-          ownerChatId,
-          input.jobVersion ?? job.version,
-        );
-    });
+    this.validateApprovalInput(input);
+    const create = this.db.transaction(() => this.createApprovalInTransaction(input));
     create();
   }
 
@@ -6249,6 +7726,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const persistedResult = parsePersistedMergeSuccessResult(input.result);
     const resultJson = serializeBoundedJson(persistedResult, "merge result", MAX_MERGE_RESULT_JSON);
     const complete = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.leaseOwner, input.leaseGeneration, input.now)) return false;
       const boundaryNow = this.currentNow();
       const effect = this.readEffect(input.jobId, input.effectIdempotencyKey);
       if (!effect) return false;
@@ -6350,11 +7828,21 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           boundaryNow,
         );
       if (updated.changes !== 1) throw new Error("Merge effect completion lost its durable row");
+      this.settleResourceClaimsInTransaction({
+        jobId: current.id,
+        ownerId: input.leaseOwner,
+        generation: input.leaseGeneration,
+        now: boundaryNow,
+        reason: "merge_succeeded",
+        resourceKinds: transitioned.job.state === "production_failed"
+          ? ["repository_merge", "production_target"]
+          : ["repository_merge"],
+      });
       if (input.outbox) persistOutbox(this.db, input.outbox, serializeOutbox(input.outbox, boundaryNow), boundaryNow);
       persistPendingEffects(this.db, transitioned.effects, boundaryNow);
       return true;
     });
-    return complete();
+    return complete.immediate();
   }
 
   public preserveUnknownMergeEffect(input: {
@@ -6370,6 +7858,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertPositiveInteger(input.leaseGeneration, "leaseGeneration");
     assertNonNegativeInteger(input.now, "now");
     const preserve = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.leaseOwner, input.leaseGeneration, input.now)) return false;
       const boundaryNow = this.currentNow();
       const updated = this.db
         .prepare(
@@ -6391,7 +7880,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         );
       return updated.changes === 1;
     });
-    return preserve();
+    return preserve.immediate();
   }
 
   public failLeasedMergeEffect(input: MergeFailureInput): boolean {
@@ -6476,9 +7965,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             .run(`${input.jobId}:${nextVersion}:render_status`, input.jobId, boundaryNow, boundaryNow, boundaryNow);
         }
       }
+      this.settleResourceClaimsInTransaction({
+        jobId: input.jobId,
+        ownerId: input.leaseOwner,
+        generation: input.leaseGeneration,
+        now: boundaryNow,
+        reason: "premerge_rejected",
+        resourceKinds: ["repository_merge", "production_target"],
+      });
       return true;
     });
-    return fail();
+    return fail.immediate();
   }
 
   public failMergeEffect(input: MergeFailureInput): boolean {
@@ -6541,8 +8038,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             input.leaseOwner,
             input.leaseGeneration,
             boundaryNow,
-          );
+        );
         if (cleaned.changes !== 1) throw new Error("Stale merge effect lost its durable row");
+        this.settleResourceClaimsInTransaction({
+          jobId: current.id,
+          ownerId: input.leaseOwner,
+          generation: input.leaseGeneration,
+          now: boundaryNow,
+          reason: "premerge_rejected",
+          resourceKinds: ["repository_merge", "production_target"],
+        });
         return true;
       }
 
@@ -6604,9 +8109,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           boundaryNow,
         );
       if (updated.changes !== 1) throw new Error("Stale merge effect lost its durable row");
+      this.settleResourceClaimsInTransaction({
+        jobId: current.id,
+        ownerId: input.leaseOwner,
+        generation: input.leaseGeneration,
+        now: boundaryNow,
+        reason: "premerge_rejected",
+        resourceKinds: ["repository_merge", "production_target"],
+      });
       return true;
     });
-    return stale();
+    return stale.immediate();
   }
 
   public beginTelegramUpdate(updateId: number, now: number): "process" | "processed" {
@@ -6851,6 +8364,159 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return enqueue();
   }
 
+  private assertExecutorFence(input: ExecutorFence): void {
+    if (!input.ownerId) throw new TypeError("ownerId must not be empty");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+  }
+
+  private markAdmissionDrainingForTerminal(job: Job, now: number): void {
+    if (!isReleaseCandidate(job.state)) return;
+    this.autonomyRepository.markDrainingInTransaction(job.id, now);
+  }
+
+  private claimReviewFormatCorrectionInTransaction(
+    attemptId: string,
+    threadId: string,
+    headSha: string,
+    jobId?: string,
+  ): boolean {
+    const attempt = this.getAttempt(attemptId);
+    if (!attempt || attempt.kind !== "review" ||
+      (jobId !== undefined && attempt.jobId !== jobId) ||
+      attempt.threadId !== threadId || attempt.headSha !== headSha) return false;
+    let current: Record<string, unknown> = {};
+    if (attempt.resultJson !== null) {
+      try {
+        const parsed = JSON.parse(attempt.resultJson);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+        current = parsed as Record<string, unknown>;
+      } catch {
+        return false;
+      }
+    }
+    if (current.formatCorrectionSent === true) return false;
+    const updated = jobId === undefined
+      ? this.db
+        .prepare("UPDATE attempts SET result_json = ? WHERE id = ? AND thread_id = ? AND head_sha = ?")
+        .run(
+          serializeBoundedJson({ ...current, formatCorrectionSent: true }, "attempt result", MAX_MERGE_RESULT_JSON),
+          attemptId,
+          threadId,
+          headSha,
+        )
+      : this.db
+        .prepare("UPDATE attempts SET result_json = ? WHERE id = ? AND job_id = ? AND thread_id = ? AND head_sha = ?")
+        .run(
+          serializeBoundedJson({ ...current, formatCorrectionSent: true }, "attempt result", MAX_MERGE_RESULT_JSON),
+          attemptId,
+          jobId,
+          threadId,
+          headSha,
+        );
+    return updated.changes === 1;
+  }
+
+  private validateAttemptPatch(patch: ExecutorAttemptPatch["patch"]): void {
+    if (patch.headSha !== undefined && patch.headSha !== null) assertFullSha(patch.headSha, "headSha");
+    if (patch.handoffSha256 !== undefined && patch.handoffSha256 !== null) assertSha256Hex(patch.handoffSha256);
+    if (patch.completedAt !== undefined && patch.completedAt !== null) {
+      assertNonNegativeInteger(patch.completedAt, "completedAt");
+    }
+  }
+
+  private appendAttemptPatch(
+    fields: string[],
+    values: unknown[],
+    patch: ExecutorAttemptPatch["patch"],
+  ): void {
+    if (patch.threadId !== undefined) { fields.push("thread_id = ?"); values.push(patch.threadId); }
+    if (patch.headSha !== undefined) { fields.push("head_sha = ?"); values.push(patch.headSha); }
+    if (patch.handoffPath !== undefined) { fields.push("handoff_path = ?"); values.push(patch.handoffPath); }
+    if (patch.handoffSha256 !== undefined) { fields.push("handoff_sha256 = ?"); values.push(patch.handoffSha256); }
+    if (patch.result !== undefined) {
+      fields.push("result_json = ?");
+      values.push(patch.result === null ? null : serializeBoundedJson(patch.result, "attempt result", MAX_MERGE_RESULT_JSON));
+    }
+    if (patch.completedAt !== undefined) { fields.push("completed_at = ?"); values.push(patch.completedAt); }
+  }
+
+  private validateApprovalInput(input: {
+    nonceHash: string;
+    jobId: string;
+    headSha: string;
+    expiresAt: number;
+    now: number;
+    jobVersion?: number | null;
+  }): void {
+    assertSha256Hex(input.nonceHash);
+    assertFullSha(input.headSha, "headSha");
+    assertNonNegativeInteger(input.now, "now");
+    assertNonNegativeInteger(input.expiresAt, "expiresAt");
+    if (input.expiresAt <= input.now) throw new TypeError("expiresAt must be after now");
+    if (!input.jobId) throw new TypeError("jobId must not be empty");
+    if (input.jobVersion !== null && input.jobVersion !== undefined) {
+      if (!Number.isInteger(input.jobVersion) || input.jobVersion < 1) {
+        throw new TypeError("jobVersion must be a positive integer");
+      }
+    }
+  }
+
+  private createApprovalInTransaction(input: {
+    nonceHash: string;
+    jobId: string;
+    headSha: string;
+    expiresAt: number;
+    now: number;
+    ownerUserId?: string | null;
+    ownerChatId?: string | null;
+    jobVersion?: number | null;
+  }): void {
+    const job = this.readJobById(input.jobId);
+    if (!job) throw new Error(`Job ${input.jobId} was not found`);
+    if (job.prHeadSha !== input.headSha) throw new VersionConflictError(input.jobId, job.version);
+
+    const owner = this.getOwner();
+    const ownerUserId = input.ownerUserId ?? owner?.userId ?? null;
+    const ownerChatId = input.ownerChatId ?? owner?.chatId ?? null;
+    if ((ownerUserId === null) !== (ownerChatId === null)) {
+      throw new TypeError("Approval owner identity must include both user and chat ids");
+    }
+    if (ownerUserId !== null) assertCanonicalPositiveDecimal(ownerUserId, "ownerUserId");
+    if (ownerChatId !== null) assertCanonicalPositiveDecimal(ownerChatId, "ownerChatId");
+
+    this.db
+      .prepare(
+        `UPDATE approvals SET consumed_at = ?, outcome = 'superseded'
+           WHERE job_id = ? AND consumed_at IS NULL`,
+      )
+      .run(input.now, input.jobId);
+    this.db
+      .prepare(
+        `INSERT INTO approvals (
+           nonce_hash, job_id, head_sha, expires_at, consumed_at, outcome,
+           owner_user_id, owner_chat_id, job_version
+         ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+      )
+      .run(
+        input.nonceHash,
+        input.jobId,
+        input.headSha,
+        input.expiresAt,
+        ownerUserId,
+        ownerChatId,
+        input.jobVersion ?? job.version,
+      );
+  }
+
+  private validateWorkerLiveness(value: WorkerLiveness): void {
+    if (!value.jobId || !value.resourceId) throw new TypeError("worker liveness identity is required");
+    assertPositiveInteger(value.generation, "generation");
+    assertNonNegativeInteger(value.sourceUpdatedAt, "sourceUpdatedAt");
+    assertNonNegativeInteger(value.observedAt, "observedAt");
+    if (value.staleNotifiedAt !== null) assertNonNegativeInteger(value.staleNotifiedAt, "staleNotifiedAt");
+  }
+
   private assertLeaseInput(ownerId: string, now: number, leaseMs: number): void {
     if (!ownerId) throw new TypeError("ownerId must not be empty");
     assertNonNegativeInteger(now, "now");
@@ -6893,6 +8559,283 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const row = this.executorLeaseRow();
     return row.owner_id === ownerId && row.generation === generation &&
       row.lease_expires_at !== null && row.lease_expires_at > now;
+  }
+
+  private mergeResourceRequirements(job: Job): MergeResourceRequirement[] | null {
+    if (!job.policy || !job.projectId || job.policy.projectId !== job.projectId) return null;
+    return [
+      {
+        resourceKind: "repository_merge" as const,
+        resourceKey: repositoryMergeResourceKey(job.policy.githubRepository),
+      },
+      ...(job.policy.production === undefined ? [] : [{
+        resourceKind: "production_target" as const,
+        resourceKey: productionResourceKey(job.policy),
+      }]),
+    ].sort((left, right) =>
+      left.resourceKey < right.resourceKey ? -1 : left.resourceKey > right.resourceKey ? 1 : 0,
+    );
+  }
+
+  private admissionJobPolicyIdentityIsValid(admission: JobAdmission, job: Job): boolean {
+    return job.projectId !== null && job.policy !== null &&
+      admission.projectId === job.projectId && job.policy.projectId === job.projectId;
+  }
+
+  private productionClaimIsCurrentInTransaction(
+    job: Job,
+    ownerId: string,
+    generation: number,
+    now: number,
+  ): boolean {
+    return this.currentProductionClaimIdInTransaction(job, ownerId, generation, now) !== null;
+  }
+
+  private currentProductionClaimIdInTransaction(
+    job: Job,
+    ownerId: string,
+    generation: number,
+    now: number,
+  ): number | null {
+    if (!job.policy?.production || job.projectId !== job.policy.projectId) return null;
+    const rows = this.db
+      .prepare(
+        `SELECT claim_id
+           FROM job_resource_claims
+          WHERE job_id = ? AND resource_key = ? AND resource_kind = 'production_target'
+            AND state = 'held' AND owner_id = ? AND generation = ? AND lease_expires_at > ?
+          ORDER BY claim_id ASC
+          LIMIT 2`,
+      )
+      .all(job.id, productionResourceKey(job.policy), ownerId, generation, now) as Array<{ claim_id: number }>;
+    return rows.length === 1 ? rows[0]!.claim_id : null;
+  }
+
+  private productionStageMutationIsCurrentInTransaction(
+    attemptId: string,
+    ownerId: string,
+    generation: number,
+    now: number,
+  ): boolean {
+    const prefix = "stage:";
+    if (!attemptId.startsWith(prefix)) return true;
+    const effectIdempotencyKey = attemptId.slice(prefix.length);
+    const effect = this.db
+      .prepare(
+        `SELECT job_id, kind, status, lease_owner, lease_generation, lease_expires_at
+           FROM effects WHERE idempotency_key = ?`,
+      )
+      .get(effectIdempotencyKey) as {
+        job_id: string;
+        kind: string;
+        status: string;
+        lease_owner: string | null;
+        lease_generation: number | null;
+        lease_expires_at: number | null;
+      } | undefined;
+    if (!effect || (effect.kind !== "deploy_production" && effect.kind !== "verify_production")) return true;
+    if (effect.status !== "leased" || effect.lease_owner !== ownerId || effect.lease_generation !== generation ||
+      effect.lease_expires_at === null || effect.lease_expires_at <= now) return false;
+    const job = this.readJobById(effect.job_id);
+    const admission = this.autonomyRepository.getAdmission(effect.job_id);
+    if (!job || !admission || !this.admissionJobPolicyIdentityIsValid(admission, job)) return false;
+    const expectedState = effect.kind === "deploy_production" ? "deploying" : "verifying_production";
+    return job.state === expectedState &&
+      this.productionClaimIsCurrentInTransaction(job, ownerId, generation, now);
+  }
+
+  private acceptedMergeEffectForLease(effect: StoredEffect, job: Job): boolean {
+    if (
+      effect.kind !== "merge_pr" ||
+      effect.jobId !== job.id ||
+      effect.idempotencyKey !== `${job.id}:${job.version}:merge_pr` ||
+      job.state !== "merging" ||
+      job.cancelRequestedAt !== null ||
+      job.prHeadSha === null
+    ) return false;
+    const acceptedLease = this.readAcceptedMergeLease(effect, job);
+    if (!acceptedLease || acceptedLease.headSha !== job.prHeadSha || acceptedLease.approvalJobVersion + 1 !== job.version) return false;
+
+    const approval = this.readApproval(acceptedLease.approvalNonceHash);
+    return approval !== undefined &&
+      approval.job_id === job.id &&
+      approval.head_sha === acceptedLease.headSha &&
+      approval.consumed_at !== null &&
+      approval.outcome === "accepted" &&
+      approval.owner_user_id === acceptedLease.approvalOwnerUserId &&
+      approval.owner_chat_id === acceptedLease.approvalOwnerChatId &&
+      approval.job_version === acceptedLease.approvalJobVersion &&
+      approval.expires_at === acceptedLease.approvalExpiresAt;
+  }
+
+  private readAcceptedMergeLease(effect: StoredEffect, job: Job): AcceptedMergeLease | null {
+    try {
+      return Object.prototype.hasOwnProperty.call(effect.payload, "receipt")
+        ? this.readReceiptMergeLease(effect, job)
+        : this.readPendingMergeLease(effect);
+    } catch {
+      return null;
+    }
+  }
+
+  private readReceiptMergeLease(effect: StoredEffect, job: Job): AcceptedMergeLease | null {
+    const payload = parseMergeEffectPayload(effect.payload);
+    if (
+      payload.mergeOutcome !== undefined ||
+      payload.receipt.jobId !== job.id ||
+      payload.receipt.effectIdempotencyKey !== effect.idempotencyKey ||
+      payload.receipt.jobVersion !== job.version
+    ) return null;
+    return {
+      headSha: payload.headSha,
+      approvalNonceHash: payload.receipt.approvalNonceHash,
+      approvalOwnerUserId: payload.receipt.approvalOwnerUserId,
+      approvalOwnerChatId: payload.receipt.approvalOwnerChatId,
+      approvalJobVersion: payload.receipt.approvalJobVersion,
+      approvalExpiresAt: Date.parse(payload.receipt.expiresAt),
+    };
+  }
+
+  private readPendingMergeLease(effect: StoredEffect): AcceptedMergeLease {
+    const payload = parsePendingMergeEffectPayload(effect.payload);
+    return {
+      headSha: payload.headSha,
+      approvalNonceHash: payload.approvalNonceHash,
+      approvalOwnerUserId: payload.approvalOwnerUserId,
+      approvalOwnerChatId: payload.approvalOwnerChatId,
+      approvalJobVersion: payload.approvalJobVersion,
+      approvalExpiresAt: payload.approvalExpiresAt,
+    };
+  }
+
+  private acquireMergeResourceClaimsInTransaction(
+    input: JobEffectLeaseInput,
+    effect: StoredEffect,
+    job: Job,
+  ): void {
+    const requirements = this.mergeResourceRequirements(job);
+    if (!requirements || !this.acceptedMergeEffectForLease(effect, job)) {
+      throw new MergeClaimConflictError();
+    }
+    const heldByKey = this.readHeldMergeClaimsInTransaction(requirements);
+    this.assertMergeClaimsBelongToLease(job, input, requirements, heldByKey);
+    this.insertMissingMergeClaims(job, input, requirements, heldByKey);
+  }
+
+  private readHeldMergeClaimsInTransaction(
+    requirements: readonly MergeResourceRequirement[],
+  ): Map<string, HeldMergeClaim> {
+    const heldRows = this.db
+      .prepare(
+        `SELECT resource_key, resource_kind, job_id, owner_id, generation, lease_expires_at
+           FROM job_resource_claims
+          WHERE state = 'held' AND resource_key IN (${requirements.map(() => "?").join(", ")})
+          ORDER BY resource_key ASC
+          LIMIT ?`,
+      )
+      .all(...requirements.map((requirement) => requirement.resourceKey), requirements.length) as HeldMergeClaim[];
+    return new Map(heldRows.map((row) => [row.resource_key, row]));
+  }
+
+  private assertMergeClaimsBelongToLease(
+    job: Job,
+    input: JobEffectLeaseInput,
+    requirements: readonly MergeResourceRequirement[],
+    heldByKey: ReadonlyMap<string, HeldMergeClaim>,
+  ): void {
+    for (const requirement of requirements) {
+      const held = heldByKey.get(requirement.resourceKey);
+      if (!held) continue;
+      if (
+        held.job_id !== job.id ||
+        held.resource_kind !== requirement.resourceKind ||
+        held.owner_id !== input.ownerId ||
+        held.generation !== input.generation ||
+        held.lease_expires_at <= input.now
+      ) throw new MergeClaimConflictError();
+    }
+  }
+
+  private insertMissingMergeClaims(
+    job: Job,
+    input: JobEffectLeaseInput,
+    requirements: readonly MergeResourceRequirement[],
+    heldByKey: ReadonlyMap<string, HeldMergeClaim>,
+  ): void {
+    try {
+      for (const requirement of requirements) {
+        if (heldByKey.has(requirement.resourceKey)) continue;
+        this.db
+          .prepare(
+            `INSERT INTO job_resource_claims (
+               job_id, resource_key, resource_kind, state, owner_id, generation,
+               lease_expires_at, acquired_at, renewed_at
+             ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            job.id,
+            requirement.resourceKey,
+            requirement.resourceKind,
+            input.ownerId,
+            input.generation,
+            input.now + input.leaseMs,
+            input.now,
+            input.now,
+          );
+      }
+    } catch (error) {
+      if (sqliteErrorCode(error) === "SQLITE_CONSTRAINT_UNIQUE") throw new MergeClaimConflictError();
+      throw error;
+    }
+  }
+
+  private mergeClaimsAreCurrentInTransaction(
+    job: Job,
+    ownerId: string,
+    generation: number,
+    now: number,
+  ): boolean {
+    const requirements = this.mergeResourceRequirements(job);
+    if (!requirements) return false;
+    const rows = this.db
+      .prepare(
+        `SELECT resource_key, resource_kind
+           FROM job_resource_claims
+          WHERE job_id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+            AND lease_expires_at > ?
+            AND resource_key IN (${requirements.map(() => "?").join(", ")})
+          ORDER BY resource_key ASC
+          LIMIT ?`,
+      )
+      .all(
+        job.id,
+        ownerId,
+        generation,
+        now,
+        ...requirements.map((requirement) => requirement.resourceKey),
+        requirements.length,
+      ) as Array<{ resource_key: string; resource_kind: string }>;
+    const current = new Map(rows.map((row) => [row.resource_key, row.resource_kind]));
+    return requirements.every((requirement) => current.get(requirement.resourceKey) === requirement.resourceKind);
+  }
+
+  private settleResourceClaimsInTransaction(input: ResourceClaimSettlement): void {
+    if (input.resourceKinds.length === 0) return;
+    this.db
+      .prepare(
+        `UPDATE job_resource_claims
+            SET state = 'released', lease_expires_at = 0, released_at = ?, release_reason = ?
+          WHERE job_id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+            AND resource_kind IN (${input.resourceKinds.map(() => "?").join(", ")})`,
+      )
+      .run(
+        input.now,
+        input.reason,
+        input.jobId,
+        input.ownerId,
+        input.generation,
+        ...input.resourceKinds,
+      );
   }
 
   private effectByKey(key: string): EffectRow | undefined {
@@ -6970,10 +8913,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   private readJobById(jobId: string): Job | null {
-    const row = this.db
-      .prepare(`${JOB_SELECT} WHERE id = ?`)
-      .get(jobId) as JobRow | undefined;
-    return row ? parseJob(row) : null;
+    return readJobById(this.db, jobId);
   }
 
   private readApproval(nonceHash: string): ApprovalRow | undefined {
@@ -7168,7 +9108,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     now: number,
   ): boolean {
     return this.effectLeaseMatches(effect, leaseOwner, leaseGeneration) &&
-      effect.lease_expires_at !== null && effect.lease_expires_at > now;
+      effect.lease_expires_at !== null && effect.lease_expires_at > now &&
+      this.executorLeaseIsCurrent(leaseOwner, leaseGeneration, now);
   }
 
   private mergeReceiptBindingError(
@@ -7346,19 +9287,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   private readJobBySourceUpdate(sourceUpdateId: number): Job | null {
-    const row = this.db
-      .prepare(`${JOB_SELECT} WHERE source_update_id = ?`)
-      .get(sourceUpdateId) as JobRow | undefined;
-    return row ? parseJob(row) : null;
+    return readJobBySourceUpdate(this.db, sourceUpdateId);
   }
 
-  private hasActiveJobExcluding(jobId: string): boolean {
-    return this.db
-      .prepare(
-        "SELECT 1 FROM jobs WHERE id <> ? AND state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed') LIMIT 1",
-      )
-      .get(jobId) !== undefined;
-  }
 }
 
 export function openStore(
