@@ -31,6 +31,7 @@
     "@types/react": "^19.0.0",
     "bb-app": "0.36.0",
     "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.5.0",
     "hono": "^4.11.9",
     "typescript": "^5.7.0",
     "vitest": "^3.2.0",
