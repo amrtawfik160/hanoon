@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type { ControllerAdapter } from "../../src/controller/bb-controller";
 import { LunaControllerService } from "../../src/controller/service";
+import { registerControllerTools } from "../../src/controller/tools";
 import {
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
@@ -33,33 +34,52 @@ function proof(value: string): string {
   return `sha256:${sha256(value)}`;
 }
 
-function corpus(): ReturnType<typeof parseControllerScenarioCorpus> {
+export function loadControllerScenarioCorpus(): ReturnType<typeof parseControllerScenarioCorpus> {
   const path = fileURLToPath(new URL("../../evals/controller-scenarios.json", import.meta.url));
   return parseControllerScenarioCorpus(JSON.parse(readFileSync(path, "utf8")));
 }
 
-function scriptedAdapter(response: string): ControllerAdapter {
+function scriptedAdapter(
+  observeToolCall: () => Promise<boolean>,
+  reply: () => Promise<string>,
+): ControllerAdapter {
   return {
     spawn: async () => ({ threadId: "thr_fixed_controller", projectId: "proj_fixed", hostId: "host_fixed" }),
     send: async () => undefined,
     steer: async () => undefined,
     answerQuestion: async () => undefined,
     status: async () => "idle",
-    output: async () => response,
+    output: reply,
     latestSeq: async () => 0,
-    events: async () => ({
-      latestSeq: 1,
-      inputAccepted: true,
-      assistantDelta: "",
-      completed: true,
-      error: null,
-      pendingQuestion: null,
-      toolCalls: 0,
-      commandFailures: 0,
-      totalTokens: 0,
-    }),
+    events: async () => {
+      const toolCalls = await observeToolCall() ? 1 : 0;
+      return {
+        latestSeq: 1,
+        inputAccepted: true,
+        assistantDelta: "",
+        completed: true,
+        error: null,
+        pendingQuestion: null,
+        toolCalls,
+        commandFailures: 0,
+        totalTokens: 0,
+      };
+    },
     findSpawnCandidate: async () => null,
   };
+}
+
+type JobStatusProjection = Readonly<{ id: string; state: string; serialized: string }>;
+
+function parseJobStatusProjection(result: unknown): JobStatusProjection {
+  if (typeof result !== "string" || result.length > 8_000) throw new Error("job-status tool returned an invalid bounded projection");
+  const parsed: unknown = JSON.parse(result);
+  if (!parsed || typeof parsed !== "object") throw new Error("job-status tool returned no projection");
+  const job = (parsed as { job?: unknown }).job;
+  if (!job || typeof job !== "object") throw new Error("job-status tool returned no job");
+  const { id, state } = job as { id?: unknown; state?: unknown };
+  if (typeof id !== "string" || typeof state !== "string") throw new Error("job-status tool returned an invalid job");
+  return { id, state, serialized: result };
 }
 
 function harnessIdentity(scenarioCase: ScenarioCase, trial: number, seed: number): ControllerScenarioTrial["harness"] {
@@ -88,7 +108,7 @@ async function runScenario(
   seed: number,
 ): Promise<ControllerScenarioTrial> {
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
-  const { bb } = createFakePluginHost({ pluginId: `telegram-controller-eval-${fixtureId}` });
+  const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-eval-${fixtureId}` });
   const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
   store.createPairingCode(hashSecret(`pair:${fixtureId}`), 1, 10_000);
   const paired = store.pairOwnerWithCode(hashSecret(`pair:${fixtureId}`), OWNER_ID, OWNER_ID, 2);
@@ -96,17 +116,33 @@ async function runScenario(
   const lease = store.acquireExecutorLease(`eval-${fixtureId}`, FIXTURE_NOW, 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
   const signal = AbortSignal.timeout(2_000);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: async () => { throw new Error("thread operations are not part of this baseline"); } },
+    health: () => ({ status: "ok" }),
+    notify: () => undefined,
+    now: () => FIXTURE_NOW,
+  });
 
   const queuedJob = scenarioCase.id === "current-job-status"
     ? store.createJob({ id: JOB_ID, sourceUpdateId: seed * 1_000 + trial, requestText: "fixed status fixture", now: 3 })
     : null;
   const jobBefore = queuedJob ? store.getJob(JOB_ID) : null;
   const effectsBefore = queuedJob ? store.listEffectsForJob(JOB_ID) : [];
-  const jobProjection = queuedJob ? store.getJob(JOB_ID) : null;
-  const response = jobProjection
-    ? `Job ${JOB_ID} is currently ${jobProjection.state}.`
-    : "Hello from Hanoon.";
-  const adapter = scriptedAdapter(response);
+  const observed = { jobStatus: null as JobStatusProjection | null };
+  let response = "Hello from Hanoon.";
+  const observeToolCall = async () => {
+    if (!queuedJob) return false;
+    observed.jobStatus = parseJobStatusProjection(await harness.behavior.callAgentTool(
+      "telegram_agent_job_status",
+      { jobId: JOB_ID },
+      { threadId: "thr_fixed_controller", projectId: "proj_fixed" },
+    ));
+    response = `Job ${observed.jobStatus.id} is currently ${observed.jobStatus.state}.`;
+    return true;
+  };
+  const adapter = scriptedAdapter(observeToolCall, async () => response);
   const service = new LunaControllerService({ store, adapter, clock: { now: () => FIXTURE_NOW } });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY,
@@ -129,19 +165,22 @@ async function runScenario(
   const effectsAfter = queuedJob ? store.listEffectsForJob(JOB_ID) : [];
 
   const plainPassed = completed?.state === "completed" && turns.length === 1 && digest.length === 1 && reply !== null;
-  const statusPassed = jobProjection !== null && jobBefore !== null && jobAfter !== null
-    && completed?.responseText?.includes(jobProjection.state) === true
+  const statusPassed = observed.jobStatus !== null && jobBefore !== null && jobAfter !== null
+    && completed?.responseText?.includes(observed.jobStatus.state) === true
     && JSON.stringify(jobAfter) === JSON.stringify(jobBefore)
     && JSON.stringify(effectsAfter) === JSON.stringify(effectsBefore)
     && reply !== null;
   const outcomePassed = scenarioCase.id === "plain-conversation" ? plainPassed : statusPassed;
   const tracePassed = scenarioCase.id === "plain-conversation"
     ? completed?.submittedAt !== null
-    : jobProjection !== null;
+    : observed.jobStatus !== null;
   const answerPassed = completed?.responseText === response;
   const outcomeProofs = scenarioCase.id === "plain-conversation"
     ? [proof(`${fixtureId}:completed:${completed?.state}`), proof(`${fixtureId}:digest:${digest.length}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "missing"}`)]
     : [proof(`${fixtureId}:job:${jobAfter?.state ?? "missing"}`), proof(`${fixtureId}:effects:${effectsAfter.length}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "missing"}`)];
+  const traceProofs = observed.jobStatus === null
+    ? [proof(`${fixtureId}:trace:${tracePassed ? "passed" : "failed"}`)]
+    : [`tool-call:telegram_agent_job_status:1:${proof(observed.jobStatus.serialized)}`];
 
   return parseControllerScenarioTrial({
     schemaVersion: 1,
@@ -161,7 +200,7 @@ async function runScenario(
       status: tracePassed ? "passed" : "failed",
       graderId: "typed-trace",
       graderVersion: 1,
-      proofRefs: [proof(`${fixtureId}:trace:${tracePassed ? "passed" : "failed"}`)],
+      proofRefs: traceProofs,
     },
     answer: {
       status: answerPassed ? "passed" : "failed",
@@ -182,7 +221,10 @@ export async function runControllerScenarioTrials(
   if (!Number.isInteger(options.seed) || options.seed < 0 || options.seed > 2_147_483_647) {
     throw new TypeError("seed must be a non-negative 32-bit integer");
   }
-  const compatible = corpus().cases.filter((scenarioCase) => scenarioCase.checkpoint === options.checkpoint);
+  if (options.checkpoint !== "baseline") {
+    throw new Error(`checkpoint ${options.checkpoint} is not supported by the Task 2 harness`);
+  }
+  const compatible = loadControllerScenarioCorpus().cases.filter((scenarioCase) => scenarioCase.checkpoint === options.checkpoint);
   if (compatible.length === 0) throw new Error(`no compatible scenarios for checkpoint ${options.checkpoint}`);
   const trials: ControllerScenarioTrial[] = [];
   for (const scenarioCase of compatible) {

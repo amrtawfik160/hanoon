@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { closeSync, openSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, openSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
@@ -41,7 +41,7 @@ function parseArguments(argv) {
 
 function isInsideRoot(path) {
   const relation = relative(root, path);
-  return relation === "" || (!relation.startsWith(`..${sep}`) && relation !== ".." && !relation.startsWith(".."));
+  return relation === "" || (!relation.startsWith(`..${sep}`) && relation !== ".." && !isAbsolute(relation));
 }
 
 function allowedOutput(path) {
@@ -54,6 +54,13 @@ function git(args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
 }
 
+function readGitIdentity() {
+  return {
+    commit: git(["rev-parse", "HEAD"]),
+    dirty: git(["status", "--porcelain"]) !== "",
+  };
+}
+
 function writeReport(path, content, replace) {
   const mode = 0o600;
   if (!replace) {
@@ -61,7 +68,9 @@ function writeReport(path, content, replace) {
     try {
       descriptor = openSync(path, "wx", mode);
     } catch (error) {
-      if (error && typeof error === "object" && error.code === "EEXIST") fail(`refusing to overwrite existing report ${path}; pass --replace`);
+      if (error && typeof error === "object" && error.code === "EEXIST") {
+        throw new Error(`refusing to overwrite existing report ${path}; pass --replace`);
+      }
       throw error;
     }
     try {
@@ -69,33 +78,73 @@ function writeReport(path, content, replace) {
     } finally {
       closeSync(descriptor);
     }
+    chmodSync(path, mode);
     return;
   }
   const temporary = `${path}.tmp-${process.pid}`;
   writeFileSync(temporary, content, { encoding: "utf8", mode, flag: "w" });
   renameSync(temporary, path);
+  chmodSync(path, mode);
 }
 
-function containsCriticalSafetyFailure(trials, checkpoint) {
-  if (checkpoint !== "baseline") return trials.some((trial) => trial.outcome.status === "failed");
-  return false;
+export function classifyControllerEvidence(trials) {
+  const nonFixedTrials = trials.filter((trial) => (
+    trial.harness.provider !== "fake-bb" || trial.harness.model !== "scripted-controller"
+  )).length;
+  if (nonFixedTrials === 0) return "fixed";
+  return nonFixedTrials === 1 ? "smoke" : "strong";
+}
+
+export async function evaluateControllerOutcomes(options, dependencies = {}) {
+  if (!allowedOutput(options.output)) {
+    throw new Error("--output must be outside the repository or under .superpowers/");
+  }
+  const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
+  const priorCommit = process.env.HANOON_EVAL_COMMIT;
+  const priorDirty = process.env.HANOON_EVAL_DIRTY;
+  process.env.HANOON_EVAL_COMMIT = identity.commit;
+  process.env.HANOON_EVAL_DIRTY = String(identity.dirty);
+  let trials;
+  try {
+    trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
+      checkpoint: options.checkpoint,
+      trials: options.trials,
+      seed: options.seed,
+    });
+  } finally {
+    if (priorCommit === undefined) delete process.env.HANOON_EVAL_COMMIT;
+    else process.env.HANOON_EVAL_COMMIT = priorCommit;
+    if (priorDirty === undefined) delete process.env.HANOON_EVAL_DIRTY;
+    else process.env.HANOON_EVAL_DIRTY = priorDirty;
+  }
+  const validatedTrials = trials.map(contract.parseControllerScenarioTrial);
+  const report = contract.aggregateControllerEvaluation({
+    label: classifyControllerEvidence(validatedTrials),
+    trials: validatedTrials,
+  });
+  contract.controllerEvaluationReportSchema.parse(report);
+  writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace);
+  const scenarios = new Map(harness.loadControllerScenarioCorpus().cases.map((scenarioCase) => [
+    scenarioCase.id,
+    scenarioCase,
+  ]));
+  const criticalSafetyFailed = validatedTrials.some((trial) => {
+    const scenarioCase = scenarios.get(trial.scenarioId);
+    if (!scenarioCase) throw new Error(`trial references an unknown scenario ${trial.scenarioId}`);
+    return scenarioCase.criticalSafety && trial.outcome.status === "failed";
+  });
+  return {
+    report,
+    criticalSafetyFailed,
+    exitCode: criticalSafetyFailed || report.status === "failed" ? 1 : 0,
+  };
 }
 
 async function main() {
-  const options = parseArguments(process.argv.slice(2));
-  if (!allowedOutput(options.output)) fail("--output must be outside the repository or under .superpowers/");
-  const commit = git(["rev-parse", "HEAD"]);
-  const dirty = git(["status", "--porcelain"]) !== "";
-  process.env.HANOON_EVAL_COMMIT = commit;
-  process.env.HANOON_EVAL_DIRTY = String(dirty);
-  const trials = await harness.runControllerScenarioTrials(options);
-  const validatedTrials = trials.map(contract.parseControllerScenarioTrial);
-  const report = contract.aggregateControllerEvaluation({ label: "fixed", trials: validatedTrials });
-  contract.controllerEvaluationReportSchema.parse(report);
-  writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace);
-  if (containsCriticalSafetyFailure(validatedTrials, options.checkpoint) || report.status === "failed") {
-    process.exitCode = 1;
-  }
+  const evaluation = await evaluateControllerOutcomes(parseArguments(process.argv.slice(2)));
+  process.exitCode = evaluation.exitCode;
 }
 
-main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+}
