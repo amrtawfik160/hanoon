@@ -125,6 +125,28 @@ it("records the current job status through the registered controller tool", asyn
   });
 });
 
+it("discloses the registered controller tool surface deterministically", async () => {
+  const [firstRun, secondRun] = await Promise.all([
+    runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 }),
+    runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 }),
+  ]);
+  const firstStatusTrial = firstRun.find((trial) => trial.scenarioId === "current-job-status");
+  const firstSurface = firstRun[0]?.harness;
+
+  expect(firstStatusTrial?.harness.advertisedTools).toContain("telegram_agent_job_status");
+  expect(firstStatusTrial?.harness.parameterSchemaSha256.telegram_agent_job_status)
+    .toMatch(/^[0-9a-f]{64}$/);
+  expect(firstStatusTrial?.harness.capabilityManifestSha256)
+    .not.toBe("874faf4af042371a613c564f29eb2e390559fb3151f2feb193249c68d1f789f1");
+  expect(firstStatusTrial?.harness.parameterSchemaSha256).not.toEqual({});
+  expect(firstRun.every((trial) => (
+    JSON.stringify(trial.harness.advertisedTools) === JSON.stringify(firstSurface?.advertisedTools)
+    && JSON.stringify(trial.harness.parameterSchemaSha256) === JSON.stringify(firstSurface?.parameterSchemaSha256)
+    && trial.harness.capabilityManifestSha256 === firstSurface?.capabilityManifestSha256
+  ))).toBe(true);
+  expect(secondRun.map((trial) => trial.harness)).toEqual(firstRun.map((trial) => trial.harness));
+});
+
 it("can import the runner without executing its CLI entrypoint", async () => {
   await expect(execFileAsync(process.execPath, [
     "--input-type=module",
