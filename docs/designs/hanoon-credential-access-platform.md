@@ -1,6 +1,6 @@
 # Hanoon Credential and Access Platform Design
 
-Status: approved architecture; written specification awaiting owner review
+Status: approved for implementation planning
 
 Date: 2026-08-12
 

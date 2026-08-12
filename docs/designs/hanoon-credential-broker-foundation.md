@@ -1,6 +1,6 @@
 # Hanoon Credential Broker Foundation Design
 
-Status: child specification awaiting owner review
+Status: approved for implementation planning
 
 Date: 2026-08-12
 
@@ -137,6 +137,15 @@ The mTLS channel authenticates the installation. The broker verifies that the ce
 ### Response envelope
 
 ```ts
+export type BrokerHealthSnapshot = Readonly<{
+  protocolVersion: 1;
+  brokerVersion: string;
+  adapter: "onepassword";
+  adapterState: "ready" | "degraded" | "unavailable";
+  auditWritable: boolean;
+  bindingCount: number;
+}>;
+
 export type BrokerResponseEnvelope = Readonly<{
   schemaVersion: 1;
   installationId: string;
@@ -157,11 +166,15 @@ export type BrokerResponseEnvelope = Readonly<{
     | null;
   retryable: boolean;
   receiptId: string | null;
+  health: BrokerHealthSnapshot | null;
+  bindings: readonly CredentialBindingMetadata[];
   completedAt: number;
 }>;
 ```
 
-Unknown fields, schema versions, operations, result values, or failure classes fail response validation. A timeout or unparseable response maps to `result_ambiguous`; Hanoon never retries it blindly under a new idempotency key.
+Unknown fields, schema versions, operations, result values, failure classes, health fields, or binding fields fail response validation. A successful `broker.health` response has `outcome: "succeeded"`, `result: "ready"`, one health snapshot, a non-null receipt, and every secret-free binding for the authenticated installation. The foundation caps an installation at 100 bindings, so reconciliation is complete rather than silently truncated. The broker reads those bindings from its policy store; it does not search or list the external vault. Hanoon reconciles the returned metadata into its local projection.
+
+A valid verification has `outcome: "succeeded"`, `result: "valid"`, and a non-null receipt. A missing item or field, empty value, or value outside the configured bound has `outcome: "failed"`, `result: "invalid"`, `failureClass: "credential_invalid"`, `retryable: false`, and a non-null audit receipt. Transport, policy, provider, authentication, and persistence failures have `result: null`. Every non-health response carries `health: null` and `bindings: []`; a failed health response does too. A timeout or unparseable response maps to `result_ambiguous`; Hanoon never retries it blindly under a new idempotency key.
 
 ### Idempotency and audit
 
@@ -187,8 +200,8 @@ Enrollment occurs on the protected broker host, not through a model tool:
 2. The owner installs the service-account token into the broker's OS secret store using the broker administrative CLI's interactive stdin or provider-native handoff. The value never appears in argv or command output.
 3. The broker runs a live service-account identity probe and displays only the account, vault scope, and status.
 4. The owner registers an exact vault item and field in the broker. The broker creates a random `bindingId` and stores the external reference broker-side.
-5. The owner assigns a label, future capability ids, risk, MFA mode, and approval mode. The foundation accepts only inactive future capability ids because no application connector exists yet.
-6. The broker emits secret-free binding metadata to Hanoon through an authenticated reconciliation call.
+5. The owner assigns a label, future capability ids, risk, MFA mode, and approval mode. The foundation accepts only inactive future capability ids because no application connector exists yet, and rejects enrollment when the installation already has 100 non-tombstoned bindings.
+6. The broker emits secret-free binding metadata in the authenticated, bounded `broker.health` response; Hanoon reconciles that projection without querying or listing the external vault.
 7. Hanoon records the metadata as `pending` and may run `vault.binding.verify`.
 8. A successful resolve changes the binding to `vault_verified`, not `active`: vault access is proven, application validity is not.
 
@@ -278,7 +291,7 @@ A disposable 1Password vault and service account prove:
 2. the service identity can reach only the dedicated test vault;
 3. an exact bound item verifies successfully;
 4. an item outside scope fails;
-5. a missing field returns `credential_invalid` without revealing item contents;
+5. a missing field returns `result: "invalid"` with `failureClass: "credential_invalid"` without revealing item contents;
 6. a revoked service token fails closed;
 7. a broker restart preserves request receipts but not resolved values;
 8. a Hanoon plugin restart reauthenticates without an agent receiving credentials;
