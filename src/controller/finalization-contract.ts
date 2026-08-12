@@ -146,7 +146,7 @@ const CONCRETE_FOLLOW_UP = new RegExp(
   `\\b(?:get\\s+back\\s+to\\s+you|follow\\s+up)\\s+(?:with|when|after|once)\\s+${FOLLOW_UP_OBJECT_WORD}(?:\\s+${FOLLOW_UP_OBJECT_WORD}){0,11}\\b`,
   "i",
 );
-const CONTROLLER_COMMITMENT = /^(?:i(?:'ll| will)|let me)\b/i;
+const CONTROLLER_COMMITMENT = /(?:^|[,;]\s*)(?:i(?:'ll| will)|let me)\b/i;
 const NON_AFFIRMATIVE_FOLLOW_UP = /\?\s*$|\bif\b|\b(?:not|never|may|might|maybe|possibly|probably|appears?|seems?|uncertain|unsure)\b|\b(?:won't|can't|couldn't|shouldn't|wouldn't)\b/i;
 const DOMAIN_OBJECT = "(?:files?|records?|data|resources?|jobs?|monitors?|projects?|worktrees?|directories|branches|deployments?|credentials?|secrets?)";
 const INSTALL_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?)";
@@ -158,7 +158,7 @@ const NON_SUCCESS_CLAUSE = [
   /\?\s*$/,
   /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
   /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
-  /\b(?:will|would|could|should|can|plan to|intend to|propose|after approval|later)\b/i,
+  /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
   /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
 ];
 const HIGH_IMPACT_SUCCESS = [
