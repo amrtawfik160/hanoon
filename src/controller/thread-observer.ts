@@ -68,6 +68,18 @@ function projectThread(thread: ThreadProjectionInput, projects: Project[], now: 
 
 export type BbThreadProjection = ReturnType<typeof projectThread>;
 
+export async function assertVisibleThreadScope(input: {
+  sdk: BbSdk;
+  threadId: string;
+  signal: AbortSignal;
+}) {
+  const thread = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
+  if (thread.visibility !== "visible" || thread.archivedAt !== null || thread.deletedAt !== null) {
+    throw new Error("The requested BB thread is not visible");
+  }
+  return thread;
+}
+
 export async function listVisibleThreads(input: {
   sdk: BbSdk;
   now: number;
@@ -116,10 +128,7 @@ export async function readThreadActivity(input: {
   threadId: string;
   signal: AbortSignal;
 }) {
-  const thread = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
-  if (thread.visibility !== "visible" || thread.archivedAt !== null || thread.deletedAt !== null) {
-    throw new Error("The requested BB thread is not visible");
-  }
+  const thread = await assertVisibleThreadScope(input);
   const [timeline, output, interactions] = await Promise.all([
     input.sdk.threads.timeline({ threadId: input.threadId, summaryOnly: "true", signal: input.signal }),
     input.sdk.threads.output({ threadId: input.threadId, signal: input.signal }),
@@ -165,9 +174,13 @@ export async function readThreadActivity(input: {
   };
 }
 
-async function projectHostId(sdk: BbSdk, projectId: string, signal: AbortSignal): Promise<string> {
-  const projects = await sdk.projects.list({ includePersonal: true, signal });
-  const project = projects.find((candidate) => candidate.id === projectId);
+export async function assertProjectHostScope(input: {
+  sdk: BbSdk;
+  projectId: string;
+  signal: AbortSignal;
+}): Promise<string> {
+  const projects = await input.sdk.projects.list({ includePersonal: true, signal: input.signal });
+  const project = projects.find((candidate) => candidate.id === input.projectId);
   if (!project) throw new Error("That BB project is unavailable");
   const source = project.sources.find((candidate) => candidate.isDefault) ??
     (project.sources.length === 1 ? project.sources[0] : undefined);
@@ -183,7 +196,7 @@ export async function createProjectThread(input: {
   prompt: string;
   signal: AbortSignal;
 }) {
-  const hostId = await projectHostId(input.sdk, input.projectId, input.signal);
+  const hostId = await assertProjectHostScope(input);
   const thread = await input.sdk.threads.spawn({
     projectId: input.projectId,
     title: input.title,
@@ -205,10 +218,7 @@ export async function sendToVisibleThread(input: {
   text: string;
   signal: AbortSignal;
 }) {
-  const thread = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
-  if (thread.visibility !== "visible" || thread.archivedAt !== null || thread.deletedAt !== null) {
-    throw new Error("The requested BB thread is not visible");
-  }
+  const thread = await assertVisibleThreadScope(input);
   await input.sdk.threads.send({
     threadId: input.threadId,
     mode: "auto",
@@ -223,10 +233,7 @@ export async function visibleThreadStatus(input: {
   threadId: string;
   signal: AbortSignal;
 }) {
-  const thread = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
-  if (thread.visibility !== "visible" || thread.archivedAt !== null || thread.deletedAt !== null) {
-    throw new Error("The requested BB thread is not visible");
-  }
+  const thread = await assertVisibleThreadScope(input);
   const [listed, projects] = await Promise.all([
     input.sdk.threads.list({
       projectId: thread.projectId,
