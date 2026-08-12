@@ -4,6 +4,7 @@ import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { SYSTEM_MONITORS, installSystemMonitors } from "../src/services/system-monitors";
+import { admitConfirmedJob, policyFixture } from "./helpers";
 import { MonitorService } from "../src/services/monitor-service";
 
 let fixtureNumber = 0;
@@ -185,4 +186,29 @@ it("retires its upkeep when self-maintenance is switched off", () => {
   // Switching off upkeep must not touch a watch the owner set themselves.
   expect(store.listMonitors(CONTROLLER_KEY, true).find((each) => each.id === ownWatch.id)?.state).toBe("armed");
   expect(store.listMonitors(CONTROLLER_KEY, false)).toHaveLength(1);
+});
+
+it("surfaces a project that a failed job has locked", () => {
+  const { store } = fixture();
+  store.upsertProjectPolicy(policyFixture({ projectId: "proj_a", alias: "a" }), NOW);
+  const job = store.createJob({ id: "job_dead", sourceUpdateId: 7_777, requestText: "ship it", now: NOW });
+  const selected = store.applyJobEvent(job.id, job.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_a",
+    policyVersion: 1,
+    policy: policyFixture({ projectId: "proj_a", alias: "a" }),
+  }, NOW + 1);
+  const admitted = admitConfirmedJob(store, selected, NOW + 2);
+  store.applyJobEvent(admitted.id, admitted.version, { type: "FAILED", error: "npm run check exited 1" }, NOW + 3);
+
+  const scorecard = store.buildAutonomyScorecard({ now: NOW + 4, windowMs: 7 * 86_400_000 });
+
+  // Nothing expires this claim, so the owner must be told it exists.
+  expect(scorecard.projectsHeldByFailedJobs).toMatchObject([{ jobId: "job_dead", projectId: "proj_a" }]);
+});
+
+it("reports no locked project when nothing has failed", () => {
+  const { store } = fixture();
+
+  expect(store.buildAutonomyScorecard({ now: NOW, windowMs: 7 * 86_400_000 }).projectsHeldByFailedJobs).toEqual([]);
 });

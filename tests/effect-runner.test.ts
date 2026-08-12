@@ -9,6 +9,7 @@ import {
   EffectRunner,
   PermanentEffectError,
   retryDelay,
+  threadResultEnvironment,
   type EffectRunnerDependencies,
 } from "../src/services/effect-runner";
 
@@ -759,4 +760,23 @@ describe("leased effect execution", () => {
     expect(store.getWorkerLiveness(job.id)?.state).toBe("stopping");
     expect(cancelled.cancelRequestedAt).not.toBeNull();
   });
+});
+
+it.each([null, undefined, ""])("retries rather than dies when the worktree has not attached yet (%p)", (environmentId) => {
+  // A managed worktree attaches a few seconds after spawn returns, so an absent
+  // environment id is timing, not breakage. Treating it as permanent killed
+  // every job at its first spawn and blocked the whole pipeline.
+  let thrown: unknown;
+  try {
+    threadResultEnvironment({ environmentId });
+  } catch (error) {
+    thrown = error;
+  }
+
+  expect(thrown).toBeInstanceOf(Error);
+  expect(thrown).not.toBeInstanceOf(PermanentEffectError);
+});
+
+it("accepts an environment id once the worktree has attached", () => {
+  expect(threadResultEnvironment({ environmentId: "env_worker" })).toBe("env_worker");
 });

@@ -1788,6 +1788,7 @@ export interface TelegramAgentStore {
     windowMs: number;
     jobs: Record<string, number>;
     blockedJobs: { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    projectsHeldByFailedJobs: { jobId: string; projectId: string | null; failedAt: number }[];
     remediationCycles: number;
     approvalsRequested: number;
     approvalsConsumed: number;
@@ -4164,6 +4165,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     windowMs: number;
     jobs: Record<string, number>;
     blockedJobs: { id: string; projectId: string | null; reason: string | null; updatedAt: number }[];
+    projectsHeldByFailedJobs: { jobId: string; projectId: string | null; failedAt: number }[];
     remediationCycles: number;
     approvalsRequested: number;
     approvalsConsumed: number;
@@ -4192,6 +4194,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       windowMs: input.windowMs,
       jobs,
       blockedJobs,
+      // A failed job keeps its project's pipeline claim so a retry can resume
+      // in place. Nothing expires that, so an abandoned failure silently blocks
+      // every future job on that project — the owner has to retry or cancel it,
+      // and can only do that if someone tells them.
+      projectsHeldByFailedJobs: this.db.prepare(
+        `SELECT job.id AS jobId, job.project_id AS projectId, job.updated_at AS failedAt
+           FROM job_resource_claims AS claim
+           JOIN jobs AS job ON job.id = claim.job_id
+          WHERE claim.state = 'held' AND claim.resource_kind = 'project' AND job.state = 'failed'
+          ORDER BY job.updated_at ASC LIMIT 10`,
+      ).all() as { jobId: string; projectId: string | null; failedAt: number }[],
       remediationCycles: scalar(
         "SELECT COALESCE(SUM(review_cycle), 0) AS value FROM jobs WHERE updated_at >= ?", since),
       approvalsRequested: scalar(

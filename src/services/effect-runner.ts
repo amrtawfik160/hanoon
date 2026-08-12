@@ -224,9 +224,13 @@ function threadResultId(result: { id?: unknown }): string {
   return result.id;
 }
 
-function threadResultEnvironment(result: { environmentId?: unknown }): string {
+export function threadResultEnvironment(result: { environmentId?: unknown }): string {
   if (typeof result.environmentId !== "string" || result.environmentId.length === 0) {
-    throw new PermanentEffectError("BB thread creation did not return an environment id");
+    // Retryable, deliberately. A managed worktree attaches to its thread a few
+    // seconds *after* the spawn call returns, so an absent environment id here
+    // is normal timing rather than a broken thread. Treating it as permanent
+    // killed every job at its first spawn and blocked the whole pipeline.
+    throw new Error("BB thread has no environment id yet");
   }
   return result.environmentId;
 }
