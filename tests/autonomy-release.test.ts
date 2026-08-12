@@ -307,14 +307,11 @@ it("frees a project locked by a failed job once that job is cancelled", () => {
     })).toMatchObject({ outcome: "not_admitted", reason: "project_busy" });
 
     // Cancelling the dead job is the recovery path the owner actually has.
-    const cancelling = store.applyJobEvent(failed.id, failed.version, {
+    // No worker left to stop, so the cancellation completes on request.
+    const cancelled = store.applyJobEvent(failed.id, failed.version, {
       type: "CANCEL_REQUESTED", activeWorker: null,
     }, 1_009);
-    store.applyExecutorJobEvent({
-      jobId: cancelling.id, expectedVersion: cancelling.version,
-      event: { type: "CANCEL_CONFIRMED" }, ownerId: "releaser",
-      generation: lease.generation, now: 1_010,
-    });
+    expect(cancelled.state).toBe("cancelled");
     // Cancelling emits render_status and revoke_approvals; release waits for
     // those to settle, exactly as the executor drives them in production.
     harnessDb.prepare(

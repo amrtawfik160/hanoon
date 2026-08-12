@@ -377,3 +377,38 @@ describe("job state machine", () => {
     );
   });
 });
+
+it("cancels immediately when there is no worker left to stop", () => {
+  // CANCEL_CONFIRMED is otherwise applied only by the stop_thread effect, which
+  // an idle job never emits — so this job would sit in "cancel requested"
+  // forever and could never reach a terminal state.
+  const job = stateJob("failed");
+
+  const result = transition(job, { type: "CANCEL_REQUESTED", activeWorker: null }, 5_000);
+
+  expect(result.job.state).toBe("cancelled");
+  expect(result.job.cancelRequestedAt).toBe(5_000);
+  expect(result.effects.map((effect) => effect.kind)).not.toContain("stop_thread");
+});
+
+it("still waits for a live worker to be stopped before cancelling", () => {
+  const job = stateJob("implementing");
+
+  const result = transition(job, {
+    type: "CANCEL_REQUESTED",
+    activeWorker: activeWorkerFixture({ jobId: job.id, state: "active" }),
+  }, 5_000);
+
+  expect(result.job.state).toBe("implementing");
+  expect(result.effects.map((effect) => effect.kind)).toContain("stop_thread");
+});
+
+it("keeps waiting when the caller supplied no worker evidence at all", () => {
+  const job = stateJob("implementing");
+
+  const result = transition(job, { type: "CANCEL_REQUESTED" }, 5_000);
+
+  // Unknown is not the same as absent: cancelling here could orphan a live worker.
+  expect(result.job.state).toBe("implementing");
+  expect(result.job.cancelRequestedAt).toBe(5_000);
+});

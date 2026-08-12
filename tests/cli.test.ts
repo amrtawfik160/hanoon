@@ -532,7 +532,9 @@ it("shows, retries, cancels, and rejects illegal job state transitions through t
   expect(parseJson(cancel.stdout)).toMatchObject({ id: active.id, cancelRequested: true });
   expect(store.getJob(active.id)?.cancelRequestedAt).not.toBeNull();
   const cancellationRequested = store.getJob(active.id)!;
-  store.applyJobEvent(active.id, cancellationRequested.version, { type: "CANCEL_CONFIRMED" }, 6);
+  // This job has no live worker, so the request already completed; confirming
+  // again would be illegal.
+  expect(cancellationRequested.state).toBe("cancelled");
   bb.storage.database().prepare("UPDATE jobs SET state = 'merged', cancel_requested_at = NULL WHERE id = ?").run(active.id);
 
   const illegal = await harness.behavior.runCli(["job", "retry", active.id]);

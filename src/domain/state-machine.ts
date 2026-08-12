@@ -179,7 +179,20 @@ function applyCancellation(
   if (job.cancelRequestedAt === null) {
     job.cancelRequestedAt = now;
     emitEffect(job, effects, "revoke_approvals");
-    stopActiveWorker(job, effects, event.activeWorker);
+    const worker = event.activeWorker;
+    const workerActive = !!worker && worker.jobId === job.id && ACTIVE_WORKER_STATES.has(worker.state);
+    if (workerActive) {
+      stopActiveWorker(job, effects, worker);
+    } else if (worker !== undefined) {
+      // Nothing to stop, and CANCEL_CONFIRMED is otherwise applied only by the
+      // stop_thread effect that an idle job never emits. Without this a
+      // cancelled-but-idle job sits in "cancel requested" forever: every later
+      // event is swallowed below, so it can never reach a terminal state.
+      // `undefined` means the caller supplied no evidence either way, so it
+      // keeps the conservative wait rather than orphaning a live worker.
+      job.state = "cancelled";
+      emitEffect(job, effects, "render_status");
+    }
   }
   return finish(job, effects, now);
 }

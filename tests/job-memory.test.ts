@@ -8,7 +8,7 @@ import {
   MEMORABLE_JOB_OUTCOMES,
   parseExtractedMemories,
 } from "../src/services/job-memory-service";
-import { admitConfirmedJob, policyFixture } from "./helpers";
+import { activeWorkerFixture, admitConfirmedJob, policyFixture } from "./helpers";
 
 let fixtureNumber = 0;
 
@@ -39,10 +39,11 @@ function finishedJob(store: TelegramAgentStore, id: string, outcome: "blocked" |
     }, 2_003);
   }
   // A requested cancellation the worker never confirmed is the shortest legal
-  // path to a genuinely terminal blocked job.
+  // path to a genuinely terminal blocked job. The worker must still be active,
+  // or the cancellation completes outright instead of going unconfirmed.
   const cancelling = store.applyJobEvent(admitted.id, admitted.version, {
     type: "CANCEL_REQUESTED",
-    activeWorker: null,
+    activeWorker: activeWorkerFixture({ jobId: admitted.id, state: "active" }),
   }, 2_003);
   return store.applyJobEvent(cancelling.id, cancelling.version, {
     type: "CANCELLATION_UNCONFIRMED",

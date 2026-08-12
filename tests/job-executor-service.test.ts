@@ -222,7 +222,9 @@ function terminalBoundaryController(
         now,
       });
       if (!requested) throw new Error("boundary cancellation request was not persisted");
-      if (!store.applyExecutorJobEvent({
+      // With no live worker to stop there is nothing to confirm: the request
+      // already completed, and a second confirmation would be illegal.
+      if (requested.state !== "cancelled" && !store.applyExecutorJobEvent({
         jobId,
         expectedVersion: requested.version,
         event: { type: "CANCEL_CONFIRMED" },
