@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { DEFAULT_MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "./autonomy/models";
 import {
+  EXTRACTION_MODELS,
   CONTROLLER_MODELS,
   CONTROLLER_PERMISSION_MODES,
   CONTROLLER_REASONING_LEVELS,
@@ -26,6 +27,7 @@ const globalConfigSchema = z.object({
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier),
   controllerPermissionMode: z.enum(CONTROLLER_PERMISSION_MODES)
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode),
+  extractionModel: z.enum(EXTRACTION_MODELS).default("inherit"),
 });
 
 export type GlobalConfig = z.infer<typeof globalConfigSchema>;
@@ -41,6 +43,7 @@ export function parseGlobalConfig(values: {
   controllerReasoningLevel?: string;
   controllerServiceTier?: string;
   controllerPermissionMode?: string;
+  extractionModel?: string;
 }): GlobalConfigResult {
   if (!values.botToken) {
     return {
@@ -56,6 +59,12 @@ export function parseGlobalConfig(values: {
         ok: false,
         message: "Fix the Telegram Agent URL or controller execution settings.",
       };
+}
+
+/** `inherit` leaves the model to the project default, which is the only safe
+ *  answer when we cannot know which providers this installation has. */
+export function extractionModel(config: GlobalConfig): string | null {
+  return config.extractionModel === "inherit" ? null : config.extractionModel;
 }
 
 export function controllerExecutionProfile(config: GlobalConfig): ControllerExecutionProfile {

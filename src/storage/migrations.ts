@@ -716,6 +716,14 @@ ALTER TABLE monitors ADD COLUMN system_key TEXT;
 CREATE UNIQUE INDEX monitors_system_key ON monitors (system_key) WHERE system_key IS NOT NULL;
 `] as const;
 
+export const CONTROLLER_OVERLAY_MIGRATIONS = [String.raw`
+CREATE TABLE controller_overlay (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  text TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -740,4 +748,5 @@ export const ALL_MIGRATIONS = [
   ...JOB_MEMORY_MIGRATIONS,
   ...MEMORY_CURATION_MIGRATIONS,
   ...SYSTEM_MONITOR_MIGRATIONS,
+  ...CONTROLLER_OVERLAY_MIGRATIONS,
 ] as const;

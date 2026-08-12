@@ -48,6 +48,7 @@ import {
   type ControllerTurnState,
 } from "../controller/models";
 import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervisor";
+import { MAX_CONTROLLER_OVERLAY } from "../controller/instructions";
 import {
   nextUnansweredQuestion,
   questionOptionToken,
@@ -1760,6 +1761,8 @@ export interface TelegramAgentStore {
     memory: { live: number; tombstoned: number; superseded: number; lowConfidence: number; extracted: number };
     monitors: { armed: number; system: number; failed: number };
   };
+  getControllerOverlay(): string | null;
+  setControllerOverlay(input: { text: string; now: number }): string | null;
   listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[];
   listArmedMonitors(limit: number): MonitorRecord[];
   cancelMonitor(id: string, now: number): boolean;
@@ -4144,6 +4147,35 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         failed: scalar("SELECT COUNT(*) AS value FROM monitors WHERE state = 'failed'"),
       },
     };
+  }
+
+  /** The owner's standing wording about how this agent should work. */
+  public getControllerOverlay(): string | null {
+    const row = this.db.prepare("SELECT text FROM controller_overlay WHERE singleton = 1")
+      .get() as { text: string } | undefined;
+    const text = row?.text.trim() ?? "";
+    return text.length === 0 ? null : text;
+  }
+
+  /** Passing empty text clears the overlay rather than storing a blank rule. */
+  public setControllerOverlay(input: { text: string; now: number }): string | null {
+    assertNonNegativeInteger(input.now, "now");
+    const text = typeof input.text === "string" ? input.text.replace(/\s+/g, " ").trim() : "";
+    if (text.length > MAX_CONTROLLER_OVERLAY) {
+      throw new TypeError(`controller overlay must be at most ${MAX_CONTROLLER_OVERLAY} characters`);
+    }
+    // The overlay is replayed into every turn's system instructions, so a
+    // pasted credential here would outlive the message that carried it.
+    if (containsCredentialLikeText(text)) throw new TypeError("controller overlay must not contain credential-like text");
+    if (text.length === 0) {
+      this.db.prepare("DELETE FROM controller_overlay WHERE singleton = 1").run();
+      return null;
+    }
+    this.db.prepare(
+      `INSERT INTO controller_overlay (singleton, text, updated_at) VALUES (1, ?, ?)
+       ON CONFLICT(singleton) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at`,
+    ).run(text, input.now);
+    return text;
   }
 
   public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {

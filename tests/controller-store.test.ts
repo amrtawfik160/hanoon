@@ -34,7 +34,7 @@ function acquire(store: ReturnType<typeof openStore>) {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(23);
+  expect(ALL_MIGRATIONS).toHaveLength(24);
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -63,6 +63,7 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[20]).toContain("CREATE TABLE job_memory_extractions");
   expect(ALL_MIGRATIONS[21]).toContain("CREATE TABLE memory_recalls");
   expect(ALL_MIGRATIONS[22]).toContain("ADD COLUMN system_key");
+  expect(ALL_MIGRATIONS[23]).toContain("CREATE TABLE controller_overlay");
 });
 
 it("enqueues Telegram controller turns idempotently and rejects changed replay input", () => {

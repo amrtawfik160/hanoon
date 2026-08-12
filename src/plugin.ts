@@ -1,5 +1,5 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { controllerExecutionProfile, parseGlobalConfig } from "./config";
+import { controllerExecutionProfile, extractionModel, parseGlobalConfig } from "./config";
 import { BbRunner } from "./bb/runner";
 import { resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
@@ -42,6 +42,7 @@ import {
   CONTROLLER_REASONING_LEVELS,
   CONTROLLER_SERVICE_TIERS,
   DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  EXTRACTION_MODELS,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
@@ -98,6 +99,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       description: "BB and the execution machine still enforce their permission limits.",
       options: [...CONTROLLER_PERMISSION_MODES],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
+    },
+    extractionModel: {
+      type: "select",
+      label: "Background learning model",
+      description: "Model for learning lessons from finished jobs. Inherit uses the project default; a cheaper model keeps background work off your conversational tier.",
+      options: [...EXTRACTION_MODELS],
+      default: "inherit",
     },
   });
   const store = openStore(bb.storage);
@@ -491,6 +499,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         const hosts = await bb.sdk.hosts.list({});
         const host = hosts.find((candidate) => candidate.status === "connected");
         if (!host) throw new Error("No connected BB host can run a memory extraction");
+        const model = config.ok ? extractionModel(config.value) : null;
         const thread = await bb.sdk.threads.spawn({
           projectId,
           title,
@@ -501,6 +510,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
             hostId: host.id,
             workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
           },
+          // Extraction reads a repository and writes three sentences; the
+          // conversational tier's reasoning budget is wasted on it.
+          ...(model === null ? {} : {
+            model,
+            reasoningLevel: "low" as const,
+            executionInputSources: { model: "explicit" as const, reasoningLevel: "explicit" as const },
+          }),
         });
         return thread.id;
       },

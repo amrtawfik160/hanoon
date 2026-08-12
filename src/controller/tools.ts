@@ -13,7 +13,7 @@ import {
 import { nextCronOccurrence } from "../services/monitor-service";
 import { CONTROLLER_PROVIDERS } from "./execution-profile";
 import { isControllerThreadTitle } from "./bb-controller";
-import { CONTROLLER_INSTRUCTIONS } from "./instructions";
+import { MAX_CONTROLLER_OVERLAY, composeControllerInstructions } from "./instructions";
 import {
   parseWorkerThreadTitle,
   resolveWorkerSkillProfile,
@@ -51,6 +51,7 @@ export const CONTROLLER_TOOL_NAMES = [
   "telegram_agent_health",
   "telegram_agent_delegate",
   "telegram_agent_scorecard",
+  "telegram_agent_set_working_style",
 ] as const;
 
 type ToolDependencies = {
@@ -712,6 +713,28 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     },
   });
 
+  bb.agents.registerTool({
+    name: CONTROLLER_TOOL_NAMES[20],
+    description: "Record how the owner wants you to work — terser answers, always show the PR link, a habit they keep asking for. This is standing behaviour, not a fact: it is applied to every later turn. Replace it wholesale each time; send empty text to clear it. Use telegram_agent_remember for things you need to know rather than ways you should act.",
+    experimental_statusLabels: { pending: "Adjusting how you work", completed: "Adjusted how you work" },
+    parameters: z.object({
+      text: z.string().max(MAX_CONTROLLER_OVERLAY),
+    }).strict(),
+    execute: (params, context) => {
+      const controller = authorizedController(dependencies.store, context);
+      return once(dependencies, {
+        controllerKey: controller.controllerKey,
+        toolName: CONTROLLER_TOOL_NAMES[20],
+        params,
+      }, () => json({
+        workingStyle: dependencies.store.setControllerOverlay({
+          text: params.text,
+          now: dependencies.now(),
+        }),
+      }));
+    },
+  });
+
   bb.agents.configure((context) => {
     const controller = dependencies.store.getControllerByThreadId(context.thread.id);
     const candidate = controller !== null &&
@@ -724,7 +747,11 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       context.environment.workspaceProvisionType === "personal" &&
       isControllerThreadTitle(context.thread.title, controller.controllerKey);
     if (candidate) {
-      return { tools: [...CONTROLLER_TOOL_NAMES], skills: [], instructions: CONTROLLER_INSTRUCTIONS };
+      return {
+        tools: [...CONTROLLER_TOOL_NAMES],
+        skills: [],
+        instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
+      };
     }
     const title = parseWorkerThreadTitle(context.thread.title);
     const durableIdentity = title === null
