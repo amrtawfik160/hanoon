@@ -34,6 +34,34 @@ function proof(value: string): string {
   return `sha256:${sha256(value)}`;
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("registered tool surface contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value !== "object") throw new TypeError("registered tool surface contains a non-JSON value");
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+    .join(",")}}`;
+}
+
+function registeredToolSurface(agentTools: ReadonlyArray<{ name: string; inputSchema: unknown }>) {
+  const tools = [...agentTools]
+    .map(({ name, inputSchema }) => ({ name, inputSchema }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const parameterSchemaSha256 = Object.fromEntries(
+    tools.map((tool) => [tool.name, sha256(canonicalJson(tool.inputSchema))]),
+  );
+  return {
+    advertisedTools: tools.map((tool) => tool.name),
+    parameterSchemaSha256,
+    capabilityManifestSha256: sha256(canonicalJson({ tools })),
+  };
+}
+
 export function loadControllerScenarioCorpus(): ReturnType<typeof parseControllerScenarioCorpus> {
   const path = fileURLToPath(new URL("../../evals/controller-scenarios.json", import.meta.url));
   return parseControllerScenarioCorpus(JSON.parse(readFileSync(path, "utf8")));
@@ -82,7 +110,12 @@ function parseJobStatusProjection(result: unknown): JobStatusProjection {
   return { id, state, serialized: result };
 }
 
-function harnessIdentity(scenarioCase: ScenarioCase, trial: number, seed: number): ControllerScenarioTrial["harness"] {
+function harnessIdentity(
+  scenarioCase: ScenarioCase,
+  trial: number,
+  seed: number,
+  toolSurface: ReturnType<typeof registeredToolSurface>,
+): ControllerScenarioTrial["harness"] {
   const fixture = `${scenarioCase.id}:${trial}:${seed}`;
   return {
     hanoonCommit: process.env.HANOON_EVAL_COMMIT ?? "0".repeat(40),
@@ -94,11 +127,11 @@ function harnessIdentity(scenarioCase: ScenarioCase, trial: number, seed: number
     permissionMode: "auto",
     instructionSha256: sha256("fixed-controller-scenario-instruction-v1"),
     overlaySha256: sha256(""),
-    capabilityManifestSha256: sha256("baseline-no-controller-tools"),
+    capabilityManifestSha256: toolSurface.capabilityManifestSha256,
     policySha256: sha256("baseline-no-project-policy"),
     contextSha256: sha256(fixture),
-    advertisedTools: [],
-    parameterSchemaSha256: {},
+    advertisedTools: toolSurface.advertisedTools,
+    parameterSchemaSha256: toolSurface.parameterSchemaSha256,
   };
 }
 
@@ -124,6 +157,7 @@ async function runScenario(
     notify: () => undefined,
     now: () => FIXTURE_NOW,
   });
+  const toolSurface = registeredToolSurface(harness.registrations.agentTools);
 
   const queuedJob = scenarioCase.id === "current-job-status"
     ? store.createJob({ id: JOB_ID, sourceUpdateId: seed * 1_000 + trial, requestText: "fixed status fixture", now: 3 })
@@ -188,7 +222,7 @@ async function runScenario(
     scenarioId: scenarioCase.id,
     trial,
     seed,
-    harness: harnessIdentity(scenarioCase, trial, seed),
+    harness: harnessIdentity(scenarioCase, trial, seed, toolSurface),
     budget: scenarioCase.budget,
     outcome: {
       status: outcomePassed ? "passed" : "failed",
