@@ -68,10 +68,10 @@ export type ControllerTurnRecord = {
   dispatchAfterSeq: number;
   retryCount: number;
   bbEventSeq: number;
-  evidenceEventSeq?: number;
-  completionContinuations?: number;
-  acceptedFinalizationId?: number | null;
-  evidenceLimitExceededAt?: number | null;
+  evidenceEventSeq: number;
+  completionContinuations: number;
+  acceptedFinalizationId: number | null;
+  evidenceLimitExceededAt: number | null;
   streamText: string;
   telegramMessageId: number | null;
   streamPhase: ControllerStreamPhase;

@@ -4,6 +4,34 @@ import {
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
 
+function nativeEvidenceCandidate(sourceItemId: string) {
+  return {
+    sourceName: "command",
+    sourceItemId,
+    outcome: "succeeded" as const,
+    argsSha256: "c".repeat(64),
+    resultSha256: "d".repeat(64),
+    proofKinds: ["command_result"] as const,
+    subjectRefs: [`command:${sourceItemId}`] as const,
+  };
+}
+
+function installAcceptedFinalization(
+  db: ReturnType<typeof submittedControllerFixture>["db"],
+  turnId: string,
+  now: number,
+): void {
+  db.prepare(
+    `INSERT INTO controller_finalizations (
+       turn_id, revision, payload_json, rendered_message, evidence_high_water_id,
+       state, rejection_code, created_at, validated_at
+     ) VALUES (?, 1, '{}', 'sealed', 0, 'accepted', NULL, ?, ?)`,
+  ).run(turnId, now, now);
+  const inserted = db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number | bigint };
+  db.prepare("UPDATE controller_turns SET accepted_finalization_id = ? WHERE id = ?")
+    .run(Number(inserted.id), turnId);
+}
+
 it("records bounded current-turn evidence under the exact executor fence", () => {
   const { store, turn, fence } = submittedControllerFixture();
 
@@ -133,6 +161,46 @@ it("persists native rows and their cursor across store restart", () => {
   expect(restarted.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 1 });
 });
 
+it("replays one native item across restart without duplicating its row", () => {
+  const { store, turn, fence, reopen } = submittedControllerFixture();
+  const candidate = nativeEvidenceCandidate("cross_batch_replay");
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [candidate],
+  })).toBe("recorded");
+
+  const restarted = reopen();
+  expect(restarted.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 1,
+    throughSeq: 2,
+    items: [candidate],
+  })).toBe("recorded");
+  expect(restarted.listControllerEvidence(turn.id, 128)).toHaveLength(1);
+  expect(restarted.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 2 });
+});
+
+it("advances the native cursor for an empty batch without inserting evidence", () => {
+  const { store, turn, fence } = submittedControllerFixture();
+
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 7,
+    items: [],
+  })).toBe("recorded");
+  expect(store.listControllerEvidence(turn.id, 128)).toEqual([]);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 7 });
+});
+
 it("rejects a native batch whose expected cursor has changed", () => {
   const { store, turn, fence } = submittedControllerFixture({
     turnColumns: { evidenceEventSeq: 4 },
@@ -248,6 +316,54 @@ it("marks a cap-crossing native batch without inserting rows or advancing its cu
   });
 });
 
+it("advances a duplicate-only replay at cap before rejecting a genuinely new native id", () => {
+  const { store, turn, fence } = submittedControllerFixture();
+  const storedNative = nativeEvidenceCandidate("stored_at_cap");
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [storedNative],
+  })).toBe("recorded");
+  for (let index = 0; index < 127; index += 1) {
+    expect(store.recordControllerEvidence({
+      ...validEvidenceInput(turn),
+      ...fence,
+      sourceName: `telegram_agent_cap_fill_${index}`,
+    }).outcome).toBe("recorded");
+  }
+  expect(store.listControllerEvidence(turn.id, 128)).toHaveLength(128);
+
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 1,
+    throughSeq: 2,
+    items: [storedNative],
+  })).toBe("recorded");
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    evidenceEventSeq: 2,
+    evidenceLimitExceededAt: null,
+  });
+
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 2,
+    throughSeq: 3,
+    items: [nativeEvidenceCandidate("new_over_cap")],
+  })).toBe("limit_exceeded");
+  expect(store.listControllerEvidence(turn.id, 128)).toHaveLength(128);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    evidenceEventSeq: 2,
+    evidenceLimitExceededAt: fence.now,
+  });
+});
+
 it("scopes evidence reads to the requested turn", () => {
   const { store, turn, fence } = submittedControllerFixture();
   const first = store.recordControllerEvidence({ ...validEvidenceInput(turn), ...fence });
@@ -292,6 +408,23 @@ it("reads subject and proof arrays back in caller order", () => {
       subjectRefs: ["project:proj_2", "project:proj_1", "health:prod"],
     },
   });
+});
+
+it("lists multiple evidence rows in ascending evidence-id order", () => {
+  const { store, turn, fence } = submittedControllerFixture();
+  for (const sourceName of ["third_observation", "first_observation", "second_observation"]) {
+    expect(store.recordControllerEvidence({
+      ...validEvidenceInput(turn),
+      ...fence,
+      sourceName,
+    }).outcome).toBe("recorded");
+  }
+
+  expect(store.listControllerEvidence(turn.id, 128).map((evidence) => evidence.ref)).toEqual([
+    "evidence:1",
+    "evidence:2",
+    "evidence:3",
+  ]);
 });
 
 it.each([
@@ -353,22 +486,29 @@ it("validates every native candidate before starting the batch transaction", () 
 
 it("rejects evidence after an accepted finalization", () => {
   const { store, turn, fence, db } = submittedControllerFixture();
-  db.prepare(
-    `INSERT INTO controller_finalizations (
-       turn_id, revision, payload_json, rendered_message, evidence_high_water_id,
-       state, rejection_code, created_at, validated_at
-     ) VALUES (?, 1, '{}', 'sealed', 0, 'accepted', NULL, ?, ?)`,
-  ).run(turn.id, fence.now, fence.now);
-  const inserted = db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number | bigint };
-  const finalizationId = Number(inserted.id);
-  db.prepare("UPDATE controller_turns SET accepted_finalization_id = ? WHERE id = ?")
-    .run(finalizationId, turn.id);
+  installAcceptedFinalization(db, turn.id, fence.now);
 
   expect(store.recordControllerEvidence({
     ...validEvidenceInput(turn),
     ...fence,
   })).toEqual({ outcome: "stale" });
   expect(store.listControllerEvidence(turn.id, 128)).toEqual([]);
+});
+
+it("rejects native evidence after an accepted finalization without advancing its cursor", () => {
+  const { store, turn, fence, db } = submittedControllerFixture();
+  installAcceptedFinalization(db, turn.id, fence.now);
+
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [nativeEvidenceCandidate("sealed_native_item")],
+  })).toBe("stale");
+  expect(store.listControllerEvidence(turn.id, 128)).toEqual([]);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 0 });
 });
 
 it("exposes the fixed proof-kind vocabulary once from controller models", async () => {

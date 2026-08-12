@@ -1,5 +1,7 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { expect, expectTypeOf, it } from "vitest";
+import type { ControllerTurnRecord } from "../src/controller/models";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore } from "../src/storage/store";
@@ -29,6 +31,10 @@ function acquire(store: ReturnType<typeof openStore>) {
   const lease = store.acquireExecutorLease("executor", 2_000, 30_000);
   if (!lease.acquired) throw new Error("missing executor lease");
   return { ownerId: "executor", generation: lease.generation, now: 2_000, leaseMs: 30_000 };
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
 }
 
 // Applied migrations are immutable history: each release appends, so these are
@@ -73,6 +79,22 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[28]).toContain("evidence_high_water_id INTEGER NOT NULL");
 });
 
+it("pins the exact shipped and controller trust migration bytes in order", () => {
+  expect(sha256(ALL_MIGRATIONS.slice(0, 28).join("\u0000"))).toBe(
+    "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
+  );
+  expect(sha256(ALL_MIGRATIONS[28]!)).toBe(
+    "4ec9eb259bbdce396ac0026c13ebd84ec71f25433092827cc9aae5fe903505d3",
+  );
+});
+
+it("requires controller trust state on the public turn record", () => {
+  expectTypeOf<ControllerTurnRecord["evidenceEventSeq"]>().toEqualTypeOf<number>();
+  expectTypeOf<ControllerTurnRecord["completionContinuations"]>().toEqualTypeOf<number>();
+  expectTypeOf<ControllerTurnRecord["acceptedFinalizationId"]>().toEqualTypeOf<number | null>();
+  expectTypeOf<ControllerTurnRecord["evidenceLimitExceededAt"]>().toEqualTypeOf<number | null>();
+});
+
 it("enqueues Telegram controller turns idempotently and rejects changed replay input", () => {
   const { store } = fixture();
   const image = {
@@ -108,6 +130,25 @@ it("enqueues Telegram controller turns idempotently and rejects changed replay i
     ...turnInput(101),
     image: { ...image, fileId: "different-file-id" },
   })).toThrow(IdempotencyConflictError);
+});
+
+it.each([
+  ["negative evidence cursor", "evidence_event_seq", -1],
+  ["unsafe evidence cursor", "evidence_event_seq", Number.MAX_SAFE_INTEGER + 1],
+  ["negative continuation count", "completion_continuations", -1],
+  ["unsafe continuation count", "completion_continuations", Number.MAX_SAFE_INTEGER + 1],
+  ["zero accepted finalization id", "accepted_finalization_id", 0],
+  ["unsafe accepted finalization id", "accepted_finalization_id", Number.MAX_SAFE_INTEGER + 1],
+  ["negative evidence-limit timestamp", "evidence_limit_exceeded_at", -1],
+  ["unsafe evidence-limit timestamp", "evidence_limit_exceeded_at", Number.MAX_SAFE_INTEGER + 1],
+])("fails closed on a persisted %s", (_scenario, column, invalidValue) => {
+  const { bb, store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(102));
+  bb.storage.database().prepare(
+    `UPDATE controller_turns SET ${column} = ? WHERE id = ?`,
+  ).run(invalidValue, turn.id);
+
+  expect(() => store.getControllerTurn(turn.id)).toThrow(/persisted controller turn/i);
 });
 
 it("claims exactly one FIFO turn while a controller turn is dispatching or submitted", () => {

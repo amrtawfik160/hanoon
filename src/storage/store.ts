@@ -2194,6 +2194,22 @@ function parseControllerThread(row: ControllerThreadRow): ControllerThreadRecord
 
 function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
   const image = parseControllerImage(row);
+  const evidenceEventSeq = parsePersistedControllerNonNegativeInteger(
+    row.evidence_event_seq,
+    "evidence_event_seq",
+  );
+  const completionContinuations = parsePersistedControllerNonNegativeInteger(
+    row.completion_continuations,
+    "completion_continuations",
+  );
+  const acceptedFinalizationId = parsePersistedControllerNullablePositiveInteger(
+    row.accepted_finalization_id,
+    "accepted_finalization_id",
+  );
+  const evidenceLimitExceededAt = parsePersistedControllerNullableNonNegativeInteger(
+    row.evidence_limit_exceeded_at,
+    "evidence_limit_exceeded_at",
+  );
   return {
     id: row.id,
     updateId: row.telegram_update_id,
@@ -2207,10 +2223,10 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     dispatchAfterSeq: row.dispatch_after_seq,
     retryCount: row.retry_count,
     bbEventSeq: row.bb_event_seq,
-    evidenceEventSeq: row.evidence_event_seq,
-    completionContinuations: row.completion_continuations,
-    acceptedFinalizationId: row.accepted_finalization_id,
-    evidenceLimitExceededAt: row.evidence_limit_exceeded_at,
+    evidenceEventSeq,
+    completionContinuations,
+    acceptedFinalizationId,
+    evidenceLimitExceededAt,
     streamText: row.stream_text,
     telegramMessageId: row.telegram_message_id,
     streamPhase: row.stream_phase,
@@ -2229,6 +2245,26 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function parsePersistedControllerNonNegativeInteger(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Persisted controller turn ${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function parsePersistedControllerNullablePositiveInteger(value: number | null, field: string): number | null {
+  if (value === null) return null;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`Persisted controller turn ${field} must be null or a positive safe integer`);
+  }
+  return value;
+}
+
+function parsePersistedControllerNullableNonNegativeInteger(value: number | null, field: string): number | null {
+  if (value === null) return null;
+  return parsePersistedControllerNonNegativeInteger(value, field);
 }
 
 // Stored as a comma-separated slug list: the vocabulary is closed and tiny, so
