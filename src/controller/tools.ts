@@ -49,6 +49,7 @@ import {
 } from "./capability-executor";
 import {
   CONTROLLER_CAPABILITIES,
+  CONTROLLER_TOOL_NAMES,
   type ControllerCapabilityDescriptor,
   type ControllerToolName,
 } from "./capability-policy";
@@ -58,31 +59,12 @@ import type {
   ControllerEvidenceReconciliationIncomplete,
 } from "./evidence-projector";
 import type { ControllerEvidenceRecord } from "../storage/controller-evidence-repository";
+import {
+  controllerFinalizationCorrection,
+  controllerFinalizationJsonSchema,
+} from "./finalization-contract";
 
-export const CONTROLLER_TOOL_NAMES = [
-  "telegram_agent_list_projects",
-  "telegram_agent_start_job",
-  "telegram_agent_job_status",
-  "telegram_agent_retry_job",
-  "telegram_agent_cancel_job",
-  "telegram_agent_list_threads",
-  "telegram_agent_thread_status",
-  "telegram_agent_read_thread",
-  "telegram_agent_create_thread",
-  "telegram_agent_send_to_thread",
-  "telegram_agent_request_thread_operation",
-  "telegram_agent_remember",
-  "telegram_agent_recall",
-  "telegram_agent_forget",
-  "telegram_agent_watch",
-  "telegram_agent_list_watches",
-  "telegram_agent_cancel_watch",
-  "telegram_agent_health",
-  "telegram_agent_delegate",
-  "telegram_agent_scorecard",
-  "telegram_agent_set_working_style",
-  "telegram_agent_turn_evidence",
-] as const;
+export { CONTROLLER_TOOL_NAMES } from "./capability-policy";
 
 type ToolDependencies = {
   store: TelegramAgentStore;
@@ -183,7 +165,7 @@ function evidenceAuthorization(
 function readableReconciliation(
   reconciliation: ControllerEvidenceReconciliation,
 ): void {
-  if (reconciliation.outcome === "stale" || reconciliation.outcome === "finalized") {
+  if (reconciliation.outcome === "stale") {
     throw new ControllerCapabilityAuthorizationError("turn_missing");
   }
 }
@@ -221,6 +203,58 @@ async function executeEvidenceIndex(request: EvidenceToolExecution): Promise<str
   );
   readableReconciliation(reconciliation);
   return currentEvidenceIndex(request, authorized, reconciliation);
+}
+
+async function executeControllerFinalizer(
+  dependencies: ToolDependencies,
+  descriptor: ControllerCapabilityDescriptor,
+  candidate: unknown,
+  context: PluginAgentToolContext,
+): Promise<string> {
+  const authorized = evidenceAuthorization(dependencies, descriptor, context);
+  if (dependencies.store.getAcceptedControllerFinalization(authorized.turn.id) !== null) {
+    return canonicalControllerJson({
+      outcome: "rejected",
+      code: "accepted_already",
+      correction: controllerFinalizationCorrection("accepted_already"),
+    });
+  }
+  if (!dependencies.evidenceProjector) {
+    throw new ControllerCapabilityAuthorizationError("policy_unreadable");
+  }
+  const reconciliation = await dependencies.evidenceProjector.reconcile(
+    authorized.controller,
+    authorized.turn,
+    authorized.fence,
+    context.signal,
+  );
+  if (reconciliation.outcome === "stale") {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
+  }
+  if (reconciliation.reconciliationIncomplete !== null) {
+    throw new Error(
+      `Controller evidence reconciliation is incomplete: ${reconciliation.reconciliationIncomplete}`,
+    );
+  }
+  const current = evidenceAuthorization(dependencies, descriptor, context);
+  if (current.turn.id !== authorized.turn.id) {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
+  }
+  const proposed = dependencies.store.proposeControllerFinalization({
+    ...current.fence,
+    turnId: current.turn.id,
+    controllerKey: current.controller.controllerKey,
+    candidate,
+  });
+  if (proposed.outcome === "stale") throw new ControllerCapabilityAuthorizationError("fence_lost");
+  if (proposed.outcome === "accepted") {
+    return canonicalControllerJson({
+      outcome: "accepted",
+      ref: proposed.finalization.ref,
+      renderedCharacters: Array.from(proposed.finalization.renderedMessage).length,
+    });
+  }
+  return canonicalControllerJson(proposed);
 }
 
 function authorizedController(
@@ -1041,6 +1075,7 @@ async function projectTrustedEvidence(
 }
 
 export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDependencies): void {
+  const pendingRegistrations: Array<Readonly<{ name: string; register(): void }>> = [];
   const registerTool = <Schema extends z.ZodType>(registration: Readonly<{
     name: ControllerToolName;
     description: string;
@@ -1053,35 +1088,38 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     ): unknown | Promise<unknown>;
   }>): void => {
     const descriptor = CONTROLLER_CAPABILITIES[registration.name];
-    registerControllerCapabilityTool(bb, {
-      store: dependencies.store,
-      sdk: dependencies.sdk,
-      now: dependencies.now,
-      credential: descriptor.credential_scope.credential === "bb"
-        ? { credential: "bb", audience: "bb-plugin-sdk" }
-        : { credential: "none", audience: "none" },
-    }, {
-      ...registration,
-      descriptor,
-      resolveScope: async (params, context, authorized) => {
-        const resolved = await resolveTrustedScope({
+    pendingRegistrations.push({
+      name: registration.name,
+      register: () => registerControllerCapabilityTool(bb, {
+        store: dependencies.store,
+        sdk: dependencies.sdk,
+        now: dependencies.now,
+        credential: descriptor.credential_scope.credential === "bb"
+          ? { credential: "bb", audience: "bb-plugin-sdk" }
+          : { credential: "none", audience: "none" },
+      }, {
+        ...registration,
+        descriptor,
+        resolveScope: async (params, context, authorized) => {
+          const resolved = await resolveTrustedScope({
+            dependencies,
+            name: registration.name,
+            params,
+            context,
+            authorized,
+          });
+          return { ...resolved, state: { ...trustedState(resolved), authorized } };
+        },
+        execute: (params, context, resolution) => registration.execute(params, context, resolution),
+        projectEvidence: (_params, context, domain, resolution) => projectTrustedEvidence({
           dependencies,
           name: registration.name,
-          params,
+          params: _params as Record<string, unknown>,
           context,
-          authorized,
-        });
-        return { ...resolved, state: { ...trustedState(resolved), authorized } };
-      },
-      execute: (params, context, resolution) => registration.execute(params, context, resolution),
-      projectEvidence: (_params, context, domain, resolution) => projectTrustedEvidence({
-        dependencies,
-        name: registration.name,
-        params: _params as Record<string, unknown>,
-        context,
-        domain,
-        resolution,
-        authorized: trustedState(resolution).authorized!,
+          domain,
+          resolution,
+          authorized: trustedState(resolution).authorized!,
+        }),
       }),
     });
   };
@@ -1546,19 +1584,48 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   });
 
   const evidenceDescriptor = CONTROLLER_CAPABILITIES.telegram_agent_turn_evidence;
-  bb.agents.registerTool({
+  pendingRegistrations.push({
     name: CONTROLLER_TOOL_NAMES[21],
-    description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
-    parameters: z.object({
-      afterEvidenceId: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
-    }).strict(),
-    execute: (params, context) => executeEvidenceIndex({
-      dependencies,
-      descriptor: evidenceDescriptor,
-      afterEvidenceId: params.afterEvidenceId,
-      context,
+    register: () => bb.agents.registerTool({
+      name: CONTROLLER_TOOL_NAMES[21],
+      description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
+      parameters: z.object({
+        afterEvidenceId: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
+      }).strict(),
+      execute: (params, context) => executeEvidenceIndex({
+        dependencies,
+        descriptor: evidenceDescriptor,
+        afterEvidenceId: params.afterEvidenceId,
+        context,
+      }),
     }),
   });
+
+  const finalizerDescriptor = CONTROLLER_CAPABILITIES.telegram_agent_respond;
+  pendingRegistrations.push({
+    name: CONTROLLER_TOOL_NAMES[22],
+    register: () => bb.agents.registerTool({
+      name: CONTROLLER_TOOL_NAMES[22],
+      description: "Submit one bounded evidence-backed final response for the current controller turn.",
+      parameters: controllerFinalizationJsonSchema,
+      execute: (candidate, context) => executeControllerFinalizer(
+        dependencies,
+        finalizerDescriptor,
+        candidate,
+        context,
+      ),
+    }),
+  });
+
+  const registeredToolNames = pendingRegistrations.map((registration) => registration.name);
+  const uniqueRegisteredNames = [...new Set(registeredToolNames)].sort();
+  const manifestNames = Object.keys(CONTROLLER_CAPABILITIES).sort();
+  if (
+    uniqueRegisteredNames.length !== registeredToolNames.length ||
+    uniqueRegisteredNames.length !== manifestNames.length ||
+    uniqueRegisteredNames.some((name, index) => name !== manifestNames[index])
+  ) throw new TypeError("Controller tool registration does not exactly match its capability manifest");
+  for (const registration of pendingRegistrations) registration.register();
 
   bb.agents.configure((context) => {
     const controller = dependencies.store.getControllerByThreadId(context.thread.id);

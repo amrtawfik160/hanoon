@@ -88,9 +88,12 @@ import {
 } from "./autonomy-repository";
 import {
   ControllerEvidenceRepository,
+  type AcceptedControllerFinalization,
   type ControllerEvidenceInput,
   type ControllerEvidenceRecord,
   type ControllerEvidenceWrite,
+  type ControllerFinalizationProposalInput,
+  type ControllerFinalizationProposalResult,
   type ControllerNativeEvidenceInput,
   type ControllerNativeEvidenceWrite,
 } from "./controller-evidence-repository";
@@ -1666,6 +1669,19 @@ export interface TelegramAgentStore {
   ): ControllerNativeEvidenceWrite;
   listControllerEvidence(turnId: string, limit: number): ControllerEvidenceRecord[];
   getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null;
+  proposeControllerFinalization(
+    input: ControllerFinalizationProposalInput,
+  ): ControllerFinalizationProposalResult;
+  getAcceptedControllerFinalization(turnId: string): AcceptedControllerFinalization | null;
+  claimControllerCompletionContinuation(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    bbHighWaterSeq: number;
+  }): "claimed" | "already_claimed" | "stale";
+  completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+  }): "completed" | "stale" | "evidence_advanced";
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
   requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
   recordControllerImagePreparationFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
@@ -3148,6 +3164,31 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null {
     return this.controllerEvidenceRepository.get(turnId, evidenceId);
+  }
+
+  public proposeControllerFinalization(
+    input: ControllerFinalizationProposalInput,
+  ): ControllerFinalizationProposalResult {
+    return this.controllerEvidenceRepository.proposeFinalization(input);
+  }
+
+  public getAcceptedControllerFinalization(turnId: string): AcceptedControllerFinalization | null {
+    return this.controllerEvidenceRepository.getAcceptedFinalization(turnId);
+  }
+
+  public claimControllerCompletionContinuation(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    bbHighWaterSeq: number;
+  }): "claimed" | "already_claimed" | "stale" {
+    return this.controllerEvidenceRepository.claimCompletionContinuation(input);
+  }
+
+  public completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+  }): "completed" | "stale" | "evidence_advanced" {
+    return this.controllerEvidenceRepository.completeFromFinalization(input);
   }
 
   public claimNextControllerTurn(

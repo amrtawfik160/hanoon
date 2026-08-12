@@ -587,7 +587,7 @@ it("rejects evidence after an accepted finalization", () => {
   expect(store.listControllerEvidence(turn.id, 128)).toEqual([]);
 });
 
-it("rejects native evidence after an accepted finalization without advancing its cursor", () => {
+it("records late native evidence after an accepted finalization and advances its cursor", () => {
   const { store, turn, fence, db } = submittedControllerFixture();
   installAcceptedFinalization(db, turn.id, fence.now);
 
@@ -598,9 +598,11 @@ it("rejects native evidence after an accepted finalization without advancing its
     fromSeq: 0,
     throughSeq: 1,
     items: [nativeEvidenceCandidate("sealed_native_item")],
-  })).toBe("stale");
-  expect(store.listControllerEvidence(turn.id, 128)).toEqual([]);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 0 });
+  })).toBe("recorded");
+  expect(store.listControllerEvidence(turn.id, 128)).toMatchObject([
+    { sourceKind: "bb_item", sourceItemId: "sealed_native_item" },
+  ]);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 1 });
 });
 
 it("exposes the fixed proof-kind vocabulary once from controller models", async () => {

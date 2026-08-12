@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { SLICE_1_CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
+import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
 import { sha256ControllerJson } from "../src/controller/capability-executor";
 import {
   ControllerEvidenceProjector,
@@ -137,7 +137,7 @@ function readyProjectorFixture(options: ProjectorFixtureOptions = {}) {
     sdk: fixture.bb.sdk,
     store: fixture.store,
     clock: { now: options.clock ?? (() => 2_100) },
-    hanoonToolNames: SLICE_1_CONTROLLER_TOOL_NAMES,
+    hanoonToolNames: CONTROLLER_TOOL_NAMES,
   });
   return { ...fixture, controller, projector, rows };
 }
@@ -342,7 +342,7 @@ it("uses generic tool status even when its error field is inconsistent", () => {
     .toBe("interrupted");
 });
 
-it.each(SLICE_1_CONTROLLER_TOOL_NAMES)("does not project Hanoon tool call %s a second time", (name) => {
+it.each(CONTROLLER_TOOL_NAMES)("does not project Hanoon tool call %s a second time", (name) => {
   expect(projectCompletedControllerItem(toolItem(name), { projectRoot: PROJECT_ROOT })).toBeNull();
 });
 
@@ -714,7 +714,7 @@ it("surfaces repository identity decisions across replay and restart", async () 
     sdk: fixture.bb.sdk,
     store: fixture.reopen(),
     clock: { now: () => 2_200 },
-    hanoonToolNames: SLICE_1_CONTROLLER_TOOL_NAMES,
+    hanoonToolNames: CONTROLLER_TOOL_NAMES,
   });
   expect(await restarted.reconcile(
     fixture.controller,
@@ -783,7 +783,7 @@ it("honors abort before paging and before the repository commit", async () => {
   expect(currentTurn(beforeCommit.store, beforeCommit.turn.id).evidenceEventSeq).toBe(0);
 });
 
-it("surfaces stale and finalized turns without any BB read", async () => {
+it("surfaces stale turns without a BB read and continues after finalization", async () => {
   const stale = readyProjectorFixture({ rows: [nonCandidateEvent(1)] });
   expect(stale.store.releaseExecutorLease(
     stale.fence.ownerId,
@@ -805,8 +805,9 @@ it("surfaces stale and finalized turns without any BB read", async () => {
     currentTurn(finalized.store, finalized.turn.id),
     finalized.fence,
     new AbortController().signal,
-  )).toMatchObject({ outcome: "finalized" });
-  expect(finalized.harness.inspection.sdk.calls).toEqual([]);
+  )).toMatchObject({ outcome: "reconciled", throughSeq: 1 });
+  expect(finalized.harness.inspection.sdk.calls.length).toBeGreaterThan(0);
+  expect(currentTurn(finalized.store, finalized.turn.id).evidenceEventSeq).toBe(1);
 });
 
 it("marks a cap crossing without advancing, advances an identical replay at cap, and rolls back conflict", async () => {

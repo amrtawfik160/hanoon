@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   CONTROLLER_CLAIM_KINDS,
   FINALIZATION_REJECTION_CODES,
+  controllerFinalizationJsonSchema,
   controllerFinalizationSchema,
   renderControllerFinalization,
   validateControllerFinalization,
@@ -90,6 +92,9 @@ function expectRejection(
 }
 
 describe("controller finalization public contract", () => {
+  it("exports the exact provider JSON Schema generated from the runtime contract", () => {
+    expect(controllerFinalizationJsonSchema).toEqual(z.toJSONSchema(controllerFinalizationSchema));
+  });
   it("pins the stable rejection vocabulary", () => {
     expect(FINALIZATION_REJECTION_CODES).toEqual([
       "invalid_contract",

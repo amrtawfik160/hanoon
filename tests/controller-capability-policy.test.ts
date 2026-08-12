@@ -4,7 +4,7 @@ import {
   CONTROLLER_CAPABILITIES,
   CONTROLLER_CAPABILITY_DENIAL_CODES,
   CONTROLLER_DATA_CLASSES,
-  SLICE_1_CONTROLLER_TOOL_NAMES,
+  CONTROLLER_TOOL_NAMES,
   controllerCapability,
   decideControllerCapability,
   type ControllerCapabilityAuthority,
@@ -450,7 +450,7 @@ describe("controller capability manifest", () => {
   });
 
   it("pins the complete Slice 1 tool and data-class vocabularies", () => {
-    expect(SLICE_1_CONTROLLER_TOOL_NAMES).toEqual([
+    expect(CONTROLLER_TOOL_NAMES).toEqual([
       "telegram_agent_list_projects",
       "telegram_agent_start_job",
       "telegram_agent_job_status",
@@ -489,11 +489,11 @@ describe("controller capability manifest", () => {
 
   it("pins every descriptor field and proof order for all 23 tools", () => {
     expect(CONTROLLER_CAPABILITIES).toEqual(EXPECTED_CAPABILITIES);
-    expect(Object.keys(CONTROLLER_CAPABILITIES)).toEqual([...SLICE_1_CONTROLLER_TOOL_NAMES]);
+    expect(Object.keys(CONTROLLER_CAPABILITIES)).toEqual([...CONTROLLER_TOOL_NAMES]);
   });
 
   it("freezes every public tuple and nested manifest value", () => {
-    expect(Object.isFrozen(SLICE_1_CONTROLLER_TOOL_NAMES)).toBe(true);
+    expect(Object.isFrozen(CONTROLLER_TOOL_NAMES)).toBe(true);
     expect(Object.isFrozen(CONTROLLER_DATA_CLASSES)).toBe(true);
     expect(Object.isFrozen(CONTROLLER_CAPABILITY_DENIAL_CODES)).toBe(true);
     expect(Object.isFrozen(CONTROLLER_CAPABILITIES)).toBe(true);
@@ -516,7 +516,7 @@ describe("controller capability manifest", () => {
   });
 
   it("returns descriptors by identity and rejects unknown runtime names", () => {
-    for (const name of SLICE_1_CONTROLLER_TOOL_NAMES) {
+    for (const name of CONTROLLER_TOOL_NAMES) {
       expect(controllerCapability(name)).toBe(CONTROLLER_CAPABILITIES[name]);
     }
     expect(() => controllerCapability("telegram_agent_unknown" as ControllerToolName))

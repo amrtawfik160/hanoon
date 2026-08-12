@@ -32,6 +32,10 @@ export const FINALIZATION_REJECTION_CODES = [
 
 export type ControllerClaimKind = (typeof CONTROLLER_CLAIM_KINDS)[number];
 export type FinalizationRejectionCode = (typeof FINALIZATION_REJECTION_CODES)[number];
+export type PersistedFinalizationRejectionCode = Exclude<
+  FinalizationRejectionCode,
+  "accepted_already" | "revision_limit"
+>;
 type EvidenceRef = `evidence:${number}`;
 
 const boundedSegmentText = z.string().refine(
@@ -42,7 +46,7 @@ const boundedSegmentText = z.string().refine(
   "segment text must be nonempty",
 );
 const boundedSubjectRef = z.string().min(1).max(256);
-const evidenceRefSchema = z.string().regex(/^evidence:[1-9][0-9]*$/).transform((ref) => ref as EvidenceRef);
+const evidenceRefSchema = z.string().regex(/^evidence:[1-9][0-9]*$/) as z.ZodType<EvidenceRef>;
 const boundedObligationRef = z.string().min(1).max(256);
 
 export const controllerFinalizationSchema = z.object({
@@ -62,6 +66,10 @@ export const controllerFinalizationSchema = z.object({
 }).strict().refine(
   (candidate) => candidate.segments.filter((segment) => segment.type === "claim").length <= 12,
   "finalization must contain at most 12 claim segments",
+);
+
+export const controllerFinalizationJsonSchema = Object.freeze(
+  z.toJSONSchema(controllerFinalizationSchema),
 );
 
 export type ControllerFinalization = z.infer<typeof controllerFinalizationSchema>;
@@ -134,6 +142,10 @@ const CORRECTIONS: Record<FinalizationRejectionCode, string> = {
   process_only: "Replace process intent with a direct answer or durable deferred obligation.",
   high_impact_text_unclaimed: "Move high-impact success assertions into evidence-backed claim segments.",
 };
+
+export function controllerFinalizationCorrection(code: FinalizationRejectionCode): string {
+  return CORRECTIONS[code];
+}
 
 const PROCESS_OBJECT_WORD = "(?!(?:and|then|if)\\b)[a-z0-9_'/:-]+";
 const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigate|work\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;

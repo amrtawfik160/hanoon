@@ -5,7 +5,7 @@ const { CONTROLLER_PROOF_KINDS } = await import(
   new URL("./models.ts", import.meta.url).href
 ) as typeof import("./models");
 
-export const SLICE_1_CONTROLLER_TOOL_NAMES = Object.freeze([
+export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_list_projects",
   "telegram_agent_start_job",
   "telegram_agent_job_status",
@@ -42,7 +42,7 @@ export const CONTROLLER_DATA_CLASSES = Object.freeze([
   "controller_finalization",
 ] as const);
 
-export type ControllerToolName = (typeof SLICE_1_CONTROLLER_TOOL_NAMES)[number];
+export type ControllerToolName = (typeof CONTROLLER_TOOL_NAMES)[number];
 export type ControllerDataClass = (typeof CONTROLLER_DATA_CLASSES)[number];
 
 export type ControllerCapabilityDescriptor = Readonly<{
@@ -614,10 +614,10 @@ function validateDescriptor(
 
 function validateManifest(): void {
   const manifestKeys = Object.keys(CONTROLLER_CAPABILITIES);
-  if (manifestKeys.length !== SLICE_1_CONTROLLER_TOOL_NAMES.length) {
+  if (manifestKeys.length !== CONTROLLER_TOOL_NAMES.length) {
     throwInvalidCapability("manifest", "keys");
   }
-  for (const capabilityId of SLICE_1_CONTROLLER_TOOL_NAMES) {
+  for (const capabilityId of CONTROLLER_TOOL_NAMES) {
     if (!Object.hasOwn(CONTROLLER_CAPABILITIES, capabilityId)) throwInvalidCapability(capabilityId, "key");
     validateDescriptor(capabilityId, CONTROLLER_CAPABILITIES[capabilityId]);
   }

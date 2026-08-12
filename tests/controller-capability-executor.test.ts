@@ -3,6 +3,7 @@ import { expect, it, vi } from "vitest";
 import {
   canonicalControllerJson,
   ControllerCapabilityExecutionError,
+  authorizeControllerCapability,
   executeControllerCapability,
   sha256ControllerJson,
   type ControllerCapabilityDependencies,
@@ -69,6 +70,64 @@ it("does not invoke a domain call when the adopted executor fence is stale", asy
 
   expect(run).not.toHaveBeenCalled();
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
+});
+
+it("denies every normal capability after durable acceptance before receipts or evidence", () => {
+  const fixture = executorFixture();
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "Done." }],
+      obligationRefs: [],
+    },
+  })).toMatchObject({ outcome: "accepted" });
+
+  for (const descriptor of Object.values(CONTROLLER_CAPABILITIES)) {
+    if (descriptor.capability_id === "telegram_agent_respond") continue;
+    expect(() => authorizeControllerCapability(fixture.dependencies, {
+      descriptor,
+      context: fixture.context,
+      scope: {
+        kind: descriptor.project_scope === "controller_global" ? "controller_global" : "exact_entity",
+        entityRefs: [],
+        matches: true,
+      },
+      approval: "current",
+      credentialAudienceMatches: true,
+    }), descriptor.capability_id).toThrow(/turn_finalized/);
+  }
+  expect(fixture.db.prepare(
+    "SELECT COUNT(*) AS count FROM tool_receipts WHERE turn_id = ?",
+  ).get(fixture.turn.id)).toEqual({ count: 0 });
+  expect(fixture.store.listControllerEvidence(fixture.turn.id, 128)).toEqual([]);
+});
+
+it("reports a stale fence before durable finalization", () => {
+  const fixture = executorFixture();
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "Done." }],
+      obligationRefs: [],
+    },
+  })).toMatchObject({ outcome: "accepted" });
+  expect(fixture.store.releaseExecutorLease(
+    fixture.fence.ownerId,
+    fixture.fence.generation,
+    fixture.fence.now,
+  )).toBe(true);
+
+  expect(() => authorizeControllerCapability(fixture.dependencies, {
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_list_projects,
+    context: fixture.context,
+    scope: globalScope,
+  })).toThrow(/fence_lost/);
 });
 
 it.each([
