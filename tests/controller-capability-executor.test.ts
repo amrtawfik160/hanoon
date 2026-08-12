@@ -16,6 +16,7 @@ import {
 } from "./support/controller-trust-fixtures";
 import { policyFixture } from "./helpers";
 import { EffectRunner } from "../src/services/effect-runner";
+import { runProductionStage } from "../src/services/production-runner";
 import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../src/bb/validation";
 import type { TelegramAgentStore } from "../src/storage/store";
 
@@ -566,14 +567,28 @@ it("isolates owner monitors from system and foreign cancellation", async () => {
     { id: ownerMonitor.id },
     fixture.toolContext,
   ) as string);
-  expect(cancelled).toMatchObject({ cancelled: true, _hanoonEvidence: { outcome: "succeeded" } });
+  expect(cancelled).toMatchObject({
+    cancelled: true,
+    _hanoonEvidence: {
+      outcome: "succeeded",
+      proofKinds: ["monitor_state"],
+      subjectRefs: [`monitor:${ownerMonitor.id}`],
+    },
+  });
 
   const inactive = JSON.parse(await fixture.harness.behavior.callAgentTool(
     "telegram_agent_cancel_watch",
     { id: inactiveMonitor.id },
     fixture.toolContext,
   ) as string);
-  expect(inactive).toMatchObject({ cancelled: false, _hanoonEvidence: { outcome: "observed" } });
+  expect(inactive).toMatchObject({
+    cancelled: false,
+    _hanoonEvidence: {
+      outcome: "observed",
+      proofKinds: ["monitor_state"],
+      subjectRefs: [`monitor:${inactiveMonitor.id}`],
+    },
+  });
 });
 
 it("promotes pipeline outcome only from the real validation writer's fully bound terminal chain", async () => {
@@ -584,7 +599,11 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   const expiresAt = "2026-08-12T13:00:00.000Z";
   const effectIdempotencyKey = "job_verified:8:merge_pr";
   const reviewAttemptId = "review_verified";
-  const policy = policyFixture({ production: undefined });
+  const longValidationCommand = `node -e "${"x".repeat(600)}"`;
+  const policy = policyFixture({
+    production: undefined,
+    validationCommands: [{ name: "long", command: longValidationCommand, timeoutMs: 600_000 }],
+  });
   const fixture = submittedControllerFixture();
   fixture.store.upsertProjectPolicy(policy, 1);
   fixture.store.createJob({ id: "job_verified", sourceUpdateId: 30_000, requestText: "verified chain", now: 1 });
@@ -612,7 +631,7 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   const validationCommands = [
     GIT_REMOTE_COMMAND,
     PR_HEAD_COMMAND(17),
-    "npm test",
+    longValidationCommand,
     PR_VIEW_COMMAND(17),
     PR_CHECKS_COMMAND(17),
     PR_HEAD_COMMAND(17),
@@ -746,10 +765,52 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   ) as string) as { _hanoonEvidence: { proofKinds: string[] } };
   expect(status._hanoonEvidence.proofKinds).toContain("job_state");
   expect(status._hanoonEvidence.proofKinds).not.toContain("pipeline_outcome");
+  writeOutcome({ ...originalOutcome, completedAt: "2026-08-12T11:00:00.000Z" });
+  expect(verifiedPipelineOutcome(fixture.store, job)).toBe(false);
+  const mismatchedTimestampStatus = JSON.parse(await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    { jobId: job.id },
+    { threadId: controller.threadId, projectId: controller.projectId },
+  ) as string) as { _hanoonEvidence: { proofKinds: string[] } };
+  expect(mismatchedTimestampStatus._hanoonEvidence.proofKinds).toContain("job_state");
+  expect(mismatchedTimestampStatus._hanoonEvidence.proofKinds).not.toContain("pipeline_outcome");
+  const postMergeValidationAt = "2026-08-12T12:01:00.000Z";
+  writeOutcome({ ...originalOutcome, completedAt: postMergeValidationAt });
+  fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE idempotency_key = ?").run(JSON.stringify({
+    headSha,
+    receipt: { ...receipt, validationCompletedAt: postMergeValidationAt },
+    mergeCallStartedAt: 1,
+    mergeCallOutcome: "unknown",
+    mergeResult,
+  }), effectIdempotencyKey);
+  expect(verifiedPipelineOutcome(fixture.store, job)).toBe(false);
+  fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE idempotency_key = ?").run(JSON.stringify({
+    headSha,
+    receipt,
+    mergeCallStartedAt: 1,
+    mergeCallOutcome: "unknown",
+    mergeResult,
+  }), effectIdempotencyKey);
   writeOutcome(originalOutcome);
   expect(verifiedPipelineOutcome(fixture.store, job)).toBe(true);
 
-  const productionPolicy = policyFixture();
+  const productionPolicy = policyFixture({
+    validationCommands: policy.validationCommands,
+    outputRedactionPatterns: ["TOPSECRET"],
+    production: {
+      deployCommands: [{
+        name: `deploy-TOPSECRET-${"n".repeat(23)}`,
+        command: `./scripts/deploy-TOPSECRET-${"d".repeat(600)}`,
+        timeoutMs: 1_800_000,
+      }],
+      canaryCommands: [{
+        name: `canary-TOPSECRET-${"n".repeat(23)}`,
+        command: `./scripts/canary-TOPSECRET-${"c".repeat(600)}`,
+        timeoutMs: 300_000,
+      }],
+      convexDeployRequired: false,
+    },
+  });
   fixture.db.prepare(
     "UPDATE jobs SET state = 'complete', policy_json = ? WHERE id = ?",
   ).run(JSON.stringify(productionPolicy), job.id);
@@ -769,45 +830,38 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
        ) VALUES (?, ?, ?, 1, 'completed', 'env_1', 'bb_terminal', ?, ?, ?, ?, ?, ?, ?, 3, 4, 4)`,
     ).run(id, job.id, role, resourceId, "d".repeat(64), outputText, outputSha256, outputText, mergeSha, mergeSha);
   };
-  const checkout = {
-    name: "verify-merged-checkout",
-    command: `test "$(git rev-parse --verify HEAD)" = '${mergeSha}'`,
-    outcome: "pass",
-    exitCode: 0,
-    output: "verified",
+  let productionTerminal = 0;
+  const productionRunner = {
+    run: async (input: { onObservation?: (observation: { id: string; status: string; updatedAt: number }) => void }) => {
+      const id = `terminal_${String(++productionTerminal)}`;
+      input.onObservation?.({ id, status: "exited", updatedAt: Date.parse(mergedAt) });
+      return { outcome: "exited" as const, exitCode: 0, output: "verified" };
+    },
   };
-  const deploySnapshot = {
+  const deploySnapshot = await runProductionStage({
+    runner: productionRunner,
+    environmentId: "env_1",
+    expectedHeadSha: mergeSha,
+    policy: productionPolicy,
     phase: "deploy",
-    outcome: "pass",
-    summary: "deployed",
-    failedCommand: null,
-    commandReceipts: [checkout, {
-      name: "deploy",
-      command: "./scripts/deploy-production.sh",
-      outcome: "pass",
-      exitCode: 0,
-      output: "deployed",
-    }],
-    terminalIds: ["terminal_deploy"],
-    completedAt: mergedAt,
-  };
-  const canarySnapshot = {
+    now: () => Date.parse(mergedAt),
+  });
+  const canarySnapshot = await runProductionStage({
+    runner: productionRunner,
+    environmentId: "env_1",
+    expectedHeadSha: mergeSha,
+    policy: productionPolicy,
     phase: "canary",
+    now: () => Date.parse(mergedAt),
+  });
+  expect(deploySnapshot.commandReceipts[1]).toMatchObject({
+    name: "deploy-[REDACTED]-nnnnnnnnnnnnnnnnnnnnn…",
     outcome: "pass",
-    summary: "healthy",
-    failedCommand: null,
-    commandReceipts: [checkout, {
-      name: "canary",
-      command: "./scripts/verify-production.sh",
-      outcome: "pass",
-      exitCode: 0,
-      output: "healthy",
-    }],
-    terminalIds: ["terminal_canary"],
-    completedAt: mergedAt,
-  };
-  writeProductionStage("deploy_verified", "DEPLOY", deploySnapshot, "terminal_deploy");
-  writeProductionStage("canary_verified", "CANARY", canarySnapshot, "terminal_canary");
+  });
+  expect(deploySnapshot.commandReceipts[1]?.command).toHaveLength(500);
+  expect(JSON.stringify([deploySnapshot, canarySnapshot])).not.toContain("TOPSECRET");
+  writeProductionStage("deploy_verified", "DEPLOY", deploySnapshot, deploySnapshot.terminalIds.at(-1)!);
+  writeProductionStage("canary_verified", "CANARY", canarySnapshot, canarySnapshot.terminalIds.at(-1)!);
   const completeJob = fixture.store.getJob(job.id);
   if (!completeJob) throw new Error("complete pipeline job disappeared");
   expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(true);
@@ -821,7 +875,7 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   };
   mutateProduction("deploy_verified", {
     ...deploySnapshot,
-    commandReceipts: [checkout, { ...deploySnapshot.commandReceipts[1], command: "./wrong-deploy.sh" }],
+    commandReceipts: [deploySnapshot.commandReceipts[0], { ...deploySnapshot.commandReceipts[1], command: "./wrong-deploy.sh" }],
   });
   expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(false);
   mutateProduction("deploy_verified", deploySnapshot);

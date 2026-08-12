@@ -248,6 +248,10 @@ function stageInputSha(...shaValues: string[]): string {
   return hash.digest("hex");
 }
 
+export function validationCommandIdentity(command: string): string {
+  return command.slice(0, 500);
+}
+
 function validationStageEvidence(result: ValidationSnapshot): Record<string, unknown> {
   return {
     validationOutcome: result.validationOutcome,
@@ -255,7 +259,7 @@ function validationStageEvidence(result: ValidationSnapshot): Record<string, unk
     originRepository: result.originRepository,
     terminalIds: (result.terminalIds ?? []).slice(0, 100),
     commandReceipts: result.commandReceipts.slice(0, 50).map((receipt) => ({
-      command: receipt.command.slice(0, 500),
+      command: validationCommandIdentity(receipt.command),
       outcome: receipt.outcome,
       exitCode: receipt.exitCode,
       output: receipt.output.slice(0, 1_000),

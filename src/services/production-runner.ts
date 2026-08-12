@@ -120,6 +120,18 @@ function redactor(patterns: readonly string[]): (value: string) => string {
   };
 }
 
+export function productionCommandIdentity(input: Readonly<{
+  name: string;
+  command: string;
+  outputRedactionPatterns: readonly string[];
+}>): Pick<ProductionCommandReceipt, "name" | "command"> {
+  const redact = redactor(input.outputRedactionPatterns);
+  return {
+    name: bounded(redact(input.name), 40),
+    command: bounded(redact(input.command), MAX_COMMAND_LENGTH),
+  };
+}
+
 function boundSnapshot(snapshot: ProductionStageSnapshot): ProductionStageSnapshot {
   if (Buffer.byteLength(JSON.stringify(snapshot), "utf8") <= MAX_SNAPSHOT_BYTES) return snapshot;
   const withoutOutput = {
@@ -137,14 +149,12 @@ function boundSnapshot(snapshot: ProductionStageSnapshot): ProductionStageSnapsh
 }
 
 function receipt(
-  name: string,
-  command: string,
+  identity: Pick<ProductionCommandReceipt, "name" | "command">,
   result: CommandResult,
   redact: (value: string) => string,
 ): ProductionCommandReceipt {
   return {
-    name: bounded(redact(name), 40),
-    command: bounded(redact(command), MAX_COMMAND_LENGTH),
+    ...identity,
     outcome: result.outcome === "exited" ? (result.exitCode === 0 ? "pass" : "fail") : result.outcome,
     exitCode: result.outcome === "exited" ? result.exitCode : null,
     output: result.outcome === "exited" ? bounded(redact(result.output), MAX_OUTPUT_LENGTH) : "",
@@ -182,7 +192,12 @@ export async function runProductionStage(input: RunProductionStageInput): Promis
       const safe = redact(raw.split(entry.command).join(redact(entry.command)));
       result = { outcome: "exited", exitCode: 1, output: bounded(safe, MAX_OUTPUT_LENGTH) };
     }
-    const commandReceipt = receipt(entry.name, entry.command, result, redact);
+    const identity = productionCommandIdentity({
+      name: entry.name,
+      command: entry.command,
+      outputRedactionPatterns: input.policy.outputRedactionPatterns,
+    });
+    const commandReceipt = receipt(identity, result, redact);
     commandReceipts.push(commandReceipt);
     if (commandReceipt.outcome !== "pass") {
       failedCommand = commandReceipt.name;

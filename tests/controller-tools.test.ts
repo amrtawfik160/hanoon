@@ -81,6 +81,25 @@ function parseToolJson(value: unknown): unknown {
   return parsed;
 }
 
+type RuntimeEvidence = Readonly<{
+  outcome: "observed" | "succeeded" | "interrupted";
+  proofKinds: string[];
+  subjectRefs: string[];
+}>;
+
+function parseToolWithEvidence(value: unknown): Record<string, unknown> & { _hanoonEvidence: RuntimeEvidence } {
+  if (typeof value !== "string") throw new Error("controller tool did not return JSON text");
+  return JSON.parse(value) as Record<string, unknown> & { _hanoonEvidence: RuntimeEvidence };
+}
+
+function runtimeProjection(evidence: RuntimeEvidence): RuntimeEvidence {
+  return {
+    outcome: evidence.outcome,
+    proofKinds: evidence.proofKinds,
+    subjectRefs: evidence.subjectRefs,
+  };
+}
+
 function queueControllerCandidate(
   store: TelegramAgentStore,
   id: string,
@@ -243,6 +262,318 @@ it("matches the exact trusted 21-tool projection permission matrix", () => {
   expect(expected.map(([name]) => name)).toEqual(CONTROLLER_TOOL_NAMES);
   for (const [name, proofKinds] of expected) {
     expect(CONTROLLER_CAPABILITIES[name].proof_kinds).toEqual(proofKinds);
+  }
+});
+
+it("emits the exact runtime projection for every registered Task 6 tool", async () => {
+  const { bb, harness, store, turn, activate, deactivate } = fixture({ active: true });
+  deactivate();
+  queueControllerCandidate(store, "job_matrix_retry", "proj_a", "failed");
+  queueControllerCandidate(store, "job_matrix_cancel", "proj_b", "awaiting_confirmation");
+  activate();
+
+  const project = {
+    id: "proj_1",
+    kind: "software" as const,
+    name: "Cyndra",
+    gitRemoteUrl: "https://github.com/acme/cyndra.git",
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [{
+      id: "source_matrix",
+      projectId: "proj_1",
+      isDefault: true,
+      createdAt: 1,
+      updatedAt: 1,
+      type: "local_path" as const,
+      hostId: "host_matrix",
+      path: "/workspace/cyndra",
+    }],
+  };
+  const spawnedProjects = new Map<string, string>();
+  let spawnNumber = 0;
+  harness.sdk.stub("projects.list", async () => [project]);
+  harness.sdk.stub("threads.list", async () => [visibleThread()]);
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread({ id: threadId, projectId: spawnedProjects.get(threadId) ?? "proj_1" }),
+    canSpawnChild: true,
+  }));
+  harness.sdk.stub("threads.spawn", async ({ projectId }) => {
+    const id = `thr_matrix_${String(++spawnNumber)}`;
+    spawnedProjects.set(id, projectId);
+    return { id, environmentId: `env_matrix_${String(spawnNumber)}` };
+  });
+  harness.sdk.stub("threads.send", async () => ({ ok: true }));
+  harness.sdk.stub("threads.timeline", async () => ({
+    rows: [],
+    activePromptMode: null,
+    activeThinking: null,
+    activeWorkflows: [],
+    activeBackgroundCommands: [],
+    pendingTodos: null,
+    goal: null,
+    modelFallback: null,
+    timelinePage: { hasMore: false, oldestSeq: null, newestSeq: null },
+    maxSeq: 0,
+  }));
+  harness.sdk.stub("threads.output", async () => ({ output: "Matrix thread output." }));
+  harness.sdk.stub("threads.interactions.list", async () => []);
+  const requestOperation = vi.fn(async (input: {
+    kind: "steer_thread" | "stop_thread" | "retry_thread";
+    threadId: string;
+    text?: string;
+  }) => {
+    store.createThreadOperation({
+      id: "operation_matrix",
+      nonceHash: "e".repeat(64),
+      ownerUserId: "7",
+      ownerChatId: "7",
+      kind: input.kind,
+      threadId: input.threadId,
+      text: input.kind === "steer_thread" ? input.text ?? "steer" : null,
+      expiresAt: 20_000,
+      now: 10_050,
+    });
+    const operation = store.markThreadOperationConfirmationSent("operation_matrix", 88, 10_051);
+    return {
+      id: operation.id,
+      kind: operation.kind,
+      threadId: operation.threadId,
+      state: operation.state,
+      expiresAt: operation.expiresAt,
+    };
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: requestOperation },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const state: {
+    startedJobId?: string;
+    memoryId?: string;
+    monitorId?: string;
+    delegationId?: string;
+  } = {};
+  type MatrixRow = Readonly<{
+    name: typeof CONTROLLER_TOOL_NAMES[number];
+    params(): Record<string, unknown>;
+    capture?(): void;
+    expected(): RuntimeEvidence;
+  }>;
+  const rows: MatrixRow[] = [
+    {
+      name: "telegram_agent_list_projects",
+      params: () => ({}),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["project_state"],
+        subjectRefs: ["project:proj_a", "project:proj_b", "project:proj_1"],
+      }),
+    },
+    {
+      name: "telegram_agent_start_job",
+      params: () => ({ projectId: "proj_1", task: "Run the runtime projection matrix." }),
+      capture: () => {
+        const job = store.getJobBySourceUpdateId(turn.updateId);
+        if (!job) throw new Error("matrix start job was not persisted");
+        state.startedJobId = job.id;
+      },
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["job_state", "obligation"],
+        subjectRefs: [`job:${state.startedJobId!}`],
+      }),
+    },
+    {
+      name: "telegram_agent_job_status",
+      params: () => ({ jobId: state.startedJobId }),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["job_state", "obligation"],
+        subjectRefs: [`job:${state.startedJobId!}`],
+      }),
+    },
+    {
+      name: "telegram_agent_retry_job",
+      params: () => ({ jobId: "job_matrix_retry" }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["job_state", "obligation"],
+        subjectRefs: ["job:job_matrix_retry"],
+      }),
+    },
+    {
+      name: "telegram_agent_cancel_job",
+      params: () => ({ jobId: "job_matrix_cancel" }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["job_state"], subjectRefs: ["job:job_matrix_cancel"] }),
+    },
+    {
+      name: "telegram_agent_list_threads",
+      params: () => ({}),
+      expected: () => ({ outcome: "observed", proofKinds: ["thread_state"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_thread_status",
+      params: () => ({ threadId: "thr_active" }),
+      expected: () => ({ outcome: "observed", proofKinds: ["thread_state"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_read_thread",
+      params: () => ({ threadId: "thr_active" }),
+      expected: () => ({ outcome: "observed", proofKinds: ["thread_state"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_create_thread",
+      params: () => ({ projectId: "proj_1", title: "Matrix exploration", prompt: "Inspect the runtime matrix." }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["thread_state", "external_mutation"],
+        subjectRefs: ["thread:thr_matrix_1", "project:proj_1"],
+      }),
+    },
+    {
+      name: "telegram_agent_send_to_thread",
+      params: () => ({ threadId: "thr_active", text: "Continue the matrix." }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["external_mutation", "thread_state"],
+        subjectRefs: ["thread:thr_active"],
+      }),
+    },
+    {
+      name: "telegram_agent_request_thread_operation",
+      params: () => ({ kind: "stop_thread", threadId: "thr_active" }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["obligation"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_remember",
+      params: () => ({ subject: "runtime matrix", body: "Preserve exact evidence order.", kind: "fact" }),
+      capture: () => {
+        const row = bb.storage.database().prepare(
+          "SELECT id FROM memories WHERE subject = 'runtime matrix' ORDER BY created_at DESC LIMIT 1",
+        ).get() as { id: string } | undefined;
+        if (!row) throw new Error("matrix memory was not persisted");
+        state.memoryId = row.id;
+      },
+      expected: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [`memory:${state.memoryId!}`] }),
+    },
+    {
+      name: "telegram_agent_recall",
+      params: () => ({ query: "runtime matrix" }),
+      expected: () => ({ outcome: "observed", proofKinds: ["memory_state"], subjectRefs: [`memory:${state.memoryId!}`] }),
+    },
+    {
+      name: "telegram_agent_forget",
+      params: () => ({ id: state.memoryId }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [`memory:${state.memoryId!}`] }),
+    },
+    {
+      name: "telegram_agent_watch",
+      params: () => ({ kind: "thread_idle", threadId: "thr_active", instruction: "Report matrix completion." }),
+      capture: () => {
+        const monitor = store.listMonitors(turn.controllerKey, false)[0];
+        if (!monitor) throw new Error("matrix monitor was not persisted");
+        state.monitorId = monitor.id;
+      },
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["monitor_state", "obligation"],
+        subjectRefs: [`monitor:${state.monitorId!}`, "thread:thr_active"],
+      }),
+    },
+    {
+      name: "telegram_agent_list_watches",
+      params: () => ({}),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["monitor_state", "obligation"],
+        subjectRefs: [`monitor:${state.monitorId!}`],
+      }),
+    },
+    {
+      name: "telegram_agent_cancel_watch",
+      params: () => ({ id: state.monitorId }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["monitor_state"], subjectRefs: [`monitor:${state.monitorId!}`] }),
+    },
+    {
+      name: "telegram_agent_health",
+      params: () => ({}),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: ["controller:owner-7-controller"],
+      }),
+    },
+    {
+      name: "telegram_agent_delegate",
+      params: () => ({
+        instruction: "Join the matrix result.",
+        tasks: [{ projectId: "proj_1", title: "Matrix delegate", prompt: "Check the matrix." }],
+      }),
+      capture: () => {
+        const row = bb.storage.database().prepare(
+          "SELECT id FROM delegations WHERE instruction = 'Join the matrix result.' ORDER BY created_at DESC LIMIT 1",
+        ).get() as { id: string } | undefined;
+        if (!row) throw new Error("matrix delegation was not persisted");
+        state.delegationId = row.id;
+      },
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["thread_state", "external_mutation", "obligation"],
+        subjectRefs: [`delegation:${state.delegationId!}`, "thread:thr_matrix_2"],
+      }),
+    },
+    {
+      name: "telegram_agent_scorecard",
+      params: () => ({}),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: ["controller:owner-7-controller"],
+      }),
+    },
+    {
+      name: "telegram_agent_set_working_style",
+      params: () => ({ text: "Keep runtime evidence ordered." }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["memory_state"],
+        subjectRefs: ["controller:owner-7-controller"],
+      }),
+    },
+  ];
+
+  expect(rows.map((row) => row.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  for (const row of rows) {
+    const params = row.params();
+    const result = parseToolWithEvidence(await harness.behavior.callAgentTool(
+      row.name,
+      params,
+      controllerToolContext,
+    ));
+    row.capture?.();
+    expect(runtimeProjection(result._hanoonEvidence), row.name).toEqual(row.expected());
+    if (row.name === "telegram_agent_create_thread") {
+      const replay = parseToolWithEvidence(await harness.behavior.callAgentTool(
+        row.name,
+        params,
+        controllerToolContext,
+      ));
+      expect(runtimeProjection(replay._hanoonEvidence)).toEqual({ ...row.expected(), outcome: "observed" });
+      expect(spawnNumber).toBe(1);
+    }
+    if (row.name === "telegram_agent_set_working_style") {
+      const noOp = parseToolWithEvidence(await harness.behavior.callAgentTool(
+        row.name,
+        params,
+        controllerToolContext,
+      ));
+      expect(runtimeProjection(noOp._hanoonEvidence)).toEqual({ ...row.expected(), outcome: "observed" });
+    }
   }
 });
 
@@ -769,21 +1100,24 @@ it("returns bounded choices for ambiguous status, retry, and cancel without muta
     cancelRequestedAt,
   }));
 
-  expect(parseToolJson(await harness.behavior.callAgentTool(
+  for (const toolName of [
     "telegram_agent_job_status",
-    {},
-    controllerToolContext,
-  ))).toEqual(expected);
-  expect(parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_retry_job",
-    {},
-    controllerToolContext,
-  ))).toEqual(expected);
-  expect(parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_cancel_job",
-    {},
-    controllerToolContext,
-  ))).toEqual(expected);
+  ] as const) {
+    const output = parseToolWithEvidence(await harness.behavior.callAgentTool(
+      toolName,
+      {},
+      controllerToolContext,
+    ));
+    const { _hanoonEvidence, ...domain } = output;
+    expect(domain).toEqual(expected);
+    expect(runtimeProjection(_hanoonEvidence)).toEqual({
+      outcome: "observed",
+      proofKinds: ["job_state"],
+      subjectRefs: ["job:controller_job_a", "job:controller_job_b"],
+    });
+  }
   expect(store.listJobs(10).map(({ id, state, version, cancelRequestedAt }) => ({
     id,
     state,
@@ -876,6 +1210,45 @@ it.each([
   expect(store.getJob("controller_job_b")?.state).toBe(racedState);
 });
 
+it.each([
+  ["telegram_agent_retry_job", "failed"],
+  ["telegram_agent_cancel_job", "awaiting_confirmation"],
+] as const)("rejects an exact authorized job whose version races before %s", async (toolName, initialState) => {
+  const { bb, harness, store, turn, activate, deactivate } = fixture({ active: true });
+  deactivate();
+  queueControllerCandidate(store, "controller_job_exact", "proj_exact", initialState);
+  activate();
+  const before = store.getJob("controller_job_exact");
+  if (!before) throw new Error("exact race job was not created");
+  bb.storage.database().exec(`
+    CREATE TRIGGER race_exact_job_version AFTER INSERT ON tool_receipts
+    WHEN NEW.tool_name = '${toolName}'
+    BEGIN
+      UPDATE jobs SET version = version + 1 WHERE id = 'controller_job_exact';
+    END;
+  `);
+  const notify = vi.fn();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify,
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    toolName,
+    { jobId: before.id },
+    controllerToolContext,
+  )).rejects.toThrow(/version/i);
+  expect(store.getJob(before.id)).toMatchObject({ state: initialState, version: before.version + 1 });
+  expect(notify).not.toHaveBeenCalled();
+  expect(store.listToolReceipts(turn.id)).toEqual([
+    expect.objectContaining({ toolName, state: "failed" }),
+  ]);
+});
+
 it("keeps job_state proof when an omitted job id resolves to none", async () => {
   const { bb, harness, store } = fixture({ active: true });
   registerControllerTools(bb, {
@@ -918,8 +1291,12 @@ it("does not expose a synthetic schedule scope in interrupted evidence", async (
     "telegram_agent_watch",
     params,
     controllerToolContext,
-  ) as string) as { _hanoonEvidence: { outcome: string; subjectRefs: string[] } };
-  expect(output._hanoonEvidence).toMatchObject({ outcome: "interrupted", subjectRefs: [] });
+  ) as string) as { _hanoonEvidence: { outcome: string; proofKinds: string[]; subjectRefs: string[] } };
+  expect(runtimeProjection(output._hanoonEvidence as RuntimeEvidence)).toEqual({
+    outcome: "interrupted",
+    proofKinds: [],
+    subjectRefs: [],
+  });
 });
 
 it("denies a valid enabled policy stored under a different project identity", async () => {
@@ -1078,7 +1455,7 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
   )).rejects.toThrow(/scope|not visible/i);
 });
 
-it("uses the authorized project host once and rejects a spawned thread from another project", async () => {
+it("uses the authorized project host once and interrupts replay after cross-project projection failure", async () => {
   const { bb, harness, store } = fixture({ active: true });
   let projectReads = 0;
   harness.sdk.stub("projects.list", async () => {
@@ -1127,6 +1504,18 @@ it("uses the authorized project host once and rejects a spawned thread from anot
     projectId: "proj_1",
     environment: expect.objectContaining({ type: "host", hostId: "host_authorized" }),
   }));
+  const replay = JSON.parse(await harness.behavior.callAgentTool(
+    "telegram_agent_create_thread",
+    { projectId: "proj_1", title: "Inspect", prompt: "Inspect only" },
+    controllerToolContext,
+  ) as string) as { _hanoonEvidence: { outcome: string; proofKinds: string[]; subjectRefs: string[] } };
+  expect(runtimeProjection(replay._hanoonEvidence as RuntimeEvidence)).toEqual({
+    outcome: "interrupted",
+    proofKinds: [],
+    subjectRefs: ["project:proj_1"],
+  });
+  expect(spawn).toHaveBeenCalledOnce();
+  expect(projectReads).toBe(2);
 });
 
 it("does not promote a thread operation for a different thread, kind, or owner binding", async () => {
