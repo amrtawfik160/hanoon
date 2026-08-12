@@ -1,10 +1,64 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
 import type {
   Job,
   JobState,
+  ProductionPolicy,
   WorkerLiveness,
 } from "../src/domain/models";
 import type { ProjectPolicy } from "../src/domain/models";
+import type { TelegramAgentStore } from "../src/storage/store";
+import { AutonomyRepository } from "../src/storage/autonomy-repository";
+import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { vi } from "vitest";
+
+export type FileBackedAutonomyHarness = Readonly<{
+  directory: string;
+  databasePath: string;
+  primary: Database.Database;
+  secondary: Database.Database;
+  primaryRepository: AutonomyRepository;
+  secondaryRepository: AutonomyRepository;
+  close(): void;
+}>;
+
+export function fileBackedAutonomyHarness(): FileBackedAutonomyHarness {
+  const directory = mkdtempSync(join(tmpdir(), "telegram-autonomy-verification-"));
+  const databasePath = join(directory, "autonomy.sqlite");
+  const primary = new Database(databasePath);
+  let secondary: Database.Database | null = null;
+  try {
+    primary.pragma("journal_mode = WAL");
+    primary.pragma("foreign_keys = ON");
+    for (const migration of ALL_MIGRATIONS) primary.exec(migration);
+    secondary = new Database(databasePath);
+    secondary.pragma("journal_mode = WAL");
+    secondary.pragma("foreign_keys = ON");
+    let closed = false;
+    return {
+      directory,
+      databasePath,
+      primary,
+      secondary,
+      primaryRepository: new AutonomyRepository(primary),
+      secondaryRepository: new AutonomyRepository(secondary),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        secondary?.close();
+        primary.close();
+        rmSync(directory, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    secondary?.close();
+    primary.close();
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
 
 export type TelegramFixtureResponse =
   | { ok: true; result: unknown }
@@ -52,6 +106,21 @@ export function privateMessage(
     from: { id: 7, is_bot: false },
     chat: { id: 70, type: "private" },
     ...(text === undefined ? {} : { text }),
+    ...overrides,
+  };
+}
+
+export function productionPolicyFixture(
+  overrides: Partial<ProductionPolicy> = {},
+): ProductionPolicy {
+  return {
+    deployCommands: [
+      { name: "deploy", command: "./scripts/deploy-test.sh", timeoutMs: 60_000 },
+    ],
+    canaryCommands: [
+      { name: "canary", command: "./scripts/canary-test.sh", timeoutMs: 60_000 },
+    ],
+    convexDeployRequired: false,
     ...overrides,
   };
 }
@@ -151,4 +220,36 @@ export function sha(char = "a"): string {
 
 export function stateJob(state: JobState, overrides: Partial<Job> = {}): Job {
   return jobFixture({ state, ...overrides });
+}
+
+export function admitConfirmedJob(
+  store: Pick<TelegramAgentStore, "queueAdmission" | "tryAdmit" | "acquireExecutorLease" | "releaseExecutorLease">,
+  selected: Job,
+  now: number,
+): Job {
+  if (!selected.projectId) throw new Error("selected job has no project identity");
+  const ownerId = "test-admitter";
+  const lease = store.acquireExecutorLease(ownerId, now, 30_000);
+  if (!lease.acquired) throw new Error("test admission lease was not acquired");
+  try {
+    store.queueAdmission({
+      jobId: selected.id,
+      expectedVersion: selected.version,
+      projectId: selected.projectId,
+      resumeEvent: "CONFIRMED",
+      now,
+    });
+    const attempt = store.tryAdmit({
+      jobId: selected.id,
+      maxConcurrentJobs: 8,
+      ownerId,
+      generation: lease.generation,
+      now,
+      leaseMs: 30_000,
+    });
+    if (attempt.outcome !== "admitted") throw new Error(`test admission failed: ${attempt.reason}`);
+    return attempt.job;
+  } finally {
+    store.releaseExecutorLease(ownerId, lease.generation, now + 1);
+  }
 }

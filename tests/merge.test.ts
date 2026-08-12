@@ -3,11 +3,12 @@ import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type { GateInput } from "../src/domain/gates";
 import type { StoredEffect } from "../src/domain/models";
+import { projectResourceKey } from "../src/autonomy/models";
 import { hashSecret } from "../src/crypto";
 import { createTask9FreshGateCollector, MergeHandler } from "../src/services/merge-handler";
 import type { ValidationSnapshot } from "../src/bb/validation";
 import { ApprovalService } from "../src/services/approval-service";
-import { openStore } from "../src/storage/store";
+import { openStore, type DurableMergeReceipt } from "../src/storage/store";
 import { policyFixture, sha } from "./helpers";
 
 const HEAD = sha();
@@ -113,6 +114,7 @@ function mergeFixture(options: {
   const db = bb.storage.database();
   const clock = options.clock ?? (() => NOW);
   const store = openStore(bb.storage, bb.storage.kv, clock);
+  expect(store.acquireExecutorLease(LEASE_OWNER, NOW, 60_000)).toEqual({ acquired: true, generation: LEASE_GENERATION });
   const policy = policyFixture({ requiredChecks: ["test"] });
   store.createPairingCode(hashSecret("pair"), NOW, NOW + 60_000);
   expect(store.pairOwnerWithPrivateChatCode(hashSecret("pair"), "7", "70", NOW)).toEqual({ ok: true });
@@ -179,7 +181,7 @@ function mergeFixture(options: {
     bb: { sdk: { environments: { mergePullRequest } } },
     now: options.clock ?? (() => NOW),
   });
-  return { db, store, approvals, issued, handler, collectGateInput, mergePullRequest, commandRunner };
+  return { db, store, approvals, issued, handler, collectGateInput, mergePullRequest, commandRunner, now: clock };
 }
 
 async function acceptApproval(fixture: ReturnType<typeof mergeFixture>) {
@@ -239,13 +241,36 @@ const LEASE_GENERATION = 1;
 
 function leaseMergeEffect(fixture: ReturnType<typeof mergeFixture>, expiresAt = NOW + 60_000): StoredEffect {
   const effect = mergeEffect(fixture.store);
-  fixture.db.prepare(
-    `UPDATE effects
-        SET status = 'leased', lease_owner = ?, lease_generation = ?, lease_expires_at = ?, updated_at = ?
-      WHERE job_id = ? AND idempotency_key = ?`,
-  ).run(LEASE_OWNER, LEASE_GENERATION, expiresAt, NOW, effect.jobId, effect.idempotencyKey);
-  const leased = fixture.store.getEffect(effect.jobId, effect.idempotencyKey);
+  const job = fixture.store.getJob(effect.jobId);
+  if (!job?.policy) throw new Error("merge job policy is missing");
+  if (!fixture.store.getAdmission(effect.jobId)) {
+    fixture.db.prepare(
+      `INSERT INTO job_admissions (
+         job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
+       ) VALUES (?, ?, 1, 'admitted', 'CONFIRMED', ?, ?)`,
+    ).run(effect.jobId, job.projectId, NOW, NOW + 1);
+    fixture.db.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, ?, 'project', 'held', ?, ?, ?, ?, ?)`,
+    ).run(effect.jobId, projectResourceKey(job.projectId!), LEASE_OWNER, LEASE_GENERATION, Math.max(expiresAt, fixture.now() + 1), NOW, NOW);
+  }
+  const now = fixture.now();
+  const leaseMs = Math.max(1, expiresAt - now);
+  const leased = fixture.store.leaseNextJobEffect({
+    jobId: effect.jobId,
+    ownerId: LEASE_OWNER,
+    generation: LEASE_GENERATION,
+    now,
+    leaseMs,
+  });
   if (!leased) throw new Error("merge effect was not leased");
+  if (expiresAt !== now + leaseMs) {
+    fixture.db.prepare(
+      "UPDATE effects SET lease_expires_at = ? WHERE job_id = ? AND idempotency_key = ?",
+    ).run(expiresAt, effect.jobId, effect.idempotencyKey);
+  }
   return { ...leased, payload: effect.payload };
 }
 
@@ -266,6 +291,17 @@ function fenceUnknown(
 ): void {
   fixture.db.prepare("UPDATE effects SET payload_json = ? WHERE job_id = ? AND idempotency_key = ?")
     .run(JSON.stringify({ ...effect.payload, mergeCallStartedAt: NOW + 2, mergeCallOutcome: "unknown" }), effect.jobId, effect.idempotencyKey);
+}
+
+function mergeDurableSnapshot(db: Database.Database): Record<string, unknown[]> {
+  return {
+    jobs: db.prepare("SELECT * FROM jobs ORDER BY id").all(),
+    effects: db.prepare("SELECT * FROM effects ORDER BY idempotency_key").all(),
+    attempts: db.prepare("SELECT * FROM attempts ORDER BY id").all(),
+    approvals: db.prepare("SELECT * FROM approvals ORDER BY nonce_hash").all(),
+    outbox: db.prepare("SELECT * FROM outbox ORDER BY logical_key").all(),
+    workerLiveness: db.prepare("SELECT * FROM worker_liveness ORDER BY job_id").all(),
+  };
 }
 
 function insertCompetingMergeEffect(
@@ -515,6 +551,9 @@ describe("fresh Telegram merge execution", () => {
     expect(runValidation).toHaveBeenCalledTimes(2);
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
     expect(fixture.store.getJob("job_1")?.state).toBe("deploying");
+    expect(fixture.store.listHeldResourceClaims("job_1", 10).filter((claim) => claim.state === "held" && claim.resourceKind !== "project")).toEqual([
+      expect.objectContaining({ resourceKind: "production_target", state: "held" }),
+    ]);
   });
 
   it("requires a fresh ready-gate evaluation before accepting approval", async () => {
@@ -1118,6 +1157,10 @@ describe("fresh Telegram merge execution", () => {
       lastError: "Merge succeeded but the base branch did not verify the approved content",
     });
     expect(fixture.store.listEffectsForJob("job_1").some((effect) => effect.kind === "deploy_production")).toBe(false);
+    expect(fixture.store.listHeldResourceClaims("job_1", 100)
+      .filter((claim) => claim.resourceKind !== "project")).not.toContainEqual(
+      expect.objectContaining({ state: "held" }),
+    );
     const mergeEffect = fixture.store.listEffectsForJob("job_1").find((effect) => effect.kind === "merge_pr");
     expect(mergeEffect?.payload).toMatchObject({ mergeResult: { baseContentVerified: false } });
   });
@@ -1153,6 +1196,12 @@ describe("fresh Telegram merge execution", () => {
 
     await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
     expect(fixture.store.getJob("job_1")?.state).toBe("deploying");
+    expect(fixture.store.listHeldResourceClaims("job_1", 100)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resourceKind: "production_target", state: "held" }),
+    ]));
+    expect(fixture.store.listHeldResourceClaims("job_1", 100)).not.toContainEqual(
+      expect.objectContaining({ resourceKind: "repository_merge", state: "held" }),
+    );
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
 
     await expect(fixture.handler.executeMergeEffect({
@@ -1355,6 +1404,7 @@ describe("fresh Telegram merge execution", () => {
         mergeCallOutcome: "unknown",
       },
     });
+    expect(fixture.store.listHeldResourceClaims("job_1", 10).filter((claim) => claim.resourceKind !== "project")).toHaveLength(2);
 
     await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "merged" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
@@ -1379,9 +1429,26 @@ describe("fresh Telegram merge execution", () => {
       status: "pending",
       payload: { mergeCallOutcome: "unknown" },
     });
+    expect(fixture.store.listHeldResourceClaims("job_1", 10).filter((claim) => claim.resourceKind !== "project")).toHaveLength(2);
 
     await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "merged" });
     expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("releases both merge-time claims after a conclusive pre-provider rejection", async () => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    fixture.db.prepare(
+      `UPDATE job_resource_claims SET state = 'released', lease_expires_at = 0,
+       released_at = ?, release_reason = ?
+       WHERE job_id = ? AND resource_kind = 'repository_merge'`,
+    ).run(NOW + 1, "test_missing_claim", effect.jobId);
+
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.mergePullRequest).not.toHaveBeenCalled();
+    expect(fixture.store.listHeldResourceClaims(effect.jobId, 10)
+      .filter((claim) => claim.state === "held" && claim.resourceKind !== "project")).toHaveLength(0);
   });
 
   it("cancels instead of resolving a PR when cancellation races stale cleanup", async () => {
@@ -1816,7 +1883,7 @@ describe("fresh Telegram merge execution", () => {
       clock: () => currentNow,
     });
     fixture.mergePullRequest.mockImplementationOnce(async () => {
-      currentNow = NOW + 20_000;
+      currentNow = NOW + 40_000;
       return { ok: true };
     });
     await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
@@ -1853,5 +1920,143 @@ describe("fresh Telegram merge execution", () => {
       leaseGeneration: LEASE_GENERATION + 1,
     })).resolves.toMatchObject({ outcome: "failed" });
     expect(fixture.mergePullRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "lease",
+    "bind",
+    "prepare",
+    "complete",
+    "preserve",
+    "fail",
+    "stale",
+  ] as const)("rejects stale executor ownership before merge %s mutation", async (method) => {
+    const fixture = mergeFixture();
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+
+    let effect = mergeEffect(fixture.store);
+    let completedResult: Record<string, unknown> | null = null;
+    if (method === "lease") {
+      effect = leaseMergeEffect(fixture);
+    } else if (method === "complete") {
+      await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "merged" });
+      const completed = fixture.store.getEffect("job_1", effect.idempotencyKey);
+      if (!completed) throw new Error("merge effect was not completed for stale completion test");
+      completedResult = (completed.payload as { mergeResult: Record<string, unknown> }).mergeResult;
+      effect = completed;
+    } else {
+      effect = leaseMergeEffect(fixture);
+      if (method === "bind" || method === "prepare") {
+        const durable = mergeEffect(fixture.store);
+        const receipt = (durable.payload as { receipt: DurableMergeReceipt }).receipt;
+        expect(fixture.store.bindMergeEffectReceipt({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          receipt,
+          leaseOwner: LEASE_OWNER,
+          leaseGeneration: LEASE_GENERATION,
+          now: NOW + 1,
+        })).toBe(true);
+        effect = fixture.store.getEffect(effect.jobId, effect.idempotencyKey) ?? effect;
+      }
+      if (method === "preserve") fenceUnknown(fixture, effect);
+    }
+
+    const takeoverNow = NOW + 60_001;
+    if (method !== "lease" && method !== "complete") {
+      fixture.db.prepare(
+        "UPDATE effects SET lease_expires_at = ? WHERE job_id = ? AND idempotency_key = ?",
+      ).run(NOW + 120_000, effect.jobId, effect.idempotencyKey);
+    }
+    const before = mergeDurableSnapshot(fixture.db);
+    const providerCalls = fixture.mergePullRequest.mock.calls.length;
+    const successor = fixture.store.acquireExecutorLease("executor-successor", takeoverNow, 60_000);
+    expect(successor).toEqual({ acquired: true, generation: 2 });
+    if (!successor.acquired) throw new Error("successor merge executor was not acquired");
+
+    let result: boolean | { ok: boolean };
+    switch (method) {
+      case "lease":
+        result = fixture.store.leaseNextJobEffect({
+          jobId: effect.jobId,
+          ownerId: LEASE_OWNER,
+          generation: LEASE_GENERATION,
+          now: takeoverNow,
+          leaseMs: 60_000,
+        }) !== null;
+        break;
+      case "bind": {
+        const durable = mergeEffect(fixture.store);
+        result = fixture.store.bindMergeEffectReceipt({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          receipt: (durable.payload as { receipt: DurableMergeReceipt }).receipt,
+          leaseOwner: LEASE_OWNER,
+          leaseGeneration: LEASE_GENERATION,
+          now: takeoverNow,
+        });
+        break;
+      }
+      case "prepare":
+        result = fixture.store.prepareMergeCall({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          leaseOwner: LEASE_OWNER,
+          leaseGeneration: LEASE_GENERATION,
+          now: takeoverNow,
+        });
+        break;
+      case "complete":
+        if (!completedResult) throw new Error("completed merge result was not prepared");
+        result = fixture.store.completeMergeSuccess({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          message: "stale completion",
+          result: completedResult,
+          outbox: {
+            logicalKey: "stale:merge:outbox",
+            chatId: "70",
+            payload: { text: "must not persist" },
+          },
+          now: takeoverNow,
+          leaseOwner: LEASE_OWNER,
+          leaseGeneration: LEASE_GENERATION,
+        });
+        break;
+      case "preserve":
+        result = fixture.store.preserveUnknownMergeEffect({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          leaseOwner: LEASE_OWNER,
+          leaseGeneration: LEASE_GENERATION,
+          now: takeoverNow,
+        });
+        break;
+      case "fail":
+        result = fixture.store.failLeasedMergeEffect({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          reason: "stale failure",
+          leaseOwner: LEASE_OWNER,
+          leaseGeneration: LEASE_GENERATION,
+          now: takeoverNow,
+        });
+        break;
+      case "stale":
+        result = fixture.store.staleMergeEffect({
+          jobId: effect.jobId,
+          effectIdempotencyKey: effect.idempotencyKey,
+          reason: "APPROVAL_STALE: stale executor",
+          leaseOwner: LEASE_OWNER,
+          leaseGeneration: LEASE_GENERATION,
+          now: takeoverNow,
+        });
+        break;
+    }
+
+    if (method === "prepare") expect(result).toMatchObject({ ok: false });
+    else expect(result).toBe(false);
+    expect(mergeDurableSnapshot(fixture.db)).toEqual(before);
+    expect(fixture.mergePullRequest).toHaveBeenCalledTimes(providerCalls);
   });
 });

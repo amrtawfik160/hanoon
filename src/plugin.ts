@@ -1,18 +1,30 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { controllerExecutionProfile, parseGlobalConfig } from "./config";
+import { controllerExecutionProfile, extractionModel, parseGlobalConfig, systemUpkeepEnabled } from "./config";
 import { BbRunner } from "./bb/runner";
 import { resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { TelegramClient, TelegramFileTooLargeError } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
-import { openStore } from "./storage/store";
+import { openStore, type TelegramAgentStore } from "./storage/store";
+import { AutonomyRepository } from "./storage/autonomy-repository";
+import { DEFAULT_MAX_CONCURRENT_JOBS } from "./autonomy/models";
+import { AutonomyScheduler } from "./autonomy/scheduler";
 import { EffectRunner } from "./services/effect-runner";
 import type { EffectFence } from "./services/effect-runner";
 import { runJobExecutorService } from "./services/job-executor-service";
 import { createTask9FreshGateCollector, MergeHandler } from "./services/merge-handler";
 import type { GateInput } from "./domain/gates";
 import type { ReviewFinding } from "./domain/models";
-import { ReviewHandler, type ReviewHandlerEvent } from "./services/review-handler";
+import {
+  ReviewHandler,
+  ReviewInvocationStaleError,
+  type ReviewAttemptLookup,
+  type ReviewAttemptUpdate,
+  type ReviewFormatCorrectionClaim,
+  type ReviewEnvironmentStatusInput,
+  type ReviewInvocation,
+  type ReviewHandlerCompletion,
+} from "./services/review-handler";
 import { runTelegramService } from "./services/telegram-service";
 import {
   projectUnknownWorker,
@@ -30,11 +42,16 @@ import {
   CONTROLLER_REASONING_LEVELS,
   CONTROLLER_SERVICE_TIERS,
   DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  EXTRACTION_MODELS,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
+import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
 import { ThreadNoticeService } from "./services/thread-notice-service";
+import { JobMemoryService } from "./services/job-memory-service";
+import { MemoryCurationService } from "./services/memory-curation-service";
+import { installSystemMonitors } from "./services/system-monitors";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -48,10 +65,12 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
     botToken: { type: "string", label: "Telegram bot token", secret: true },
     bbAppBaseUrl: { type: "string", label: "BB app base URL", default: "" },
-    pollTimeoutSeconds: {
-      type: "string",
-      label: "Telegram poll timeout in seconds",
-      default: "30",
+    maxConcurrentJobs: {
+      type: "select",
+      label: "Maximum concurrent jobs",
+      description: "Independent projects may run together; each project remains serialized.",
+      options: ["1", "2", "3", "4", "5", "6", "7", "8"],
+      default: String(DEFAULT_MAX_CONCURRENT_JOBS),
     },
     controllerModel: {
       type: "select",
@@ -81,9 +100,25 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       options: [...CONTROLLER_PERMISSION_MODES],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
     },
+    extractionModel: {
+      type: "select",
+      label: "Background learning model",
+      description: "Model for learning lessons from finished jobs. Inherit uses the project default; a cheaper model keeps background work off your conversational tier.",
+      options: [...EXTRACTION_MODELS],
+      default: "inherit",
+    },
+    systemUpkeep: {
+      type: "select",
+      label: "Self-maintenance",
+      description: "Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard, and message you when something needs a decision. Turning this off does not touch monitors you set yourself.",
+      options: ["enabled", "disabled"],
+      default: "enabled",
+    },
   });
   const store = openStore(bb.storage);
+  const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()));
   const executorNudge = new ExecutorNudge();
+  const laneSnapshots = new JobLaneSnapshotProvider();
   let config = parseGlobalConfig(await settings.get());
   if (!config.ok) bb.status.needsConfiguration(config.message);
 
@@ -91,6 +126,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     const parsed = parseGlobalConfig(next);
     config = parsed;
     if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
+    executorNudge.notify();
   });
 
   const telegramForToken = (token: string): TelegramClient => new TelegramClient(token);
@@ -119,7 +155,12 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     store,
     sdk: bb.sdk,
     threadOperations,
-    health: (now) => buildHealthReport(bb.storage.database(), now),
+    health: (now) => buildHealthReport(
+      bb.storage.database(),
+      now,
+      config.ok ? config.value.maxConcurrentJobs : null,
+      laneSnapshots.snapshot(),
+    ),
     notify: () => executorNudge.notify(),
     now: clock,
   });
@@ -131,7 +172,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     commands: [
       { name: "pair", summary: "Create a one-use Telegram pairing link", usage: "bb telegram-agent pair [--json]" },
       { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--json]" },
-      { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ..." },
+      { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
       { name: "doctor", summary: "Check Telegram, BB, host, provider, and GitHub readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
     ],
@@ -160,84 +201,155 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     }, argv, context),
   });
   const bbRunner = new BbRunner(bb.sdk);
-  let reviewStatusJob: NonNullable<ReturnType<typeof store.getJob>> | null = null;
-  let reviewEvent: ReviewHandlerEvent | null = null;
-  const reviewHandler = new ReviewHandler({
-    threads: {
-      output: (threadId) => bb.sdk.threads.output({ threadId }),
-      send: (threadId, prompt) => bbRunner.sendSteering(threadId, prompt),
-      create: async () => {
-        throw new Error("review cycle creation belongs to the leased review effect");
+  const createReviewHandler = (
+    invocation: ReviewInvocation,
+    expectedVersion: number,
+    fence: EffectFence,
+  ): ReviewHandler => {
+    const reviewJobMatches = (): boolean => {
+      const current = store.getJob(invocation.jobId);
+      return current !== null && current.id === invocation.jobId && current.version === expectedVersion &&
+        (current.state === "reviewing" || current.state === "final_reviewing") &&
+        current.environmentId === invocation.environmentId && current.prHeadSha === invocation.expectedSha &&
+        current.reviewThreadId === invocation.reviewThreadId &&
+        current.implementationThreadId === invocation.implementationThreadId;
+    };
+    const reviewAttemptMatches = (): boolean => {
+      const attempt = store.getAttempt(invocation.attemptId);
+      return attempt !== null && attempt.jobId === invocation.jobId && attempt.kind === "review" &&
+        attempt.threadId === invocation.reviewThreadId && attempt.headSha === invocation.expectedSha;
+    };
+    const isCurrent = (): boolean => !invocation.signal.aborted && !fence.signal.aborted &&
+      store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock()) &&
+      reviewJobMatches() && reviewAttemptMatches();
+    const assertCurrent = (): void => {
+      if (!isCurrent()) throw new ReviewInvocationStaleError("review invocation identity or fence changed");
+    };
+    const readAttemptResult = (resultJson: string | null): Record<string, unknown> | null => {
+      if (resultJson === null) return null;
+      try {
+        const parsed = JSON.parse(resultJson);
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed as Record<string, unknown>
+          : null;
+      } catch {
+        return null;
+      }
+    };
+    return new ReviewHandler({
+      threads: {
+        output: async (threadId) => {
+          assertCurrent();
+          if (threadId !== invocation.reviewThreadId) throw new ReviewInvocationStaleError("review thread identity changed");
+          const output = await bb.sdk.threads.output({ threadId });
+          assertCurrent();
+          return output;
+        },
+        send: async (threadId, prompt) => {
+          assertCurrent();
+          if (threadId !== invocation.reviewThreadId) throw new ReviewInvocationStaleError("review thread identity changed");
+          await bbRunner.sendSteering(threadId, prompt);
+          assertCurrent();
+        },
+        create: async () => {
+          throw new Error("review cycle creation belongs to the leased review effect");
+        },
       },
-    },
-    environment: {
-      status: async () => {
-        const job = reviewStatusJob;
-        if (!job?.environmentId || !job.policy) return { available: false, clean: false, headSha: null };
-        const value = await bb.sdk.environments.status({
-          environmentId: job.environmentId,
-          mergeBaseBranch: job.policy.baseBranch,
-        });
-        const raw = value as unknown as Record<string, unknown>;
-        const workspace = (raw.workspace ?? {}) as Record<string, unknown>;
-        const workingTree = (raw.workingTree ?? workspace.workingTree ?? {}) as Record<string, unknown>;
-        const checkout = (raw.checkout ?? workspace.checkout ?? {}) as Record<string, unknown>;
-        const clean = raw.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false);
-        const available = raw.available !== false && raw.outcome !== "unavailable" && raw.outcome !== "not_applicable";
-        return {
-          available,
-          clean,
-          headSha: typeof checkout.headSha === "string" ? checkout.headSha : null,
-        };
-      },
-    },
-    attempts: {
-      get: (attemptId) => {
-        const attempt = store.getAttempt(attemptId);
-        if (!attempt) return {};
-        let result: Record<string, unknown> | null = null;
-        if (attempt.resultJson !== null) {
-          try {
-            const parsed = JSON.parse(attempt.resultJson);
-            if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) result = parsed as Record<string, unknown>;
-          } catch {
-            result = null;
+      environment: {
+        status: async (input: ReviewEnvironmentStatusInput) => {
+          assertCurrent();
+          if (input.environmentId !== invocation.environmentId || input.mergeBaseBranch !== invocation.mergeBaseBranch) {
+            throw new ReviewInvocationStaleError("review environment identity changed");
           }
-        }
-        return {
-          threadId: attempt.threadId,
-          headSha: attempt.headSha ?? undefined,
-          formatCorrectionSent: result?.formatCorrectionSent === true,
-          requiresNewHead: result?.requiresNewHead === true,
-          result: result as never,
-        };
-      },
-      update: (attemptId, patch) => {
-        const existing = store.getAttempt(attemptId);
-        let result = patch.result === undefined
-          ? existing?.resultJson
-            ? JSON.parse(existing.resultJson) as Record<string, unknown>
-            : null
-          : patch.result;
-        if (result !== null && result !== undefined) {
-          result = {
-            ...result,
-            ...(patch.formatCorrectionSent === undefined ? {} : { formatCorrectionSent: patch.formatCorrectionSent }),
-            ...(patch.requiresNewHead === undefined ? {} : { requiresNewHead: patch.requiresNewHead }),
+          const value = await bb.sdk.environments.status({
+            environmentId: input.environmentId,
+            mergeBaseBranch: input.mergeBaseBranch,
+          });
+          assertCurrent();
+          const raw = value as unknown as Record<string, unknown>;
+          const workspace = (raw.workspace ?? {}) as Record<string, unknown>;
+          const workingTree = (raw.workingTree ?? workspace.workingTree ?? {}) as Record<string, unknown>;
+          const checkout = (raw.checkout ?? workspace.checkout ?? {}) as Record<string, unknown>;
+          return {
+            available: raw.available !== false && raw.outcome !== "unavailable" && raw.outcome !== "not_applicable",
+            clean: raw.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false),
+            headSha: typeof checkout.headSha === "string" ? checkout.headSha : null,
           };
-        }
-        store.updateAttempt(attemptId, {
-          threadId: patch.threadId,
-          headSha: patch.headSha,
-          result: result as Record<string, unknown> | null,
-        });
+        },
       },
-      claimFormatCorrection: (attemptId, threadId, headSha) => store.claimReviewFormatCorrection(attemptId, threadId, headSha),
-    },
-    emit: (event) => {
-      reviewEvent = event;
-    },
-  });
+      attempts: {
+        get: ({ jobId, attemptId }: ReviewAttemptLookup) => {
+          assertCurrent();
+          if (jobId !== invocation.jobId || attemptId !== invocation.attemptId) {
+            throw new ReviewInvocationStaleError("review attempt identity changed");
+          }
+          const attempt = store.getAttempt(attemptId);
+          if (!attempt || attempt.jobId !== jobId) throw new ReviewInvocationStaleError("review attempt owner changed");
+          const result = readAttemptResult(attempt.resultJson);
+          return {
+            threadId: attempt.threadId,
+            headSha: attempt.headSha ?? undefined,
+            formatCorrectionSent: result?.formatCorrectionSent === true,
+            requiresNewHead: result?.requiresNewHead === true,
+            result: result as never,
+          };
+        },
+        update: ({ jobId, attemptId, patch }: ReviewAttemptUpdate) => {
+          assertCurrent();
+          if (jobId !== invocation.jobId || attemptId !== invocation.attemptId) {
+            throw new ReviewInvocationStaleError("review attempt identity changed");
+          }
+          const existing = store.getAttempt(attemptId);
+          if (!existing || existing.jobId !== jobId) throw new ReviewInvocationStaleError("review attempt owner changed");
+          const existingResult = readAttemptResult(existing.resultJson);
+          const result = patch.result === undefined
+            ? existingResult
+            : patch.result === null
+              ? null
+              : {
+                  ...existingResult,
+                  ...patch.result,
+                  ...(patch.formatCorrectionSent === undefined ? {} : { formatCorrectionSent: patch.formatCorrectionSent }),
+                  ...(patch.requiresNewHead === undefined ? {} : { requiresNewHead: patch.requiresNewHead }),
+                };
+          const updated = store.updateExecutorAttempt({
+            jobId,
+            attemptId,
+            patch: {
+              threadId: patch.threadId,
+              headSha: patch.headSha,
+              result: result as Record<string, unknown> | null,
+            },
+            ownerId: fence.ownerId,
+            generation: fence.generation,
+            now: clock(),
+          });
+          if (!updated) {
+            if (!isCurrent()) throw new ReviewInvocationStaleError("review attempt identity or fence changed before persistence");
+            throw new ReviewInvocationStaleError("review attempt changed before persistence");
+          }
+          if (updated.jobId !== jobId) throw new ReviewInvocationStaleError("review attempt owner changed");
+        },
+        claimFormatCorrection: ({ jobId, attemptId, threadId, headSha }: ReviewFormatCorrectionClaim) => {
+          assertCurrent();
+          if (jobId !== invocation.jobId || attemptId !== invocation.attemptId || threadId !== invocation.reviewThreadId || headSha !== invocation.expectedSha) {
+            throw new ReviewInvocationStaleError("review correction identity changed");
+          }
+          const claimed = store.claimExecutorReviewFormatCorrection({
+            jobId,
+            attemptId,
+            threadId,
+            headSha,
+            ownerId: fence.ownerId,
+            generation: fence.generation,
+            now: clock(),
+          });
+          if (!claimed && !isCurrent()) throw new ReviewInvocationStaleError("review correction identity or fence changed before claim");
+          return claimed;
+        },
+      },
+    });
+  };
   const collectGateInput = createTask9FreshGateCollector({
     validation: { runner: terminal, environments: bb.sdk.environments },
     runValidation: (input) => runValidation({
@@ -256,7 +368,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       onTerminalObservation: (observation) => {
         if (input.signal?.aborted) return;
         const current = store.getJob(input.job.id);
-        if (current) projectTerminalLiveness(store, current, observation, "validation", clock());
+        if (current) projectTerminalLiveness(store, current, observation, "validation", clock(), undefined, input.fence);
       },
     }),
     getContext: async ({ job, receipt, validation, approvalExpiresAt }): Promise<{
@@ -335,7 +447,12 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     bb: { sdk: bb.sdk },
     collectGateInput,
   });
-  const health = (now: number) => buildHealthReport(bb.storage.database(), now);
+  const health = (now: number) => buildHealthReport(
+    bb.storage.database(),
+    now,
+    config.ok ? config.value.maxConcurrentJobs : null,
+    laneSnapshots.snapshot(),
+  );
   const ingress = new TelegramIngress({
     store,
     telegram: telegramTransport,
@@ -374,10 +491,69 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
         return thread.status;
       },
+      output: async (threadId) => {
+        const result = await bb.sdk.threads.output({ threadId });
+        return result.output ?? "";
+      },
     },
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
+  const jobMemory = new JobMemoryService({
+    store,
+    threads: {
+      spawnHidden: async ({ projectId, title, prompt }) => {
+        const hosts = await bb.sdk.hosts.list({});
+        const host = hosts.find((candidate) => candidate.status === "connected");
+        if (!host) throw new Error("No connected BB host can run a memory extraction");
+        const model = config.ok ? extractionModel(config.value) : null;
+        const thread = await bb.sdk.threads.spawn({
+          projectId,
+          title,
+          visibility: "hidden",
+          input: [{ type: "text", text: prompt, mentions: [] }],
+          environment: {
+            type: "host",
+            hostId: host.id,
+            workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+          },
+          // Extraction reads a repository and writes three sentences; the
+          // conversational tier's reasoning budget is wasted on it.
+          ...(model === null ? {} : {
+            model,
+            reasoningLevel: "low" as const,
+            executionInputSources: { model: "explicit" as const, reasoningLevel: "explicit" as const },
+          }),
+        });
+        return thread.id;
+      },
+      status: async (threadId) => {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
+        return thread.status;
+      },
+      output: async (threadId) => {
+        const result = await bb.sdk.threads.output({ threadId });
+        return result.output ?? "";
+      },
+    },
+    clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
+  });
+  const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
+  let systemMonitorsInstalled = false;
+  const systemMonitors = {
+    install: () => {
+      if (systemMonitorsInstalled) return;
+      if (!config.ok || !systemUpkeepEnabled(config.value)) return;
+      const installed = installSystemMonitors({
+        store,
+        clock: { now: clock },
+        warn: (message) => bb.log.warn(message),
+      });
+      if (installed > 0) systemMonitorsInstalled = true;
+    },
+  };
   const threadNotices = new ThreadNoticeService({
     store,
     threads: {
@@ -413,6 +589,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const presence = new TelegramPresenceCoordinator({
     store,
+    jobLanes: laneSnapshots,
     telegram: {
       sendChatAction: (chatId, action, signal) => {
         if (!config.ok) throw new Error(config.message);
@@ -449,6 +626,17 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   ): Promise<void> => {
     const fenceCurrent = (): boolean => !signal.aborted && !fence.signal.aborted &&
       store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock());
+    const applyExecutorEvent = (jobId: string, expectedVersion: number, event: Parameters<TelegramAgentStore["applyExecutorJobEvent"]>[0]["event"]): void => {
+      const updated = store.applyExecutorJobEvent({
+        jobId,
+        expectedVersion,
+        event,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: clock(),
+      });
+      if (!updated) throw new Error("executor lease was lost before reconciliation transition");
+    };
     if (!fenceCurrent()) return;
 
     const pipelineRole = job.state === "planning" ? "PLAN" as const
@@ -472,7 +660,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     } catch {
       if (!fenceCurrent()) return;
       const current = store.getJob(job.id);
-      if (current) projectUnknownWorker(store, current, resourceId, clock(), workerKind, generation);
+      if (current) projectUnknownWorker(store, current, resourceId, clock(), workerKind, generation, {
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: clock(),
+      });
       return;
     }
     if (!fenceCurrent()) return;
@@ -481,22 +673,26 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     const currentResourceId = currentPipelineAttempt?.threadId ?? (reviewStage ? current?.reviewThreadId : current?.implementationThreadId);
     if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
-    const projected = projectWorkerLiveness(store, current, thread, clock(), workerKind, generation);
+    const projected = projectWorkerLiveness(store, current, thread, clock(), workerKind, generation, {
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now: clock(),
+    });
     const failed = thread.status === "error" || thread.runtime.displayStatus === "error";
     if (failed) {
       if (!fenceCurrent()) return;
       if (currentPipelineAttempt) {
-        store.failPipelineStageAttempt({
+        if (!store.failPipelineStageAttempt({
           id: currentPipelineAttempt.id,
           error: `${workerKind} worker thread failed`,
           ownerId: fence.ownerId,
           generation: fence.generation,
           now: clock(),
-        });
+        })) throw new Error("executor lease was lost before pipeline failure persistence");
       }
       const latest = store.getJob(job.id);
       if (latest && latest.cancelRequestedAt === null) {
-        store.applyJobEvent(job.id, latest.version, { type: "THREAD_FAILED", workerKind, error: `${workerKind} worker thread failed` }, clock());
+        applyExecutorEvent(job.id, latest.version, { type: "THREAD_FAILED", workerKind, error: `${workerKind} worker thread failed` });
       }
       return;
     }
@@ -508,16 +704,16 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         output = await bbRunner.getThreadOutput(resourceId);
       } catch {
         if (!fenceCurrent()) return;
-        store.failPipelineStageAttempt({
+        if (!store.failPipelineStageAttempt({
           id: currentPipelineAttempt.id,
           error: `${workerKind} output is unavailable`,
           ownerId: fence.ownerId,
           generation: fence.generation,
           now: clock(),
-        });
+        })) throw new Error("executor lease was lost before pipeline failure persistence");
         const latest = store.getJob(job.id);
         if (latest?.state === job.state) {
-          store.applyJobEvent(job.id, latest.version, { type: "FAILED", error: `${workerKind} output is unavailable` }, clock());
+          applyExecutorEvent(job.id, latest.version, { type: "FAILED", error: `${workerKind} output is unavailable` });
         }
         return;
       }
@@ -537,7 +733,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       if (!fenceCurrent()) return;
       const latest = store.getJob(job.id);
       if (latest && (latest.state === "implementing" || latest.state === "remediating")) {
-        store.applyJobEvent(job.id, latest.version, { type: "IMPLEMENTATION_IDLE" }, clock());
+        applyExecutorEvent(job.id, latest.version, { type: "IMPLEMENTATION_IDLE" });
       }
       return;
     }
@@ -546,26 +742,44 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     if (!attempt || !current.implementationThreadId || !current.prHeadSha) {
       if (!fenceCurrent()) return;
       const latest = store.getJob(job.id);
-      if (latest) store.applyJobEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" }, clock());
+      if (latest) applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
       return;
     }
-    reviewStatusJob = current;
-    reviewEvent = null;
-    await reviewHandler.handleThreadIdle({
+    if (attempt.jobId !== current.id || attempt.kind !== "review" || attempt.headSha !== current.prHeadSha) return;
+    const invocation: ReviewInvocation = {
+      jobId: current.id,
       attemptId: attempt.id,
       reviewThreadId: resourceId,
       implementationThreadId: current.implementationThreadId,
+      environmentId: current.environmentId ?? "",
+      mergeBaseBranch: current.policy?.baseBranch ?? "",
       expectedSha: current.prHeadSha,
-    });
-    const event = (reviewEvent as unknown) as ReviewHandlerEvent | null;
-    reviewStatusJob = null;
-    if (!event || !fenceCurrent()) return;
-    const latest = store.getJob(job.id);
-    if (!latest || (latest.state !== "reviewing" && latest.state !== "final_reviewing") || !fenceCurrent()) return;
+      signal,
+    };
+    if (!invocation.environmentId || !invocation.mergeBaseBranch || !fenceCurrent()) return;
+    const reviewHandler = createReviewHandler(invocation, current.version, fence);
+    let completion: ReviewHandlerCompletion;
+    try {
+      completion = await reviewHandler.handleThreadIdle(invocation);
+    } catch (error) {
+      if (error instanceof ReviewInvocationStaleError || !fenceCurrent()) return;
+      throw error;
+    }
+    if (!completion.event || !fenceCurrent()) return;
+    const latest = store.getJob(invocation.jobId);
+    const latestAttempt = store.getAttempt(invocation.attemptId);
+    if (!latest || !latestAttempt || latestAttempt.jobId !== invocation.jobId ||
+      latestAttempt.threadId !== invocation.reviewThreadId || latestAttempt.headSha !== invocation.expectedSha ||
+      latest.id !== invocation.jobId || latest.version !== current.version ||
+      (latest.state !== "reviewing" && latest.state !== "final_reviewing") ||
+      latest.environmentId !== invocation.environmentId || latest.prHeadSha !== invocation.expectedSha ||
+      latest.reviewThreadId !== invocation.reviewThreadId ||
+      latest.implementationThreadId !== invocation.implementationThreadId || !fenceCurrent()) return;
+    const event = completion.event;
     if (event.type === "REVIEW_PASSED") {
-      store.applyJobEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: String(event.payload.headSha) }, clock());
+      applyExecutorEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: String(event.payload.headSha) });
     } else if (event.type === "REVIEW_CHANGES_REQUESTED") {
-      store.applyJobEvent(job.id, latest.version, {
+      applyExecutorEvent(job.id, latest.version, {
         type: "REVIEW_CHANGES_REQUESTED",
         headSha: typeof event.payload.headSha === "string" ? event.payload.headSha : undefined,
         summary: typeof event.payload.summary === "string" ? event.payload.summary : undefined,
@@ -573,9 +787,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         reasons: Array.isArray(event.payload.reasons)
           ? event.payload.reasons.filter((reason): reason is string => typeof reason === "string")
           : undefined,
-      }, clock());
+      });
     } else {
-      store.applyJobEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" }, clock());
+      applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
     }
   };
   const effectRunnerFactory = (fence: EffectFence) => new EffectRunner({
@@ -612,7 +826,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         onTerminalObservation: (observation) => {
           if (signal.aborted || !store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock())) return;
           const current = store.getJob(job.id);
-          if (current) projectTerminalLiveness(store, current, observation, "validation", clock());
+          if (current) projectTerminalLiveness(store, current, observation, "validation", clock(), undefined, {
+            ownerId: fence.ownerId,
+            generation: fence.generation,
+            now: clock(),
+          });
         },
       });
     },
@@ -646,6 +864,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     start: (signal) => runJobExecutorService({
       store,
       effectRunnerFactory,
+      scheduler,
+      maxConcurrentJobs: () => config.ok ? config.value.maxConcurrentJobs : null,
+      onWorkAvailable: () => executorNudge.notify(),
       clock: { now: clock },
       reconcileJob,
       telegramToken: () => config.ok ? config.value.botToken : undefined,
@@ -664,7 +885,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       operations: threadOperations,
       monitors,
       threadNotices,
+      jobMemory,
+      memoryCuration,
+      systemMonitors,
       presence,
+      laneSnapshots,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),
     }, signal),
   });

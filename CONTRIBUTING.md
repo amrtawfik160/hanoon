@@ -10,25 +10,26 @@ You need BB `0.36` or newer, npm, and the toolchains required by the tests. Inst
 npm ci
 ```
 
-Refresh the SDK declarations for your installed BB, then type check and build:
-
-```bash
-bb plugin types .
-npm run typecheck
-npm run build
-```
-
-`types/bb-plugin-sdk.d.ts` is committed and is what `@bb/plugin-sdk` resolves to during type checking, so both commands work from a clean clone.
-
-Running the tests needs one thing this repository cannot ship. The suite imports `@bb/plugin-sdk/testing` — the fake plugin host — at runtime, and BB does not publish that package to a registry. Install it from your BB distribution before running:
+Run a focused Vitest file while developing:
 
 ```bash
 npx vitest run tests/controller-service.test.ts
+```
+
+Run the complete gate before committing:
+
+```bash
 npm run check
 bb plugin types --check .
 ```
 
-`npm run check` performs TypeScript validation, the complete Vitest suite, and a BB plugin build; the middle step is the one that needs the package. The SDK check confirms the committed declarations still match the installed BB contract. Pull requests should state which of these were run and their results.
+The full check performs TypeScript validation, the complete Vitest suite, and a BB plugin build. The SDK check confirms the vendored plugin declarations still match the installed BB contract.
+
+## Answer-quality evaluation
+
+The deterministic suite proves the plumbing; it cannot tell you whether an answer reads the way the controller instructions promise. `npm run eval:answers -- --project <project-id>` grades golden answers against that contract using a BB thread as judge.
+
+It is deliberately outside `npm run check`: grading costs a provider turn per case, and the suite must stay runnable offline and for free. The golden cases carry the verdict a correctly calibrated judge must reach, so the rubric is checked against known-good and known-bad answers *before* it is trusted to judge a prompt change. A disagreement with a golden case exits non-zero — a rubric that misgrades its own fixtures cannot grade anything else.
 
 ## Change boundaries
 

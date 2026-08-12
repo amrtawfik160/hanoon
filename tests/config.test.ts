@@ -1,18 +1,21 @@
 import { expect, it } from "vitest";
 import { parseGlobalConfig } from "../src/config";
 
-const telegramSettings = {
-  botToken: "123:test-token",
-  bbAppBaseUrl: "",
-  pollTimeoutSeconds: "30",
-};
+function globalValues(overrides: Record<string, string | undefined> = {}) {
+  return {
+    botToken: "123:test-token",
+    bbAppBaseUrl: "",
+    ...overrides,
+  };
+}
 
-it("defaults controller execution to Opus 5 at xhigh with full permissions", () => {
-  const parsed = parseGlobalConfig(telegramSettings);
+it("defaults controller execution when only public connection settings are present", () => {
+  const parsed = parseGlobalConfig(globalValues({ maxConcurrentJobs: undefined }));
 
   expect(parsed.ok).toBe(true);
   if (!parsed.ok) throw new Error(parsed.message);
   expect(parsed.value).toMatchObject({
+    maxConcurrentJobs: 5,
     controllerModel: "claude-opus-5[1m]",
     controllerReasoningLevel: "xhigh",
     controllerServiceTier: "default",
@@ -21,13 +24,13 @@ it("defaults controller execution to Opus 5 at xhigh with full permissions", () 
 });
 
 it("preserves a non-default controller execution profile", () => {
-  const parsed = parseGlobalConfig({
-    ...telegramSettings,
+  const parsed = parseGlobalConfig(globalValues({
     controllerModel: "gpt-5.6-terra",
     controllerReasoningLevel: "high",
     controllerServiceTier: "default",
     controllerPermissionMode: "accept-edits",
-  });
+    maxConcurrentJobs: undefined,
+  }));
 
   expect(parsed.ok).toBe(true);
   if (!parsed.ok) throw new Error(parsed.message);
@@ -41,10 +44,28 @@ it("preserves a non-default controller execution profile", () => {
 
 it("rejects an unknown controller model instead of silently falling back", () => {
   expect(parseGlobalConfig({
-    ...telegramSettings,
+    ...globalValues({ maxConcurrentJobs: undefined }),
     controllerModel: "made-up-model",
   })).toEqual({
     ok: false,
-    message: "Fix the Telegram Agent URL, polling timeout, or controller execution settings.",
+    message: "Fix the Telegram Agent URL or controller execution settings.",
   });
 });
+
+it.each(["1", "2", "3", "4", "5", "6", "7", "8"]) (
+  "accepts maxConcurrentJobs=%s",
+  (maxConcurrentJobs) => {
+    const parsed = parseGlobalConfig(globalValues({ maxConcurrentJobs }));
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.message);
+    expect(parsed.value.maxConcurrentJobs).toBe(Number(maxConcurrentJobs));
+  },
+);
+
+it.each(["0", "9", "1.5", "not-a-number", ""]) (
+  "rejects invalid maxConcurrentJobs=%s",
+  (maxConcurrentJobs) => {
+    expect(parseGlobalConfig(globalValues({ maxConcurrentJobs })).ok).toBe(false);
+  },
+);

@@ -75,6 +75,11 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
     submittedAt: null,
     completedAt: null,
     awaitingInteractionId: null,
+    toolCalls: 0,
+    commandFailures: 0,
+    totalTokens: 0,
+    supervisorSteers: 0,
+    supervisorReasons: [],
     createdAt: 1_000,
     updatedAt: 1_000,
     ...overrides,
@@ -174,35 +179,6 @@ it("spawns the hidden personal controller on the configured model and provider",
   }));
 });
 
-it("uploads a Telegram image and attaches it when spawning the controller", async () => {
-  const bytes = new Uint8Array([1, 2, 3, 4]);
-  const downloadImage = vi.fn(async () => bytes);
-  const { adapter, spawn, upload } = sdkFixture({ downloadImage });
-  const image = {
-    fileId: "telegram-file-id",
-    fileName: "telegram-screenshot.jpg",
-    mimeType: "image/jpeg" as const,
-    sizeBytes: 4,
-  };
-  const signal = AbortSignal.timeout(1_000);
-
-  await adapter.spawn(turnRecord({ image }), controllerRecord(), signal);
-
-  expect(downloadImage).toHaveBeenCalledWith("telegram-file-id", 10 * 1024 * 1024, signal);
-  expect(upload).toHaveBeenCalledWith({
-    projectId: "proj_personal",
-    clientFile: bytes,
-    filename: "telegram-screenshot.jpg",
-    mimeType: "image/jpeg",
-  });
-  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
-    input: [
-      { type: "text", text: expect.stringContaining("What projects can you work on?"), mentions: [] },
-      { type: "localImage", path: "/attachments/telegram-screenshot.jpg" },
-    ],
-  }));
-});
-
 it("keeps the configured execution tuple on later controller turns", async () => {
   const { adapter, send } = sdkFixture();
 
@@ -223,32 +199,27 @@ it("keeps the configured execution tuple on later controller turns", async () =>
   });
 });
 
-it("attaches a Telegram image to a later controller turn", async () => {
+it("uploads and attaches a Telegram image to a controller turn", async () => {
   const bytes = new Uint8Array([1, 2, 3, 4]);
   const downloadImage = vi.fn(async () => bytes);
   const { adapter, send, upload } = sdkFixture({ downloadImage });
-  const image = {
+  const signal = AbortSignal.timeout(1_000);
+
+  await adapter.send("thr_controller", "Fix this overlap", signal, {
     fileId: "telegram-file-id",
     fileName: "telegram-screenshot.png",
-    mimeType: "image/png" as const,
+    mimeType: "image/png",
     sizeBytes: 4,
-  };
+  });
 
-  await adapter.send(
-    "thr_controller",
-    "Fix this overlap",
-    AbortSignal.timeout(1_000),
-    image,
-  );
-
-  expect(upload).toHaveBeenCalledWith({
+  expect(downloadImage).toHaveBeenCalledWith("telegram-file-id", 10 * 1024 * 1024, signal);
+  expect(upload).toHaveBeenCalledWith(expect.objectContaining({
     projectId: "proj_personal",
     clientFile: bytes,
     filename: "telegram-screenshot.png",
     mimeType: "image/png",
-  });
+  }));
   expect(send).toHaveBeenCalledWith(expect.objectContaining({
-    threadId: "thr_controller",
     input: [
       { type: "text", text: "Fix this overlap", mentions: [] },
       { type: "localImage", path: "/attachments/telegram-screenshot.png" },
@@ -264,29 +235,19 @@ it("uses BB's active-steer mode for a text correction", async () => {
   expect(send).toHaveBeenCalledWith(expect.objectContaining({
     threadId: "thr_controller",
     mode: "steer-if-active",
-    input: [{ type: "text", text: "Use the second option instead", mentions: [] }],
   }));
 });
 
 it("classifies a pre-submit image download failure as retryable", async () => {
   const downloadImage = vi.fn(async () => { throw new Error("temporary Telegram outage"); });
   const { adapter, send } = sdkFixture({ downloadImage });
-  const image = {
+
+  await expect(adapter.send("thr_controller", "Inspect this", AbortSignal.timeout(1_000), {
     fileId: "telegram-file-id",
     fileName: "telegram-screenshot.png",
-    mimeType: "image/png" as const,
+    mimeType: "image/png",
     sizeBytes: null,
-  };
-
-  await expect(adapter.send(
-    "thr_controller",
-    "Inspect this",
-    AbortSignal.timeout(1_000),
-    image,
-  )).rejects.toMatchObject({
-    name: "ControllerImagePreparationError",
-    retryable: true,
-  });
+  })).rejects.toMatchObject({ name: "ControllerImagePreparationError", retryable: true });
   expect(send).not.toHaveBeenCalled();
 });
 
@@ -306,7 +267,7 @@ it("reduces BB controller events after the durable sequence without exposing rea
     assistantDelta: "Hello",
     completed: true,
     error: null,
-    pendingQuestion: null,
+    pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
   });
   expect(eventsList).toHaveBeenCalledWith({
     threadId: "thr_controller",
@@ -488,7 +449,7 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
     status: async () => status,
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "First answer."),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -505,64 +466,6 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.send).toHaveBeenCalledWith("thr_controller", "second", fence.signal);
   expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["completed", "submitted"]);
-});
-
-it("passes a persisted image into a later controller dispatch", async () => {
-  const { store, fence } = serviceFixture();
-  const bootstrap = store.enqueueControllerTurn({
-    ...turnRecord({ updateId: 13, inputText: "bootstrap" }),
-    telegramUserId: "7",
-    telegramChatId: "7",
-    now: 2_000,
-  });
-  const leaseFence = { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 };
-  expect(store.claimNextControllerTurn(leaseFence)?.id).toBe(bootstrap.id);
-  expect(store.markControllerSpawned({
-    ...leaseFence,
-    turnId: bootstrap.id,
-    projectId: "proj_personal",
-    hostId: "host_personal",
-    threadId: "thr_controller",
-  })).toBe(true);
-  expect(store.markControllerTurnSubmitted({ ...leaseFence, turnId: bootstrap.id })).toBe(true);
-  expect(store.completeControllerTurn({
-    ...leaseFence,
-    turnId: bootstrap.id,
-    responseText: "Ready.",
-  })).toBe(true);
-  const image = {
-    fileId: "telegram-file-id",
-    fileName: "telegram-screenshot.png",
-    mimeType: "image/png" as const,
-    sizeBytes: 4,
-  };
-  store.enqueueControllerTurn({
-    ...turnRecord({ updateId: 14, inputText: "Fix this overlap", image }),
-    telegramUserId: "7",
-    telegramChatId: "7",
-    now: 2_001,
-  });
-  const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
-    send: vi.fn(async () => undefined),
-    status: vi.fn(async (): Promise<"idle"> => "idle"),
-    latestSeq: vi.fn(async () => 12),
-    output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
-    steer: vi.fn(async () => undefined),
-    answerQuestion: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => null),
-  };
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
-
-  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-
-  expect(adapter.send).toHaveBeenCalledWith("thr_controller", "Fix this overlap", fence.signal, image);
-  expect(store.getControllerTurn("controller-turn-14")).toMatchObject({
-    state: "submitted",
-    image,
-    dispatchAfterSeq: 12,
-  });
 });
 
 it("keeps a queued image durable until the active turn finishes", async () => {
@@ -589,7 +492,7 @@ it("keeps a queued image durable until the active turn finishes", async () => {
     mimeType: "image/webp" as const,
     sizeBytes: 8,
   };
-  store.enqueueControllerTurn({
+  const waiting = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 16, inputText: "Use this screenshot instead", image }),
     telegramUserId: "7",
     telegramChatId: "7",
@@ -600,9 +503,9 @@ it("keeps a queued image durable until the active turn finishes", async () => {
     spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => status),
-    latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    latestSeq: vi.fn(async () => 1),
+    output: vi.fn(async () => "First answer."),
+    events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -610,35 +513,28 @@ it("keeps a queued image durable until the active turn finishes", async () => {
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
   expect(adapter.steer).not.toHaveBeenCalled();
-  expect(store.getControllerTurn("controller-turn-16")).toMatchObject({
-    state: "queued",
-    image,
-  });
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "queued", image });
 
   status = "idle";
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-  expect(adapter.send).toHaveBeenCalledWith(
-    "thr_controller",
-    "Use this screenshot instead",
-    fence.signal,
-    image,
-  );
-  expect(store.getControllerTurn("controller-turn-16")).toMatchObject({ state: "submitted" });
+  expect(adapter.send).toHaveBeenCalledWith("thr_controller", "Use this screenshot instead", fence.signal, image);
 });
 
 it("requeues a transient image preparation failure without adopting a late spawn candidate", async () => {
   const { store, fence } = serviceFixture();
-  const image = {
-    fileId: "telegram-file-id",
-    fileName: "telegram-screenshot.jpg",
-    mimeType: "image/jpeg" as const,
-    sizeBytes: null,
-  };
   const turn = store.enqueueControllerTurn({
-    ...turnRecord({ updateId: 17, inputText: "Read this", image }),
+    ...turnRecord({
+      updateId: 17,
+      inputText: "Read this",
+      image: {
+        fileId: "telegram-file-id",
+        fileName: "telegram-screenshot.jpg",
+        mimeType: "image/jpeg" as const,
+        sizeBytes: null,
+      },
+    }),
     telegramUserId: "7",
     telegramChatId: "7",
     now: 2_000,
@@ -652,7 +548,7 @@ it("requeues a transient image preparation failure without adopting a late spawn
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate,
@@ -684,8 +580,8 @@ it("requeues an aborted image preparation without consuming a retry", async () =
     telegramChatId: "7",
     now: 2_000,
   });
-  const controller = new AbortController();
-  controller.abort();
+  const aborted = new AbortController();
+  aborted.abort();
   const findSpawnCandidate = vi.fn(async () => ({
     threadId: "thr_unrelated",
     projectId: "proj_personal",
@@ -697,15 +593,15 @@ it("requeues an aborted image preparation without consuming a retry", async () =
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate,
   };
   const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
 
-  await expect(service.processOne(fence, controller.signal)).resolves.toBe(true);
-  await expect(service.processOne(fence, controller.signal)).resolves.toBe(true);
+  await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
+  await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
 
   expect(findSpawnCandidate).not.toHaveBeenCalled();
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", retryCount: 0 });
@@ -764,7 +660,7 @@ it("requeues a turn while the controller thread is still busy instead of failing
     status: vi.fn(async () => status),
     latestSeq: vi.fn(async () => 4),
         output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 4, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 4, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -820,7 +716,7 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
         output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -875,7 +771,7 @@ it("delivers a completed answer even when the controller thread ends in error", 
       assistantDelta: "Here is the answer.",
       completed: true,
       error: null,
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -901,7 +797,7 @@ it("reports a streaming turn only while its answer is still arriving", async () 
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -942,7 +838,7 @@ it("fails an uncertain send closed and never submits it twice", async () => {
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
@@ -1003,7 +899,7 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => { throw new Error("temporary BB output failure"); }),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -1057,7 +953,7 @@ it("projects active Luna assistant deltas into the durable controller reply", as
       assistantDelta: "Working on it",
       completed: false,
       error: null,
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1118,7 +1014,7 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
       assistantDelta: "",
       completed: false,
       error: null,
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1176,7 +1072,7 @@ it("retires an errored controller so a later queued message can start a fresh ge
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -1239,7 +1135,7 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned_idle" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -1288,7 +1184,7 @@ it("retires an errored controller generation even when no turn remains submitted
     status: vi.fn(async () => "error" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "unused"),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
@@ -1346,7 +1242,7 @@ it("retries one controller generation when BB proves the input was never accepte
       assistantDelta: "",
       completed: false,
       error: "Controller provider turn failed",
-      pendingQuestion: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),

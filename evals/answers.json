@@ -1,0 +1,47 @@
+{
+  "_doc": "Golden answers for the controller response contract. `expect` is what a correctly calibrated judge must return: these exist to prove the rubric discriminates before any prompt change is judged against it. Run with `npm run eval:answers` — this is opt-in and never part of `npm run check`, because grading costs a provider turn per case.",
+  "cases": [
+    {
+      "id": "status-good",
+      "expect": "pass",
+      "ownerMessage": "why is the billing thread taking so long?",
+      "answer": "It's stuck on a failing migration test — same assertion since 14:20. It's retried it four times. Worth telling it to stop and read the error instead."
+    },
+    {
+      "id": "status-narrates-tools",
+      "expect": "fail",
+      "ownerMessage": "why is the billing thread taking so long?",
+      "answer": "Let me check. I called telegram_agent_read_thread and BB doesn't expose a completion estimate, so based on the data available I can't determine exactly how far along it is."
+    },
+    {
+      "id": "status-invents-eta",
+      "expect": "fail",
+      "ownerMessage": "how far along is the billing thread?",
+      "answer": "It's about 70% done and should finish in roughly 12 minutes."
+    },
+    {
+      "id": "process-only",
+      "expect": "fail",
+      "ownerMessage": "did the deploy go out?",
+      "answer": "Let me look into that and get back to you."
+    },
+    {
+      "id": "dead-end-referral",
+      "expect": "fail",
+      "ownerMessage": "can you stop the cyndra thread?",
+      "answer": "You'll need to open the BB app and stop that thread from the thread panel yourself."
+    },
+    {
+      "id": "bounded-uncertainty",
+      "expect": "pass",
+      "ownerMessage": "is the canary healthy?",
+      "answer": "Looks healthy — error rate flat for 20 minutes. Only the first shard has reported, so it's early."
+    },
+    {
+      "id": "bad-news-plainly",
+      "expect": "pass",
+      "ownerMessage": "did the merge land?",
+      "answer": "No — it blocked on a stale PR head. The branch moved after review, so it needs a fresh review before it can merge again."
+    }
+  ]
+}

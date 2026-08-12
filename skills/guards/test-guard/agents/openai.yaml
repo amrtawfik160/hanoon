@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Guard"
+  short_description: "Test quality guardrails for AI agents"
+  default_prompt: "Use $test-guard after tests are written or changed to review them against pragmatic testing guardrails."

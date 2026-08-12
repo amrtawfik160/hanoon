@@ -42,9 +42,11 @@ The remaining connection settings are:
 | Setting | Accepted value | Default | Purpose |
 | --- | --- | --- | --- |
 | BB app base URL | Empty or a URL | Empty | An external HTTPS value adds an **Open BB** link to Telegram status messages. |
-| Telegram poll timeout | Integer from `5` to `50` seconds | `30` | Telegram long-poll timeout. |
+| Maximum concurrent jobs | Integer select from `1` to `8` | `5` | Bounds admitted or draining project pipelines across the installation. |
 
 An empty BB app URL disables the link. Non-HTTPS values are not rendered as Telegram buttons.
+
+A valid concurrency change affects later admissions immediately. Lowering it does not cancel or preempt already admitted work; available capacity remains zero until enough draining jobs release. Invalid persisted input fails configuration closed and does not silently substitute the default.
 
 ## Pair one owner
 
@@ -74,6 +76,23 @@ The model selects its provider: `claude-*` models run on Claude Code, `gpt-*` mo
 Changing the model to one owned by the other provider retires the live BB conversation thread, because a thread cannot switch providers. The next message opens a replacement seeded with the recent conversation, so the change costs a pause rather than the conversation.
 
 Saved values apply when the next controller turn starts, including later turns in the existing durable conversation. They do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode.
+
+### Background work
+
+Two settings govern what the agent does when you have not asked it anything:
+
+| Setting | Options | Default | Purpose |
+| --- | --- | --- | --- |
+| Background learning model | `inherit` or any controller model | `inherit` | Model used to learn lessons from finished jobs. `inherit` leaves it to the project default, which is the only safe answer when the installation's providers are unknown; naming a cheaper model keeps background work off your conversational tier. |
+| Self-maintenance | `enabled`, `disabled` | `enabled` | Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard. |
+
+Turning self-maintenance off stops the agent installing its own monitors. It does not touch monitors you set yourself, and it does not stop the agent learning from finished jobs.
+
+The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
+
+### How the agent works for you
+
+How the agent should behave — terser answers, always leading with the pull-request link — is not a setting. Tell it in the chat and it records a single standing instruction that is applied to every later turn, replaced whenever you restate it, and cleared when you tell it to stop. It is layered after the fixed instructions, so it can change tone and habits but never a safety boundary.
 
 ### Why the default is `full`
 
@@ -119,6 +138,8 @@ bb telegram-agent project enable <project-id> \
 
 Policy files/JSON cannot be mixed with individual policy flags.
 
+For production, individual flags accept `--production-target-key shared.prod` alongside at least one `--deploy-json` and one `--canary-json`. A target key without both command groups is rejected with exit code `2`.
+
 ## Project policy reference
 
 Use unmistakable placeholders and replace them with values verified for the target BB project:
@@ -152,6 +173,7 @@ Use unmistakable placeholders and replace them with values verified for the targ
     }
   ],
   "production": {
+    "targetKey": "shared.prod",
     "deployCommands": [
       {
         "name": "deploy",
@@ -191,6 +213,7 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `baseBranch` | Non-empty and present in the selected BB source. |
 | `implementation`, `review` | Optional provider/model/reasoning/tier/permission fields. Missing values use BB's resolved defaults. |
 | `validationCommands` | Up to 20 owner-authored commands. |
+| `production.targetKey` | Optional shared isolation key: 1–64 lowercase letters, numbers, `.`, `_`, or `-`, starting alphanumeric. When absent, the project id is used. |
 | `production.deployCommands` | One to 20 commands when production is configured. |
 | `production.canaryCommands` | One to 20 commands when production is configured. |
 | `production.rollbackCommand` | Optional operator guidance. It is recorded but never executed automatically. |

@@ -10,7 +10,7 @@ Send `/health` in the paired chat. It is answered from durable state rather than
 /health
 ```
 
-A healthy reply confirms the executor is running and reports queued job steps, waiting messages, armed monitors, and stored memories. An unhealthy reply names each problem: an executor lease that is not current, job steps that gave up, messages that could not be delivered, failed Telegram updates, failed monitors, unavailable memory search, or a database integrity fault.
+A healthy `/health` reply confirms the executor is running and summarizes queued job steps, waiting messages, armed monitors, and stored memories. The durable health report used by controller health inspection additionally separates the configured cap, admitted, draining and queued counts, occupied slots, available slots, pipeline/control lane use, oldest queue age, and held project/repository/production resource counts. An invalid cap is reported as a configuration problem rather than replaced with the default. An unhealthy reply also names executor, dead-letter, Telegram, monitor, memory-search, and database-integrity problems.
 
 From a shell:
 
@@ -24,6 +24,27 @@ bb plugin logs telegram-agent -n 50
 A healthy loaded plugin reports `running` with both `telegram-ingress` and `job-executor` services running. The global doctor requires a configured token and paired owner. The project doctor reports every failing prerequisite and returns a non-zero exit code if the project is not ready.
 
 Use `--json` on Telegram Agent commands when another tool must consume the result.
+
+## Verify the bundled skill runtime
+
+Skills are committed locally under the manifest roots `skills/workflow-kit` and `skills/guards`; operators do not install another skill plugin. The catalog has 17 local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+
+Run the deterministic integrity gate from the repository root:
+
+```bash
+npm run skills:verify
+```
+
+The command checks the manifest roots and lock, file sizes/counts and regular-file type, complete SHA-256 coverage, frontmatter and directory names, nested local Markdown resources, and the pinned provenance and licence of every vendored root. Success prints a bounded `bundleDigest` and `skillCount`; a malformed lock, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter/resource mismatch, or digest mismatch exits non-zero. `npm run build` invokes this verifier before `bb plugin build`, and activation invokes it before plugin registration. Treat any failure as a stop: the runtime never downloads, substitutes, or repairs a bundle.
+
+Only a maintainer may synchronize the pinned upstream workflow kit. Use an already-reviewed local absolute checkout of the `superpowers` package with version `6.2.0`, `LICENSE`, `skills/`, and the reviewed MIT license; the synchronizer is network-free and has no runtime role:
+
+```bash
+WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.2.0
+npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.2.0
+```
+
+Synchronization rewrites the local `skills/workflow-kit` files and `skills/skills.lock.json`. Re-run `npm run skills:verify` and review the resulting diff before any plugin reload. Do not use synchronization as an activation-time repair mechanism.
 
 ## Memory and monitors
 
@@ -51,9 +72,22 @@ bb telegram-agent job show <job-id>
 bb telegram-agent job show <job-id> --json
 ```
 
-`job list` returns at most 100 recent jobs; `--limit` accepts `1`–`100`. `job show` returns the bounded stored projection for exactly one job. It does not expose raw prompts, secrets, or unbounded provider logs.
+`job list` returns at most 100 recent jobs; `--limit` accepts `1`–`100`. `job show` returns the bounded stored projection for exactly one job. Its safe projection includes admission state, queue sequence/age/release reason, held resource kind/key pairs, and merge-resource waits, but not raw prompts, secrets, claim owners, lease generations, or unbounded provider logs.
 
 In Telegram, the durable status message reports the current state, review/validation summaries, pull-request identity, liveness, approval expiry, and production outcome. BB does not expose a reliable completion ETA, so the controller reports observed progress instead of inventing one.
+
+`/status` without an id lists up to eight current jobs and reports when more exist. `/status <job-id>`, `/cancel <job-id>`, and `/retry <job-id>` target that exact job. Replying to a job status message is another exact selector. If cancel or retry has neither an id nor a status reply, one eligible job is selected only when unambiguous; otherwise Telegram returns bounded choices. Plain-text steering by status reply is accepted only while that exact job is admitted.
+
+## Admissions and concurrency
+
+The executor may run independent projects concurrently up to **Maximum concurrent jobs** (`5` by default, `1`–`8` allowed). One project claim permits only one admitted pipeline for a project, so same-project jobs remain FIFO even when spare global slots exist.
+
+- `queued`: waiting for capacity or the project claim;
+- `admitted`: occupies a slot and may run ordinary pipeline work;
+- `draining`: terminal transition is recorded, but worker/effect cleanup still owns the slot;
+- `released`: cleanup finished and its claims no longer block later work.
+
+At merge time, the job must also own the normalized repository merge claim and, for production policies, the production target claim. Different projects with the same repository therefore cannot merge concurrently. Different repositories can share `production.targetKey` to serialize one deployment target; without it, the target key falls back to the project id. These waits appear in the safe CLI job projection.
 
 ## Retry or cancel
 
@@ -77,7 +111,7 @@ Cancellation revokes approvals and asks the authoritative active worker to stop 
 
 Change **Telegram bot token** only in **Extensions → Plugins → Telegram Agent**. The background service recreates its Telegram client for the new token. Do not set or pass the token through a command line.
 
-The plugin binds the observed Telegram bot identity. Changing to a different bot while a job is active fails closed. Rotate credentials during an idle window and run:
+The plugin binds the observed Telegram bot identity. Changing to a different bot while any queued, admitted, or draining admission exists fails closed. Rotate credentials during an idle window and run:
 
 ```bash
 bb telegram-agent doctor
@@ -100,7 +134,7 @@ bb plugin reload telegram-agent
 bb plugin list --json
 ```
 
-The plugin resumes from durable controller/job/effect/outbox state. The executor reacquires its generation-fenced lease and reconciles BB state before continuing. It does not start a speculative replacement when liveness is stale or unknown.
+The plugin resumes from durable controller/job/effect/outbox state. The executor reacquires its generation-fenced lease and reconciles each occupied job before adopting that job's held claims into the new generation. It does not adopt foreign claims or start a speculative replacement when liveness is stale or unknown.
 
 Important recovery behavior:
 
@@ -111,6 +145,8 @@ Important recovery behavior:
 - An uneditable status message is replaced and the new message id is stored.
 - Permanent Telegram 4xx responses are dead-lettered; retryable 429/5xx failures use bounded retry accounting.
 - Restart recovery does not issue a second merge, deploy, or canary for a completed receipt.
+- A merge call with an unknown provider outcome keeps its repository and production claims held until authoritative reconciliation; capacity is not guessed free.
+- Every merge still requires current review/validation evidence and the exact unexpired one-use Telegram approval, regardless of available capacity.
 
 ## Production failures
 

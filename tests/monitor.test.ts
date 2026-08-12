@@ -21,7 +21,7 @@ function service(
   status: () => Promise<"idle" | "active" | "error" | "missing">,
   now = () => NOW,
 ) {
-  return new MonitorService({ store, threads: { status }, clock: { now } });
+  return new MonitorService({ store, threads: { status, output: async () => "" }, clock: { now } });
 }
 
 it("waits while the watched thread is still working", async () => {
@@ -160,6 +160,7 @@ it("keeps checking other monitors when one thread cannot be read", async () => {
         if (threadId === "thr_unreadable") throw new Error("BB unreachable");
         return "idle" as const;
       }),
+      output: async () => "",
     },
     clock: { now: () => NOW },
     warn: (message) => warnings.push(message),

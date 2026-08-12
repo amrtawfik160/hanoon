@@ -1,28 +1,9 @@
-import type {
-  JobState,
-  WorkerKind,
-  WorkerLiveness,
-} from "../domain/models";
 import type { ControllerTurnState } from "../controller/models";
 import { redactError } from "../errors";
+import type { ReadonlyJobLaneSnapshotProvider } from "./job-lane-runner";
 
 const HEARTBEAT_MS = 4_000;
 const CONTROLLER_PRESENCE_STATES = new Set<ControllerTurnState>(["dispatching", "submitted"]);
-const WORKER_PRESENCE_STATES = new Set<WorkerLiveness["state"]>(["starting", "active"]);
-const JOB_WORKER_KIND: Partial<Record<JobState, WorkerKind>> = {
-  planning: "plan",
-  critiquing: "critique",
-  creating_implementation: "implementation",
-  implementing: "implementation",
-  remediating: "implementation",
-  reviewing: "review",
-  validating: "validation",
-  documenting: "docs",
-  final_validating: "validation",
-  final_reviewing: "review",
-  deploying: "deploy",
-  verifying_production: "canary",
-};
 
 type PresenceStore = {
   getOwner(): { userId: string; chatId: string } | null;
@@ -32,8 +13,6 @@ type PresenceStore = {
     state: ControllerTurnState;
     awaitingInteractionId?: string | null;
   } | null;
-  getActiveJob(): { id: string; state: JobState } | null;
-  getWorkerLiveness(jobId: string): WorkerLiveness | null;
 };
 
 type PresenceTransport = {
@@ -58,23 +37,22 @@ function controllerPresenceTarget(store: PresenceStore, owner: PresenceOwner): T
   return { key: `controller:${turn.id}`, chatId: owner.chatId };
 }
 
-function workerPresenceTarget(store: PresenceStore, owner: PresenceOwner): TelegramPresenceTarget | null {
-  const job = store.getActiveJob();
-  if (!job) return null;
-  const expectedWorkerKind = JOB_WORKER_KIND[job.state];
-  const worker = store.getWorkerLiveness(job.id);
-  if (!expectedWorkerKind || !worker || worker.jobId !== job.id) return null;
-  if (worker.workerKind !== expectedWorkerKind || !WORKER_PRESENCE_STATES.has(worker.state)) return null;
-  return {
-    key: `job:${job.id}:${worker.workerKind}:${worker.generation}:${worker.resourceId}`,
-    chatId: owner.chatId,
-  };
+function jobPresenceTarget(
+  snapshots: ReadonlyJobLaneSnapshotProvider,
+  owner: PresenceOwner,
+): TelegramPresenceTarget | null {
+  const snapshot = snapshots.snapshot();
+  if (snapshot.pipelineActive + snapshot.controlActive === 0) return null;
+  return { key: "jobs:aggregate", chatId: owner.chatId };
 }
 
-export function resolveTelegramPresenceTarget(store: PresenceStore): TelegramPresenceTarget | null {
+export function resolveTelegramPresenceTarget(
+  store: PresenceStore,
+  snapshots: ReadonlyJobLaneSnapshotProvider,
+): TelegramPresenceTarget | null {
   const owner = store.getOwner();
   if (!owner) return null;
-  return controllerPresenceTarget(store, owner) ?? workerPresenceTarget(store, owner);
+  return controllerPresenceTarget(store, owner) ?? jobPresenceTarget(snapshots, owner);
 }
 
 export class TelegramPresenceCoordinator {
@@ -82,6 +60,7 @@ export class TelegramPresenceCoordinator {
 
   public constructor(private readonly dependencies: {
     store: PresenceStore;
+    jobLanes: ReadonlyJobLaneSnapshotProvider;
     telegram: PresenceTransport;
     warn: (message: string) => void;
   }) {}
@@ -92,7 +71,7 @@ export class TelegramPresenceCoordinator {
 
   public async pulse(now: number, signal: AbortSignal): Promise<number | null> {
     if (!Number.isInteger(now) || now < 0) throw new TypeError("presence clock must be a non-negative integer");
-    const target = resolveTelegramPresenceTarget(this.dependencies.store);
+    const target = resolveTelegramPresenceTarget(this.dependencies.store, this.dependencies.jobLanes);
     if (!target) {
       this.lastAttempt = null;
       return null;

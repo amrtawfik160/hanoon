@@ -5,6 +5,7 @@ import type { MergeHandler } from "../services/merge-handler";
 import {
   OWNER_MEMORY_SCOPE,
   type OutboxInput,
+  type JobControlKind,
   type ProjectPolicyRecord,
   type TelegramAgentStore,
   type TelegramStatusOutboxStore,
@@ -23,7 +24,9 @@ import {
   ephemeralTelegramPayload,
   parseCallbackData,
   persistableJobStatusPayload,
+  renderJobChoices,
   renderJobStatus,
+  renderJobStatusSummary,
   type CallbackAction,
 } from "./view";
 import { TelegramRequestError } from "./client";
@@ -70,6 +73,13 @@ const PRIVATE_ID = /^[1-9][0-9]*$/;
 const MAX_TASK_TEXT = 4_000;
 const MAX_AUDIT_RECORDS = 256;
 const STATUS_LOGICAL_SUFFIX = ":status";
+const CONTROL_JOB_ID = /^[A-Za-z0-9_-]{1,256}$/;
+const STEERABLE_STATES = new Set<Job["state"]>(["implementing", "remediating"]);
+
+type ControlResolution =
+  | { outcome: "job"; job: Job }
+  | { outcome: "none" }
+  | { outcome: "choose"; jobs: Job[]; total: number };
 
 function stableControllerKey(userId: string, chatId: string): string {
   return createHash("sha256")
@@ -240,9 +250,11 @@ export class TelegramIngress {
     const normalized = boundedText(text);
     if (normalized === null) return;
 
-    const command = /^\/(\w+)(?:\s|$)/.exec(normalized)?.[1]?.toLowerCase();
+    const commandMatch = /^\/(\w+)(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?$/.exec(normalized);
+    const command = commandMatch?.[1]?.toLowerCase();
+    const commandArgument = commandMatch?.[2]?.trim() || null;
     if (command === "help") {
-      await this.sendPlain(identity.chatId, "Talk naturally. Reply to the active status message to steer implementation, or use /status, /projects, /health, /retry, and /cancel for recovery.");
+      await this.sendPlain(identity.chatId, "Talk naturally. Reply to a job status message to steer that implementation, or use /status, /projects, /health, /retry, and /cancel for recovery.");
       return;
     }
     if (command === "projects") {
@@ -254,26 +266,62 @@ export class TelegramIngress {
       return;
     }
 
-    const active = this.store.getActiveJob();
-    if (command === "status") {
-      if (active) await this.deliverJobView(active, renderJobStatus(active), identity.chatId, message.message_id, now);
-      else await this.sendPlain(identity.chatId, "No active job.");
-      return;
-    }
-    if (command === "cancel") {
-      if (active) await this.cancelJob(active, identity.chatId, message.message_id, now);
-      else await this.sendPlain(identity.chatId, "No active job.");
-      return;
-    }
-    if (command === "retry") {
-      if (active?.state === "failed") await this.retryJob(active, identity.chatId, message.message_id, now);
-      else await this.sendPlain(identity.chatId, "No retryable job is active.");
+    if (command === "status" || command === "cancel" || command === "retry") {
+      if (commandArgument !== null && !CONTROL_JOB_ID.test(commandArgument)) {
+        await this.sendPlain(identity.chatId, "That job id is invalid.");
+        return;
+      }
+      const replyMessageId = message.reply_to_message?.message_id ?? null;
+      if (command === "status" && commandArgument === null && replyMessageId === null) {
+        const jobs = this.store.listControlJobs("status", 8);
+        await this.telegram.sendMessage(identity.chatId, renderJobStatusSummary({
+          jobs: jobs.map((job) => ({ job, admission: this.store.getAdmission(job.id) })),
+          total: this.store.countControlJobs("status"),
+        }));
+        return;
+      }
+      const resolution = this.resolveControlJob(command, commandArgument, replyMessageId);
+      if (resolution.outcome === "choose") {
+        if (command === "status") {
+          await this.telegram.sendMessage(identity.chatId, renderJobStatusSummary({
+            jobs: resolution.jobs.map((job) => ({ job, admission: this.store.getAdmission(job.id) })),
+            total: resolution.total,
+          }));
+        } else {
+          await this.telegram.sendMessage(
+            identity.chatId,
+            renderJobChoices(command, resolution.jobs, resolution.total),
+          );
+        }
+        return;
+      }
+      if (resolution.outcome === "none") {
+        await this.sendPlain(identity.chatId, command === "retry" ? "No retryable job." : "No matching job.");
+        return;
+      }
+      if (command === "status") {
+        await this.deliverJobView(resolution.job, this.renderStatus(resolution.job), identity.chatId, undefined, now);
+      } else if (command === "cancel") {
+        if (!this.controlEligible(resolution.job, "cancel")) {
+          await this.sendPlain(identity.chatId, "That job cannot be cancelled.");
+        } else {
+          await this.cancelJob(resolution.job, identity.chatId, undefined, now);
+        }
+      } else if (!this.controlEligible(resolution.job, "retry")) {
+        await this.sendPlain(identity.chatId, "That job is not retryable.");
+      } else {
+        await this.retryJob(resolution.job, identity.chatId, undefined, now);
+      }
       return;
     }
 
-    if (active && message.reply_to_message?.message_id === active.statusMessageId) {
-      this.steer(active, normalized, updateId, now);
-      return;
+    const replyMessageId = message.reply_to_message?.message_id;
+    if (replyMessageId !== undefined) {
+      const repliedJob = this.store.findJobByStatusMessageId(replyMessageId);
+      if (repliedJob && this.canSteer(repliedJob, replyMessageId)) {
+        this.steer(repliedJob, normalized, updateId, now);
+        return;
+      }
     }
 
     const controllerKey = stableControllerKey(identity.userId, identity.chatId);
@@ -491,17 +539,14 @@ export class TelegramIngress {
 
     let selected = job;
     if (job.state === "awaiting_project") {
-      selected = this.store.applyJobEvent(
-        job.id,
-        job.version,
-        {
-          type: "PROJECT_SELECTED",
-          projectId: record.policy.projectId,
-          policyVersion: record.version,
-          policy: record.policy,
-        },
+      selected = this.store.selectProjectAndQueueAdmission({
+        jobId: job.id,
+        expectedVersion: job.version,
+        projectId: record.policy.projectId,
+        policyVersion: record.version,
+        policy: record.policy,
         now,
-      );
+      });
       await this.store.setLastProject(record.policy.projectId);
     } else if (
       job.state !== "awaiting_confirmation" ||
@@ -511,8 +556,9 @@ export class TelegramIngress {
       return;
     }
 
-    await this.deliverJobView(selected, renderJobStatus(selected), chatId, callback.message?.message_id, now);
+    await this.deliverJobView(selected, this.renderStatus(selected), chatId, callback.message?.message_id, now);
     await this.finishCallback(callback.id, selected.id, chatId, "project", "accepted", now, "Project selected.");
+    this.onWorkAvailable();
   }
 
   private async startJob(
@@ -521,27 +567,31 @@ export class TelegramIngress {
     chatId: string,
     now: number,
   ): Promise<void> {
-    let started = job;
-    if (job.state === "awaiting_confirmation") {
-      started = this.store.applyJobEvent(job.id, job.version, { type: "CONFIRMED" }, now);
-    } else if (!this.hasStartEffect(job)) {
+    let admission = this.store.getAdmission(job.id);
+    if (job.state === "awaiting_confirmation" && admission === null) {
+      admission = this.store.queueAdmission({
+        jobId: job.id,
+        expectedVersion: job.version,
+        projectId: job.projectId ?? "",
+        resumeEvent: "CONFIRMED",
+        now,
+      });
+    }
+    if (!admission || !["queued", "admitted"].includes(admission.state)) {
       await this.finishCallback(callback.id, job.id, chatId, "start", "rejected", now, "Start is no longer available.");
       return;
     }
 
-    await this.deliverJobView(started, renderJobStatus(started), chatId, callback.message?.message_id, now);
-    await this.finishCallback(callback.id, started.id, chatId, "start", "accepted", now, "Job started.");
-  }
-
-  private hasStartEffect(job: Job): boolean {
-    return this.store.listEffectsForJob(job.id).some((effect) =>
-      effect.kind === "spawn_plan" || effect.kind === "spawn_implementation");
+    const queued = this.store.getJob(job.id) ?? job;
+    await this.deliverJobView(queued, this.renderStatus(queued), chatId, callback.message?.message_id, now);
+    await this.finishCallback(callback.id, queued.id, chatId, "start", "accepted", now, "Job queued.");
+    this.onWorkAvailable();
   }
 
   private async cancelJob(
     job: Job,
     chatId: string,
-    messageId: number,
+    messageId: number | undefined,
     now: number,
     callback?: TelegramCallbackQuery,
   ): Promise<void> {
@@ -553,25 +603,26 @@ export class TelegramIngress {
         { type: "CANCEL_REQUESTED", activeWorker: this.store.getWorkerLiveness(job.id) },
         now,
       );
+      this.onWorkAvailable();
     }
     if (callback) {
-      await this.deliverJobView(cancelled, renderJobStatus(cancelled), chatId, messageId, now);
+      await this.deliverJobView(cancelled, this.renderStatus(cancelled), chatId, messageId, now);
       await this.finishCallback(callback.id, cancelled.id, chatId, "cancel", "accepted", now, "Cancellation requested.");
     } else {
-      await this.deliverJobView(cancelled, renderJobStatus(cancelled), chatId, messageId, now);
+      await this.deliverJobView(cancelled, this.renderStatus(cancelled), chatId, messageId, now);
     }
   }
 
   private async retryJob(
     job: Job,
     chatId: string,
-    messageId: number,
+    messageId: number | undefined,
     now: number,
     callback?: TelegramCallbackQuery,
   ): Promise<void> {
     if (job.state !== "failed") return;
     const retried = this.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, now);
-    await this.deliverJobView(retried, renderJobStatus(retried), chatId, messageId, now);
+    await this.deliverJobView(retried, this.renderStatus(retried), chatId, messageId, now);
     if (callback) await this.finishCallback(callback.id, retried.id, chatId, "retry", "accepted", now, "Retry scheduled.");
   }
 
@@ -583,14 +634,59 @@ export class TelegramIngress {
     callback?: TelegramCallbackQuery,
   ): Promise<void> {
     if (job.state !== "blocked" || job.blockedReason !== "review_limit") return;
-    const reviewed = this.store.applyJobEvent(job.id, job.version, { type: "CONTINUE_REVIEW" }, now);
-    await this.deliverJobView(reviewed, renderJobStatus(reviewed), chatId, messageId, now);
-    if (callback) await this.finishCallback(callback.id, reviewed.id, chatId, "review", "accepted", now, "Review continued.");
+    const queued = this.store.requeueReviewAdmission(job.id, job.version, now);
+    if (queued.outcome === "unavailable") return;
+    const current = this.store.getJob(job.id) ?? job;
+    const stillCleaningUp = queued.outcome === "still_cleaning_up";
+    await this.deliverJobView(current, this.renderStatus(current), chatId, messageId, now);
+    if (callback) {
+      await this.finishCallback(
+        callback.id,
+        current.id,
+        chatId,
+        "review",
+        stillCleaningUp ? "rejected" : "accepted",
+        now,
+        stillCleaningUp ? "Review is still cleaning up." : "Review queued.",
+      );
+    }
+    if (!stillCleaningUp) this.onWorkAvailable();
   }
 
   private steer(job: Job, text: string, updateId: number, now: number): void {
-    if (!job.implementationThreadId || jobIsTerminal(job)) return;
+    if (!job.implementationThreadId || !this.canSteer(job, job.statusMessageId)) return;
     this.store.enqueueSteeringEffect(job.id, updateId, job.implementationThreadId, text, now);
+  }
+
+  private canSteer(job: Job, statusMessageId: number | null): boolean {
+    const admission = this.store.getAdmission(job.id);
+    return statusMessageId !== null && job.statusMessageId === statusMessageId &&
+      admission?.state === "admitted" && job.cancelRequestedAt === null &&
+      !jobIsTerminal(job) && STEERABLE_STATES.has(job.state) && job.implementationThreadId !== null;
+  }
+
+  private controlEligible(job: Job, kind: Exclude<JobControlKind, "status">): boolean {
+    if (kind === "retry") return job.state === "failed" && job.cancelRequestedAt === null;
+    return !jobIsTerminal(job) && job.cancelRequestedAt === null;
+  }
+
+  private resolveControlJob(
+    kind: JobControlKind,
+    explicitJobId: string | null,
+    replyMessageId: number | null,
+  ): ControlResolution {
+    if (explicitJobId !== null) {
+      const job = this.store.getJob(explicitJobId);
+      return job ? { outcome: "job", job } : { outcome: "none" };
+    }
+    if (replyMessageId !== null) {
+      const job = this.store.findJobByStatusMessageId(replyMessageId);
+      return job ? { outcome: "job", job } : { outcome: "none" };
+    }
+    const jobs = this.store.listControlJobs(kind, 8);
+    if (jobs.length === 0) return { outcome: "none" };
+    if (jobs.length === 1) return { outcome: "job", job: jobs[0] };
+    return { outcome: "choose", jobs, total: this.store.countControlJobs(kind) };
   }
 
   private async finishCallback(
@@ -679,6 +775,10 @@ export class TelegramIngress {
       chatType: safeAuditChatType(chat?.type),
       isBot: from.is_bot,
     });
+  }
+
+  private renderStatus(job: Job): SendMessagePayload {
+    return renderJobStatus({ job, admission: this.store.getAdmission(job.id) });
   }
 
   private async deliverJobView(

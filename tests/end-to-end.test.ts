@@ -3,7 +3,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import type { GateInput } from "../src/domain/gates";
-import type { Job, StoredEffect } from "../src/domain/models";
+import type { Job } from "../src/domain/models";
 import { resolvePrHead, runValidation, type ValidationSnapshot } from "../src/bb/validation";
 import { BbRunner } from "../src/bb/runner";
 import { buildCritiqueArtifact, buildDocsReportArtifact, buildPlanArtifact } from "../src/bb/pipeline-handoffs";
@@ -42,6 +42,16 @@ type AttachmentCall = {
   filename: string;
   clientFile: Uint8Array;
   mimeType: string;
+};
+
+type ExecutorSession = Readonly<{
+  ownerId: string;
+  generation: number;
+  fence: EffectFence;
+}>;
+
+type DeprecatedLeaseProbe = {
+  leaseEffects(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): unknown[];
 };
 
 function callbackUpdate(
@@ -179,28 +189,54 @@ async function drainEffects(
   store: TelegramAgentStore,
   makeRunner: (fence: EffectFence) => EffectRunner,
   now: () => number,
-  ownerId: string,
+  session: ExecutorSession,
 ): Promise<void> {
-  const lease = store.acquireExecutorLease(ownerId, now(), 1_000_000);
-  if (!lease.acquired) throw new Error(`executor lease ${ownerId} was not acquired`);
-  const fence: EffectFence = {
-    ownerId,
-    generation: lease.generation,
-    signal: new AbortController().signal,
-  };
-  try {
-    for (let pass = 0; pass < 100; pass += 1) {
-      const effects = store.leaseEffects(ownerId, lease.generation, now(), 20, 1_000_000);
-      if (effects.length === 0) return;
-      for (const effect of effects) {
-        await makeRunner(fence).run(effect);
-        store.completeEffect(effect.idempotencyKey, ownerId, lease.generation, now());
+  for (let pass = 0; pass < 100; pass += 1) {
+    if (!store.isExecutorLeaseCurrent(session.ownerId, session.generation, now())) {
+      throw new Error("workflow executor lease was lost while draining effects");
+    }
+    const occupiedAdmissions = store.listAdmissions(["admitted", "draining"], 100);
+    const effects = store.leaseControlEffects({
+      ownerId: session.ownerId,
+      generation: session.generation,
+      now: now(),
+      limit: 8,
+      leaseMs: 1_000_000,
+      busyJobIds: occupiedAdmissions.map((admission) => admission.jobId),
+    });
+    for (const admission of occupiedAdmissions) {
+      const next = store.leaseNextJobEffect({
+        jobId: admission.jobId,
+        ownerId: session.ownerId,
+        generation: session.generation,
+        now: now(),
+        leaseMs: 1_000_000,
+      });
+      if (next) effects.push(next);
+    }
+    if (effects.length === 0) return;
+    for (const effect of effects) {
+      if (!store.renewJobOperationFences({
+        jobId: effect.jobId,
+        effectIdempotencyKey: effect.idempotencyKey,
+        ownerId: session.ownerId,
+        generation: session.generation,
+        now: now(),
+        leaseMs: 1_000_000,
+      })) throw new Error(`effect fence was lost while draining ${effect.idempotencyKey}`);
+      await makeRunner(session.fence).run(effect);
+      const settled = store.getEffect(effect.jobId, effect.idempotencyKey);
+      if (settled?.status === "leased" && !store.completeEffect(
+        effect.idempotencyKey,
+        session.ownerId,
+        session.generation,
+        now(),
+      )) {
+        throw new Error(`effect did not complete while draining: ${effect.idempotencyKey}`);
       }
     }
-    throw new Error("effect drain exceeded its bounded pass count");
-  } finally {
-    store.releaseExecutorLease(ownerId, lease.generation, now());
   }
+  throw new Error("effect drain exceeded its bounded pass count");
 }
 
 async function runExecutorOnce(
@@ -233,6 +269,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     const now = () => time;
     const { bb, harness } = createFakePluginHost({ pluginId: "telegram-agent" });
     const store = openStore(bb.storage, bb.storage.kv, now);
+    const deprecatedLease = vi.spyOn(store as unknown as DeprecatedLeaseProbe, "leaseEffects");
     const sdk = bb.sdk as unknown as BbPluginApi["sdk"];
     const attachments: AttachmentCall[] = [];
     const spawns: SpawnCall[] = [];
@@ -539,24 +576,22 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
 
     const policy = policyFixture({ projectId: "proj_1", alias: "cyndra", githubRepository: "acme/cyndra" });
-    const completeDocs = (jobId: string, ownerId: string): void => {
+    let executorSession: ExecutorSession;
+    const completeDocs = (jobId: string): void => {
       const current = store.getJob(jobId);
       const docsAttempt = store.getLatestPipelineStageAttempt(jobId, "DOCS");
       if (!current || current.state !== "documenting" || !docsAttempt) throw new Error("docs stage was not ready");
       const report = buildDocsReportArtifact("# Documentation gate\n\nNo documentation change was necessary; existing docs remain accurate. Checks passed.\n");
-      const lease = store.acquireExecutorLease(ownerId, ++time, 1_000_000);
-      if (!lease.acquired) throw new Error("docs completion lease missing");
       expect(store.completePipelineStageAttempt({
         id: docsAttempt.id,
         outputText: new TextDecoder().decode(report.bytes),
         outputSha256: report.sha256,
         outcome: { verdict: "success" },
-        ownerId,
-        generation: lease.generation,
+        ownerId: executorSession.ownerId,
+        generation: executorSession.generation,
         now: time,
       })).toBe(true);
       store.applyJobEvent(jobId, current.version, { type: "DOCS_IDLE" }, ++time);
-      store.releaseExecutorLease(ownerId, lease.generation, ++time);
     };
     store.createPairingCode(hashSecret("one-use-pairing-code"), time, time + 600_000);
     await ingress.handleClaimed({ update_id: 1, message: privateMessage("/start one-use-pairing-code") } as TelegramUpdate, ++time);
@@ -614,54 +649,76 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     const status = await telegram.sendMessage("70", { text: "Job started." });
     job = store.setJobStatusMessage(job.id, status.message_id, job.version, ++time);
     const statusMessageId = status.message_id;
+    expect(job.state).toBe("awaiting_confirmation");
+    const workflowLease = store.acquireExecutorLease("workflow-executor", ++time, 1_000_000);
+    if (!workflowLease.acquired) throw new Error("workflow executor lease was not acquired");
+    executorSession = {
+      ownerId: "workflow-executor",
+      generation: workflowLease.generation,
+      fence: {
+        ownerId: "workflow-executor",
+        generation: workflowLease.generation,
+        signal: new AbortController().signal,
+      },
+    };
+    const admission = store.tryAdmit({
+      jobId: job.id,
+      maxConcurrentJobs: 1,
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      now: ++time,
+      leaseMs: 1_000_000,
+    });
+    expect(admission.outcome).toBe("admitted");
+    job = store.getJob(job.id)!;
     expect(job.state).toBe("planning");
+    expect(store.getAdmission(job.id)?.state).toBe("admitted");
+    expect(store.listHeldResourceClaims(job.id, 10)).toMatchObject([{
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      state: "held",
+    }]);
 
-    await drainEffects(store, makeRunner, now, "initial-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     let stage = store.getLatestPipelineStageAttempt(job.id, "PLAN");
     if (!stage) throw new Error("planner stage was not created");
     const planArtifact = buildPlanArtifact("# Plan\n\n1. Implement the bounded change.\n2. Run the configured checks.\n");
-    let stageLease = store.acquireExecutorLease("plan-completer", ++time, 1_000_000);
-    if (!stageLease.acquired) throw new Error("plan completion lease missing");
     expect(store.completePipelineStageAttempt({
       id: stage.id,
       outputText: new TextDecoder().decode(planArtifact.bytes),
       outputSha256: planArtifact.sha256,
       outcome: { verdict: "success" },
-      ownerId: "plan-completer",
-      generation: stageLease.generation,
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
       now: time,
     })).toBe(true);
     job = store.getJob(job.id)!;
     store.applyJobEvent(job.id, job.version, { type: "PLAN_READY", attemptId: stage.id }, ++time);
-    store.releaseExecutorLease("plan-completer", stageLease.generation, ++time);
 
-    await drainEffects(store, makeRunner, now, "critique-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     stage = store.getLatestPipelineStageAttempt(job.id, "CRITIQUE");
     if (!stage) throw new Error("critique stage was not created");
     const critiqueArtifact = buildCritiqueArtifact({ verdict: "pass", summary: "The plan is complete and testable" });
-    stageLease = store.acquireExecutorLease("critique-completer", ++time, 1_000_000);
-    if (!stageLease.acquired) throw new Error("critique completion lease missing");
     expect(store.completePipelineStageAttempt({
       id: stage.id,
       outputText: new TextDecoder().decode(critiqueArtifact.bytes),
       outputSha256: critiqueArtifact.sha256,
       outcome: { verdict: "pass", summary: "The plan is complete and testable" },
-      ownerId: "critique-completer",
-      generation: stageLease.generation,
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
       now: time,
     })).toBe(true);
     job = store.getJob(job.id)!;
     store.applyJobEvent(job.id, job.version, { type: "CRITIQUE_PASSED", attemptId: stage.id }, ++time);
-    store.releaseExecutorLease("critique-completer", stageLease.generation, ++time);
 
-    await drainEffects(store, makeRunner, now, "builder-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("implementing");
     expect(job.environmentId).toBe("env_telegram_worktree");
     expect(job.implementationThreadId).toContain("implementation");
 
     store.applyJobEvent(job.id, job.version, { type: "IMPLEMENTATION_IDLE" }, ++time);
-    await drainEffects(store, makeRunner, now, "implementation-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("reviewing");
     expect(job.prNumber).toBe(PR_NUMBER);
@@ -684,7 +741,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       headSha: HEAD_ONE,
       summary: "Fix the bounded finding",
     }, ++time);
-    await drainEffects(store, makeRunner, now, "remediation-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     expect(store.getJob(job.id)?.state).toBe("implementing");
     const implementationThreadId = job.implementationThreadId;
     if (!implementationThreadId) throw new Error("implementation thread was lost during remediation");
@@ -693,7 +750,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     remoteHead = HEAD_TWO;
     job = store.getJob(job.id)!;
     store.applyJobEvent(job.id, job.version, { type: "IMPLEMENTATION_IDLE" }, ++time);
-    await drainEffects(store, makeRunner, now, "second-review-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("reviewing");
     expect(job.prHeadSha).toBe(HEAD_TWO);
@@ -708,9 +765,9 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
     expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
     store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_TWO }, ++time);
-    await drainEffects(store, makeRunner, now, "docs-executor");
-    completeDocs(job.id, "docs-completer-one");
-    await drainEffects(store, makeRunner, now, "final-verification-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
+    completeDocs(job.id);
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("final_reviewing");
     const firstFinalReviewThread = job.reviewThreadId!;
@@ -724,10 +781,13 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
     expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
     store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_TWO }, ++time);
-    await drainEffects(store, makeRunner, now, "approval-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("awaiting_merge_approval");
     expect(approvalIssue).toHaveBeenCalledTimes(1);
+    expect(store.listHeldResourceClaims(job.id, 10).filter((claim) =>
+      claim.resourceKind === "repository_merge" || claim.resourceKind === "production_target",
+    )).toHaveLength(0);
     const firstApproval = approvalIssue.mock.results[0]?.value as { nonce: string };
 
     remoteHead = HEAD_THREE;
@@ -736,13 +796,13 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       ++time,
     );
     expect(store.getJob(job.id)?.state).toBe("merging");
-    await drainEffects(store, makeRunner, now, "stale-merge-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(mergeCalls).toHaveLength(0);
     expect(gateObservations).toContainEqual({ phase: "pre_merge", remote: HEAD_THREE, github: HEAD_TWO });
     expect(job.state).toBe("reviewing");
 
-    await drainEffects(store, makeRunner, now, "fresh-review-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("reviewing");
     expect(job.prHeadSha).toBe(HEAD_THREE);
@@ -757,9 +817,9 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
     expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
     store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_THREE }, ++time);
-    await drainEffects(store, makeRunner, now, "fresh-docs-executor");
-    completeDocs(job.id, "docs-completer-two");
-    await drainEffects(store, makeRunner, now, "fresh-final-verification-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
+    completeDocs(job.id);
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("final_reviewing");
     const secondFinalReviewThread = job.reviewThreadId!;
@@ -773,41 +833,76 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     });
     expect(requireReviewEvent(reviewEvent).type).toBe("REVIEW_PASSED");
     store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_THREE }, ++time);
-    await drainEffects(store, makeRunner, now, "fresh-approval-executor");
+    await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
     expect(job.state).toBe("awaiting_merge_approval");
     expect(approvalIssue).toHaveBeenCalledTimes(2);
     const secondApproval = approvalIssue.mock.results[1]?.value as { nonce: string };
 
-    const winner = store.acquireExecutorLease("merge-winner", ++time, 1_000_000);
-    const loser = store.acquireExecutorLease("merge-loser", time, 1_000_000);
-    expect(winner).toEqual({ acquired: true, generation: expect.any(Number) });
-    expect(loser).toEqual({ acquired: false });
     await ingress.handleClaimed(
       callbackUpdate(6, statusMessageId, encodeCallbackData({ type: "merge", nonce: secondApproval.nonce }), "merge-fresh"),
       ++time,
     );
     const mergeEffect = store.listEffectsForJob(job.id).find((effect) => effect.kind === "merge_pr" && effect.status === "pending");
-    if (!mergeEffect || !winner.acquired) throw new Error("fresh merge effect or winning lease is missing");
-    const mergeFence: EffectFence = {
-      ownerId: "merge-winner",
-      generation: winner.generation,
-      signal: new AbortController().signal,
-    };
-    const leased = store.leaseEffects("merge-winner", winner.generation, now(), 20, 1_000_000)
-      .find((effect) => effect.idempotencyKey === mergeEffect.idempotencyKey);
+    if (!mergeEffect) throw new Error("fresh merge effect is missing");
+    const leased = store.leaseNextJobEffect({
+      jobId: job.id,
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      now: now(),
+      leaseMs: 1_000_000,
+    });
     if (!leased) throw new Error("fresh merge effect was not leased by the winning executor");
-    await makeRunner(mergeFence).run(leased);
+    expect(leased.idempotencyKey).toBe(mergeEffect.idempotencyKey);
+    expect(store.renewJobOperationFences({
+      jobId: leased.jobId,
+      effectIdempotencyKey: leased.idempotencyKey,
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      now: now(),
+      leaseMs: 1_000_000,
+    })).toBe(true);
+    await makeRunner(executorSession.fence).run(leased);
     expect(mergeCalls).toHaveLength(1);
-    store.completeEffect(leased.idempotencyKey, "merge-winner", winner.generation, now());
-    store.releaseExecutorLease("merge-winner", winner.generation, now());
-    await drainEffects(store, makeRunner, now, "post-merge-status-executor");
+    expect(store.getEffect(leased.jobId, leased.idempotencyKey)?.status).toBe("done");
+    await drainEffects(store, makeRunner, now, executorSession);
     expect(store.getJob(job.id)).toMatchObject({
       state: "complete",
       mergeCommitSha: MERGE_COMMIT,
       deploymentSummary: `1/1 production deploy commands passed at ${MERGE_COMMIT.slice(0, 12)}`,
       canarySummary: `1/1 production canary commands passed at ${MERGE_COMMIT.slice(0, 12)}`,
     });
+    expect(deprecatedLease).not.toHaveBeenCalled();
+    expect(store.getAdmission(job.id)?.state).toBe("draining");
+    expect(store.listHeldResourceClaims(job.id, 10).filter((claim) => claim.state === "held")).toMatchObject([{
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      state: "held",
+    }]);
+    const terminalLiveness = store.getWorkerLiveness(job.id);
+    if (!terminalLiveness) throw new Error("terminal worker liveness is missing");
+    expect(store.upsertExecutorWorkerLiveness({
+      value: { ...terminalLiveness, state: "idle", observedAt: ++time },
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      now: time,
+    })).toBe(true);
+    expect(store.beginDraining({
+      jobId: job.id,
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      now: ++time,
+    })).toMatchObject({ id: job.id, state: "complete" });
+    const releaseResult = store.finalizeRelease({
+      jobId: job.id,
+      ownerId: executorSession.ownerId,
+      generation: executorSession.generation,
+      now: ++time,
+    });
+    expect(releaseResult).toMatchObject({ outcome: "released" });
+    expect(store.getAdmission(job.id)?.state).toBe("released");
+    expect(store.listHeldResourceClaims(job.id, 10).filter((claim) => claim.state === "held")).toHaveLength(0);
+    expect(store.releaseExecutorLease(executorSession.ownerId, executorSession.generation, ++time)).toBe(true);
 
     let deliveryFailures = 1;
     const delivered: Array<Record<string, unknown>> = [];
@@ -827,12 +922,14 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       answerCallback: async () => undefined,
     };
     await runExecutorOnce(store, now, completionTelegram);
+    expect(store.getAdmission(job.id)?.state).toBe("released");
     expect(store.listOutbox(20).map((item) => ({ key: item.logicalKey, status: item.status, nextAttemptAt: item.nextAttemptAt }))).toContainEqual(
       expect.objectContaining({ status: "failed" }),
     );
     time += 5_000;
     await runExecutorOnce(store, now, completionTelegram);
     expect(delivered).toHaveLength(1);
+    expect(store.getAdmission(job.id)?.state).toBe("released");
     expect(store.listOutbox(20).some((item) => item.status === "sent")).toBe(true);
     expect(mergeCalls).toHaveLength(1);
 

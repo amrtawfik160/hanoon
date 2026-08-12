@@ -12,6 +12,7 @@ import {
 import { TelegramClient } from "./telegram/client";
 import type { TelegramAgentStore } from "./storage/store";
 import { TerminalCommandRunner } from "./bb/terminal-command";
+import { projectResourceWait } from "./storage/autonomy-repository";
 
 type BbSdk = BbPluginApi["sdk"];
 
@@ -59,6 +60,7 @@ const PROJECT_ENABLE_FLAGS: Record<string, FlagSpec> = {
   "validation-json": { kind: "value", repeatable: true },
   "deploy-json": { kind: "value", repeatable: true },
   "canary-json": { kind: "value", repeatable: true },
+  "production-target-key": { kind: "value" },
   "rollback-json": { kind: "value" },
   "convex-deploy-required": { kind: "flag" },
   "required-check": { kind: "value", repeatable: true },
@@ -241,7 +243,20 @@ function selectedSource(project: JsonRecord): JsonRecord | null {
   return projectSources(project).find((source) => source.isDefault === true) ?? projectSources(project)[0] ?? null;
 }
 
-function safeJob(job: Job): JsonRecord {
+function safeJob(store: TelegramAgentStore, job: Job, now: number): JsonRecord {
+  const admission = store.getAdmission(job.id);
+  const queueEnd = admission?.admittedAt ?? admission?.releasedAt ?? now;
+  const held = store.listCurrentHeldResourceClaims(job.id, 8).map((claim) => ({
+    kind: claim.resourceKind,
+    key: claim.resourceKey,
+  }));
+  const waiting = job.policy
+    ? projectResourceWait({
+      jobId: job.id,
+      policy: job.policy,
+      claims: store.listCurrentHeldMergeResourceClaims({ jobId: job.id, policy: job.policy, limit: 8 }),
+    }).slice(0, Math.max(0, 8 - held.length))
+    : [];
   return {
     id: job.id,
     state: job.state,
@@ -262,6 +277,13 @@ function safeJob(job: Job): JsonRecord {
     lastError: job.lastError,
     version: job.version,
     updatedAt: job.updatedAt,
+    admission: admission ? {
+      state: admission.state,
+      queueSequence: admission.queueSeq,
+      queueAgeMs: Math.max(0, queueEnd - admission.queuedAt),
+      releaseReason: admission.releaseReason,
+    } : null,
+    resources: { held, waiting },
   };
 }
 
@@ -376,12 +398,19 @@ function individualPolicy(
     });
   const deployCommands = parseCommands("deploy-json");
   const canaryCommands = parseCommands("canary-json");
+  const productionTargetKey = parsed.values.get("production-target-key");
   const rollbackValue = parsed.values.get("rollback-json");
   const rollbackCommand = rollbackValue === undefined ? undefined : parseJsonValue(rollbackValue, "--rollback-json");
   if (rollbackCommand !== undefined && !isRecord(rollbackCommand)) {
     throw new CliOperationError("--rollback-json must contain an object");
   }
-  const hasProduction = deployCommands.length > 0 || canaryCommands.length > 0 || rollbackCommand !== undefined ||
+  if (productionTargetKey !== undefined && (deployCommands.length === 0 || canaryCommands.length === 0)) {
+    throw new CliInputError("--production-target-key requires both --deploy-json and --canary-json");
+  }
+  const hasProduction = deployCommands.length > 0 ||
+    canaryCommands.length > 0 ||
+    productionTargetKey !== undefined ||
+    rollbackCommand !== undefined ||
     parsed.flags.has("convex-deploy-required");
   const candidate: JsonRecord = {
     projectId,
@@ -394,6 +423,7 @@ function individualPolicy(
     validationCommands,
     ...(hasProduction ? {
       production: {
+        ...(productionTargetKey === undefined ? {} : { targetKey: productionTargetKey }),
         deployCommands,
         canaryCommands,
         ...(rollbackCommand === undefined ? {} : { rollbackCommand }),
@@ -448,6 +478,7 @@ async function enableProject(
     "validation-json",
     "deploy-json",
     "canary-json",
+    "production-target-key",
     "rollback-json",
     "convex-deploy-required",
     "required-check",
@@ -515,7 +546,7 @@ async function runPair(
     botId: String(identity.id),
     username: identity.username,
     now,
-    hasActiveJob: deps.store.getActiveJob() !== null,
+    hasActiveJob: deps.store.hasUnreleasedAdmissions(),
   });
   if (bind === "active_job_conflict") throw new CliOperationError("Cannot change Telegram identity while a job is active");
   const secret = createSecret(24);
@@ -575,8 +606,16 @@ function jobList(
   const limit = parsed.values.has("limit")
     ? boundedInteger(parsed.values.get("limit") ?? "", "--limit", 1, MAX_COLLECTION_SIZE)
     : MAX_COLLECTION_SIZE;
-  const jobs = deps.store.listJobs(limit).slice(0, MAX_COLLECTION_SIZE).map(safeJob);
-  return success({ jobs }, jobs.map((job) => `${String(job.id)}\t${String(job.state)}`).join("\n"), json);
+  const now = deps.now();
+  const jobs = deps.store.listJobs(limit).map((job) => safeJob(deps.store, job, now));
+  return success(
+    { jobs },
+    jobs.map((job) => {
+      const admission = job.admission as JsonRecord | null;
+      return `${String(job.id)}\t${String(job.state)}\t${String(admission?.state ?? "none")}\t${String(job.projectId ?? "unselected")}`;
+    }).join("\n"),
+    json,
+  );
 }
 
 function jobShow(
@@ -587,7 +626,7 @@ function jobShow(
   const jobId = onePositional(parsed, "job show");
   const job = deps.store.getJob(jobId);
   if (!job) throw new CliOperationError("Job was not found");
-  const output = safeJob(job);
+  const output = safeJob(deps.store, job, deps.now());
   return success(output, `${String(output.id)}\t${String(output.state)}\tversion=${String(output.version)}`, json);
 }
 
@@ -600,7 +639,7 @@ function jobRetry(
   const current = deps.store.getJob(jobId);
   if (!current) throw new CliOperationError("Job was not found");
   const next = deps.store.applyJobEvent(jobId, current.version, { type: "RETRY" }, deps.now());
-  const output = safeJob(next);
+  const output = safeJob(deps.store, next, deps.now());
   return success(output, `Retried ${jobId} (${next.state})`, json);
 }
 
@@ -618,7 +657,7 @@ function jobCancel(
     { type: "CANCEL_REQUESTED", activeWorker: deps.store.getWorkerLiveness(jobId) },
     deps.now(),
   );
-  const output = { ...safeJob(next), cancelRequested: next.cancelRequestedAt !== null };
+  const output = { ...safeJob(deps.store, next, deps.now()), cancelRequested: next.cancelRequestedAt !== null };
   return success(output, `Cancellation requested for ${jobId}`, json);
 }
 

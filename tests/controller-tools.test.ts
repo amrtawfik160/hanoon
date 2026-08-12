@@ -1,8 +1,10 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
+import { BUNDLED_SKILL_IDS, buildWorkerThreadTitle, type WorkerSkillRole } from "../src/agent-skills/role-resolver";
 import { hashSecret } from "../src/crypto";
-import { policyFixture } from "./helpers";
-import { ActiveJobConflictError, openStore } from "../src/storage/store";
+import { admitConfirmedJob, policyFixture, sha } from "./helpers";
+import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../src/controller/tools";
 
 type ThreadListEntry = Awaited<ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["sdk"]["threads"]["list"]>>[number];
@@ -74,9 +76,53 @@ function parseToolJson(value: unknown): unknown {
   return JSON.parse(value);
 }
 
+function queueControllerCandidate(
+  store: TelegramAgentStore,
+  id: string,
+  projectId: string,
+  state: "awaiting_confirmation" | "failed" = "awaiting_confirmation",
+): void {
+  const candidatePolicy = policyFixture({
+    projectId,
+    alias: projectId.replace(/^proj_/, "candidate-").slice(0, 24),
+    githubRepository: `acme/${projectId}`,
+    production: undefined,
+  });
+  store.upsertProjectPolicy(candidatePolicy, 10_000);
+  const job = store.createJob({
+    id,
+    sourceUpdateId: 900 + id.charCodeAt(id.length - 1),
+    requestText: id,
+    now: 10_001,
+  });
+  const selected = store.applyJobEvent(job.id, job.version, {
+    type: "PROJECT_SELECTED",
+    projectId,
+    policyVersion: 1,
+    policy: candidatePolicy,
+  }, 10_002);
+  if (state === "failed") {
+    const admitted = admitConfirmedJob(store, selected, 10_003);
+    store.applyJobEvent(admitted.id, admitted.version, { type: "FAILED", error: `${id} failed` }, 10_004);
+  } else {
+    store.queueAdmission({
+      jobId: selected.id,
+      expectedVersion: selected.version,
+      projectId,
+      resumeEvent: "CONFIRMED",
+      now: 10_003,
+    });
+  }
+}
+
+const controllerToolContext = { threadId: "thr_controller", projectId: "proj_personal" };
+
 let fixtureNumber = 0;
 function fixture() {
-  const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-tools-${fixtureNumber++}` });
+  const { bb, harness } = createFakePluginHost({
+    pluginId: `telegram-controller-tools-${fixtureNumber++}`,
+    agentSkillIds: [...BUNDLED_SKILL_IDS],
+  });
   const store = openStore(bb.storage, bb.storage.kv, () => 10_000);
   store.createPairingCode(hashSecret("pair-tools"), 1_000, 20_000);
   expect(store.pairOwnerWithCode(hashSecret("pair-tools"), "7", "7", 1_001)).toEqual({ ok: true });
@@ -108,10 +154,130 @@ function fixture() {
     generation: lease.generation,
     now: 10_000,
   })).toBe(true);
+  expect(store.releaseExecutorLease("executor", lease.generation, 10_000)).toBe(true);
   return { bb, harness, store, turn };
 }
 
-it("atomically creates one confirmed controller job through the existing state machine", () => {
+function workerContext(
+  pluginId: string,
+  identity: { jobId: string; attemptId: string; role: WorkerSkillRole },
+  overrides: Partial<PluginAgentConfigurationContext> = {},
+): PluginAgentConfigurationContext {
+  return {
+    thread: {
+      id: "thr_worker",
+      title: buildWorkerThreadTitle(identity),
+      parentThreadId: null,
+      sourceThreadId: null,
+    },
+    project: { id: "proj_worker", kind: "standard", name: "Worker", gitRemoteUrl: "https://github.com/acme/worker.git" },
+    environment: {
+      id: "env_worker",
+      name: "worker",
+      path: "/workspace/worker",
+      workspaceProvisionType: "managed-worktree",
+      branchName: "agent/worker",
+    },
+    host: { id: "host_worker", name: "Worker host" },
+    provider: { id: "codex", model: "gpt-5.6" },
+    origin: { kind: null, pluginId },
+    ...overrides,
+  };
+}
+
+function workerJob(store: TelegramAgentStore, id: string) {
+  const policy = policyFixture({ projectId: "proj_worker", alias: "worker" });
+  store.upsertProjectPolicy(policy, 1_000);
+  const job = store.createJob({ id, sourceUpdateId: 800 + id.length, requestText: "worker task", now: 1_001 });
+  return store.applyJobEvent(job.id, job.version, {
+    type: "PROJECT_SELECTED",
+    projectId: policy.projectId,
+    policyVersion: 1,
+    policy,
+  }, 1_002);
+}
+
+function effect(store: TelegramAgentStore, jobId: string, kind: string) {
+  const found = store.listEffectsForJob(jobId).find((candidate) => candidate.kind === kind);
+  if (!found) throw new Error(`${kind} effect was not created`);
+  return found;
+}
+
+function advanceToImplementation(store: TelegramAgentStore, id: string) {
+  let job = workerJob(store, id);
+  job = admitConfirmedJob(store, job, 1_003);
+  job = store.applyJobEvent(job.id, job.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_004);
+  job = store.applyJobEvent(job.id, job.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_005);
+  return { job, effect: effect(store, job.id, "spawn_implementation") };
+}
+
+function advanceImplementationToReview(store: TelegramAgentStore, job: ReturnType<typeof advanceToImplementation>["job"]) {
+  job = store.applyJobEvent(job.id, job.version, {
+    type: "IMPLEMENTATION_CREATED", threadId: "thr_implementation", environmentId: "env_worker",
+  }, 1_006);
+  job = store.applyJobEvent(job.id, job.version, { type: "IMPLEMENTATION_IDLE" }, 1_007);
+  job = store.applyJobEvent(job.id, job.version, { type: "PR_LOCATED", number: 12, url: "https://github.com/acme/worker/pull/12" }, 1_008);
+  job = store.applyJobEvent(job.id, job.version, { type: "PR_HEAD_RESOLVED", headSha: sha() }, 1_009);
+  job = store.applyJobEvent(job.id, job.version, { type: "VALIDATION_PASSED", headSha: sha() }, 1_010);
+  return { job, effect: effect(store, job.id, "spawn_review") };
+}
+
+function advanceReviewToDocs(store: TelegramAgentStore, job: ReturnType<typeof advanceImplementationToReview>["job"]) {
+  job = store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: sha() }, 1_011);
+  return { job, effect: effect(store, job.id, "spawn_docs") };
+}
+
+function advanceDocsToFinalReview(store: TelegramAgentStore, job: ReturnType<typeof advanceReviewToDocs>["job"]) {
+  job = store.applyJobEvent(job.id, job.version, { type: "DOCS_IDLE" }, 1_012);
+  job = store.applyJobEvent(job.id, job.version, { type: "PR_HEAD_RESOLVED", headSha: sha() }, 1_013);
+  job = store.applyJobEvent(job.id, job.version, { type: "VALIDATION_PASSED", headSha: sha() }, 1_014);
+  return { job, effect: effect(store, job.id, "spawn_final_review") };
+}
+
+function registerWorkerConfiguration() {
+  const value = fixture();
+  registerControllerTools(value.bb, {
+    store: value.store,
+    sdk: value.bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+  return value;
+}
+
+function createStage(
+  store: TelegramAgentStore,
+  input: { jobId: string; effectKey: string; role: "PLAN" | "CRITIQUE" | "DOCS"; threadId?: string },
+) {
+  const lease = store.acquireExecutorLease("stage-writer", 2_000, 30_000);
+  if (!lease.acquired) throw new Error("stage writer lease was not acquired");
+  const attempt = store.createPipelineStageAttempt({
+    id: `stage:${input.effectKey}`,
+    jobId: input.jobId,
+    role: input.role,
+    ordinal: 1,
+    inputSha256: "a".repeat(64),
+    ownerId: "stage-writer",
+    generation: lease.generation,
+    now: 2_001,
+  });
+  if (input.threadId) {
+    expect(store.bindPipelineStageThread({
+      id: attempt.id,
+      threadId: input.threadId,
+      environmentId: "env_worker",
+      ownerId: "stage-writer",
+      generation: lease.generation,
+      now: 2_002,
+    })).toBe(true);
+  }
+  expect(store.releaseExecutorLease("stage-writer", lease.generation, 2_003)).toBe(true);
+  return attempt;
+}
+
+it("atomically creates one queued controller job with one confirmed admission", () => {
   const { store } = fixture();
 
   const job = store.createConfirmedControllerJob({
@@ -121,10 +287,14 @@ it("atomically creates one confirmed controller job through the existing state m
     now: 10_000,
   });
 
-  expect(job).toMatchObject({ state: "planning", projectId: "proj_1", policyVersion: 1 });
+  expect(job).toMatchObject({ state: "awaiting_confirmation", projectId: "proj_1", policyVersion: 1 });
+  expect(store.getAdmission(job.id)).toMatchObject({
+    projectId: "proj_1",
+    state: "queued",
+    resumeEvent: "CONFIRMED",
+  });
   expect(store.listEffectsForJob(job.id).map((effect) => effect.kind)).toEqual([
     "render_status",
-    "spawn_plan",
   ]);
   expect(store.createConfirmedControllerJob({
     controllerThreadId: "thr_controller",
@@ -134,7 +304,7 @@ it("atomically creates one confirmed controller job through the existing state m
   })).toEqual(job);
 });
 
-it("rejects unmapped controllers, disabled projects, and a second active job without partial writes", () => {
+it("rejects unmapped controllers and disabled projects while allowing another queued job", () => {
   const { bb, store } = fixture();
   expect(() => store.createConfirmedControllerJob({
     controllerThreadId: "thr_unrelated",
@@ -152,15 +322,18 @@ it("rejects unmapped controllers, disabled projects, and a second active job wit
   })).toThrow(/enabled|project/i);
   expect(bb.storage.database().prepare("SELECT COUNT(*) AS count FROM jobs").get()).toEqual({ count: 0 });
 
-  store.createJob({ id: "existing", sourceUpdateId: 900, requestText: "existing", now: 10_000 });
-  expect(() => store.createConfirmedControllerJob({
+  const existing = store.createJob({ id: "existing", sourceUpdateId: 900, requestText: "existing", now: 10_000 });
+  const created = store.createConfirmedControllerJob({
     controllerThreadId: "thr_controller",
     projectId: "proj_1",
     task: "new work",
     now: 10_000,
-  })).toThrow(ActiveJobConflictError);
-  expect(bb.storage.database().prepare("SELECT COUNT(*) AS count FROM jobs").get()).toEqual({ count: 1 });
-  expect(bb.storage.database().prepare("SELECT COUNT(*) AS count FROM effects").get()).toEqual({ count: 0 });
+  });
+  expect(created.id).not.toBe(existing.id);
+  expect(created.state).toBe("awaiting_confirmation");
+  expect(store.getAdmission(created.id)).toMatchObject({ state: "queued" });
+  expect(bb.storage.database().prepare("SELECT COUNT(*) AS count FROM jobs").get()).toEqual({ count: 2 });
+  expect(bb.storage.database().prepare("SELECT COUNT(*) AS count FROM effects").get()).toEqual({ count: 1 });
 });
 
 it("registers the exact controller tools and keeps them off unrelated sessions", async () => {
@@ -213,6 +386,8 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   };
   const selected = await harness.behavior.resolveAgentConfiguration(context);
   expect(selected.tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  expect(selected.skills).toEqual([]);
+  expect(selected.instructions).toContain("You are the owner's teammate");
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
     thread: { ...context.thread, title: "Telegram Codex controller owner-7-controller" },
@@ -295,7 +470,235 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     { projectId: "proj_1", task: "Fix the redirect and add a regression test" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   );
-  expect(started).toContain("planning");
+  expect(started).toContain("awaiting_confirmation");
+  const startedJob = store.listJobs(10).find((job) => job.requestText === "Fix the redirect and add a regression test");
+  expect(startedJob).toBeDefined();
+  expect(store.getAdmission(startedJob!.id)).toMatchObject({ state: "queued" });
+  expect(notify).toHaveBeenCalledOnce();
+});
+
+it("routes verified implementation attempts through their exact durable effect before and after thread persistence", async () => {
+  const { bb, harness, store } = registerWorkerConfiguration();
+  const { job, effect: implementationEffect } = advanceToImplementation(store, "job_implementation");
+  const attemptId = `attempt:${implementationEffect.idempotencyKey}`;
+  store.createAttempt({ id: attemptId, jobId: job.id, kind: "implementation", ordinal: 1, now: 1_006 });
+  const identity = { jobId: job.id, attemptId, role: "implementation" as const };
+
+  const firstStart = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity));
+  expect(firstStart).toMatchObject({
+    tools: [],
+    skills: [
+      "systematic-debugging",
+      "test-driven-development",
+      "verification-before-completion",
+      "clean-code-guard",
+      "test-guard",
+      "pr-writer",
+    ],
+  });
+  expect(firstStart.instructions).toContain("Verified worker role: implementation");
+
+  const implementationCreated = store.applyJobEvent(job.id, job.version, {
+    type: "IMPLEMENTATION_CREATED", threadId: "thr_implementation", environmentId: "env_worker",
+  }, 1_007);
+  const lease = store.acquireExecutorLease("attempt-writer", 1_008, 30_000);
+  if (!lease.acquired) throw new Error("attempt writer lease was not acquired");
+  expect(store.updateExecutorAttempt({
+    attemptId,
+    jobId: implementationCreated.id,
+    patch: { threadId: "thr_implementation" },
+    ownerId: "attempt-writer",
+    generation: lease.generation,
+    now: 1_009,
+  })).toMatchObject({ threadId: "thr_implementation" });
+  expect(store.releaseExecutorLease("attempt-writer", lease.generation, 1_010)).toBe(true);
+
+  const resumed = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity, {
+    thread: { id: "thr_implementation", title: buildWorkerThreadTitle(identity), parentThreadId: null, sourceThreadId: null },
+  }));
+  expect(resumed).toMatchObject({ tools: [], skills: firstStart.skills, instructions: firstStart.instructions });
+
+  const wrongEnvironment = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity, {
+    thread: { id: "thr_implementation", title: buildWorkerThreadTitle(identity), parentThreadId: null, sourceThreadId: null },
+    environment: {
+      id: "env_other",
+      name: "other worker",
+      path: "/workspace/other",
+      workspaceProvisionType: "managed-worktree",
+      branchName: "agent/other",
+    },
+  }));
+  expect(wrongEnvironment).toMatchObject({ tools: [], skills: [] });
+  expect(wrongEnvironment.instructions).toBeNull();
+});
+
+it("routes review variants and pipeline stages only when their stored role and effect kind exactly agree", async () => {
+  const { bb, harness, store } = registerWorkerConfiguration();
+  const implementation = advanceToImplementation(store, "job_roles");
+  const planEffect = effect(store, implementation.job.id, "spawn_plan");
+  const critiqueEffect = effect(store, implementation.job.id, "spawn_critique");
+  createStage(store, { jobId: implementation.job.id, effectKey: planEffect.idempotencyKey, role: "PLAN", threadId: "thr_plan" });
+  createStage(store, { jobId: implementation.job.id, effectKey: critiqueEffect.idempotencyKey, role: "CRITIQUE" });
+  const review = advanceImplementationToReview(store, implementation.job);
+  const reviewId = `attempt:${review.effect.idempotencyKey}`;
+  store.createAttempt({ id: reviewId, jobId: review.job.id, kind: "review", ordinal: 1, headSha: sha(), now: 2_100 });
+  const docs = advanceReviewToDocs(store, review.job);
+  createStage(store, { jobId: docs.job.id, effectKey: docs.effect.idempotencyKey, role: "DOCS" });
+  const finalReview = advanceDocsToFinalReview(store, docs.job);
+  const finalReviewId = `attempt:${finalReview.effect.idempotencyKey}`;
+  store.createAttempt({ id: finalReviewId, jobId: finalReview.job.id, kind: "review", ordinal: 2, headSha: sha(), now: 2_101 });
+
+  const cases = [
+    [{ jobId: review.job.id, attemptId: reviewId, role: "review" as const }, undefined, ["clean-code-guard", "test-guard"]],
+    [{ jobId: finalReview.job.id, attemptId: finalReviewId, role: "final-review" as const }, undefined, ["clean-code-guard", "test-guard", "docs-guard"]],
+    [{ jobId: implementation.job.id, attemptId: `stage:${planEffect.idempotencyKey}`, role: "planner" as const }, "thr_plan", []],
+    [{ jobId: implementation.job.id, attemptId: `stage:${critiqueEffect.idempotencyKey}`, role: "critic" as const }, undefined, []],
+    [{ jobId: docs.job.id, attemptId: `stage:${docs.effect.idempotencyKey}`, role: "documentation" as const }, undefined, ["docs-guard", "verification-before-completion"]],
+  ] as const;
+  for (const [identity, threadId, skills] of cases) {
+    const configuration = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity, threadId === undefined ? {} : {
+      thread: { id: threadId, title: buildWorkerThreadTitle(identity), parentThreadId: null, sourceThreadId: null },
+    }));
+    expect(configuration).toMatchObject({ tools: [], skills });
+    expect(configuration.instructions).toContain(`Verified worker role: ${identity.role}`);
+  }
+
+  const swappedReviewTitles = [
+    { jobId: review.job.id, attemptId: reviewId, role: "final-review" as const },
+    { jobId: finalReview.job.id, attemptId: finalReviewId, role: "review" as const },
+  ];
+  for (const identity of swappedReviewTitles) {
+    const configuration = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity));
+    expect(configuration).toMatchObject({ tools: [], skills: [] });
+    expect(configuration.instructions).toBeNull();
+  }
+});
+
+it("fails closed for forged durable worker and controller identities", async () => {
+  const { bb, harness, store } = registerWorkerConfiguration();
+  const implementation = advanceToImplementation(store, "job_guard");
+  const implementationId = `attempt:${implementation.effect.idempotencyKey}`;
+  store.createAttempt({ id: implementationId, jobId: implementation.job.id, kind: "implementation", ordinal: 1, now: 3_000 });
+  const identity = { jobId: implementation.job.id, attemptId: implementationId, role: "implementation" as const };
+  const review = advanceImplementationToReview(store, implementation.job);
+  const wrongEffectId = `attempt:${review.effect.idempotencyKey}`;
+  store.createAttempt({ id: wrongEffectId, jobId: review.job.id, kind: "implementation", ordinal: 2, now: 3_001 });
+  const wrongStage = createStage(store, { jobId: implementation.job.id, effectKey: implementation.effect.idempotencyKey, role: "CRITIQUE" });
+  const lease = store.acquireExecutorLease("guard-writer", 3_002, 30_000);
+  if (!lease.acquired) throw new Error("guard writer lease was not acquired");
+  expect(store.updateExecutorAttempt({
+    attemptId: implementationId,
+    jobId: implementation.job.id,
+    patch: { threadId: "thr_bound" },
+    ownerId: "guard-writer",
+    generation: lease.generation,
+    now: 3_003,
+  })).not.toBeNull();
+  expect(store.releaseExecutorLease("guard-writer", lease.generation, 3_004)).toBe(true);
+
+  const forged = [
+    workerContext(bb.pluginId, { ...identity, role: "review" }),
+    workerContext(bb.pluginId, { jobId: review.job.id, attemptId: wrongEffectId, role: "implementation" }),
+    workerContext(bb.pluginId, { jobId: implementation.job.id, attemptId: wrongStage.id, role: "planner" }),
+    workerContext(bb.pluginId, { ...identity, attemptId: "attempt:missing:1:spawn_implementation" }),
+    workerContext(bb.pluginId, { ...identity, jobId: "job_other" }),
+    workerContext(bb.pluginId, identity, {
+      thread: { id: "thr_other", title: buildWorkerThreadTitle(identity), parentThreadId: null, sourceThreadId: null },
+    }),
+    workerContext(bb.pluginId, identity, { project: { id: "proj_other", kind: "standard", name: "Other", gitRemoteUrl: null } }),
+    workerContext(bb.pluginId, identity, { environment: { id: "env_worker", name: "worker", path: "/workspace/worker", workspaceProvisionType: "unmanaged", branchName: null } }),
+    workerContext("other-plugin", identity),
+    workerContext(bb.pluginId, identity, { origin: { kind: "fork", pluginId: bb.pluginId } }),
+  ];
+  for (const context of forged) {
+    const configuration = await harness.behavior.resolveAgentConfiguration(context);
+    expect(configuration).toMatchObject({ tools: [], skills: [] });
+    expect(configuration.instructions).toBeNull();
+  }
+
+  const spoofedController = workerContext(bb.pluginId, identity, {
+    thread: { id: "thr_controller", title: buildWorkerThreadTitle(identity), parentThreadId: null, sourceThreadId: null },
+    project: { id: "proj_personal", kind: "personal", name: "Personal", gitRemoteUrl: null },
+    environment: { id: "env_personal", name: null, path: "/private/path", workspaceProvisionType: "personal", branchName: null },
+    host: { id: "host_personal", name: "Host" },
+  });
+  const configuration = await harness.behavior.resolveAgentConfiguration(spoofedController);
+  expect(configuration).toMatchObject({ tools: [], skills: [] });
+  expect(configuration.instructions).toBeNull();
+});
+
+it("returns bounded choices for ambiguous status, retry, and cancel without mutation", async () => {
+  const { bb, harness, store, turn } = fixture();
+  const notify = vi.fn();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify,
+    now: () => 10_100,
+  });
+  expect(parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    {},
+    controllerToolContext,
+  ))).toEqual({ outcome: "none", candidates: [] });
+  queueControllerCandidate(store, "controller_job_a", "proj_a", "failed");
+  expect(parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    {},
+    controllerToolContext,
+  ))).toMatchObject({ job: { id: "controller_job_a", projectId: "proj_a", state: "failed" } });
+  queueControllerCandidate(store, "controller_job_b", "proj_b", "failed");
+
+  const expected = {
+    outcome: "choose_job",
+    candidates: [
+      { id: "controller_job_a", projectId: "proj_a", state: "failed" },
+      { id: "controller_job_b", projectId: "proj_b", state: "failed" },
+    ],
+  };
+  const before = store.listJobs(10).map(({ id, state, version, cancelRequestedAt }) => ({
+    id,
+    state,
+    version,
+    cancelRequestedAt,
+  }));
+
+  expect(parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    {},
+    controllerToolContext,
+  ))).toEqual(expected);
+  expect(parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_retry_job",
+    {},
+    controllerToolContext,
+  ))).toEqual(expected);
+  expect(parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_cancel_job",
+    {},
+    controllerToolContext,
+  ))).toEqual(expected);
+  expect(store.listJobs(10).map(({ id, state, version, cancelRequestedAt }) => ({
+    id,
+    state,
+    version,
+    cancelRequestedAt,
+  }))).toEqual(before);
+  expect(notify).not.toHaveBeenCalled();
+
+  expect(store.listToolReceipts(turn.id)).toEqual([
+    expect.objectContaining({ toolName: "telegram_agent_cancel_job", state: "completed" }),
+    expect.objectContaining({ toolName: "telegram_agent_retry_job", state: "completed" }),
+  ]);
+
+  expect(parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_retry_job",
+    { jobId: "controller_job_a" },
+    controllerToolContext,
+  ))).toMatchObject({ job: { id: "controller_job_a", state: "planning" } });
+  expect(store.getJob("controller_job_b")?.state).toBe("failed");
   expect(notify).toHaveBeenCalledOnce();
 });
 
@@ -429,4 +832,134 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     { threadId: "thr_hidden", text: "leak" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   )).rejects.toThrow(/not visible/i);
+});
+
+function delegationProjects() {
+  return ["proj_a", "proj_b"].map((id) => ({
+    id,
+    kind: "standard" as const,
+    name: id,
+    gitRemoteUrl: `https://github.com/acme/${id}.git`,
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [{
+      id: `src_${id}`,
+      projectId: id,
+      isDefault: true,
+      createdAt: 1,
+      updatedAt: 1,
+      type: "local_path" as const,
+      hostId: `host_${id}`,
+      path: `/work/${id}`,
+    }],
+  }));
+}
+
+it("fans work out to one thread per task and records them against one delegation", async () => {
+  const { bb, harness, store } = fixture();
+  const spawned: string[] = [];
+  harness.sdk.stub("projects.list", async () => delegationProjects());
+  harness.sdk.stub("threads.spawn", async ({ title }: { title: string }) => {
+    spawned.push(title);
+    return { id: `thr_${spawned.length}`, environmentId: "env_worker" };
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const result = parseToolJson(await harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "tell me which of the two is worse",
+    tasks: [
+      { projectId: "proj_a", title: "invoice spike", prompt: "look into the invoice spike" },
+      { projectId: "proj_b", title: "billing latency", prompt: "look into billing latency" },
+    ],
+  }, controllerToolContext)) as { outcome: string; delegation: { id: string; threads: unknown[] } };
+
+  expect(result.outcome).toBe("delegated");
+  expect(spawned).toEqual(["invoice spike", "billing latency"]);
+  expect(store.getDelegation(result.delegation.id)).toMatchObject({
+    state: "open",
+    instruction: "tell me which of the two is worse",
+    threads: [
+      { threadId: "thr_1", projectId: "proj_a", title: "invoice spike", state: "running" },
+      { threadId: "thr_2", projectId: "proj_b", title: "billing latency", state: "running" },
+    ],
+  });
+});
+
+it("keeps the threads that did start when a later spawn fails", async () => {
+  const { bb, harness, store } = fixture();
+  let spawnCount = 0;
+  harness.sdk.stub("projects.list", async () => delegationProjects());
+  harness.sdk.stub("threads.spawn", async () => {
+    spawnCount += 1;
+    if (spawnCount === 2) throw new Error("BB refused the second spawn");
+    return { id: `thr_${spawnCount}`, environmentId: "env_worker" };
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const result = parseToolJson(await harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "compare them",
+    tasks: [
+      { projectId: "proj_a", title: "first", prompt: "first task" },
+      { projectId: "proj_b", title: "second", prompt: "second task" },
+    ],
+  }, controllerToolContext)) as { outcome: string; delegation: { id: string }; failed: { title: string } };
+
+  expect(result.outcome).toBe("partial");
+  expect(result.failed.title).toBe("second");
+  expect(store.getDelegation(result.delegation.id)).toMatchObject({
+    state: "open",
+    threads: [{ threadId: "thr_1", title: "first", state: "running" }],
+  });
+});
+
+it("opens no delegation when the very first spawn fails", async () => {
+  const { bb, harness, store } = fixture();
+  harness.sdk.stub("threads.spawn", async () => { throw new Error("BB refused the spawn"); });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "compare them",
+    tasks: [{ projectId: "proj_a", title: "only", prompt: "only task" }],
+  }, controllerToolContext)).rejects.toThrow();
+
+  expect(store.listOpenDelegations(10)).toEqual([]);
+});
+
+it("refuses to delegate for a thread that is not the durable controller", async () => {
+  const { bb, harness, store } = fixture();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "compare them",
+    tasks: [{ projectId: "proj_a", title: "only", prompt: "only task" }],
+  }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/not authorized/);
+  expect(store.listOpenDelegations(10)).toEqual([]);
 });

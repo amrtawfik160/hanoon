@@ -1,5 +1,7 @@
 import { z } from "zod";
+import { DEFAULT_MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "./autonomy/models";
 import {
+  EXTRACTION_MODELS,
   CONTROLLER_MODELS,
   CONTROLLER_PERMISSION_MODES,
   CONTROLLER_REASONING_LEVELS,
@@ -8,10 +10,16 @@ import {
   type ControllerExecutionProfile,
 } from "./controller/execution-profile";
 
+const MAX_CONCURRENT_JOB_VALUES = ["1", "2", "3", "4", "5", "6", "7", "8"] as const;
+const maxConcurrentJobsSchema = z.preprocess(
+  (value) => value === undefined ? String(DEFAULT_MAX_CONCURRENT_JOBS) : value,
+  z.enum(MAX_CONCURRENT_JOB_VALUES).transform((value) => Number(value) as MaxConcurrentJobs),
+);
+
 const globalConfigSchema = z.object({
   botToken: z.string().min(1),
   bbAppBaseUrl: z.union([z.literal(""), z.string().url()]),
-  pollTimeoutSeconds: z.coerce.number().int().min(5).max(50),
+  maxConcurrentJobs: maxConcurrentJobsSchema,
   controllerModel: z.enum(CONTROLLER_MODELS).default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.model),
   controllerReasoningLevel: z.enum(CONTROLLER_REASONING_LEVELS)
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.reasoningLevel),
@@ -19,6 +27,8 @@ const globalConfigSchema = z.object({
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier),
   controllerPermissionMode: z.enum(CONTROLLER_PERMISSION_MODES)
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode),
+  extractionModel: z.enum(EXTRACTION_MODELS).default("inherit"),
+  systemUpkeep: z.enum(["enabled", "disabled"]).default("enabled"),
 });
 
 export type GlobalConfig = z.infer<typeof globalConfigSchema>;
@@ -29,11 +39,13 @@ export type GlobalConfigResult =
 export function parseGlobalConfig(values: {
   botToken?: string;
   bbAppBaseUrl: string;
-  pollTimeoutSeconds: string;
+  maxConcurrentJobs?: string;
   controllerModel?: string;
   controllerReasoningLevel?: string;
   controllerServiceTier?: string;
   controllerPermissionMode?: string;
+  extractionModel?: string;
+  systemUpkeep?: string;
 }): GlobalConfigResult {
   if (!values.botToken) {
     return {
@@ -47,8 +59,20 @@ export function parseGlobalConfig(values: {
     ? { ok: true, value: parsed.data }
     : {
         ok: false,
-        message: "Fix the Telegram Agent URL, polling timeout, or controller execution settings.",
+        message: "Fix the Telegram Agent URL or controller execution settings.",
       };
+}
+
+/** `inherit` leaves the model to the project default, which is the only safe
+ *  answer when we cannot know which providers this installation has. */
+export function extractionModel(config: GlobalConfig): string | null {
+  return config.extractionModel === "inherit" ? null : config.extractionModel;
+}
+
+/** The agent's own daily and weekly upkeep. Owners who do not want unprompted
+ *  messages can turn it off without losing anything they set themselves. */
+export function systemUpkeepEnabled(config: GlobalConfig): boolean {
+  return config.systemUpkeep === "enabled";
 }
 
 export function controllerExecutionProfile(config: GlobalConfig): ControllerExecutionProfile {

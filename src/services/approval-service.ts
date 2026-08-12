@@ -7,6 +7,7 @@ import type {
   ApprovalIdentity,
   ApprovalRecord,
   ApprovalState,
+  ExecutorFence,
   TelegramAgentStore,
 } from "../storage/store";
 
@@ -54,30 +55,29 @@ export class ApprovalService {
     this.randomBytes = options.randomBytes ?? nodeRandomBytes;
   }
 
-  public issue(jobId: string, headSha: string, now = this.clock()): IssuedApproval {
-    assertNow(now);
-    assertHead(headSha);
-    const job = this.store.getJob(jobId);
-    if (!job) throw new Error(`Job ${jobId} was not found`);
-    if (job.state !== "awaiting_merge_approval" || job.prHeadSha !== headSha || job.cancelRequestedAt !== null) {
-      throw new Error("Approval can only be issued for the current uncancelled merge head");
-    }
-    const owner = this.store.getOwner();
-    if (!owner) throw new Error("Telegram approval requires a paired owner");
-
-    const value = nonce(this.randomBytes);
-    const expiresAt = now + APPROVAL_TTL_MS;
-    this.store.createApproval({
-      nonceHash: hashSecret(value),
+  public issue(jobId: string, headSha: string, now = this.clock(), fence?: ExecutorFence): IssuedApproval {
+    const prepared = this.prepareIssue(jobId, headSha, now);
+    const input = {
+      nonceHash: hashSecret(prepared.value),
       jobId,
       headSha,
-      expiresAt,
+      expiresAt: prepared.expiresAt,
       now,
-      ownerUserId: owner.userId,
-      ownerChatId: owner.chatId,
-      jobVersion: job.version,
-    });
-    return { nonce: value, jobId, headSha, jobVersion: job.version, expiresAt };
+      ownerUserId: prepared.owner.userId,
+      ownerChatId: prepared.owner.chatId,
+      jobVersion: prepared.job.version,
+    };
+    if (fence) {
+      const created = this.store.createExecutorApproval({ ...input, ...fence });
+      if (!created) throw new Error("executor lease was lost before approval issuance");
+    } else {
+      this.store.createApproval(input);
+    }
+    return { nonce: prepared.value, jobId, headSha, jobVersion: prepared.job.version, expiresAt: prepared.expiresAt };
+  }
+
+  public issueExecutor(jobId: string, headSha: string, fence: ExecutorFence): IssuedApproval {
+    return this.issue(jobId, headSha, fence.now, fence);
   }
 
   public get(nonceValue: string, now = this.clock()): ApprovalRecord | null {
@@ -118,6 +118,25 @@ export class ApprovalService {
   public revoke(jobId: string, reason: string, now = this.clock()): number {
     assertNow(now);
     return this.store.revokeApprovals(jobId, reason, now);
+  }
+
+  private prepareIssue(jobId: string, headSha: string, now: number): {
+    job: NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
+    owner: NonNullable<ReturnType<TelegramAgentStore["getOwner"]>>;
+    value: string;
+    expiresAt: number;
+  } {
+    assertNow(now);
+    assertHead(headSha);
+    const job = this.store.getJob(jobId);
+    if (!job) throw new Error(`Job ${jobId} was not found`);
+    if (job.state !== "awaiting_merge_approval" || job.prHeadSha !== headSha || job.cancelRequestedAt !== null) {
+      throw new Error("Approval can only be issued for the current uncancelled merge head");
+    }
+    const owner = this.store.getOwner();
+    if (!owner) throw new Error("Telegram approval requires a paired owner");
+    const value = nonce(this.randomBytes);
+    return { job, owner, value, expiresAt: now + APPROVAL_TTL_MS };
   }
 }
 

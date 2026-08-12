@@ -1,9 +1,10 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
-import type { JobEffect } from "../src/domain/models";
+import type { JobEffect, StoredEffect } from "../src/domain/models";
+import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
-import { policyFixture } from "./helpers";
+import { admitConfirmedJob, policyFixture } from "./helpers";
 import {
   EffectRunner,
   PermanentEffectError,
@@ -33,13 +34,197 @@ function addJobEffect(store: TelegramAgentStore, db: Database.Database, effect: 
   ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload), 1_000, 1_000, 1_000);
 }
 
+function addProductionAdmissionAndClaims(
+  db: Database.Database,
+  jobId: string,
+  policy: ReturnType<typeof policyFixture>,
+  ownerId: string,
+  generation: number,
+  now: number,
+  leaseExpiresAt: number,
+): void {
+  db.prepare(
+    `INSERT INTO job_admissions (
+       job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
+     ) VALUES (?, ?, 1, 'admitted', 'CONFIRMED', ?, ?)`,
+  ).run(jobId, policy.projectId, now, now + 1);
+  const insertClaim = db.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at
+     ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
+  );
+  insertClaim.run(jobId, projectResourceKey(policy.projectId), "project", ownerId, generation, leaseExpiresAt, now, now);
+  insertClaim.run(jobId, productionResourceKey(policy), "production_target", ownerId, generation, leaseExpiresAt, now, now);
+}
+
 function fence(store: TelegramAgentStore, now = 1_000): { ownerId: string; generation: number } {
   const lease = store.acquireExecutorLease("owner-a", now, 100);
   if (!lease.acquired) throw new Error("lease was not acquired");
   return { ownerId: "owner-a", generation: lease.generation };
 }
 
+type LegacyLeaseStore = TelegramAgentStore & {
+  leaseEffects(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredEffect[];
+};
+
+function leaseEffectsForTest(
+  store: TelegramAgentStore,
+  ownerId: string,
+  generation: number,
+  now: number,
+  limit: number,
+  leaseMs: number,
+): StoredEffect[] {
+  return (store as LegacyLeaseStore).leaseEffects(ownerId, generation, now, limit, leaseMs);
+}
+
+function selectedJobForRecovery(
+  store: TelegramAgentStore,
+  db: Database.Database,
+  id: string,
+  state: "planning" | "creating_implementation",
+): ReturnType<TelegramAgentStore["getJob"]> {
+  const job = store.createJob({ id, sourceUpdateId: 1, requestText: "work", now: 1_000 });
+  db.prepare(
+    `UPDATE jobs SET state = ?, project_id = 'proj_1', policy_version = 1, policy_json = ?, version = 2 WHERE id = ?`,
+  ).run(state, JSON.stringify(policyFixture()), job.id);
+  return store.getJob(job.id);
+}
+
+function addPendingEffectForRecovery(db: Database.Database, effect: JobEffect): void {
+  db.prepare(
+    `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+  ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+}
+
 describe("leased effect execution", () => {
+  it("recovers an ordinary implementation thread by the centralized title bytes", async () => {
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_ordinary_recovery", "creating_implementation");
+    if (!job) throw new Error("job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("ordinary spawn effect missing");
+    const title = "Telegram job_ordinary_recovery implementation attempt:job_ordinary_recovery:2:spawn_implementation";
+    const decoyTitle = "Telegram job_ordinary_recovery implementation attempt:job_ordinary_recovery:2:spawn_implementation:decoy";
+    const spawnImplementation = vi.fn(async () => ({ id: "thr_spawned_ordinary", environmentId: "env_spawned" }));
+    const listThreads = vi.fn(async () => ({
+      threads: [{
+        id: "thr_wrong_ordinary",
+        projectId: "proj_1",
+        environmentId: "env_ordinary",
+        parentThreadId: null,
+        title: decoyTitle,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }, {
+        id: "thr_recovered_ordinary",
+        projectId: "proj_1",
+        environmentId: "env_ordinary",
+        parentThreadId: null,
+        title,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }],
+      total: 1,
+    }));
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: { listThreads, spawnImplementation },
+      now: () => 1_002,
+    }).run(claimed);
+
+    expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ projectId: "proj_1" }));
+    expect(spawnImplementation).not.toHaveBeenCalled();
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "implementing",
+      implementationThreadId: "thr_recovered_ordinary",
+      environmentId: "env_ordinary",
+    });
+  });
+
+  it("recovers a pipeline planner thread by the same centralized title bytes", async () => {
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_pipeline_recovery", "planning");
+    if (!job) throw new Error("job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_plan`,
+      jobId: job.id,
+      kind: "spawn_plan",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("pipeline spawn effect missing");
+    const title = "Telegram job_pipeline_recovery plan stage:job_pipeline_recovery:2:spawn_plan";
+    const decoyTitle = "Telegram job_pipeline_recovery plan stage:job_pipeline_recovery:2:spawn_plan:decoy";
+    const spawnPlanner = vi.fn(async () => ({ id: "thr_spawned_pipeline", environmentId: "env_spawned" }));
+    const listThreads = vi.fn(async () => ({
+      threads: [{
+        id: "thr_wrong_pipeline",
+        projectId: "proj_1",
+        environmentId: "env_pipeline",
+        parentThreadId: null,
+        title: decoyTitle,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }, {
+        id: "thr_recovered_pipeline",
+        projectId: "proj_1",
+        environmentId: "env_pipeline",
+        parentThreadId: null,
+        title,
+        status: "active",
+        updatedAt: 1_001,
+        runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
+      }],
+      total: 1,
+    }));
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: {
+        listThreads,
+        spawnPlanner,
+      },
+      now: () => 1_002,
+    }).run(claimed);
+
+    expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ projectId: "proj_1" }));
+    expect(spawnPlanner).not.toHaveBeenCalled();
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "planning",
+      environmentId: "env_pipeline",
+    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
+      id: `stage:${effect.idempotencyKey}`,
+      threadId: "thr_recovered_pipeline",
+      environmentId: "env_pipeline",
+    });
+  });
+
   it("allows exactly one executor generation to win a race", () => {
     const first = storeFixture();
     const one = first.store.acquireExecutorLease("one", 1_000, 30_000);
@@ -47,6 +232,27 @@ describe("leased effect execution", () => {
 
     expect(one).toEqual({ acquired: true, generation: 1 });
     expect(two).toEqual({ acquired: false });
+  });
+
+  it("refuses to execute an effect that is not durably leased", async () => {
+    const { store, db } = storeFixture();
+    const effect: JobEffect = {
+      idempotencyKey: "job_1:2:render_status",
+      jobId: "job_1",
+      kind: "render_status",
+      payload: {},
+    };
+    addJobEffect(store, db, effect);
+    const executor = fence(store);
+    const pending = store.getEffect(effect.jobId, effect.idempotencyKey);
+    if (!pending) throw new Error("pending effect missing");
+
+    await expect(new EffectRunner({
+      store,
+      fence: { ...executor, signal: new AbortController().signal },
+      now: () => 1_000,
+    }).run(pending)).rejects.toThrow(/effect lease was lost/i);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM outbox").get()).toEqual({ count: 0 });
   });
 
   it("fences an expired owner before a successor can mutate a claimed effect", () => {
@@ -59,12 +265,12 @@ describe("leased effect execution", () => {
     };
     addJobEffect(store, db, effect);
     const first = fence(store);
-    const claimed = store.leaseEffects(first.ownerId, first.generation, 1_000, 1, 100);
+    const claimed = leaseEffectsForTest(store, first.ownerId, first.generation, 1_000, 1, 100);
     expect(claimed).toHaveLength(1);
     expect(store.acquireExecutorLease("owner-b", 1_101, 100)).toEqual({ acquired: true, generation: 2 });
     expect(store.renewExecutorLease(first.ownerId, first.generation, 1_102, 100)).toBe(false);
     expect(store.completeEffect(effect.idempotencyKey, first.ownerId, first.generation, 1_102)).toBe(false);
-    expect(store.leaseEffects("owner-b", 2, 1_102, 1, 100)[0]).toMatchObject({
+    expect(leaseEffectsForTest(store, "owner-b", 2, 1_102, 1, 100)[0]).toMatchObject({
       idempotencyKey: effect.idempotencyKey,
       attempts: 2,
       leaseOwner: "owner-b",
@@ -84,6 +290,7 @@ describe("leased effect execution", () => {
     ["verifying_production", "verify_production", "canary", "CANARY", "complete"],
   ] as const)("persists terminal-bound production receipts for %s before advancing", async (state, kind, phase, role, nextState) => {
     const { store, db } = storeFixture();
+    const policy = policyFixture();
     const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
     db.prepare(
       `UPDATE jobs SET state = ?, project_id = 'proj_1', policy_version = 1, policy_json = ?,
@@ -92,7 +299,7 @@ describe("leased effect execution", () => {
          deployment_summary = ?, version = 2 WHERE id = ?`,
     ).run(
       state,
-      JSON.stringify(policyFixture()),
+      JSON.stringify(policy),
       "a".repeat(40),
       "d".repeat(40),
       phase === "canary" ? "Production deploy passed" : null,
@@ -108,9 +315,10 @@ describe("leased effect execution", () => {
       `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
        VALUES (?, ?, ?, '{}', 'pending', 0, 1000, 1000, 1000)`,
     ).run(effect.idempotencyKey, effect.jobId, effect.kind);
+    addProductionAdmissionAndClaims(db, job.id, policy, "owner-a", 1, 1_000, 31_000);
     const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
     if (!lease.acquired) throw new Error("lease missing");
-    const claimed = store.leaseEffects("owner-a", lease.generation, 1_001, 10, 30_000)
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
       .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("production effect missing");
     const runStage = vi.fn(async (_job, _effect, calledPhase, _signal, observe) => {
@@ -150,14 +358,86 @@ describe("leased effect execution", () => {
     expect(store.getWorkerLiveness(job.id)).toMatchObject({ workerKind: phase === "deploy" ? "deploy" : "canary" });
   });
 
+  it("blocks production execution before any stage attempt or provider call after target claim loss", async () => {
+    const { store, db } = storeFixture();
+    const policy = policyFixture({
+      projectId: "proj_production_gate",
+      githubRepository: "acme/production-gate",
+      production: {
+        ...policyFixture().production!,
+        targetKey: "production-gate",
+      },
+    });
+    const job = store.createJob({ id: "job_production_gate", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = 'deploying', project_id = ?, policy_version = 1, policy_json = ?,
+         environment_id = 'env_1', pr_number = 7, pr_head_sha = ?, merge_message = 'Merged',
+         merge_commit_sha = ?, merged_at = '2026-08-10T00:00:00.000Z', version = 3 WHERE id = ?`,
+    ).run(policy.projectId, JSON.stringify(policy), "a".repeat(40), "d".repeat(40), job.id);
+    db.prepare(
+      `INSERT INTO job_admissions (
+         job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
+       ) VALUES (?, ?, 1, 'admitted', 'CONFIRMED', 1000, 1001)`,
+    ).run(job.id, policy.projectId);
+    const insertClaim = db.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, ?, ?, 'held', 'owner-a', ?, ?, 1000, 1000)`,
+    );
+    insertClaim.run(job.id, projectResourceKey(policy.projectId), "project", 1, 31_000);
+    insertClaim.run(job.id, productionResourceKey(policy), "production_target", 1, 31_000);
+    const effect: JobEffect = {
+      idempotencyKey: "job_production_gate:3:deploy_production",
+      jobId: job.id,
+      kind: "deploy_production",
+      payload: {},
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, '{}', 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const claimed = store.leaseNextJobEffect({
+      jobId: job.id,
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_001,
+      leaseMs: 30_000,
+    });
+    if (!claimed) throw new Error("production effect missing");
+    db.prepare(
+      `UPDATE job_resource_claims SET state = 'released', lease_expires_at = 0,
+         released_at = 1002, release_reason = 'test_lost_production_claim'
+       WHERE job_id = ? AND resource_kind = 'production_target'`,
+    ).run(job.id);
+    const runStage = vi.fn();
+
+    await expect(new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      runProductionStage: runStage,
+    }).run(claimed)).rejects.toThrow();
+
+    expect(runStage).not.toHaveBeenCalled();
+    expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toBeNull();
+    expect(store.getJob(job.id)).toMatchObject({ state: "deploying", version: 3 });
+    expect(db.prepare(
+      "SELECT status, attempts FROM effects WHERE idempotency_key = ?",
+    ).get(effect.idempotencyKey)).toEqual({ status: "leased", attempts: 1 });
+  });
+
   it("fails closed without repeating a production command after executor interruption", async () => {
     const { store, db } = storeFixture();
+    const policy = policyFixture();
     const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
     db.prepare(
       `UPDATE jobs SET state = 'deploying', project_id = 'proj_1', policy_version = 1, policy_json = ?,
          environment_id = 'env_1', pr_number = 7, pr_head_sha = ?, merge_message = 'Merged PR #7',
          merge_commit_sha = ?, merged_at = '2026-08-10T00:00:00.000Z', version = 2 WHERE id = ?`,
-    ).run(JSON.stringify(policyFixture()), "a".repeat(40), "d".repeat(40), job.id);
+    ).run(JSON.stringify(policy), "a".repeat(40), "d".repeat(40), job.id);
     const effect: JobEffect = {
       idempotencyKey: "job_1:3:deploy_production",
       jobId: job.id,
@@ -168,10 +448,11 @@ describe("leased effect execution", () => {
       `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
        VALUES (?, ?, ?, '{}', 'pending', 0, 1000, 1000, 1000)`,
     ).run(effect.idempotencyKey, effect.jobId, effect.kind);
+    addProductionAdmissionAndClaims(db, job.id, policy, "owner-a", 1, 1_000, 31_000);
 
     const firstLease = store.acquireExecutorLease("owner-a", 1_001, 100);
     if (!firstLease.acquired) throw new Error("first lease missing");
-    const firstClaim = store.leaseEffects("owner-a", firstLease.generation, 1_001, 10, 100)[0];
+    const firstClaim = leaseEffectsForTest(store, "owner-a", firstLease.generation, 1_001, 10, 100)[0];
     if (!firstClaim) throw new Error("first claim missing");
     const firstRun = vi.fn(async (_job, _effect, _phase, _signal, observe) => {
       observe({ id: "term_uncertain", status: "running", updatedAt: 1_001 });
@@ -184,15 +465,22 @@ describe("leased effect execution", () => {
       runProductionStage: firstRun,
     }).run(firstClaim)).rejects.toThrow("executor disconnected");
 
-    const secondLease = store.acquireExecutorLease("owner-b", 1_102, 30_000);
+    const secondLease = store.acquireExecutorLease("owner-b", 31_002, 30_000);
     if (!secondLease.acquired) throw new Error("second lease missing");
-    const secondClaim = store.leaseEffects("owner-b", secondLease.generation, 1_102, 10, 30_000)[0];
+    expect(store.adoptHeldClaims({
+      jobId: job.id,
+      ownerId: "owner-b",
+      generation: secondLease.generation,
+      now: 31_002,
+      leaseMs: 30_000,
+    })).toBe(true);
+    const secondClaim = leaseEffectsForTest(store, "owner-b", secondLease.generation, 31_002, 10, 30_000)[0];
     if (!secondClaim) throw new Error("second claim missing");
     const repeatedRun = vi.fn();
     await new EffectRunner({
       store,
       fence: { ownerId: "owner-b", generation: secondLease.generation, signal: new AbortController().signal },
-      now: () => 1_102,
+      now: () => 31_002,
       runProductionStage: repeatedRun,
     }).run(secondClaim);
 
@@ -216,7 +504,7 @@ describe("leased effect execution", () => {
     addJobEffect(store, db, effect);
     const current = fence(store);
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const claimed = store.leaseEffects(current.ownerId, current.generation, 1_000 + attempt, 1, 100);
+      const claimed = leaseEffectsForTest(store, current.ownerId, current.generation, 1_000 + attempt, 1, 100);
       expect(claimed).toHaveLength(1);
       if (attempt === 19) {
         expect(store.failEffect(effect.idempotencyKey, current.ownerId, current.generation, "bounded failure", 1_020, 1_020)).toBe(true);
@@ -233,11 +521,13 @@ describe("leased effect execution", () => {
 
   it("turns a permanent post-merge effect failure into a production incident", () => {
     const { store, db } = storeFixture();
+    const policy = policyFixture();
     const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
     db.prepare(
-      `UPDATE jobs SET state = 'deploying', merge_message = 'Merged PR #7', merge_commit_sha = ?,
+      `UPDATE jobs SET state = 'deploying', project_id = ?, policy_version = 1, policy_json = ?,
+         environment_id = 'env_1', merge_message = 'Merged PR #7', merge_commit_sha = ?,
          merged_at = '2026-08-10T00:00:00.000Z', version = 2 WHERE id = ?`,
-    ).run("d".repeat(40), job.id);
+    ).run(policy.projectId, JSON.stringify(policy), "d".repeat(40), job.id);
     const effect: JobEffect = {
       idempotencyKey: "job_1:3:deploy_production",
       jobId: job.id,
@@ -248,8 +538,9 @@ describe("leased effect execution", () => {
       `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
        VALUES (?, ?, ?, '{}', 'pending', 0, 1000, 1000, 1000)`,
     ).run(effect.idempotencyKey, effect.jobId, effect.kind);
+    addProductionAdmissionAndClaims(db, job.id, policy, "owner-a", 1, 1_000, 31_000);
     const lease = fence(store);
-    const claimed = store.leaseEffects(lease.ownerId, lease.generation, 1_000, 1, 30_000)[0];
+    const claimed = leaseEffectsForTest(store, lease.ownerId, lease.generation, 1_000, 1, 30_000)[0];
     if (!claimed) throw new Error("production effect missing");
 
     expect(store.deadLetterEffect(claimed.idempotencyKey, lease.ownerId, lease.generation, "Malformed deploy receipt", 1_001)).toBe(true);
@@ -265,15 +556,17 @@ describe("leased effect execution", () => {
   it("dispatches Start to a planner only through the injected BB runner after a live fence check", async () => {
     const { store, db } = storeFixture();
     const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
-    const selected = store.applyJobEvent(job.id, job.version, {
+    store.applyJobEvent(job.id, job.version, {
       type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture(),
     }, 1_001);
-    store.applyJobEvent(job.id, selected.version, { type: "CONFIRMED" }, 1_002);
+    admitConfirmedJob(store, store.getJob(job.id)!, 1_002);
     const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "spawn_plan");
     if (!effect) throw new Error("spawn effect missing");
     const lease = store.acquireExecutorLease("owner-a", 1_003, 30_000);
     if (!lease.acquired) throw new Error("lease missing");
-    const claimed = store.leaseEffects("owner-a", lease.generation, 1_003, 10, 30_000)
+    db.prepare("UPDATE job_resource_claims SET state = 'released', lease_expires_at = 0, released_at = ?, release_reason = ? WHERE job_id = ?")
+      .run(1_003, "test-fence-setup", job.id);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_003, 10, 30_000)
       .find((item) => item.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("spawn effect was not leased");
     const spawnPlanner = vi.fn(async () => ({ id: "thr_plan", environmentId: "env_1" }));
@@ -300,18 +593,18 @@ describe("leased effect execution", () => {
   it("does not invoke BB after the executor fence is lost", async () => {
     const { store, db } = storeFixture();
     const job = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
-    const selected = store.applyJobEvent(job.id, job.version, {
+    store.applyJobEvent(job.id, job.version, {
       type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture(),
     }, 1_001);
-    store.applyJobEvent(job.id, selected.version, { type: "CONFIRMED" }, 1_002);
+    admitConfirmedJob(store, store.getJob(job.id)!, 1_002);
     const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "spawn_plan");
     if (!effect) throw new Error("spawn effect missing");
     const first = store.acquireExecutorLease("owner-a", 1_003, 100);
     if (!first.acquired) throw new Error("lease missing");
-    const claimed = store.leaseEffects("owner-a", first.generation, 1_003, 10, 100)
+    const claimed = leaseEffectsForTest(store, "owner-a", first.generation, 1_003, 10, 100)
       .find((item) => item.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("spawn effect was not leased");
-    expect(store.acquireExecutorLease("owner-b", 1_104, 100)).toEqual({ acquired: true, generation: 2 });
+    expect(store.acquireExecutorLease("owner-b", 1_104, 100)).toEqual({ acquired: true, generation: first.generation + 1 });
     const spawnPlanner = vi.fn(async () => ({ id: "thr_plan", environmentId: "env_1" }));
 
     await expect(new EffectRunner({
@@ -325,7 +618,7 @@ describe("leased effect execution", () => {
     expect(db.prepare("SELECT status, lease_owner, lease_generation FROM effects WHERE idempotency_key = ?").get(effect.idempotencyKey)).toEqual({
       status: "leased",
       lease_owner: "owner-a",
-      lease_generation: 1,
+      lease_generation: first.generation,
     });
   });
 
@@ -339,7 +632,7 @@ describe("leased effect execution", () => {
     } as unknown as JobEffect;
     addJobEffect(store, db, effect);
     const current = fence(store);
-    const claimed = store.leaseEffects(current.ownerId, current.generation, 1_000, 1, 100)[0];
+    const claimed = leaseEffectsForTest(store, current.ownerId, current.generation, 1_000, 1, 100)[0];
     if (!claimed) throw new Error("effect missing");
     await expect(new EffectRunner({
       store,
@@ -371,7 +664,7 @@ describe("leased effect execution", () => {
     ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
     const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
     if (!lease.acquired) throw new Error("lease missing");
-    const claimed = store.leaseEffects("owner-a", lease.generation, 1_001, 10, 30_000)
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
       .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("validation effect missing");
 
@@ -428,7 +721,7 @@ describe("leased effect execution", () => {
     if (!effect) throw new Error("stop effect missing");
     const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
     if (!lease.acquired) throw new Error("executor lease missing");
-    const claimed = store.leaseEffects("owner-a", lease.generation, 1_001, 10, 30_000)
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
       .find((item) => item.idempotencyKey === effect.idempotencyKey);
     if (!claimed) throw new Error("stop effect was not leased");
     const controller = new AbortController();

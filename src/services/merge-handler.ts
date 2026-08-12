@@ -28,6 +28,7 @@ import {
   type MergeCallbackIdentity,
   type PersistedMergeSuccessResult,
   type PersistedMergeEvidence,
+  type ExecutorFence,
   type TelegramAgentStore,
 } from "../storage/store";
 import type { TerminalObservation } from "../bb/terminal-command";
@@ -95,6 +96,7 @@ export type GateCollectionInput = {
   receipt: MergeReadyReceipt | null;
   now: number;
   approvalExpiresAt?: number;
+  fence?: ExecutorFence;
 };
 
 export type Task9FreshGateContext = {
@@ -112,8 +114,9 @@ export type Task9FreshGateCollectorOptions = {
     validation: ValidationSnapshot;
     now: number;
     approvalExpiresAt?: number;
+    fence?: ExecutorFence;
   }) => Promise<Task9FreshGateContext>;
-  runValidation?: (input: ValidationInput) => Promise<ValidationSnapshot>;
+  runValidation?: (input: ValidationInput & { fence?: ExecutorFence }) => Promise<ValidationSnapshot>;
 };
 
 function remoteHeadEvidenceFromTask8(
@@ -156,6 +159,7 @@ export function createTask9FreshGateCollector(
         policy: job.policy,
         prNumber: job.prNumber,
       },
+      fence: input.fence,
     });
     if (!snapshot.githubPr) throw new TypeError("Task 8 validation did not return pull-request metadata");
     const context = await options.getContext({
@@ -165,6 +169,7 @@ export function createTask9FreshGateCollector(
       validation: snapshot,
       now: input.now,
       approvalExpiresAt: input.approvalExpiresAt,
+      fence: input.fence,
     });
     const remoteHead = remoteHeadEvidenceFromTask8(snapshot, job.prNumber);
     const githubPr = snapshot.githubPr;
@@ -472,6 +477,18 @@ export class MergeHandler {
     }
     if (effect.status === "failed" || effect.status === "dead") return { outcome: "already_done" };
     if (input.leaseOwner === undefined || input.leaseGeneration === undefined) return { outcome: "failed" };
+    const executorFence = (): ExecutorFence => ({
+      ownerId: input.leaseOwner!,
+      generation: input.leaseGeneration!,
+      now: freshNow(),
+    });
+    const renewOperation = (): boolean => this.options.store.renewJobOperationFences({
+      jobId: effect.jobId,
+      effectIdempotencyKey: effect.idempotencyKey,
+      leaseMs: 30_000,
+      ...executorFence(),
+    });
+    if (!renewOperation()) return failCurrentLease("merge effect fence was lost before execution");
 
     let job: Job | null;
     try {
@@ -498,7 +515,9 @@ export class MergeHandler {
           receipt: null,
           approvalExpiresAt: pending.approvalExpiresAt,
           now: freshNow(),
+          fence: executorFence(),
         });
+        if (!renewOperation()) return failCurrentLease("merge approval gate fence was lost");
         const approvalEvaluation = readyEvaluation(approvalCollected, freshNow());
         if (!approvalEvaluation.ready || approvalEvaluation.receipt.jobId !== job.id || approvalEvaluation.receipt.headSha !== pending.headSha) {
           return failCurrentLease("approval gate evidence is stale");
@@ -548,7 +567,7 @@ export class MergeHandler {
         return preserveUnknownOutcome();
       }
       if (!prepared.ok) return preserveUnknownOutcome();
-      return this.finishProviderAttempt(prepared, input, freshNow, failCurrentLease, preserveUnknownOutcome);
+      return this.finishProviderAttempt(prepared, input, freshNow, renewOperation, failCurrentLease, preserveUnknownOutcome);
     }
 
     let collected: GateInput;
@@ -559,7 +578,9 @@ export class MergeHandler {
         phase: "pre_merge",
         receipt: storedPayload.receipt as MergeReadyReceipt,
         now: freshNow(),
+        fence: executorFence(),
       });
+      if (!renewOperation()) return failCurrentLease("merge gate fence was lost");
       evaluation = readyEvaluation(collected, freshNow());
     } catch (error) {
       return failCurrentLease(error);
@@ -594,7 +615,7 @@ export class MergeHandler {
       return failCurrentLease(error);
     }
     if (!prepared.ok) return failCurrentLease(prepared.reason);
-    return this.finishProviderAttempt(prepared, input, freshNow, failCurrentLease, preserveUnknownOutcome);
+    return this.finishProviderAttempt(prepared, input, freshNow, renewOperation, failCurrentLease, preserveUnknownOutcome);
   }
 
   public async runMergeEffect(
@@ -607,6 +628,7 @@ export class MergeHandler {
     prepared: Extract<MergeCallPreparation, { ok: true }>,
     input: ExecuteMergeEffectInput,
     freshNow: () => number,
+    renewOperation: () => boolean,
     failCurrentLease: (reason: unknown, effectKey?: string) => MergeEffectResult,
     preserveUnknownOutcome: (effectKey?: string) => MergeEffectResult,
   ): Promise<MergeEffectResult> {
@@ -639,6 +661,7 @@ export class MergeHandler {
       } catch (error) {
         return preserveUnknownOutcome(effect.idempotencyKey);
       }
+      if (!renewOperation()) return preserveUnknownOutcome(effect.idempotencyKey);
       if (!providerFence.ok) return preserveUnknownOutcome(effect.idempotencyKey);
       try {
         await this.options.bb.sdk.environments.mergePullRequest({
@@ -648,6 +671,7 @@ export class MergeHandler {
       } catch (error) {
         return preserveUnknownOutcome(effect.idempotencyKey);
       }
+      if (!renewOperation()) return preserveUnknownOutcome(effect.idempotencyKey);
     }
 
     let completionFence: MergeCallPreparation;
@@ -671,8 +695,11 @@ export class MergeHandler {
       confirmed = await this.confirmPostMerge(
         completionFence.receipt,
         effect.idempotencyKey,
+        input.leaseOwner!,
+        input.leaseGeneration!,
         freshNow,
         (now) => {
+          if (!renewOperation()) return false;
           try {
             return this.options.store.prepareMergeCall({
               jobId: effect.jobId,
@@ -688,6 +715,9 @@ export class MergeHandler {
       );
     } catch (error) {
       confirmed = { ok: false, reason: safeFailureReason(error, "post-merge provider truth is unavailable") };
+    }
+    if (confirmed.ok && !renewOperation()) {
+      return preserveUnknownOutcome(effect.idempotencyKey);
     }
     if (!confirmed.ok) {
       return preserveUnknownOutcome(effect.idempotencyKey);
@@ -917,6 +947,8 @@ export class MergeHandler {
   private async confirmPostMerge(
     receipt: DurableMergeReceipt,
     effectIdempotencyKey: string,
+    leaseOwner: string,
+    leaseGeneration: number,
     freshNow: () => number,
     checkFence: (now: number) => boolean,
   ): Promise<{ ok: true; result: PersistedMergeSuccessResult } | { ok: false; reason: string }> {
@@ -932,7 +964,11 @@ export class MergeHandler {
       const current = this.options.store.getJob(receipt.jobId);
       const terminalGeneration = terminalGenerations.get(observation.id) ?? generationBase + terminalGenerations.size + 1;
       terminalGenerations.set(observation.id, terminalGeneration);
-      if (current) projectTerminalLiveness(this.options.store, current, observation, "merge", now, terminalGeneration);
+      if (current) projectTerminalLiveness(this.options.store, current, observation, "merge", now, terminalGeneration, {
+        ownerId: leaseOwner,
+        generation: leaseGeneration,
+        now,
+      });
     };
     if (!checkFence(freshNow())) {
       return { ok: false, reason: "post-merge effect fence rejected the Git head confirmation" };

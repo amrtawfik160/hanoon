@@ -77,7 +77,7 @@ function makeHarness({
   };
 
   const environment = {
-    async status() {
+    async status(_input: { environmentId: string; mergeBaseBranch: string; signal: AbortSignal }) {
       return { available: true, clean, headSha };
     },
   };
@@ -85,8 +85,8 @@ function makeHarness({
   const attempts = {
     values: new Map<string, Record<string, unknown>>([["attempt-1", attemptState]]),
     getCalls: 0,
-    async get(attemptId: string) {
-      const state = attempts.values.get(attemptId) ?? {};
+    async get(input: { jobId: string; attemptId: string; signal?: AbortSignal }) {
+      const state = attempts.values.get(input.attemptId) ?? {};
       attempts.getCalls += 1;
       if (synchronizeCorrectionClaims && attempts.getCalls > 2) {
         if (attempts.getCalls === 4) correctionReadsReleased();
@@ -94,26 +94,27 @@ function makeHarness({
       }
       return state;
     },
-    async update(attemptId: string, patch: Record<string, unknown>) {
-      attempts.values.set(attemptId, {
-        ...attempts.values.get(attemptId),
-        ...patch,
+    async update(input: { jobId: string; attemptId: string; patch: Record<string, unknown> }) {
+      attempts.values.set(input.attemptId, {
+        ...attempts.values.get(input.attemptId),
+        ...input.patch,
       });
     },
-    async claimFormatCorrection(
-      attemptId: string,
-      threadId: string,
-      headSha: string,
-    ) {
-      const state = attempts.values.get(attemptId) ?? {};
+    async claimFormatCorrection(input: {
+      jobId: string;
+      attemptId: string;
+      threadId: string;
+      headSha: string;
+    }) {
+      const state = attempts.values.get(input.attemptId) ?? {};
       if (
-        state.threadId !== threadId ||
-        state.headSha !== headSha ||
+        state.threadId !== input.threadId ||
+        state.headSha !== input.headSha ||
         state.formatCorrectionSent
       ) {
         return false;
       }
-      attempts.values.set(attemptId, {
+      attempts.values.set(input.attemptId, {
         ...state,
         formatCorrectionSent: true,
       });
@@ -126,14 +127,10 @@ function makeHarness({
     correctionReadsReleased = resolve;
   });
 
-  const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const dependencies = {
     threads,
     environment,
     attempts,
-    emit(event: { type: string; payload: Record<string, unknown> }) {
-      events.push(event);
-    },
   };
   const handler = new ReviewHandler(dependencies);
 
@@ -143,7 +140,6 @@ function makeHarness({
     threads,
     environment,
     attempts,
-    events,
   };
 }
 
@@ -157,10 +153,14 @@ async function idle(
   }> = {},
 ) {
   return handler.handleThreadIdle({
+    jobId: "job-review-loop",
     attemptId: "attempt-1",
     reviewThreadId: "review-thread-1",
     implementationThreadId: "implementation-thread-1",
+    environmentId: "environment-review-loop",
+    mergeBaseBranch: "main",
     expectedSha: EXPECTED_SHA,
+    signal: new AbortController().signal,
     ...overrides,
   });
 }
@@ -169,6 +169,7 @@ describe("review remediation loop", () => {
   it("does not rebind a trusted attempt from a repeated stale idle event", async () => {
     const harness = makeHarness({ reviewOutputs: [output()] });
     const cycle = await harness.handler.startReviewCycle({
+      jobId: "job-review-loop",
       attemptId: "attempt-1",
       implementationThreadId: "implementation-thread-1",
       expectedSha: EXPECTED_SHA,
@@ -181,8 +182,8 @@ describe("review remediation loop", () => {
     const first = await idle(harness.handler, staleInput);
     const second = await idle(harness.handler, staleInput);
 
-    expect(first.outcome).toBe("blocked");
-    expect(second.outcome).toBe("blocked");
+    expect(first.result.outcome).toBe("blocked");
+    expect(second.result.outcome).toBe("blocked");
     expect(harness.threads.outputCalls).toEqual([]);
     expect(harness.attempts.values.get("attempt-1")).toMatchObject({
       threadId: cycle.reviewThreadId,
@@ -199,7 +200,7 @@ describe("review remediation loop", () => {
 
     const result = await idle(harness.handler);
 
-    expect(result.outcome).toBe("blocked");
+    expect(result.result.outcome).toBe("blocked");
     expect(harness.threads.outputCalls).toEqual([]);
   });
 
@@ -222,8 +223,8 @@ describe("review remediation loop", () => {
 
     const result = await idle(harness.handler);
 
-    expect(result.outcome).toBe("pass");
-    expect(harness.events.at(-1)?.type).toBe("REVIEW_PASSED");
+    expect(result.result.outcome).toBe("pass");
+    expect(result.event?.type).toBe("REVIEW_PASSED");
   });
 
   it("requests changes with findings sorted by severity and location", async () => {
@@ -243,13 +244,13 @@ describe("review remediation loop", () => {
 
     const result = await idle(harness.handler);
 
-    expect(result.outcome).toBe("changes_requested");
-    expect(result.findings?.map((item) => item.title)).toEqual([
+    expect(result.result.outcome).toBe("changes_requested");
+    expect(result.result.findings?.map((item) => item.title)).toEqual([
       "first",
       "second",
       "later",
     ]);
-    expect(harness.events.at(-1)?.type).toBe("REVIEW_CHANGES_REQUESTED");
+    expect(result.event?.type).toBe("REVIEW_CHANGES_REQUESTED");
   });
 
   it("blocks when a reported check is blocked", async () => {
@@ -273,8 +274,8 @@ describe("review remediation loop", () => {
 
     const result = await idle(harness.handler);
 
-    expect(result.outcome).toBe("blocked");
-    expect(result.reasons[0]).toContain("check unit was blocked");
+    expect(result.result.outcome).toBe("blocked");
+    expect(result.result.reasons[0]).toContain("check unit was blocked");
   });
 
   it.each([
@@ -293,7 +294,7 @@ describe("review remediation loop", () => {
 
     const result = await idle(harness.handler);
 
-    expect(result.outcome).toBe("blocked");
+    expect(result.result.outcome).toBe("blocked");
   });
 
   it("sends one format correction to the same review thread and blocks a second invalid output", async () => {
@@ -302,11 +303,11 @@ describe("review remediation loop", () => {
     const first = await idle(harness.handler);
     const second = await idle(harness.handler);
 
-    expect(first.outcome).toBe("format_correction_sent");
+    expect(first.result.outcome).toBe("format_correction_sent");
     expect(harness.threads.sent).toHaveLength(1);
     expect(harness.threads.sent[0]?.threadId).toBe("review-thread-1");
-    expect(second.outcome).toBe("blocked");
-    expect(harness.events.at(-1)?.type).toBe("REVIEW_BLOCKED");
+    expect(second.result.outcome).toBe("blocked");
+    expect(second.event?.type).toBe("REVIEW_BLOCKED");
   });
 
   it("routes schema-invalid JSON through correction and then durable blocking", async () => {
@@ -325,8 +326,8 @@ describe("review remediation loop", () => {
     const first = await idle(harness.handler);
     const second = await idle(harness.handler);
 
-    expect(first.outcome).toBe("format_correction_sent");
-    expect(second.outcome).toBe("blocked");
+    expect(first.result.outcome).toBe("format_correction_sent");
+    expect(second.result.outcome).toBe("blocked");
     expect(harness.threads.sent).toHaveLength(1);
   });
 
@@ -344,7 +345,7 @@ describe("review remediation loop", () => {
 
     const retry = await idle(harness.handler);
 
-    expect(retry.outcome).toBe("blocked");
+    expect(retry.result.outcome).toBe("blocked");
     expect(sendCalls).toBe(1);
   });
 
@@ -359,7 +360,7 @@ describe("review remediation loop", () => {
       idle(harness.makeHandler()),
     ]);
 
-    expect([first.outcome, second.outcome].sort()).toEqual([
+    expect([first.result.outcome, second.result.outcome].sort()).toEqual([
       "blocked",
       "format_correction_sent",
     ]);
@@ -376,10 +377,10 @@ describe("review remediation loop", () => {
       ],
     });
 
-    await idle(harness.handler);
+    const result = await idle(harness.handler);
 
     expect(harness.threads.sent).toEqual([]);
-    expect(harness.events.at(-1)).toMatchObject({
+    expect(result.event).toMatchObject({
       type: "REVIEW_CHANGES_REQUESTED",
       payload: { findings: [expect.objectContaining({ title: "fix this" })] },
     });
@@ -404,8 +405,8 @@ describe("review remediation loop", () => {
 
     const failedCheckResult = await idle(failedCheckHarness.handler);
 
-    expect(failedCheckResult.outcome).toBe("changes_requested");
-    expect(failedCheckHarness.events.at(-1)?.payload.reasons).toContain(
+    expect(failedCheckResult.result.outcome).toBe("changes_requested");
+    expect(failedCheckResult.event?.payload.reasons).toContain(
       "check unit failed: one assertion failed",
     );
 
@@ -423,7 +424,7 @@ describe("review remediation loop", () => {
 
     const tiedFindingResult = await idle(tiedFindingHarness.handler);
 
-    expect(tiedFindingResult.findings?.map((item) => item.details)).toEqual([
+    expect(tiedFindingResult.result.findings?.map((item) => item.details)).toEqual([
       "alpha",
       "zulu",
     ]);
@@ -443,6 +444,7 @@ describe("review remediation loop", () => {
     await idle(harness.handler);
     const oldHeadPass = await idle(harness.handler);
     const nextCycle = await harness.handler.startReviewCycle({
+      jobId: "job-review-loop",
       attemptId: "attempt-2",
       implementationThreadId: "implementation-thread-1",
       expectedSha: NEXT_SHA,
@@ -458,19 +460,21 @@ describe("review remediation loop", () => {
       expectedSha: NEXT_SHA,
     });
 
-    expect(oldHeadPass.outcome).toBe("blocked");
-    expect(newHeadPass.outcome).toBe("pass");
+    expect(oldHeadPass.result.outcome).toBe("blocked");
+    expect(newHeadPass.result.outcome).toBe("pass");
   });
 
   it("creates a fresh child thread for every review cycle", async () => {
     const harness = makeHarness();
 
     await harness.handler.startReviewCycle({
+      jobId: "job-review-loop",
       attemptId: "attempt-1",
       implementationThreadId: "implementation-thread-1",
       expectedSha: EXPECTED_SHA,
     });
     await harness.handler.startReviewCycle({
+      jobId: "job-review-loop",
       attemptId: "attempt-2",
       implementationThreadId: "implementation-thread-1",
       expectedSha: NEXT_SHA,

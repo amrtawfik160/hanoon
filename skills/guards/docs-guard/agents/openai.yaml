@@ -1,0 +1,4 @@
+interface:
+  display_name: "Docs Guard"
+  short_description: "Documentation accuracy guardrails for AI agents"
+  default_prompt: "Use $docs-guard after documentation is written or changed to review it for drift, hallucinations, and unverifiable claims."

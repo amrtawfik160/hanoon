@@ -518,11 +518,210 @@ export const NOTICE_COOLDOWN_MIGRATIONS = [String.raw`
 ALTER TABLE observed_threads ADD COLUMN notified_at INTEGER;
 `] as const;
 
+export const AUTONOMY_MIGRATIONS = [String.raw`
+CREATE TABLE autonomy_sequence (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  next_queue_seq INTEGER NOT NULL CHECK (next_queue_seq >= 1)
+);
+
+CREATE TABLE job_admissions (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  project_id TEXT NOT NULL,
+  queue_seq INTEGER NOT NULL UNIQUE CHECK (queue_seq >= 1),
+  state TEXT NOT NULL CHECK (state IN ('queued', 'admitted', 'draining', 'released')),
+  resume_event TEXT NOT NULL CHECK (resume_event IN ('CONFIRMED', 'CONTINUE_REVIEW')),
+  queued_at INTEGER NOT NULL,
+  admitted_at INTEGER,
+  draining_at INTEGER,
+  released_at INTEGER,
+  release_reason TEXT CHECK (release_reason IS NULL OR length(release_reason) BETWEEN 1 AND 160)
+);
+
+CREATE TABLE job_resource_claims (
+  claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  resource_key TEXT NOT NULL CHECK (length(resource_key) BETWEEN 1 AND 384),
+  resource_kind TEXT NOT NULL CHECK (
+    resource_kind IN ('project', 'repository_merge', 'production_target')
+  ),
+  state TEXT NOT NULL CHECK (state IN ('held', 'released')),
+  owner_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  lease_expires_at INTEGER NOT NULL,
+  acquired_at INTEGER NOT NULL,
+  renewed_at INTEGER NOT NULL,
+  released_at INTEGER,
+  release_reason TEXT CHECK (release_reason IS NULL OR length(release_reason) BETWEEN 1 AND 160)
+);
+
+CREATE INDEX job_admissions_state_queue
+  ON job_admissions(state, queue_seq, job_id);
+CREATE INDEX job_admissions_project_queue
+  ON job_admissions(project_id, state, queue_seq, job_id);
+CREATE INDEX job_resource_claims_job
+  ON job_resource_claims(job_id, claim_id);
+
+CREATE TEMP TABLE autonomy_migration_guard (
+  invariant TEXT PRIMARY KEY,
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO autonomy_migration_guard (invariant, valid)
+SELECT 'legacy_active_job_count', CASE WHEN (
+  SELECT COUNT(*) FROM jobs
+   WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+) <= 1 THEN 1 ELSE 0 END;
+INSERT INTO autonomy_migration_guard (invariant, valid)
+SELECT 'selected_job_identity', CASE WHEN NOT EXISTS (
+  SELECT 1 FROM jobs
+   WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+     AND state <> 'awaiting_project'
+     AND CASE
+       WHEN project_id IS NULL OR policy_version IS NULL OR policy_version < 1 OR policy_json IS NULL THEN 1
+       WHEN json_valid(policy_json) <> 1 THEN 1
+       WHEN json_extract(policy_json, '$.projectId') IS NULL THEN 1
+       WHEN json_extract(policy_json, '$.projectId') <> project_id THEN 1
+       ELSE 0
+     END = 1
+) THEN 1 ELSE 0 END;
+INSERT INTO autonomy_migration_guard (invariant, valid)
+SELECT 'status_message_identity', CASE WHEN NOT EXISTS (
+  SELECT status_message_id FROM jobs
+   WHERE status_message_id IS NOT NULL
+   GROUP BY status_message_id
+  HAVING COUNT(*) > 1
+) THEN 1 ELSE 0 END;
+
+CREATE UNIQUE INDEX job_resource_claims_held_resource
+  ON job_resource_claims(resource_key) WHERE state = 'held';
+CREATE UNIQUE INDEX jobs_status_message_identity
+  ON jobs(status_message_id) WHERE status_message_id IS NOT NULL;
+
+INSERT INTO autonomy_sequence(singleton, next_queue_seq) VALUES (1, 1);
+INSERT INTO job_admissions (
+  job_id, project_id, queue_seq, state, resume_event, queued_at,
+  admitted_at, draining_at, released_at, release_reason
+) SELECT
+  id,
+  project_id,
+  1,
+  CASE WHEN state = 'awaiting_confirmation' THEN 'queued' ELSE 'admitted' END,
+  'CONFIRMED',
+  updated_at,
+  CASE WHEN state = 'awaiting_confirmation' THEN NULL ELSE updated_at END,
+  NULL,
+  NULL,
+  NULL
+FROM jobs
+WHERE state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+  AND state <> 'awaiting_project'
+ORDER BY updated_at DESC, id DESC
+LIMIT 1;
+INSERT INTO job_resource_claims (
+  job_id, resource_key, resource_kind, state, owner_id, generation,
+  lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+) SELECT
+  job_id,
+  'project:' || project_id || ':pipeline',
+  'project',
+  'held',
+  'migration-unadopted',
+  0,
+  0,
+  admitted_at,
+  admitted_at,
+  NULL,
+  NULL
+FROM job_admissions
+WHERE state = 'admitted';
+UPDATE autonomy_sequence
+   SET next_queue_seq = COALESCE((SELECT MAX(queue_seq) + 1 FROM job_admissions), 1)
+ WHERE singleton = 1;
+
+DROP TABLE autonomy_migration_guard;
+DROP INDEX one_active_job;
+`] as const;
+
 export const CONTROLLER_IMAGE_MIGRATIONS = [String.raw`
 ALTER TABLE controller_turns ADD COLUMN image_file_id TEXT;
 ALTER TABLE controller_turns ADD COLUMN image_file_name TEXT;
 ALTER TABLE controller_turns ADD COLUMN image_mime_type TEXT;
 ALTER TABLE controller_turns ADD COLUMN image_size_bytes INTEGER;
+`] as const;
+
+export const CONTROLLER_SUPERVISOR_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN command_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN supervisor_steers INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN supervisor_reasons TEXT NOT NULL DEFAULT '';
+`] as const;
+
+export const DELEGATION_MIGRATIONS = [String.raw`
+CREATE TABLE delegations (
+  id TEXT PRIMARY KEY,
+  controller_key TEXT NOT NULL,
+  instruction TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('open', 'fired', 'cancelled', 'failed')),
+  fired_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX delegations_open ON delegations (state, created_at);
+CREATE TABLE delegation_threads (
+  delegation_id TEXT NOT NULL REFERENCES delegations(id),
+  thread_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('running', 'finished', 'failed', 'missing')),
+  summary TEXT,
+  settled_at INTEGER,
+  PRIMARY KEY (delegation_id, thread_id)
+);
+`] as const;
+
+export const JOB_MEMORY_MIGRATIONS = [String.raw`
+CREATE TABLE job_memory_extractions (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  project_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'done', 'failed')),
+  thread_id TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  saved_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX job_memory_extractions_due ON job_memory_extractions (state, created_at);
+ALTER TABLE memories ADD COLUMN origin TEXT;
+`] as const;
+
+export const MEMORY_CURATION_MIGRATIONS = [String.raw`
+CREATE TABLE memory_recalls (
+  turn_id TEXT NOT NULL,
+  memory_id TEXT NOT NULL REFERENCES memories(id),
+  recalled_at INTEGER NOT NULL,
+  scored_at INTEGER,
+  outcome TEXT CHECK (outcome IN ('reinforced', 'demoted')),
+  PRIMARY KEY (turn_id, memory_id)
+);
+CREATE INDEX memory_recalls_unscored ON memory_recalls (scored_at, recalled_at);
+ALTER TABLE memories ADD COLUMN curated_at INTEGER;
+`] as const;
+
+export const SYSTEM_MONITOR_MIGRATIONS = [String.raw`
+ALTER TABLE monitors ADD COLUMN system_key TEXT;
+CREATE UNIQUE INDEX monitors_system_key ON monitors (system_key) WHERE system_key IS NOT NULL;
+`] as const;
+
+export const CONTROLLER_OVERLAY_MIGRATIONS = [String.raw`
+CREATE TABLE controller_overlay (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  text TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 `] as const;
 
 export const ALL_MIGRATIONS = [
@@ -542,5 +741,12 @@ export const ALL_MIGRATIONS = [
   ...THREAD_NOTICE_MIGRATIONS,
   ...UNSUPPORTED_INTERACTION_MIGRATIONS,
   ...NOTICE_COOLDOWN_MIGRATIONS,
+  ...AUTONOMY_MIGRATIONS,
   ...CONTROLLER_IMAGE_MIGRATIONS,
+  ...CONTROLLER_SUPERVISOR_MIGRATIONS,
+  ...DELEGATION_MIGRATIONS,
+  ...JOB_MEMORY_MIGRATIONS,
+  ...MEMORY_CURATION_MIGRATIONS,
+  ...SYSTEM_MONITOR_MIGRATIONS,
+  ...CONTROLLER_OVERLAY_MIGRATIONS,
 ] as const;

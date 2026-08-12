@@ -8,6 +8,11 @@ export const CONTROLLER_MODELS = [
   "gpt-5.6-sol",
 ] as const;
 
+// Background extraction should not run on the owner's conversational tier.
+// `inherit` keeps the project default, because a model this installation's
+// providers do not offer would fail every extraction.
+export const EXTRACTION_MODELS = ["inherit", ...CONTROLLER_MODELS] as const;
+
 export const CONTROLLER_REASONING_LEVELS = [
   "low",
   "medium",
