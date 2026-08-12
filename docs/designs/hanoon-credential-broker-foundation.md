@@ -156,6 +156,7 @@ export type BrokerResponseEnvelope = Readonly<{
   result: "ready" | "valid" | "invalid" | null;
   failureClass:
     | "broker_auth_failed"
+    | "vault_auth_failed"
     | "binding_missing"
     | "binding_inactive"
     | "binding_generation_stale"
