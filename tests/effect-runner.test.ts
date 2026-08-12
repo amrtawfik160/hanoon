@@ -5,6 +5,7 @@ import type { JobEffect, StoredEffect } from "../src/domain/models";
 import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { admitConfirmedJob, policyFixture } from "./helpers";
+import { settleEffectFailure } from "../src/services/job-executor-service";
 import {
   EffectRunner,
   PermanentEffectError,
@@ -779,4 +780,75 @@ it.each([null, undefined, ""])("retries rather than dies when the worktree has n
 
 it("accepts an environment id once the worktree has attached", () => {
   expect(threadResultEnvironment({ environmentId: "env_worker" })).toBe("env_worker");
+});
+
+describe("late managed worktree", () => {
+  it("survives BB attaching the worktree after the spawn call returns", async () => {
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_late_worktree", "creating_implementation");
+    if (!job) throw new Error("job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("spawn effect missing");
+
+    // This is what BB really does: the thread exists immediately, its managed
+    // worktree attaches a moment later. Every fake in this suite returned the
+    // environment id straight away, which is why a bug that killed *every* job
+    // in production could not be seen from here.
+    let attempt = 0;
+    const spawnImplementation = vi.fn(async () => ({
+      id: "thr_late_worktree",
+      environmentId: (attempt += 1) === 1 ? null : "env_attached",
+    }));
+    const listThreads = vi.fn(async () => ({ threads: [], total: 0 }));
+    const runner = () => new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: { listThreads, spawnImplementation },
+      now: () => 1_002,
+    }).run(claimed);
+
+    // First pass: no environment yet. It must be retryable, never fatal.
+    const firstFailure = await runner().then(() => null, (error: unknown) => error);
+    expect(firstFailure).toBeInstanceOf(Error);
+    expect(store.getJob(job.id)?.state).toBe("creating_implementation");
+
+    // Settle it exactly as the executor does. This is the assertion that
+    // matters: a late worktree must land in 'failed' with a retry backoff, not
+    // in the dead letter that used to strand the whole pipeline.
+    expect(settleEffectFailure(
+      store, claimed, "owner-a", lease.generation, 1_003, firstFailure, () => 0,
+    )).toBe(true);
+    const afterFirst = store.getEffect(job.id, effect.idempotencyKey);
+    expect(afterFirst?.status).toBe("failed");
+
+    // Second pass, once the worktree has attached: the job proceeds. Stay
+    // inside the executor lease taken at 1_001 — past it, leaseEffects returns
+    // nothing because the executor, not the effect, is what expired.
+    const retry = leaseEffectsForTest(store, "owner-a", lease.generation, 2_000, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!retry) throw new Error("effect was not retryable");
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: { listThreads, spawnImplementation },
+      now: () => 2_001,
+    }).run(retry);
+
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "implementing",
+      implementationThreadId: "thr_late_worktree",
+      environmentId: "env_attached",
+    });
+  });
 });

@@ -255,7 +255,10 @@ async function runWithLaneLease(input: Readonly<{
   }
 }
 
-function settleEffectFailure(
+// Exported so tests can settle a failed effect the way the executor does. A
+// bare EffectRunner.run() rejection leaves the effect 'leased'; only this
+// decides retry-with-backoff versus dead letter.
+export function settleEffectFailure(
   store: TelegramAgentStore,
   effect: StoredEffect,
   ownerId: string,
