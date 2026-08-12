@@ -7,6 +7,7 @@ import {
   MEMORY_DEMOTION,
   MEMORY_IDLE_HALF_LIFE_MS,
   MEMORY_REINFORCEMENT,
+  MEMORY_TOMBSTONE_CONFIDENCE,
   adjustedConfidence,
   decayedConfidence,
   subjectsContradict,
@@ -194,4 +195,61 @@ it("tombstones an agent memory that was never used and never scores twice", () =
   // What the owner said out loud decays but is never aged out on a timer.
   expect(store.getMemory(spoken.id)?.forgottenAt).toBeNull();
   expect(store.getMemory(spoken.id)?.confidence).toBeLessThan(0.5);
+});
+
+it("does not compound decay across passes", () => {
+  const { store } = fixture();
+  const memory = store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "anchored",
+    body: "decays once per elapsed interval", source: "owner", confidence: 0.8, now: 2_000,
+  });
+  const month = 30 * 86_400_000;
+
+  // One pass a month later, then three more at the same instant.
+  store.curateMemories({ now: 2_000 + month });
+  const afterFirst = store.getMemory(memory.id)?.confidence ?? 0;
+  for (const _ of [1, 2, 3]) store.curateMemories({ now: 2_000 + month });
+
+  expect(store.getMemory(memory.id)?.confidence).toBeCloseTo(afterFirst, 9);
+  expect(afterFirst).toBeCloseTo(0.8 * 0.5 ** (month / MEMORY_IDLE_HALF_LIFE_MS), 6);
+});
+
+it("reaches the same confidence whether curated once or many times", () => {
+  const { store } = fixture();
+  const once = store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "swept once",
+    body: "a", source: "owner", confidence: 0.8, now: 2_000,
+  });
+  const often = store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "swept often",
+    body: "b", source: "owner", confidence: 0.8, now: 2_000,
+  });
+  const span = 60 * 86_400_000;
+
+  // Sweeping every six hours must not age a memory faster than one sweep does.
+  for (let elapsed = 6 * 3_600_000; elapsed <= span; elapsed += 6 * 3_600_000) {
+    store.curateMemories({ now: 2_000 + elapsed });
+  }
+  const swept = store.getMemory(often.id)?.confidence ?? 0;
+
+  // `once` has been swept on the same schedule, so compare against the maths.
+  expect(swept).toBeCloseTo(0.8 * 0.5 ** (span / MEMORY_IDLE_HALF_LIFE_MS), 4);
+  expect(store.getMemory(once.id)?.confidence).toBeCloseTo(swept, 9);
+  // Sixty days is nowhere near the tombstone threshold on a 90-day half-life.
+  expect(swept).toBeGreaterThan(MEMORY_TOMBSTONE_CONFIDENCE);
+});
+
+it("keeps an unused extracted memory alive far longer than the ranking down-weights it", () => {
+  const { store } = fixture();
+  const extracted = store.rememberMemory({
+    scope: "proj_a", kind: "fact", subject: "a project lesson",
+    body: "learned from a finished job", source: "agent", confidence: 0.5, now: 2_000,
+  });
+
+  // Thirty days of six-hourly sweeps: it must still be here.
+  for (let elapsed = 6 * 3_600_000; elapsed <= 30 * 86_400_000; elapsed += 6 * 3_600_000) {
+    store.curateMemories({ now: 2_000 + elapsed });
+  }
+
+  expect(store.getMemory(extracted.id)?.forgottenAt).toBeNull();
 });

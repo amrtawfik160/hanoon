@@ -374,3 +374,41 @@ it("keeps the turn running when a budget nudge cannot be delivered", async () =>
     supervisorSteers: 0,
   });
 });
+
+it("budgets this turn's tokens, not the whole thread's history", async () => {
+  const { store, fence } = storeFixture("token-baseline");
+  const turn = submittedTurn(store, fence);
+  // A controller thread answers many messages; BB reports tokens cumulatively
+  // for the thread, so a week-old thread opens far above the hard budget.
+  const lifetime = SUPERVISOR_HARD_TOKENS + 25_000;
+  let seq = 1;
+  const adapter = serviceAdapter(
+    () => observation({ latestSeq: (seq += 1), totalTokens: lifetime }),
+    () => "active",
+  );
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
+
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  // The turn itself has spent nothing yet, so it must still be running.
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    tokenBaseline: lifetime,
+  });
+  expect(adapter.steer).not.toHaveBeenCalled();
+
+  // Once this turn genuinely spends past the hard budget, it is stopped.
+  const spent = lifetime + SUPERVISOR_HARD_TOKENS;
+  const busy = serviceAdapter(
+    () => observation({ latestSeq: (seq += 1), totalTokens: spent }),
+    () => "active",
+  );
+  const second = new LunaControllerService({ store, adapter: busy, clock: { now: () => 2_002 } });
+  await expect(second.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "failed",
+    lastError: "Controller turn exceeded its budget",
+  });
+});

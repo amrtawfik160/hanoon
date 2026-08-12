@@ -42,12 +42,12 @@ it("installs every system monitor once and stays idempotent across restarts", ()
   const { store } = fixture();
 
   expect(install(store)).toBe(SYSTEM_MONITORS.length);
-  const first = store.listMonitors(CONTROLLER_KEY, true);
+  const first = store.listSystemMonitors();
   expect(first).toHaveLength(SYSTEM_MONITORS.length);
 
   expect(install(store, NOW + 60_000)).toBe(SYSTEM_MONITORS.length);
 
-  const second = store.listMonitors(CONTROLLER_KEY, true);
+  const second = store.listSystemMonitors();
   expect(second).toHaveLength(SYSTEM_MONITORS.length);
   expect(second.map((monitor) => monitor.id).sort()).toEqual(first.map((monitor) => monitor.id).sort());
 });
@@ -57,19 +57,19 @@ it("installs nothing until an owner is paired", () => {
 
   expect(install(store)).toBe(0);
 
-  expect(store.listMonitors(CONTROLLER_KEY, true)).toEqual([]);
+  expect(store.listSystemMonitors()).toEqual([]);
 });
 
 it("re-arms a system monitor the owner cancelled", () => {
   const { store } = fixture();
   install(store);
-  const monitor = store.listMonitors(CONTROLLER_KEY, true)[0];
+  const monitor = store.listSystemMonitors()[0];
   if (!monitor) throw new Error("missing monitor");
   expect(store.cancelMonitor(monitor.id, NOW + 1_000)).toBe(true);
 
   install(store, NOW + 2_000);
 
-  expect(store.listMonitors(CONTROLLER_KEY, false).map((each) => each.id)).toContain(monitor.id);
+  expect(store.listSystemMonitors().filter((each) => each.state === "armed").map((each) => each.id)).toContain(monitor.id);
 });
 
 it("does not spend the owner's armed-monitor budget", () => {
@@ -92,7 +92,7 @@ it("does not spend the owner's armed-monitor budget", () => {
 it("fires a system monitor as an ordinary follow-up turn", async () => {
   const { store } = fixture();
   install(store);
-  const due = store.listMonitors(CONTROLLER_KEY, true)
+  const due = store.listSystemMonitors()
     .map((monitor) => monitor.dueAt ?? 0)
     .reduce((left, right) => Math.min(left, right));
   const service = new MonitorService({
@@ -153,4 +153,36 @@ it("rejects a nonsensical scorecard window", () => {
   const { store } = fixture();
 
   expect(() => store.buildAutonomyScorecard({ now: NOW, windowMs: 0 })).toThrow(/windowMs/);
+});
+
+it("hides its own upkeep from the owner's monitor list", () => {
+  const { store } = fixture();
+  install(store);
+  store.createMonitor({
+    controllerKey: CONTROLLER_KEY, kind: "schedule", cron: "0 9 * * *",
+    instruction: "my own watch", dueAt: NOW + 86_400_000, now: NOW,
+  });
+
+  const owned = store.listMonitors(CONTROLLER_KEY, true);
+
+  expect(owned).toHaveLength(1);
+  expect(owned[0]?.instruction).toBe("my own watch");
+  expect(store.listSystemMonitors()).toHaveLength(SYSTEM_MONITORS.length);
+});
+
+it("retires its upkeep when self-maintenance is switched off", () => {
+  const { store } = fixture();
+  install(store);
+  expect(store.listSystemMonitors().every((each) => each.state === "armed")).toBe(true);
+  const ownWatch = store.createMonitor({
+    controllerKey: CONTROLLER_KEY, kind: "schedule", cron: "0 9 * * *",
+    instruction: "my own watch", dueAt: NOW + 86_400_000, now: NOW,
+  });
+
+  expect(store.cancelSystemMonitors(NOW + 1_000)).toBe(SYSTEM_MONITORS.length);
+
+  expect(store.listSystemMonitors().every((each) => each.state === "cancelled")).toBe(true);
+  // Switching off upkeep must not touch a watch the owner set themselves.
+  expect(store.listMonitors(CONTROLLER_KEY, true).find((each) => each.id === ownWatch.id)?.state).toBe("armed");
+  expect(store.listMonitors(CONTROLLER_KEY, false)).toHaveLength(1);
 });

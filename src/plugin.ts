@@ -544,8 +544,14 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   let systemMonitorsInstalled = false;
   const systemMonitors = {
     install: () => {
+      // Turning the setting off has to retire what is already armed, or the
+      // owner keeps getting the daily sweep they just switched off.
+      if (config.ok && !systemUpkeepEnabled(config.value)) {
+        if (store.cancelSystemMonitors(clock()) > 0) systemMonitorsInstalled = false;
+        return;
+      }
       if (systemMonitorsInstalled) return;
-      if (!config.ok || !systemUpkeepEnabled(config.value)) return;
+      if (!config.ok) return;
       const installed = installSystemMonitors({
         store,
         clock: { now: clock },

@@ -211,6 +211,8 @@ function twoMemberDelegation(store: ReturnType<typeof fixture>["store"]) {
   store.addDelegationThread({
     delegationId: delegation.id, threadId: "thr_b", projectId: "proj_b", title: "billing latency", now: 2_002,
   });
+  // The tool seals once every member is recorded; the join waits for it.
+  store.sealDelegation({ id: delegation.id, now: 2_003 });
   return delegation;
 }
 
@@ -301,4 +303,62 @@ it("leaves a delegation open when BB cannot be reached", async () => {
   await expect(service.processDueDelegations()).resolves.toBe(false);
 
   expect(store.getDelegation(delegation.id)).toMatchObject({ state: "open" });
+});
+
+it("does not join a fan-out that is still being published", async () => {
+  const { store } = fixture();
+  const delegation = store.createDelegation({
+    controllerKey: CONTROLLER_KEY, instruction: "compare both", now: 2_000,
+  });
+  store.addDelegationThread({
+    delegationId: delegation.id, threadId: "thr_a", projectId: "proj_a", title: "first", now: 2_001,
+  });
+  // thr_b is still being spawned: unsealed, so the join must wait even though
+  // every recorded member has settled.
+  const { service } = joinService(store, { thr_a: "idle" }, { thr_a: "done" });
+
+  await expect(service.processDueDelegations()).resolves.toBe(false);
+  expect(joinedTurn(store)).toBeUndefined();
+
+  store.addDelegationThread({
+    delegationId: delegation.id, threadId: "thr_b", projectId: "proj_b", title: "second", now: 2_002,
+  });
+  store.sealDelegation({ id: delegation.id, now: 2_003 });
+  const { service: after } = joinService(store, { thr_a: "idle", thr_b: "idle" }, { thr_a: "done", thr_b: "also done" });
+
+  await expect(after.processDueDelegations()).resolves.toBe(true);
+  expect(joinedTurn(store)?.inputText).toContain("second (thr_b)");
+});
+
+it("gives up on a delegation that never recorded any work", async () => {
+  const { store } = fixture();
+  const orphan = store.createDelegation({
+    controllerKey: CONTROLLER_KEY, instruction: "never published", now: 2_000,
+  });
+  const { service } = joinService(store, {}, {}, () => 2_000 + DELEGATION_JOIN_TIMEOUT_MS);
+
+  await service.processDueDelegations();
+
+  // Otherwise it holds one of the two slots forever and delegation dies.
+  expect(store.getDelegation(orphan.id)?.state).toBe("failed");
+  expect(store.listOpenDelegations(10)).toEqual([]);
+});
+
+it("still joins on deadline when one member can never be reached", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const status = vi.fn(async (threadId: string) => {
+    if (threadId === "thr_b") throw new Error("BB unreachable");
+    return "idle" as const;
+  });
+  const service = new MonitorService({
+    store,
+    threads: { status, output: async () => "found it" },
+    clock: { now: () => 2_000 + DELEGATION_JOIN_TIMEOUT_MS },
+    warn: () => undefined,
+  });
+
+  await expect(service.processDueDelegations()).resolves.toBe(true);
+
+  expect(joinedTurn(store)?.inputText).toContain("billing latency (thr_b): still running when the deadline passed");
 });

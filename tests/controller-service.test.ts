@@ -78,6 +78,7 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
     toolCalls: 0,
     commandFailures: 0,
     totalTokens: 0,
+    tokenBaseline: null,
     supervisorSteers: 0,
     supervisorReasons: [],
     createdAt: 1_000,

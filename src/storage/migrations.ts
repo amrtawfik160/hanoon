@@ -724,6 +724,14 @@ CREATE TABLE controller_overlay (
 );
 `] as const;
 
+export const TURN_TOKEN_BASELINE_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN token_baseline INTEGER;
+`] as const;
+
+export const DELEGATION_SEAL_MIGRATIONS = [String.raw`
+ALTER TABLE delegations ADD COLUMN sealed_at INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -749,4 +757,6 @@ export const ALL_MIGRATIONS = [
   ...MEMORY_CURATION_MIGRATIONS,
   ...SYSTEM_MONITOR_MIGRATIONS,
   ...CONTROLLER_OVERLAY_MIGRATIONS,
+  ...TURN_TOKEN_BASELINE_MIGRATIONS,
+  ...DELEGATION_SEAL_MIGRATIONS,
 ] as const;

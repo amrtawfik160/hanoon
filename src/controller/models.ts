@@ -67,6 +67,9 @@ export type ControllerTurnRecord = {
   commandFailures: number;
   /** Highest cumulative thread token total observed on this turn. */
   totalTokens: number;
+  /** The thread's cumulative token total before this turn began, so spend can
+   *  be measured for the turn rather than for the thread's whole lifetime. */
+  tokenBaseline: number | null;
   supervisorSteers: number;
   supervisorReasons: readonly SupervisorReason[];
   createdAt: number;

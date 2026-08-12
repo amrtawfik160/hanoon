@@ -239,6 +239,8 @@ export type MonitorRecord = {
   cron: string | null;
   instruction: string;
   state: MonitorState;
+  /** Set when the plugin owns this monitor rather than the owner. */
+  systemKey: string | null;
   dueAt: number | null;
   fireCount: number;
   lastFiredAt: number | null;
@@ -289,6 +291,8 @@ export type DelegationRecord = {
   controllerKey: string;
   instruction: string;
   state: DelegationState;
+  /** Set once every member has been published; the join waits for it. */
+  sealedAt: number | null;
   threads: readonly DelegationThreadRecord[];
   firedAt: number | null;
   lastError: string | null;
@@ -726,6 +730,7 @@ type ControllerTurnRow = {
   total_tokens: number;
   supervisor_steers: number;
   supervisor_reasons: string;
+  token_baseline: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -1741,6 +1746,8 @@ export interface TelegramAgentStore {
     dueAt: number | null;
     now: number;
   }): MonitorRecord;
+  listSystemMonitors(): MonitorRecord[];
+  cancelSystemMonitors(now: number): number;
   ensureSystemMonitor(input: {
     systemKey: string;
     controllerKey: string;
@@ -1785,6 +1792,7 @@ export interface TelegramAgentStore {
     summary: string | null;
     now: number;
   }): boolean;
+  sealDelegation(input: { id: string; now: number }): boolean;
   recordDelegationFired(input: { id: string; now: number }): boolean;
   failDelegation(input: { id: string; error: string; now: number }): boolean;
   cancelDelegation(id: string, now: number): boolean;
@@ -1793,6 +1801,7 @@ export interface TelegramAgentStore {
   startJobMemoryExtraction(input: { jobId: string; threadId: string; now: number }): boolean;
   recordJobMemoryExtractionFailure(input: { jobId: string; error: string; now: number }): boolean;
   completeJobMemoryExtraction(input: { jobId: string; savedCount: number; now: number }): boolean;
+  recordJobMemorySaved(input: { jobId: string; savedCount: number; now: number }): boolean;
   failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean;
   rememberMemory(input: MemoryInput): MemoryRecord;
   recallMemories(input: {
@@ -2162,6 +2171,7 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     totalTokens: row.total_tokens,
     supervisorSteers: row.supervisor_steers,
     supervisorReasons: parseSupervisorReasons(row.supervisor_reasons),
+    tokenBaseline: row.token_baseline,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2274,6 +2284,7 @@ type DelegationRow = {
   instruction: string;
   state: string;
   fired_at: number | null;
+  sealed_at: number | null;
   last_error: string | null;
   created_at: number;
   updated_at: number;
@@ -2322,6 +2333,7 @@ function parseDelegation(row: DelegationRow, threads: readonly DelegationThreadR
     controllerKey: row.controller_key,
     instruction: row.instruction,
     state: row.state as DelegationState,
+    sealedAt: row.sealed_at,
     threads,
     firedAt: row.fired_at,
     lastError: row.last_error,
@@ -2345,6 +2357,7 @@ function parseMonitor(row: MonitorRow): MonitorRecord {
     cron: row.cron,
     instruction: row.instruction,
     state: row.state as MonitorState,
+    systemKey: row.system_key ?? null,
     dueAt: row.due_at,
     fireCount: row.fire_count,
     lastFiredAt: row.last_fired_at,
@@ -2365,6 +2378,7 @@ type MemoryRow = {
   source: string;
   origin: string | null;
   source_turn_id: string | null;
+  curated_at: number | null;
   use_count: number;
   last_used_at: number | null;
   superseded_by: string | null;
@@ -3251,7 +3265,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             SET bb_event_seq = ?, stream_text = ?, stream_phase = ?, updated_at = ?,
                 tool_calls = tool_calls + ?,
                 command_failures = command_failures + ?,
-                total_tokens = MAX(total_tokens, ?)
+                total_tokens = MAX(total_tokens, ?),
+                -- BB reports tokens cumulatively for the whole thread, and a
+                -- controller thread outlives many turns. The first non-zero
+                -- reading of a turn is therefore the thread's prior spend, not
+                -- this turn's: recording it as a baseline is what keeps a
+                -- week-old thread from failing "hi" against a hard budget.
+                token_baseline = COALESCE(token_baseline, NULLIF(?, 0))
           WHERE id = ? AND state = 'submitted' AND bb_event_seq < ?`,
       ).run(
         input.cursor,
@@ -3260,6 +3280,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.now,
         input.toolCalls ?? 0,
         input.commandFailures ?? 0,
+        input.totalTokens ?? 0,
         input.totalTokens ?? 0,
         input.turnId,
         input.cursor,
@@ -4179,11 +4200,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return text;
   }
 
+  /** Retires every plugin-owned monitor; the owner's own watches are untouched. */
+  public listSystemMonitors(): MonitorRecord[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM monitors WHERE system_key IS NOT NULL ORDER BY system_key ASC",
+    ).all() as MonitorRow[];
+    return rows.map(parseMonitor);
+  }
+
+  public cancelSystemMonitors(now: number): number {
+    assertNonNegativeInteger(now, "now");
+    return this.db.prepare(
+      "UPDATE monitors SET state = 'cancelled', updated_at = ? WHERE system_key IS NOT NULL AND state = 'armed'",
+    ).run(now).changes;
+  }
+
   public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {
     assertControllerKey(controllerKey);
     const rows = this.db.prepare(
       `SELECT * FROM monitors
-        WHERE controller_key = ? AND (? = 1 OR state = 'armed')
+        WHERE controller_key = ? AND system_key IS NULL AND (? = 1 OR state = 'armed')
         ORDER BY created_at DESC LIMIT ?`,
     ).all(controllerKey, includeFinished ? 1 : 0, MAX_ARMED_MONITORS * 4) as MonitorRow[];
     return rows.map(parseMonitor);
@@ -4321,6 +4357,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).run(input.state, summary, input.now, input.delegationId, input.threadId).changes === 1;
   }
 
+  /**
+   * Marks the fan-out complete. Until this lands the executor must not join:
+   * members are published one at a time across network round-trips, and a join
+   * that fires between them reports a partial result and orphans the rest.
+   */
+  public sealDelegation(input: { id: string; now: number }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE delegations SET sealed_at = ?, updated_at = ? WHERE id = ? AND state = 'open' AND sealed_at IS NULL",
+    ).run(input.now, input.now, input.id).changes === 1;
+  }
+
   public recordDelegationFired(input: { id: string; now: number }): boolean {
     assertNonNegativeInteger(input.now, "now");
     return this.db.prepare(
@@ -4424,6 +4472,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).run(input.savedCount, input.now, input.jobId).changes === 1;
   }
 
+  /** Records how much a claimed extraction actually stored, after the fact. */
+  public recordJobMemorySaved(input: { jobId: string; savedCount: number; now: number }): boolean {
+    assertNonNegativeInteger(input.savedCount, "savedCount");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      "UPDATE job_memory_extractions SET saved_count = ?, updated_at = ? WHERE job_id = ? AND state = 'done'",
+    ).run(input.savedCount, input.now, input.jobId).changes === 1;
+  }
+
   public failJobMemoryExtraction(input: { jobId: string; error: string; now: number }): boolean {
     assertSafeFailureSummary(input.error);
     assertNonNegativeInteger(input.now, "now");
@@ -4449,7 +4506,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   private countArmedMonitors(controllerKey: string): number {
     const row = this.db.prepare(
-      "SELECT COUNT(*) AS count FROM monitors WHERE controller_key = ? AND state = 'armed'",
+      `SELECT COUNT(*) AS count FROM monitors
+        WHERE controller_key = ? AND state = 'armed' AND system_key IS NULL`,
     ).get(controllerKey) as { count: number };
     return row.count;
   }
@@ -4622,9 +4680,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): { decayed: number; tombstoned: number } => {
       const live = this.db.prepare(
-        `SELECT id, source, confidence, use_count, last_used_at, created_at FROM memories
+        `SELECT id, source, confidence, use_count, last_used_at, created_at, curated_at FROM memories
           WHERE forgotten_at IS NULL AND superseded_by IS NULL`,
-      ).all() as Pick<MemoryRow, "id" | "source" | "confidence" | "use_count" | "last_used_at" | "created_at">[];
+      ).all() as Pick<
+        MemoryRow,
+        "id" | "source" | "confidence" | "use_count" | "last_used_at" | "created_at" | "curated_at"
+      >[];
       const update = this.db.prepare(
         "UPDATE memories SET confidence = ?, curated_at = ?, updated_at = ? WHERE id = ?",
       );
@@ -4634,12 +4695,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       let decayed = 0;
       let tombstoned = 0;
       for (const row of live) {
-        const idleMs = input.now - (row.last_used_at ?? row.created_at);
-        const next = decayedConfidence(row.confidence, idleMs);
-        if (Math.abs(next - row.confidence) > 1e-9) {
-          update.run(next, input.now, input.now, row.id);
-          decayed += 1;
-        }
+        // Decay the interval since confidence was last touched, not the whole
+        // idle span: `confidence` is already the decayed value, so re-applying
+        // the full span every pass compounds it. With a six-hour sweep that
+        // turned a 217-day half-life into nine days and deleted memories the
+        // ranking had barely begun to down-weight. Anchoring here also makes a
+        // repeat pass at the same clock a no-op.
+        const anchor = Math.max(row.curated_at ?? 0, row.last_used_at ?? 0) || row.created_at;
+        const next = decayedConfidence(row.confidence, input.now - anchor);
+        // The anchor advances on every pass, even when the value did not move,
+        // or a memory resting on the floor would keep an ancient anchor and
+        // hand the next pass an interval it has already served.
+        update.run(next, input.now, input.now, row.id);
+        if (Math.abs(next - row.confidence) > 1e-9) decayed += 1;
         const expendable = row.source === "agent" && row.use_count === 0;
         if (expendable && next <= MEMORY_TOMBSTONE_CONFIDENCE) {
           tombstone.run(input.now, input.now, input.now, row.id);

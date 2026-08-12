@@ -31,6 +31,7 @@ export type MonitorServiceDependencies = {
     | "getDelegation"
     | "settleDelegationThread"
     | "recordDelegationFired"
+    | "failDelegation"
   >;
   threads: MonitorThreads;
   clock: { now(): number };
@@ -128,18 +129,30 @@ export class MonitorService {
     let fired = false;
     for (const delegation of this.dependencies.store.listOpenDelegations(DELEGATION_BATCH)) {
       const now = this.dependencies.clock.now();
-      try {
-        await this.settleMembers(delegation, now);
-      } catch (error) {
-        this.dependencies.warn?.(
-          `Delegation ${delegation.id} could not be checked: ${redactError(error).slice(0, 200)}`,
-        );
+      // Deliberately not wrapped in a bail-out: a member whose status call
+      // always throws must not be able to hold the whole fan-out past its
+      // deadline. settleMembers absorbs each member's failure individually.
+      await this.settleMembers(delegation, now);
+      const current = this.dependencies.store.getDelegation(delegation.id);
+      if (!current || current.state !== "open") continue;
+      const expired = now - current.createdAt >= DELEGATION_JOIN_TIMEOUT_MS;
+      // A delegation the tool never finished publishing — the process died
+      // between creating it and recording its first member — would otherwise
+      // stay open forever and permanently consume one of the two slots.
+      if (current.threads.length === 0) {
+        if (expired) {
+          this.dependencies.store.failDelegation({
+            id: current.id,
+            error: "Delegation never recorded any work",
+            now,
+          });
+        }
         continue;
       }
-      const current = this.dependencies.store.getDelegation(delegation.id);
-      if (!current || current.state !== "open" || current.threads.length === 0) continue;
+      // Joining before the fan-out is sealed reports a partial result and
+      // orphans the members still being spawned.
+      if (current.sealedAt === null && !expired) continue;
       const settled = current.threads.every((member) => member.state !== "running");
-      const expired = now - current.createdAt >= DELEGATION_JOIN_TIMEOUT_MS;
       if (!settled && !expired) continue;
       // Claiming first means a crash mid-fire cannot replay the joined turn.
       if (!this.dependencies.store.recordDelegationFired({ id: current.id, now })) continue;
@@ -159,7 +172,17 @@ export class MonitorService {
   private async settleMembers(delegation: DelegationRecord, now: number): Promise<void> {
     for (const member of delegation.threads) {
       if (member.state !== "running") continue;
-      const state = settledState(await this.dependencies.threads.status(member.threadId));
+      let status: MonitorThreadStatus;
+      try {
+        status = await this.dependencies.threads.status(member.threadId);
+      } catch (error) {
+        // One unreachable member costs that member, not the whole join.
+        this.dependencies.warn?.(
+          `Delegated thread ${member.threadId} could not be checked: ${redactError(error).slice(0, 200)}`,
+        );
+        continue;
+      }
+      const state = settledState(status);
       if (state === null) continue;
       // Only a thread that finished has output worth quoting; a failed or
       // missing one is reported as such rather than given an invented summary.

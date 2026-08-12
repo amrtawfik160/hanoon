@@ -681,6 +681,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
               dependencies.store.cancelDelegation(delegation.id, dependencies.now());
               throw error;
             }
+            dependencies.store.sealDelegation({ id: delegation.id, now: dependencies.now() });
             dependencies.notify();
             return json({
               outcome: "partial",
@@ -689,18 +690,24 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
               failed: { title: task.title, reason: redactError(error).slice(0, 200) },
             });
           }
-          dependencies.store.addDelegationThread({
+          // A rejected member means the join already fired or the delegation
+          // closed; recording it as started would promise a result nobody will
+          // ever deliver.
+          if (!dependencies.store.addDelegationThread({
             delegationId: delegation.id,
             threadId,
             projectId: task.projectId,
             title: task.title,
             now: dependencies.now(),
-          });
+          })) break;
           started.push({ threadId, title: task.title, projectId: task.projectId });
         }
+        // Sealed only once every member is durably recorded, so the executor
+        // cannot join a fan-out that is still being published.
+        dependencies.store.sealDelegation({ id: delegation.id, now: dependencies.now() });
         dependencies.notify();
         return json({
-          outcome: "delegated",
+          outcome: started.length === params.tasks.length ? "delegated" : "partial",
           delegation: { id: delegation.id, instruction: delegation.instruction, threads: started },
         });
       });

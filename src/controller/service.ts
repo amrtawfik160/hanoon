@@ -394,7 +394,9 @@ export class LunaControllerService {
     if (!turn || turn.state !== "submitted" || controller.threadId === null) return false;
     const decision = evaluateSupervisor({
       toolCalls: turn.toolCalls,
-      totalTokens: turn.totalTokens,
+      // Spend for *this* turn: the reported figure counts the whole thread,
+      // which has answered every earlier message too.
+      totalTokens: Math.max(0, turn.totalTokens - (turn.tokenBaseline ?? turn.totalTokens)),
       commandFailures: turn.commandFailures,
       steersIssued: turn.supervisorSteers,
       steeredReasons: turn.supervisorReasons,
