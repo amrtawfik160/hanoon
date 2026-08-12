@@ -25,6 +25,12 @@ bb plugin types --check .
 
 The full check performs TypeScript validation, the complete Vitest suite, and a BB plugin build. The SDK check confirms the vendored plugin declarations still match the installed BB contract.
 
+## Answer-quality evaluation
+
+The deterministic suite proves the plumbing; it cannot tell you whether an answer reads the way the controller instructions promise. `npm run eval:answers -- --project <project-id>` grades golden answers against that contract using a BB thread as judge.
+
+It is deliberately outside `npm run check`: grading costs a provider turn per case, and the suite must stay runnable offline and for free. The golden cases carry the verdict a correctly calibrated judge must reach, so the rubric is checked against known-good and known-bad answers *before* it is trusted to judge a prompt change. A disagreement with a golden case exits non-zero — a rubric that misgrades its own fixtures cannot grade anything else.
+
 ## Change boundaries
 
 - Telegram ingress is I/O only: accept, authenticate, persist, and nudge. It must not spawn BB sessions or touch worktrees.

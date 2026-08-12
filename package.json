@@ -21,6 +21,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "eval:answers": "node scripts/eval-controller-answers.mjs",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
