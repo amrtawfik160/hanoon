@@ -673,21 +673,15 @@ describe("bounded text heuristics", () => {
       .toMatchObject({ outcome: "accepted" });
   });
 
-  it("does not reject process language backed by a live deferred obligation", () => {
+  it.each([
+    "I'll follow up with the measured result.",
+    "I'll investigate and follow up with the measured result.",
+    "I will get back to you when the monitor fires.",
+    "Let me follow up once the job completes.",
+  ])("accepts controller-owned concrete deferred follow-up: %s", (text) => {
     const candidate: ControllerFinalization = {
       disposition: "deferred",
-      segments: [{ type: "text", text: "I'll investigate and follow up with the measured result." }],
-      obligationRefs: ["obligation:1"],
-    };
-    expect(validateControllerFinalization(candidate, emptyFinalizationContext({
-      liveObligationRefs: new Set(["obligation:1"]),
-    }))).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("recognizes a concrete deferred follow-up after a condition", () => {
-    const candidate: ControllerFinalization = {
-      disposition: "deferred",
-      segments: [{ type: "text", text: "I'll get back to you when the monitor fires." }],
+      segments: [{ type: "text", text }],
       obligationRefs: ["obligation:1"],
     };
     expect(validateControllerFinalization(candidate, emptyFinalizationContext({
@@ -699,6 +693,11 @@ describe("bounded text heuristics", () => {
     "I'll try.",
     "I'll investigate and follow up.",
     "I'll get back to you.",
+    "I won't follow up with the measured result.",
+    "I will not follow up with the measured result.",
+    "You can follow up with the measured result.",
+    "It might follow up with the measured result.",
+    "I'll investigate, then I'll get back to you.",
   ])("rejects deferred process intent without concrete follow-up: %s", (text) => {
     const candidate: ControllerFinalization = {
       disposition: "deferred",
@@ -747,6 +746,9 @@ describe("bounded text heuristics", () => {
     "We rotated the credentials.",
     "We paid USD 500 for the service.",
     "We purchased the deployment service.",
+    "The credentials were rotated.",
+    "USD 500 was spent on the service.",
+    "The tests were completed.",
   ])("rejects unclaimed high-impact assertion: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
@@ -765,6 +767,9 @@ describe("bounded text heuristics", () => {
     "Should the package be installed?",
     "The records were not deleted.",
     "We will purchase the service after approval.",
+    "Can you confirm whether the fix is implemented?",
+    "I don't think the fix is implemented.",
+    "It seems the fix is implemented.",
   ])("does not treat non-success text as a high-impact success: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
