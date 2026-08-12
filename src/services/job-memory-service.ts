@@ -20,6 +20,7 @@ const MAX_ATTEMPTS = 2;
 // stop the agent ever learning again.
 export const EXTRACTION_TIMEOUT_MS = 30 * 60_000;
 const MAX_MEMORIES_PER_JOB = 3;
+const MAX_EXTRACTION_OUTPUT = 64 * 1024;
 const MAX_SUBJECT = 120;
 const MAX_BODY = 1_000;
 // Extracted memories are a guess about a pattern, not something the owner said,
@@ -90,7 +91,12 @@ type ParsedMemory = { kind: MemoryKind; subject: string; body: string };
  * whole extraction, and must never throw into the executor loop.
  */
 export function parseExtractedMemories(output: string): ParsedMemory[] {
-  const fenced = output.replace(/```(?:json)?/gi, " ");
+  // Thread output is unbounded and untrusted. A megabyte of it would make the
+  // replace below throw RangeError *outside* any caller's try, unwinding the
+  // executor loop; the answer we want is never past the first few hundred bytes.
+  if (typeof output !== "string") return [];
+  const bounded = output.length > MAX_EXTRACTION_OUTPUT ? output.slice(0, MAX_EXTRACTION_OUTPUT) : output;
+  const fenced = bounded.replace(/```(?:json)?/gi, " ");
   const start = fenced.indexOf("{");
   const end = fenced.lastIndexOf("}");
   if (start < 0 || end <= start) return [];

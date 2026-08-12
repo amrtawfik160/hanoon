@@ -731,6 +731,7 @@ type ControllerTurnRow = {
   supervisor_steers: number;
   supervisor_reasons: string;
   token_baseline: number | null;
+  origin: string;
   created_at: number;
   updated_at: number;
 };
@@ -1625,6 +1626,7 @@ export interface TelegramAgentStore {
     updateId: number;
     inputText: string;
     image?: ControllerImage | null;
+    origin?: "owner" | "system";
     now: number;
   }): ControllerTurnRecord;
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
@@ -2172,6 +2174,7 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     supervisorSteers: row.supervisor_steers,
     supervisorReasons: parseSupervisorReasons(row.supervisor_reasons),
     tokenBaseline: row.token_baseline,
+    origin: row.origin === "system" ? "system" : "owner",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2874,6 +2877,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     updateId: number;
     inputText: string;
     image?: ControllerImage | null;
+    origin?: "owner" | "system";
     now: number;
   }): ControllerTurnRecord {
     assertControllerKey(input.controllerKey);
@@ -2942,8 +2946,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `INSERT INTO controller_turns (
            id, telegram_update_id, controller_key, ordinal, input_text,
            image_file_id, image_file_name, image_mime_type, image_size_bytes,
-           state, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+           state, origin, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
       ).run(
         id,
         input.updateId,
@@ -2954,6 +2958,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         image?.fileName ?? null,
         image?.mimeType ?? null,
         image?.sizeBytes ?? null,
+        input.origin === "system" ? "system" : "owner",
         input.now,
         input.now,
       );
@@ -4412,6 +4417,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       `SELECT id, state, project_id FROM jobs
         WHERE state IN (${placeholders})
           AND project_id IS NOT NULL
+          -- A review-limit block is resumable: CONTINUE_REVIEW puts the job
+          -- back to reviewing. Learning from it would draw a lesson from a
+          -- live job, and enrolling it here would then bar the eventual merge
+          -- — the outcome actually worth learning from — from ever enrolling.
+          AND NOT (state = 'blocked' AND blocked_reason = 'review_limit')
           AND id NOT IN (SELECT job_id FROM job_memory_extractions)
         ORDER BY updated_at ASC LIMIT ?`,
     ).all(...outcomes, limit) as { id: string; state: string; project_id: string }[];
@@ -4549,12 +4559,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       // beliefs it contradicts rather than sitting alongside them. Only a
       // correction may do this: an ordinary restatement is not a refutation.
       if (input.kind === "correction") {
+        // No self-exclusion needed: this row is inserted after the loop, so it
+        // cannot be among the live rows being scanned.
         const live = this.db.prepare(
           `SELECT id, subject FROM memories
-            WHERE scope = ? AND id != ? AND forgotten_at IS NULL AND superseded_by IS NULL`,
-        ).all(input.scope, id) as { id: string; subject: string }[];
+            WHERE scope = ? AND forgotten_at IS NULL AND superseded_by IS NULL`,
+        ).all(input.scope) as { id: string; subject: string }[];
         const supersede = this.db.prepare(
-          "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
+          "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ? AND superseded_by IS NULL",
         );
         for (const candidate of live) {
           if (candidate.id === previous?.id) continue;
@@ -4736,7 +4748,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerKey(controllerKey);
     const row = this.db.prepare(
       `SELECT * FROM controller_turns
-        WHERE controller_key = ? AND ordinal > ?
+        WHERE controller_key = ? AND ordinal > ? AND origin = 'owner'
         ORDER BY ordinal ASC LIMIT 1`,
     ).get(controllerKey, ordinal) as ControllerTurnRow | undefined;
     return row ? parseControllerTurn(row) : null;

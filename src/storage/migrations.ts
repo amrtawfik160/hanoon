@@ -732,6 +732,10 @@ export const DELEGATION_SEAL_MIGRATIONS = [String.raw`
 ALTER TABLE delegations ADD COLUMN sealed_at INTEGER;
 `] as const;
 
+export const TURN_ORIGIN_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN origin TEXT NOT NULL DEFAULT 'owner';
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -759,4 +763,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_OVERLAY_MIGRATIONS,
   ...TURN_TOKEN_BASELINE_MIGRATIONS,
   ...DELEGATION_SEAL_MIGRATIONS,
+  ...TURN_ORIGIN_MIGRATIONS,
 ] as const;

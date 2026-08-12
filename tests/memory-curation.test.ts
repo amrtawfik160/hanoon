@@ -25,13 +25,20 @@ function fixture() {
   return { bb, store };
 }
 
-function completedTurn(store: TelegramAgentStore, updateId: number, inputText: string, now: number) {
+function completedTurn(
+  store: TelegramAgentStore,
+  updateId: number,
+  inputText: string,
+  now: number,
+  origin: "owner" | "system" = "owner",
+) {
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY,
     telegramUserId: "7",
     telegramChatId: "7",
     updateId,
     inputText,
+    origin,
     now,
   });
   const lease = store.acquireExecutorLease(`executor-${updateId}`, now, 60 * 60_000);
@@ -252,4 +259,28 @@ it("keeps an unused extracted memory alive far longer than the ranking down-weig
   }
 
   expect(store.getMemory(extracted.id)?.forgottenAt).toBeNull();
+});
+
+it("does not let a monitor firing count as the owner moving on", () => {
+  const { store } = fixture();
+  const memory = store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "canary timing",
+    body: "the canary needs two minutes", source: "owner", confidence: 0.7, now: 2_000,
+  });
+  const answered = completedTurn(store, 601, "how long does the canary take?", 2_001);
+  store.recallMemories({ scope: "owner", query: "canary", limit: 5, now: 2_002, turnId: answered.id });
+  // A scheduled monitor fires before the owner has said anything back.
+  completedTurn(store, 602, "A monitor you set has fired.", 2_003, "system");
+  const service = new MemoryCurationService({ store, clock: { now: () => 2_004 } });
+
+  expect(service.processDue()).toBe(false);
+
+  // A timer is not a verdict: the wrong memory must not be promoted by it.
+  expect(store.getMemory(memory.id)?.confidence).toBeCloseTo(0.7, 6);
+  expect(store.listUnscoredRecallTurns(10)).toHaveLength(1);
+
+  // The owner's real correction, whenever it lands, is what scores that turn.
+  completedTurn(store, 603, "never say that, it is ten minutes", 2_005);
+  expect(new MemoryCurationService({ store, clock: { now: () => 2_006 } }).processDue()).toBe(true);
+  expect(store.getMemory(memory.id)?.confidence).toBeCloseTo(0.7 - MEMORY_DEMOTION, 6);
 });

@@ -70,6 +70,9 @@ export type ControllerTurnRecord = {
   /** The thread's cumulative token total before this turn began, so spend can
    *  be measured for the turn rather than for the thread's whole lifetime. */
   tokenBaseline: number | null;
+  /** `system` marks a turn the plugin raised itself — a fired monitor or a
+   *  delegation join — which must never be read as the owner reacting. */
+  origin: "owner" | "system";
   supervisorSteers: number;
   supervisorReasons: readonly SupervisorReason[];
   createdAt: number;

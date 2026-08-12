@@ -45,6 +45,7 @@ const DELEGATION_BATCH = 10;
 // still produces an answer the same day.
 export const DELEGATION_JOIN_TIMEOUT_MS = 6 * 60 * 60_000;
 const MAX_JOINED_PROMPT = 3_500;
+const DELEGATION_SWEEP_MS = 15_000;
 // Firing enqueues an ordinary controller turn, which is keyed by Telegram update
 // id. Ids are derived from the clock so they stay above real Telegram ids
 // (~2.2e8) and keep climbing across restarts, and a counter breaks same-
@@ -67,11 +68,23 @@ function memberLine(member: DelegationThreadRecord): string {
 }
 
 function joinedPrompt(delegation: DelegationRecord): string {
-  const lines = delegation.threads.map(memberLine).join("\n");
-  const prompt = `Work you delegated has finished.\n\n` +
-    `What you said to do: ${delegation.instruction}\n\nResults:\n${lines}\n\n` +
-    "Do it now, then tell the owner what happened in one or two sentences. They did not just ask you anything — this is you following up.";
-  return prompt.length <= MAX_JOINED_PROMPT ? prompt : `${prompt.slice(0, MAX_JOINED_PROMPT - 1)}…`;
+  const head = `Work you delegated has finished.\n\nWhat you said to do: ${delegation.instruction}\n\nResults:\n`;
+  const tail = "\n\nDo it now, then tell the owner what happened in one or two sentences. They did not just ask you anything — this is you following up.";
+  // Clip the results, never the instruction or the trailer. Trimming the whole
+  // string from its end drops the directive first, leaving the agent a wall of
+  // output with no idea what to do or that this is an unprompted follow-up.
+  const budget = Math.max(0, MAX_JOINED_PROMPT - head.length - tail.length);
+  let lines = "";
+  for (const member of delegation.threads) {
+    const line = `${lines.length === 0 ? "" : "\n"}${memberLine(member)}`;
+    if (lines.length + line.length > budget) {
+      const room = budget - lines.length;
+      if (room > 1) lines += `${line.slice(0, room - 1)}…`;
+      break;
+    }
+    lines += line;
+  }
+  return `${head}${lines}${tail}`;
 }
 
 function settledState(status: MonitorThreadStatus): Exclude<DelegationThreadState, "running"> | null {
@@ -88,6 +101,9 @@ function settledState(status: MonitorThreadStatus): Exclude<DelegationThreadStat
  */
 export class MonitorService {
   private lastUpdateId = 0;
+  /** Negative infinity, not 0: the first sweep must never be gated by how
+   *  close the clock happens to be to the epoch. */
+  private lastDelegationSweep = Number.NEGATIVE_INFINITY;
 
   public constructor(private readonly dependencies: MonitorServiceDependencies) {}
 
@@ -126,6 +142,12 @@ export class MonitorService {
   public async processDueDelegations(): Promise<boolean> {
     const owner = this.dependencies.store.getOwner();
     if (!owner) return false;
+    // Paced, or an open fan-out costs eight BB round-trips per executor tick
+    // for six hours. Delegated work takes minutes; polling it every second buys
+    // nothing and competes with the owner's own turn for the same event loop.
+    const sweepAt = this.dependencies.clock.now();
+    if (sweepAt - this.lastDelegationSweep < DELEGATION_SWEEP_MS) return false;
+    this.lastDelegationSweep = sweepAt;
     let fired = false;
     for (const delegation of this.dependencies.store.listOpenDelegations(DELEGATION_BATCH)) {
       const now = this.dependencies.clock.now();
@@ -162,6 +184,9 @@ export class MonitorService {
         telegramChatId: owner.chatId,
         updateId: this.issueUpdateId(now),
         inputText: joinedPrompt(current),
+        // Not the owner speaking, so this must never be read as their verdict
+        // on the previous answer.
+        origin: "system",
         now,
       });
       fired = true;
@@ -237,6 +262,7 @@ export class MonitorService {
       telegramChatId: owner.chatId,
       updateId: this.issueUpdateId(now),
       inputText: firedPrompt(monitor, reason),
+      origin: "system",
       now,
     });
     return true;

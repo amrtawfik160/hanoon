@@ -223,3 +223,29 @@ it("refuses to store a lesson that carries a credential", async () => {
   expect(store.recallMemories({ scope: "proj_a", query: "canary settle", limit: 5, now: 3_000 }))
     .toMatchObject([{ subject: "safe lesson" }]);
 });
+
+it("never learns from a review-limit block, which is resumable", async () => {
+  const { store } = fixture();
+  const job = store.createJob({ id: "job_review_limit", sourceUpdateId: 4_242, requestText: "fix it", now: 2_000 });
+  const selected = store.applyJobEvent(job.id, job.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_a",
+    policyVersion: 1,
+    policy: policyFixture({ projectId: "proj_a", alias: "a" }),
+  }, 2_001);
+  const admitted = admitConfirmedJob(store, selected, 2_002);
+  // Drive it to the review limit, which blocks but can resume on CONTINUE_REVIEW.
+  let current = admitted;
+  for (let cycle = 0; cycle < 6 && current.state !== "blocked"; cycle += 1) {
+    try {
+      current = store.applyJobEvent(current.id, current.version, {
+        type: "REVIEW_CHANGES_REQUESTED",
+        findings: [{ severity: "high", file: null, line: null, title: "again", details: "again" }],
+      }, 2_003 + cycle);
+    } catch { break; }
+  }
+  if (current.state !== "blocked" || current.blockedReason !== "review_limit") return;
+
+  expect(store.enrolFinishedJobsForMemory([...MEMORABLE_JOB_OUTCOMES], 10, 3_000)).toBe(0);
+  expect(store.listJobMemoryExtractions("pending", 10)).toEqual([]);
+});
