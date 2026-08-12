@@ -145,6 +145,7 @@ export type BrokerHealthSnapshot = Readonly<{
   auditWritable: boolean;
   bindingCount: number;
   topologyReceiptDigest: string;
+  topologyReceiptExpiresAt: number;
 }>;
 
 export type BrokerResponseEnvelope = Readonly<{
@@ -236,7 +237,7 @@ The doctor prints no certificate, vault id, item id, token status detail that re
 
 Readiness is conjunctive. A failed check prevents `telegram_agent_access_verify` execution. A transient runtime failure fails the call closed and updates health; it does not remove historical receipts.
 
-BB does not currently expose a read-only authorization-introspection API that can prove the controller and worker identities lack plugin administration. Before isolated mode is enabled, the operator runs the versioned negative probes from those exact identities, reviews the secret-free acceptance report on the protected control plane, and installs its SHA-256 digest in both the broker installation policy and Hanoon settings. `broker.health` returns that digest and Hanoon requires an exact match. A digest match binds the reviewed operational evidence; it does not excuse a missing or failed probe. A BB version, identity, host assignment, endpoint, trust-root, or policy change invalidates the report and returns the credential subsystem to `unsafe_topology` until the probes are rerun.
+BB does not currently expose a read-only authorization-introspection API that can prove the controller and worker identities lack plugin administration. Before isolated mode is enabled, the operator runs the versioned negative probes from those exact identities, reviews the secret-free acceptance report on the protected control plane, and installs its SHA-256 digest and expiry in both the broker installation policy and Hanoon settings. `broker.health` returns both values and Hanoon requires an exact match and an unexpired report. Version 1 caps validity at 30 days. A digest match binds the reviewed operational evidence; it does not excuse a missing or failed probe. A BB version, identity, host assignment, endpoint, trust-root, or policy change invalidates the report immediately and returns the credential subsystem to `unsafe_topology` until the probes are rerun.
 
 ## Configuration
 
@@ -246,6 +247,7 @@ Hanoon adds these settings:
 - `credentialBrokerEndpoint`: fixed HTTPS URL, non-secret;
 - `credentialBrokerInstallationId`: fixed opaque id, non-secret;
 - `credentialBrokerTopologyReceiptDigest`: SHA-256 of the current reviewed topology acceptance report, non-secret;
+- `credentialBrokerTopologyReceiptExpiresAt`: expiry from the same report as an epoch-millisecond integer, non-secret;
 - `credentialBrokerClientCertificate`: public certificate string;
 - `credentialBrokerClientKey`: secret string;
 - `credentialBrokerCaCertificate`: public certificate string when a private CA is used.
