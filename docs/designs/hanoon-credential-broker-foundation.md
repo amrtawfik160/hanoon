@@ -165,6 +165,7 @@ export type BrokerResponseEnvelope = Readonly<{
     | "result_ambiguous"
     | null;
   retryable: boolean;
+  retryAfterMs: number | null;
   receiptId: string | null;
   health: BrokerHealthSnapshot | null;
   bindings: readonly CredentialBindingMetadata[];
@@ -174,7 +175,7 @@ export type BrokerResponseEnvelope = Readonly<{
 
 Unknown fields, schema versions, operations, result values, failure classes, health fields, or binding fields fail response validation. A successful `broker.health` response has `outcome: "succeeded"`, `result: "ready"`, one health snapshot, a non-null receipt, and every secret-free binding for the authenticated installation. The foundation caps an installation at 100 bindings, so reconciliation is complete rather than silently truncated. The broker reads those bindings from its policy store; it does not search or list the external vault. Hanoon reconciles the returned metadata into its local projection.
 
-A valid verification has `outcome: "succeeded"`, `result: "valid"`, and a non-null receipt. A missing item or field, empty value, or value outside the configured bound has `outcome: "failed"`, `result: "invalid"`, `failureClass: "credential_invalid"`, `retryable: false`, and a non-null audit receipt. Transport, policy, provider, authentication, and persistence failures have `result: null`. Every non-health response carries `health: null` and `bindings: []`; a failed health response does too. A timeout or unparseable response maps to `result_ambiguous`; Hanoon never retries it blindly under a new idempotency key.
+A valid verification has `outcome: "succeeded"`, `result: "valid"`, and a non-null receipt. A missing item or field, empty value, or value outside the configured bound has `outcome: "failed"`, `result: "invalid"`, `failureClass: "credential_invalid"`, `retryable: false`, and a non-null audit receipt. Transport, policy, provider, authentication, and persistence failures have `result: null`. `retryAfterMs` is non-null only for a retryable provider rate limit or outage, and is bounded from 1,000 through 300,000 milliseconds. Every non-health response carries `health: null` and `bindings: []`; a failed health response does too. A timeout or unparseable response maps to `result_ambiguous`; Hanoon never retries it blindly under a new idempotency key.
 
 ### Idempotency and audit
 
