@@ -2001,7 +2001,9 @@ function controllerProjector(value: ReturnType<typeof fixture>): ControllerEvide
 function registerEvidenceTools(
   value: ReturnType<typeof fixture>,
   evidenceProjector: Pick<ControllerEvidenceProjector, "reconcile">,
+  maxSeq = 0,
 ): void {
+  value.harness.sdk.stub("threads.timeline", async () => ({ maxSeq }));
   registerControllerTools(value.bb, {
     store: value.store,
     sdk: value.bb.sdk,
@@ -2078,6 +2080,23 @@ it("accepts through the special finalizer and makes retries projector-free", asy
   expect(value.store.listControllerEvidence(value.turn.id, 128)).toEqual([]);
 });
 
+it("fails closed when the evidence projector misses the fixed native high-water", async () => {
+  const value = fixture({ active: true });
+  registerEvidenceTools(value, { reconcile: vi.fn(async () => ({
+    outcome: "reconciled" as const,
+    reconciliationIncomplete: null,
+    fromSeq: 0,
+    throughSeq: 0,
+    targetSeq: 0,
+  })) }, 1);
+
+  await expect(value.harness.behavior.callAgentTool(
+    "telegram_agent_turn_evidence",
+    {},
+    controllerToolContext,
+  )).rejects.toThrow(/fence_lost|turn_missing/);
+});
+
 it.each(["page_cap", "source_gap"] as const)(
   "does not consume a revision when finalizer reconciliation ends at %s",
   async (reconciliationIncomplete) => {
@@ -2088,7 +2107,7 @@ it.each(["page_cap", "source_gap"] as const)(
       fromSeq: 0,
       throughSeq: 0,
       targetSeq: 1,
-    })) });
+    })) }, 1);
 
     await expect(value.harness.behavior.callAgentTool(
       "telegram_agent_respond",
@@ -2146,12 +2165,12 @@ it("persists the evidence-limit rejection after limit-exceeded reconciliation", 
     "UPDATE controller_turns SET evidence_limit_exceeded_at = ? WHERE id = ?",
   ).run(10_100, value.turn.id);
   registerEvidenceTools(value, { reconcile: vi.fn(async () => ({
-    outcome: "limit_exceeded" as const,
-    reconciliationIncomplete: null,
-    fromSeq: 0,
-    throughSeq: 0,
-    targetSeq: 1,
-  })) });
+      outcome: "limit_exceeded" as const,
+      reconciliationIncomplete: null,
+      fromSeq: 0,
+      throughSeq: 0,
+      targetSeq: 1,
+    })) }, 1);
 
   expect(JSON.parse(await value.harness.behavior.callAgentTool(
     "telegram_agent_respond",
@@ -2207,7 +2226,7 @@ it("authorizes, reconciles before listing, and uses the injected projector witho
       targetSeq: 1,
     };
   });
-  registerEvidenceTools(value, { reconcile });
+  registerEvidenceTools(value, { reconcile }, 1);
   const signal = new AbortController().signal;
 
   const listed = evidenceIndex(await value.harness.behavior.callAgentTool(
@@ -2258,7 +2277,7 @@ it("reconciles a Hanoon native tool item without recording it a second time", as
     },
   };
   stubControllerEvidenceSdk(value.harness, [row]);
-  registerEvidenceTools(value, controllerProjector(value));
+  registerEvidenceTools(value, controllerProjector(value), 1);
 
   const listed = evidenceIndex(await value.harness.behavior.callAgentTool(
     "telegram_agent_turn_evidence",
@@ -2339,7 +2358,7 @@ it("fails closed when one complete valid evidence descriptor cannot fit", async 
 it("reports source-gap reconciliation and the durable evidence cap without claiming catch-up", async () => {
   const sourceGap = fixture({ active: true });
   stubControllerEvidenceSdk(sourceGap.harness, [], 1);
-  registerEvidenceTools(sourceGap, controllerProjector(sourceGap));
+  registerEvidenceTools(sourceGap, controllerProjector(sourceGap), 1);
   expect(evidenceIndex(await sourceGap.harness.behavior.callAgentTool(
     "telegram_agent_turn_evidence",
     {},
@@ -2377,7 +2396,7 @@ it("reports source-gap reconciliation and the durable evidence cap without claim
     reconciliationIncomplete: null,
     truncated: true,
   });
-  expect(capped.harness.inspection.sdk.calls).toEqual([]);
+  expect(capped.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(1);
 });
 
 it("rejects unknown evidence-index parameters before authorization or reconciliation", async () => {

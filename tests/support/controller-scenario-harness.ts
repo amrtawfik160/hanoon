@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type { ControllerAdapter } from "../../src/controller/bb-controller";
 import { LunaControllerService } from "../../src/controller/service";
-import { registerControllerTools } from "../../src/controller/tools";
+import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../../src/controller/tools";
+import { ControllerEvidenceProjector } from "../../src/controller/evidence-projector";
 import {
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
@@ -151,9 +152,31 @@ async function runScenario(
   const lease = store.acquireExecutorLease(executionOwnerId, FIXTURE_NOW, 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
   const signal = AbortSignal.timeout(2_000);
+  harness.sdk.stub("threads.get", async () => ({
+    id: "thr_fixed_controller",
+    projectId: "proj_fixed",
+    environmentId: "env_fixed_controller",
+  }));
+  harness.sdk.stub("environments.get", async () => ({
+    id: "env_fixed_controller",
+    projectId: "proj_fixed",
+    hostId: "host_fixed",
+    path: "/tmp/hanoon-controller-scenario",
+    status: "ready",
+    workspaceProvisionType: "personal",
+  }));
+  harness.sdk.stub("threads.timeline", async () => ({ maxSeq: 0 }));
+  harness.sdk.stub("threads.events.list", async () => []);
+  const evidenceProjector = new ControllerEvidenceProjector({
+    sdk: bb.sdk,
+    store,
+    clock: { now: () => FIXTURE_NOW },
+    hanoonToolNames: CONTROLLER_TOOL_NAMES,
+  });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
+    evidenceProjector,
     threadOperations: { request: async () => { throw new Error("thread operations are not part of this baseline"); } },
     health: () => ({ status: "ok" }),
     notify: () => undefined,
@@ -199,7 +222,7 @@ async function runScenario(
     finalizationAccepted = true;
   };
   const adapter = scriptedAdapter(observeToolCall, finalizeTurn);
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => FIXTURE_NOW } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => FIXTURE_NOW } });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY,
     telegramUserId: OWNER_ID,

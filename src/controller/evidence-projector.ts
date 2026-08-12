@@ -430,6 +430,7 @@ export class ControllerEvidenceProjector {
     turn: ControllerTurnRecord,
     fence: ControllerLeaseFence,
     signal: AbortSignal,
+    immutableHighWater: number,
   ): Promise<ControllerEvidenceReconciliation> {
     const initial = this.currentTurn(controller, turn.id, fence);
     if (!this.matchesSubmittedTurn(turn, controller, fence) || initial.outcome !== "ready") {
@@ -438,7 +439,10 @@ export class ControllerEvidenceProjector {
         : unavailableResult(initial, turn.evidenceEventSeq);
     }
     signal.throwIfAborted();
-    const target = await this.snapshotTarget(controller, signal);
+    const target = await this.snapshotTarget(controller, signal, immutableHighWater);
+    if (target.targetSeq < initial.turn.evidenceEventSeq) {
+      return unavailableResult({ outcome: "stale", turn: initial.turn }, initial.turn.evidenceEventSeq);
+    }
     return await this.reconcileToTarget({
       controller,
       turnId: turn.id,
@@ -513,18 +517,14 @@ export class ControllerEvidenceProjector {
   private async snapshotTarget(
     controller: ControllerThreadRecord,
     signal: AbortSignal,
+    immutableHighWater: number,
   ): Promise<Pick<ReconciliationTarget, "projectRoot" | "targetSeq">> {
-    const projectRoot = await this.projectRoot(controller, signal);
-    signal.throwIfAborted();
-    const timeline = await this.dependencies.sdk.threads.timeline({
-      threadId: controller.threadId!,
-      summaryOnly: "true",
-      signal,
-    });
-    if (!validSequence(timeline.maxSeq)) {
+    if (!validSequence(immutableHighWater)) {
       throw new ControllerEvidenceProjectorError("source_event_invalid");
     }
-    return { projectRoot, targetSeq: timeline.maxSeq };
+    const projectRoot = await this.projectRoot(controller, signal);
+    signal.throwIfAborted();
+    return { projectRoot, targetSeq: immutableHighWater };
   }
 
   private async reconcileToTarget(

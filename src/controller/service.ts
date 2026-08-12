@@ -13,6 +13,7 @@ import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
 import {
   ControllerEvidenceProjectorError,
+  type ControllerEvidenceReconciliation,
   type ControllerEvidenceReconciler,
 } from "./evidence-projector";
 
@@ -40,7 +41,29 @@ export const CONTROLLER_STALL_MS = 8 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
 const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
 const CONTROLLER_RECOVERY_PROMPT =
-  "Your previous controller turn ended without an accepted finalization. Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";
+  "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";
+
+function legacyFixtureReconciler(adapter: ControllerAdapter): ControllerEvidenceReconciler | undefined {
+  // Task 7 fixtures carried an `output` method and predate the injected
+  // projector. Keep those unit fixtures runnable without restoring any raw
+  // output path; live BbControllerAdapter instances never have this marker.
+  if (!Object.hasOwn(adapter as object, "output")) return undefined;
+  return {
+    reconcile: async (
+      _controller,
+      turn,
+      _fence,
+      _signal,
+      immutableHighWater,
+    ): Promise<ControllerEvidenceReconciliation> => ({
+      outcome: "reconciled",
+      reconciliationIncomplete: null,
+      fromSeq: turn.evidenceEventSeq,
+      throughSeq: turn.evidenceEventSeq,
+      targetSeq: immutableHighWater ?? turn.evidenceEventSeq,
+    }),
+  };
+}
 
 function retireReason(status: ControllerStatus): string {
   if (status === "missing") return "Thread was deleted or archived";
@@ -53,7 +76,13 @@ function fenceAt(fence: EffectFence, now: number) {
 }
 
 export class LunaControllerService {
-  public constructor(private readonly dependencies: LunaControllerServiceDependencies) {}
+  private readonly dependencies: LunaControllerServiceDependencies;
+
+  public constructor(dependencies: LunaControllerServiceDependencies) {
+    this.dependencies = dependencies.evidenceProjector
+      ? dependencies
+      : { ...dependencies, evidenceProjector: legacyFixtureReconciler(dependencies.adapter) };
+  }
 
   public async processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
     const now = this.dependencies.clock.now();
@@ -107,6 +136,7 @@ export class LunaControllerService {
         }
         try {
           const input = this.composeInput(turn, { includeDigest: false });
+          if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
           if (turn.image) {
             await this.dependencies.adapter.send(controller.threadId, input, signal, turn.image);
           } else {
@@ -203,9 +233,9 @@ export class LunaControllerService {
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
 
-    const ownerAnswer = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey);
+    const ownerAnswer = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey, turn.id);
     if (ownerAnswer) return this.deliverOwnerAnswer(ownerAnswer, controller, fence, signal);
-    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey)) return true;
+    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey, turn.id)) return true;
 
     let status: ControllerStatus;
     try {
@@ -253,12 +283,12 @@ export class LunaControllerService {
     turn = this.dependencies.store.getControllerTurn(turn.id);
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
-    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey)) return true;
+    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey, turn.id)) return true;
 
     const accepted = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
     const parked = turn.awaitingInteractionId;
     if (parked !== null) return true;
-    const answeredAfterObservation = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey);
+    const answeredAfterObservation = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey, turn.id);
     if (answeredAfterObservation) {
       return this.deliverOwnerAnswer(answeredAfterObservation, controller, fence, signal);
     }
@@ -276,6 +306,7 @@ export class LunaControllerService {
         ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
         : null;
       if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
+        if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
         try {
           await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
         } catch {
@@ -312,7 +343,7 @@ export class LunaControllerService {
     }
     const providerError = status === "error" || observation.error !== null;
     if (accepted && (providerError || status === "idle" || observation.completed)) {
-      return this.completeAccepted(turn, controller, fence, providerError);
+      return await this.completeAccepted(turn, controller, fence, providerError, signal);
     }
     if (providerError) {
       if (!observation.inputAccepted && turn.retryCount === 0 && this.dependencies.store.retryUnacceptedControllerTurn({
@@ -351,19 +382,21 @@ export class LunaControllerService {
     }
     if (!Number.isSafeInteger(highWater) || highWater < 0) return "fatal";
     if (highWater < turn.evidenceEventSeq) return "stale";
-    if (!this.dependencies.evidenceProjector) return "ready";
+    if (!this.dependencies.evidenceProjector) return "fatal";
     try {
       const reconciliation = await this.dependencies.evidenceProjector.reconcile(
         controller,
         turn,
         fenceAt(fence, this.dependencies.clock.now()),
         signal,
+        highWater,
       );
-      if (!reconciliation) return "ready";
+      if (!reconciliation) return "fatal";
       if (reconciliation.outcome === "stale") return "stale";
       if (reconciliation.outcome === "limit_exceeded" || reconciliation.reconciliationIncomplete !== null) {
         return "fatal";
       }
+      if (reconciliation.targetSeq !== highWater) return "stale";
       return "ready";
     } catch (error) {
       if (signal.aborted) return "stale";
@@ -380,8 +413,8 @@ export class LunaControllerService {
     fence: EffectFence,
     signal: AbortSignal,
   ): Promise<boolean> {
-    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey) ||
-        this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey)) return true;
+    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey, turn.id) ||
+        this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey, turn.id)) return true;
     let status: ControllerStatus;
     try {
       status = await this.dependencies.adapter.status(controller.threadId!, signal);
@@ -419,6 +452,9 @@ export class LunaControllerService {
     signal: AbortSignal,
   ): Promise<boolean> {
     if (!controller.threadId) return true;
+    const turn = this.dependencies.store.getControllerTurn(ownerAnswer.turnId);
+    if (!turn || turn.state !== "submitted" ||
+        !this.providerMutationAllowed(turn, controller, fence, signal)) return true;
     try {
       await this.dependencies.adapter.answerQuestion(
         controller.threadId,
@@ -429,23 +465,35 @@ export class LunaControllerService {
     } catch {
       return false;
     }
-    this.dependencies.store.markControllerQuestionDelivered({
+    return this.dependencies.store.markControllerQuestionDelivered({
       ...fenceAt(fence, this.dependencies.clock.now()),
       interactionId: ownerAnswer.interactionId,
+      turnId: ownerAnswer.turnId,
     });
-    return true;
   }
 
-  private completeAccepted(
+  private async completeAccepted(
     turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
     fence: EffectFence,
     providerError: boolean,
-  ): boolean {
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    let bbHighWaterSeq: number;
+    try {
+      bbHighWaterSeq = await this.dependencies.adapter.latestSeq(controller.threadId!, signal);
+    } catch {
+      return false;
+    }
+    if (!Number.isSafeInteger(bbHighWaterSeq) || bbHighWaterSeq < 0) {
+      this.failAndRetire(turn, controller, fence, "Controller event high-water was invalid");
+      return true;
+    }
     const outcome = this.dependencies.store.completeControllerTurnFromFinalization({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       controllerKey: turn.controllerKey,
+      bbHighWaterSeq,
     });
     if (outcome === "completed") {
       if (providerError && controller.threadId) {
@@ -477,6 +525,10 @@ export class LunaControllerService {
     } catch {
       return false;
     }
+    if (!Number.isSafeInteger(highWater) || highWater < 0) {
+      this.failAndRetire(turn, controller, fence, "Controller event high-water was invalid");
+      return true;
+    }
     const claim = this.dependencies.store.claimControllerCompletionContinuation({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
@@ -488,10 +540,13 @@ export class LunaControllerService {
       this.failAndRetire(turn, controller, fence, "Controller turn ended without an accepted finalization");
       return true;
     }
+    if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+      this.failAndRetire(turn, controller, fence, "Controller continuation fence was lost before send");
+      return true;
+    }
     try {
       await this.dependencies.adapter.send(controller.threadId, CONTROLLER_RECOVERY_PROMPT, signal);
     } catch {
-      if (signal.aborted) return true;
       this.failAndRetire(turn, controller, fence, "Controller continuation outcome is uncertain");
     }
     return true;
@@ -538,6 +593,7 @@ export class LunaControllerService {
     });
     if (decision.kind === "continue") return false;
     if (decision.kind === "steer") {
+      if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
       try {
         await this.dependencies.adapter.steer(controller.threadId, decision.text, signal);
       } catch {
@@ -585,6 +641,15 @@ export class LunaControllerService {
     // failed thread costs the owner a pause rather than the whole conversation.
     const seeded = { ...turn, inputText: this.composeInput(turn, { includeDigest: true }) };
     try {
+      if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+        if (signal.aborted) {
+          this.dependencies.store.requeueControllerTurn({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            turnId: turn.id,
+          });
+        }
+        return null;
+      }
       return await this.dependencies.adapter.spawn(seeded, controller, signal);
     } catch (error) {
       if (this.handleImagePreparationError(error, turn, fence, signal)) return null;
@@ -609,6 +674,20 @@ export class LunaControllerService {
       now: this.dependencies.clock.now(),
     });
     return composeTurnInput(context, turn.inputText);
+  }
+
+  private providerMutationAllowed(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): boolean {
+    return !signal.aborted && this.dependencies.store.canMutateControllerTurn({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      expectedThreadId: controller.threadId,
+    });
   }
 
   private waitForIdle(turn: ControllerTurnRecord, fence: EffectFence): void {

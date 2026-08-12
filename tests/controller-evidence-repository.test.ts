@@ -605,6 +605,58 @@ it("records late native evidence after an accepted finalization and advances its
   expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 1 });
 });
 
+it("persists the accepted evidence seal and immutable BB event seal separately", () => {
+  const { store, turn, fence, reopen } = submittedControllerFixture({
+    turnColumns: { evidenceEventSeq: 4 },
+  });
+  const accepted = store.proposeControllerFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbEventHighWaterSeq: 4,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "sealed answer" }],
+      obligationRefs: [],
+    },
+  });
+
+  expect(accepted.outcome).toBe("accepted");
+  if (accepted.outcome !== "accepted") return;
+  expect(accepted.finalization).toMatchObject({ evidenceHighWaterId: 0, bbEventHighWaterSeq: 4 });
+  expect(reopen().getAcceptedControllerFinalization(turn.id)).toMatchObject({
+    evidenceHighWaterId: 0,
+    bbEventHighWaterSeq: 4,
+  });
+});
+
+it("rejects completion when the BB event high-water advances after acceptance", () => {
+  const { store, turn, fence } = submittedControllerFixture({
+    turnColumns: { evidenceEventSeq: 4 },
+  });
+  const accepted = store.proposeControllerFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbEventHighWaterSeq: 4,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "must not escape" }],
+      obligationRefs: [],
+    },
+  });
+  expect(accepted.outcome).toBe("accepted");
+
+  expect(store.completeControllerTurnFromFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbHighWaterSeq: 5,
+  })).toBe("evidence_advanced");
+  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
+});
+
 it("exposes the fixed proof-kind vocabulary once from controller models", async () => {
   const models = await import("../src/controller/models");
   expect(models.CONTROLLER_PROOF_KINDS).toEqual([

@@ -42,13 +42,13 @@ export type ControllerStreamPhase =
   | "failed";
 
 export const CONTROLLER_PHASE_TEXT: Readonly<Record<ControllerStreamPhase, string>> = {
-  queued: "",
-  connecting: "Connecting to Luna Max…",
-  thinking: "Luna Max is thinking…",
-  using_tools: "Luna Max is using tools…",
-  responding: "Luna Max is responding…",
-  complete: "",
-  failed: "",
+  queued: "Hanoon is queued…",
+  connecting: "Hanoon is connecting…",
+  thinking: "Hanoon is thinking…",
+  using_tools: "Hanoon is using tools…",
+  responding: "Hanoon is responding…",
+  complete: "Hanoon completed.",
+  failed: "Hanoon failed.",
 };
 
 export type ControllerThreadRecord = {

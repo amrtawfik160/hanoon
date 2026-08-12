@@ -116,7 +116,7 @@ it("enqueues Telegram controller turns idempotently and rejects changed replay i
     dispatchAfterSeq: 0,
     retryCount: 0,
     bbEventSeq: 0,
-    streamText: "",
+    streamText: "Hanoon is queued…",
     telegramMessageId: null,
     streamPhase: "queued",
     evidenceEventSeq: 0,
@@ -280,7 +280,7 @@ it("keeps one durable Telegram message id from controller placeholder through li
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     messageId: null,
     status: "pending",
-    payload: { text: "Connecting to Luna Max…" },
+    payload: { text: "Hanoon is connecting…" },
   });
 
   const leased = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
@@ -298,7 +298,7 @@ it("keeps one durable Telegram message id from controller placeholder through li
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     messageId: 501,
     status: "pending",
-    payload: { text: "Luna Max is responding…" },
+    payload: { text: "Hanoon is responding…" },
   });
   const edit = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
   expect(edit).toHaveLength(1);

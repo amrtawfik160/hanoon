@@ -1311,8 +1311,8 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), "Connecting to Luna Max…");
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), "Luna Max is responding…");
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), "Hanoon is connecting…");
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), "Hanoon is responding…");
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBeGreaterThan(0);
     expect(sendMessage).not.toHaveBeenCalled();
@@ -1320,7 +1320,7 @@ describe("singleton job executor", () => {
     expect(store.getOutbox("controller:controller-turn-900:reply")).toMatchObject({
       status: "sent",
       messageId: null,
-      payload: { text: "Luna Max is responding…" },
+      payload: { text: "Hanoon is responding…" },
     });
   });
 
@@ -1362,7 +1362,7 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledOnce();
-    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "Connecting to Luna Max…");
+    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "Hanoon is connecting…");
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage).toHaveBeenCalledWith("7", {
       text: "Final answer",

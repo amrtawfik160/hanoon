@@ -1682,6 +1682,8 @@ export interface TelegramAgentStore {
   completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
+    /** The provider high-water re-read immediately before the atomic completion. */
+    bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced";
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
   requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
@@ -1760,9 +1762,14 @@ export interface TelegramAgentStore {
   getAnsweredThreadInteraction(): ThreadInteractionDelivery | null;
   markThreadInteractionDelivered(interactionId: string, now: number): boolean;
   discardThreadInteractions(threadId: string, keep: readonly string[]): number;
-  getPendingControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
-  getAnsweredControllerQuestion(controllerKey: string): ControllerQuestionRecord | null;
-  markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string }): boolean;
+  getPendingControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null;
+  getAnsweredControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null;
+  markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string; turnId?: string }): boolean;
+  canMutateControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId?: string | null;
+  }): boolean;
   getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null;
   recordControllerSteerFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
   foldControllerTurnIntoRunning(input: ControllerLeaseFence & { turnId: string }): boolean;
@@ -3194,13 +3201,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
+    bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced" {
     this.assertControllerMutation(input);
     assertControllerKey(input.controllerKey);
     return this.db.transaction(() => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale" as const;
       const turn = this.db.prepare(
-        `SELECT turn.controller_key, turn.ordinal, turn.input_text,
+        `SELECT turn.controller_key, turn.ordinal, turn.input_text, turn.evidence_event_seq,
                 turn.accepted_finalization_id, turn.evidence_limit_exceeded_at,
                 controller.telegram_chat_id
            FROM controller_turns AS turn
@@ -3221,6 +3229,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         controller_key: string;
         ordinal: number;
         input_text: string;
+        evidence_event_seq: number;
         accepted_finalization_id: number;
         evidence_limit_exceeded_at: number | null;
         telegram_chat_id: string;
@@ -3229,6 +3238,21 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const accepted = this.controllerEvidenceRepository.getAcceptedFinalization(input.turnId);
       if (!accepted || accepted.id !== turn.accepted_finalization_id || accepted.consumedAt !== null) {
         return "stale" as const;
+      }
+      if (accepted.candidate.disposition === "needs_owner" && this.db.prepare(
+        `SELECT 1 FROM controller_questions
+          WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered')
+          LIMIT 1`,
+      ).get(input.turnId, input.controllerKey)) {
+        return "stale" as const;
+      }
+      if (accepted.bbEventHighWaterSeq === null) return "evidence_advanced" as const;
+      const completionHighWater = input.bbHighWaterSeq;
+      if (
+          !Number.isSafeInteger(completionHighWater) || completionHighWater < 0 ||
+          completionHighWater !== accepted.bbEventHighWaterSeq ||
+          turn.evidence_event_seq !== accepted.bbEventHighWaterSeq) {
+        return "evidence_advanced" as const;
       }
       const laterEvidence = this.db.prepare(
         "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id > ? LIMIT 1",
@@ -4006,25 +4030,60 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   /** An answer the owner has given that BB has not been told about yet. */
-  public getAnsweredControllerQuestion(controllerKey: string): ControllerQuestionRecord | null {
-    return this.readControllerQuestion(controllerKey, "answered");
+  public getAnsweredControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null {
+    return this.readControllerQuestion(controllerKey, "answered", turnId);
   }
 
-  public getPendingControllerQuestion(controllerKey: string): ControllerQuestionRecord | null {
-    return this.readControllerQuestion(controllerKey, "pending");
+  public getPendingControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null {
+    return this.readControllerQuestion(controllerKey, "pending", turnId);
   }
 
   // Delivery is recorded separately from the answer so a crash between the two
   // re-sends the answer rather than losing it.
-  public markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string }): boolean {
+  public markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string; turnId?: string }): boolean {
     assertControllerIdentifier(input.interactionId, "interactionId");
     this.assertLeaseIdentity("controller-question", input.ownerId, input.generation, input.now);
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      return this.db.prepare(
-        "UPDATE controller_questions SET state = 'delivered' WHERE interaction_id = ? AND state = 'answered'",
-      ).run(input.interactionId).changes === 1;
+      const delivered = input.turnId === undefined
+        ? this.db.prepare(
+          "UPDATE controller_questions SET state = 'delivered' WHERE interaction_id = ? AND state = 'answered'",
+        ).run(input.interactionId)
+        : this.db.prepare(
+          "UPDATE controller_questions SET state = 'delivered' WHERE interaction_id = ? AND turn_id = ? AND state = 'answered'",
+        ).run(input.interactionId, input.turnId);
+      return delivered.changes === 1;
     }).immediate();
+  }
+
+  public canMutateControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId?: string | null;
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    if (input.expectedThreadId !== undefined && input.expectedThreadId !== null) {
+      assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    }
+    if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+    const row = this.db.prepare(
+      `SELECT 1 FROM controller_turns AS turn
+         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+        WHERE turn.id = ? AND turn.controller_key = ?
+          AND ((turn.state = 'submitted' AND controller.state = 'active') OR
+               (turn.state = 'dispatching' AND controller.state IN ('active', 'pending_spawn')))
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND ((? IS NULL AND controller.bb_thread_id IS NULL) OR controller.bb_thread_id = ?)` ,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.expectedThreadId ?? null,
+      input.expectedThreadId ?? null,
+    );
+    return row !== undefined;
   }
 
   // A question outlives its turn only on paper. Once that turn is gone the
@@ -4033,14 +4092,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readControllerQuestion(
     controllerKey: string,
     state: ControllerQuestionRow["state"],
+    turnId?: string,
   ): ControllerQuestionRecord | null {
     assertControllerKey(controllerKey);
     const row = this.db.prepare(
       `SELECT question.* FROM controller_questions AS question
          JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
         WHERE question.controller_key = ? AND question.state = ?
+          AND (? IS NULL OR question.turn_id = ?)
         ORDER BY question.asked_at DESC LIMIT 1`,
-    ).get(controllerKey, state) as ControllerQuestionRow | undefined;
+    ).get(controllerKey, state, turnId ?? null, turnId ?? null) as ControllerQuestionRow | undefined;
     if (!row) return null;
     return {
       interactionId: row.interaction_id,
@@ -4200,6 +4261,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     leaseMs?: number;
   }): boolean {
     this.assertControllerMutation(input);
+    const accepted = this.controllerEvidenceRepository.getAcceptedFinalization(input.turnId);
+    if (accepted) {
+      if (accepted.bbEventHighWaterSeq === null) return false;
+      const turn = this.getControllerTurn(input.turnId);
+      if (!turn) return false;
+      return this.completeControllerTurnFromFinalization({
+        ownerId: input.ownerId,
+        generation: input.generation,
+        now: input.now,
+        turnId: input.turnId,
+        controllerKey: turn.controllerKey,
+        bbHighWaterSeq: accepted.bbEventHighWaterSeq,
+      }) === "completed";
+    }
     assertControllerText(input.responseText, "controller response");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;

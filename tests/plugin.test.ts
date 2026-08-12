@@ -276,7 +276,7 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
     await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
       status: "sent",
       messageId: null,
-      payload: { text: "Connecting to Luna Max…" },
+      payload: { text: "Hanoon is connecting…" },
     }));
   } finally {
     run.controller.abort();

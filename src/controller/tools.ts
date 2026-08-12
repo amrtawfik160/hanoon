@@ -98,6 +98,22 @@ type EvidenceToolExecution = Readonly<{
   context: PluginAgentToolContext;
 }>;
 
+async function immutableNativeHighWater(
+  dependencies: ToolDependencies,
+  threadId: string,
+  signal: AbortSignal,
+): Promise<number> {
+  const timeline = await dependencies.sdk.threads.timeline({
+    threadId,
+    summaryOnly: "true",
+    signal,
+  });
+  if (!Number.isSafeInteger(timeline.maxSeq) || timeline.maxSeq < 0) {
+    throw new Error("Controller event high-water was invalid");
+  }
+  return timeline.maxSeq;
+}
+
 function evidenceIndexDescriptor(row: ControllerEvidenceRecord): EvidenceIndexDescriptor {
   return {
     ref: row.ref,
@@ -164,9 +180,14 @@ function evidenceAuthorization(
 
 function readableReconciliation(
   reconciliation: ControllerEvidenceReconciliation,
+  immutableHighWater: number,
 ): void {
   if (reconciliation.outcome === "stale") {
     throw new ControllerCapabilityAuthorizationError("turn_missing");
+  }
+  if (reconciliation.outcome === "limit_exceeded") return;
+  if (reconciliation.targetSeq !== immutableHighWater) {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
   }
 }
 
@@ -195,13 +216,19 @@ async function executeEvidenceIndex(request: EvidenceToolExecution): Promise<str
   if (!dependencies.evidenceProjector) {
     throw new ControllerCapabilityAuthorizationError("policy_unreadable");
   }
+  const immutableHighWater = await immutableNativeHighWater(
+    dependencies,
+    authorized.controller.threadId!,
+    context.signal,
+  );
   const reconciliation = await dependencies.evidenceProjector.reconcile(
     authorized.controller,
     authorized.turn,
     authorized.fence,
     context.signal,
+    immutableHighWater,
   );
-  readableReconciliation(reconciliation);
+  readableReconciliation(reconciliation, immutableHighWater);
   return currentEvidenceIndex(request, authorized, reconciliation);
 }
 
@@ -222,11 +249,17 @@ async function executeControllerFinalizer(
   if (!dependencies.evidenceProjector) {
     throw new ControllerCapabilityAuthorizationError("policy_unreadable");
   }
+  const immutableHighWater = await immutableNativeHighWater(
+    dependencies,
+    authorized.controller.threadId!,
+    context.signal,
+  );
   const reconciliation = await dependencies.evidenceProjector.reconcile(
     authorized.controller,
     authorized.turn,
     authorized.fence,
     context.signal,
+    immutableHighWater,
   );
   if (reconciliation.outcome === "stale") {
     throw new ControllerCapabilityAuthorizationError("fence_lost");
@@ -236,6 +269,9 @@ async function executeControllerFinalizer(
       `Controller evidence reconciliation is incomplete: ${reconciliation.reconciliationIncomplete}`,
     );
   }
+  if (reconciliation.targetSeq !== immutableHighWater) {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
+  }
   const current = evidenceAuthorization(dependencies, descriptor, context);
   if (current.turn.id !== authorized.turn.id) {
     throw new ControllerCapabilityAuthorizationError("fence_lost");
@@ -244,6 +280,7 @@ async function executeControllerFinalizer(
     ...current.fence,
     turnId: current.turn.id,
     controllerKey: current.controller.controllerKey,
+    bbEventHighWaterSeq: immutableHighWater,
     candidate,
   });
   if (proposed.outcome === "stale") throw new ControllerCapabilityAuthorizationError("fence_lost");

@@ -1,7 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { projectControllerStream } from "../src/controller/stream";
+import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 
 describe("controller stream projection", () => {
+  it("has a nonempty exact Hanoon phase map", () => {
+    expect(CONTROLLER_PHASE_TEXT).toEqual({
+      queued: "Hanoon is queued…",
+      connecting: "Hanoon is connecting…",
+      thinking: "Hanoon is thinking…",
+      using_tools: "Hanoon is using tools…",
+      responding: "Hanoon is responding…",
+      complete: "Hanoon completed.",
+      failed: "Hanoon failed.",
+    });
+  });
+
   it("records assistant output as phase evidence without retaining provider prose", () => {
     const projected = projectControllerStream({
       latestSeq: 13,
@@ -19,7 +32,7 @@ describe("controller stream projection", () => {
 
     expect(projected).toEqual({
       cursor: 13,
-      text: "Luna Max is responding…",
+      text: "Hanoon is responding…",
       phase: "responding",
     });
   });
@@ -63,7 +76,7 @@ describe("controller stream projection", () => {
 
     expect(projected).toEqual({
       cursor: 2,
-      text: "Luna Max is using tools…",
+      text: "Hanoon is using tools…",
       phase: "using_tools",
     });
   });
