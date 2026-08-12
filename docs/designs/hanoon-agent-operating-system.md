@@ -1,6 +1,6 @@
 # Hanoon Agent Operating System Design
 
-Status: research-amended specification awaiting owner review
+Status: approved research-amended specification; Slice 1 implementation planning authorized
 
 Date: 2026-08-12
 
@@ -319,7 +319,7 @@ The owner-visible message is the exact concatenation of segment text in order. B
 
 Claim segments are required for statements about current Hanoon, BB, workspace, pipeline, or external-system state and about completed work. This binds the exact delivered words to their evidence instead of keeping a detached claims inventory. General explanations, calculations, opinions, and other conversational answers that do not assert current operational state may use text segments only.
 
-`controller_finalizations` is append-only except for a one-way null-to-timestamp `consumed_at` transition. It stores one row per turn revision with its bounded JSON contract, rendered message, state (`accepted` or `rejected`), rejection code, creation time, validation time, and consumption time. A partial unique index permits at most one accepted revision per turn, and at most eight revisions may be inserted for one logical turn. It stores no raw provider output.
+`controller_finalizations` is append-only except for a one-way null-to-timestamp `consumed_at` transition. It stores one row per turn revision with its bounded JSON contract, rendered message, `evidence_high_water_id`, state (`accepted` or `rejected`), rejection code, creation time, validation time, and consumption time. A partial unique index permits at most one accepted revision per turn, and at most eight revisions may be inserted for one logical turn. It stores no raw provider output. The accepted row's evidence high-water id is an immutable seal over the evidence set against which its words were validated.
 
 ### Completion validation
 
@@ -334,6 +334,8 @@ Before validation or evidence-index listing, the tool path reconciles unseen com
 7. A text segment containing a high-impact completion assertion about implementation, tests, review, merge, deployment, production, deletion, installation, credential mutation, or spending is rejected. The assertion must be a compatible claim segment with a successful outcome.
 8. Evidence from returned command, web, or connector content is untrusted data. Only the plugin projector assigns outcome, proof kind, and subjects.
 9. All referenced records are re-read inside the validation transaction; stale or missing evidence rejects the candidate.
+
+After acceptance, the common capability gate denies every Hanoon-managed capability except an idempotent repeat of `telegram_agent_respond`, which returns `accepted_already` without reconciliation or another effect. If a BB-native item that was already in flight completes after acceptance, its evidence id exceeds the seal. Completion then fails closed, leaves the accepted row unconsumed, emits no answer outbox, and retires the provider generation. This makes “final action” a durable ordering rule rather than an instruction-only convention.
 
 The compatibility boundary is fixed:
 
@@ -361,9 +363,10 @@ When BB reports the provider turn complete or idle:
 - the continuation's BB event baseline is moved to the current high-water mark so earlier deltas and item events are not replayed;
 - if the continuation also ends without an accepted finalization, the turn fails with a concise owner-visible notice and the controller generation is retired;
 - an accepted finalization survives a provider error that occurs after the tool call, because the owner message was already durably validated;
+- evidence recorded after the accepted row's high-water seal prevents delivery and retires the provider generation;
 - controller-turn completion, digest insertion, accepted-finalization consumption, and Telegram outbox insertion occur in one fenced transaction.
 
-This replaces acceptance of arbitrary nonempty BB output. Raw assistant deltas remain only in the existing bounded in-flight `stream_text` projection for supervision and are never inserted into the Telegram draft or outbox. Telegram may show typing plus deterministic phase text derived from BB lifecycle/item types. The stream is cleared at terminalization, and only the accepted finalization enters the conversation digest and durable outbox.
+This replaces acceptance of arbitrary nonempty BB output. Raw assistant deltas are reduced to bounded observation booleans and are never stored in `stream_text`, a Telegram draft, or an outbox. Telegram may show typing plus deterministic phase text derived from BB lifecycle/item types. The stream is cleared at terminalization, and only the accepted finalization enters the conversation digest and durable outbox.
 
 ### Generic controller interactions
 
@@ -498,6 +501,8 @@ Implementation follows test-driven development. Required tests include:
 - A deferred answer without a live job or armed monitor is rejected.
 - A valid current-turn claim and a valid durable obligation are accepted.
 - An accepted finalization is immutable.
+- An accepted finalization stores the current evidence high-water id and denies every later non-finalizer Hanoon capability before effect.
+- A native BB item completing beyond the accepted evidence seal prevents finalization consumption and owner-answer delivery.
 - A ninth finalization revision is rejected without inserting another row.
 
 #### Completion and races
@@ -555,6 +560,7 @@ Live evidence is reported separately from deterministic tests. An incomplete sce
 - Controller standing instructions appear exactly once.
 - New default controller sessions run in `auto` permission mode.
 - Every delivered controller answer came from an accepted structured finalization.
+- Every delivered accepted finalization remained the last evidence-producing action for its turn.
 - Raw provider prose never reaches Telegram before finalization acceptance.
 - Every referenced claim is bound to compatible evidence from the same turn.
 - Every deferred promise names a live durable obligation.
