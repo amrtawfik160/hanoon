@@ -59,6 +59,8 @@ it("writes a bounded fixed-harness report with disclosed denominators", async ()
 it("seeds downstream completed state without invoking production completion methods", async () => {
   const fixture = submittedControllerFixture();
   try {
+    // These throws are the mutation guard: a downstream seed must remain
+    // usable even if the production completion path is unavailable.
     vi.spyOn(fixture.store, "adoptSubmittedControllerTurnFence").mockImplementation(() => {
       throw new Error("production adoption must not seed this downstream fixture");
     });
@@ -116,7 +118,7 @@ it("replaces an existing report with owner-only permissions when --replace is su
   expect(statSync(output).mode & 0o777).toBe(0o600);
 });
 
-  it("requires an absolute output path even when a relative path resolves outside the repository", async () => {
+it("requires an absolute output path even when a relative path resolves outside the repository", async () => {
   const directory = mkdtempSync(join(tmpdir(), "hanoon-eval-"));
   const output = join(directory, "baseline.json");
   try {
