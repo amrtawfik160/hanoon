@@ -69,13 +69,13 @@ The same plugin settings page controls subsequent turns in the hidden conversati
 | Controller model | `claude-opus-5[1m]`, `claude-opus-4-8[1m]`, `claude-sonnet-5`, `claude-fable-5`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `claude-opus-5[1m]` |
 | Reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` |
 | Service tier | `fast`, `default` | `default` |
-| Permission mode | `auto`, `accept-edits`, `full` | `full` |
+| Permission mode | `auto`, `accept-edits`, `full` | `auto` |
 
 The model selects its provider: `claude-*` models run on Claude Code, `gpt-*` models on Codex. Service tier is a Codex-only input and is not sent for Claude models.
 
 Changing the model to one owned by the other provider retires the live BB conversation thread, because a thread cannot switch providers. The next message opens a replacement seeded with the recent conversation, so the change costs a pause rather than the conversation.
 
-Saved values apply when the next controller turn starts, including later turns in the existing durable conversation. They do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode.
+Fresh or unset settings resolve to `auto`. An explicitly saved `auto`, `accept-edits`, or `full` value is preserved and applies when the next controller turn starts, including later turns in the existing durable conversation. Settings do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode, so the configured value is not proof that a provider action was allowed.
 
 ### Background work
 
@@ -94,17 +94,11 @@ The conversation's own budgets are deliberately not settings. A turn is bounded 
 
 How the agent should behave — terser answers, always leading with the pull-request link — is not a setting. Tell it in the chat and it records a single standing instruction that is applied to every later turn, replaced whenever you restate it, and cleared when you tell it to stop. It is layered after the fixed instructions, so it can change tone and habits but never a safety boundary.
 
-### Why the default is `full`
+### Permission mode and Telegram bridge
 
-The owner works from Telegram and is not watching the BB app, so an approval prompt rendered there stalls the agent with nobody to answer it. `full` lets it use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without that dead end.
+The hidden controller uses the configured mode for the provider session, but the controller trust boundary is still the Hanoon-only 23-tool manifest described in [Architecture](architecture.md). Supported BB-native controller approval interactions are routed to Telegram as one-use *Allow once*/*Deny* choices. A question or supported approval is parked durably until the owner's tap or typed answer is persisted and the exact BB interaction is resolved; a restart retries that resolution. Unsupported BB-native payloads may still need the BB app and are reported without a guessed choice.
 
-The limits that remain are the ones the owner can actually see and answer:
-
-- merging a pull request and promoting to production run through the job pipeline and need a one-use Telegram approval;
-- destructive or irreversible actions outside a worktree are asked about in the chat first;
-- credential-shaped text is refused before it can be stored as a memory.
-
-Set `auto` or `accept-edits` if you would rather approve execution in the BB app, and expect the agent to stop and wait when it hits one.
+The permission setting does not authorize connector installation, credential mutation or rotation, spending, destructive external action, or irreversible external write through the Hanoon manifest. Provider-native and opaque third-party capabilities remain outside that structured boundary and are residual risk under BB, the execution machine, and the provider. Credential-shaped text is still refused before it can be stored as a memory.
 
 Planner, critic, and documentation stages pin their own execution tuple and are unaffected by this setting; implementation and review workers use the enabled project's immutable policy snapshot.
 
@@ -115,9 +109,9 @@ Only standard BB Git projects with a canonical GitHub remote and an available so
 Prepare a JSON policy, then use one of three mutually exclusive input modes:
 
 ```bash
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json --host <host-id>
-bb telegram-agent project enable <project-id> --policy-json '<policy-json>'
+bb telegram-agent project enable proj_example --policy-file /absolute/path/to/policy.json
+bb telegram-agent project enable proj_example --policy-file /absolute/path/to/policy.json --host host_example
+bb telegram-agent project enable proj_example --policy-json '<policy-json>'
 ```
 
 The `--host` flag is valid only with an absolute `--policy-file` path and selects the BB host that owns that file. A command invoked from a BB thread can otherwise resolve the invoking environment's host.
@@ -125,7 +119,7 @@ The `--host` flag is valid only with an absolute `--policy-file` path and select
 Individual flags are also supported. At minimum they require `--alias`, `--base`, and `--merge-method`:
 
 ```bash
-bb telegram-agent project enable <project-id> \
+bb telegram-agent project enable proj_example \
   --alias example \
   --base main \
   --merge-method squash \
@@ -232,7 +226,7 @@ Deploy and canary must both be present before the plugin can issue merge approva
 
 ```bash
 bb telegram-agent doctor
-bb telegram-agent doctor <project-id>
+bb telegram-agent doctor proj_example
 bb telegram-agent project list
 ```
 

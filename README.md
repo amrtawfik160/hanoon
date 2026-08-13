@@ -6,7 +6,7 @@ The installed plugin and CLI namespace remain `telegram-agent`.
 
 ## Why Hanoon?
 
-- **Run BB from Telegram, not from BB.** Hanoon has the shell, the `bb` CLI, installed skills and MCP servers, and reach across every connected machine. Nothing waits for a click in the BB app.
+- **Run supported BB work from Telegram.** Hanoon exposes an exact 23-tool controller manifest for its registered operations. BB-native interactions that cannot be represented faithfully are reported as blocked, and opaque provider actions remain subject to BB's own boundaries.
 - **It remembers, and keeps it honest.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall. Correcting Hanoon devalues whatever misled it, notes it never uses fade, and a correction retires the belief it contradicts.
 - **It learns from finished work.** When a job ends, Hanoon works out what is worth knowing about that repository next time — a check that always fails for a known reason, a convention it enforces — and keeps it per project.
 - **It follows up by itself.** Set a monitor to watch a thread or run on a schedule; when it fires, Hanoon does the work and messages you. It also runs its own daily and weekly upkeep, and stays quiet when nothing needs you.
@@ -34,7 +34,7 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 
 | Capability | What it means in the chat |
 | --- | --- |
-| Full BB control | "Install the Linear MCP", "restart that host", "what's on machine two" — the shell and `bb` CLI, with full permissions, on any connected machine. |
+| Bounded controller operations | List projects, inspect visible threads, manage jobs and monitors, delegate bounded work, and report current state through Hanoon's enforced 23-tool manifest. |
 | Live thread insight | "Why is this taking so long?" answers from the thread's current step, todo list, running commands, and latest message — not just its status. |
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
@@ -42,10 +42,16 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Parallel work | "Compare the invoice spike and the billing latency" opens both at once and answers from what comes back. |
 | Self-maintenance | A daily sweep for work needing your decision, a weekly memory audit, and a weekly scorecard of what actually happened. Off by one setting. |
 | Monitors | "Tell me when this finishes and open a PR", or "every weekday at 9, summarise the overnight runs." |
-| Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. A block it cannot render is still reported, so nothing waits on you in silence. |
+| Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and supported questions or BB-native permission interactions are surfaced in Telegram. Hidden-controller approvals are one-use *Allow once*/*Deny*; visible worker notices may expose their own BB-supported options. |
 | Reviewed delivery | A guarded job takes a change from plan to merge; merging and production still ask you in Telegram. |
 | Self-diagnosis | `/health` reports the executor, queued work, undelivered messages, monitors, memory, and database integrity — even when the agent is the stuck part. |
 | Bounded turns | A question that runs away is nudged once to land the answer, then stopped before it burns your budget out of sight. |
+
+## Answer trust boundary
+
+The controller's final reply is delivered only after `telegram_agent_respond` accepts a structured finalization. Its claim segments cite same-turn durable evidence for the exact subject and compatible proof; a deferred answer names a live durable obligation. Provider message deltas never become the answer, and Telegram drafts contain only fixed phase text such as queued, connecting, thinking, using tools, responding, complete, or failed.
+
+The finalization, evidence, and interaction records are durable. Evidence or finalization limits, a stale capability fence, evidence that advances after acceptance, an unresolved owner boundary, or an uncertain provider outcome fails closed. Supported controller questions and BB-native approval interactions use Telegram's durable question bridge; hidden-controller approval choices are one-use *Allow once* or *Deny*. See the [architecture guide](docs/architecture.md) for the exact manifest and recovery rules.
 
 ## Architecture
 
@@ -67,14 +73,14 @@ The project policy chooses implementation/review providers and commands. The con
 
 ## Bundled worker skills
 
-The plugin bundles its skill files locally in the two manifest roots `skills/workflow-kit` and `skills/guards`; no separate skill plugin installation is required. The workflow kit is pinned to version `6.2.0` from [obra/superpowers](https://github.com/obra/superpowers) under its MIT license. The three guards are independently authored repository-owned skills. The committed catalog contains 17 skills, but a worker receives only the role profile below.
+The plugin bundles its skill files locally in the three manifest roots `skills/workflow-kit`, `skills/guards`, and `skills/delivery`; no separate skill plugin installation is required. The workflow kit is pinned to version `6.2.0` from [obra/superpowers](https://github.com/obra/superpowers) under its MIT license. The guards and delivery skill are independently sourced and recorded in the manifest. The committed catalog contains 18 skills, but a worker receives only the role profile below.
 
 | Verified context | Selected skill ids |
 | --- | --- |
 | controller | none (controller tools and controller instructions only) |
 | planner | none |
 | critic | none |
-| implementation | `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard` |
+| implementation | `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
 | review | `clean-code-guard`, `test-guard` |
 | documentation | `docs-guard`, `verification-before-completion` |
 | final-review | `clean-code-guard`, `test-guard`, `docs-guard` |
@@ -82,7 +88,7 @@ The plugin bundles its skill files locally in the two manifest roots `skills/wor
 
 Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1–256 characters from `[A-Za-z0-9_-]`; attempt ids are 1–264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact `attempt:` or `stage:` record must match the title's job, attempt, and role, and its originating effect must be the corresponding `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs` effect. The job project, persisted environment (when present), and persisted thread (when present) must match the current context. A null environment or thread is accepted only for the first start; a later context must match the persisted id. Any mismatch receives no tools and no skills; the hidden controller branch receives no worker skills.
 
-The bundle is checked before it can run. `npm run skills:verify` validates the two registered roots, lock schema/provenance, bounded regular files, frontmatter names, nested local Markdown resources, and every SHA-256 file digest; it emits a bounded `bundleDigest` and skill count. `npm run build` runs this check before `bb plugin build`, and plugin activation runs it before registration. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle stops build/activation. The runtime never downloads or repairs a replacement.
+The bundle is checked before it can run. `npm run skills:verify` validates the three registered roots, lock schema/provenance, bounded regular files, frontmatter names, nested local Markdown resources, and every SHA-256 file digest; it emits a bounded `bundleDigest` and skill count. `npm run build` runs this check before `bb plugin build`, and plugin activation runs it before registration. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle stops build/activation. The runtime never downloads or repairs a replacement.
 
 Only a maintainer synchronizes the pinned workflow kit from an already-reviewed local checkout. The source must be an absolute directory for the reviewed `superpowers` `6.2.0` package; synchronization is network-free and rewrites only the local bundle and lock:
 
@@ -92,7 +98,7 @@ npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.2.0
 ```
 
 > [!WARNING]
-> This is a full-trust BB plugin, and the agent runs with full permissions by design so the owner never has to approve anything inside the BB app. It can use the shell, the `bb` CLI, and installed skills and MCP servers on any connected machine. Merging a pull request and promoting to production still require a one-use Telegram approval, and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
+> This is a full-trust BB plugin. Fresh or unset controller permission settings resolve to `auto`; an explicitly saved `auto`, `accept-edits`, or `full` value is preserved for later turns. Supported BB-native controller approvals are routed to Telegram as one-use *Allow once*/*Deny* choices, while BB and the execution machine continue to enforce their limits. The exact Hanoon controller manifest is Hanoon-only; BB-native and opaque provider capabilities outside it remain residual risk. Merging a pull request and promoting to production still require unchanged one-use Telegram approvals plus their existing receipts. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
 
 ## Quick start
 
@@ -124,8 +130,8 @@ Open the sensitive, ten-minute pairing link from the intended owner's private Te
 Create a reviewed project policy, then enable and validate it:
 
 ```bash
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json
-bb telegram-agent doctor <project-id>
+bb telegram-agent project enable proj_example --policy-file /absolute/path/to/policy.json
+bb telegram-agent doctor proj_example
 ```
 
 The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. Projects that deploy to the same target can share `production.targetKey`, which serializes that target even when their repositories differ. See [Configuration](docs/configuration.md) for the complete verified schema and examples.

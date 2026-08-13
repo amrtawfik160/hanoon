@@ -1,6 +1,6 @@
 # Disposable live acceptance
 
-This runbook is for owner-only live acceptance after the automated test suite passes. It collects evidence from a real Telegram bot, BB environment, disposable GitHub repository, and disposable production commands. It is not a substitute for the mocked end-to-end test.
+This runbook is for owner-only live acceptance after the automated test suite passes. It collects evidence from a real Telegram bot, BB environment, disposable GitHub repository, and disposable production commands. It is not a substitute for the mocked end-to-end test, and this documentation update is not a live run. No live Telegram/provider acceptance has been run for the current trust-kernel documentation.
 
 ## Hard boundaries
 
@@ -9,6 +9,7 @@ This runbook is for owner-only live acceptance after the automated test suite pa
 - Do not record pairing codes, bot tokens, provider credentials, raw private message content, or raw command output containing secrets.
 - Record identifiers, digests, SHAs, statuses, and bounded summaries only.
 - A live run is not successful unless every required step has evidence. HTTP 200, static tests, or a plugin registration row alone is not live acceptance.
+- Every required evidence row below is mandatory. An empty, pending, unavailable-without-an-explicit-value, or ambiguous row makes the live result **incomplete**, never **passed**.
 
 ## Evidence boundaries
 
@@ -42,7 +43,7 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | pairing Telegram message id(s) | `<message id>` |
 | task/status/review/approval/completion message ids | `<message ids only>` |
 | controller BB thread/project/host ids | `<thread id>`, `<personal project id>`, `<host id>` |
-| controller execution tuple | `codex`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
+| controller execution tuple | `<claude-code or codex>`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
 | controller conversation check | `<ordinary question received a natural answer and created no job>` |
 | paired owner identity | `<redacted Telegram user/chat identifiers>` |
 | configured project alias | `<alias, not a private path>` |
@@ -53,7 +54,7 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | review BB thread ids | `<thread id>` per attempt |
 | implementation environment id | `<environment id>` |
 | review environment ids | `<same environment id>` per attempt |
-| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | review skill-provider evidence | real thread id: `<pending>`; role: `review`; selected ids: `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | documentation skill-provider evidence | real thread id: `<pending>`; role: `documentation`; selected ids: `docs-guard`, `verification-before-completion`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | final-review skill-provider evidence | real thread id: `<pending>`; role: `final-review`; selected ids: `clean-code-guard`, `test-guard`, `docs-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
@@ -83,6 +84,21 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | production state | `<complete or production_failed>` |
 | restart recovery result | `<completion delivered; no second merge>` |
 | final `bb plugin list --json` status | `<installed/running status>` |
+| normal accepted finalization id and exact evidence refs | `<finalization id>`; `<evidence:ids in the accepted finalization>` |
+| live current-status evidence | `<live job/thread/monitor status id and bounded observation>` |
+| one process-only continuation with no leaked draft | `<continuation id>`; `<phase-only draft evidence>`; `<raw provider prose leaked=false>` |
+| auto-mode permission interaction id | `<controller interaction id>`; `<permission mode=auto>` |
+| Allow once exact resolution | `<interaction id>`; `<resolution=allow_once>`; `<BB resolution receipt>` |
+| restart between tap persistence and BB resolution | `<restart time>`; `<answer persisted before restart>`; `<exact resolution after restart>` |
+| armed monitor obligation for deferred response | `<monitor id>`; `<state=armed>`; `<deferred finalization obligation ref>` |
+| unsupported-success count zero | `<count=0>`; `<fixed report path/digest>` |
+| stale capability approval denied before effect | `<interaction/effect ids>`; `<denied>`; `<effect count=0>` |
+| fixed report path/digest, budgets, denominators, outcomes, and cost availability | `<path>`; `<digest>`; `<budgets>`; `<denominators>`; `<outcomes>`; `<cost available or unavailable/null explicitly>` |
+| explicit assertion no merge/deploy/credential/spend/destructive action exercised | `<assertion>`; `<bounded call counts>` |
+
+The eleven trust-kernel rows are part of the acceptance gate, not explanatory notes. A row is complete only when its identifier or explicit zero/unavailable outcome is recorded with a bounded source. Any incomplete row forces the overall live result to **incomplete**, never **passed**.
+
+The Task 14 historical fixed before/after comparison is not currently comparable: the original fake-provider baseline recorded token availability as `0`, while the current audited harness reports token availability as unavailable/null. Do not report that comparison as fixed or passed. Cost availability must likewise be recorded explicitly as available or unavailable/null in the fixed report row.
 
 ## Acceptance procedure
 
@@ -182,4 +198,4 @@ Also exercise one recoverable Telegram failure: an expired callback must not rep
 
 ## Final acceptance decision
 
-Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Until then, live provider skill-use evidence remains **pending**, not passed or complete. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the live acceptance as **not run**, not successful.
+For an actual run, accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, restart recovery, and all eleven trust-kernel rows. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Any incomplete row makes the result **incomplete**, never **passed**. The current documentation track has no live Telegram/provider acceptance result, so it must be reported as **not run/incomplete**, not successful. The Task 14 historical comparison remains non-comparable because its original fake-provider token availability was recorded as `0` while the current audited harness reports unavailable/null; no fixed before/after result may be claimed.

@@ -17,7 +17,7 @@ From a shell:
 ```bash
 bb plugin list --json
 bb telegram-agent doctor
-bb telegram-agent doctor <project-id>
+bb telegram-agent doctor proj_example
 bb plugin logs telegram-agent -n 50
 ```
 
@@ -27,7 +27,7 @@ Use `--json` on Telegram Agent commands when another tool must consume the resul
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally under the manifest roots `skills/workflow-kit` and `skills/guards`; operators do not install another skill plugin. The catalog has 17 local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+Skills are committed locally under the three manifest roots `skills/workflow-kit`, `skills/guards`, and `skills/delivery`; operators do not install another skill plugin. The catalog has 18 local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
 
 Run the deterministic integrity gate from the repository root:
 
@@ -61,22 +61,30 @@ An invalid cron expression is rejected when the monitor is created. A schedule t
 
 Notices about top-level threads are automatic; nothing needs arming. The plugin records each thread the first time it sees it and reports later moves into `idle` or `error`, so a freshly installed or restarted plugin does not replay a backlog.
 
-If a thread seems stuck and you were told nothing, check that it is top-level — a sub-agent's thread is reported to its parent, not to you — and that it is `visible`. To recover a controller thread that has wedged, `bb thread archive <id>`: the plugin reads the archived thread as missing and opens a fresh session on its own, which is safer than editing the database.
+If a thread seems stuck and you were told nothing, check that it is top-level — a sub-agent's thread is reported to its parent, not to you — and that it is `visible`. To recover a controller thread that has wedged, `bb thread archive thread_example`: the plugin reads the archived thread as missing and opens a fresh session on its own, which is safer than editing the database.
+
+## Controller answer and interaction recovery
+
+The controller delivers a final answer only from an accepted structured finalization. Provider output is never promoted from a draft into the answer; Telegram drafts show only the fixed controller phase. Claims must cite same-turn evidence for the exact subject, and a deferred response must cite a live durable obligation. A process-only continuation, unsupported high-impact claim, stale capability fence, evidence-limit breach, or evidence that advanced after acceptance fails closed.
+
+The evidence projection is capped at 128 rows per turn and finalization revisions at eight. When a controller reaches a completion boundary without an accepted finalization, it receives one bounded continuation asking it to inspect `telegram_agent_turn_evidence` and call `telegram_agent_respond`; a second boundary without acceptance fails and retires the generation. An accepted answer is persisted before delivery, and an accepted answer survives a provider error; later evidence cannot be appended to it.
+
+Controller questions and supported BB-native approval interactions are stored in `controller_interactions`. Telegram persists the owner's answer before resolving the exact BB interaction, and restart recovery retries that resolution under its identity and fence. Hidden-controller approval choices are only one-use *Allow once*/*Deny*; visible worker notices can have different BB-supported options. The older `controller_questions` table is migration history, not the active write path.
 
 ## Inspect jobs
 
 ```bash
 bb telegram-agent job list
 bb telegram-agent job list --limit 10 --json
-bb telegram-agent job show <job-id>
-bb telegram-agent job show <job-id> --json
+bb telegram-agent job show job_example
+bb telegram-agent job show job_example --json
 ```
 
 `job list` returns at most 100 recent jobs; `--limit` accepts `1`–`100`. `job show` returns the bounded stored projection for exactly one job. Its safe projection includes admission state, queue sequence/age/release reason, held resource kind/key pairs, and merge-resource waits, but not raw prompts, secrets, claim owners, lease generations, or unbounded provider logs.
 
 In Telegram, the durable status message reports the current state, review/validation summaries, pull-request identity, liveness, approval expiry, and production outcome. BB does not expose a reliable completion ETA, so the controller reports observed progress instead of inventing one.
 
-`/status` without an id lists up to eight current jobs and reports when more exist. `/status <job-id>`, `/cancel <job-id>`, and `/retry <job-id>` target that exact job. Replying to a job status message is another exact selector. If cancel or retry has neither an id nor a status reply, one eligible job is selected only when unambiguous; otherwise Telegram returns bounded choices. Plain-text steering by status reply is accepted only while that exact job is admitted.
+`/status` without an id lists up to eight current jobs and reports when more exist. `/status job_example`, `/cancel job_example`, and `/retry job_example` target that exact job. Replying to a job status message is another exact selector. If cancel or retry has neither an id nor a status reply, one eligible job is selected only when unambiguous; otherwise Telegram returns bounded choices. Plain-text steering by status reply is accepted only while that exact job is admitted.
 
 ## Admissions and concurrency
 
@@ -94,7 +102,7 @@ At merge time, the job must also own the normalized repository merge claim and, 
 Retry a job only after it reaches the recoverable `failed` state:
 
 ```bash
-bb telegram-agent job retry <job-id>
+bb telegram-agent job retry job_example
 ```
 
 Retry resumes the state recorded before failure and re-enqueues the corresponding idempotent effect. It does not reset the job, bypass review, or reuse a stale approval.
@@ -102,7 +110,7 @@ Retry resumes the state recorded before failure and re-enqueues the correspondin
 Request cancellation with:
 
 ```bash
-bb telegram-agent job cancel <job-id>
+bb telegram-agent job cancel job_example
 ```
 
 Cancellation revokes approvals and asks the authoritative active worker to stop when one exists. The job is not marked cancelled until stop/reconciliation evidence permits the transition. Cancellation does not delete the worktree or project attachments.
@@ -144,6 +152,7 @@ Important recovery behavior:
 - A Telegram `message is not modified` response is accepted as success.
 - An uneditable status message is replaced and the new message id is stored.
 - Permanent Telegram 4xx responses are dead-lettered; retryable 429/5xx failures use bounded retry accounting.
+- An accepted controller finalization creates one logical reply outbox entry, such as `controller:turn_example:reply`; Telegram delivery is retried from that durable intent separately from provider completion. A delivery retry does not create a second finalization or repeat the controller's tool effects.
 - Restart recovery does not issue a second merge, deploy, or canary for a completed receipt.
 - A merge call with an unknown provider outcome keeps its repository and production claims held until authoritative reconciliation; capacity is not guessed free.
 - Every merge still requires current review/validation evidence and the exact unexpired one-use Telegram approval, regardless of available capacity.
@@ -153,7 +162,7 @@ Important recovery behavior:
 `production_failed` means the pull request was already merged and either deployment or canary failed. The merge fact remains durable. Inspect the job and redacted command receipt before following the operator-approved recovery or rollback procedure:
 
 ```bash
-bb telegram-agent job show <job-id> --json
+bb telegram-agent job show job_example --json
 bb plugin logs telegram-agent -n 50
 ```
 

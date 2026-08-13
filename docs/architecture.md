@@ -69,6 +69,48 @@ After implementation produces a pull request, deterministic validation runs befo
 
 Documentation, final validation, and final review happen before the owner receives a one-use merge approval. Merge, deploy, and canary each produce separate durable receipts. A successful merge followed by a failed deploy or canary is recorded as `production_failed`; the plugin does not claim completion or run rollback automatically.
 
+## Controller trust kernel
+
+The hidden controller has one answer source. `telegram_agent_respond` proposes a structured finalization, and only an accepted finalization becomes the controller response, conversation digest entry, and final Telegram outbox delivery. Raw provider message deltas are not answer content. The streaming path projects only fixed phase text — `Hanoon is queued…`, `Hanoon is connecting…`, `Hanoon is thinking…`, `Hanoon is using tools…`, `Hanoon is responding…`, `Hanoon completed.`, or `Hanoon failed.` — so a draft cannot leak provider prose.
+
+An accepted finalization is bounded text plus optional claim segments. Each claim must cite evidence from the same turn; its subject must match exactly and its proof kind must be compatible with the claim. High-impact success statements cannot remain unclaimed prose. A process-only continuation is rejected. `answered` and `needs_owner` finalizations cannot carry obligation references. A `deferred` finalization must name a live durable obligation: a nonterminal job, an armed owner monitor, or an open sealed delegation with a running member. A `needs_owner` disposition must have an active owner boundary.
+
+Evidence is projected into the turn with a high-water mark. The turn allows at most 128 evidence rows and eight finalization revisions. Hitting either bound fails closed. After a finalization is accepted, any later evidence, an exceeded evidence limit, or a lost lease/capability fence prevents completion and final delivery; it is not appended silently to the accepted answer.
+
+### Hanoon-only controller manifest
+
+The enforced Hanoon controller surface is exactly these 23 tools:
+
+```text
+telegram_agent_list_projects
+telegram_agent_start_job
+telegram_agent_job_status
+telegram_agent_retry_job
+telegram_agent_cancel_job
+telegram_agent_list_threads
+telegram_agent_thread_status
+telegram_agent_read_thread
+telegram_agent_create_thread
+telegram_agent_send_to_thread
+telegram_agent_request_thread_operation
+telegram_agent_remember
+telegram_agent_recall
+telegram_agent_forget
+telegram_agent_watch
+telegram_agent_list_watches
+telegram_agent_cancel_watch
+telegram_agent_health
+telegram_agent_delegate
+telegram_agent_scorecard
+telegram_agent_set_working_style
+telegram_agent_turn_evidence
+telegram_agent_respond
+```
+
+`telegram_agent_turn_evidence` reads the bounded evidence projection; `telegram_agent_respond` is the finalization boundary. The manifest is Hanoon-only: it does not expose a controller capability for connector installation, credential mutation or rotation, spending, destructive external action, or irreversible external write. Ordinary BB-native capabilities and opaque third-party provider actions remain outside this manifest and outside Hanoon's structured evidence boundary. They are residual risk governed by BB, the execution machine, and the provider rather than by an assumption that a provider session is proof.
+
+The manifest and finalization contract do not change the delivery approvals. Merge still requires current review/validation evidence and the exact expiring one-use Telegram approval; deploy and canary still require their existing ordered receipts and terminal boundaries. No controller answer can claim those stages succeeded without same-turn durable evidence.
+
 ## Agent skill runtime
 
 The BB manifest registers exactly three local skill roots, each vendored verbatim from one permissively licensed upstream and carrying that upstream's licence:
@@ -182,10 +224,10 @@ A monitor is a durable obligation, not a reminder. It watches a BB thread for co
 
 ## Thread notices
 
-The owner drives BB from Telegram, so anything that would wait for a click in the BB app is work that waits forever. A background sweep watches every **top-level** visible thread — a sub-agent's thread is reported to its parent, not to the owner — and delivers two things:
+A background sweep watches every **top-level** visible thread — a sub-agent's thread is reported to its parent, not to the owner — and delivers two things. Interactions that Hanoon can represent are bridged to Telegram; an unfamiliar or opaque BB interaction is reported without a guessed resolution and may still require the BB app.
 
 - **Finished and failed.** A thread's first observation is recorded silently, so enabling the sweep does not replay a backlog. After that, only a thread that was *working* can stop working: a move into `idle` or `error` is announced when it comes from `active`, `starting`, or `stopping`. A thread marked failed after it already finished has had its say, and repeating it as a failure would contradict what the owner just read. A thread being steered turn by turn is announced at most once every ten minutes, so it does not narrate every reply.
-- **Blocked.** A thread waiting on a BB interaction is rendered into Telegram with inline buttons: the options of a question, or *Allow once* / *Allow all session* / *Deny* for a command or file-change approval. The tap is carried back through BB's interaction resolution, and delivery is recorded separately from the answer so a crash between the two re-sends rather than loses it.
+- **Blocked.** A thread waiting on a BB interaction is rendered into Telegram with inline buttons: the options of a question, or the BB-supported approval choices for a command or file change. Visible worker notices may show *Allow once* / *Allow all session* / *Deny*. The hidden controller bridge is narrower: it offers only one-use *Allow once* / *Deny*. The tap is carried back through BB's interaction resolution, and delivery is recorded separately from the answer so a crash between the two re-sends rather than loses it.
 
 Notices are written straight to the durable outbox rather than routed through the agent. They are a property of the plugin, not of the conversation, so they still arrive when the agent itself is the stuck part.
 
@@ -195,7 +237,9 @@ The sweep is paced independently of the executor loop it rides on, which polls a
 
 ## Controller questions
 
-The conversational agent can ask the owner a question mid-answer. BB raises that as a pending interaction, which is answerable only in the BB app, so the plugin bridges it: the question is detected on the event stream the reconcile loop already reads, asked in Telegram with buttons, and resolved from a tap or a plain typed reply. Multi-question interactions are asked one at a time and resolved once every question is settled. While a turn is parked on a question the typing indicator stops, because the turn is waiting on a person rather than composing.
+The conversational agent can ask the owner a question mid-answer. BB raises that as a pending interaction; the plugin detects it on the event stream, asks it in Telegram with inline options, and resolves it from a tap or a plain typed reply. Multi-question interactions are asked one at a time and resolved once every question is settled. Controller approval interactions are deliberately narrower than visible worker notices: the Telegram bridge accepts only one-use *Allow once* or *Deny*. While a turn is parked on a question or supported approval, the typing indicator stops because the turn is waiting on a person rather than composing.
+
+The owner tap is persisted in `controller_interactions` before the exact BB interaction is resolved. On restart, recovery reads the answered interaction and retries the same resolution under its identity and fence; it does not invent a new approval or widen the decision. The older `controller_questions` table is migration history: migrations validate its pending/answered rows and copy their projections into `controller_interactions`, while active controller interaction state uses the newer table.
 
 Two timeouts bound the ways an answer can go missing, and their ordering matters. A submitted turn that produces no BB event for eight minutes is treated as wedged: the turn fails with a message to the owner **and the thread is retired**, so the next message opens a fresh session. That deadline sits below the ten-minute limit on how long a queued message waits for a busy thread, so recovery happens before the queue starts failing behind it. A turn parked on a question is exempt — waiting on a person is not a stall.
 
@@ -264,7 +308,7 @@ Background learning runs on its own model setting, defaulting to `inherit`. Extr
 
 ## Controller supervision
 
-The stall clock only catches a turn that goes silent. A turn that keeps producing events while getting nowhere is invisible to it, and the agent runs with full permissions, so the work itself is bounded too.
+The stall clock only catches a turn that goes silent. A turn that keeps producing events while getting nowhere is invisible to it, so the controller's tool, token, command-failure, and completion-continuation limits provide the other bounds.
 
 The reconcile loop already pages the BB event stream to redraw the Telegram draft. It now also counts what that stream reveals: tool-shaped item starts, non-zero command exits, and the cumulative token total. Those land on the turn row inside the same cursor-guarded update that advances the draft, so a replayed page cannot count twice.
 
@@ -280,7 +324,7 @@ Budgets are constants rather than settings, on the same reasoning as the stall d
 ## Safety properties
 
 - Exactly one private Telegram user/chat identity is paired. Multiple independent projects may be admitted up to the configured bound, but each project pipeline is serialized.
-- The agent runs with full permissions and may use the shell, the `bb` CLI, skills, and MCP servers; it cannot approve a merge or merge code, which stay behind a one-use Telegram approval.
+- Fresh or unset controller settings resolve to `auto`; explicit saved permission values are preserved. Supported BB-native controller approvals reach Telegram as one-use *Allow once* / *Deny*, while BB and the execution machine continue to enforce their limits. The Hanoon manifest does not itself grant connector installation, credential mutation, spending, destructive external action, or irreversible external write capabilities.
 - Reviewed code work goes through the job pipeline. The agent creates durable job intent through registered tools; it cannot spawn pipeline workers or touch a worktree directly.
 - A mutating tool call runs at most once per turn for identical arguments. A call interrupted mid-flight is reported to the agent as an uncertain outcome to verify, never silently retried.
 - Memory never stores credential-shaped text, and hidden threads stay unreachable from the thread tools.
