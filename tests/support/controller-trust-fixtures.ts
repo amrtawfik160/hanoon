@@ -216,3 +216,41 @@ export function registeredControllerFixture(options: { staleLease?: boolean } = 
     },
   };
 }
+
+/**
+ * A registered controller whose agent configuration can be resolved exactly as
+ * BB would resolve it, so `bb.agents.configure` can be tested as the single
+ * standing-instruction source rather than through the strings it composes from.
+ */
+export function configuredControllerFixture(options: { staleLease?: boolean } = {}) {
+  const fixture = registeredControllerFixture(options);
+  const controller = fixture.store.getControllerForOwner("7", "7");
+  if (!controller?.threadId || !controller.projectId || !controller.hostId) {
+    throw new Error("configured controller fixture is incomplete");
+  }
+  const context = {
+    thread: {
+      id: controller.threadId,
+      title: `Telegram Codex controller ${controller.controllerKey}`,
+      parentThreadId: null,
+      sourceThreadId: null,
+    },
+    project: { id: controller.projectId, kind: "personal" as const, name: "Personal", gitRemoteUrl: null },
+    environment: {
+      id: "env_personal",
+      name: null,
+      path: "/private/path",
+      workspaceProvisionType: "personal" as const,
+      branchName: null,
+    },
+    host: { id: controller.hostId, name: "Host" },
+    provider: { id: "codex", model: "gpt-5.6-luna" },
+    origin: { kind: null, pluginId: fixture.bb.pluginId },
+  };
+  return {
+    ...fixture,
+    controllerContext: context,
+    resolveConfiguration: (overrides: Record<string, unknown> = {}) =>
+      fixture.harness.behavior.resolveAgentConfiguration({ ...context, ...overrides } as never),
+  };
+}

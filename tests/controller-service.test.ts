@@ -20,6 +20,7 @@ import {
   LunaControllerService,
   type ControllerInteractionReconciler,
 } from "../src/controller/service";
+import { CONTROLLER_INSTRUCTION_SENTINEL } from "../src/controller/instructions";
 import { ControllerInteractionService } from "../src/controller/interaction-service";
 import { ControllerInteractionRepository } from "../src/storage/controller-interaction-repository";
 import {
@@ -2347,4 +2348,59 @@ it.each(["missing", "incompatible"] as const)("fails and retires a submitted tur
 
   expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
+});
+
+it("sends the owner's first message byte-for-byte, with no standing instruction block", async () => {
+  const { adapter, spawn } = sdkFixture();
+  const inputText = "What projects can you work on?";
+
+  await adapter.spawn(turnRecord({ inputText }), controllerRecord(), AbortSignal.timeout(1_000));
+
+  const sent = spawn.mock.calls.at(0)?.at(0) as unknown as { input: { type: string; text?: string }[] };
+  expect(sent.input).toEqual([{ type: "text", text: inputText, mentions: [] }]);
+  // `bb.agents.configure` is the only standing-instruction source now, so the
+  // spawn payload must carry none of it.
+  expect(JSON.stringify(sent.input)).not.toContain(CONTROLLER_INSTRUCTION_SENTINEL);
+  expect(JSON.stringify(sent.input)).not.toContain("You are the owner's teammate");
+});
+
+it("composes the replacement digest once and never as a standing block", async () => {
+  const { store, fence } = serviceFixture();
+  const earlier = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 71, inputText: "what changed in cyndra?" }),
+    telegramUserId: "7", telegramChatId: "7", now: 1_900,
+  });
+  store.claimNextControllerTurn({ ...fence, now: 1_900 });
+  store.markControllerSpawned({
+    ...fence, now: 1_901, turnId: earlier.id, projectId: "proj_personal", hostId: "host_personal", threadId: "thr_gone",
+  });
+  store.markControllerTurnSubmitted({ ...fence, now: 1_902, turnId: earlier.id });
+  store.failControllerTurn({ ...fence, now: 1_903, turnId: earlier.id, error: "Provider turn failed" });
+  expect(store.resetControllerThread({
+    ...fence, now: 1_904, controllerKey: earlier.controllerKey,
+    expectedThreadId: "thr_gone", reason: "Provider session ended in error",
+  })).toBe(true);
+  store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 72, inputText: "and now?" }),
+    telegramUserId: "7", telegramChatId: "7", now: 2_000,
+  });
+  const spawn = vi.fn(async () => ({ threadId: "thr_replacement", projectId: "proj_personal", hostId: "host_personal" }));
+  const adapter: ControllerAdapter = {
+    ...adapterForSubmitted(),
+    spawn: spawn as unknown as ControllerAdapter["spawn"],
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(),
+    store, adapter, evidenceProjector, clock: { now: () => 2_001 },
+  });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  const seeded = spawn.mock.calls.at(0)?.at(0) as unknown as { inputText: string };
+  // The digest is composed exactly once, by the service, and carries no
+  // standing-instruction block of its own.
+  expect(seeded.inputText).toContain("and now?");
+  expect(seeded.inputText).not.toContain(CONTROLLER_INSTRUCTION_SENTINEL);
+  expect(seeded.inputText).not.toContain("You are the owner's teammate");
 });

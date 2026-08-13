@@ -5,7 +5,6 @@ import {
   type ControllerThreadRecord,
   type ControllerTurnRecord,
 } from "./models";
-import { buildInitialControllerPrompt } from "./instructions";
 import {
   controllerExecutionArguments,
   controllerProviderFor,
@@ -188,12 +187,9 @@ export class BbControllerAdapter implements ControllerAdapter {
       throw error;
     }
     const execution = this.dependencies.executionProfile();
-    const input = await this.promptInput(
-      personal.projectId,
-      buildInitialControllerPrompt(turn.inputText),
-      turn.image,
-      signal,
-    );
+    // Standing instructions come from `bb.agents.configure` alone, so the first
+    // message is exactly what the owner sent.
+    const input = await this.promptInput(personal.projectId, turn.inputText, turn.image, signal);
     const thread = await this.dependencies.sdk.threads.spawn({
       projectId: personal.projectId,
       title: controllerTitle(controller.controllerKey),

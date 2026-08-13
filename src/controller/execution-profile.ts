@@ -51,9 +51,15 @@ export const DEFAULT_CONTROLLER_EXECUTION_PROFILE: ControllerExecutionProfile = 
   model: "claude-opus-5[1m]",
   reasoningLevel: "xhigh",
   serviceTier: "default",
-  // The owner drives this agent from Telegram and does not watch the BB app, so
-  // an approval prompt rendered there is a dead end rather than a safeguard.
-  // Merges and production still gate on a one-use Telegram approval.
+  // A compatibility default carried forward from before the trust kernel, not a
+  // safe target: it is residual risk that the reliability privilege/default gate
+  // has not yet retired. Activating a fresh `auto` default requires versioned
+  // runtime BB attestations for an atomic activity snapshot, atomic conditional
+  // commit, and mechanical denial of worker native commit, ref mutation, push,
+  // GitHub write, merge, deploy, and equivalent network effects; instruction
+  // text is not enforcement. Merges and production still gate on a one-use
+  // Telegram approval, and explicit `auto`/`accept-edits`/`full` values are
+  // preserved exactly as saved.
   permissionMode: "full",
 };
 

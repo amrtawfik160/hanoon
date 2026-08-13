@@ -25,6 +25,10 @@ const globalConfigSchema = z.object({
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.reasoningLevel),
   controllerServiceTier: z.enum(CONTROLLER_SERVICE_TIERS)
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier),
+  // Unset resolves to the compatibility default, which is `full` and remains
+  // residual risk rather than a safe target. An explicitly saved value is never
+  // rewritten, and the fresh-`auto` cutover stays disabled behind the runtime
+  // attestation gate.
   controllerPermissionMode: z.enum(CONTROLLER_PERMISSION_MODES)
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode),
   extractionModel: z.enum(EXTRACTION_MODELS).default("inherit"),
