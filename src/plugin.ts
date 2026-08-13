@@ -48,6 +48,7 @@ import {
   CONTROLLER_SERVICE_TIERS,
   DEFAULT_CONTROLLER_EXECUTION_PROFILE,
   EXTRACTION_MODELS,
+  controllerProviderFor,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
 import { ControllerInteractionService } from "./controller/interaction-service";
@@ -177,6 +178,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     ),
     notify: () => executorNudge.notify(),
     now: clock,
+    controllerProviderId: () => controllerProviderFor(
+      config.ok ? controllerExecutionProfile(config.value).model : DEFAULT_CONTROLLER_EXECUTION_PROFILE.model,
+    ),
   });
 
   const terminal = new TerminalCommandRunner(bb.sdk);
@@ -477,6 +481,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const controllerAdapter = new BbControllerAdapter({
     sdk: bb.sdk,
     pluginId: bb.pluginId,
+    now: clock,
+    reserveSpawn: (input) => store.reserveControllerSpawn(input),
     executionProfile: () => {
       if (!config.ok) throw new Error(config.message);
       return controllerExecutionProfile(config.value);

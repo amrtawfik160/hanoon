@@ -1748,6 +1748,13 @@ export interface TelegramAgentStore {
     bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced";
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
+  reserveControllerSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    projectId: string;
+    hostId: string;
+    now: number;
+  }): boolean;
   requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
   recordControllerImagePreparationFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
   failStaleControllerDispatches(fence: ControllerLeaseFence): boolean;
@@ -3459,6 +3466,67 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  public reserveControllerSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    projectId: string;
+    hostId: string;
+    now: number;
+  }): boolean {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertControllerIdentifier(input.hostId, "hostId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      const eligible = this.db.prepare(
+        `SELECT controller.controller_key
+           FROM controller_threads AS controller
+           JOIN controller_turns AS turn
+             ON turn.id = ? AND turn.controller_key = controller.controller_key
+           JOIN owners ON owners.singleton = 1
+            AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+           JOIN executor_lease AS lease ON lease.singleton = 1
+          WHERE controller.controller_key = ?
+            AND controller.state = 'pending_spawn'
+            AND controller.bb_thread_id IS NULL
+            AND controller.pending_spawn_token = ?
+            AND (controller.project_id IS NULL AND controller.host_id IS NULL
+                 OR controller.project_id = ? AND controller.host_id = ?)
+            AND turn.state = 'dispatching'
+            AND turn.lease_owner = lease.owner_id
+            AND turn.lease_generation = lease.generation
+            AND lease.lease_expires_at > ?`,
+      ).get(
+        input.turnId,
+        input.controllerKey,
+        input.turnId,
+        input.projectId,
+        input.hostId,
+        input.now,
+      );
+      if (!eligible) return false;
+      return this.db.prepare(
+        `UPDATE controller_threads
+            SET project_id = ?, host_id = ?, updated_at = ?
+          WHERE controller_key = ? AND state = 'pending_spawn' AND bb_thread_id IS NULL
+            AND pending_spawn_token = ?
+            AND (project_id IS NULL AND host_id IS NULL
+                 OR project_id = ? AND host_id = ?)` ,
+      ).run(
+        input.projectId,
+        input.hostId,
+        input.now,
+        input.controllerKey,
+        input.turnId,
+        input.projectId,
+        input.hostId,
+      ).changes === 1;
+    }).immediate();
+  }
+
   // A claim taken while the BB thread is still answering is returned to the
   // queue rather than failed, so the message is still delivered a moment later.
   public requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean {
@@ -3472,7 +3540,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.now, input.turnId, input.ownerId, input.generation);
       if (requeued.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
             AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, input.turnId, input.turnId);
@@ -3494,7 +3562,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.now, input.turnId, input.ownerId, input.generation);
       if (requeued.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
             AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, input.turnId, input.turnId);
@@ -3525,7 +3593,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(error, fence.now, fence.now, stale.id);
       if (updated.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(fence.now, stale.controller_key, stale.id);
       const outbox = controllerFailureOutbox(stale.id, stale.telegram_chat_id);
@@ -3548,19 +3616,40 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerIdentifier(input.threadId, "threadId");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const turn = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(input.turnId) as ControllerTurnRow | undefined;
+      const turn = this.db.prepare(
+        `SELECT turn.* FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1
+            AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ?`,
+      ).get(input.turnId) as ControllerTurnRow | undefined;
       if (
         !turn || turn.state !== "dispatching" ||
         turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation
       ) return false;
-      if (input.spawnToken !== undefined && input.spawnToken !== input.turnId) return false;
+      const strictSpawn = input.spawnToken !== undefined;
+      if (strictSpawn && input.spawnToken !== input.turnId) return false;
+      const scopePredicate = strictSpawn
+        ? "project_id = ? AND host_id = ?"
+        : "project_id IS NULL AND host_id IS NULL";
+      const scopeParameters = strictSpawn ? [input.projectId, input.hostId] : [];
       const spawned = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = ?, host_id = ?, bb_thread_id = ?, state = 'active',
                 pending_spawn_token = NULL, last_error = NULL, updated_at = ?
           WHERE controller_key = ? AND state = 'pending_spawn' AND bb_thread_id IS NULL
-            AND pending_spawn_token = ?`,
-      ).run(input.projectId, input.hostId, input.threadId, input.now, turn.controller_key, input.turnId).changes === 1;
+            AND pending_spawn_token = ? AND ${scopePredicate}`,
+      ).run(
+        input.projectId,
+        input.hostId,
+        input.threadId,
+        input.now,
+        turn.controller_key,
+        input.turnId,
+        ...scopeParameters,
+      ).changes === 1;
       if (spawned) {
         this.db.prepare(
           `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
@@ -4414,7 +4503,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.error, input.now, input.now, input.turnId);
       if (updated.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
       const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.ownerMessage);

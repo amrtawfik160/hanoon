@@ -220,6 +220,13 @@ function pendingConfigurationFixture() {
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
   const controller = store.getControllerForOwner("7", "7");
   if (!controller?.pendingSpawnToken) throw new Error("missing pending controller token");
+  expect(store.reserveControllerSpawn({
+    ...fence,
+    controllerKey: controller.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(true);
   return { bb, harness, store, turn, controller, fence };
 }
 
@@ -859,6 +866,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     health: () => ({ ok: true }),
     notify,
     now: () => 10_000,
+    controllerProviderId: () => "codex",
   });
 
   expect(harness.registrations.agentTools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
@@ -882,11 +890,15 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     ...context,
     thread: { ...context.thread, id: "thr_unrelated" },
   })).tools).toEqual([]);
-  // Either controller provider may host the conversation; anything else may not.
+  // The active controller must use the currently configured provider.
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
     provider: { id: "claude-code", model: "claude-opus-5[1m]" },
-  })).tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  })).tools).toEqual([]);
+  expect((await harness.behavior.resolveAgentConfiguration({
+    ...context,
+    provider: { id: "claude-code", model: "claude-opus-5[1m]" },
+  })).instructions).toBeNull();
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
     provider: { id: "acp-grok", model: "grok" },
@@ -895,7 +907,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     ...context,
     thread: {
       ...context.thread,
-      title: controllerSpawnTitle("owner-7-controller", turn.id, "proj_personal"),
+      title: controllerSpawnTitle("owner-7-controller", turn.id, "proj_personal", "host_personal", "codex"),
     },
   })).tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
 
@@ -981,12 +993,15 @@ it("authorizes one exact pending spawn identity before the BB thread mapping exi
     health: () => ({ ok: true }),
     notify: vi.fn(),
     now: () => 10_000,
+    controllerProviderId: () => "claude-code",
   });
-  const title = controllerSpawnTitle(controller.controllerKey, pendingSpawnToken, "proj_personal");
+  const title = controllerSpawnTitle(controller.controllerKey, pendingSpawnToken, "proj_personal", "host_personal", "claude-code");
   expect(parseControllerSpawnTitle(title)).toEqual({
     controllerKey: controller.controllerKey,
     pendingSpawnToken,
     projectId: "proj_personal",
+    hostId: "host_personal",
+    providerId: "claude-code",
   });
   expect(store.getControllerForPendingSpawn({
     controllerKey: controller.controllerKey,
@@ -1011,11 +1026,13 @@ it("authorizes one exact pending spawn identity before the BB thread mapping exi
   const forgedContexts = [
     { ...context, thread: { ...context.thread, title: `${title} suffix-spoof` } },
     { ...context, thread: { ...context.thread, title: `prefix-spoof ${title}` } },
-    { ...context, thread: { ...context.thread, title: controllerSpawnTitle("owner-8-controller", pendingSpawnToken, "proj_personal") } },
-    { ...context, thread: { ...context.thread, title: controllerSpawnTitle(controller.controllerKey, "controller-turn-wrong", "proj_personal") } },
+    { ...context, thread: { ...context.thread, title: controllerSpawnTitle("owner-8-controller", pendingSpawnToken, "proj_personal", "host_personal", "claude-code") } },
+    { ...context, thread: { ...context.thread, title: controllerSpawnTitle(controller.controllerKey, "controller-turn-wrong", "proj_personal", "host_personal", "claude-code") } },
     { ...context, origin: { kind: "fork" as const, pluginId: bb.pluginId } },
     { ...context, origin: { kind: null, pluginId: "other-plugin" } },
     { ...context, provider: { id: "acp-grok", model: "grok" } },
+    { ...context, provider: { id: "codex", model: "gpt-5.6-luna" } },
+    { ...context, host: { id: "host_other", name: "Other host" } },
     { ...context, project: { ...context.project, id: "proj_other" } },
     { ...context, project: { ...context.project, kind: "standard" as const } },
     { ...context, environment: { ...context.environment, workspaceProvisionType: "managed-worktree" as const } },

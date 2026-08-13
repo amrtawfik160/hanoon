@@ -154,6 +154,8 @@ function sdkFixture(options: {
     sdk,
     pluginId: "telegram-agent",
     executionProfile: () => options.executionProfile ?? DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+    now: () => 2_000,
+    reserveSpawn: () => true,
     downloadImage: options.downloadImage,
   };
   return { adapter: new BbControllerAdapter(dependencies), spawn, send, upload, list, eventsList, timeline };
@@ -358,7 +360,7 @@ it("uses the configured execution profile for initial and later controller turns
 
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
     providerId: "codex",
-    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal"),
+    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal", "host_personal", "codex"),
     ...executionProfile,
     executionInputSources: {
       providerId: "explicit",
@@ -429,21 +431,22 @@ it("adopts only one exact plugin-origin hidden spawn candidate", async () => {
     projectId: "proj_personal",
     providerId: "claude-code",
     status: "idle",
-    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal"),
+    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal", "host_personal", "claude-code"),
     visibility: "hidden",
     originPluginId: "telegram-agent",
+    environmentHostId: "host_personal",
     archivedAt: null,
     deletedAt: null,
   };
   const one = sdkFixture({ threads: [candidate] });
-  await expect(one.adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toMatchObject({
+  await expect(one.adapter.findSpawnCandidate("owner-7-controller", "controller-turn-1", AbortSignal.timeout(1_000))).resolves.toMatchObject({
     threadId: "thr_candidate",
     projectId: "proj_personal",
     hostId: "host_personal",
   });
 
   const ambiguous = sdkFixture({ threads: [candidate, { ...candidate, id: "thr_other" }] });
-  await expect(ambiguous.adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).rejects.toThrow(/multiple|ambiguous/i);
+  await expect(ambiguous.adapter.findSpawnCandidate("owner-7-controller", "controller-turn-1", AbortSignal.timeout(1_000))).rejects.toThrow(/multiple|ambiguous/i);
 });
 
 it("does not re-adopt the errored production controller during recovery", async () => {
@@ -460,7 +463,56 @@ it("does not re-adopt the errored production controller during recovery", async 
   };
   const { adapter } = sdkFixture({ threads: [poisoned] });
 
-  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toBeNull();
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-1", AbortSignal.timeout(1_000))).resolves.toBeNull();
+});
+
+it("passes the current pending token to adoption so a stale title yields a fresh spawn", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 77, inputText: "start fresh" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const findSpawnCandidate = vi.fn(async (controllerKey: string, pendingSpawnToken: string) => {
+    expect(controllerKey).toBe("owner-7-controller");
+    expect(pendingSpawnToken).toBe(turn.id);
+    // The adapter has already ignored a stale T1 title; only the current T2
+    // token may participate in adoption.
+    return null;
+  });
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_000,
+    })).toBe(true);
+    return {
+      threadId: "thr_fresh_token",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: spawnTurn.id,
+    };
+  });
+  const adapter: ControllerAdapter = {
+    spawn,
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    output: vi.fn(async () => "unused"),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate,
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(findSpawnCandidate).toHaveBeenCalledWith("owner-7-controller", turn.id, fence.signal);
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: "thr_fresh_token", state: "active" });
 });
 
 let serviceFixtureNumber = 0;
@@ -1646,12 +1698,21 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     telegramChatId: "7",
     now: 2_002,
   });
-  const spawn = vi.fn(async () => ({
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_003,
+    })).toBe(true);
+    return {
     threadId: "thr_fresh_after_poison",
     projectId: "proj_personal",
     hostId: "host_personal",
-    spawnToken: next.id,
-  }));
+    spawnToken: spawnTurn.id,
+    };
+  });
   const adapter: ControllerAdapter = {
     spawn,
     send: vi.fn(async () => undefined),

@@ -143,13 +143,20 @@ it("keeps standing instructions in configuration and owner content in the first 
     preReturnTools = preReturn.tools.map((tool) => tool.name);
     preReturnSkills = [...preReturn.skills];
     preReturnInstructions = preReturn.instructions;
-    expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+    expect(store.getControllerForOwner("7", "7")).toMatchObject({
+      threadId: null,
+      state: "pending_spawn",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+    });
     return { id: "thr_trust_kernel", environmentId: "env_personal" };
   });
   const adapter = new BbControllerAdapter({
     sdk: bb.sdk,
     pluginId: bb.pluginId,
     executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+    now: () => now,
+    reserveSpawn: (input) => store.reserveControllerSpawn(input),
   });
   const location = await adapter.spawn(turn, controller, AbortSignal.timeout(1_000));
   expect(preReturnTools).toEqual(CONTROLLER_TOOL_NAMES);
@@ -159,11 +166,11 @@ it("keeps standing instructions in configuration and owner content in the first 
   expect(store.markControllerSpawned({ ...fence, turnId: turn.id, ...location })).toBe(true);
 
   const configured = await harness.behavior.resolveAgentConfiguration({
-    thread: { id: location.threadId, title: "Telegram Codex controller owner-7-controller", parentThreadId: null, sourceThreadId: null },
+    thread: { id: location.threadId, title: controllerSpawnTitle(controller.controllerKey, turn.id, "proj_personal", "host_personal", "claude-code"), parentThreadId: null, sourceThreadId: null },
     project: { id: location.projectId, kind: "personal", name: "Personal", gitRemoteUrl: null },
     environment: { id: "env_personal", name: null, path: "/personal", workspaceProvisionType: "personal", branchName: null },
     host: { id: location.hostId, name: "Personal host" },
-    provider: { id: "codex", model: "gpt-5.6-luna" },
+    provider: { id: "claude-code", model: "claude-opus-5[1m]" },
     origin: { kind: null, pluginId: bb.pluginId },
   });
   if (configured.instructions === null) throw new Error("missing controller instructions");
@@ -172,7 +179,7 @@ it("keeps standing instructions in configuration and owner content in the first 
   if (!spawnCall || typeof spawnCall !== "object" || !("input" in spawnCall) || !("title" in spawnCall)) {
     throw new Error("missing controller spawn input");
   }
-  expect(spawnCall.title).toBe(controllerSpawnTitle(controller.controllerKey, turn.id, "proj_personal"));
+  expect(spawnCall.title).toBe(controllerSpawnTitle(controller.controllerKey, turn.id, "proj_personal", "host_personal", "claude-code"));
   const firstInput = (spawnCall as { input: Array<{ type: string; text?: string; mentions?: string[] }> }).input;
 
   expect(countOccurrences(`${configured.instructions}\n${turn.inputText}`, CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
@@ -201,7 +208,7 @@ it("adopts one exact tokenized controller title and rejects spoofed or ambiguous
     gitRemoteUrl: null,
     sources: [{ id: "src_personal", isDefault: true, hostId: "host_personal" }],
   }]);
-  const exactTitle = controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal");
+  const exactTitle = controllerSpawnTitle("owner-7-controller", "controller-turn-2", "proj_personal", "host_personal", "claude-code");
   const candidate = {
     id: "thr_tokenized",
     projectId: "proj_personal",
@@ -210,6 +217,7 @@ it("adopts one exact tokenized controller title and rejects spoofed or ambiguous
     title: exactTitle,
     visibility: "hidden",
     originPluginId: bb.pluginId,
+    environmentHostId: "host_personal",
     archivedAt: null,
     deletedAt: null,
   };
@@ -219,7 +227,7 @@ it("adopts one exact tokenized controller title and rejects spoofed or ambiguous
     pluginId: bb.pluginId,
     executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
   });
-  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toMatchObject({
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000))).resolves.toMatchObject({
     threadId: "thr_tokenized",
     projectId: "proj_personal",
     hostId: "host_personal",
@@ -229,14 +237,25 @@ it("adopts one exact tokenized controller title and rejects spoofed or ambiguous
     ...candidate,
     title: "Telegram Codex controller owner-7-controller",
   }]);
-  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toBeNull();
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000))).resolves.toBeNull();
 
   harness.sdk.stub("threads.list", async () => [{ ...candidate, title: `${exactTitle}-suffix-spoof` }]);
-  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toBeNull();
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000))).resolves.toBeNull();
 
   harness.sdk.stub("threads.list", async () => [candidate, { ...candidate, id: "thr_tokenized_other" }]);
-  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000)))
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000)))
     .rejects.toThrow(/multiple|ambiguous/i);
+
+  harness.sdk.stub("threads.list", async () => [{ ...candidate, providerId: "codex" }]);
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000))).resolves.toBeNull();
+  harness.sdk.stub("threads.list", async () => [{ ...candidate, environmentHostId: "host_other" }]);
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000))).resolves.toBeNull();
+
+  harness.sdk.stub("threads.list", async () => [{
+    ...candidate,
+    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal", "host_personal", "claude-code"),
+  }]);
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000))).resolves.toBeNull();
 });
 
 it("keeps the Telegram polling timeout out of user-facing settings", async () => {

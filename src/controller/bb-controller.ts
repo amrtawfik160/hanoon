@@ -18,8 +18,8 @@ export type ControllerLocation = {
   threadId: string;
   projectId: string;
   hostId: string;
-  /** The pending token carried by a tokenized spawn title, when available. */
-  spawnToken?: string;
+  /** The exact pending token carried by the tokenized spawn title. */
+  spawnToken: string;
 };
 export type ControllerStatus =
   | "idle"
@@ -102,11 +102,22 @@ type ControllerAdapterMethods = {
   status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
   latestSeq(threadId: string, signal: AbortSignal): Promise<number>;
   events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventResult>;
-  findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null>;
+  findSpawnCandidate(controllerKey: string, pendingSpawnToken: string, signal: AbortSignal): Promise<ControllerLocation | null>;
+};
+
+type LegacyControllerLocation = Omit<ControllerLocation, "spawnToken"> & { spawnToken?: string };
+export type ControllerSpawnResult = ControllerLocation | LegacyControllerLocation;
+type LegacyControllerAdapterMethods = Omit<ControllerAdapterMethods, "spawn" | "findSpawnCandidate"> & {
+  spawn(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    signal: AbortSignal,
+  ): Promise<ControllerSpawnResult>;
+  findSpawnCandidate(controllerKey: string, pendingSpawnToken: string, signal: AbortSignal): Promise<ControllerSpawnResult | null>;
 };
 
 /** Allows older fixture adapters to carry fields removed from the live contract. */
-export type ControllerAdapter = ControllerAdapterMethods | (ControllerAdapterMethods & Record<string, unknown>);
+export type ControllerAdapter = ControllerAdapterMethods | (LegacyControllerAdapterMethods & Record<string, unknown>);
 
 export const CONTROLLER_EVENT_PAGE_LIMIT = 100;
 export const MAX_CONTROLLER_EVENT_PAGES = 50;
@@ -250,37 +261,54 @@ function controllerTitle(controllerKey: string): string {
 const CONTROLLER_SPAWN_TITLE_MARKER = " [pending-spawn:";
 const CONTROLLER_SPAWN_TITLE_END = "]";
 const CONTROLLER_TITLE_PART = /^[A-Za-z0-9_-]{1,128}$/;
+const CONTROLLER_SCOPE_PART = /^[A-Za-z0-9_.:-]{1,256}$/;
 
 export type ControllerSpawnTitleIdentity = Readonly<{
   controllerKey: string;
   pendingSpawnToken: string;
   projectId: string;
+  hostId: string;
+  providerId: string;
 }>;
 
 export function controllerSpawnTitle(
   controllerKey: string,
   pendingSpawnToken: string,
   projectId: string,
+  hostId: string,
+  providerId: string,
 ): string {
-  return `${controllerTitle(controllerKey)}${CONTROLLER_SPAWN_TITLE_MARKER}${pendingSpawnToken};project:${projectId}${CONTROLLER_SPAWN_TITLE_END}`;
+  return `${controllerTitle(controllerKey)}${CONTROLLER_SPAWN_TITLE_MARKER}${pendingSpawnToken};project:${projectId};host:${hostId};provider:${providerId}${CONTROLLER_SPAWN_TITLE_END}`;
 }
 
 export function parseControllerSpawnTitle(title: string | null): ControllerSpawnTitleIdentity | null {
   if (typeof title !== "string") return null;
-  const match = /^Telegram Codex controller ([A-Za-z0-9_-]{1,128}) \[pending-spawn:([A-Za-z0-9_-]{1,128});project:([A-Za-z0-9_.:-]{1,256})\]$/.exec(title);
-  if (!match || !CONTROLLER_TITLE_PART.test(match[1]!) || !CONTROLLER_TITLE_PART.test(match[2]!)) return null;
+  const match = /^Telegram Codex controller ([A-Za-z0-9_-]{1,128}) \[pending-spawn:([A-Za-z0-9_-]{1,128});project:([A-Za-z0-9_.:-]{1,256});host:([A-Za-z0-9_.:-]{1,256});provider:([A-Za-z0-9_.:-]{1,256})\]$/.exec(title);
+  if (!match || !CONTROLLER_TITLE_PART.test(match[1]!) || !CONTROLLER_TITLE_PART.test(match[2]!) ||
+      !CONTROLLER_SCOPE_PART.test(match[3]!) || !CONTROLLER_SCOPE_PART.test(match[4]!) ||
+      !CONTROLLER_SCOPE_PART.test(match[5]!)) return null;
   return {
     controllerKey: match[1]!,
     pendingSpawnToken: match[2]!,
     projectId: match[3]!,
+    hostId: match[4]!,
+    providerId: match[5]!,
   };
 }
 
-export function isControllerThreadTitle(title: string | null, controllerKey: string, projectId?: string): boolean {
+export function isControllerThreadTitle(
+  title: string | null,
+  controllerKey: string,
+  expected?: Readonly<Pick<ControllerSpawnTitleIdentity, "projectId" | "hostId" | "providerId">>,
+): boolean {
   if (title === controllerTitle(controllerKey) || title === `Telegram Luna controller ${controllerKey}`) return true;
   const identity = parseControllerSpawnTitle(title);
   return identity?.controllerKey === controllerKey &&
-    (projectId === undefined || identity.projectId === projectId);
+    (expected === undefined || (
+      identity.projectId === expected.projectId &&
+      identity.hostId === expected.hostId &&
+      identity.providerId === expected.providerId
+    ));
 }
 
 export class BbControllerAdapter implements ControllerAdapterMethods {
@@ -288,6 +316,14 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     sdk: BbSdk;
     pluginId: string;
     executionProfile: () => ControllerExecutionProfile;
+    now?: () => number;
+    reserveSpawn?: (input: {
+      controllerKey: string;
+      turnId: string;
+      projectId: string;
+      hostId: string;
+      now: number;
+    }) => boolean;
     downloadImage?: (
       fileId: string,
       maxBytes: number,
@@ -317,12 +353,24 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       turn.image,
       signal,
     );
+    const now = this.dependencies.now?.();
+    if (!this.dependencies.reserveSpawn || now === undefined || !this.dependencies.reserveSpawn({
+      controllerKey: controller.controllerKey,
+      turnId: turn.id,
+      projectId: personal.projectId,
+      hostId: personal.hostId,
+      now,
+    })) {
+      throw new Error("Controller spawn reservation is unavailable or stale");
+    }
     const thread = await this.dependencies.sdk.threads.spawn({
       projectId: personal.projectId,
       title: controllerSpawnTitle(
         controller.controllerKey,
         controller.pendingSpawnToken,
         personal.projectId,
+        personal.hostId,
+        controllerProviderFor(execution.model),
       ),
       visibility: "hidden",
       input,
@@ -514,8 +562,13 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     };
   }
 
-  public async findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null> {
+  public async findSpawnCandidate(
+    controllerKey: string,
+    pendingSpawnToken: string,
+    signal: AbortSignal,
+  ): Promise<ControllerLocation | null> {
     const personal = await this.resolvePersonalProject(signal);
+    const providerId = controllerProviderFor(this.dependencies.executionProfile().model);
     const threads = await this.dependencies.sdk.threads.list({
       projectId: personal.projectId,
       includeHidden: true,
@@ -526,9 +579,13 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       const identity = parseControllerSpawnTitle(thread.title);
       if (
         !identity || identity.controllerKey !== controllerKey ||
+        identity.pendingSpawnToken !== pendingSpawnToken ||
         identity.projectId !== personal.projectId ||
+        identity.hostId !== personal.hostId ||
+        identity.providerId !== providerId ||
         thread.projectId !== personal.projectId ||
-        thread.providerId !== controllerProviderFor(this.dependencies.executionProfile().model) ||
+        thread.environmentHostId !== personal.hostId ||
+        thread.providerId !== providerId ||
         thread.status === "error" || thread.status === "stopping" ||
         thread.visibility !== "hidden" ||
         thread.originPluginId !== this.dependencies.pluginId ||

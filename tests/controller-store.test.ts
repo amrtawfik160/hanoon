@@ -256,6 +256,141 @@ it("resolves only the exact live pending controller spawn identity", () => {
   }
 });
 
+it("reserves and consumes one exact pending controller project/host scope", () => {
+  const value = pendingSpawnFixture();
+  const scope = {
+    controllerKey: value.controller.controllerKey,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    ...value.fence,
+  };
+
+  expect(value.store.reserveControllerSpawn(scope)).toBe(true);
+  expect(value.store.reserveControllerSpawn(scope)).toBe(true);
+  expect(value.store.reserveControllerSpawn({ ...scope, projectId: "proj_other" })).toBe(false);
+  expect(value.store.reserveControllerSpawn({ ...scope, hostId: "host_other" })).toBe(false);
+  expect(value.store.markControllerSpawned({
+    ...value.fence,
+    turnId: value.turn.id,
+    projectId: "proj_other",
+    hostId: "host_personal",
+    threadId: "thr_wrong_scope",
+    spawnToken: value.turn.id,
+  })).toBe(false);
+  expect(value.store.markControllerSpawned({
+    ...value.fence,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_exact_scope",
+    spawnToken: value.turn.id,
+  })).toBe(true);
+  expect(value.store.getControllerForOwner("7", "7")).toMatchObject({
+    state: "active",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_exact_scope",
+    pendingSpawnToken: null,
+  });
+});
+
+it("fails closed for stale, expired, and taken-over pending spawn reservations", () => {
+  const expired = pendingSpawnFixture(902);
+  expect(expired.store.reserveControllerSpawn({
+    ...expired.fence,
+    controllerKey: expired.controller.controllerKey,
+    turnId: expired.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: expired.fence.now + expired.fence.leaseMs + 1,
+  })).toBe(false);
+  expect(expired.store.getControllerForOwner("7", "7")).toMatchObject({ projectId: null, hostId: null });
+
+  const takenOver = pendingSpawnFixture(903);
+  const successor = takenOver.store.acquireExecutorLease("successor", takenOver.fence.now + takenOver.fence.leaseMs + 1, 30_000);
+  if (!successor.acquired) throw new Error("missing successor lease");
+  expect(takenOver.store.reserveControllerSpawn({
+    now: takenOver.fence.now + takenOver.fence.leaseMs + 1,
+    controllerKey: takenOver.controller.controllerKey,
+    turnId: takenOver.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(false);
+
+  const stale = pendingSpawnFixture(904);
+  stale.bb.storage.database().prepare(
+    "UPDATE controller_threads SET pending_spawn_token = ? WHERE controller_key = ?",
+  ).run("controller-turn-stale", stale.controller.controllerKey);
+  expect(stale.store.reserveControllerSpawn({
+    ...stale.fence,
+    controllerKey: stale.controller.controllerKey,
+    turnId: stale.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(false);
+  expect(stale.store.getControllerForOwner("7", "7")).toMatchObject({ projectId: null, hostId: null });
+});
+
+it("clears a reserved pending scope on requeue and ordinary controller failure", () => {
+  const requeued = pendingSpawnFixture(905);
+  expect(requeued.store.reserveControllerSpawn({
+    ...requeued.fence,
+    controllerKey: requeued.controller.controllerKey,
+    turnId: requeued.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(true);
+  expect(requeued.store.requeueControllerTurn({ ...requeued.fence, turnId: requeued.turn.id })).toBe(true);
+  expect(requeued.store.getControllerForOwner("7", "7")).toMatchObject({ projectId: null, hostId: null, pendingSpawnToken: null });
+
+  const failed = pendingSpawnFixture(906);
+  expect(failed.store.reserveControllerSpawn({
+    ...failed.fence,
+    controllerKey: failed.controller.controllerKey,
+    turnId: failed.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(true);
+  expect(failed.store.failControllerTurn({
+    ...failed.fence,
+    turnId: failed.turn.id,
+    error: "spawn failed",
+  })).toBe(true);
+  expect(failed.store.getControllerForOwner("7", "7")).toMatchObject({ projectId: null, hostId: null, pendingSpawnToken: null });
+
+  const imageFailed = pendingSpawnFixture(907);
+  expect(imageFailed.store.reserveControllerSpawn({
+    ...imageFailed.fence,
+    controllerKey: imageFailed.controller.controllerKey,
+    turnId: imageFailed.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(true);
+  expect(imageFailed.store.recordControllerImagePreparationFailure({
+    ...imageFailed.fence,
+    turnId: imageFailed.turn.id,
+  })).toBe(true);
+  expect(imageFailed.store.getControllerForOwner("7", "7")).toMatchObject({ projectId: null, hostId: null, pendingSpawnToken: null });
+
+  const stale = pendingSpawnFixture(908);
+  expect(stale.store.reserveControllerSpawn({
+    ...stale.fence,
+    controllerKey: stale.controller.controllerKey,
+    turnId: stale.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(true);
+  const staleSuccessor = stale.store.acquireExecutorLease("stale-successor", stale.fence.now + stale.fence.leaseMs + 1, 30_000);
+  if (!staleSuccessor.acquired) throw new Error("missing stale successor lease");
+  expect(stale.store.failStaleControllerDispatches({
+    ownerId: "stale-successor",
+    generation: staleSuccessor.generation,
+    now: stale.fence.now + stale.fence.leaseMs + 1,
+  })).toBe(true);
+  expect(stale.store.getControllerForOwner("7", "7")).toMatchObject({ projectId: null, hostId: null, pendingSpawnToken: null });
+});
+
 it.each([
   ["queued turn", (value: ReturnType<typeof pendingSpawnFixture>) => {
     value.bb.storage.database().prepare(
@@ -330,6 +465,13 @@ it("fences controller mapping to the exact pending turn token and one unmapped c
     threadId: "thr_wrong_spawn_token",
     spawnToken: "controller-turn-other",
   })).toBe(false);
+  expect(value.store.reserveControllerSpawn({
+    ...value.fence,
+    controllerKey: value.controller.controllerKey,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(true);
   expect(value.store.markControllerSpawned({
     ...value.fence,
     turnId: value.turn.id,

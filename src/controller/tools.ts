@@ -74,6 +74,8 @@ type ToolDependencies = {
   health(now: number): unknown;
   notify(): void;
   now(): number;
+  /** Current persisted controller provider; absent only for legacy unit fixtures. */
+  controllerProviderId?: () => string;
 };
 
 type EvidenceIndexDescriptor = Readonly<{
@@ -1678,20 +1680,32 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         now: dependencies.now(),
       })
       : null;
+    const configuredProviderId = dependencies.controllerProviderId?.();
+    const providerMatches = configuredProviderId !== undefined &&
+      (CONTROLLER_PROVIDERS as readonly string[]).includes(configuredProviderId) &&
+      context.provider.id === configuredProviderId;
     const commonContext = context.origin.kind === null &&
       context.origin.pluginId === bb.pluginId &&
-      (CONTROLLER_PROVIDERS as readonly string[]).includes(context.provider.id) &&
+      providerMatches &&
       context.project.kind === "personal" &&
       context.environment.workspaceProvisionType === "personal";
     const candidate = commonContext && (
       (activeMappedController !== null &&
         activeMappedController.projectId === context.project.id &&
         activeMappedController.hostId === context.host.id &&
-        isControllerThreadTitle(context.thread.title, activeMappedController.controllerKey, activeMappedController.projectId)) ||
+        isControllerThreadTitle(context.thread.title, activeMappedController.controllerKey, {
+          projectId: activeMappedController.projectId,
+          hostId: activeMappedController.hostId,
+          providerId: context.provider.id,
+        })) ||
       (pendingController !== null && spawnIdentity !== null &&
         spawnIdentity.controllerKey === pendingController.controllerKey &&
         spawnIdentity.pendingSpawnToken === pendingController.pendingSpawnToken &&
-        spawnIdentity.projectId === context.project.id)
+        spawnIdentity.projectId === context.project.id &&
+        spawnIdentity.hostId === context.host.id &&
+        spawnIdentity.providerId === context.provider.id &&
+        pendingController.projectId === context.project.id &&
+        pendingController.hostId === context.host.id)
     );
     if (candidate) {
       return {

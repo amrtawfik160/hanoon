@@ -6,7 +6,7 @@ import {
   type ControllerInteractionReference,
   type ControllerInteractionSnapshot,
   type ControllerAdapter,
-  type ControllerLocation,
+  type ControllerSpawnResult,
   type ControllerStatus,
 } from "./bb-controller";
 import { ControllerInteractionService } from "./interaction-service";
@@ -763,15 +763,24 @@ export class LunaControllerService {
     controller: ControllerThreadRecord,
     fence: EffectFence,
     signal: AbortSignal,
-  ): Promise<ControllerLocation | null> {
-    let candidate: ControllerLocation | null = null;
+  ): Promise<ControllerSpawnResult | null> {
+    let candidate: ControllerSpawnResult | null = null;
+    const pendingSpawnToken = controller.pendingSpawnToken;
+    if (pendingSpawnToken === null) {
+      this.fail(turn, fence, "Controller spawn token is unavailable");
+      return null;
+    }
     // Image turns never adopt by title before attempting their own spawn. A
     // title match cannot prove that the image was attached, and adopting it
     // would silently drop the image. Recovery after an uncertain actual spawn
     // remains available in the catch block below.
     if (!turn.image) {
       try {
-        candidate = await this.dependencies.adapter.findSpawnCandidate(controller.controllerKey, signal);
+        candidate = await this.dependencies.adapter.findSpawnCandidate(
+          controller.controllerKey,
+          pendingSpawnToken,
+          signal,
+        );
       } catch {
         this.fail(turn, fence, "Controller spawn candidates are ambiguous");
         return null;
@@ -795,7 +804,11 @@ export class LunaControllerService {
     } catch (error) {
       if (this.handleImagePreparationError(error, turn, fence, signal)) return null;
       try {
-        candidate = await this.dependencies.adapter.findSpawnCandidate(controller.controllerKey, signal);
+        candidate = await this.dependencies.adapter.findSpawnCandidate(
+          controller.controllerKey,
+          pendingSpawnToken,
+          signal,
+        );
       } catch {
         candidate = null;
       }
