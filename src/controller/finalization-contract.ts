@@ -189,15 +189,58 @@ const QUESTION_SIBLING = /\?\s*$/;
  */
 const TAG_AUXILIARY = "(?:is|are|was|were|do|does|did|has|have|had|will|would|can|could|should|shall|might|must)";
 const TAG_PRONOUN = "(?:i|you|we|they|he|she|it|there)";
-const TAG_QUESTION = new RegExp(
-  `^\\s*(?:` +
-    `(?:right|correct|ok|okay|yes|no|yeah|agreed|don't you think)` +
-    `|${TAG_AUXILIARY}(?:n't|\\s+not)\\s+${TAG_PRONOUN}` +
-    // The same negative tag with the older word order: "is it not?".
-    `|${TAG_AUXILIARY}\\s+${TAG_PRONOUN}\\s+not` +
-  `)\\s*\\?\\s*$`,
+/** The short confirmations, which agree with anything by construction. */
+const LEXICAL_CONFIRMATION = /^\s*(?:right|correct|ok|okay|yes|no|yeah|agreed|don't you think)\s*\?\s*$/i;
+/** A negative tag, in either word order, with its auxiliary and pronoun. */
+const NEGATIVE_TAG = new RegExp(
+  `^\\s*(?:(${TAG_AUXILIARY})(?:n't|\\s+not)\\s+(${TAG_PRONOUN})` +
+  `|(${TAG_AUXILIARY})\\s+(${TAG_PRONOUN})\\s+not)\\s*\\?\\s*$`,
   "i",
 );
+
+/**
+ * What a tag would have to say to be asking about this assertion. A negative
+ * shape alone is not agreement: "The tests passed, didn't I?" is negative and
+ * still about someone else entirely, so the subject and tense of the assertion
+ * decide which tag can confirm it.
+ */
+type TagProfile = Readonly<{ pronouns: readonly string[]; auxiliaries: readonly string[] }>;
+
+/** Perfect and simple past both admit "did" and "have": "passed, haven't they?" */
+const PAST_AUXILIARIES = ["did", "have", "has"] as const;
+
+/** Assertions whose subject was dropped: "Ran the tests" means "I ran them". */
+const ELIDED_SPEAKER = /^\s*(?:ran|run)\b/;
+
+function tagProfile(assertion: string): TagProfile {
+  const text = assertion.toLowerCase();
+  const speaker = /^\s*(i|we)\b/.exec(text)?.[1] ?? (ELIDED_SPEAKER.test(text) ? "i" : undefined);
+  const auxiliaries = /\b(?:has|have|had)\b/.test(text)
+    ? PAST_AUXILIARIES
+    : /\b(?:is|are)\b/.test(text)
+      ? (["is", "are"] as const)
+      : /\b(?:was|were)\b/.test(text)
+        ? (["was", "were"] as const)
+        : PAST_AUXILIARIES;
+  // An elided subject is the speaker either way, so both first persons agree.
+  if (speaker) return { pronouns: speaker === "i" ? ["i", "we"] : ["we"], auxiliaries };
+  // A nominal subject is referred to by "it" or "they" depending on its number,
+  // which the head noun's own plural carries.
+  const head = /^\s*(?:the\s+)?([a-z]+)/.exec(text)?.[1] ?? "";
+  const plural = head.endsWith("s") && !head.endsWith("ss");
+  return { pronouns: [plural ? "they" : "it"], auxiliaries };
+}
+
+/** True when this tag is asking about this assertion rather than something else. */
+function tagConfirms(assertion: string, tag: string): boolean {
+  if (LEXICAL_CONFIRMATION.test(tag)) return true;
+  const match = NEGATIVE_TAG.exec(tag);
+  if (!match) return false;
+  const auxiliary = (match[1] ?? match[3] ?? "").toLowerCase();
+  const pronoun = (match[2] ?? match[4] ?? "").toLowerCase();
+  const profile = tagProfile(assertion);
+  return profile.auxiliaries.includes(auxiliary) && profile.pronouns.includes(pronoun);
+}
 
 /** Curly apostrophes are the same contraction; the grammar reads one spelling. */
 function normalizedApostrophes(text: string): string {
@@ -493,7 +536,11 @@ function assertionIsSuppressed(clause: string, start: number, end: number): bool
   // question, or the part right after it is a tag confirming that same wording.
   if (overlapping.some((sibling) => QUESTION_SIBLING.test(sibling.text))) return true;
   const last = overlapping.at(-1);
-  return last !== undefined && TAG_QUESTION.test(normalizedApostrophes(siblings[last.index + 1]?.text ?? ""));
+  if (last === undefined) return false;
+  return tagConfirms(
+    normalizedApostrophes(clause.slice(start, end)),
+    normalizedApostrophes(siblings[last.index + 1]?.text ?? ""),
+  );
 }
 
 /**

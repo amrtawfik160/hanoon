@@ -81,12 +81,17 @@ function unquoted(text: string): string {
   return text.replace(/[\\'"`\u2018\u2019\u201C\u201D]/g, "");
 }
 
-/** Each successful percent-decoding of a view, up to the depth cap. */
-function decodedViews(text: string): string[] {
+/**
+ * Each successful percent-decoding of a view, up to the depth cap, and whether
+ * the cap ran out with readable encoding still left. Exhaustion is not evidence
+ * of safety: whatever was not unwrapped could be anything, so the caller treats
+ * it as unsafe rather than as clean.
+ */
+function decodedViews(text: string): { views: string[]; exhausted: boolean } {
   const views: string[] = [];
   let current = text;
   for (let depth = 0; depth < MAX_DECODE_DEPTH; depth += 1) {
-    if (!current.includes("%")) break;
+    if (!current.includes("%")) return { views, exhausted: false };
     let next: string;
     try {
       next = decodeURIComponent(current);
@@ -94,14 +99,33 @@ function decodedViews(text: string): string[] {
       // Malformed encoding is not decoded further here. Callers that must fail
       // closed on it — the approval command screen — do so themselves, so that
       // ordinary prose containing a stray `%` is not condemned by this policy.
-      break;
+      return { views, exhausted: false };
     }
-    if (next === current) break;
+    if (next === current) return { views, exhausted: false };
     current = next;
     views.push(current);
   }
-  return views;
+  return { views, exhausted: decodesFurther(current) };
 }
+
+/** True when another well-formed percent-escape is still waiting to be read. */
+function decodesFurther(text: string): boolean {
+  if (!/%[0-9A-Fa-f]{2}/.test(text)) return false;
+  try {
+    return decodeURIComponent(text) !== text;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bash's ANSI-C and localized quoting carry their own escape language, so the
+ * bytes inside bear no relation to what a screen reading the text can see.
+ * Rather than reimplement shell escaping, the construct itself is unreadable:
+ * `curl $'\x2d\x55proxy:pw'` is refused because of the `$'`, not because of
+ * anything recovered from inside it.
+ */
+const SHELL_ESCAPE_CONSTRUCT = /\$['"]/;
 
 /**
  * The readings of one string that a screen has to consider. A secret hidden by
@@ -113,20 +137,26 @@ function decodedViews(text: string): string[] {
  * into a quoted flag that has to be dequoted afterwards to be seen at all.
  * Every decoded view is therefore screened dequoted as well.
  */
-function credentialViews(text: string): string[] {
+function credentialViews(text: string): { views: string[]; exhausted: boolean } {
   const views = new Set<string>();
+  let exhausted = false;
   for (const base of [text, unquoted(text)]) {
     views.add(base);
-    for (const decoded of decodedViews(base)) {
-      views.add(decoded);
-      views.add(unquoted(decoded));
+    const decoded = decodedViews(base);
+    exhausted = exhausted || decoded.exhausted;
+    for (const view of decoded.views) {
+      views.add(view);
+      views.add(unquoted(view));
     }
   }
-  return [...views];
+  return { views: [...views], exhausted };
 }
 
 export function isUnsafeProviderText(text: string): boolean {
-  return credentialViews(text).some((view) => (
+  if (SHELL_ESCAPE_CONSTRUCT.test(text)) return true;
+  const { views, exhausted } = credentialViews(text);
+  if (exhausted) return true;
+  return views.some((view) => (
     containsCredentialLikeText(view) || hasUnsafeCallbackMaterial(view) ||
     CLI_CREDENTIAL_FLAG.some((pattern) => pattern.test(view)) ||
     CREDENTIAL_URI.test(view)

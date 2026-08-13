@@ -875,6 +875,14 @@ describe("claim outcome compatibility", () => {
     ["another positive modal", "The tests passed, could I?"],
     ["a positive auxiliary", "The tests passed, will they?"],
     ["a bare positive auxiliary", "The tests passed, did they?"],
+    // Negative shape alone is not agreement: the tag has to match the subject
+    // and tense of the assertion it claims to be asking about.
+    ["a mismatched subject", "The tests passed, didn't I?"],
+    ["a mismatched modal", "The tests passed, shouldn't I?"],
+    ["another mismatched modal", "The tests passed, couldn't I?"],
+    ["a mismatched subject on an implementation", "I implemented the fix, didn't they?"],
+    ["a mismatched tense on a deployment", "The deployment is live, didn't it?"],
+    ["a mismatched subject on an elided assertion", "Ran the tests, didn't it?"],
   ] as const)("does not let an unrelated question after %s suppress the success", (_scenario, text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
     expectRejection(
@@ -892,7 +900,9 @@ describe("claim outcome compatibility", () => {
     ["a first-person tag", "I implemented the fix, didn't I?"],
     ["a curly-apostrophe tag", "The tests passed, haven\u2019t they?"],
     ["a modal tag", "The deployment is live, isn't it?"],
-    ["an inverted-order negative tag", "The tests passed, is it not?"],
+    ["an inverted-order negative tag", "The deployment is live, is it not?"],
+    ["a tag on a subject-elided assertion", "Ran the tests, didn't I?"],
+    ["a plural-subject tag", "The credentials are rotated, aren't they?"],
     ["a question about the assertion itself", "Did the tests pass?"],
     ["a question in the asserting part", "The tests passed?"],
   ] as const)("still accepts %s", (_scenario, text) => {

@@ -481,3 +481,49 @@ it.each([
     questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
   })).toMatchObject({ kind: "user_question" });
 });
+
+it.each([
+  ["exactly the decode cap", "Run curl %252527-Uproxyuser:hunter2%252527 now?"],
+  ["one layer past the cap", "Run curl %25252527-Uproxyuser:hunter2%25252527 now?"],
+  ["far past the cap", "Run curl %2525252527-Uproxyuser:hunter2%2525252527 now?"],
+] as const)("downgrades a question prompt encoded to %s", (_scenario, prompt) => {
+  // Running out of decoding depth is not evidence of safety: what is left
+  // unread could be anything, so exhaustion fails closed.
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "user_question",
+    questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
+  })).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "user_question" },
+  });
+});
+
+it.each([
+  ["an ANSI-C quoted flag", "curl $'-Uproxyuser:hunter2' https://example.com"],
+  ["an ANSI-C quoted password flag", "mysql $'-phunter2'"],
+  ["ANSI-C quoting on both tokens", "curl $'--proxy-user' $'alice:hunter2' https://example.com"],
+  ["a hex escape inside ANSI-C quoting", "curl $'\\x2d\\x55proxyuser:hunter2' https://example.com"],
+  ["a localized double quote", "curl $\"-Uproxyuser:hunter2\" https://example.com"],
+] as const)("makes an approval carrying %s unsupported", (_scenario, command) => {
+  // Shell escape semantics are not reimplemented here; the construct itself is
+  // treated as unreadable, which is the bounded and fail-closed reading.
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "command", command },
+    availableDecisions: ["allow_once", "deny"],
+  })).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "approval" },
+  });
+});
+
+it.each([
+  ["an ordinary shell variable", "Deploy using $HOME/config?"],
+  ["a braced shell variable", "Deploy using ${RELEASE} now?"],
+  ["a quoted branch name", "Use the \"main\" branch?"],
+  ["an encoded space", "Deploy the %20release%20 build?"],
+  ["an encoded path", "Read %2Fsrc%2Fservice.ts?"],
+] as const)("still projects a question prompt carrying %s", (_scenario, prompt) => {
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "user_question",
+    questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
+  })).toMatchObject({ kind: "user_question" });
+});
