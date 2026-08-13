@@ -12,6 +12,7 @@ import {
   type ControllerInteractionAnswer,
   type ControllerInteraction,
 } from "../src/storage/controller-interaction-repository";
+import { migrateControllerInteractionStorage } from "../src/storage/store";
 import {
   controllerInteractionToken,
   parseControllerInteractionResolution,
@@ -202,7 +203,7 @@ function legacyQuestionDatabaseFixture() {
     insertQuestion(
       state: "pending" | "answered" | "delivered",
       interactionId = "legacy_interaction",
-      answersJson = state === "pending" ? "{}" : JSON.stringify({ question_1: { selected: ["first"] } }),
+      answersJson: string | null = state === "pending" ? "{}" : JSON.stringify({ question_1: { selected: ["first"] } }),
       questionsJson = JSON.stringify(questionPayload().questions),
     ) {
       db.prepare(
@@ -221,7 +222,7 @@ function legacyQuestionDatabaseFixture() {
       );
     },
     migrateRemaining() {
-      bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+      migrateControllerInteractionStorage(bb.storage);
     },
   };
 }
@@ -431,6 +432,46 @@ it("preserves and exposes a valid partial pending legacy answer", () => {
   });
 });
 
+it("migrates valid Unicode questions and preserves their pending answer bytes", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  const questions = JSON.parse(JSON.stringify(questionPayload().questions)) as Record<string, unknown>[];
+  const question = questions[0]!;
+  question.id = "質問一";
+  question.prompt = "どの経路を使いますか？";
+  const options = question.options as Record<string, unknown>[];
+  options[0]!.value = "第一経路";
+  options[0]!.label = "最初";
+  const partial = JSON.stringify({ "質問一": { selected: ["第一経路"], freeText: "安全な回答" } });
+  fixture.insertQuestion("pending", "legacy_unicode_interaction", partial, JSON.stringify(questions));
+
+  fixture.migrateRemaining();
+
+  expect(fixture.db.prepare(
+    "SELECT answer_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get("legacy_unicode_interaction")).toEqual({ answer_json: partial });
+  expect(new ControllerInteractionRepository(fixture.db).getPending(fixture.controllerKey)).toMatchObject({
+    answers: { "質問一": { selected: ["第一経路"], freeText: "安全な回答" } },
+  });
+});
+
+it("persists the bounded runtime projection for an oversized legacy prompt", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion(
+    "pending",
+    "legacy_bounded_projection",
+    "{}",
+    legacyQuestionsJson((questions) => { questions[0]!.prompt = "x".repeat(401); }),
+  );
+
+  fixture.migrateRemaining();
+
+  const row = fixture.db.prepare(
+    "SELECT payload_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get("legacy_bounded_projection") as { payload_json: string };
+  const payload = JSON.parse(row.payload_json) as { questions: Array<{ prompt: string }> };
+  expect(payload.questions[0]?.prompt).toHaveLength(400);
+});
+
 it("copies a delivered legacy row with null source identity", () => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("delivered");
@@ -537,9 +578,23 @@ const INVALID_LEGACY_PROJECTIONS = [
     options[0]!.label = 7;
   }), "{}"],
   ["unsafe projection text", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "access_token=secret-value"; }), "{}"],
+  ["NFKC secret assignment", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "ＡＰＩ＿ＫＥＹ＝secret-value"; }), "{}"],
   ["unsafe option text", "pending", legacyQuestionsJson((questions) => {
     const options = questions[0]!.options as Record<string, unknown>[];
     options[0]!.description = "https://inner.test/?private_key=secret-value";
+  }), "{}"],
+  ["boundaryless raw callback nonce", "pending", legacyQuestionsJson((questions) => {
+    questions[0]!.prompt = `prefixxm:${"A".repeat(32)}suffix`;
+  }), "{}"],
+  ["raw token material", "pending", legacyQuestionsJson((questions) => {
+    questions[0]!.prompt = `ghp_${"A".repeat(20)}`;
+  }), "{}"],
+  ["raw credential URL", "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[0]!.value = "https://user:pass@example.test/inner";
+  }), "{}"],
+  ["nested credential URL", "pending", legacyQuestionsJson((questions) => {
+    questions[0]!.prompt = `https://outer.test/?next=${encodeURIComponent("https://inner.test/?token=secret-value")}`;
   }), "{}"],
   ["standalone auth query", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "https://example.test/?auth=abc"; }), "{}"],
   ["standalone session query", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "https://example.test/?session=abc"; }), "{}"],
@@ -558,9 +613,25 @@ const INVALID_LEGACY_PROJECTIONS = [
   ["nested encoded answer", "pending", legacyQuestionsJson(), JSON.stringify({
     question_1: { selected: [], freeText: percentEncodeLayers("https://inner.test/?token=abc", 2) },
   })],
+  ["residual percent projection", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "safe%25"; }), "{}"],
+  ["excess percent projection", "pending", legacyQuestionsJson((questions) => {
+    questions[0]!.prompt = percentEncodeLayers("safe value", 4);
+  }), "{}"],
   ["incomplete answered map", "answered", legacyQuestionsJson((questions) => {
     questions.push({ ...questions[0], id: "question_2" });
   }), JSON.stringify({ question_1: { selected: ["first"] } })],
+  ["canonical duplicate question id", "pending", JSON.stringify([
+    { ...questionPayloadQuestion(), id: "Ｆirst" },
+    { ...questionPayloadQuestion(), id: "First" },
+  ]), "{}"],
+  ["canonical duplicate option value", "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[0]!.value = "Ｆirst";
+    options[1]!.value = "First";
+  }), "{}"],
+  ["oversized question id", "pending", legacyQuestionsJson((questions) => {
+    questions[0]!.id = "q".repeat(129);
+  }), "{}"],
 ] as const;
 
 it.each(INVALID_LEGACY_PROJECTIONS)(
@@ -580,6 +651,53 @@ it.each(INVALID_LEGACY_PROJECTIONS)(
   },
 );
 
+it("rejects an oversized legacy interaction id before creating the tail table", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion("pending", "i".repeat(257));
+
+  expect(() => fixture.migrateRemaining()).toThrow();
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: SHIPPED_MIGRATION_COUNT,
+  });
+  expect(fixture.db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+  ).get()).toBeUndefined();
+});
+
+it("rejects an active pending legacy row without an answer map", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion("pending", "legacy_missing_pending_answers", null);
+
+  expect(() => fixture.migrateRemaining()).toThrow();
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: SHIPPED_MIGRATION_COUNT,
+  });
+  expect(fixture.db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+  ).get()).toBeUndefined();
+});
+
+it("rolls back a nested tail failure after the exact legacy preflight", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion("pending", "legacy_nested_failure");
+  const originalMigrate = fixture.bb.storage.migrate.bind(fixture.bb.storage);
+  fixture.bb.storage.migrate = (database, statements) => {
+    const failingStatements = statements.length === ALL_MIGRATIONS.length
+      ? [...statements.slice(0, -1), `${statements.at(-1)}\nSELECT missing_nested_migration_table;`]
+      : statements;
+    originalMigrate(database, failingStatements);
+  };
+
+  expect(() => migrateControllerInteractionStorage(fixture.bb.storage)).toThrow();
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: SHIPPED_MIGRATION_COUNT,
+  });
+  expect(fixture.db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+  ).get()).toBeUndefined();
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_questions").get()).toEqual({ count: 1 });
+});
+
 it("projects only safe controller approval decisions", () => {
   expect(parseControllerInteraction("approval_1", approvalPayload())).toEqual({
     kind: "approval",
@@ -587,6 +705,43 @@ it("projects only safe controller approval decisions", () => {
     summary: "wants to run:\n\n`npm test`\n\nin project",
     decisions: ["allow_once", "deny"],
   });
+});
+
+it.each([
+  ["a lowercase plain assignment", "lowercase=plain-value"],
+  ["a lowercase single-quoted assignment", "lowercase='quoted value'"],
+  ["a lowercase double-quoted assignment", 'lowercase="quoted value"'],
+  ["an empty generic assignment", "lowercase="],
+  ["an embedded callback nonce", `prefixxm:${"A".repeat(32)}suffix`],
+] as const)("rejects %s at every controller text boundary", (_name, unsafeText) => {
+  const commandProjection = parseControllerInteraction("boundary_command", approvalPayload({
+    subject: { kind: "command", command: `run ${unsafeText}`, cwd: "/workspace/project" },
+  }));
+  expect(commandProjection).toMatchObject({ kind: "approval", summary: expect.stringContaining("a redacted command") });
+
+  const questionProjection = parseControllerInteraction("boundary_question", questionPayload(unsafeText));
+  expect(questionProjection).toEqual({ kind: "unsupported", interactionId: "boundary_question" });
+
+  const optionPayload = questionPayload();
+  const optionQuestion = optionPayload.questions as Record<string, unknown>[];
+  const optionList = optionQuestion[0]!.options as Record<string, unknown>[];
+  optionList[0]!.label = unsafeText;
+  const optionProjection = parseControllerInteraction("boundary_option", optionPayload);
+  expect(optionProjection).toEqual({ kind: "unsupported", interactionId: "boundary_option" });
+
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("boundary_owner_text");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: unsafeText,
+    now: 2_100,
+  })).toEqual({ ok: false, reason: "stale" });
+  expect(fixture.db.prepare("SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?")
+    .get(interaction.interactionId)).toEqual({ state: "pending", answer_json: null });
+  closeCurrentFixture(fixture);
 });
 
 it.each([

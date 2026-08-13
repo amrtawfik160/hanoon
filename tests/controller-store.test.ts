@@ -89,8 +89,45 @@ it("pins the exact shipped and controller trust migration bytes in order", () =>
     "4ec9eb259bbdce396ac0026c13ebd84ec71f25433092827cc9aae5fe903505d3",
   );
   expect(sha256(ALL_MIGRATIONS[29]!)).toBe(
-    "fb43e022810269187cc6081dfb4da2c368a295d362705b4648ad8acc8e7d8653",
+    "a02875eab12120926d87ea4e759944dc6646c33b7dd019cc71edf016d28b7410",
   );
+});
+
+it("runs the exact legacy interaction preflight during store startup", () => {
+  const { bb } = createFakePluginHost({ pluginId: "telegram-controller-store-legacy-preflight" });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, ALL_MIGRATIONS.slice(0, 29));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, project_id, host_id,
+       bb_thread_id, state, pending_spawn_token, last_error, created_at, updated_at
+     ) VALUES ('legacy_controller', '7', '70', 'proj_1', 'host_1', 'thr_legacy', 'active', NULL, NULL, 1, 1)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_turns (
+       id, telegram_update_id, controller_key, ordinal, input_text, state,
+       lease_owner, lease_generation, submitted_at, created_at, updated_at
+     ) VALUES ('legacy_turn', 1, 'legacy_controller', 1, 'legacy input', 'submitted', 'executor', 1, 1, 1, 1)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+     VALUES ('legacy_generation', 'legacy_controller', 'thr_legacy', 1, NULL, NULL)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_questions (
+       interaction_id, turn_id, controller_key, questions_json, state, answers_json, asked_at, answered_at
+     ) VALUES ('legacy_interaction', 'legacy_turn', 'legacy_controller', ?, 'pending', '{}', 2, NULL)`,
+  ).run(JSON.stringify([{
+    id: "question_1",
+    prompt: "ＡＰＩ＿ＫＥＹ＝secret-value",
+    options: [{ value: "first", label: "First", description: null }],
+  }]));
+
+  expect(() => openStore(bb.storage, bb.storage.kv, () => 2_000)).toThrow();
+  expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({ count: 29 });
+  expect(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+  ).get()).toBeUndefined();
 });
 
 it("requires controller trust state on the public turn record", () => {

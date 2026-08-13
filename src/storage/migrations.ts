@@ -861,7 +861,7 @@ SELECT 'legacy_active_source_identity', CASE WHEN NOT EXISTS (
 ) THEN 1 ELSE 0 END;
 
 INSERT INTO controller_interaction_migration_guard (invariant, valid)
-SELECT 'legacy_projection_shape', CASE WHEN NOT EXISTS (
+SELECT 'legacy_projection_schema', CASE WHEN NOT EXISTS (
   SELECT 1
     FROM controller_questions AS question
    WHERE question.state IN ('pending', 'answered')
@@ -874,32 +874,13 @@ SELECT 'legacy_projection_shape', CASE WHEN NOT EXISTS (
        OR EXISTS (
          SELECT 1 FROM json_each(question.questions_json) AS question_item
           WHERE json_type(question_item.value) <> 'object'
-             OR json_type(question_item.value, '$.id') <> 'text'
-             OR length(trim(COALESCE(json_extract(question_item.value, '$.id'), ''))) = 0
-             OR length(json_extract(question_item.value, '$.id')) > 128
-             OR json_extract(question_item.value, '$.id') GLOB '*[^ -~]*'
-             OR lower(json_extract(question_item.value, '$.id')) IN (
-               '__proto__', 'constructor', 'prototype', 'tostring', 'valueof',
-               'hasownproperty', 'isprototypeof', 'propertyisenumerable',
-               'tolocalestring', '__definegetter__', '__definesetter__',
-               '__lookupgetter__', '__lookupsetter__'
-             )
-             OR json_type(question_item.value, '$.prompt') <> 'text'
-             OR length(trim(COALESCE(json_extract(question_item.value, '$.prompt'), ''))) = 0
-             OR length(json_extract(question_item.value, '$.prompt')) > 400
-             OR json_type(question_item.value, '$.options') IS NULL
-             OR json_type(question_item.value, '$.options') <> 'array'
+             OR COALESCE(json_type(question_item.value, '$.id'), '') <> 'text'
+             OR COALESCE(json_type(question_item.value, '$.prompt'), '') <> 'text'
+             OR COALESCE(json_type(question_item.value, '$.options'), '') <> 'array'
              OR json_array_length(json_extract(question_item.value, '$.options')) > 6
              OR (
                json_type(question_item.value, '$.shortLabel') IS NOT NULL
                AND json_type(question_item.value, '$.shortLabel') NOT IN ('null', 'text')
-             )
-             OR (
-               json_type(question_item.value, '$.shortLabel') = 'text'
-               AND (
-                 length(trim(json_extract(question_item.value, '$.shortLabel'))) = 0
-                 OR length(json_extract(question_item.value, '$.shortLabel')) > 60
-               )
              )
              OR (
                json_type(question_item.value, '$.multiSelect') IS NOT NULL
@@ -919,23 +900,11 @@ SELECT 'legacy_projection_shape', CASE WHEN NOT EXISTS (
                SELECT 1
                  FROM json_each(json(json_extract(question_item.value, '$.options'))) AS option
                 WHERE json_type(option.value) <> 'object'
-                   OR json_type(option.value, '$.value') <> 'text'
-                   OR length(trim(COALESCE(json_extract(option.value, '$.value'), ''))) = 0
-                   OR length(json_extract(option.value, '$.value')) > 256
-                   OR json_extract(option.value, '$.value') GLOB '*[^ -~]*'
-                   OR json_type(option.value, '$.label') <> 'text'
-                   OR length(trim(COALESCE(json_extract(option.value, '$.label'), ''))) = 0
-                   OR length(json_extract(option.value, '$.label')) > 60
+                   OR COALESCE(json_type(option.value, '$.value'), '') <> 'text'
+                   OR COALESCE(json_type(option.value, '$.label'), '') <> 'text'
                    OR (
                      json_type(option.value, '$.description') IS NOT NULL
                      AND json_type(option.value, '$.description') NOT IN ('null', 'text')
-                   )
-                   OR (
-                     json_type(option.value, '$.description') = 'text'
-                     AND (
-                       length(trim(json_extract(option.value, '$.description'))) = 0
-                       OR length(json_extract(option.value, '$.description')) > 200
-                     )
                    )
                    OR EXISTS (
                      SELECT 1
@@ -957,9 +926,7 @@ SELECT 'legacy_projection_shape', CASE WHEN NOT EXISTS (
          SELECT COUNT(DISTINCT json_extract(question_item.value, '$.id'))
            FROM json_each(question.questions_json) AS question_item
        )
-       OR (
-         question.state = 'answered' AND question.answers_json IS NULL
-       )
+       OR question.state = 'answered' AND question.answers_json IS NULL
        OR (
          question.answers_json IS NOT NULL
          AND (
@@ -974,10 +941,12 @@ SELECT 'legacy_projection_shape', CASE WHEN NOT EXISTS (
            OR EXISTS (
              SELECT 1
                FROM json_each(question.answers_json) AS answer
-               LEFT JOIN json_each(question.questions_json) AS question_item
-                 ON json_extract(question_item.value, '$.id') = answer.key
               WHERE json_type(answer.value) <> 'object'
-                 OR question_item.value IS NULL
+                 OR COALESCE(json_type(answer.value, '$.selected'), '') <> 'array'
+                 OR EXISTS (
+                   SELECT 1 FROM json_each(answer.value) AS answer_field
+                    WHERE answer_field.key NOT IN ('selected', 'freeText')
+                 )
                  OR EXISTS (
                    SELECT 1
                      FROM json_each(answer.value) AS answer_field
@@ -985,20 +954,9 @@ SELECT 'legacy_projection_shape', CASE WHEN NOT EXISTS (
                    HAVING COUNT(*) > 1
                  )
                  OR EXISTS (
-                   SELECT 1 FROM json_each(answer.value) AS answer_field
-                    WHERE answer_field.key NOT IN ('selected', 'freeText')
-                 )
-                 OR json_type(answer.value, '$.selected') IS NULL
-                 OR json_type(answer.value, '$.selected') <> 'array'
-                 OR EXISTS (
                    SELECT 1
                      FROM json_each(json(json_extract(answer.value, '$.selected'))) AS selected
                     WHERE selected.type <> 'text'
-                       OR NOT EXISTS (
-                         SELECT 1
-                           FROM json_each(json(json_extract(question_item.value, '$.options'))) AS option
-                          WHERE json_extract(option.value, '$.value') = selected.value
-                       )
                  )
                  OR EXISTS (
                    SELECT selected.value
@@ -1007,139 +965,15 @@ SELECT 'legacy_projection_shape', CASE WHEN NOT EXISTS (
                    HAVING COUNT(*) > 1
                  )
                  OR (
-                   COALESCE(json_extract(question_item.value, '$.multiSelect'), 0) <> 1
-                   AND json_array_length(json_extract(answer.value, '$.selected')) > 1
-                 )
-                 OR (
                    EXISTS (
                      SELECT 1 FROM json_each(answer.value) AS answer_field
                       WHERE answer_field.key = 'freeText'
                    )
-                   AND (
-                     json_type(answer.value, '$.freeText') <> 'text'
-                     OR length(trim(json_extract(answer.value, '$.freeText'))) = 0
-                     OR length(json_extract(answer.value, '$.freeText')) > 4000
-                     OR COALESCE(json_extract(question_item.value, '$.allowFreeText'), 1) <> 1
-                   )
+                   AND COALESCE(json_type(answer.value, '$.freeText'), '') <> 'text'
                  )
-           )
-           OR (
-             question.state = 'answered'
-             AND (
-               (SELECT COUNT(*) FROM json_each(question.answers_json)) <> json_array_length(question.questions_json)
-               OR EXISTS (
-                 SELECT 1
-                   FROM json_each(question.questions_json) AS question_item
-                  WHERE NOT EXISTS (
-                    SELECT 1 FROM json_each(question.answers_json) AS answer
-                     WHERE answer.key = json_extract(question_item.value, '$.id')
-                  )
-               )
-             )
            )
          )
        )
-     )
-) THEN 1 ELSE 0 END;
-
-INSERT INTO controller_interaction_migration_guard (invariant, valid)
-WITH legacy_text(text) AS (
-  SELECT json_extract(question_item.value, '$.id')
-    FROM controller_questions AS question
-    JOIN json_each(question.questions_json) AS question_item
-   WHERE question.state IN ('pending', 'answered')
-  UNION ALL
-  SELECT json_extract(question_item.value, '$.prompt')
-    FROM controller_questions AS question
-    JOIN json_each(question.questions_json) AS question_item
-   WHERE question.state IN ('pending', 'answered')
-  UNION ALL
-  SELECT json_extract(question_item.value, '$.shortLabel')
-    FROM controller_questions AS question
-    JOIN json_each(question.questions_json) AS question_item
-   WHERE question.state IN ('pending', 'answered')
-     AND json_type(question_item.value, '$.shortLabel') = 'text'
-  UNION ALL
-  SELECT json_extract(option.value, '$.value')
-    FROM controller_questions AS question
-    JOIN json_each(question.questions_json) AS question_item
-    JOIN json_each(json(json_extract(question_item.value, '$.options'))) AS option
-   WHERE question.state IN ('pending', 'answered')
-  UNION ALL
-  SELECT json_extract(option.value, '$.label')
-    FROM controller_questions AS question
-    JOIN json_each(question.questions_json) AS question_item
-    JOIN json_each(json(json_extract(question_item.value, '$.options'))) AS option
-   WHERE question.state IN ('pending', 'answered')
-  UNION ALL
-  SELECT json_extract(option.value, '$.description')
-    FROM controller_questions AS question
-    JOIN json_each(question.questions_json) AS question_item
-    JOIN json_each(json(json_extract(question_item.value, '$.options'))) AS option
-   WHERE question.state IN ('pending', 'answered')
-     AND json_type(option.value, '$.description') = 'text'
-  UNION ALL
-  SELECT json_extract(answer.value, '$.freeText')
-    FROM controller_questions AS question
-    JOIN json_each(COALESCE(question.answers_json, '{}')) AS answer
-   WHERE question.state IN ('pending', 'answered')
-     AND json_type(answer.value, '$.freeText') = 'text'
-)
-SELECT 'legacy_projection_safety', CASE WHEN NOT EXISTS (
-  SELECT 1 FROM legacy_text
-   WHERE text IS NOT NULL
-     AND (
-       instr(text, '%') > 0
-       OR instr(text, '＝') > 0
-       OR instr(text, 'ｍ：') > 0
-       OR instr(text, 'ＡＰＩ＿ＫＥＹ') > 0
-       OR instr(text, 'ＰＡＳＳＷＯＲＤ') > 0
-       OR instr(lower(text), 'm:') > 0
-       OR instr(lower(text), 'callback') > 0
-       OR instr(lower(text), 'webhook') > 0
-       OR instr(lower(text), 'bearer ') > 0
-       OR lower(text) LIKE '%://%:%@%'
-       OR lower(text) LIKE '%access_token%'
-       OR lower(text) LIKE '%access-token%'
-       OR lower(text) LIKE '%access token%'
-       OR lower(text) LIKE '%refresh_token%'
-       OR lower(text) LIKE '%refresh-token%'
-       OR lower(text) LIKE '%refresh token%'
-       OR lower(text) LIKE '%id_token%'
-       OR lower(text) LIKE '%id-token%'
-       OR lower(text) LIKE '%id token%'
-       OR lower(text) LIKE '%client_secret%'
-       OR lower(text) LIKE '%client-secret%'
-       OR lower(text) LIKE '%client secret%'
-       OR lower(text) LIKE '%api_key%'
-       OR lower(text) LIKE '%api-key%'
-       OR lower(text) LIKE '%api key%'
-       OR lower(text) LIKE '%authorization%'
-       OR lower(text) LIKE '%auth=%'
-       OR lower(text) LIKE '%auth_token%'
-       OR lower(text) LIKE '%auth-token%'
-       OR lower(text) LIKE '%auth token%'
-       OR lower(text) LIKE '%session=%'
-       OR lower(text) LIKE '%session_token%'
-       OR lower(text) LIKE '%session-token%'
-       OR lower(text) LIKE '%session token%'
-       OR lower(text) LIKE '%private=%'
-       OR lower(text) LIKE '%private_key%'
-       OR lower(text) LIKE '%private-key%'
-       OR lower(text) LIKE '%private key%'
-       OR lower(text) LIKE '%credential=%'
-       OR lower(text) LIKE '%credential%'
-       OR lower(text) LIKE '%credentials%'
-       OR lower(text) LIKE '%password%'
-       OR lower(text) LIKE '%passwd%'
-       OR lower(text) LIKE '%secret%'
-       OR lower(text) LIKE '%token%'
-       OR lower(text) LIKE '%key=%'
-       OR lower(text) LIKE '%jwt%'
-       OR lower(text) LIKE '%signature%'
-       OR lower(text) LIKE '%sig=%'
-       OR lower(text) LIKE '%sig:%'
-       OR text GLOB '*[A-Z_]*=*'
      )
 ) THEN 1 ELSE 0 END;
 

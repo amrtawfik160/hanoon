@@ -52,6 +52,8 @@ import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervi
 import { MAX_CONTROLLER_OVERLAY } from "../controller/instructions";
 import {
   nextUnansweredQuestion,
+  parseControllerInteraction,
+  parseControllerInteractionResolution,
   questionOptionToken,
   renderQuestion,
   renderThreadInteraction,
@@ -111,6 +113,14 @@ export { VersionConflictError, assertSafeExternalHttpsUrl };
 type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
 type PluginKv = PluginStorage["kv"];
+const CONTROLLER_INTERACTION_TAIL_ID = 29;
+
+type LegacyControllerQuestionRow = Readonly<{
+  interaction_id: unknown;
+  questions_json: unknown;
+  state: unknown;
+  answers_json: unknown;
+}>;
 
 export type PairingResult =
   | { ok: true }
@@ -1637,6 +1647,70 @@ function ensureTask9ApprovalColumns(db: SqliteDatabase): void {
   if (!columns.has("owner_user_id")) db.exec("ALTER TABLE approvals ADD COLUMN owner_user_id TEXT");
   if (!columns.has("owner_chat_id")) db.exec("ALTER TABLE approvals ADD COLUMN owner_chat_id TEXT");
   if (!columns.has("job_version")) db.exec("ALTER TABLE approvals ADD COLUMN job_version INTEGER");
+}
+
+function parseLegacyJson(jsonText: unknown, field: string): unknown {
+  if (typeof jsonText !== "string") throw new TypeError(`${field} must be JSON text`);
+  try {
+    return JSON.parse(jsonText) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new TypeError(`${field} is malformed JSON`);
+    throw error;
+  }
+}
+
+function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): [string, string] {
+  if (row.state !== "pending" && row.state !== "answered") throw new TypeError("legacy question state is invalid");
+  const questions = parseLegacyJson(row.questions_json, "legacy questions_json");
+  const interaction = parseControllerInteraction(row.interaction_id, { kind: "user_question", questions });
+  if (!interaction || interaction.kind !== "user_question") throw new TypeError("legacy question projection is unsupported");
+  if (row.answers_json === null) throw new TypeError("active legacy question is missing answers");
+  const answers = parseLegacyJson(row.answers_json, "legacy answers_json");
+  if (!parseControllerInteractionResolution(interaction, answers, row.state)) {
+    throw new TypeError("legacy question answers are invalid");
+  }
+  return [interaction.interactionId, JSON.stringify(interaction)];
+}
+
+function validateLegacyControllerQuestions(db: SqliteDatabase): Map<string, string> {
+  const rows = db.prepare(
+    `SELECT interaction_id, questions_json, state, answers_json
+       FROM controller_questions
+      WHERE state IN ('pending', 'answered')
+      ORDER BY rowid ASC`,
+  ).all() as LegacyControllerQuestionRow[];
+  return new Map(rows.map(validateLegacyControllerQuestion));
+}
+
+function persistLegacyControllerProjections(db: SqliteDatabase, projections: Map<string, string>): void {
+  const update = db.prepare(
+    `UPDATE controller_interactions
+        SET payload_json = ?
+      WHERE interaction_id = ? AND state IN ('pending', 'answered')`,
+  );
+  for (const [interactionId, payloadJson] of projections) {
+    if (update.run(payloadJson, interactionId).changes !== 1) {
+      throw new Error("legacy interaction projection was not copied");
+    }
+  }
+}
+
+function hasMigration(db: SqliteDatabase, migrationId: number): boolean {
+  return db.prepare("SELECT 1 FROM _bb_migrations WHERE id = ?").get(migrationId) !== undefined;
+}
+
+export function migrateControllerInteractionStorage(storage: PluginStorage): void {
+  const db = storage.database();
+  storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
+  if (hasMigration(db, CONTROLLER_INTERACTION_TAIL_ID)) {
+    storage.migrate(db, [...ALL_MIGRATIONS]);
+    return;
+  }
+  db.transaction(() => {
+    const projections = validateLegacyControllerQuestions(db);
+    storage.migrate(db, [...ALL_MIGRATIONS]);
+    persistLegacyControllerProjections(db, projections);
+  }).immediate();
 }
 
 export interface TelegramAgentStore {
@@ -10008,8 +10082,8 @@ export function openStore(
   kv: PluginKv = storage.kv,
   now: () => number = () => Date.now(),
 ): TelegramAgentStore {
+  migrateControllerInteractionStorage(storage);
   const db = storage.database();
-  storage.migrate(db, [...ALL_MIGRATIONS]);
   ensureTask9ApprovalColumns(db);
   return new SqliteTelegramAgentStore(db, kv, now);
 }
