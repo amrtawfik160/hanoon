@@ -99,7 +99,11 @@ it("reserves a mutating invocation before async scope resolution can finalize th
       return { scope: globalScope };
     },
     run,
-    projectEvidence: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [] }),
+    projectEvidence: () => ({
+      outcome: "succeeded" as const,
+      proofKinds: ["memory_state"] as const,
+      subjectRefs: [] as const,
+    }),
   });
 
   await resolutionStarted;
@@ -112,7 +116,7 @@ it("reserves a mutating invocation before async scope resolution can finalize th
     controllerKey: fixture.turn.controllerKey,
     candidate: {
       disposition: "answered",
-      segments: [{ type: "text", text: "The answer is ready." }],
+      segments: [{ type: "text", text: "Here is the requested answer." }],
       obligationRefs: [],
     },
   })).toMatchObject({ outcome: "rejected", code: "invocation_in_flight" });
@@ -127,7 +131,7 @@ it("reserves a mutating invocation before async scope resolution can finalize th
     controllerKey: fixture.turn.controllerKey,
     candidate: {
       disposition: "answered",
-      segments: [{ type: "text", text: "The answer is ready." }],
+      segments: [{ type: "text", text: "Here is the requested answer." }],
       obligationRefs: [],
     },
   })).toMatchObject({ outcome: "accepted" });
@@ -169,7 +173,7 @@ it("denies every normal capability after durable acceptance before receipts or e
     controllerKey: fixture.turn.controllerKey,
     candidate: {
       disposition: "answered",
-      segments: [{ type: "text", text: "Done." }],
+      segments: [{ type: "text", text: "Here is the requested answer." }],
       obligationRefs: [],
     },
   })).toMatchObject({ outcome: "accepted" });
@@ -202,7 +206,7 @@ it("reports a stale fence before durable finalization", () => {
     controllerKey: fixture.turn.controllerKey,
     candidate: {
       disposition: "answered",
-      segments: [{ type: "text", text: "Done." }],
+      segments: [{ type: "text", text: "Here is the requested answer." }],
       obligationRefs: [],
     },
   })).toMatchObject({ outcome: "accepted" });
@@ -571,23 +575,62 @@ it("records interrupted receipt uncertainty without invoking the domain call", a
   })).toEqual({ outcome: "fresh" });
   const run = vi.fn(() => ({ unreachable: true }));
 
-  const output = JSON.parse(await executeControllerCapability(fixture.dependencies, {
+  const input = {
     descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
     params,
     context: fixture.context,
     scope: globalScope,
     run,
-    projectEvidence: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [] }),
-  }));
+    projectEvidence: () => ({
+      outcome: "succeeded" as const,
+      proofKinds: ["memory_state"] as const,
+      subjectRefs: [] as const,
+    }),
+  } as const;
+  const output = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
+  const repeated = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
 
   expect(run).not.toHaveBeenCalled();
   expect(output).toMatchObject({
     outcome: "uncertain",
     _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
   });
+  expect(repeated).toMatchObject({
+    outcome: "uncertain",
+    _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
+  });
   expect(fixture.store.listToolReceipts(fixture.turn.id)).toMatchObject([
     { toolName: "telegram_agent_remember", state: "failed", result: null },
   ]);
+});
+
+it("does not repeat a mutation whose domain operation threw after reservation", async () => {
+  const fixture = executorFixture();
+  const params = { subject: "style", body: "Use short answers.", kind: "fact" };
+  const run = vi.fn(() => {
+    throw new Error("write result became ambiguous");
+  });
+  const input = {
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
+    params,
+    context: fixture.context,
+    scope: globalScope,
+    run,
+    projectEvidence: () => ({
+      outcome: "succeeded" as const,
+      proofKinds: ["memory_state"] as const,
+      subjectRefs: [] as const,
+    }),
+  } as const;
+
+  await expect(executeControllerCapability(fixture.dependencies, input)).rejects.toThrow("ambiguous");
+  const replay = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
+
+  expect(run).toHaveBeenCalledOnce();
+  expect(replay).toMatchObject({
+    outcome: "uncertain",
+    _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
+  });
 });
 
 it("rejects corrupt receipt JSON and receipt completion overflow", async () => {

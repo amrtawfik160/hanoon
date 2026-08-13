@@ -67,8 +67,20 @@ const ANSWER_RELEASE_CASE_IDS = Object.freeze([
   "bounded-uncertainty",
   "bad-news-plainly",
 ]);
-const ANSWER_RELEASE_GOLDEN_SHA256 = "05cb2da1e88ba767e07f7ed22389fe39ae278acd9f8f3c5879851cf17dd2370b";
-const ANSWER_RELEASE_EXPECTATIONS_SHA256 = "0876bcb014fd595337fe35b21906c46e5ac3b0d89d02220a839da2cb7aabcd7b";
+const ANSWER_RELEASE_GOLDEN_SHA256 = "43e2872b5f40fb8266760153dac1e6a9b4b049ddd2bce53b5a223eda5e9bb79b";
+const ANSWER_RELEASE_EXPECTATIONS_SHA256 = "de278dc8d2ad3531ee4c91b0cf1af1fa5d373d242a9f4692bca325c1515b4805";
+const ANSWER_RELEASE_EXPECTATIONS: Readonly<Record<string, Readonly<{
+  aggregate: "pass" | "fail";
+  clauses: Readonly<Record<AnswerClauseId, boolean>>;
+}>>> = Object.freeze({
+  "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true } },
+  "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false } },
+  "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true } },
+  "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+});
 
 export function answerFinalInputSha256(input: {
   goldenSha256: string;
@@ -116,7 +128,7 @@ export const ANSWER_LIVE_GATE_RELEASE_CORPUS = Object.freeze({
   caseIds: ANSWER_RELEASE_CASE_IDS,
   goldenSha256: ANSWER_RELEASE_GOLDEN_SHA256,
   expectationsSha256: ANSWER_RELEASE_EXPECTATIONS_SHA256,
-  finalInputSha256: "61596d741a3d31c2d73d80aa3a55121b68dd34e92d2216aacf1fb476e9324d66",
+  finalInputSha256: "cd859f7937bf5214d1be38adc3d284d49352ab5a1f666ffe887e573a752ebfb2",
 } as const);
 
 export function isExactAnswerReleaseCorpus(input: {
@@ -619,6 +631,12 @@ export function parseLiveGateArtifact(
     || aggregate.cases.agreed !== aggregate.cases.total
     || aggregate.clauses.agreed !== aggregate.clauses.total
     || parsedCases.some((candidate) => !candidate.matchesGolden)
+    || !parsedCases.every((candidate) => {
+      const expected = ANSWER_RELEASE_EXPECTATIONS[candidate.id];
+      return expected !== undefined
+        && candidate.expected === expected.aggregate
+        && candidate.clauses.every((clause) => clause.expected === expected.clauses[clause.id]);
+    })
     || !hasCompleteLiveGateAudit(audit)
   )) return null;
   return { ...parsed, cases: parsedCases, infrastructureErrors: parsed.infrastructureErrors, audit, aggregate } as unknown as LiveGateArtifact;
@@ -645,6 +663,7 @@ function parseLiveGateClause(input: unknown): LiveGateClauseResult | null {
   if (!isRecord(input) || !hasExactKeys(input, ["expected", "id", "isolation", "judgeThreadId", "result", "source"]) || !ANSWER_CLAUSE_IDS.includes(input.id as AnswerClauseId) || typeof input.expected !== "boolean" || (input.result !== null && typeof input.result !== "boolean") || !["deterministic", "model", "infrastructure"].includes(input.source as string) || (input.judgeThreadId !== null && typeof input.judgeThreadId !== "string") || (input.isolation !== null && !isJudgeIsolationEvidence(input.isolation))) return null;
   if (input.source === "infrastructure" && (input.result !== null || input.judgeThreadId !== null || input.isolation !== null)) return null;
   if (input.source === "deterministic" && (input.judgeThreadId !== null || input.isolation !== null)) return null;
+  if (input.source === "deterministic" && input.result !== false) return null;
   if (input.source === "model" && (typeof input.judgeThreadId !== "string" || !input.judgeThreadId || !isJudgeIsolationEvidence(input.isolation))) return null;
   if (["deterministic", "model"].includes(input.source as string) && typeof input.result !== "boolean") return null;
   return input as LiveGateClauseResult;

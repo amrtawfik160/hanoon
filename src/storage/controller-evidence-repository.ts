@@ -278,7 +278,24 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
         input.argsSha256,
         input.controllerKey,
       );
-      if (settled.changes !== 1) return { outcome: "stale" };
+      if (settled.changes !== 1) {
+        let terminalUnknown: unknown;
+        if (input.receiptState === "failed" && input.receiptError === "outcome_unknown") {
+          const normalized = this.db.prepare(
+            `UPDATE tool_receipts SET last_error = 'outcome_unknown', updated_at = ?
+              WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND controller_key = ?
+                AND state = 'failed' AND last_error <> 'authorization_failed'`,
+          ).run(input.now, input.turnId, input.toolName, input.argsSha256, input.controllerKey);
+          terminalUnknown = normalized.changes === 1
+            ? true
+            : this.db.prepare(
+              `SELECT 1 FROM tool_receipts
+                WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?
+                  AND controller_key = ? AND state = 'failed' AND last_error = 'outcome_unknown'`,
+            ).get(input.turnId, input.toolName, input.argsSha256, input.controllerKey);
+        }
+        if (!terminalUnknown) return { outcome: "stale" };
+      }
       const id = this.insertDirectEvidence({
         ...validated,
         sourceKind: "hanoon_tool",

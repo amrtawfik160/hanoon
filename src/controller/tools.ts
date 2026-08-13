@@ -920,13 +920,19 @@ function jobProjectionEvidence(
   const current = exactId ? dependencies.store.getJob(exactId) : null;
   const before = trustedState(resolution).beforeJob;
   const changed = current !== null && before !== null && before !== undefined && current.version !== before.version;
-  const proofKinds: ("job_state" | "pipeline_outcome" | "obligation")[] = ["job_state"];
-  if (mutation === "read" && current !== null && verifiedPipelineOutcome(dependencies.store, current)) {
+  const proofKinds: ("job_state" | "pipeline_outcome" | "external_mutation" | "obligation")[] = ["job_state"];
+  const verifiedPipeline = mutation === "read" && current !== null && verifiedPipelineOutcome(dependencies.store, current);
+  if (mutation !== "read" && changed) proofKinds.push("external_mutation");
+  if (verifiedPipeline) {
     proofKinds.push("pipeline_outcome");
   }
   if (current !== null && !TERMINAL_JOB_STATES.has(current.state) && mutation !== "cancel") proofKinds.push("obligation");
   return {
-    outcome: mutation !== "read" && changed ? "succeeded" : "observed",
+    outcome: mutation !== "read" && changed
+      ? "succeeded"
+      : verifiedPipeline && current?.state === "complete"
+        ? "succeeded"
+        : verifiedPipeline ? "interrupted" : "observed",
     proofKinds,
     subjectRefs: refs,
   };
@@ -957,10 +963,13 @@ async function projectTrustedEvidence(
         job.sourceUpdateId !== authorized.turn.updateId ||
         (capturedId !== undefined && capturedId !== job.id)
       ) throw new Error("created job is not bound to the authorized project and turn");
-      const proofKinds: ("job_state" | "obligation")[] = job ? ["job_state"] : [];
+      const created = capturedId === job.id && trustedState(resolution).beforeJob === null;
+      const proofKinds: ("job_state" | "external_mutation" | "obligation")[] = job
+        ? ["job_state", ...(created ? ["external_mutation" as const] : [])]
+        : [];
       if (job && !TERMINAL_JOB_STATES.has(job.state)) proofKinds.push("obligation");
       return {
-        outcome: capturedId === job.id && trustedState(resolution).beforeJob === null ? "succeeded" : "observed",
+        outcome: created ? "succeeded" : "observed",
         proofKinds,
         subjectRefs: refs,
       };

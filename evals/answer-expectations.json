@@ -32,7 +32,7 @@
         "outcome-first": true,
         "no-tool-narration": true,
         "no-invented-progress": false,
-        "bounded-uncertainty": true,
+        "bounded-uncertainty": false,
         "no-dead-end-referral": true,
         "not-process-only": true
       }

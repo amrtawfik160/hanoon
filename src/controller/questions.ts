@@ -43,6 +43,7 @@ const MAX_CANONICAL_SCAN = 16_384;
 const MAX_PERCENT_DECODE_LAYERS = 3;
 const MIN_BASE64_TOKEN_LENGTH = 16;
 const MAX_BASE64_TOKEN_LENGTH = 4_096;
+const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 const CREDENTIAL_QUERY_KEY = [
   "access[_-]?token",
@@ -156,7 +157,13 @@ function decodeBoundedBase64Token(token: string): string | null {
   const bytes = Buffer.from(normalized, "base64");
   if (bytes.length === 0) return null;
   if (bytes.toString("base64").replace(/=+$/u, "") !== standardBody) return null;
-  return bytes.toString("utf8");
+  try {
+    return STRICT_UTF8_DECODER.decode(bytes);
+  } catch {
+    // Opaque identifiers such as UUIDs are valid base64url alphabets but do
+    // not represent text. Only decoded UTF-8 can contain a textual secret.
+    return null;
+  }
 }
 
 function containsEncodedSensitiveText(value: string): boolean {
@@ -255,14 +262,16 @@ function parseQuestionShortLabel(candidate: Record<string, unknown>): string | n
 function parseQuestion(raw: unknown): ControllerQuestion | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  if (!Object.hasOwn(candidate, "id") || !Object.hasOwn(candidate, "prompt") || !Object.hasOwn(candidate, "options")) return null;
+  if (!Object.hasOwn(candidate, "id") || !Object.hasOwn(candidate, "prompt")) return null;
   const id = boundedIdentity(candidate.id, 128);
   const prompt = boundedString(candidate.prompt, MAX_PROMPT);
   if (!id || RESERVED_QUESTION_IDS.has(id) || !prompt) return null;
   const flags = parseQuestionFlags(candidate);
   if (!flags) return null;
-  const options = parseQuestionOptions(candidate.options);
-  if (!options) return null;
+  const options = Object.hasOwn(candidate, "options")
+    ? parseQuestionOptions(candidate.options)
+    : flags.allowFreeText ? [] : null;
+  if (!options || (options.length === 0 && !flags.allowFreeText)) return null;
   const shortLabel = parseQuestionShortLabel(candidate);
   if (Object.hasOwn(candidate, "shortLabel") && candidate.shortLabel !== null && !shortLabel) return null;
   return {
@@ -329,18 +338,16 @@ function safePathBasename(value: unknown): string {
   return basename;
 }
 
-function boundedApprovalSummary(summary: string): string {
-  return summary.length <= MAX_CONTROLLER_APPROVAL_SUMMARY
-    ? summary
-    : `${summary.slice(0, MAX_CONTROLLER_APPROVAL_SUMMARY - 1)}…`;
+function boundedApprovalSummary(summary: string): string | null {
+  return Array.from(summary).length <= MAX_CONTROLLER_APPROVAL_SUMMARY ? summary : null;
 }
 
 function controllerApprovalSummary(subject: Record<string, unknown>): string | null {
   if (subject.kind === "command") {
-    const rawCommand = typeof subject.command === "string" ? subject.command.trim() : "";
+    const rawCommand = typeof subject.command === "string" ? subject.command : "";
     if (rawCommand.length === 0) return null;
-    const command = canonicalControllerText(rawCommand, MAX_PROMPT) ?? "a redacted command";
-    if (!command) return null;
+    const command = canonicalControllerText(rawCommand, MAX_PROMPT);
+    if (!command || command !== rawCommand || command.includes("`") || /[\r\n\u0000-\u001f\u007f]/u.test(command)) return null;
     const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
       ? safePathBasename(subject.cwd)
       : null;
@@ -634,14 +641,18 @@ const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
 
 function approvalSummary(subject: Record<string, unknown>): string | null {
   if (subject.kind === "command") {
-    const command = boundedString(subject.command, MAX_PROMPT);
-    if (!command) return null;
-    const cwd = boundedString(subject.cwd, 120);
+    const rawCommand = typeof subject.command === "string" ? subject.command : "";
+    const command = canonicalControllerText(rawCommand, MAX_PROMPT);
+    if (!command || command !== rawCommand || command.includes("`") || /[\r\n\u0000-\u001f\u007f]/u.test(command)) return null;
+    const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
+      ? safePathBasename(subject.cwd)
+      : null;
     return cwd ? `wants to run:\n\n\`${command}\`\n\nin ${cwd}` : `wants to run:\n\n\`${command}\``;
   }
   if (subject.kind === "file_change") {
-    const scope = boundedString(subject.writeScope, 200);
-    return scope ? `wants to write files under ${scope}` : "wants to write files";
+    const rawScope = subject.writeScope;
+    if (rawScope === null || rawScope === undefined || rawScope === "") return "wants to write files";
+    return `wants to write files under ${safePathBasename(rawScope)}`;
   }
   return null;
 }
@@ -667,7 +678,8 @@ export function parseThreadInteraction(interactionId: unknown, payload: unknown)
   const summary = typeof subject === "object" && subject !== null
     ? approvalSummary(subject as Record<string, unknown>)
     : null;
-  const offered = Array.isArray(candidate.decisions) ? candidate.decisions : Object.keys(APPROVAL_LABELS);
+  const offered = Array.isArray(candidate.availableDecisions) ? candidate.availableDecisions : null;
+  if (!offered) return { kind: "unsupported", interactionId };
   const decisions = (Object.keys(APPROVAL_LABELS) as ThreadApprovalDecision[])
     .filter((decision) => offered.includes(decision));
   if (!summary || decisions.length === 0) return { kind: "unsupported", interactionId };

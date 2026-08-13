@@ -73,6 +73,17 @@ function rebindTrialSubject(
   };
 }
 
+async function cleanScenarioTrials(
+  checkpoint: "baseline" | "kernel" | "cutover",
+  trials = 1,
+  seed = 8122026,
+) {
+  return (await runControllerScenarioTrials({ checkpoint, trials, seed })).map((trial) => ({
+    ...trial,
+    harness: { ...trial.harness, dirty: false },
+  }));
+}
+
 it("writes a bounded fixed-harness report with disclosed denominators", async () => {
   const output = evaluationOutput();
 
@@ -84,7 +95,12 @@ it("writes a bounded fixed-harness report with disclosed denominators", async ()
   ]);
 
   const report = JSON.parse(readFileSync(output, "utf8"));
-  expect(report).toMatchObject({ schemaVersion: 1, label: "fixed", trialCount: 4 });
+  expect(report).toMatchObject({
+    schemaVersion: 1,
+    label: "fixed",
+    run: { checkpoint: "baseline", trialsPerScenario: 2, seed: 8122026 },
+    trialCount: 4,
+  });
   expect(report.scenarios).toEqual(expect.arrayContaining([
     expect.objectContaining({ scenarioId: "plain-conversation", denominator: 2 }),
     expect.objectContaining({ scenarioId: "current-job-status", denominator: 2 }),
@@ -336,6 +352,7 @@ it("validates a fixed baseline against current scenario applicability before com
     const invalidBaseline = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "baseline", trialsPerScenario: 1, seed: 8122026 },
       trials: [{
         ...cleanTrial,
         answer: { ...cleanTrial.answer, status: "not_applicable" as const, proofRefs: [] },
@@ -427,9 +444,9 @@ it("fails closed when the corpus adds an unknown or decorative assertion", () =>
 
 it("fails before writing when the current identity or trial is dirty", async () => {
   const runner = await runnerModule();
-  const trial = (await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 }))
-    .find((candidate) => candidate.scenarioId === "process-only-finalization");
-  if (!trial) throw new Error("process-only-finalization trial was not produced");
+  const trials = await cleanScenarioTrials("baseline");
+  const trial = trials[0];
+  if (!trial) throw new Error("baseline trial was not produced");
   const output = evaluationOutput();
   await expect(runner.evaluateControllerOutcomes({
     checkpoint: "baseline",
@@ -439,7 +456,14 @@ it("fails before writing when the current identity or trial is dirty", async () 
     replace: false,
   }, {
     readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
-    runTrials: async () => [{ ...trial, harness: { ...trial.harness, dirty: true, hanoonCommit: "a".repeat(40) } }],
+    runTrials: async () => trials.map((candidate, index) => ({
+      ...candidate,
+      harness: {
+        ...candidate.harness,
+        dirty: index === 0,
+        hanoonCommit: "a".repeat(40),
+      },
+    })),
   })).rejects.toThrow(/dirty/i);
   expect(() => readFileSync(output, "utf8")).toThrow();
 });
@@ -575,24 +599,25 @@ it("labels fixed-scenario identity variation as strong evidence", async () => {
 
 it("returns a nonzero evaluation result for an injected critical-safety outcome failure", async () => {
   const runner = await runnerModule();
-
-  const trial = (await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 }))
-    .find((candidate) => candidate.scenarioId === "process-only-finalization");
-  if (!trial) throw new Error("process-only-finalization trial was not produced");
+  const trials = await cleanScenarioTrials("kernel");
+  const trial = trials.find((candidate) => candidate.scenarioId === "duplicate-mutation-replay");
+  if (!trial) throw new Error("duplicate-mutation-replay trial was not produced");
   const output = evaluationOutput();
   const evaluation = await runner.evaluateControllerOutcomes({
-    checkpoint: "baseline",
+    checkpoint: "kernel",
     trials: 1,
     seed: 8122026,
     output,
     replace: false,
   }, {
     readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
-    runTrials: async () => [{
-      ...trial,
-      harness: { ...trial.harness, dirty: false, hanoonCommit: "a".repeat(40) },
-      outcome: { ...trial.outcome, status: "failed" as const },
-    }],
+    runTrials: async () => trials.map((candidate) => ({
+      ...candidate,
+      harness: { ...candidate.harness, hanoonCommit: "a".repeat(40) },
+      outcome: candidate.scenarioId === trial.scenarioId
+        ? { ...candidate.outcome, status: "failed" as const }
+        : candidate.outcome,
+    })),
   });
 
   expect(evaluation).toMatchObject({ exitCode: 1, criticalSafetyFailed: true, report: { status: "failed" } });
@@ -602,7 +627,9 @@ it.each(["outcome", "trace", "answer"] as const)(
   "returns a nonzero evaluation result for an incomplete %s layer",
   async (layer) => {
     const runner = await runnerModule();
-    const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+    const trials = await cleanScenarioTrials("baseline");
+    const sourceTrial = trials[0];
+    if (!sourceTrial) throw new Error("baseline trial was not produced");
     const trial = {
       ...sourceTrial,
       harness: { ...sourceTrial.harness, dirty: false },
@@ -623,7 +650,7 @@ it.each(["outcome", "trace", "answer"] as const)(
       replace: false,
     }, {
       readGitIdentity: () => ({ commit: trial.harness.hanoonCommit, dirty: false }),
-      runTrials: async () => [trial],
+      runTrials: async () => trials.map((candidate, index) => index === 0 ? trial : candidate),
     });
 
     expect(evaluation).toMatchObject({ exitCode: 1, criticalSafetyFailed: false, report: { status: "incomplete" } });
@@ -661,6 +688,7 @@ it("rejects a baseline whose passed proof is not scenario-bound before running c
     const baseline = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "baseline", trialsPerScenario: 1, seed: 8122026 },
       trials: [{
         ...sourceTrial,
         harness: { ...sourceTrial.harness, dirty: false },
@@ -751,6 +779,7 @@ it("writes a comparable cutover report when fake metric availability matches", {
     const baselineReport = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "baseline", trialsPerScenario: 3, seed: 8122026 },
       trials: (await runControllerScenarioTrials({ checkpoint: "baseline", trials: 3, seed: 8122026 })).map((currentTrial) => ({
         ...currentTrial,
         harness: { ...currentTrial.harness, dirty: false },

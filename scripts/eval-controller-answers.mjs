@@ -11,17 +11,20 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  existsSync,
   fsyncSync,
+  lstatSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -170,11 +173,20 @@ function parseSpawnedThreadId(output) {
 
 function assertExternalArtifactPath(artifactPath) {
   const resolvedPath = resolve(artifactPath);
-  const pathFromRoot = relative(pluginRoot, resolvedPath);
-  if (!isAbsolute(artifactPath) || pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))) {
+  if (!isAbsolute(artifactPath)) {
     throw new Error("live gate artifact path must be absolute and outside the plugin worktree");
   }
-  return resolvedPath;
+  const realPluginRoot = realpathSync(pluginRoot);
+  const realParent = realpathSync(dirname(resolvedPath));
+  const realTarget = join(realParent, basename(resolvedPath));
+  const pathFromRoot = relative(realPluginRoot, realTarget);
+  if (pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))) {
+    throw new Error("live gate artifact path must be absolute and outside the plugin worktree");
+  }
+  if (existsSync(resolvedPath) && lstatSync(resolvedPath).isSymbolicLink()) {
+    throw new Error("live gate artifact path must not be a symbolic link");
+  }
+  return realTarget;
 }
 
 function buildJudgeCorrelation(testCase, clause) {
@@ -547,6 +559,7 @@ function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, assertCu
   if (!parseLiveGateArtifact(serialized, forbiddenValues)) throw new Error("live gate artifact failed schema or secret validation");
   const temporaryPath = `${artifactPath}.${process.pid}.${randomUUID()}.tmp`;
   let descriptor = null;
+  let published = false;
   try {
     descriptor = openSync(temporaryPath, "wx", 0o600);
     writeFileSync(descriptor, serialized, "utf8");
@@ -555,10 +568,15 @@ function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, assertCu
     descriptor = null;
     chmodSync(temporaryPath, 0o600);
     renameSync(temporaryPath, artifactPath);
+    published = true;
     chmodSync(artifactPath, 0o600);
+    assertCurrentInputs?.();
   } catch (error) {
     if (descriptor !== null) closeSync(descriptor);
     try { unlinkSync(temporaryPath); } catch { /* best effort for an incomplete atomic write */ }
+    if (published) {
+      try { unlinkSync(artifactPath); } catch { /* fail closed even if cleanup itself is unavailable */ }
+    }
     throw new Error(`live gate artifact write failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

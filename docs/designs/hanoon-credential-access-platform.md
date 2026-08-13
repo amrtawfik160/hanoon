@@ -6,7 +6,7 @@ Date: 2026-08-12
 
 Hanoon committed baseline: `cc71a96f9b719128505a8073597ca4390a47f26e`
 
-Valor reference baseline: `a13a31a083746d0c66e8cba17b84fea82c8b8096`
+External reference baseline: `a13a31a083746d0c66e8cba17b84fea82c8b8096`
 
 Package: `bb-plugin-telegram-agent`
 
@@ -362,9 +362,9 @@ Every autonomous connector workflow publishes:
 
 Unlisted operations are unsupported even if the model believes it knows how to perform them. A generic browser is not a qualification shortcut.
 
-## Valor adaptations
+## External reference system adaptations
 
-The Valor reference informed these decisions:
+The external reference informed these decisions:
 
 - retain noninteractive, fail-closed external-vault access and verify a credential against its provider before adoption;
 - retain auto-continue, durable obligations, stable browser/window identities, serialized resource ownership, stale-state rejection, machine-readable Definition of Done, anti-criteria, red-state proof, and trace-and-verify diagnosis;
@@ -374,7 +374,7 @@ The Valor reference informed these decisions:
 - replace audit-only arbitrary Bash at the credential boundary with an unreachable broker control plane;
 - expand the example happy-path pipeline into a required per-connector real acceptance corpus.
 
-Valor remains a reference, not a runtime dependency. Hanoon keeps BB as the session, provider, environment, and worktree authority.
+The external reference system remains a reference, not a runtime dependency. Hanoon keeps BB as the session, provider, environment, and worktree authority.
 
 ## Release sequence and gates
 

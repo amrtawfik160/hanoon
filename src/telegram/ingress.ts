@@ -328,13 +328,16 @@ export class TelegramIngress {
     // The agent asked something and is blocked on it. A reply now is the answer,
     // not a new request to line up behind the answer it is waiting to give.
     if (this.store.getPendingControllerInteraction(controllerKey)) {
-      const answered = this.store.answerControllerInteractionWithText({
+      const result = this.store.answerControllerInteractionTextUpdate({
+        updateId,
         controllerKey,
         userId: identity.userId,
         chatId: identity.chatId,
         text: normalized,
         now,
       });
+      if (result.outcome === "replay") return;
+      const answered = result.answer;
       if (answered.ok) {
         this.rememberStandingInstruction(normalized, answered.turnId, now);
         this.onWorkAvailable();

@@ -30,6 +30,7 @@ export type TelegramServiceDeps = {
     | { ok: true; value: Pick<GlobalConfig, "botToken"> }
     | { ok: false; message: string };
   clock: { now(): number };
+  onTokenVerified?: (token: string) => void;
   warn?: (message: string) => void;
 };
 
@@ -93,6 +94,7 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
         throw configurationError("Telegram bot identity changed while an active job exists (active_job_conflict).");
       }
       identityBound = true;
+      deps.onTokenVerified?.(token);
     }
 
     let updates: TelegramUpdate[];

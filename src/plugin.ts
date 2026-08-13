@@ -128,28 +128,35 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const executorNudge = new ExecutorNudge();
   const laneSnapshots = new JobLaneSnapshotProvider();
   let config = parseGlobalConfig(await settings.get());
+  let verifiedBotToken: string | null = null;
   if (!config.ok) bb.status.needsConfiguration(config.message);
 
   settings.onChange((next) => {
     const parsed = parseGlobalConfig(next);
     config = parsed;
-    if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
+    if (!parsed.ok || parsed.value.botToken !== verifiedBotToken) {
+      verifiedBotToken = null;
+    }
+    if (!parsed.ok) {
+      bb.status.needsConfiguration(parsed.message);
+    }
     executorNudge.notify();
   });
 
   const telegramForToken = (token: string): TelegramClient => new TelegramClient(token);
+  const verifiedTelegramClient = (): TelegramClient => {
+    if (verifiedBotToken === null) throw new Error("Telegram bot token is not verified.");
+    return telegramForToken(verifiedBotToken);
+  };
   const telegramTransport = {
     sendMessage: (chatId: string, payload: Parameters<TelegramClient["sendMessage"]>[1]) => {
-      if (!config.ok) throw new Error(config.message);
-      return telegramForToken(config.value.botToken).sendMessage(chatId, payload);
+      return verifiedTelegramClient().sendMessage(chatId, payload);
     },
     editMessage: (chatId: string, messageId: number, payload: Parameters<TelegramClient["editMessage"]>[2]) => {
-      if (!config.ok) throw new Error(config.message);
-      return telegramForToken(config.value.botToken).editMessage(chatId, messageId, payload);
+      return verifiedTelegramClient().editMessage(chatId, messageId, payload);
     },
     answerCallback: (callbackQueryId: string, text: string) => {
-      if (!config.ok) throw new Error(config.message);
-      return telegramForToken(config.value.botToken).answerCallback(callbackQueryId, text);
+      return verifiedTelegramClient().answerCallback(callbackQueryId, text);
     },
   };
   const threadOperations = new ThreadOperationService({
@@ -488,9 +495,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       return controllerExecutionProfile(config.value);
     },
     downloadImage: async (fileId, maxBytes, signal) => {
-      if (!config.ok) throw new Error(config.message);
       try {
-        return await telegramForToken(config.value.botToken).downloadFile(fileId, maxBytes, signal);
+        return await verifiedTelegramClient().downloadFile(fileId, maxBytes, signal);
       } catch (error) {
         if (error instanceof TelegramFileTooLargeError) {
           throw new ControllerImagePreparationError(false);
@@ -645,8 +651,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const threadNotices = new ThreadNoticeService({
     store,
     threads: {
-      listWatchable: async () => {
-        const threads = await bb.sdk.threads.list({ includeHidden: false, archived: false, limit: 100 });
+      listWatchable: async (offset, limit) => {
+        const threads = await bb.sdk.threads.list({ includeHidden: false, archived: false, offset, limit });
         return threads
           .filter((thread) => thread.visibility === "visible" && thread.archivedAt === null && thread.deletedAt === null)
           .map((thread) => ({
@@ -680,8 +686,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     jobLanes: laneSnapshots,
     telegram: {
       sendChatAction: (chatId, action, signal) => {
-        if (!config.ok) throw new Error(config.message);
-        return telegramForToken(config.value.botToken).sendChatAction(chatId, action, signal);
+        return verifiedTelegramClient().sendChatAction(chatId, action, signal);
       },
     },
     warn: (message) => bb.log.warn(message),
@@ -945,6 +950,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       ingress,
       getConfig: () => config,
       clock: { now: clock },
+      onTokenVerified: (token) => {
+        if (config.ok && config.value.botToken === token) verifiedBotToken = token;
+      },
       warn: (message) => bb.log.warn(message),
     }, signal),
   });
@@ -957,10 +965,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       onWorkAvailable: () => executorNudge.notify(),
       clock: { now: clock },
       reconcileJob,
-      telegramToken: () => config.ok ? config.value.botToken : undefined,
+      telegramToken: () => verifiedBotToken ?? undefined,
       getTelegramClient: () => {
-        if (!config.ok) throw new Error(config.message);
-        const client = telegramForToken(config.value.botToken);
+        const client = verifiedTelegramClient();
         return {
           sendMessage: (chatId: string, payload: Record<string, unknown>) => client.sendMessage(chatId, payload as Parameters<TelegramClient["sendMessage"]>[1]),
           sendMessageDraft: (chatId: string, draftId: number, text: string) => client.sendMessageDraft(chatId, draftId, text),

@@ -443,7 +443,7 @@ export class LunaControllerService {
     if (!controller.threadId) return;
     const turn = this.dependencies.store.getControllerTurn(ownerAnswer.turnId);
     if (!turn || turn.state !== "submitted" ||
-        !this.providerMutationAllowed(turn, controller, fence, signal)) return;
+        !this.interactionDeliveryAllowed(ownerAnswer, fence, signal)) return;
     try {
       if (this.dependencies.adapter.resolveInteraction) {
         const resolution = parseControllerInteractionResolution(ownerAnswer.resolution);
@@ -468,6 +468,7 @@ export class LunaControllerService {
       // executor retry after an authoritative read on the next pass.
       return;
     }
+    if (!this.interactionDeliveryAllowed(ownerAnswer, fence, signal)) return;
     const getInteraction = this.dependencies.adapter.getInteraction;
     if (!getInteraction) return;
     let observed: ControllerInteractionSnapshot;
@@ -489,6 +490,21 @@ export class LunaControllerService {
       interactionId: ownerAnswer.interactionId,
       turnId: ownerAnswer.turnId,
       bbThreadId: ownerAnswer.bbThreadId,
+    });
+  }
+
+  private interactionDeliveryAllowed(
+    ownerAnswer: NonNullable<ReturnType<TelegramAgentStore["getAnsweredControllerInteraction"]>>,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): boolean {
+    return !signal.aborted && this.dependencies.store.isControllerInteractionDeliveryFenceCurrent({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      interactionId: ownerAnswer.interactionId,
+      turnId: ownerAnswer.turnId,
+      controllerKey: ownerAnswer.controllerKey,
+      bbThreadId: ownerAnswer.bbThreadId,
+      controllerGenerationId: ownerAnswer.controllerGenerationId,
     });
   }
 

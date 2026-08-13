@@ -147,7 +147,7 @@ it("reports an interrupted call as uncertain instead of running it twice", async
   expect(request).not.toHaveBeenCalled();
 });
 
-it("lets a failed call be attempted again", () => {
+it("retries only a failure recorded before the operation starts", () => {
   const { store, turn } = fixture();
   const key = {
     turnId: turn.id,
@@ -158,6 +158,13 @@ it("lets a failed call be attempted again", () => {
   store.failToolReceipt({ ...key, error: "BB unreachable", now: NOW + 1 });
 
   expect(store.claimToolReceipt({ ...key, controllerKey: CONTROLLER_KEY, now: NOW + 2 }))
+    .toEqual({ outcome: "interrupted" });
+
+  const safeKey = { ...key, argsSha256: "d".repeat(64) };
+  expect(store.claimToolReceipt({ ...safeKey, controllerKey: CONTROLLER_KEY, now: NOW + 3 }))
+    .toEqual({ outcome: "fresh" });
+  store.failToolReceipt({ ...safeKey, error: "authorization_failed", now: NOW + 4 });
+  expect(store.claimToolReceipt({ ...safeKey, controllerKey: CONTROLLER_KEY, now: NOW + 5 }))
     .toEqual({ outcome: "fresh" });
 });
 

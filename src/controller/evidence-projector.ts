@@ -323,7 +323,9 @@ function toolCandidate(
 ): ControllerNativeEvidenceCandidate {
   return nativeEvidenceCandidate({
     nativeItem,
-    outcome: statusOutcome(nativeItem.status, null),
+    // Provider tools are opaque to this plugin. Their lifecycle is observable,
+    // but their result is not an authoritative Hanoon execution receipt.
+    outcome: "observed",
     argsProjection: {
       type: nativeItem.type,
       ...ownDefinedFields(nativeItem, ["server"]),
@@ -334,7 +336,7 @@ function toolCandidate(
       status: nativeItem.status,
       ...ownDefinedFields(nativeItem, ["result", "error", "durationMs", "truncation"]),
     },
-    proofKind: "tool_result",
+    proofKind: "thread_state",
   });
 }
 

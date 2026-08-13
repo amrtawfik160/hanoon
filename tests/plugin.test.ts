@@ -24,6 +24,42 @@ async function loadPlugin() {
   return { bb, harness };
 }
 
+function stubTelegramApi(
+  methods: string[],
+  resultForMethod: (method: string) => unknown = () => true,
+): void {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const method = String(input).split("/").at(-1) ?? "";
+    methods.push(method);
+    if (method === "getMe") return telegramResponse({ id: 123, username: "test_bot" });
+    if (method === "getUpdates") {
+      return new Promise<Response>((resolve) => {
+        const release = (): void => resolve(telegramResponse([]));
+        if (init?.signal?.aborted) release();
+        else init?.signal?.addEventListener("abort", release, { once: true });
+      });
+    }
+    return telegramResponse(resultForMethod(method));
+  }));
+}
+
+function telegramResponse(result: unknown): Response {
+  return new Response(JSON.stringify({ ok: true, result }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function verifyConfiguredTelegramToken(
+  harness: Awaited<ReturnType<typeof loadPlugin>>["harness"],
+  methods: string[],
+): Promise<void> {
+  const run = harness.behavior.runService("telegram-ingress");
+  await vi.waitFor(() => expect(methods).toContain("getUpdates"));
+  run.controller.abort();
+  await run.done;
+}
+
 it("requests the secret bot token when configuration is absent", async () => {
   const { harness } = await loadPlugin();
 
@@ -410,10 +446,9 @@ it("registers both background services and all enqueue-only thread lifecycle han
 it("wires submitted controller turns through the leased job executor", async () => {
   const { bb, harness } = await loadPlugin();
   await harness.behavior.setSettings({ botToken: "123:test-token" });
-  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { message_id: 901 } }), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  })));
+  const telegramMethods: string[] = [];
+  stubTelegramApi(telegramMethods, (method) => method === "sendMessage" ? { message_id: 901 } : true);
+  await verifyConfiguredTelegramToken(harness, telegramMethods);
   const store = openStore(bb.storage);
   store.createPairingCode(hashSecret("controller-pair"), 1_000, Date.now() + 60_000);
   expect(store.pairOwnerWithCode(hashSecret("controller-pair"), "7", "7", Date.now())).toEqual({ ok: true });
@@ -484,6 +519,17 @@ it("wires submitted controller turns through the leased job executor", async () 
   ));
   run.controller.abort();
   await run.done;
+
+  store.enqueueOutbox({
+    logicalKey: "notice:token-rotation-probe",
+    chatId: "7",
+    payload: { text: "token rotation probe" },
+  }, Date.now());
+  const sendsBeforeRotation = telegramMethods.filter((method) => method === "sendMessage").length;
+  await harness.behavior.setSettings({ botToken: "456:replacement-token" });
+  const unverifiedReplacement = harness.behavior.runService("job-executor");
+  await expect(unverifiedReplacement.done).rejects.toThrow(/token is not verified/i);
+  expect(telegramMethods.filter((method) => method === "sendMessage")).toHaveLength(sendsBeforeRotation);
   vi.unstubAllGlobals();
 });
 
@@ -491,15 +537,8 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
   const { bb, harness } = await loadPlugin();
   await harness.behavior.setSettings({ botToken: "123:test-token" });
   const telegramMethods: string[] = [];
-  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
-    const method = String(input).split("/").at(-1) ?? "";
-    telegramMethods.push(method);
-    const result = method === "sendMessage" ? { message_id: 902 } : true;
-    return new Response(JSON.stringify({ ok: true, result }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  }));
+  stubTelegramApi(telegramMethods, (method) => method === "sendMessage" ? { message_id: 902 } : true);
+  await verifyConfiguredTelegramToken(harness, telegramMethods);
   const store = openStore(bb.storage);
   const now = Date.now();
   store.createPairingCode(hashSecret("presence-pair"), now, now + 60_000);

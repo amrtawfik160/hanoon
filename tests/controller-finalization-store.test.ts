@@ -95,7 +95,7 @@ try {
       controllerKey: "controller_race",
       candidate: {
         disposition: "answered",
-        segments: [{ type: "text", text: "The answer is complete." }],
+        segments: [{ type: "text", text: "Here is the requested answer." }],
         obligationRefs: [],
       },
     });
@@ -241,7 +241,7 @@ function processOnlyFinalization() {
   };
 }
 
-function plainFinalization(text = "The answer is complete.") {
+function plainFinalization(text = "Here is the requested answer.") {
   return {
     disposition: "answered" as const,
     segments: [{ type: "text" as const, text }],
@@ -267,7 +267,7 @@ function deferredFinalization(ref: string) {
 
 function acceptPlainFinalization(
   fixture: ReturnType<typeof submittedControllerFixture>,
-  text = "The answer is complete.",
+  text = "Here is the requested answer.",
 ) {
   const accepted = fixture.store.proposeControllerFinalization({
     ...fixture.fence,
@@ -290,6 +290,23 @@ function nativeEvidenceCandidate(sourceItemId: string) {
     subjectRefs: [`bb-item:${sourceItemId}`] as const,
   };
 }
+
+it("does not permit a controller mutation after finalization is accepted", () => {
+  const fixture = submittedControllerFixture();
+  const row = fixture.db.prepare(
+    "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  const mutationFence = {
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    expectedThreadId: row.bb_thread_id,
+  };
+
+  expect(fixture.store.canMutateControllerTurn(mutationFence)).toBe(true);
+  acceptPlainFinalization(fixture);
+  expect(fixture.store.canMutateControllerTurn(mutationFence)).toBe(false);
+});
 
 it("accepts one evidence-bound candidate and makes it immutable", () => {
   const { store, turn, fence, db } = submittedControllerFixture();

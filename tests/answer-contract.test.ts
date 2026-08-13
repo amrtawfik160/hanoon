@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { join } from "node:path";
@@ -34,13 +34,23 @@ const RELEASE_CASE_IDS = [
   "bounded-uncertainty",
   "bad-news-plainly",
 ];
-const RELEASE_GOLDEN_SHA256 = "05cb2da1e88ba767e07f7ed22389fe39ae278acd9f8f3c5879851cf17dd2370b";
-const RELEASE_EXPECTATIONS_SHA256 = "0876bcb014fd595337fe35b21906c46e5ac3b0d89d02220a839da2cb7aabcd7b";
+const RELEASE_GOLDEN_SHA256 = "43e2872b5f40fb8266760153dac1e6a9b4b049ddd2bce53b5a223eda5e9bb79b";
+const RELEASE_EXPECTATIONS_SHA256 = "de278dc8d2ad3531ee4c91b0cf1af1fa5d373d242a9f4692bca325c1515b4805";
+const RELEASE_EXPECTATIONS = {
+  "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true } },
+  "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false } },
+  "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true } },
+  "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+} as const;
 
 type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "infra" | "ambiguous-spawn" | "spawn-error";
 
 function fakeBbPath(directory: string, mode: FakeBbMode): string {
   const commandPath = join(directory, "bb");
+  const gitPath = join(directory, "git");
   const logPath = join(directory, "bb-commands.jsonl");
   writeFileSync(commandPath, `#!/usr/bin/env node
 import fs from "node:fs";
@@ -106,15 +116,32 @@ if (args[0] === "thread" && args[1] === "spawn") {
   process.exit(2);
 }
 `, { mode: 0o755 });
+  writeFileSync(gitPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "rev-parse" && args[1] === "HEAD") {
+  process.stdout.write("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n");
+} else if (args[0] === "status" && args.includes("--porcelain")) {
+  process.stdout.write("");
+} else {
+  process.stderr.write("unexpected fake git command");
+  process.exit(2);
+}
+`, { mode: 0o755 });
   appendFileSync(logPath, "");
   chmodSync(commandPath, 0o755);
+  chmodSync(gitPath, 0o755);
   return commandPath;
 }
 
-async function runWithFakeBb(caseId: string, mode: FakeBbMode, status = "idle") {
+async function runWithFakeBb(
+  caseId: string,
+  mode: FakeBbMode,
+  status = "idle",
+  artifactPathFor?: (directory: string) => string,
+) {
   const directory = mkdtempSync(join(tmpdir(), "answer-eval-test-"));
   const logPath = join(directory, "bb-commands.jsonl");
-  const artifactPath = join(directory, "live-gate.json");
+  const artifactPath = artifactPathFor?.(directory) ?? join(directory, "live-gate.json");
   fakeBbPath(directory, mode);
   try {
     const result = await execFileAsync(process.execPath, [
@@ -191,14 +218,6 @@ async function runWithMismatchedAnswerCorpus(
 }
 
 function buildReleasePassedArtifact(): Record<string, any> {
-  const clauses = ANSWER_CLAUSES.map((clause) => ({
-    id: clause.id,
-    expected: true,
-    result: true,
-    source: "deterministic",
-    judgeThreadId: null,
-    isolation: null,
-  }));
   return {
     schemaVersion: "answer-live-gate-v2",
     rubricVersion: ANSWER_RUBRIC_VERSION,
@@ -212,10 +231,33 @@ function buildReleasePassedArtifact(): Record<string, any> {
     selectedClauseCount: RELEASE_CASE_IDS.length * ANSWER_CLAUSES.length,
     cases: RELEASE_CASE_IDS.map((id) => ({
       id,
-      expected: "pass",
-      result: "pass",
+      expected: RELEASE_EXPECTATIONS[id as keyof typeof RELEASE_EXPECTATIONS].aggregate,
+      result: RELEASE_EXPECTATIONS[id as keyof typeof RELEASE_EXPECTATIONS].aggregate,
       matchesGolden: true,
-      clauses,
+      clauses: ANSWER_CLAUSES.map((clause) => {
+        const expected = RELEASE_EXPECTATIONS[id as keyof typeof RELEASE_EXPECTATIONS].clauses[clause.id];
+        return expected ? {
+          id: clause.id,
+          expected,
+          result: true,
+          source: "model",
+          judgeThreadId: `thr_${id}_${clause.id}`,
+          isolation: {
+            eventCount: 1,
+            eventLog: "completed-audited",
+            toolActivity: "none-observed",
+            workspace: "empty-temporary",
+            workspaceCleanup: "complete",
+          },
+        } : {
+          id: clause.id,
+          expected,
+          result: false,
+          source: "deterministic",
+          judgeThreadId: null,
+          isolation: null,
+        };
+      }),
     })),
     infrastructureErrors: [],
     audit: {
@@ -238,6 +280,41 @@ function buildReleasePassedArtifact(): Record<string, any> {
 
 it("accepts a complete release-shaped artifact", () => {
   expect(parseLiveGateArtifact(JSON.stringify(buildReleasePassedArtifact()))).not.toBeNull();
+});
+
+it("rejects deterministic pass provenance because deterministic checks are fail-only", () => {
+  const artifact = buildReleasePassedArtifact();
+  artifact.cases[0].clauses[0] = {
+    ...artifact.cases[0].clauses[0],
+    result: true,
+    source: "deterministic",
+    judgeThreadId: null,
+    isolation: null,
+  };
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
+});
+
+it("rejects a self-attested all-pass expectation matrix despite pinned fixture hashes", () => {
+  const artifact = buildReleasePassedArtifact();
+  for (const candidate of artifact.cases) {
+    candidate.expected = "pass";
+    candidate.result = "pass";
+    candidate.matchesGolden = true;
+    for (const clause of candidate.clauses) {
+      clause.expected = true;
+      clause.result = true;
+      clause.source = "model";
+      clause.judgeThreadId = `thr_fabricated_${candidate.id}_${clause.id}`;
+      clause.isolation = {
+        eventCount: 1,
+        eventLog: "completed-audited",
+        toolActivity: "none-observed",
+        workspace: "empty-temporary",
+        workspaceCleanup: "complete",
+      };
+    }
+  }
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
 });
 
 it("requires passed artifacts to carry repository and final-input identity", () => {
@@ -765,6 +842,27 @@ it("keeps a targeted artifact diagnostic and never reports it passed", async () 
   }
 });
 
+it("rejects a symbolic-link artifact target before starting any judge", async () => {
+  let targetPath = "";
+  const run = await runWithFakeBb("status-good", "all-hold", "idle", (directory) => {
+    targetPath = join(directory, "protected-target.json");
+    writeFileSync(targetPath, "protected\n", { mode: 0o600 });
+    const linkPath = join(directory, "live-gate-link.json");
+    symlinkSync(targetPath, linkPath);
+    return linkPath;
+  });
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
+    expect(readFileSync(targetPath, "utf8")).toBe("protected\n");
+    expect(readFileSync(run.logPath, "utf8")).toBe("");
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
+  }
+});
+
 it("writes a failed artifact without shrinking denominators when infrastructure fails", async () => {
   const run = await runWithFakeBb("status-good", "infra");
   try {
@@ -879,7 +977,7 @@ it("ships independent literal expectations for every golden case and clause", ()
   const expected = {
     "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
     "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-    "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+    "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true } },
     "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false } },
     "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true } },
     "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },

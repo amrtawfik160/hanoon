@@ -824,6 +824,10 @@ export type ControllerInteractionCallbackResult = Readonly<{
   answer: ControllerInteractionAnswer;
   recorded: boolean;
 }>;
+
+export type ControllerInteractionTextUpdateResult =
+  | Readonly<{ outcome: "replay" }>
+  | Readonly<{ outcome: "handled"; answer: ControllerInteractionAnswer }>;
 type ThreadOperationRow = {
   id: string;
   nonce_hash: string;
@@ -1831,6 +1835,14 @@ export interface TelegramAgentStore {
     text: string;
     now: number;
   }): ControllerInteractionAnswer;
+  answerControllerInteractionTextUpdate(input: {
+    updateId: number;
+    controllerKey: string;
+    userId: string;
+    chatId: string;
+    text: string;
+    now: number;
+  }): ControllerInteractionTextUpdateResult;
   answerControllerInteractionByTokenAndRecordCallback(input: {
     token: string;
     userId: string;
@@ -3953,6 +3965,63 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  public answerControllerInteractionTextUpdate(input: {
+    updateId: number;
+    controllerKey: string;
+    userId: string;
+    chatId: string;
+    text: string;
+    now: number;
+  }): ControllerInteractionTextUpdateResult {
+    assertNonNegativeInteger(input.updateId, "updateId");
+    const result = this.db.transaction((): ControllerInteractionTextUpdateResult => {
+      const existing = this.db.prepare(
+        `SELECT status, claim_owner, claim_generation, claim_expires_at
+           FROM telegram_updates WHERE update_id = ?`,
+      ).get(input.updateId) as Pick<
+        TelegramUpdateRow,
+        "status" | "claim_owner" | "claim_generation" | "claim_expires_at"
+      > | undefined;
+      if (existing?.status === "processed") return { outcome: "replay" };
+
+      let claimGeneration = this.claimedUpdates.get(input.updateId);
+      if (!existing) {
+        claimGeneration = 1;
+        const expiresAt = input.now + TELEGRAM_UPDATE_LEASE_MS;
+        this.db.prepare(
+          `INSERT INTO telegram_updates (
+             update_id, status, attempts, outcome, last_error, processed_at,
+             claim_owner, claim_generation, claim_expires_at
+           ) VALUES (?, 'processing', 1, NULL, NULL, NULL, ?, ?, ?)`,
+        ).run(input.updateId, this.claimOwner, claimGeneration, expiresAt);
+        this.claimedUpdates.set(input.updateId, claimGeneration);
+      } else if (
+        existing.status !== "processing" || claimGeneration === undefined ||
+        existing.claim_owner !== this.claimOwner || existing.claim_generation !== claimGeneration ||
+        existing.claim_expires_at === null || existing.claim_expires_at <= input.now
+      ) {
+        throw new UpdateClaimConflictError(input.updateId);
+      }
+
+      const answer = this.controllerInteractionRepository.answerWithText(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      if (!answer.ok) return { outcome: "handled", answer };
+
+      const completed = this.db.prepare(
+        `UPDATE telegram_updates
+            SET status = 'processed', outcome = 'controller_interaction_answered',
+                last_error = NULL, processed_at = ?, claim_owner = NULL, claim_expires_at = NULL
+          WHERE update_id = ? AND status = 'processing'
+            AND claim_owner = ? AND claim_generation = ? AND claim_expires_at > ?`,
+      ).run(input.now, input.updateId, this.claimOwner, claimGeneration!, input.now);
+      if (completed.changes !== 1) throw new UpdateClaimConflictError(input.updateId);
+      advanceTelegramCursor(this.db);
+      return { outcome: "handled", answer };
+    }).immediate();
+    if (result.outcome === "replay" || result.answer.ok) this.claimedUpdates.delete(input.updateId);
+    return result;
+  }
+
   public getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null {
     return this.controllerInteractionRepository.getPending(controllerKey);
   }
@@ -4264,6 +4333,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           AND ((turn.state = 'submitted' AND controller.state = 'active') OR
                (turn.state = 'dispatching' AND controller.state IN ('active', 'pending_spawn')))
           AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.accepted_finalization_id IS NULL
           AND ((? IS NULL AND controller.bb_thread_id IS NULL) OR controller.bb_thread_id = ?)` ,
     ).get(
       input.turnId,
@@ -4531,15 +4601,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)
       )) return { outcome: "fence_lost" };
       const existing = this.db.prepare(
-        `SELECT state, result_text, controller_key FROM tool_receipts
+        `SELECT state, result_text, last_error, controller_key FROM tool_receipts
           WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?`,
       ).get(input.turnId, input.toolName, input.argsSha256) as
-        { state: string; result_text: string | null; controller_key: string } | undefined;
+        { state: string; result_text: string | null; last_error: string | null; controller_key: string } | undefined;
       if (existing && existing.controller_key !== input.controllerKey) return { outcome: "fence_lost" };
       if (existing?.state === "completed") {
         return { outcome: "completed", result: existing.result_text ?? "" };
       }
       if (existing?.state === "started") return { outcome: "interrupted" };
+      if (existing?.state === "failed" && existing.last_error !== "authorization_failed") {
+        return { outcome: "interrupted" };
+      }
       if (existing) {
         this.db.prepare(
           `UPDATE tool_receipts SET state = 'started', last_error = NULL, updated_at = ?
@@ -8967,7 +9040,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertSafeFailureSummary(outcome);
     assertNoRawMergeCallback(outcome, "Telegram update outcome");
     const claimGeneration = this.claimedUpdates.get(updateId);
-    if (claimGeneration === undefined) throw new UpdateClaimConflictError(updateId);
+    if (claimGeneration === undefined) {
+      const existing = this.db.prepare(
+        "SELECT status FROM telegram_updates WHERE update_id = ?",
+      ).get(updateId) as { status: string } | undefined;
+      if (existing?.status === "processed") {
+        advanceTelegramCursor(this.db);
+        return;
+      }
+      throw new UpdateClaimConflictError(updateId);
+    }
 
     const complete = this.db.transaction(() => {
       const updated = this.db

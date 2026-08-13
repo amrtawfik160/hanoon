@@ -20,6 +20,8 @@ export const controllerHarnessIdentitySchema = z.object({
   capabilityManifestSha256: sha256Schema,
   policySha256: sha256Schema,
   contextSha256: sha256Schema,
+  /** Optional only for parsing historical reports created before fixture identity was recorded. */
+  answerFixtureSha256: sha256Schema.optional(),
   /** Tools supplied by the task harness outside the Hanoon controller surface. */
   outerTaskTools: z.array(z.string().min(1).max(128)).max(64).optional(),
   advertisedTools: z.array(z.string().min(1).max(128)).max(64),
@@ -150,6 +152,12 @@ const scenarioSummarySchema = z.object({
   incomplete: z.number().int().min(0).max(512),
 }).strict();
 
+const evaluationRunIdentitySchema = z.object({
+  checkpoint: z.enum(["baseline", "kernel", "cutover"]),
+  trialsPerScenario: z.number().int().min(1).max(512),
+  seed: z.number().int().min(0).max(2_147_483_647),
+}).strict();
+
 const comparisonScenarioSideSchema = scenarioSummarySchema.extend({
   scenarioVersion: z.number().int().min(1).max(10_000),
   criticalSafety: z.boolean(),
@@ -162,6 +170,7 @@ const interventionHarnessSchema = z.object({
   capabilityManifestSha256: sha256Schema,
   policySha256: sha256Schema,
   contextSha256: sha256Schema,
+  answerFixtureSha256: sha256Schema,
   parameterSchemaSha256: z.record(z.string().min(1).max(128), sha256Schema),
 }).strict();
 
@@ -252,6 +261,8 @@ function summariesMatch(trials: readonly ControllerScenarioTrial[], summaries: r
 export const controllerEvaluationReportSchema = z.object({
   schemaVersion: z.literal(1),
   label: z.enum(["fixed", "strong", "smoke"]),
+  /** Optional only for parsing historical artifacts; every current evaluator write requires it. */
+  run: evaluationRunIdentitySchema.optional(),
   generatedAt: reportGeneratedAtSchema,
   status: reportStatusSchema,
   trialCount: z.number().int().min(1).max(512),
@@ -361,6 +372,7 @@ type ComparableTrialSignature = Readonly<{
   permissionMode: "auto" | "accept-edits" | "full";
   overlaySha256: string;
   contextSha256: string;
+  answerFixtureSha256: string;
   budget: ControllerScenarioTrial["budget"];
   graders: Readonly<{
     outcome: Readonly<{ graderId: string; graderVersion: number }>;
@@ -406,6 +418,9 @@ function assertCurrentTrialIdentity(trial: ControllerScenarioTrial): void {
   }
   if (trial.harness.outerTaskTools === undefined) {
     throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing outer task tool identity; historical reports may remain incomplete`);
+  }
+  if (trial.harness.answerFixtureSha256 === undefined) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing answer fixture identity; historical reports may remain incomplete`);
   }
   if (trial.evidenceRecords === undefined) {
     throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing redacted evidence records; historical reports may remain incomplete`);
@@ -586,6 +601,9 @@ function trialSignature(trial: ControllerScenarioTrial): ComparableTrialSignatur
   if (trial.harness.outerTaskTools === undefined) {
     throw new Error(`fixed comparison trial ${trial.scenarioId}:${trial.trial} is missing outer task tool identity`);
   }
+  if (trial.harness.answerFixtureSha256 === undefined) {
+    throw new Error(`fixed comparison trial ${trial.scenarioId}:${trial.trial} is missing answer fixture identity`);
+  }
   return {
     scenarioVersion: trial.scenarioVersion,
     outerTaskTools: trial.harness.outerTaskTools,
@@ -596,6 +614,7 @@ function trialSignature(trial: ControllerScenarioTrial): ComparableTrialSignatur
     permissionMode: trial.harness.permissionMode,
     overlaySha256: trial.harness.overlaySha256,
     contextSha256: trial.harness.contextSha256,
+    answerFixtureSha256: trial.harness.answerFixtureSha256,
     budget: trial.budget,
     graders: {
       outcome: { graderId: trial.outcome.graderId, graderVersion: trial.outcome.graderVersion },
@@ -702,6 +721,9 @@ function requiredFixedIdentity(
   if (trial.harness.outerTaskTools === undefined) {
     throw new Error(`fixed comparison ${side} trial ${key} ${trial.trial} is missing outer task tool identity`);
   }
+  if (trial.harness.answerFixtureSha256 === undefined) {
+    throw new Error(`fixed comparison ${side} trial ${key} ${trial.trial} is missing answer fixture identity`);
+  }
   return {
     scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
     outerTaskTools: trial.harness.outerTaskTools,
@@ -747,6 +769,7 @@ function interventionTrial(trial: ControllerScenarioTrial): z.infer<typeof inter
       capabilityManifestSha256: trial.harness.capabilityManifestSha256,
       policySha256: trial.harness.policySha256,
       contextSha256: trial.harness.contextSha256,
+      answerFixtureSha256: trial.harness.answerFixtureSha256!,
       parameterSchemaSha256: trial.harness.parameterSchemaSha256,
     },
   };
@@ -771,6 +794,9 @@ export function compareControllerEvaluations(input: Readonly<{
   const after = parseControllerEvaluationReport(input.after);
   if (baseline.label !== "fixed" || after.label !== "fixed") {
     throw new Error("fixed comparison requires fixed baseline and after reports");
+  }
+  if (!baseline.run || !after.run) {
+    throw new Error("fixed comparison requires explicit checkpoint, trial, and seed identity on both reports");
   }
   assertCleanFixedReport(baseline, "baseline");
   assertCleanFixedReport(after, "after");
@@ -851,6 +877,7 @@ export function attachControllerComparison(
 export function aggregateControllerEvaluation(input: {
   label: z.infer<typeof controllerEvaluationReportSchema>["label"];
   generatedAt?: string;
+  run?: z.infer<typeof evaluationRunIdentitySchema>;
   trials: readonly ControllerScenarioTrial[];
   comparison?: ControllerEvaluationComparison;
 }): ControllerEvaluationReport {
@@ -858,6 +885,7 @@ export function aggregateControllerEvaluation(input: {
   return controllerEvaluationReportSchema.parse({
     schemaVersion: 1,
     label: input.label,
+    ...(input.run ? { run: input.run } : {}),
     generatedAt: input.generatedAt ?? new Date().toISOString(),
     status: derivedReportStatus(trials),
     trialCount: trials.length,

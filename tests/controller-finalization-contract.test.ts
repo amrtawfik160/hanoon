@@ -548,6 +548,18 @@ describe("ordered rejection branches", () => {
     }))).toMatchObject({ outcome: "accepted" });
   });
 
+  it("does not interpret an opaque delegation UUID as encoded credential text", () => {
+    const ref = "delegation:del-20fdbb26-2c90-4bae-a60c-234895988d03";
+    const candidate: ControllerFinalization = {
+      disposition: "deferred",
+      segments: [{ type: "text", text: "I'll follow up when the work finishes." }],
+      obligationRefs: [ref],
+    };
+    expect(validateControllerFinalization(candidate, emptyFinalizationContext({
+      liveObligationRefs: new Set([ref]),
+    }))).toMatchObject({ outcome: "accepted" });
+  });
+
   it("rejects process-only intent", () => {
     expectRejection(
       textFinalization("I'll investigate and get back to you."),
@@ -697,13 +709,20 @@ describe("claim outcome compatibility", () => {
 
   it.each([
     ["observed_state", "project_state"],
-    ["pipeline_outcome", "pipeline_outcome"],
     ["health_assessment", "health_snapshot"],
   ] as const)("allows current observation to support successful %s", (kind, proofKind) => {
     expect(validateControllerFinalization(
       claimFinalization({ kind, outcome: "succeeded" }),
       contextWithEvidence(evidenceRow("evidence:1", proofKind, "observed")),
     )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not let an observed failed production outcome support a successful pipeline claim", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "The rollout succeeded." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "observed")),
+      "proof_incompatible",
+    );
   });
 
   it.each([
@@ -802,8 +821,27 @@ describe("fail-closed operational claim binding", () => {
     "CI is green.",
     "The rollout succeeded.",
     "The work is finished.",
+    "Production is up.",
+    "The release went out.",
   ])("rejects an unclaimed operational paraphrase: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "The fix is\nimplemented.",
+    "The fix is\r\nimplemented.",
+    "The build\nsucceeded.",
+    "Everything is\ndone.",
+  ])("does not let line boundaries split an operational assertion: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it("does not let a negative subordinate clause suppress an earlier success assertion", () => {
+    expectRejection(
+      textFinalization("The tests passed, although deployment failed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
   });
 
   it.each([
@@ -870,6 +908,11 @@ describe("bounded text heuristics", () => {
     "I'll try.",
     "I'll get back to you.",
     "I'll follow up.",
+    "I'll take care of it.",
+    "I will handle it.",
+    "I am addressing it now.",
+    "I'll resolve the situation.",
+    "We are progressing it.",
     "I'll check the logs.",
     "I'll look into the current job.",
     "I'll work on the migration.",
@@ -969,6 +1012,12 @@ describe("bounded text heuristics", () => {
     "USD 500 was spent on the service.",
     "The tests were completed.",
     "I can confirm the fix is implemented.",
+    "The migration is wrapped up.",
+    "The issue has been resolved.",
+    "The launch cleared its final gate.",
+    "The rollout went smoothly.",
+    "The change landed.",
+    "The service is good to go.",
   ])("rejects unclaimed high-impact assertion: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
@@ -987,7 +1036,6 @@ describe("bounded text heuristics", () => {
   it.each([
     "Should I deploy the service?",
     "I did not deploy the service.",
-    "I will deploy the service after approval.",
     "The deployment failed.",
     "The deployment may have succeeded, but I am uncertain.",
     "We could install the package later.",
@@ -997,13 +1045,19 @@ describe("bounded text heuristics", () => {
     "We paid attention to the details.",
     "Should the package be installed?",
     "The records were not deleted.",
-    "We will purchase the service after approval.",
     "Can you confirm whether the fix is implemented?",
     "I don't think the fix is implemented.",
     "It seems the fix is implemented.",
   ])("does not treat non-success text as a high-impact success: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "I will deploy the service after approval.",
+    "We will purchase the service after approval.",
+  ])("rejects a future action as process-only rather than an answered result: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "process_only");
   });
 
   it("rejects a completed assertion split across adjacent text segments", () => {

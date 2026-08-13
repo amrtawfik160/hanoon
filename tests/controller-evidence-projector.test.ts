@@ -254,7 +254,7 @@ it.each(commandApprovalRows)(
   },
 );
 
-it("projects web, image, and generic tool completions with their exact proof kinds", () => {
+it("projects web and image results but treats an opaque provider tool only as observed thread state", () => {
   const roots = { projectRoot: PROJECT_ROOT };
   expect(projectCompletedControllerItem({
     type: "webSearch",
@@ -280,8 +280,8 @@ it("projects web, image, and generic tool completions with their exact proof kin
     subjectRefs: ["bb-item:image_1"],
   });
   expect(projectCompletedControllerItem(toolItem("external_lookup"), roots)).toMatchObject({
-    outcome: "succeeded",
-    proofKinds: ["tool_result"],
+    outcome: "observed",
+    proofKinds: ["thread_state"],
     subjectRefs: ["bb-item:tool_1"],
   });
 });
@@ -341,20 +341,20 @@ it("hashes exact web, image, file, and tool projections without exposing them", 
   });
 });
 
-it("uses generic tool status even when its error field is inconsistent", () => {
+it("keeps opaque provider tool observations non-authoritative regardless of status fields", () => {
   const roots = { projectRoot: PROJECT_ROOT };
   expect(projectCompletedControllerItem(toolItem("external", {
     status: "completed",
     error: "stale error text",
-  }), roots)?.outcome).toBe("succeeded");
+  }), roots)?.outcome).toBe("observed");
   expect(projectCompletedControllerItem(toolItem("external", {
     status: "failed",
     result: { stale: "success" },
-  }), roots)?.outcome).toBe("failed");
+  }), roots)?.outcome).toBe("observed");
   expect(projectCompletedControllerItem(toolItem("external", { status: "pending" }), roots)?.outcome)
     .toBe("observed");
   expect(projectCompletedControllerItem(toolItem("external", { status: "interrupted" }), roots)?.outcome)
-    .toBe("interrupted");
+    .toBe("observed");
 });
 
 it.each(CONTROLLER_TOOL_NAMES)("does not project Hanoon tool call %s a second time", (name) => {

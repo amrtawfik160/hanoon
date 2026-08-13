@@ -1,12 +1,21 @@
 import { describe, expect, it } from "vitest";
 import * as controllerScenarioContract from "../src/eval/controller-scenario-contract";
 import {
-  aggregateControllerEvaluation,
+  aggregateControllerEvaluation as aggregateControllerEvaluationRaw,
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
   validateControllerScenarioTrialEvidence,
   type ControllerScenarioTrial,
 } from "../src/eval/controller-scenario-contract";
+
+function aggregateControllerEvaluation(
+  input: Parameters<typeof aggregateControllerEvaluationRaw>[0],
+) {
+  return aggregateControllerEvaluationRaw({
+    run: { checkpoint: "baseline", trialsPerScenario: 1, seed: 8122026 },
+    ...input,
+  });
+}
 
 const baseTrial: ControllerScenarioTrial = {
   schemaVersion: 1 as const,
@@ -28,6 +37,7 @@ const baseTrial: ControllerScenarioTrial = {
     capabilityManifestSha256: "d".repeat(64),
     policySha256: "e".repeat(64),
     contextSha256: "f".repeat(64),
+    answerFixtureSha256: "0".repeat(64),
     outerTaskTools: [],
     advertisedTools: [],
     parameterSchemaSha256: {},

@@ -377,6 +377,7 @@ describe("Telegram ingress service", () => {
     const abort = new AbortController();
     let token = "123:first";
     const clientTokens: string[] = [];
+    const verifiedTokens: string[] = [];
     const client = vi.fn((clientToken: string) => {
       clientTokens.push(clientToken);
       return {
@@ -399,10 +400,13 @@ describe("Telegram ingress service", () => {
     }) as TelegramServiceDeps["client"];
 
     const promise = runTelegramService(
-      serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
-        ok: true,
-        value: { botToken: token },
-      })),
+      {
+        ...serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+          ok: true,
+          value: { botToken: token },
+        })),
+        onTokenVerified: (verified) => verifiedTokens.push(verified),
+      },
       abort.signal,
     );
     await vi.advanceTimersByTimeAsync(100);
@@ -410,6 +414,7 @@ describe("Telegram ingress service", () => {
     await promise;
 
     expect(clientTokens).toEqual(["123:first", "123:second"]);
+    expect(verifiedTokens).toEqual(["123:first", "123:second"]);
     expect(store.getTelegramIdentity()).toMatchObject({ botId: "123", username: "bot" });
     expect(vi.getTimerCount()).toBe(0);
   });

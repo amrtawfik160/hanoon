@@ -119,7 +119,6 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, ReadonlySet<ControllerProofKind>
 
 const CURRENT_OBSERVATION_SUCCESS_KINDS: ReadonlySet<ControllerClaimKind> = new Set([
   "observed_state",
-  "pipeline_outcome",
   "health_assessment",
 ]);
 const NEGATIVE_EVIDENCE_OUTCOMES: ReadonlySet<EvidenceRow["outcome"]> = new Set([
@@ -150,11 +149,12 @@ export function controllerFinalizationCorrection(code: FinalizationRejectionCode
 }
 
 const PROCESS_OBJECT_WORD = "(?!(?:and|then|if)\\b)[a-z0-9_'/:-]+";
-const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigat(?:e|ing)|work(?:ing)?\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
+const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigat(?:e|ing)|work(?:ing)?\\s+on|try|take\\s+care\\s+of|handle|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
 const PROCESS_CLAUSE = new RegExp(
   `^(?:(?:i(?:'ll| will| am|'m)|let me)\\s+)?${PROCESS_ACTION}[.!]?$`,
   "i",
 );
+const GENERIC_PROCESS_COMMITMENT = /^(?:(?:i(?:'ll| will| am|'m)|we(?:'ll| will| are|'re)|let me)\s+)[a-z][a-z'-]*(?:\s+[a-z0-9_'/:-]+){0,16}[.!]?$/i;
 const PROCESS_STATUS_CLAUSE = /^(?:the\s+)?(?:work|task|job|operation)\s+(?:is|remains?)\s+(?:in\s+progress|underway|ongoing)[.!]?$/i;
 const FOLLOW_UP_OBJECT_WORD = "[a-z0-9_'/:-]+";
 const CONCRETE_FOLLOW_UP = new RegExp(
@@ -194,6 +194,14 @@ const GENERIC_COMPLETION_SUBJECT = "(?:everything|all(?:\\s+(?:the\\s+)?(?:work|
  * wording is still attached to typed evidence.
  */
 const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
+  {
+    pattern: /\b(?:implemented|fixed|repaired|resolved|addressed|handled|changed|updated|modified|shipped|deployed|released|rolled\s+out|merged|built|compiled|tested|verified|validated|published|promoted|provisioned|configured|enabled|activated|executed|launched|landed)\b/i,
+    kinds: ["execution_result", "workspace_change", "external_mutation", "pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:done|complete|completed|finished|successful|succeeded|passed|green|live|healthy|verified|ready|resolved|wrapped\s+up|good\s+to\s+go|went\s+smoothly|cleared\s+(?:its|the)\s+(?:final\s+)?gate)\b/i,
+    kinds: ["execution_result", "workspace_change", "external_mutation", "pipeline_outcome", "health_assessment"],
+  },
   {
     pattern: /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
     kinds: ["workspace_change"],
@@ -308,6 +316,14 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   },
   {
     pattern: new RegExp("\\b(?:the\\s+)?(?:rollout|release|deployment)\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished|live|healthy|verified)\\b", "i"),
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\bproduction\s+(?:is|was|has been|had been)\s+(?:up|online)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:the\s+)?release\s+(?:went|has gone|had gone)\s+out\b/i,
     kinds: ["pipeline_outcome"],
   },
 ];
@@ -427,7 +443,7 @@ function hasProofIncompatibility(
 }
 
 function normalizedSentences(text: string): string[] {
-  const normalized = text.replace(/[’‘]/g, "'").replace(/[\r\n]+/g, ". ");
+  const normalized = text.replace(/[’‘]/g, "'").replace(/[\r\n]+/g, " ");
   return (normalized.match(/[^.!?]+[.!?]?/g) ?? [normalized])
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
@@ -435,7 +451,7 @@ function normalizedSentences(text: string): string[] {
 
 function textClauses(text: string): string[] {
   return normalizedSentences(text)
-    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/i))
+    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|although|however|which|while|then)\b\s+|;\s*/i))
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
@@ -479,7 +495,7 @@ function trimmedSourceSpan(text: string, start: number, end: number, offset: num
 
 function sentenceSourceSpans(text: string): SourceTextSpan[] {
   const sentences: SourceTextSpan[] = [];
-  const sentencePattern = /[^.!?\r\n]+[.!?]?/g;
+  const sentencePattern = /[^.!?]+[.!?]?/g;
   let sentenceMatch = sentencePattern.exec(text);
   while (sentenceMatch !== null) {
     const span = trimmedSourceSpan(text, sentenceMatch.index, sentenceMatch.index + sentenceMatch[0].length, 0);
@@ -491,7 +507,7 @@ function sentenceSourceSpans(text: string): SourceTextSpan[] {
 
 function splitOperationalSentence(sentence: SourceTextSpan): SourceTextSpan[] {
   const clauses: SourceTextSpan[] = [];
-  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/gi;
+  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|although|however|which|while|then)\b\s+|;\s*/gi;
   let cursor = 0;
   let separator = clauseSeparator.exec(sentence.text);
   while (separator !== null) {
@@ -518,7 +534,9 @@ function isConcreteFollowUp(sentence: string): boolean {
 function isProcessOnly(candidate: ControllerFinalization, renderedMessage: string): boolean {
   const clauses = textClauses(renderedMessage);
   if (candidate.disposition === "deferred") return !normalizedSentences(renderedMessage).some(isConcreteFollowUp);
-  return clauses.length > 0 && clauses.every((clause) => PROCESS_CLAUSE.test(clause) || PROCESS_STATUS_CLAUSE.test(clause));
+  return clauses.length > 0 && clauses.every((clause) => (
+    PROCESS_CLAUSE.test(clause) || PROCESS_STATUS_CLAUSE.test(clause) || GENERIC_PROCESS_COMMITMENT.test(clause)
+  ));
 }
 
 function clauseHasHighImpactSuccess(clause: string): boolean {

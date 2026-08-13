@@ -102,9 +102,15 @@ function readValidatedBaseline(path, scenarioCorpus) {
     throw new Error(`baseline report is not valid: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (report.label !== "fixed") throw new Error("baseline report must have fixed label");
+  if (!report.run) throw new Error("baseline report lacks checkpoint, trial, and seed identity");
   if (report.trials.some((trial) => trial.harness.dirty)) throw new Error("baseline report contains dirty trials");
   const validation = contract.validateControllerScenarioTrialsAgainstCorpus(report.trials, scenarioCorpus);
   for (const trial of validation.trials) contract.validateControllerScenarioTrialBudget(trial);
+  assertExactTrialSet(validation.trials, scenarioCorpus, {
+    checkpoint: report.run.checkpoint,
+    trials: report.run.trialsPerScenario,
+    seed: report.run.seed,
+  });
   return report;
 }
 
@@ -112,6 +118,7 @@ function fixedScenarioIdentity(trial) {
   return JSON.stringify({
     scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
     outerTaskTools: trial.harness.outerTaskTools,
+    answerFixtureSha256: trial.harness.answerFixtureSha256,
     provider: trial.harness.provider,
     model: trial.harness.model,
     reasoningLevel: trial.harness.reasoningLevel,
@@ -139,7 +146,8 @@ function hasFixedScenarioIdentityVariation(trials) {
 
 export function classifyControllerEvidence(trials) {
   const identityIncomplete = trials.some((trial) => (
-    trial.scenarioDefinitionSha256 === undefined || trial.harness.outerTaskTools === undefined
+    trial.scenarioDefinitionSha256 === undefined || trial.harness.outerTaskTools === undefined ||
+    trial.harness.answerFixtureSha256 === undefined
   ));
   if (identityIncomplete) throw new Error("current evaluation identity is incomplete; refusing to label it strong");
   const nonFixedTrials = trials.filter((trial) => (
@@ -159,9 +167,38 @@ function assertCurrentEvaluationIdentity(trials, identity) {
   }
 }
 
+function assertExactTrialSet(trials, scenarioCorpus, options) {
+  const checkpointRank = { baseline: 0, kernel: 1, cutover: 2 };
+  const expectedCases = scenarioCorpus.cases.filter((scenarioCase) =>
+    checkpointRank[scenarioCase.checkpoint] <= checkpointRank[options.checkpoint]);
+  const expected = new Set();
+  for (const scenarioCase of expectedCases) {
+    for (let trial = 1; trial <= options.trials; trial += 1) {
+      expected.add(`${scenarioCase.id}:${scenarioCase.scenarioVersion}:${trial}`);
+    }
+  }
+  const actual = new Set();
+  for (const trial of trials) {
+    if (trial.seed !== options.seed) {
+      throw new Error(`trial ${trial.scenarioId}:${trial.trial} has an unexpected seed`);
+    }
+    const key = `${trial.scenarioId}:${trial.scenarioVersion}:${trial.trial}`;
+    if (actual.has(key)) throw new Error(`duplicate trial ${key}`);
+    actual.add(key);
+  }
+  const missing = [...expected].filter((key) => !actual.has(key));
+  const extra = [...actual].filter((key) => !expected.has(key));
+  if (missing.length > 0 || extra.length > 0) {
+    throw new Error(`evaluation trial set is incomplete or unexpected (missing=${missing.length}, extra=${extra.length})`);
+  }
+}
+
 export async function evaluateControllerOutcomes(options, dependencies = {}) {
   if (!allowedOutput(options.output)) {
     throw new Error("--output must be outside the repository or under .superpowers/");
+  }
+  if (options.checkpoint === "cutover" && options.baseline === null) {
+    throw new Error("cutover evaluation requires a fixed baseline comparison");
   }
   const scenarioCorpus = harness.loadControllerScenarioCorpus();
   const baseline = options.baseline ? readValidatedBaseline(options.baseline, scenarioCorpus) : null;
@@ -186,8 +223,14 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
   const currentValidation = contract.validateControllerScenarioTrialsAgainstCorpus(trials, scenarioCorpus);
   const validatedTrials = currentValidation.trials.map(contract.validateControllerScenarioTrialBudget);
   assertCurrentEvaluationIdentity(validatedTrials, identity);
+  assertExactTrialSet(validatedTrials, scenarioCorpus, options);
   const baseReport = contract.aggregateControllerEvaluation({
     label: classifyControllerEvidence(validatedTrials),
+    run: {
+      checkpoint: options.checkpoint,
+      trialsPerScenario: options.trials,
+      seed: options.seed,
+    },
     trials: validatedTrials,
   });
   const comparison = baseline
@@ -206,6 +249,11 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     ? contract.attachControllerComparison(baseReport, comparison)
     : baseReport;
   contract.controllerEvaluationReportSchema.parse(report);
+  const finalIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
+  if (finalIdentity.commit !== identity.commit || finalIdentity.dirty || identity.dirty) {
+    throw new Error("current evaluator identity changed before report write");
+  }
+  assertCurrentEvaluationIdentity(validatedTrials, finalIdentity);
   writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace);
   const criticalSafetyFailed = currentValidation.criticalSafetyFailed;
   return {

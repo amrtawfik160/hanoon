@@ -20,7 +20,7 @@ afterEach(async () => {
 const NOW = 2_000;
 const RECOVERY_PROMPT = "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.";
 const RAW_PROVIDER_SENTINEL = "RAW PROVIDER PROSE MUST NOT SHIP";
-const NATURAL_RESPONSE = "The enabled project is available.";
+const NATURAL_RESPONSE = "The project is available.";
 const DENIAL_RESPONSE = "The requested command was denied.";
 const OWNER_OVERLAY = "Prefer concise summaries.";
 const REQUIRED_CONTROLLER_INSTRUCTION_SENTINEL = "telegram-agent:controller-instructions:v1";
@@ -831,6 +831,21 @@ async function stopServices(runs: readonly (ServiceRun | null)[]): Promise<void>
   await Promise.allSettled(activeRuns.map((run) => stopService(run)));
 }
 
+async function verifyRegisteredTelegramToken(
+  fixture: ProductionFixture,
+  recording: RecordingTelegram,
+): Promise<void> {
+  const ingress = fixture.harness.behavior.runService("telegram-ingress");
+  try {
+    await waitForCondition(() => {
+      expect(recording.calls.some((call) => call.method === "getUpdates")).toBe(true);
+      return true;
+    });
+  } finally {
+    await stopService(ingress);
+  }
+}
+
 function getNudgeInstanceTrace(
   boundary: ExecutorNudgeBoundary,
   instance: ExecutorNudge,
@@ -1083,6 +1098,7 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
   expect(fixture.store.releaseExecutorLease(fixture.fence.ownerId, fixture.fence.generation, NOW)).toBe(true);
   const recording = recordingTelegramTransport();
   vi.stubGlobal("fetch", recording.fetch);
+  await verifyRegisteredTelegramToken(fixture, recording);
   const executorRun = fixture.harness.behavior.runService("job-executor");
   executorRunForCleanup = executorRun;
     await waitForCondition(() => expect(finalOutbox(fixture.store, fixture.turn.id)).toEqual(expect.objectContaining({
@@ -1326,6 +1342,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
   expect(fixture.store.releaseExecutorLease(fixture.fence.ownerId, fixture.fence.generation, NOW)).toBe(true);
   const recording = recordingTelegramTransport(() => state.orderLedger.push("final-delivery"));
   vi.stubGlobal("fetch", recording.fetch);
+  await verifyRegisteredTelegramToken(fixture, recording);
   const executorRun = fixture.harness.behavior.runService("job-executor");
   executorRunForCleanup = executorRun;
     const prompt = await waitForCondition(() => {
@@ -1483,6 +1500,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
     const restartedStore = openStore(restartedHost.bb.storage, restartedHost.bb.storage.kv, () => NOW);
     const notificationsBeforeRestartConfiguration = state.settingsNotificationCount;
     await assertProductionWiring(restartedHost, restartedStore, state);
+    await verifyRegisteredTelegramToken(restartedHost, recording);
     expect(state.settingsNotificationCount).toBeGreaterThan(notificationsBeforeRestartConfiguration);
     stubControllerSdk(restartedHost.harness, state, interactionId);
     nudgeBoundary!.captureTargetAtNextWait = true;

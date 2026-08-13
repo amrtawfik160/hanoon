@@ -16,7 +16,7 @@ export type PendingThreadInteraction = {
 };
 
 export type ThreadNoticeThreads = {
-  listWatchable(): Promise<WatchedThread[]>;
+  listWatchable(offset: number, limit: number): Promise<WatchedThread[]>;
   interactions(threadId: string): Promise<PendingThreadInteraction[]>;
   resolve(threadId: string, interactionId: string, resolution: Record<string, unknown>): Promise<void>;
 };
@@ -47,6 +47,8 @@ const BLOCKABLE_STATUSES = new Set(["active", "starting", "stopping"]);
  * which is nothing next to how long the owner would otherwise wait.
  */
 const SWEEP_INTERVAL_MS = 15_000;
+const THREAD_PAGE_SIZE = 100;
+const MAX_WATCHABLE_THREADS = 10_000;
 
 /**
  * Tells the owner when a thread finishes or gets blocked, and carries their
@@ -68,7 +70,14 @@ export class ThreadNoticeService {
     this.sweptAt = now;
     let threads: WatchedThread[];
     try {
-      threads = await this.dependencies.threads.listWatchable();
+      threads = [];
+      while (threads.length < MAX_WATCHABLE_THREADS) {
+        const page = await this.dependencies.threads.listWatchable(threads.length, THREAD_PAGE_SIZE);
+        if (page.length > THREAD_PAGE_SIZE) throw new Error("thread list page exceeded its requested limit");
+        threads.push(...page);
+        if (page.length < THREAD_PAGE_SIZE) break;
+      }
+      if (threads.length >= MAX_WATCHABLE_THREADS) throw new Error("watchable thread scan exceeded its safe limit");
     } catch (error) {
       this.warn("Watched threads could not be listed", error);
       return didWork;

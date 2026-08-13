@@ -146,6 +146,11 @@ export function loadControllerScenarioAnswerFixture(): ControllerScenarioAnswerF
   return parseControllerScenarioAnswerFixture(JSON.parse(readFileSync(path, "utf8")));
 }
 
+function controllerScenarioAnswerFixtureSha256(): string {
+  const path = fileURLToPath(new URL("../../evals/controller-scenario-answers.json", import.meta.url));
+  return sha256(readFileSync(path, "utf8"));
+}
+
 const CONTROLLER_SCENARIO_ANSWER_FIXTURE = loadControllerScenarioAnswerFixture();
 
 type ScenarioGrade = Readonly<{
@@ -453,7 +458,7 @@ type ScriptedAdapterOptions = Readonly<{
 
 function scriptedAdapter(
   observeToolCall: () => Promise<number>,
-  finalizeTurn: () => Promise<void>,
+  finalizeTurn: () => Promise<number>,
   reserveSpawn: (turnId: string) => boolean,
   options: ScriptedAdapterOptions = {},
 ): ControllerAdapter {
@@ -469,8 +474,8 @@ function scriptedAdapter(
     status: async () => "idle",
     latestSeq: async () => options.eventSequence?.() ?? 0,
     events: async (): Promise<ControllerEventResult> => {
-      const toolCalls = await observeToolCall();
-      if (options.finalizeOnEvents !== false) await finalizeTurn();
+      let toolCalls = await observeToolCall();
+      if (options.finalizeOnEvents !== false) toolCalls += await finalizeTurn();
       options.onEvents?.({ toolCalls, totalTokens: null });
       return {
         latestSeq: options.eventSequence?.() ?? 1,
@@ -896,6 +901,7 @@ function harnessIdentity(
     capabilityManifestSha256: toolSurface.capabilityManifestSha256,
     policySha256: controllerScenarioPolicySha256(effectivePolicy),
     contextSha256: sha256(trustInputs.contextCapsule ?? ""),
+    answerFixtureSha256: controllerScenarioAnswerFixtureSha256(),
     outerTaskTools: [],
     advertisedTools: toolSurface.advertisedTools,
     parameterSchemaSha256: toolSurface.parameterSchemaSha256,
@@ -926,7 +932,8 @@ async function runScenario(
   const executionOwnerId = `eval-${fixtureId}`;
   const lease = store.acquireExecutorLease(executionOwnerId, Date.now(), 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
-  const signal = AbortSignal.timeout(2_000);
+  const signal = AbortSignal.timeout(10_000);
+  const toolContext = { threadId: "thr_fixed_controller", projectId: "proj_fixed", signal };
   harness.sdk.stub("threads.get", async () => ({
     id: "thr_fixed_controller",
     projectId: "proj_fixed",
@@ -971,23 +978,21 @@ async function runScenario(
     response = `Job ${observed.jobStatus.id} is currently ${observed.jobStatus.state}.`;
     return 1;
   };
-  const finalizeTurn = async () => {
-    if (finalizationAccepted) return;
+  const finalizeTurn = async (): Promise<number> => {
+    if (finalizationAccepted) return 0;
     if (activeTurnId === null) throw new Error("fixed scenario turn was not created before finalization");
-    const accepted = store.proposeControllerFinalization({
-      ownerId: executionOwnerId,
-      generation: lease.generation,
-      now: FIXTURE_NOW,
-      turnId: activeTurnId,
-      controllerKey: CONTROLLER_KEY,
-      candidate: {
+    const accepted = parseScenarioToolResult(await harness.behavior.callAgentTool(
+      "telegram_agent_respond",
+      {
         disposition: "answered",
         segments: [{ type: "text", text: response }],
         obligationRefs: [],
       },
-    });
-    if (accepted.outcome !== "accepted") throw new Error("fixed scenario finalization was not accepted");
+      toolContext,
+    ));
+    if (accepted.outcome !== "accepted") throw new Error("fixed scenario finalization was not accepted through the registered tool");
     finalizationAccepted = true;
+    return 1;
   };
   const adapter = scriptedAdapter(
     observeToolCall,
@@ -1080,7 +1085,7 @@ async function runExtendedScenario(
   const executionOwnerId = `eval-${fixtureId}`;
   const lease = store.acquireExecutorLease(executionOwnerId, Date.now(), 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
-  const signal = AbortSignal.timeout(2_000);
+  const signal = AbortSignal.timeout(10_000);
   const threadId = "thr_fixed_controller";
   const projectId = "proj_fixed";
   const toolContext = { threadId, projectId, signal };
@@ -1190,8 +1195,8 @@ async function runExtendedScenario(
     return 0;
   };
 
-  const finalizeTurn = async (): Promise<void> => {
-    if (finalizationAttempted) return;
+  const finalizeTurn = async (): Promise<number> => {
+    if (finalizationAttempted) return 0;
     finalizationAttempted = true;
     if (activeTurnId === null) throw new Error("fixed scenario turn was not created before finalization");
 
@@ -1222,7 +1227,7 @@ async function runExtendedScenario(
         segments: [{
           type: "claim",
           text: responseText,
-          kind: "observed_state",
+          kind: "external_mutation",
           outcome: "succeeded",
           subjectRef: `job:${jobId}`,
           evidenceRefs: [evidenceRef],
@@ -1233,38 +1238,29 @@ async function runExtendedScenario(
       const watching = scenarioRecord(toolResults[0]?.watching);
       const monitorId = typeof watching?.id === "string" ? watching.id : null;
       if (!monitorId) throw new Error("fixed monitor result was not bound to a monitor");
-      const unbound = store.proposeControllerFinalization({
-        ownerId: executionOwnerId,
-        generation: lease.generation,
-        now: FIXTURE_NOW,
-        turnId: activeTurnId,
-        controllerKey: CONTROLLER_KEY,
-        bbEventHighWaterSeq: 0,
-        candidate: {
+      const unbound = parseScenarioToolResult(await harness.behavior.callAgentTool(
+        "telegram_agent_respond",
+        {
           disposition: "deferred",
           segments: [{ type: "text", text: responseText }],
           obligationRefs: ["monitor:not-a-real-monitor"],
         },
-      });
-      unboundRejectionCode = unbound.outcome === "rejected" ? unbound.code : null;
+        toolContext,
+      ));
+      unboundRejectionCode = unbound.outcome === "rejected" && typeof unbound.code === "string"
+        ? unbound.code
+        : null;
       candidate = {
         disposition: "deferred",
         segments: [{ type: "text", text: responseText }],
         obligationRefs: [`monitor:${monitorId}`],
       };
     } else {
-      return;
+      return 0;
     }
 
-    store.proposeControllerFinalization({
-      ownerId: executionOwnerId,
-      generation: lease.generation,
-      now: FIXTURE_NOW,
-      turnId: activeTurnId,
-      controllerKey: CONTROLLER_KEY,
-      bbEventHighWaterSeq: 0,
-      candidate,
-    });
+    await harness.behavior.callAgentTool("telegram_agent_respond", candidate, toolContext);
+    return scenarioCase.id === "durable-deferred-monitor" ? 2 : 1;
   };
 
   const adapter = scriptedAdapter(

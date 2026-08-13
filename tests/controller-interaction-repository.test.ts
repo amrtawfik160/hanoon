@@ -771,7 +771,7 @@ it.each([
   const commandProjection = parseControllerInteraction("boundary_command", approvalPayload({
     subject: { kind: "command", command: `run ${unsafeText}`, cwd: "/workspace/project" },
   }));
-  expect(commandProjection).toMatchObject({ kind: "approval", summary: expect.stringContaining("a redacted command") });
+  expect(commandProjection).toEqual({ kind: "unsupported", interactionId: "boundary_command" });
 
   const questionProjection = parseControllerInteraction("boundary_question", questionPayload(unsafeText));
   expect(questionProjection).toEqual({ kind: "unsupported", interactionId: "boundary_question" });
@@ -801,13 +801,13 @@ it.each([
 });
 
 it.each([
-  ["a credential in the middle of the command", "echo before API_KEY=secret-value && echo after", "a redacted command"],
-  ["callback-shaped command material", "curl --callback https://example.test/hook?token=secret-value", "a redacted command"],
-  ["a percent-encoded callback", "curl https%3A%2F%2Fexample.test%2Fcallback%3Ftoken%3Dsecret-value", "a redacted command"],
-  ["a percent-encoded credential URL", "open https%3A%2F%2Fuser%3Apass%40example.test", "a redacted command"],
-  ["a Unicode-normalized secret assignment", "ＰＡＳＳＷＯＲＤ＝secret-value", "a redacted command"],
-  ["a shell environment assignment", "FOO=bar npm test", "a redacted command"],
-] as const)("redacts %s as a whole", (_name, command, expectedCommand) => {
+  ["a credential in the middle of the command", "echo before API_KEY=secret-value && echo after"],
+  ["callback-shaped command material", "curl --callback https://example.test/hook?token=secret-value"],
+  ["a percent-encoded callback", "curl https%3A%2F%2Fexample.test%2Fcallback%3Ftoken%3Dsecret-value"],
+  ["a percent-encoded credential URL", "open https%3A%2F%2Fuser%3Apass%40example.test"],
+  ["a Unicode-normalized secret assignment", "ＰＡＳＳＷＯＲＤ＝secret-value"],
+  ["a shell environment assignment", "FOO=bar npm test"],
+] as const)("makes %s non-actionable", (_name, command) => {
   const projection = parseControllerInteraction("approval_secret", approvalPayload({
     subject: {
       kind: "command",
@@ -819,8 +819,7 @@ it.each([
       output: "secret output",
     },
   }));
-  expect(projection).toMatchObject({ kind: "approval" });
-  expect(JSON.stringify(projection)).toContain(expectedCommand);
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_secret" });
   expect(JSON.stringify(projection)).not.toContain("before");
   expect(JSON.stringify(projection)).not.toContain("after");
   expect(JSON.stringify(projection)).not.toContain("secret-value");
@@ -837,11 +836,11 @@ it.each([
   ["a lowercase quoted assignment", "run secret='secret-value'"],
   ["a lowercase double-quoted assignment", 'run api_key="secret-value"'],
   ...RAW_TOKEN_SIGNATURES.map(([name, token]) => [`a standalone ${name}`, `run ${token}`] as const),
-] as const)("redacts %s before clipping", (_name, command) => {
+] as const)("makes %s non-actionable before clipping", (_name, command) => {
   const projection = parseControllerInteraction("approval_vocabulary", approvalPayload({
     subject: { kind: "command", command, cwd: "/workspace/project" },
   }));
-  expect(projection).toMatchObject({ kind: "approval", summary: expect.stringContaining("a redacted command") });
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_vocabulary" });
   expect(JSON.stringify(projection)).not.toContain("secret-value");
 });
 
@@ -853,16 +852,26 @@ it.each([
   const projection = parseControllerInteraction("approval_bad_percent", approvalPayload({
     subject: { kind: "command", command, cwd: "/workspace/project" },
   }));
-  expect(projection).toMatchObject({ kind: "approval", summary: expect.stringContaining("a redacted command") });
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_bad_percent" });
 });
 
-it("redacts credential material beyond the bounded command summary", () => {
+it("makes a command with credential material beyond the bounded summary non-actionable", () => {
   const command = `${"echo safe ".repeat(60)} API_KEY=secret-value`;
   const projection = parseControllerInteraction("approval_late_secret", approvalPayload({
     subject: { kind: "command", command, cwd: "/workspace/project" },
   }));
-  expect(projection).toMatchObject({ kind: "approval", summary: expect.stringContaining("a redacted command") });
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_late_secret" });
   expect(JSON.stringify(projection)).not.toContain("secret-value");
+});
+
+it("does not offer buttons when an otherwise safe command cannot be shown losslessly", () => {
+  const command = "printf safe ".repeat(80);
+  expect(parseControllerInteraction("approval_clipped", approvalPayload({
+    subject: { kind: "command", command, cwd: "/workspace/project" },
+  }))).toEqual({ kind: "unsupported", interactionId: "approval_clipped" });
+  expect(parseControllerInteraction("approval_wrapper_clipped", approvalPayload({
+    subject: { kind: "command", command: "x".repeat(390) },
+  }))).toEqual({ kind: "unsupported", interactionId: "approval_wrapper_clipped" });
 });
 
 it.each([
@@ -933,9 +942,9 @@ it.each([
     ...questionPayload(),
     questions: [{ ...questionPayloadQuestion(), options: [{ value: "first", label: "First", description: "https://inner.test/?private_key=secret" }] }],
   }],
-  ["a missing options array", {
+  ["a missing options array that also disallows free text", {
     ...questionPayload(),
-    questions: [{ ...questionPayloadQuestion(), options: undefined }],
+    questions: [{ ...questionPayloadQuestion(), allowFreeText: false, options: undefined }],
   }],
   ["an invalid multi-select type", {
     ...questionPayload(),
@@ -957,6 +966,24 @@ it.each([
   expect(parseControllerInteraction("unsafe_question_field", payload)).toEqual({
     kind: "unsupported",
     interactionId: "unsafe_question_field",
+  });
+});
+
+it("accepts an SDK-valid free-text-only question without options", () => {
+  const payload = questionPayload();
+  const questions = payload.questions as Record<string, unknown>[];
+  delete questions[0]!.options;
+  expect(parseControllerInteraction("free_text_only", payload)).toEqual({
+    kind: "user_question",
+    interactionId: "free_text_only",
+    questions: [{
+      id: "question_1",
+      prompt: "Which option should I use?",
+      shortLabel: "Choose",
+      multiSelect: false,
+      allowFreeText: true,
+      options: [],
+    }],
   });
 });
 

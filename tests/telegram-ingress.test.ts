@@ -789,7 +789,7 @@ it("does not let wrong-identity controller callbacks consume the parked interact
   expect(nudges).toBe(0);
 });
 
-it("routes plain text to the oldest pending controller question instead of queueing a new turn", async () => {
+it("atomically binds a plain-text answer to its update so crash replay cannot create another turn", async () => {
   let nudges = 0;
   const fixture = ingressFixture({
     owner: { userId: "7", chatId: "70" },
@@ -808,7 +808,8 @@ it("routes plain text to the oldest pending controller question instead of queue
     }],
   });
 
-  await fixture.ingress.handleClaimed(messageUpdate(90_005, 7, 70, "Use the fallback route."), 9_005);
+  const update = messageUpdate(90_005, 7, 70, "Use the fallback route.");
+  await fixture.ingress.handleClaimed(update, 9_005);
 
   expect(fixture.store.getAnsweredControllerInteraction(seeded.controllerKey)).toMatchObject({
     interactionId: "ingress_text_question",
@@ -816,6 +817,17 @@ it("routes plain text to the oldest pending controller question instead of queue
   });
   expect(fixture.store.listControllerTurns(seeded.controllerKey, 10)).toHaveLength(1);
   expect(nudges).toBe(1);
+  expect(fixture.db.prepare(
+    "SELECT status, outcome FROM telegram_updates WHERE update_id = 90005",
+  ).get()).toEqual({ status: "processed", outcome: "controller_interaction_answered" });
+
+  // Simulate a crash after ingress returned but before the outer polling loop
+  // called completeTelegramUpdate. The next poll must see the atomic answer/update
+  // commit and must not deliver the update to ingress a second time.
+  expect(fixture.store.beginTelegramUpdate(90_005, 9_006)).toBe("processed");
+  expect(fixture.store.listControllerTurns(seeded.controllerKey, 10)).toHaveLength(1);
+  expect(nudges).toBe(1);
+  expect(() => fixture.store.completeTelegramUpdate(90_005, "processed", 9_007)).not.toThrow();
 });
 
 it("durably queues the largest Telegram photo with its caption for Luna", async () => {

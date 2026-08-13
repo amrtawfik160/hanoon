@@ -306,10 +306,10 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
 it("matches the exact trusted 21-tool projection permission matrix", () => {
   const expected = [
     ["telegram_agent_list_projects", ["project_state"]],
-    ["telegram_agent_start_job", ["job_state", "obligation"]],
+    ["telegram_agent_start_job", ["job_state", "external_mutation", "obligation"]],
     ["telegram_agent_job_status", ["job_state", "pipeline_outcome", "obligation"]],
-    ["telegram_agent_retry_job", ["job_state", "obligation"]],
-    ["telegram_agent_cancel_job", ["job_state"]],
+    ["telegram_agent_retry_job", ["job_state", "external_mutation", "obligation"]],
+    ["telegram_agent_cancel_job", ["job_state", "external_mutation"]],
     ["telegram_agent_list_threads", ["thread_state"]],
     ["telegram_agent_thread_status", ["thread_state"]],
     ["telegram_agent_read_thread", ["thread_state"]],
@@ -454,7 +454,7 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
       },
       expected: () => ({
         outcome: "succeeded",
-        proofKinds: ["job_state", "obligation"],
+        proofKinds: ["job_state", "external_mutation", "obligation"],
         subjectRefs: [`job:${state.startedJobId!}`],
       }),
     },
@@ -472,14 +472,14 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
       params: () => ({ jobId: "job_matrix_retry" }),
       expected: () => ({
         outcome: "succeeded",
-        proofKinds: ["job_state", "obligation"],
+        proofKinds: ["job_state", "external_mutation", "obligation"],
         subjectRefs: ["job:job_matrix_retry"],
       }),
     },
     {
       name: "telegram_agent_cancel_job",
       params: () => ({ jobId: "job_matrix_cancel" }),
-      expected: () => ({ outcome: "succeeded", proofKinds: ["job_state"], subjectRefs: ["job:job_matrix_cancel"] }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["job_state", "external_mutation"], subjectRefs: ["job:job_matrix_cancel"] }),
     },
     {
       name: "telegram_agent_list_threads",
@@ -2140,7 +2140,7 @@ function registerEvidenceTools(
   });
 }
 
-function plainFinalization(text = "The answer is complete.") {
+function plainFinalization(text = "Here is the requested answer.") {
   return {
     disposition: "answered",
     segments: [{ type: "text", text }],
@@ -2186,9 +2186,9 @@ it("accepts through the special finalizer and makes retries projector-free", asy
 
   expect(JSON.parse(await value.harness.behavior.callAgentTool(
     "telegram_agent_respond",
-    plainFinalization("Done 😀"),
+    plainFinalization("Answer 😀"),
     controllerToolContext,
-  ) as string)).toEqual({ outcome: "accepted", ref: "finalization:1", renderedCharacters: 6 });
+  ) as string)).toEqual({ outcome: "accepted", ref: "finalization:1", renderedCharacters: 8 });
   expect(reconcile).toHaveBeenCalledOnce();
 
   expect(JSON.parse(await value.harness.behavior.callAgentTool(
