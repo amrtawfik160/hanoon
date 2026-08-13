@@ -177,15 +177,18 @@ function hasDuplicateTrialPairs(trials: readonly ControllerScenarioTrial[]): boo
   return !unique(trials.map(trialPairKey));
 }
 
-function derivedReportStatus(trials: readonly ControllerScenarioTrial[]): z.infer<typeof reportStatusSchema> {
-  if (trials.some((trial) => trial.outcome.status === "failed")) return "failed";
-  if (trials.some((trial) => [trial.outcome, trial.trace, trial.answer].some((grade) => grade.status === "incomplete"))) return "incomplete";
+function trialClassification(trial: ControllerScenarioTrial): "passed" | "failed" | "incomplete" {
+  const applicableLayers = [trial.outcome, trial.trace, trial.answer]
+    .filter((grade) => grade.status !== "not_applicable");
+  if (applicableLayers.some((grade) => grade.status === "failed")) return "failed";
+  if (applicableLayers.some((grade) => grade.status === "incomplete")) return "incomplete";
   return "passed";
 }
 
-function trialClassification(trial: ControllerScenarioTrial): "passed" | "failed" | "incomplete" {
-  if (trial.outcome.status === "failed") return "failed";
-  if ([trial.outcome, trial.trace, trial.answer].some((grade) => grade.status === "incomplete")) return "incomplete";
+function derivedReportStatus(trials: readonly ControllerScenarioTrial[]): z.infer<typeof reportStatusSchema> {
+  const classifications = trials.map(trialClassification);
+  if (classifications.includes("failed")) return "failed";
+  if (classifications.includes("incomplete")) return "incomplete";
   return "passed";
 }
 
@@ -219,7 +222,7 @@ export const controllerEvaluationReportSchema = z.object({
 }).strict().superRefine((report, context) => {
   if (hasDuplicateTrialPairs(report.trials)) context.addIssue({ code: "custom", message: "duplicate scenario trial pair" });
   if (report.trialCount !== report.trials.length) context.addIssue({ code: "custom", message: "trialCount must match trials" });
-  if (report.status !== derivedReportStatus(report.trials)) context.addIssue({ code: "custom", message: "status must match trial outcomes" });
+  if (report.status !== derivedReportStatus(report.trials)) context.addIssue({ code: "custom", message: "status must match applicable layer outcomes" });
   if (!summariesMatch(report.trials, report.scenarios)) context.addIssue({ code: "custom", message: "scenario summaries must match trials" });
 });
 

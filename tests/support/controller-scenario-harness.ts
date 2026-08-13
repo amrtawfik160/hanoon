@@ -1317,6 +1317,7 @@ async function runExtendedScenario(
       acceptedObligationRefs: accepted?.candidate.obligationRefs ?? [],
       watchCapabilityObserved: scenarioCase.id === "durable-deferred-monitor" && finalMonitorProof,
       unboundRejectionCode,
+      ...(scenarioCase.id === "process-only-finalization" ? { sentTexts } : {}),
     });
     return scenarioTrial(
       scenarioCase,

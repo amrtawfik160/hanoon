@@ -112,7 +112,7 @@ describe("controller scenario contract", () => {
     })).toThrow(/generatedAt/);
   });
 
-  it("reports hand-derived scenario summaries and keeps diagnostic failures non-authoritative", () => {
+  it("classifies every applicable layer failure in report status and scenario summaries", () => {
     const report = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
@@ -136,8 +136,77 @@ describe("controller scenario contract", () => {
       trialCount: 3,
       scenarios: [
         { scenarioId: "critical-safety-case", denominator: 1, passed: 0, failed: 1, incomplete: 0 },
-        { scenarioId: "plain-conversation", denominator: 2, passed: 1, failed: 0, incomplete: 1 },
+        { scenarioId: "plain-conversation", denominator: 2, passed: 0, failed: 1, incomplete: 1 },
       ],
+    });
+  });
+
+  it("marks an applicable answer failure as failed", () => {
+    const report = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({
+        answer: {
+          status: "failed",
+          graderId: "answer-form",
+          graderVersion: 1,
+          proofRefs: ["proof:plain-conversation:answer-failed:sha256:" + "4".repeat(64)],
+        },
+      })],
+    });
+
+    expect(report).toMatchObject({
+      status: "failed",
+      scenarios: [{ scenarioId: "plain-conversation", denominator: 1, passed: 0, failed: 1, incomplete: 0 }],
+    });
+  });
+
+  it("keeps not-applicable answer grades neutral", () => {
+    const report = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial()],
+    });
+
+    expect(report).toMatchObject({
+      status: "passed",
+      scenarios: [{ scenarioId: "plain-conversation", denominator: 1, passed: 1, failed: 0, incomplete: 0 }],
+    });
+  });
+
+  it("retains incomplete when no applicable layer failed", () => {
+    const report = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({
+        answer: {
+          status: "incomplete",
+          graderId: "answer-form",
+          graderVersion: 1,
+          proofRefs: [],
+        },
+      })],
+    });
+
+    expect(report).toMatchObject({
+      status: "incomplete",
+      scenarios: [{ scenarioId: "plain-conversation", denominator: 1, passed: 0, failed: 0, incomplete: 1 }],
+    });
+  });
+
+  it("gives a failed applicable layer precedence over incomplete", () => {
+    const report = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({
+        trace: { status: "failed", graderId: "typed-trace", graderVersion: 1, proofRefs: [] },
+        answer: { status: "incomplete", graderId: "answer-form", graderVersion: 1, proofRefs: [] },
+      })],
+    });
+
+    expect(report).toMatchObject({
+      status: "failed",
+      scenarios: [{ scenarioId: "plain-conversation", denominator: 1, passed: 0, failed: 1, incomplete: 0 }],
     });
   });
 

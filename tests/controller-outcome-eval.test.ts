@@ -225,6 +225,16 @@ it("records measured wall time and explicit unavailable token usage", async () =
   expect(trial.metrics.tokens).toBeNull();
 });
 
+it("preserves the process-only recovery send in durable assertion evidence", async () => {
+  const trials = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
+  const processOnlyTrial = trials.find((trial) => trial.scenarioId === "process-only-finalization");
+
+  expect(processOnlyTrial?.trace.status).toBe("passed");
+  expect(processOnlyTrial?.trace.proofRefs).toContainEqual(
+    expect.stringMatching(/assertion:recovery_prompt_sent:true:sha256:[0-9a-f]{64}$/),
+  );
+});
+
 it("disposes every repeated scenario resource, including restart scenarios", async () => {
   const before = controllerScenarioResourceStats();
   await runControllerScenarioTrials({ checkpoint: "cutover", trials: 2, seed: 8122026 });
