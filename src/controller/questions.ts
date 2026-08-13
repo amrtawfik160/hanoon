@@ -141,6 +141,12 @@ export type ThreadInteraction =
   /** A block the plugin can name but not answer, so the owner still hears about it. */
   | { kind: "unsupported"; interactionId: string };
 
+/** The safe, durable projection of an interaction from a hidden controller. */
+export type ControllerInteraction =
+  | { kind: "user_question"; interactionId: string; questions: ControllerQuestion[] }
+  | { kind: "approval"; interactionId: string; summary: string; decisions: Extract<ThreadApprovalDecision, "allow_once" | "deny">[] }
+  | { kind: "unsupported"; interactionId: string; metadata: { sourceKind: string | null } };
+
 const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
   allow_once: "Allow once",
   allow_for_session: "Allow all session",
@@ -159,6 +165,64 @@ function approvalSummary(subject: Record<string, unknown>): string | null {
     return scope ? `wants to write files under ${scope}` : "wants to write files";
   }
   return null;
+}
+
+function containsApprovalSecret(value: string): boolean {
+  return /\b(?:bearer|authorization|token|secret|password|api[_-]?key)\b/i.test(value) ||
+    /(?:https?|ssh):\/\/[^\s/@]*:[^\s/@]*@/i.test(value) ||
+    /[?&](?:token|secret|key|callback|nonce|code)=[^&\s]+/i.test(value) ||
+    /\b[A-Z][A-Z0-9_]{1,}=[^\s]+/.test(value);
+}
+
+function safeApprovalPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 240 || value.startsWith("/") ||
+    value.includes("\\") || value.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
+  const basename = value.split("/").at(-1)!;
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(basename) ? basename : null;
+}
+
+function controllerApprovalSummary(subject: unknown): string | null {
+  if (typeof subject !== "object" || subject === null) return null;
+  const candidate = subject as Record<string, unknown>;
+  if (candidate.kind === "command" && typeof candidate.command === "string") {
+    return containsApprovalSecret(candidate.command) || candidate.command.length === 0 || candidate.command.length > MAX_PROMPT
+      ? "wants to run:\n\n`a redacted command`"
+      : `wants to run:\n\n\`${candidate.command}\``;
+  }
+  if (candidate.kind === "file_change") {
+    return `wants to write ${safeApprovalPath(candidate.writeScope) ?? "a protected path"}`;
+  }
+  return null;
+}
+
+/**
+ * Projects an exact BB interaction into the bounded data the hidden Telegram
+ * controller may retain. Lifecycle payloads are deliberately not accepted here.
+ */
+export function parseControllerInteraction(interactionId: unknown, payload: unknown): ControllerInteraction | null {
+  if (typeof interactionId !== "string" || interactionId.length === 0 || interactionId.length > 200 ||
+    typeof payload !== "object" || payload === null) return null;
+  const candidate = payload as Record<string, unknown>;
+  if (candidate.kind === "user_question") {
+    const pending = parsePendingQuestion(interactionId, payload);
+    return pending
+      ? { kind: "user_question", interactionId, questions: pending.questions }
+      : { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
+  }
+  if (candidate.kind === "approval") {
+    const summary = controllerApprovalSummary(candidate.subject);
+    const availableDecisions = Array.isArray(candidate.availableDecisions) ? candidate.availableDecisions : null;
+    const decisions = availableDecisions !== null
+      ? (["allow_once", "deny"] as const).filter((decision) => availableDecisions.includes(decision))
+      : [];
+    return summary && decisions.length > 0
+      ? { kind: "approval", interactionId, summary, decisions: [...decisions] }
+      : { kind: "unsupported", interactionId, metadata: { sourceKind: "approval" } };
+  }
+  const sourceKind = typeof candidate.kind === "string" && /^[a-z_]{1,40}$/.test(candidate.kind)
+    ? candidate.kind
+    : null;
+  return { kind: "unsupported", interactionId, metadata: { sourceKind } };
 }
 
 /**

@@ -799,6 +799,74 @@ CREATE INDEX controller_finalizations_turn
   ON controller_finalizations(turn_id, revision);
 `] as const;
 
+export const CONTROLLER_INTERACTION_MIGRATIONS = [String.raw`
+CREATE TABLE controller_interactions (
+  interaction_id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  bb_thread_id TEXT,
+  controller_generation_id TEXT REFERENCES controller_generations(id),
+  kind TEXT NOT NULL CHECK (kind IN ('user_question', 'approval', 'unsupported')),
+  payload_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answer_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  delivered_at INTEGER,
+  CHECK (state = 'delivered' OR
+    (bb_thread_id IS NOT NULL AND controller_generation_id IS NOT NULL))
+);
+CREATE INDEX controller_interactions_state
+  ON controller_interactions(controller_key, state, asked_at, interaction_id);
+
+-- Legacy pending/answered questions can only be safe if their controller has
+-- exactly one live generation. A failed guard aborts this whole migration.
+CREATE TABLE controller_interaction_migration_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO controller_interaction_migration_guard(valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+    FROM controller_questions AS question
+    JOIN controller_threads AS controller ON controller.controller_key = question.controller_key
+   WHERE question.state IN ('pending', 'answered')
+     AND (
+       controller.bb_thread_id IS NULL OR
+       (SELECT COUNT(*) FROM controller_generations AS generation
+         WHERE generation.controller_key = question.controller_key
+           AND generation.thread_id = controller.bb_thread_id
+           AND generation.ended_at IS NULL) <> 1
+     )
+) THEN 0 ELSE 1 END;
+
+INSERT INTO controller_interactions (
+  interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
+  kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
+)
+SELECT
+  question.interaction_id,
+  question.turn_id,
+  question.controller_key,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE controller.bb_thread_id END,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE (
+    SELECT generation.id FROM controller_generations AS generation
+     WHERE generation.controller_key = question.controller_key
+       AND generation.thread_id = controller.bb_thread_id
+       AND generation.ended_at IS NULL
+  ) END,
+  'user_question',
+  json_object('kind', 'user_question', 'interactionId', question.interaction_id, 'questions', json(question.questions_json)),
+  question.state,
+  CASE WHEN question.answers_json = '{}' THEN NULL
+       ELSE json_object('kind', 'user_answer', 'answers', json(question.answers_json)) END,
+  question.asked_at,
+  question.answered_at,
+  CASE WHEN question.state = 'delivered' THEN COALESCE(question.answered_at, question.asked_at) ELSE NULL END
+FROM controller_questions AS question
+JOIN controller_threads AS controller ON controller.controller_key = question.controller_key;
+DROP TABLE controller_interaction_migration_guard;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -829,4 +897,5 @@ export const ALL_MIGRATIONS = [
   ...TURN_ORIGIN_MIGRATIONS,
   ...PRODUCTION_HEALTH_MIGRATIONS,
   ...CONTROLLER_TRUST_MIGRATIONS,
+  ...CONTROLLER_INTERACTION_MIGRATIONS,
 ] as const;

@@ -99,6 +99,8 @@ import {
   type ControllerNativeEvidenceWrite,
 } from "./controller-evidence-repository";
 
+export type { ControllerInteractionStore } from "./controller-interaction-repository";
+
 export { VersionConflictError, assertSafeExternalHttpsUrl };
 
 type PluginStorage = BbPluginApi["storage"];
