@@ -77,6 +77,9 @@ export const controllerScenarioCorpusSchema = z.object({
 
 const controllerMetricsSchema = z.object({
   wallMs: z.number().int().min(0).max(3_600_000),
+  /** Current harnesses must expose these counters; historical reports may omit them until audited. */
+  turns: z.number().int().min(0).max(16).optional(),
+  toolCalls: z.number().int().min(0).max(512).optional(),
   /** Provider token usage is nullable when the adapter does not expose it. */
   tokens: z.number().int().min(0).max(2_000_000).nullable(),
   costUsd: z.number().min(0).max(1_000).nullable(),
@@ -118,6 +121,8 @@ const reportGeneratedAtSchema = z.string().refine(
 );
 const scenarioSummarySchema = z.object({
   scenarioId: scenarioIdSchema,
+  /** Optional only so historical reports can be rejected with a contract error rather than a JSON parse error. */
+  scenarioVersion: z.number().int().min(1).max(10_000).optional(),
   denominator: z.number().int().min(1).max(512),
   passed: z.number().int().min(0).max(512),
   failed: z.number().int().min(0).max(512),
@@ -193,16 +198,26 @@ function derivedReportStatus(trials: readonly ControllerScenarioTrial[]): z.infe
 }
 
 function summarizeTrials(trials: readonly ControllerScenarioTrial[]): z.infer<typeof scenarioSummarySchema>[] {
-  const countsByScenario = new Map<string, { passed: number; failed: number; incomplete: number }>();
+  const countsByScenario = new Map<string, { scenarioId: string; scenarioVersion: number; passed: number; failed: number; incomplete: number }>();
   for (const currentTrial of trials) {
-    const counts = countsByScenario.get(currentTrial.scenarioId) ?? { passed: 0, failed: 0, incomplete: 0 };
+    const key = comparisonScenarioKey(currentTrial.scenarioId, currentTrial.scenarioVersion);
+    const counts = countsByScenario.get(key) ?? {
+      scenarioId: currentTrial.scenarioId,
+      scenarioVersion: currentTrial.scenarioVersion,
+      passed: 0,
+      failed: 0,
+      incomplete: 0,
+    };
     counts[trialClassification(currentTrial)] += 1;
-    countsByScenario.set(currentTrial.scenarioId, counts);
+    countsByScenario.set(key, counts);
   }
-  return [...countsByScenario.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([scenarioId, counts]) => ({
-    scenarioId,
+  return [...countsByScenario.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([, counts]) => ({
+    scenarioId: counts.scenarioId,
+    scenarioVersion: counts.scenarioVersion,
     denominator: counts.passed + counts.failed + counts.incomplete,
-    ...counts,
+    passed: counts.passed,
+    failed: counts.failed,
+    incomplete: counts.incomplete,
   }));
 }
 
@@ -223,6 +238,9 @@ export const controllerEvaluationReportSchema = z.object({
   if (hasDuplicateTrialPairs(report.trials)) context.addIssue({ code: "custom", message: "duplicate scenario trial pair" });
   if (report.trialCount !== report.trials.length) context.addIssue({ code: "custom", message: "trialCount must match trials" });
   if (report.status !== derivedReportStatus(report.trials)) context.addIssue({ code: "custom", message: "status must match applicable layer outcomes" });
+  if (report.scenarios.some((summary) => summary.scenarioVersion === undefined)) {
+    context.addIssue({ code: "custom", message: "scenario summaries must include scenarioVersion" });
+  }
   if (!summariesMatch(report.trials, report.scenarios)) context.addIssue({ code: "custom", message: "scenario summaries must match trials" });
 });
 
@@ -257,6 +275,26 @@ export function validateControllerScenarioTrialEvidence(
   return trial;
 }
 
+export function validateControllerScenarioTrialBudget(candidate: unknown): ControllerScenarioTrial {
+  const trial = parseControllerScenarioTrial(candidate);
+  const counters: ReadonlyArray<readonly [string, number | undefined, number]> = [
+    ["turns", trial.metrics.turns, trial.budget.maxTurns],
+    ["toolCalls", trial.metrics.toolCalls, trial.budget.maxToolCalls],
+    ["wallMs", trial.metrics.wallMs, trial.budget.maxWallMs],
+  ];
+  for (const [name, observed, maximum] of counters) {
+    if (observed === undefined) throw new Error(`${name} execution counter is unavailable for ${trial.scenarioId}:${trial.trial}`);
+    if (observed > maximum) throw new Error(`${name} execution counter exceeds budget for ${trial.scenarioId}:${trial.trial}`);
+  }
+  if (trial.metrics.tokens !== null && trial.metrics.tokens > trial.budget.maxTokens) {
+    throw new Error(`tokens execution counter exceeds budget for ${trial.scenarioId}:${trial.trial}`);
+  }
+  if (trial.budget.maxCostUsd !== null && trial.metrics.costUsd !== null && trial.metrics.costUsd > trial.budget.maxCostUsd) {
+    throw new Error(`cost execution counter exceeds budget for ${trial.scenarioId}:${trial.trial}`);
+  }
+  return trial;
+}
+
 export function parseControllerEvaluationReport(candidate: unknown): ControllerEvaluationReport {
   return controllerEvaluationReportSchema.parse(candidate);
 }
@@ -275,6 +313,7 @@ type ComparableTrialSignature = Readonly<{
   reasoningLevel: string;
   serviceTier: string;
   permissionMode: "auto" | "accept-edits" | "full";
+  overlaySha256: string;
   contextSha256: string;
   budget: ControllerScenarioTrial["budget"];
   graders: Readonly<{
@@ -312,6 +351,7 @@ function trialSignature(trial: ControllerScenarioTrial): ComparableTrialSignatur
     reasoningLevel: trial.harness.reasoningLevel,
     serviceTier: trial.harness.serviceTier,
     permissionMode: trial.harness.permissionMode,
+    overlaySha256: trial.harness.overlaySha256,
     contextSha256: trial.harness.contextSha256,
     budget: trial.budget,
     graders: {
@@ -332,8 +372,11 @@ function scenarioSummary(
   scenarioVersion: number,
   criticalSafety: boolean,
 ): z.infer<typeof comparisonScenarioSideSchema> {
-  const summary = report.scenarios.find((candidate) => candidate.scenarioId === scenarioId);
-  if (!summary) throw new Error(`comparison scenario summary is missing ${scenarioId}`);
+  const candidates = report.scenarios.filter((candidate) => candidate.scenarioId === scenarioId);
+  const summary = candidates.find((candidate) => candidate.scenarioVersion === scenarioVersion);
+  if (!summary) {
+    throw new Error(`comparison scenario summary is missing or legacy for ${scenarioId}:${scenarioVersion}`);
+  }
   return { ...summary, scenarioVersion, criticalSafety };
 }
 
@@ -351,7 +394,9 @@ function criticalSafetyFor(
   scenarioVersion: number,
   definitions: Map<string, ScenarioDefinition>,
 ): boolean {
-  return definitions.get(comparisonScenarioKey(scenarioId, scenarioVersion))?.criticalSafety ?? false;
+  const definition = definitions.get(comparisonScenarioKey(scenarioId, scenarioVersion));
+  if (!definition) throw new Error(`comparison scenario definition is missing ${scenarioId}:${scenarioVersion}`);
+  return definition.criticalSafety;
 }
 
 function reportScenarioKeys(report: ControllerEvaluationReport): Set<string> {
@@ -361,6 +406,36 @@ function reportScenarioKeys(report: ControllerEvaluationReport): Set<string> {
 function assertCleanFixedReport(report: ControllerEvaluationReport, label: "baseline" | "after"): void {
   if (report.trials.some((trial) => trial.harness.dirty)) {
     throw new Error(`fixed comparison ${label} report contains dirty trials`);
+  }
+}
+
+function assertFixedReportEvidence(report: ControllerEvaluationReport, label: "baseline" | "after"): void {
+  for (const trial of report.trials) {
+    try {
+      validateControllerScenarioTrialEvidence(trial);
+    } catch (error) {
+      throw new Error(`fixed comparison ${label} trial ${trial.scenarioId}:${trial.trial} has invalid proof evidence: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+function assertComparableTrialBudgetEvidence(
+  baselineTrial: ControllerScenarioTrial,
+  afterTrial: ControllerScenarioTrial,
+  key: string,
+): void {
+  validateControllerScenarioTrialBudget(baselineTrial);
+  validateControllerScenarioTrialBudget(afterTrial);
+  for (const [side, trial] of [["baseline", baselineTrial], ["after", afterTrial]] as const) {
+    if (trial.metrics.turns === undefined || trial.metrics.toolCalls === undefined) {
+      throw new Error(`fixed comparison ${side} trial ${key}:${trial.trial} lacks measurable turn/tool budget evidence`);
+    }
+    if (trial.metrics.tokens === null) {
+      throw new Error(`fixed comparison ${side} trial ${key}:${trial.trial} has unavailable token budget evidence`);
+    }
+    if (trial.budget.maxCostUsd !== null && trial.metrics.costUsd === null) {
+      throw new Error(`fixed comparison ${side} trial ${key}:${trial.trial} has unavailable cost budget evidence`);
+    }
   }
 }
 
@@ -446,11 +521,17 @@ export function compareControllerEvaluations(input: Readonly<{
   }
   assertCleanFixedReport(baseline, "baseline");
   assertCleanFixedReport(after, "after");
+  assertFixedReportEvidence(baseline, "baseline");
+  assertFixedReportEvidence(after, "after");
   const baselineKeys = reportScenarioKeys(baseline);
   const afterKeys = reportScenarioKeys(after);
   const commonKeys = [...baselineKeys].filter((key) => afterKeys.has(key));
   if (commonKeys.length === 0) throw new Error("fixed comparison has no intersecting scenarios");
+  if (!input.scenarioDefinitions) throw new Error("fixed comparison requires definitions for every scenario");
   const definitions = scenarioDefinitionsByKey(input.scenarioDefinitions);
+  for (const key of new Set([...baselineKeys, ...afterKeys])) {
+    if (!definitions.has(key)) throw new Error(`fixed comparison scenario definition is missing ${key}`);
+  }
   const common = commonKeys.sort().map((key) => {
     const scenario = scenarioKeysWithVersion(baseline).find((candidate) => candidate.key === key);
     if (!scenario) throw new Error(`fixed comparison scenario ${key} is missing`);
@@ -462,6 +543,11 @@ export function compareControllerEvaluations(input: Readonly<{
       throw new Error(`fixed comparison is not comparable for ${key}: trial denominators differ`);
     }
     assertFixedComparisonIdentity(baselineTrials, afterTrials, key);
+    for (const baselineTrial of baselineTrials) {
+      const afterTrial = afterTrials.find((candidate) => candidate.trial === baselineTrial.trial);
+      if (!afterTrial) throw new Error(`fixed comparison is not comparable for ${key}: missing trial ${baselineTrial.trial}`);
+      assertComparableTrialBudgetEvidence(baselineTrial, afterTrial, key);
+    }
     return {
       scenarioId: scenario.scenarioId,
       scenarioVersion: scenario.scenarioVersion,

@@ -103,6 +103,9 @@ function readValidatedBaseline(path) {
   }
   if (report.label !== "fixed") throw new Error("baseline report must have fixed label");
   if (report.trials.some((trial) => trial.harness.dirty)) throw new Error("baseline report contains dirty trials");
+  for (const trial of report.trials) {
+    contract.validateControllerScenarioTrialEvidence(trial);
+  }
   return report;
 }
 
@@ -180,7 +183,9 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     if (priorDirty === undefined) delete process.env.HANOON_EVAL_DIRTY;
     else process.env.HANOON_EVAL_DIRTY = priorDirty;
   }
-  const validatedTrials = trials.map(contract.validateControllerScenarioTrialEvidence);
+  const validatedTrials = trials
+    .map(contract.validateControllerScenarioTrialEvidence)
+    .map(contract.validateControllerScenarioTrialBudget);
   assertCurrentEvaluationIdentity(validatedTrials, identity);
   const baseReport = contract.aggregateControllerEvaluation({
     label: classifyControllerEvidence(validatedTrials),
@@ -214,7 +219,7 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
   return {
     report,
     criticalSafetyFailed,
-    exitCode: criticalSafetyFailed || report.status === "failed" ? 1 : 0,
+    exitCode: criticalSafetyFailed || report.status !== "passed" ? 1 : 0,
   };
 }
 

@@ -36,11 +36,38 @@ const baseTrial: ControllerScenarioTrial = {
   outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: ["proof:plain-conversation:outcome:sha256:" + "2".repeat(64)] },
   trace: { status: "passed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: ["proof:plain-conversation:trace:sha256:" + "3".repeat(64)] },
   answer: { status: "not_applicable" as const, graderId: "answer-form", graderVersion: 1, proofRefs: [] },
-  metrics: { wallMs: 2, tokens: null, costUsd: null, terminalFailureClass: null },
+  metrics: { wallMs: 2, turns: 1, toolCalls: 0, tokens: 0, costUsd: null, terminalFailureClass: null },
 };
 
 function trial(overrides: Partial<ControllerScenarioTrial> = {}): ControllerScenarioTrial {
   return { ...baseTrial, ...overrides };
+}
+
+function trialForScenario(scenarioId: string, overrides: Partial<ControllerScenarioTrial> = {}): ControllerScenarioTrial {
+  const candidate = trial({ scenarioId, ...overrides });
+  return {
+    ...candidate,
+    outcome: candidate.outcome.status === "passed"
+      ? { ...candidate.outcome, proofRefs: [`proof:${scenarioId}:outcome:sha256:${"2".repeat(64)}`] }
+      : candidate.outcome,
+    trace: candidate.trace.status === "passed"
+      ? { ...candidate.trace, proofRefs: [`proof:${scenarioId}:trace:sha256:${"3".repeat(64)}`] }
+      : candidate.trace,
+  };
+}
+
+function scenarioDefinitionsFor(...reports: ReadonlyArray<{ trials: readonly unknown[] }>) {
+  const definitions = new Map<string, { id: string; scenarioVersion: number; criticalSafety: boolean }>();
+  for (const report of reports) {
+    for (const currentTrial of report.trials as readonly ControllerScenarioTrial[]) {
+      definitions.set(`${currentTrial.scenarioId}:${currentTrial.scenarioVersion}`, {
+        id: currentTrial.scenarioId,
+        scenarioVersion: currentTrial.scenarioVersion,
+        criticalSafety: false,
+      });
+    }
+  }
+  return [...definitions.values()];
 }
 
 describe("controller scenario contract", () => {
@@ -239,6 +266,14 @@ describe("controller scenario contract", () => {
       })),
       scenarios: report.scenarios,
     })],
+    ["overlay digest", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, overlaySha256: "1".repeat(64) },
+      })),
+      scenarios: report.scenarios,
+    })],
     ["provider", (report: ControllerScenarioContractReport) => ({
       ...report,
       trials: report.trials.map((currentTrial) => ({
@@ -288,7 +323,10 @@ describe("controller scenario contract", () => {
           harness: Object.fromEntries(Object.entries(currentTrial.harness).filter(([key]) => key !== "outerTaskTools")),
         })) } }
       : { baseline: after, after: baseline };
-    expect(() => (compare as (input: unknown) => unknown)(input)).toThrow(/comparable|scenario|budget|grader|tool|provider|identity/i);
+    expect(() => (compare as (input: unknown) => unknown)({
+      ...input,
+      scenarioDefinitions: scenarioDefinitionsFor(input.baseline, input.after),
+    })).toThrow(/comparable|scenario|budget|grader|tool|provider|identity/i);
   });
 
   it("rejects a dirty after report as well as a dirty baseline", () => {
@@ -299,7 +337,7 @@ describe("controller scenario contract", () => {
       generatedAt: "2026-08-12T00:00:00.000Z",
       trials: [{ ...baseTrial, harness: { ...baseTrial.harness, dirty: true } }],
     });
-    expect(() => compare({ baseline, after })).toThrow(/dirty/i);
+    expect(() => compare({ baseline, after, scenarioDefinitions: scenarioDefinitionsFor(baseline, after) })).toThrow(/dirty/i);
   });
 
   it("reports comparable denominators and new scenarios without averaging safety failures", () => {
@@ -316,7 +354,7 @@ describe("controller scenario contract", () => {
       trials: [
         trial(),
         trial({ trial: 2, outcome: { ...baseTrial.outcome, status: "failed" } }),
-        trial({ scenarioId: "new-safety-case" }),
+        trialForScenario("new-safety-case"),
       ],
     });
     const comparison = (compare as (input: unknown) => {
@@ -324,7 +362,7 @@ describe("controller scenario contract", () => {
       common: Array<{ baseline: { passed: number; denominator: number }; after: { passed: number; denominator: number } }>;
       newScenarios: Array<{ scenarioId: string; denominator: number }>;
       intervention: { baseline: unknown; after: unknown };
-    })({ baseline, after });
+    })({ baseline, after, scenarioDefinitions: scenarioDefinitionsFor(baseline, after) });
 
     expect(comparison).toMatchObject({
       status: "comparable",
@@ -350,8 +388,146 @@ describe("controller scenario contract", () => {
       trials: [trial()],
     });
 
-    expect(() => (compare as (input: unknown) => unknown)({ baseline, after }))
+    expect(() => (compare as (input: unknown) => unknown)({
+      baseline,
+      after,
+      scenarioDefinitions: scenarioDefinitionsFor(baseline, after),
+    }))
       .toThrow(/trial|denominator|comparable/i);
+  });
+
+  it("keeps summaries distinct when one scenario id has multiple versions", () => {
+    const report = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [
+        trial(),
+        trial({ trial: 2, scenarioVersion: 2 }),
+      ],
+    });
+
+    expect(report.scenarios).toEqual([
+      { scenarioId: "plain-conversation", scenarioVersion: 1, denominator: 1, passed: 1, failed: 0, incomplete: 0 },
+      { scenarioId: "plain-conversation", scenarioVersion: 2, denominator: 1, passed: 1, failed: 0, incomplete: 0 },
+    ]);
+  });
+
+  it("rejects a fixed comparison when a passed baseline proof is scenario-unbound", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [baseTrial],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [baseTrial],
+    });
+    const invalidBaseline = {
+      ...baseline,
+      trials: baseline.trials.map((currentTrial) => ({
+        ...currentTrial,
+        outcome: {
+          ...currentTrial.outcome,
+          proofRefs: ["proof:other-scenario:outcome:sha256:" + "7".repeat(64)],
+        },
+      })),
+    };
+
+    expect(() => compare({
+      baseline: invalidBaseline,
+      after,
+      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+    })).toThrow(/subject-bound|proof/i);
+  });
+
+  it("rejects a fixed comparison when any intersecting scenario lacks a definition", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [baseTrial],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [baseTrial, trialForScenario("new-safety-case", { trial: 2 })],
+    });
+
+    expect(() => compare({
+      baseline,
+      after,
+      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+    })).toThrow(/definition|criticalSafety/i);
+  });
+
+  it("rejects legacy summaries without a scenario version before fixed comparison", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [baseTrial],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [baseTrial],
+    });
+    const legacyBaseline = {
+      ...baseline,
+      scenarios: baseline.scenarios.map(({ scenarioVersion: _version, ...summary }) => summary),
+    };
+
+    expect(() => compare({
+      baseline: legacyBaseline,
+      after,
+      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+    })).toThrow(/summary|version/i);
+  });
+
+  it.each([
+    ["wall time", { metrics: { ...baseTrial.metrics, wallMs: baseTrial.budget.maxWallMs + 1, turns: 1, toolCalls: 0 } }],
+    ["turns", { metrics: { ...baseTrial.metrics, turns: baseTrial.budget.maxTurns + 1, toolCalls: 0 } }],
+    ["tool calls", { metrics: { ...baseTrial.metrics, turns: 1, toolCalls: baseTrial.budget.maxToolCalls + 1 } }],
+    ["tokens", { metrics: { ...baseTrial.metrics, turns: 1, toolCalls: 0, tokens: baseTrial.budget.maxTokens + 1 } }],
+    ["cost", {
+      budget: { ...baseTrial.budget, maxCostUsd: 1 },
+      metrics: { ...baseTrial.metrics, turns: 1, toolCalls: 0, costUsd: 2 },
+    }],
+  ] as const)("rejects an over-budget %s measurement", (_name, overrides) => {
+    const validate = (controllerScenarioContract as Record<string, unknown>).validateControllerScenarioTrialBudget as ((candidate: unknown) => unknown) | undefined;
+    expect(typeof validate).toBe("function");
+    expect(() => validate?.({ ...baseTrial, ...overrides })).toThrow(/budget|bound|exceed/i);
+  });
+
+  it("preserves unavailable token and cost metrics instead of fabricating values", () => {
+    const validate = (controllerScenarioContract as Record<string, unknown>).validateControllerScenarioTrialBudget as ((candidate: unknown) => unknown) | undefined;
+    expect(typeof validate).toBe("function");
+    expect(() => validate?.({
+      ...baseTrial,
+      metrics: { ...baseTrial.metrics, turns: 1, toolCalls: 0, tokens: null, costUsd: null },
+    })).not.toThrow();
+  });
+
+  it("rejects unavailable measured budget evidence from a fixed comparison", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{ ...baseTrial, metrics: { ...baseTrial.metrics, turns: 1, toolCalls: 0, tokens: null } }],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{ ...baseTrial, metrics: { ...baseTrial.metrics, turns: 1, toolCalls: 0, tokens: null } }],
+    });
+
+    expect(() => compare({
+      baseline,
+      after,
+      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+    })).toThrow(/unavailable|budget|comparable/i);
   });
 });
 

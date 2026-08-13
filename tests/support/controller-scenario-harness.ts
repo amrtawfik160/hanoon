@@ -22,9 +22,16 @@ import type {
 import {
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
+  validateControllerScenarioTrialBudget,
   validateControllerScenarioTrialEvidence,
   type ControllerScenarioTrial,
 } from "../../src/eval/controller-scenario-contract";
+import {
+  evaluateControllerScenarioAnswer,
+  isExpectedControllerRecoveryPrompt,
+  parseControllerScenarioAnswerFixture,
+  type ControllerScenarioAnswerFixture,
+} from "../../src/eval/controller-scenario-answer-contract";
 import {
   controllerInteractionToken,
   renderControllerInteraction,
@@ -97,6 +104,13 @@ function fixedProjectPolicy(): ProjectPolicy {
 
 type ScenarioCase = ReturnType<typeof parseControllerScenarioCorpus>["cases"][number];
 
+export function loadControllerScenarioAnswerFixture(): ControllerScenarioAnswerFixture {
+  const path = fileURLToPath(new URL("../../evals/controller-scenario-answers.json", import.meta.url));
+  return parseControllerScenarioAnswerFixture(JSON.parse(readFileSync(path, "utf8")));
+}
+
+const CONTROLLER_SCENARIO_ANSWER_FIXTURE = loadControllerScenarioAnswerFixture();
+
 type ScenarioGrade = Readonly<{
   responseText: string;
   outcomePassed: boolean;
@@ -114,6 +128,8 @@ function scenarioTrial(
   startedAt: number,
   toolSurface: ReturnType<typeof registeredToolSurface>,
   grade: ScenarioGrade,
+  executionCounters: ScenarioExecutionCounters,
+  effectivePolicy: unknown | null = null,
 ): ControllerScenarioTrial {
   if (!grade.assertionFacts) throw new Error(`scenario ${scenarioCase.id} has no durable assertion facts`);
   const assertions = evaluateDeclaredAssertions(scenarioCase, grade.assertionFacts);
@@ -130,7 +146,7 @@ function scenarioTrial(
     scenarioId: scenarioCase.id,
     trial,
     seed,
-    harness: harnessIdentity(scenarioCase, trial, seed, toolSurface),
+    harness: harnessIdentity(scenarioCase, trial, seed, toolSurface, effectivePolicy),
     budget: scenarioCase.budget,
     outcome: {
       status: outcomePassed ? "passed" : "failed",
@@ -159,12 +175,15 @@ function scenarioTrial(
     },
     metrics: {
       wallMs: Math.max(0, Math.ceil(performance.now() - startedAt)),
+      turns: executionCounters.turns,
+      toolCalls: executionCounters.toolCalls,
       tokens: null,
       costUsd: null,
       terminalFailureClass: null,
     },
   });
-  return validateControllerScenarioTrialEvidence(parsed);
+  const evidenceValidated = validateControllerScenarioTrialEvidence(parsed);
+  return validateControllerScenarioTrialBudget(evidenceValidated);
 }
 
 function controllerInteractionStore(store: TelegramAgentStore): ControllerInteractionStore {
@@ -239,10 +258,12 @@ type ScriptedAdapterOptions = Readonly<{
     resolution: ControllerInteractionResolution,
     signal: AbortSignal,
   ) => Promise<void>;
+  onSpawn?: () => void;
+  onEvents?: (observation: Readonly<{ toolCalls: number; totalTokens: number | null }>) => void;
 }>;
 
 function scriptedAdapter(
-  observeToolCall: () => Promise<boolean>,
+  observeToolCall: () => Promise<number>,
   finalizeTurn: () => Promise<void>,
   reserveSpawn: (turnId: string) => boolean,
   options: ScriptedAdapterOptions = {},
@@ -250,6 +271,7 @@ function scriptedAdapter(
   return {
     spawn: async (turn) => {
       if (!reserveSpawn(turn.id)) throw new Error("fixed scenario spawn reservation failed");
+      options.onSpawn?.();
       return { threadId: "thr_fixed_controller", projectId: "proj_fixed", hostId: "host_fixed", spawnToken: turn.id };
     },
     send: async (_threadId, text) => options.onSend?.(text),
@@ -258,8 +280,9 @@ function scriptedAdapter(
     status: async () => "idle",
     latestSeq: async () => options.eventSequence?.() ?? 0,
     events: async (): Promise<ControllerEventResult> => {
-      const toolCalls = await observeToolCall() ? 1 : 0;
+      const toolCalls = await observeToolCall();
       if (options.finalizeOnEvents !== false) await finalizeTurn();
+      options.onEvents?.({ toolCalls, totalTokens: null });
       return {
         latestSeq: options.eventSequence?.() ?? 1,
         inputAccepted: true,
@@ -329,6 +352,15 @@ type ScenarioAssertionFacts = Readonly<{
   replayOutcome: string | null;
   evidence: readonly unknown[];
   sentTexts: readonly string[];
+  recoveryPromptTexts: readonly string[];
+  providerContinuationTexts: readonly string[];
+  staleApprovalSettlementDenied: boolean;
+  staleApprovalStateBefore: string | null;
+  staleApprovalStateAfter: string | null;
+  staleApprovalExternalCalls: number;
+  staleApprovalResolutionAttempts: number;
+  staleApprovalOutboxCountBefore: number;
+  staleApprovalOutboxCountAfter: number;
   telegramApprovalRendered: boolean;
   interactionRowState: string | null;
   interactionAnswer: Readonly<Record<string, unknown>> | null;
@@ -345,6 +377,13 @@ type ScenarioAssertionFacts = Readonly<{
   acceptedObligationRefs: readonly string[];
   unboundRejectionCode: string | null;
   watchCapabilityObserved: boolean;
+}>;
+
+type ScenarioExecutionCounters = Readonly<{
+  turns: number;
+  toolCalls: number;
+  tokens: number | null;
+  costUsd: number | null;
 }>;
 
 type ScenarioAssertionEvaluator = (facts: ScenarioAssertionFacts) => boolean;
@@ -371,7 +410,7 @@ export const CONTROLLER_ASSERTION_REGISTRY: Readonly<Record<string, ScenarioAsse
   unsupported_success_rejected: (facts) => facts.finalizationRows.some((row) => row.state === "rejected" && row.rejectionCode === "high_impact_text_unclaimed"),
   process_only_candidate_rejected: (facts) => facts.finalizationRows.some((row) => row.state === "rejected" && row.rejectionCode === "process_only"),
   finalization_rejection_observed: (facts) => facts.finalizationRows.some((row) => row.state === "rejected"),
-  recovery_prompt_sent: (facts) => facts.sentTexts.length === 1,
+  recovery_prompt_sent: (facts) => facts.recoveryPromptTexts.length === 1,
   success_claim_not_delivered: (facts) => facts.turn?.responseText === null && outboxText(facts.reply) === "Hanoon is connecting…",
   deployment_success_delivered: (facts) => outboxText(facts.reply) === "The deployment is deployed.",
   generic_command_used_as_pipeline_proof: (facts) => facts.finalizationRows.some((row) => row.rejectionCode === "generic_command_used_as_pipeline_proof"),
@@ -388,15 +427,25 @@ export const CONTROLLER_ASSERTION_REGISTRY: Readonly<Record<string, ScenarioAsse
   duplicate_job_created: (facts) => facts.jobSourceUpdateCount > 1,
   mutation_executed_twice: (facts) => facts.receipts.length > 1 || facts.jobSourceUpdateCount > 1,
   stale_fence_denied: (facts) => facts.denialCode === "fence_lost",
+  stale_approval_denied: (facts) => facts.staleApprovalSettlementDenied,
+  stale_approval_no_effect: (facts) => facts.staleApprovalStateBefore === "answered"
+    && facts.staleApprovalStateAfter === "answered"
+    && facts.staleApprovalExternalCalls === 0
+    && facts.staleApprovalResolutionAttempts === 0
+    && facts.staleApprovalOutboxCountBefore === facts.staleApprovalOutboxCountAfter,
   job_count_unchanged: (facts) => facts.jobCountBefore === facts.jobCountAfter,
   success_evidence_absent: (facts) => facts.evidence.length === 0,
   job_created: (facts) => facts.jobCountAfter > facts.jobCountBefore,
   success_envelope_returned: (facts) => facts.staleToolReturned,
   capability_denied_before_effect: (facts) => facts.denialCode === "fence_lost" &&
     facts.jobCountBefore === facts.jobCountAfter && facts.receipts.length === 0 && facts.evidence.length === 0,
+  stale_approval_denied_before_effect: (facts) => facts.staleApprovalSettlementDenied
+    && facts.staleApprovalExternalCalls === 0
+    && facts.staleApprovalResolutionAttempts === 0
+    && facts.staleApprovalStateBefore === facts.staleApprovalStateAfter,
   telegram_approval_rendered: (facts) => facts.telegramApprovalRendered,
   interaction_resolved_once: (facts) => facts.successfulResolutionCount === 1,
-  provider_continued: (facts) => facts.providerContinued,
+  provider_continued: (facts) => facts.providerContinuationTexts.length === 1,
   session_wide_approval_offered: (facts) => !facts.telegramApprovalRendered,
   interaction_resolved_twice: (facts) => facts.successfulResolutionCount > 1,
   permission_interaction_observed: (facts) => facts.telegramApprovalRendered && facts.interactionRowState !== null,
@@ -413,42 +462,25 @@ export const CONTROLLER_ASSERTION_REGISTRY: Readonly<Record<string, ScenarioAsse
   obligation_validated: (facts) => facts.unboundRejectionCode === "obligation_not_live",
 };
 
-type ScenarioAnswerEvaluator = (facts: ScenarioAssertionFacts) => boolean;
-
-/**
- * Required answer layers use only durable rows and literal expectations. The
- * scripted adapter's local response is diagnostic evidence, never the oracle.
- */
-const CONTROLLER_ANSWER_REGISTRY: Readonly<Record<string, ScenarioAnswerEvaluator>> = {
-  "plain-conversation": (facts) => facts.turn?.responseText === "Hello from Hanoon."
-    && outboxText(facts.reply) === "Hello from Hanoon.",
-  "current-job-status": (facts) => facts.turn?.responseText === "Job job_fixture_1 is currently awaiting_project."
-    && outboxText(facts.reply) === "Job job_fixture_1 is currently awaiting_project."
-    && facts.observedJobStatus?.id === "job_fixture_1"
-    && facts.observedJobStatus.state === "awaiting_project",
-  "duplicate-mutation-replay": (facts) => facts.turn?.responseText === "I created the fixed replay job once."
-    && outboxText(facts.reply) === "I created the fixed replay job once.",
-  "telegram-allow-once": (facts) => facts.interactionRowState === "delivered"
-    && facts.interactionAnswer?.decision === "allow_once"
-    && facts.interactionAnswer.grantedPermissions === null,
-  "restart-after-owner-tap": (facts) => facts.interactionRowState === "delivered"
-    && facts.interactionAnswer?.decision === "allow_once"
-    && facts.interactionAnswer.grantedPermissions === null,
-  "durable-deferred-monitor": (facts) => facts.turn?.responseText?.includes("get back to you") === true
-    && facts.monitorId !== null
-    && facts.turn.responseText?.includes(facts.monitorId) === true
-    && facts.acceptedObligationRefs.includes(`monitor:${facts.monitorId}`),
-};
-
 function evaluateScenarioAnswer(
   scenarioCase: ScenarioCase,
   facts: ScenarioAssertionFacts | undefined,
 ): boolean {
   if (scenarioCase.answerGrader !== "required") return true;
   if (!facts) throw new Error(`scenario ${scenarioCase.id} has no durable answer facts`);
-  const evaluator = CONTROLLER_ANSWER_REGISTRY[scenarioCase.id];
-  if (!evaluator) throw new Error(`scenario ${scenarioCase.id} has no registered answer oracle`);
-  return evaluator(facts);
+  const expectation = CONTROLLER_SCENARIO_ANSWER_FIXTURE.cases.find(
+    (candidate) => candidate.scenarioId === scenarioCase.id,
+  );
+  if (!expectation) throw new Error(`scenario ${scenarioCase.id} has no independent answer expectation`);
+  return evaluateControllerScenarioAnswer(expectation, {
+    responseText: facts.turn?.responseText ?? null,
+    outboxText: outboxText(facts.reply),
+    observedJobStatus: facts.observedJobStatus,
+    interactionRowState: facts.interactionRowState,
+    interactionAnswer: facts.interactionAnswer,
+    monitorId: facts.monitorId,
+    acceptedObligationRefs: facts.acceptedObligationRefs,
+  });
 }
 
 function outboxText(reply: ReturnType<TelegramAgentStore["getOutbox"]>): string | null {
@@ -506,6 +538,15 @@ function readScenarioAssertionFacts(
     replayOutcome: null,
     evidence: store.listControllerEvidence(turnId, 256),
     sentTexts: [],
+    recoveryPromptTexts: [],
+    providerContinuationTexts: [],
+    staleApprovalSettlementDenied: false,
+    staleApprovalStateBefore: null,
+    staleApprovalStateAfter: null,
+    staleApprovalExternalCalls: 0,
+    staleApprovalResolutionAttempts: 0,
+    staleApprovalOutboxCountBefore: 0,
+    staleApprovalOutboxCountAfter: 0,
     telegramApprovalRendered: false,
     interactionRowState: interactionRow?.state ?? null,
     interactionAnswer,
@@ -557,14 +598,15 @@ export function validateControllerAssertionRegistry(corpus: ReturnType<typeof pa
   const requiredAnswerCases = new Set(
     corpus.cases.filter((scenarioCase) => scenarioCase.answerGrader === "required").map((scenarioCase) => scenarioCase.id),
   );
-  for (const scenarioCase of corpus.cases) {
-    if (scenarioCase.answerGrader === "required" && !(scenarioCase.id in CONTROLLER_ANSWER_REGISTRY)) {
-      throw new Error(`unknown controller answer oracle ${scenarioCase.id}`);
+  const fixtureAnswerCases = new Set(CONTROLLER_SCENARIO_ANSWER_FIXTURE.cases.map((candidate) => candidate.scenarioId));
+  for (const scenarioId of requiredAnswerCases) {
+    if (!fixtureAnswerCases.has(scenarioId)) {
+      throw new Error(`unknown independent controller answer expectation ${scenarioId}`);
     }
   }
-  for (const scenarioId of Object.keys(CONTROLLER_ANSWER_REGISTRY)) {
+  for (const scenarioId of fixtureAnswerCases) {
     if (!requiredAnswerCases.has(scenarioId)) {
-      throw new Error(`controller answer oracle entry is not declared: ${scenarioId}`);
+      throw new Error(`controller answer expectation is not declared: ${scenarioId}`);
     }
   }
 }
@@ -595,6 +637,7 @@ function harnessIdentity(
   trial: number,
   seed: number,
   toolSurface: ReturnType<typeof registeredToolSurface>,
+  effectivePolicy: unknown | null,
 ): ControllerScenarioTrial["harness"] {
   const fixture = `${scenarioCase.id}:${trial}:${seed}`;
   const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -619,12 +662,16 @@ function harnessIdentity(
     instructionSha256: sha256("fixed-controller-scenario-instruction-v1"),
     overlaySha256: sha256(""),
     capabilityManifestSha256: toolSurface.capabilityManifestSha256,
-    policySha256: sha256("baseline-no-project-policy"),
+    policySha256: controllerScenarioPolicySha256(effectivePolicy),
     contextSha256: sha256(fixture),
     outerTaskTools: [],
     advertisedTools: toolSurface.advertisedTools,
     parameterSchemaSha256: toolSurface.parameterSchemaSha256,
   };
+}
+
+export function controllerScenarioPolicySha256(effectivePolicy: unknown | null): string {
+  return sha256(effectivePolicy === null ? "baseline-no-project-policy" : canonicalJson(effectivePolicy));
 }
 
 async function runScenario(
@@ -687,18 +734,19 @@ async function runScenario(
   const effectsBefore = queuedJob ? store.listEffectsForJob(JOB_ID) : [];
   const jobCountBefore = store.listJobs(256).length;
   const observed = { jobStatus: null as JobStatusProjection | null };
+  const executionCounters = { turns: 0, toolCalls: 0, tokens: null, costUsd: null } satisfies ScenarioExecutionCounters;
   let response = "Hello from Hanoon.";
   let activeTurnId: string | null = null;
   let finalizationAccepted = false;
   const observeToolCall = async () => {
-    if (!queuedJob) return false;
+    if (!queuedJob) return 0;
     observed.jobStatus = parseJobStatusProjection(await harness.behavior.callAgentTool(
       "telegram_agent_job_status",
       { jobId: JOB_ID },
       { threadId: "thr_fixed_controller", projectId: "proj_fixed" },
     ));
     response = `Job ${observed.jobStatus.id} is currently ${observed.jobStatus.state}.`;
-    return true;
+    return 1;
   };
   const finalizeTurn = async () => {
     if (finalizationAccepted) return;
@@ -728,6 +776,10 @@ async function runScenario(
       hostId: "host_fixed",
       now: FIXTURE_NOW,
     }),
+    {
+      onSpawn: () => { executionCounters.turns += 1; },
+      onEvents: ({ toolCalls }) => { executionCounters.toolCalls += toolCalls; },
+    },
   );
   const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => FIXTURE_NOW } });
   const turn = store.enqueueControllerTurn({
@@ -791,6 +843,7 @@ async function runScenario(
         jobCountAfter: store.listJobs(256).length,
         observedJobStatus: observed.jobStatus,
       }),
+      executionCounters,
     );
   } finally {
     await disposeScenarioResources(harness);
@@ -836,7 +889,8 @@ async function runExtendedScenario(
   harness.sdk.stub("threads.timeline", async () => ({ maxSeq: 0 }));
   harness.sdk.stub("threads.events.list", async () => []);
 
-  store.upsertProjectPolicy(fixedProjectPolicy(), FIXTURE_NOW);
+  const effectivePolicy = fixedProjectPolicy();
+  store.upsertProjectPolicy(effectivePolicy, FIXTURE_NOW);
   const evidenceProjector = new ControllerEvidenceProjector({
     sdk: bb.sdk,
     store,
@@ -860,6 +914,9 @@ async function runExtendedScenario(
   let finalizationOutcome: string | null = null;
   let finalizationCode: string | null = null;
   const sentTexts: string[] = [];
+  const recoveryPromptTexts: string[] = [];
+  const providerContinuationTexts: string[] = [];
+  const executionCounters = { turns: 0, toolCalls: 0, tokens: null, costUsd: null } satisfies ScenarioExecutionCounters;
   const toolResults: Record<string, unknown>[] = [];
   let observedToolCalls = 0;
 
@@ -876,7 +933,7 @@ async function runExtendedScenario(
   let successfulResolutions = 0;
   let unboundRejectionCode: string | null = null;
 
-  const observeToolCall = async (): Promise<boolean> => {
+  const observeToolCall = async (): Promise<number> => {
     if (scenarioCase.id === "duplicate-mutation-replay") {
       const params = { projectId: "proj_1", task: "Create the fixed replay job." };
       const first = parseScenarioToolResult(await harness.behavior.callAgentTool(
@@ -892,7 +949,7 @@ async function runExtendedScenario(
       toolResults.push(first, second);
       observedToolCalls = 2;
       responseText = "I created the fixed replay job once.";
-      return true;
+      return 2;
     }
     if (scenarioCase.id === "durable-deferred-monitor") {
       const result = parseScenarioToolResult(await harness.behavior.callAgentTool(
@@ -910,9 +967,9 @@ async function runExtendedScenario(
       const monitorId = typeof watching?.id === "string" ? watching.id : null;
       if (!monitorId) throw new Error("fixed scenario watch returned no monitor id");
       responseText = `I'll get back to you when monitor ${monitorId} reports it finishes.`;
-      return true;
+      return 1;
     }
-    return false;
+    return 0;
   };
 
   const finalizeTurn = async (): Promise<void> => {
@@ -1007,7 +1064,15 @@ async function runExtendedScenario(
     {
       finalizeOnEvents: !isInteractionScenario,
       eventSequence: () => 0,
-      onSend: (text) => sentTexts.push(text),
+      onSend: (text) => {
+        sentTexts.push(text);
+        if (isExpectedControllerRecoveryPrompt(CONTROLLER_SCENARIO_ANSWER_FIXTURE.recoveryPrompt, text)) {
+          recoveryPromptTexts.push(text);
+        }
+        if (text.includes("telegram_agent_turn_evidence")) providerContinuationTexts.push(text);
+      },
+      onSpawn: () => { executionCounters.turns += 1; },
+      onEvents: ({ toolCalls }) => { executionCounters.toolCalls += toolCalls; },
       ...(isInteractionScenario ? {
         eventReferences: () => [{
           interactionId,
@@ -1067,9 +1132,61 @@ async function runExtendedScenario(
 
   if (scenarioCase.id === "stale-capability-fence") {
     const jobsBefore = store.listJobs(100).length;
+    const controllerGeneration = store.listControllerGenerations(CONTROLLER_KEY, 1)[0];
+    if (!controllerGeneration) throw new Error("fixed stale scenario has no controller generation");
+    const staleApprovalId = `stale_approval_${seed}_${trial}`;
+    const recordedApproval = store.recordControllerInteraction({
+      ownerId: executionOwnerId,
+      generation: lease.generation,
+      now: FIXTURE_NOW,
+      turnId: turn.id,
+      controllerKey: CONTROLLER_KEY,
+      bbThreadId: threadId,
+      controllerGenerationId: controllerGeneration.id,
+      interaction: {
+        kind: "approval",
+        interactionId: staleApprovalId,
+        summary: "Run the fixture command once.",
+        decisions: ["allow_once", "deny"],
+      },
+    });
+    if (!recordedApproval) throw new Error("fixed stale scenario approval could not be recorded");
+    const answeredApproval = store.answerControllerInteractionByToken({
+      token: controllerInteractionToken(staleApprovalId, "allow_once"),
+      userId: OWNER_ID,
+      chatId: OWNER_ID,
+      now: FIXTURE_NOW + 1,
+    });
+    if (!answeredApproval.ok) throw new Error("fixed stale scenario approval could not be answered");
+    const staleApprovalStateBefore = store.getAnsweredControllerInteraction(CONTROLLER_KEY) ? "answered" : null;
+    const staleApprovalOutboxCountBefore = store.listOutbox(256).length;
+    let staleApprovalExternalCalls = 0;
+    let staleApprovalResolutionAttempts = 0;
+    const staleApprovalService = new ControllerInteractionService({
+      store: controllerInteractionStore(store),
+      clock: { now: () => FIXTURE_NOW },
+      interactions: {
+        get: async () => {
+          staleApprovalExternalCalls += 1;
+          return { id: staleApprovalId, threadId, status: "pending" };
+        },
+        resolve: async () => {
+          staleApprovalExternalCalls += 1;
+          staleApprovalResolutionAttempts += 1;
+          return { id: staleApprovalId, threadId, status: "resolved" };
+        },
+      },
+    });
     if (!store.releaseExecutorLease(executionOwnerId, lease.generation, FIXTURE_NOW)) {
       throw new Error("fixed scenario lease could not be released");
     }
+    const staleApprovalSettlementDenied = !(await staleApprovalService.deliverAnswered(
+      CONTROLLER_KEY,
+      { ownerId: executionOwnerId, generation: lease.generation, now: FIXTURE_NOW },
+      signal,
+    ));
+    const staleApprovalStateAfter = store.getAnsweredControllerInteraction(CONTROLLER_KEY) ? "answered" : null;
+    const staleApprovalOutboxCountAfter = store.listOutbox(256).length;
     let denialCode: string | null = null;
     try {
       await harness.behavior.callAgentTool(
@@ -1085,8 +1202,8 @@ async function runExtendedScenario(
     const jobsAfter = store.listJobs(100).length;
     const grade: ScenarioGrade = {
       responseText: "",
-      outcomePassed: denialCode === "fence_lost" && jobsAfter === jobsBefore && store.listToolReceipts(turn.id).length === 0 && store.listControllerEvidence(turn.id, 128).length === 0,
-      tracePassed: denialCode === "fence_lost",
+      outcomePassed: denialCode === "fence_lost" && jobsAfter === jobsBefore && store.listToolReceipts(turn.id).length === 0 && store.listControllerEvidence(turn.id, 128).length === 0 && staleApprovalSettlementDenied,
+      tracePassed: denialCode === "fence_lost" && staleApprovalSettlementDenied,
       outcomeProofs: [proof(`${fixtureId}:denial:${denialCode ?? "missing"}`), proof(`${fixtureId}:jobs:${jobsAfter}`), proof(`${fixtureId}:evidence:${store.listControllerEvidence(turn.id, 128).length}`)],
       traceProofs: [proof(`${fixtureId}:capability-denied-before-effect:${denialCode ?? "missing"}`)],
       answerProofs: [proof(`${fixtureId}:not-applicable`)],
@@ -1102,7 +1219,16 @@ async function runExtendedScenario(
         jobCountAfter: jobsAfter,
         denialCode,
         staleToolReturned: false,
+        staleApprovalSettlementDenied,
+        staleApprovalStateBefore,
+        staleApprovalStateAfter,
+        staleApprovalExternalCalls,
+        staleApprovalResolutionAttempts,
+        staleApprovalOutboxCountBefore,
+        staleApprovalOutboxCountAfter,
       }),
+      executionCounters,
+      effectivePolicy,
     );
   }
 
@@ -1180,7 +1306,7 @@ async function runExtendedScenario(
     ).get(interactionId) as { state?: string } | undefined;
     const exactResolution = resolutionAttempts.length === (scenarioCase.id === "restart-after-owner-tap" ? 2 : 1) &&
       resolutionAttempts.every((resolution) => JSON.stringify(resolution) === JSON.stringify({ decision: "allow_once", grantedPermissions: null }));
-    const providerContinued = sentTexts.length === 1 && sentTexts[0]?.includes("telegram_agent_turn_evidence") === true;
+    const providerContinued = providerContinuationTexts.length === 1;
     const grade: ScenarioGrade = {
       responseText: "Allow once",
       outcomePassed: telegramApprovalRendered && answeredBeforeResolution &&
@@ -1217,7 +1343,12 @@ async function runExtendedScenario(
         serviceReopened: scenarioCase.id === "restart-after-owner-tap",
         firstDelivery,
         secondDelivery,
+        sentTexts,
+        recoveryPromptTexts,
+        providerContinuationTexts,
       }),
+      executionCounters,
+      effectivePolicy,
     );
   }
 
@@ -1233,10 +1364,10 @@ async function runExtendedScenario(
       completed.acceptedFinalizationId === null && safeStatusOnly;
     grade = {
       responseText: "",
-      outcomePassed: exactContinuation && neverDelivered && sentTexts.length === 1,
-      tracePassed: exactContinuation && sentTexts.length === 1,
-      outcomeProofs: [proof(`${fixtureId}:continuations:${completed?.completionContinuations ?? "missing"}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "none"}`), proof(`${fixtureId}:sent:${sentTexts.length}`)],
-      traceProofs: [proof(`${fixtureId}:recovery:${sentTexts[0] ?? "missing"}`)],
+      outcomePassed: exactContinuation && neverDelivered && recoveryPromptTexts.length === 1,
+      tracePassed: exactContinuation && recoveryPromptTexts.length === 1,
+      outcomeProofs: [proof(`${fixtureId}:continuations:${completed?.completionContinuations ?? "missing"}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "none"}`), proof(`${fixtureId}:sent:${recoveryPromptTexts.length}`)],
+      traceProofs: [proof(`${fixtureId}:recovery:${recoveryPromptTexts[0] ?? "missing"}`)],
       answerProofs: [proof(`${fixtureId}:not-applicable`)],
     };
   } else if (scenarioCase.id === "unsupported-success-claim") {
@@ -1317,7 +1448,9 @@ async function runExtendedScenario(
       acceptedObligationRefs: accepted?.candidate.obligationRefs ?? [],
       watchCapabilityObserved: scenarioCase.id === "durable-deferred-monitor" && finalMonitorProof,
       unboundRejectionCode,
-      ...(scenarioCase.id === "process-only-finalization" ? { sentTexts } : {}),
+      sentTexts,
+      recoveryPromptTexts,
+      providerContinuationTexts,
     });
     return scenarioTrial(
       scenarioCase,
@@ -1326,6 +1459,8 @@ async function runExtendedScenario(
       startedAt,
       toolSurface,
       factfulGrade,
+      executionCounters,
+      effectivePolicy,
     );
   } finally {
     await disposeScenarioResources(harness);

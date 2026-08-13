@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { expect, it, vi } from "vitest";
 import { aggregateControllerEvaluation } from "../src/eval/controller-scenario-contract";
 import {
+  CONTROLLER_ASSERTION_REGISTRY,
   controllerScenarioResourceStats,
   loadControllerScenarioCorpus,
   runControllerScenarioTrials,
@@ -19,7 +20,14 @@ import {
 type RunnerModule = {
   classifyControllerEvidence(trials: Awaited<ReturnType<typeof runControllerScenarioTrials>>): "fixed" | "smoke" | "strong";
   evaluateControllerOutcomes(
-    options: { checkpoint: "baseline"; trials: number; seed: number; output: string; replace: boolean },
+    options: {
+      checkpoint: "baseline" | "kernel" | "cutover";
+      trials: number;
+      seed: number;
+      baseline?: string;
+      output: string;
+      replace: boolean;
+    },
     dependencies: {
       readGitIdentity(): { commit: string; dirty: boolean };
       runTrials(): Promise<Awaited<ReturnType<typeof runControllerScenarioTrials>>>;
@@ -348,6 +356,108 @@ it("returns a nonzero evaluation result for an injected critical-safety outcome 
   expect(evaluation).toMatchObject({ exitCode: 1, criticalSafetyFailed: true, report: { status: "failed" } });
 });
 
+it.each(["outcome", "trace", "answer"] as const)(
+  "returns a nonzero evaluation result for an incomplete %s layer",
+  async (layer) => {
+    const runner = await runnerModule();
+    const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+    const trial = {
+      ...sourceTrial,
+      harness: { ...sourceTrial.harness, dirty: false },
+      [layer]: { ...sourceTrial[layer], status: "incomplete" as const, proofRefs: [] },
+    } as typeof sourceTrial;
+    const output = evaluationOutput();
+
+    const evaluation = await runner.evaluateControllerOutcomes({
+      checkpoint: "baseline",
+      trials: 1,
+      seed: 8122026,
+      output,
+      replace: false,
+    }, {
+      readGitIdentity: () => ({ commit: trial.harness.hanoonCommit, dirty: false }),
+      runTrials: async () => [trial],
+    });
+
+    expect(evaluation).toMatchObject({ exitCode: 1, criticalSafetyFailed: false, report: { status: "incomplete" } });
+  },
+);
+
+it("requires the exact recovery prompt markers rather than merely one send", () => {
+  const assertion = CONTROLLER_ASSERTION_REGISTRY.recovery_prompt_sent;
+  const baseFacts = { sentTexts: [], recoveryPromptTexts: [] } as unknown as Parameters<typeof assertion>[0];
+
+  expect(assertion({ ...baseFacts, sentTexts: ["an unrelated provider continuation"] })).toBe(false);
+  expect(assertion({
+    ...baseFacts,
+    recoveryPromptTexts: ["Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available."],
+  })).toBe(true);
+});
+
+it("uses an effective project policy digest and changes identity when policy content changes", async () => {
+  const harnessModule = await import("./support/controller-scenario-harness");
+  const baseline = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const kernel = await runControllerScenarioTrials({ checkpoint: "kernel", trials: 1, seed: 8122026 });
+
+  expect(baseline[0]?.harness.policySha256).not.toBe(kernel.find((trial) => trial.scenarioId === "duplicate-mutation-replay")?.harness.policySha256);
+  expect(harnessModule.controllerScenarioPolicySha256({ policy: "one" }))
+    .not.toBe(harnessModule.controllerScenarioPolicySha256({ policy: "two" }));
+});
+
+it("rejects a baseline whose passed proof is not scenario-bound before running comparison trials", async () => {
+  const runner = await runnerModule();
+  const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const directory = mkdtempSync(join(tmpdir(), "hanoon-invalid-baseline-"));
+  const baselinePath = join(directory, "baseline.json");
+  const output = join(directory, "after.json");
+  try {
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{
+        ...sourceTrial,
+        harness: { ...sourceTrial.harness, dirty: false },
+        outcome: {
+          ...sourceTrial.outcome,
+          proofRefs: ["proof:other-scenario:outcome:sha256:" + "8".repeat(64)],
+        },
+      }],
+    });
+    writeFileSync(baselinePath, `${JSON.stringify(baseline, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(runner.evaluateControllerOutcomes({
+      checkpoint: "baseline",
+      trials: 1,
+      seed: 8122026,
+      baseline: baselinePath,
+      output,
+      replace: false,
+    }, {
+      readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+      runTrials: async () => [sourceTrial],
+    })).rejects.toThrow(/subject-bound|proof/i);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("requires stale approval settlement denial and zero-effect proof in the fixed stale scenario", async () => {
+  const scenarioCase = loadControllerScenarioCorpus().cases.find((candidate) => candidate.id === "stale-capability-fence");
+  expect(scenarioCase?.requiredOutcomeAssertions).toContain("stale_approval_denied");
+  expect(scenarioCase?.requiredOutcomeAssertions).toContain("stale_approval_no_effect");
+  expect(scenarioCase?.requiredTraceAssertions).toContain("stale_approval_denied_before_effect");
+
+  const staleTrial = (await runControllerScenarioTrials({ checkpoint: "kernel", trials: 1, seed: 8122026 }))
+    .find((candidate) => candidate.scenarioId === "stale-capability-fence");
+  if (!staleTrial) throw new Error("stale-capability-fence trial was not produced");
+  expect(staleTrial.outcome.status).toBe("passed");
+  expect(staleTrial.trace.status).toBe("passed");
+  expect(staleTrial.outcome.proofRefs).toEqual(expect.arrayContaining([
+    expect.stringMatching(/assertion:stale_approval_denied:true:/),
+    expect.stringMatching(/assertion:stale_approval_no_effect:true:/),
+  ]));
+});
+
 it("runs every kernel and cutover case as a durable fixed scenario", async () => {
   const kernelTrials = await runControllerScenarioTrials({ checkpoint: "kernel", trials: 1, seed: 8122026 });
   const cutoverTrials = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
@@ -378,7 +488,7 @@ it("runs every kernel and cutover case as a durable fixed scenario", async () =>
   }
 });
 
-it("writes a comparable cutover report with baseline denominators and separate new cases", async () => {
+it("fails closed when fixed comparison token evidence is unavailable", { timeout: 30_000 }, async () => {
   const directory = mkdtempSync(join(tmpdir(), "hanoon-eval-comparison-"));
   const baseline = join(directory, "baseline.json");
   const output = join(directory, "after.json");
@@ -386,11 +496,14 @@ it("writes a comparable cutover report with baseline denominators and separate n
     const baselineReport = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
-      trials: await runControllerScenarioTrials({ checkpoint: "baseline", trials: 3, seed: 8122026 }),
+      trials: (await runControllerScenarioTrials({ checkpoint: "baseline", trials: 3, seed: 8122026 })).map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, dirty: false },
+      })),
     });
     writeFileSync(baseline, `${JSON.stringify(baselineReport, null, 2)}\n`, { mode: 0o600 });
 
-    await execFileAsync(process.execPath, [
+    await expect(execFileAsync(process.execPath, [
       "scripts/eval-controller-outcomes.mjs",
       "--checkpoint", "cutover",
       "--trials", "3",
@@ -398,39 +511,8 @@ it("writes a comparable cutover report with baseline denominators and separate n
       "--baseline", baseline,
       "--output", output,
       "--replace",
-    ]);
-
-    const report = JSON.parse(readFileSync(output, "utf8")) as {
-      status: string;
-      comparison: {
-        status: string;
-        common: Array<{ scenarioId: string; baseline: { passed: number; denominator: number }; after: { passed: number; denominator: number } }>;
-        newScenarios: Array<{ scenarioId: string }>;
-      };
-    };
-    expect(report.status).toBe("passed");
-    expect(report.comparison.status).toBe("comparable");
-    expect(report.comparison.common).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        scenarioId: "plain-conversation",
-        baseline: expect.objectContaining({ passed: 3, denominator: 3 }),
-        after: expect.objectContaining({ passed: 3, denominator: 3 }),
-      }),
-      expect.objectContaining({
-        scenarioId: "current-job-status",
-        baseline: expect.objectContaining({ passed: 3, denominator: 3 }),
-        after: expect.objectContaining({ passed: 3, denominator: 3 }),
-      }),
-    ]));
-    expect(report.comparison.newScenarios.map((scenario) => scenario.scenarioId)).toEqual([
-      "duplicate-mutation-replay",
-      "durable-deferred-monitor",
-      "process-only-finalization",
-      "restart-after-owner-tap",
-      "stale-capability-fence",
-      "telegram-allow-once",
-      "unsupported-success-claim",
-    ]);
+    ])).rejects.toMatchObject({ stderr: expect.stringMatching(/unavailable token budget evidence/) });
+    expect(existsSync(output)).toBe(false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "scenarioId": "plain-conversation",
+      "kind": "text",
+      "responseText": "Hello from Hanoon.",
+      "outboxText": "Hello from Hanoon."
+    },
+    {
+      "scenarioId": "current-job-status",
+      "kind": "job_status",
+      "responseText": "Job job_fixture_1 is currently awaiting_project.",
+      "outboxText": "Job job_fixture_1 is currently awaiting_project.",
+      "jobId": "job_fixture_1",
+      "jobState": "awaiting_project"
+    },
+    {
+      "scenarioId": "duplicate-mutation-replay",
+      "kind": "text",
+      "responseText": "I created the fixed replay job once.",
+      "outboxText": "I created the fixed replay job once."
+    },
+    {
+      "scenarioId": "telegram-allow-once",
+      "kind": "interaction",
+      "rowState": "delivered",
+      "decision": "allow_once",
+      "grantedPermissions": null
+    },
+    {
+      "scenarioId": "restart-after-owner-tap",
+      "kind": "interaction",
+      "rowState": "delivered",
+      "decision": "allow_once",
+      "grantedPermissions": null
+    },
+    {
+      "scenarioId": "durable-deferred-monitor",
+      "kind": "deferred_monitor",
+      "responseContains": "get back to you",
+      "obligationPrefix": "monitor:"
+    }
+  ],
+  "recoveryPrompt": {
+    "scenarioId": "process-only-finalization",
+    "exactText": "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.",
+    "requiredMarkers": ["telegram_agent_turn_evidence", "telegram_agent_respond"]
+  }
+}
