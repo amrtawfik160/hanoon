@@ -483,9 +483,9 @@ it.each([
 });
 
 it.each([
-  ["exactly the decode cap", "Run curl %252527-Uproxyuser:hunter2%252527 now?"],
-  ["one layer past the cap", "Run curl %25252527-Uproxyuser:hunter2%25252527 now?"],
-  ["far past the cap", "Run curl %2525252527-Uproxyuser:hunter2%2525252527 now?"],
+  ["one layer below the decode cap", "Run curl %252527-Uproxyuser:hunter2%252527 now?"],
+  ["exactly the decode cap", "Run curl %25252527-Uproxyuser:hunter2%25252527 now?"],
+  ["one layer past the cap", "Run curl %2525252527-Uproxyuser:hunter2%2525252527 now?"],
 ] as const)("downgrades a question prompt encoded to %s", (_scenario, prompt) => {
   // Running out of decoding depth is not evidence of safety: what is left
   // unread could be anything, so exhaustion fails closed.

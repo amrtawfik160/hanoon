@@ -229,14 +229,43 @@ const SIMPLE_PAST: Record<TagSubject, readonly string[]> = {
 /** Assertions whose subject was dropped: "Ran the tests" means "I ran them". */
 const ELIDED_SPEAKER = /^\s*(?:ran|run)\b/;
 
+/** The verbs a success assertion uses when it has no auxiliary of its own. */
+const SIMPLE_PAST_VERB = /\b(?:passed|succeeded|completed|implemented|fixed|shipped|merged|deployed|deleted|removed|purged|installed|rotated|updated|created|issued|changed|spent|paid|purchased|ran|run)\b/;
+/** Auxiliaries that state their subject's number outright. */
+const PLURAL_AUXILIARY = /\b(?:are|were|have)\b/;
+const SINGULAR_AUXILIARY = /\b(?:is|was|has)\b/;
+
+/**
+ * Whether a bare noun reads as plural. Deliberately crude, and only ever asked
+ * of the head of the phrase rather than of whatever word came first.
+ */
+function isPluralNoun(head: string): boolean {
+  if (head === "data") return true;
+  return head.endsWith("s") && !head.endsWith("ss") && !head.endsWith("us");
+}
+
+/**
+ * The head of the subject noun phrase: the last word before the verb, not the
+ * first word of the sentence. "The API keys were rotated" is about the keys, and
+ * "The unit tests passed" about the tests — reading "API" or "unit" instead
+ * inverts the number and lets a singular tag confirm a plural assertion.
+ */
+function nominalHead(text: string): string {
+  const verb = SIMPLE_PAST_VERB.exec(text);
+  const before = verb ? text.slice(0, verb.index) : text;
+  return [...before.matchAll(/[a-z]+/g)].at(-1)?.[0] ?? "";
+}
+
 function tagSubject(text: string): TagSubject {
   const speaker = /^\s*(i|we)\b/.exec(text)?.[1];
   if (speaker === "i" || ELIDED_SPEAKER.test(text)) return "i";
   if (speaker === "we") return "we";
-  // A nominal subject is referred to by "it" or "they" depending on its number,
-  // which the head noun's own plural carries.
-  const head = /^\s*(?:the\s+)?([a-z]+)/.exec(text)?.[1] ?? "";
-  return head.endsWith("s") && !head.endsWith("ss") ? "they" : "it";
+  // A finite auxiliary agrees with its subject, so it states the number more
+  // reliably than the noun's spelling does; the head noun answers only when
+  // there is no auxiliary to ask, as in a simple past.
+  if (PLURAL_AUXILIARY.test(text)) return "they";
+  if (SINGULAR_AUXILIARY.test(text)) return "it";
+  return isPluralNoun(nominalHead(text)) ? "they" : "it";
 }
 
 function tagAuxiliaries(text: string): Record<TagSubject, readonly string[]> {
@@ -475,18 +504,94 @@ function hasProofIncompatibility(
   return candidateClaims.some((claim) => !evidenceSupportsClaim(claim, evidenceRows(claim, context)));
 }
 
+/** A piece of the original text and where it starts in it. */
+type SourceSpan = Readonly<{ text: string; start: number }>;
+
+/**
+ * Appends `text.slice(from, to)` trimmed, keeping the offset the trimmed text
+ * actually has in the original. Every span in this module is anchored this way,
+ * so a later search for the text is never needed to find it again — a search
+ * would return the first occurrence rather than this one, and would fail
+ * outright once the text had been normalised for matching.
+ */
+function pushSpan(spans: SourceSpan[], text: string, offset: number, from: number, to: number): void {
+  const raw = text.slice(from, to);
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return;
+  spans.push({ text: trimmed, start: offset + from + (raw.length - raw.trimStart().length) });
+}
+
+const SENTENCE_TERMINATOR = new Set([".", "!", "?"]);
+
+/**
+ * Sentence spans over the original text. A line break ends a sentence just as a
+ * full stop does, and is not part of either one.
+ */
+function sentenceSpans(text: string): SourceSpan[] {
+  const spans: SourceSpan[] = [];
+  let start = 0;
+  let index = 0;
+  while (index < text.length) {
+    const character = text[index]!;
+    if (SENTENCE_TERMINATOR.has(character)) {
+      pushSpan(spans, text, 0, start, index + 1);
+      index += 1;
+      start = index;
+      continue;
+    }
+    if (character === "\r" || character === "\n") {
+      pushSpan(spans, text, 0, start, index);
+      while (index < text.length && (text[index] === "\r" || text[index] === "\n")) index += 1;
+      start = index;
+      continue;
+    }
+    index += 1;
+  }
+  pushSpan(spans, text, 0, start, text.length);
+  return spans;
+}
+
+const CLAUSE_SEPARATOR = /\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/gi;
+
+/** Clause spans within one sentence span, still anchored to the original. */
+function clauseSpansOf(sentence: SourceSpan): SourceSpan[] {
+  const spans: SourceSpan[] = [];
+  const separator = new RegExp(CLAUSE_SEPARATOR.source, CLAUSE_SEPARATOR.flags);
+  let cursor = 0;
+  let match = separator.exec(sentence.text);
+  while (match !== null) {
+    if (match[0].length === 0) {
+      separator.lastIndex += 1;
+    } else {
+      pushSpan(spans, sentence.text, sentence.start, cursor, match.index);
+      cursor = match.index + match[0].length;
+    }
+    match = separator.exec(sentence.text);
+  }
+  pushSpan(spans, sentence.text, sentence.start, cursor, sentence.text.length);
+  return spans;
+}
+
+/** Every clause of the text, each anchored where it actually appears. */
+function clauseSpans(text: string): SourceSpan[] {
+  return sentenceSpans(text).flatMap(clauseSpansOf);
+}
+
+/**
+ * Normalisation for matching only, never before an offset is derived. It is
+ * one-for-one on characters, so a match found in the normalised form has the
+ * same offset in the original span.
+ */
+function normalizedForMatching(text: string): string {
+  return text.replace(/[’‘]/g, "'");
+}
+
 function normalizedSentences(text: string): string[] {
-  const normalized = text.replace(/[’‘]/g, "'").replace(/[\r\n]+/g, ". ");
-  return (normalized.match(/[^.!?]+[.!?]?/g) ?? [normalized])
-    .map((clause) => clause.trim())
-    .filter((clause) => clause.length > 0);
+  return sentenceSpans(text).map((span) => normalizedForMatching(span.text));
 }
 
 function textClauses(text: string): string[] {
-  return normalizedSentences(text)
-    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/i))
-    .map((clause) => clause.trim())
-    .filter((clause) => clause.length > 0);
+  return clauseSpans(text).map((span) => normalizedForMatching(span.text));
 }
 
 function isConcreteFollowUp(sentence: string): boolean {
@@ -557,8 +662,8 @@ function assertionIsSuppressed(clause: string, start: number, end: number): bool
   const last = overlapping.at(-1);
   if (last === undefined) return false;
   return tagConfirms(
-    normalizedApostrophes(clause.slice(start, end)),
-    normalizedApostrophes(siblings[last.index + 1]?.text ?? ""),
+    clause.slice(start, end),
+    siblings[last.index + 1]?.text ?? "",
   );
 }
 
@@ -604,19 +709,6 @@ function segmentSpans(candidate: ControllerFinalization): SegmentSpan[] {
   return spans;
 }
 
-/** Each clause of the rendered message, with where it sits in that message. */
-function clauseSpans(renderedMessage: string): { clause: string; start: number }[] {
-  const spans: { clause: string; start: number }[] = [];
-  let cursor = 0;
-  for (const clause of textClauses(renderedMessage)) {
-    const start = renderedMessage.indexOf(clause, cursor);
-    if (start < 0) continue;
-    spans.push({ clause, start });
-    cursor = start + clause.length;
-  }
-  return spans;
-}
-
 /**
  * True when a high-impact assertion the owner will read is not carried by a
  * claim entitled to make it.
@@ -635,7 +727,8 @@ function clauseSpans(renderedMessage: string): { clause: string; start: number }
  */
 function hasIncompatibleClaimText(candidate: ControllerFinalization, renderedMessage: string): boolean {
   const spans = segmentSpans(candidate);
-  for (const { clause, start } of clauseSpans(renderedMessage)) {
+  for (const { text: rawClause, start } of clauseSpans(renderedMessage)) {
+    const clause = normalizedForMatching(rawClause);
     for (const { assertion, start: matchStart, end: matchEnd } of highImpactMatchesIn(clause)) {
       const assertionStart = start + matchStart;
       const assertionEnd = start + matchEnd;

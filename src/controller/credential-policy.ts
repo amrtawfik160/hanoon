@@ -96,9 +96,10 @@ function decodedViews(text: string): { views: string[]; exhausted: boolean } {
     try {
       next = decodeURIComponent(current);
     } catch {
-      // Malformed encoding is not decoded further here. Callers that must fail
-      // closed on it — the approval command screen — do so themselves, so that
-      // ordinary prose containing a stray `%` is not condemned by this policy.
+      // Malformed encoding stops the unwrapping rather than being read as a
+      // reason on its own. It is not thereby accepted: the callback screen below
+      // already refuses a stray or malformed percent wherever it appears, so
+      // this branch decides only how far decoding goes, not the verdict.
       return { views, exhausted: false };
     }
     if (next === current) return { views, exhausted: false };

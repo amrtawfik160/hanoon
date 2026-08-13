@@ -1362,3 +1362,107 @@ describe("tag agreement across subjects and auxiliaries", () => {
     }
   });
 });
+
+describe("source-preserving clause offsets", () => {
+  const observed = () => contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
+
+  it.each([
+    ["a curly mismatched tag", "The tests passed, shouldn\u2019t I?"],
+    ["a curly mismatched subject", "The tests passed, didn\u2019t I?"],
+    ["a newline before more prose", "The tests passed\nAnything else"],
+    ["a carriage return before more prose", "The tests passed\r\nAnything else"],
+    ["a curly tag after a newline", "Work is done\nThe tests passed, shouldn\u2019t I?"],
+  ] as const)("screens %s on the incompatible-claim path", (_scenario, text) => {
+    // Normalization must never move the offsets used to locate a clause in the
+    // original, or the clause is silently skipped and nothing is screened.
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      observed(),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["a curly mismatched tag", "The tests passed, shouldn\u2019t I?"],
+    ["a newline before more prose", "The tests passed\nAnything else"],
+    ["a carriage return before more prose", "The tests passed\r\nAnything else"],
+  ] as const)("screens %s on the plain-text path", (_scenario, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it("keeps a curly agreeing tag accepted, exactly as its ASCII spelling is", () => {
+    for (const text of ["The tests passed, didn't they?", "The tests passed, didn\u2019t they?"]) {
+      expect(validateControllerFinalization(
+        claimFinalization({ kind: "observed_state", outcome: "observed", text }), observed(),
+      )).toMatchObject({ outcome: "accepted" });
+    }
+  });
+
+  it("screens each occurrence of a repeated clause against its own tag", () => {
+    // Recovering an offset by searching for the clause text would find the first
+    // occurrence twice and never reach the mismatched second one.
+    const observedContext = contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "observed_state", outcome: "observed",
+        text: "The tests passed, didn't they? The tests passed, didn't they?",
+      }), observedContext,
+    )).toMatchObject({ outcome: "accepted" });
+    expectRejection(
+      claimFinalization({
+        kind: "observed_state", outcome: "observed",
+        text: "The tests passed, didn't they? The tests passed, shouldn't I?",
+      }),
+      observedContext,
+      "proof_incompatible",
+    );
+  });
+
+  it("screens a repeated identical clause at each of its own positions", () => {
+    // Recovering an offset by searching for the clause text would find the first
+    // occurrence twice and never reach the second.
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [
+          { type: "claim", text: "The tests passed. The tests passed.", kind: "execution_result",
+            outcome: "succeeded", subjectRef: "job:job_1", evidenceRefs: ["evidence:1"] },
+          { type: "text", text: " The tests pa" },
+          { type: "claim", text: "ssed.", kind: "uncertainty", outcome: "uncertain",
+            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"] },
+        ],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+});
+
+describe("nominal number from agreement and head noun", () => {
+  const plain = (text: string) => validateControllerFinalization(
+    textFinalization(text), emptyFinalizationContext()).outcome;
+
+  it.each([
+    ["a multiword plural with past be", "The API keys were rotated", "weren't they?", "wasn't it?"],
+    ["a multiword plural with perfect", "The API keys have been rotated", "haven't they?", "hasn't it?"],
+    ["an irregular plural with past be", "The data were deleted", "weren't they?", "wasn't it?"],
+    ["a multiword plural in simple past", "The unit tests passed", "didn't they?", "didn't it?"],
+    ["a multiword singular with present be", "The release deployment is live", "isn't it?", "aren't they?"],
+    ["a multiword singular in simple past", "The unit test passed", "didn't it?", "didn't they?"],
+  ] as const)("reads %s", (_scenario, assertion, agreeing, mismatched) => {
+    expect([assertion, agreeing, plain(`${assertion}, ${agreeing}`)])
+      .toEqual([assertion, agreeing, "accepted"]);
+    expect([assertion, mismatched, plain(`${assertion}, ${mismatched}`)])
+      .toEqual([assertion, mismatched, "rejected"]);
+  });
+
+  it.each([
+    ["inverted order", "The API keys were rotated, were they not?", "accepted"],
+    ["inverted mismatched order", "The API keys were rotated, was it not?", "rejected"],
+    ["curly contracted", "The API keys were rotated, weren\u2019t they?", "accepted"],
+    ["curly contracted mismatch", "The API keys were rotated, wasn\u2019t it?", "rejected"],
+  ] as const)("reads a multiword plural with %s", (_scenario, text, expected) => {
+    expect([text, plain(text)]).toEqual([text, expected]);
+  });
+});
