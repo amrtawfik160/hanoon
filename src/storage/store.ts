@@ -98,6 +98,13 @@ import {
   type ControllerNativeEvidenceInput,
   type ControllerNativeEvidenceWrite,
 } from "./controller-evidence-repository";
+import {
+  ControllerInteractionRepository,
+  type ControllerInteraction,
+  type ControllerInteractionAnswer,
+  type ControllerInteractionDelivery,
+  type ControllerInteractionRecord,
+} from "./controller-interaction-repository";
 
 export { VersionConflictError, assertSafeExternalHttpsUrl };
 
@@ -1727,6 +1734,38 @@ export interface TelegramAgentStore {
     interactionId: string;
     questions: readonly ControllerQuestion[];
   }): boolean;
+  recordControllerInteraction(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    bbThreadId: string;
+    controllerGenerationId: string;
+    interaction: ControllerInteraction;
+  }): boolean;
+  markControllerInteractionResolved(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
+  }): boolean;
+  answerControllerInteractionByToken(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerInteractionAnswer;
+  answerControllerInteractionWithText(input: {
+    controllerKey: string;
+    userId: string;
+    chatId: string;
+    text: string;
+    now: number;
+  }): ControllerInteractionAnswer;
+  getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null;
+  getAnsweredControllerInteraction(controllerKey: string): ControllerInteractionDelivery | null;
+  markControllerInteractionDelivered(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
+  }): boolean;
   answerControllerQuestion(input: {
     token: string;
     userId: string;
@@ -2896,6 +2935,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly claimedUpdates = new Map<number, number>();
   private readonly autonomyRepository: AutonomyRepository;
   private readonly controllerEvidenceRepository: ControllerEvidenceRepository;
+  private readonly controllerInteractionRepository: ControllerInteractionRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -2904,6 +2944,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   ) {
     this.autonomyRepository = new AutonomyRepository(db);
     this.controllerEvidenceRepository = new ControllerEvidenceRepository(db);
+    this.controllerInteractionRepository = new ControllerInteractionRepository(db);
   }
 
   private currentNow(): number {
@@ -3631,6 +3672,59 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.reason, input.reason, input.now, input.turnId, input.reason);
       return updated.changes === 1;
     }).immediate();
+  }
+
+  public recordControllerInteraction(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    bbThreadId: string;
+    controllerGenerationId: string;
+    interaction: ControllerInteraction;
+  }): boolean {
+    return this.controllerInteractionRepository.record(input);
+  }
+
+  public markControllerInteractionResolved(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
+  }): boolean {
+    return this.controllerInteractionRepository.markResolved(input);
+  }
+
+  public answerControllerInteractionByToken(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerInteractionAnswer {
+    return this.controllerInteractionRepository.answerByToken(input);
+  }
+
+  public answerControllerInteractionWithText(input: {
+    controllerKey: string;
+    userId: string;
+    chatId: string;
+    text: string;
+    now: number;
+  }): ControllerInteractionAnswer {
+    return this.controllerInteractionRepository.answerWithText(input);
+  }
+
+  public getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null {
+    return this.controllerInteractionRepository.getPending(controllerKey);
+  }
+
+  public getAnsweredControllerInteraction(controllerKey: string): ControllerInteractionDelivery | null {
+    return this.controllerInteractionRepository.getAnswered(controllerKey);
+  }
+
+  public markControllerInteractionDelivered(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
+  }): boolean {
+    return this.controllerInteractionRepository.markDelivered(input);
   }
 
   /**

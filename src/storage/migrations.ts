@@ -799,6 +799,117 @@ CREATE INDEX controller_finalizations_turn
   ON controller_finalizations(turn_id, revision);
 `] as const;
 
+export const CONTROLLER_INTERACTION_MIGRATIONS = [String.raw`
+CREATE TABLE controller_interactions (
+  interaction_id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  bb_thread_id TEXT,
+  controller_generation_id TEXT REFERENCES controller_generations(id),
+  kind TEXT NOT NULL CHECK (kind IN ('user_question', 'approval', 'unsupported')),
+  payload_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answer_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  delivered_at INTEGER,
+  CHECK (state = 'delivered' OR
+    (bb_thread_id IS NOT NULL AND controller_generation_id IS NOT NULL))
+);
+CREATE INDEX controller_interactions_state
+  ON controller_interactions(controller_key, state, asked_at, interaction_id);
+
+CREATE TEMP TABLE controller_interaction_migration_guard (
+  invariant TEXT PRIMARY KEY,
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO controller_interaction_migration_guard (invariant, valid)
+SELECT 'legacy_active_source_identity', CASE WHEN NOT EXISTS (
+  SELECT 1
+    FROM controller_questions AS question
+    JOIN controller_turns AS turn ON turn.id = question.turn_id
+   WHERE question.state IN ('pending', 'answered')
+     AND (
+       turn.controller_key <> question.controller_key
+       OR
+       turn.state <> 'submitted'
+       OR (
+         SELECT COUNT(*)
+           FROM controller_threads AS current_thread
+          WHERE current_thread.controller_key = question.controller_key
+            AND current_thread.state = 'active'
+            AND current_thread.bb_thread_id IS NOT NULL
+       ) <> 1
+       OR (
+         SELECT COUNT(*)
+           FROM controller_generations AS open_generation
+          WHERE open_generation.controller_key = question.controller_key
+            AND open_generation.ended_at IS NULL
+       ) <> 1
+       OR NOT EXISTS (
+         SELECT 1
+           FROM controller_threads AS current_thread
+           JOIN controller_generations AS open_generation
+             ON open_generation.controller_key = current_thread.controller_key
+            AND open_generation.thread_id = current_thread.bb_thread_id
+            AND open_generation.ended_at IS NULL
+          WHERE current_thread.controller_key = question.controller_key
+            AND current_thread.state = 'active'
+            AND current_thread.bb_thread_id IS NOT NULL
+       )
+     )
+) THEN 1 ELSE 0 END;
+
+INSERT INTO controller_interactions (
+  interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
+  kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
+)
+SELECT
+  question.interaction_id,
+  question.turn_id,
+  question.controller_key,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE current_thread.bb_thread_id END,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE open_generation.id END,
+  'user_question',
+  json_object(
+    'kind', 'user_question',
+    'interactionId', question.interaction_id,
+    'questions', json(question.questions_json)
+  ),
+  question.state,
+  CASE WHEN question.state = 'pending' THEN NULL ELSE question.answers_json END,
+  question.asked_at,
+  question.answered_at,
+  CASE WHEN question.state = 'delivered' THEN COALESCE(question.answered_at, question.asked_at) ELSE NULL END
+FROM controller_questions AS question
+LEFT JOIN controller_threads AS current_thread
+  ON current_thread.controller_key = question.controller_key
+ AND current_thread.state = 'active'
+ AND current_thread.bb_thread_id IS NOT NULL
+LEFT JOIN controller_generations AS open_generation
+  ON open_generation.controller_key = question.controller_key
+ AND open_generation.thread_id = current_thread.bb_thread_id
+ AND open_generation.ended_at IS NULL;
+
+UPDATE controller_turns AS turn
+   SET awaiting_interaction_id = (
+     SELECT interaction.interaction_id
+       FROM controller_interactions AS interaction
+      WHERE interaction.turn_id = turn.id
+        AND interaction.state IN ('pending', 'answered')
+      ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC
+      LIMIT 1
+   )
+ WHERE EXISTS (
+   SELECT 1
+     FROM controller_interactions AS interaction
+    WHERE interaction.turn_id = turn.id
+      AND interaction.state IN ('pending', 'answered')
+ );
+
+DROP TABLE controller_interaction_migration_guard;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -829,4 +940,5 @@ export const ALL_MIGRATIONS = [
   ...TURN_ORIGIN_MIGRATIONS,
   ...PRODUCTION_HEALTH_MIGRATIONS,
   ...CONTROLLER_TRUST_MIGRATIONS,
+  ...CONTROLLER_INTERACTION_MIGRATIONS,
 ] as const;

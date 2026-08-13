@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { containsCredentialLikeText } from "../domain/state-machine";
 
 /** One selectable answer to a question the controller thread asked. */
 export type ControllerQuestionOption = {
@@ -24,6 +25,12 @@ export type ControllerPendingQuestion = {
   interactionId: string;
   questions: ControllerQuestion[];
 };
+
+export type ControllerApprovalDecision = "allow_once" | "deny";
+export type ControllerInteraction =
+  | { kind: "user_question"; interactionId: string; questions: ControllerQuestion[] }
+  | { kind: "approval"; interactionId: string; summary: string; decisions: ControllerApprovalDecision[] }
+  | { kind: "unsupported"; interactionId: string };
 
 export type ControllerQuestionAnswers = Record<string, { selected: string[]; freeText?: string }>;
 
@@ -86,6 +93,126 @@ export function parsePendingQuestion(interactionId: unknown, payload: unknown): 
   return { interactionId, questions };
 }
 
+const CONTROLLER_APPROVAL_DECISIONS: readonly ControllerApprovalDecision[] = ["allow_once", "deny"];
+const MAX_CONTROLLER_INTERACTION_ID = 256;
+const MAX_CONTROLLER_APPROVAL_SUMMARY = 400;
+const MAX_CONTROLLER_QUESTION_ID = 128;
+const MAX_CONTROLLER_OPTION_VALUE = 256;
+const PROTECTED_PATH_TEXT = "a protected path";
+const SENSITIVE_COMMAND_PATTERNS = [
+  /\bbearer\s+\S+/i,
+  /\b(?:api[_-]?key|password|secret|token|credential)\s*[:=]\s*\S+/i,
+  /\b(?:secret|token|password|credential)\b\s+(?:is\s+)?\S+/i,
+  /[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|APIKEY)[A-Z0-9_]*\s*[:=]\s*\S+/i,
+  /(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=[^\s]+/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,
+  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,})\b/,
+  /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/,
+  /\b(?:https?|wss?):\/\/[^\s/@]+:[^\s/@]+@/i,
+  /\b(?:callback|webhook)\b/i,
+  /\b(?:curl|wget|httpie)\b[^\n]*(?:https?|wss?):\/\//i,
+];
+
+function controllerCommandContainsSensitiveMaterial(command: string): boolean {
+  return containsCredentialLikeText(command) || SENSITIVE_COMMAND_PATTERNS.some((pattern) => pattern.test(command));
+}
+
+function safePathBasename(value: unknown): string {
+  if (typeof value !== "string") return PROTECTED_PATH_TEXT;
+  const normalized = value.replaceAll("\\", "/").trim();
+  const segments = normalized.split("/").filter((segment) => segment.length > 0);
+  const basename = segments.at(-1);
+  if (!basename || basename === "." || basename === ".." || segments.includes("..")) return PROTECTED_PATH_TEXT;
+  if (/^(?:\.env|.*(?:credentials?|secrets?|private[_-]?key|\.pem|\.key))$/i.test(basename)) {
+    return PROTECTED_PATH_TEXT;
+  }
+  if (!/^[A-Za-z0-9._-]{1,80}$/.test(basename)) return PROTECTED_PATH_TEXT;
+  return basename;
+}
+
+function boundedApprovalSummary(summary: string): string {
+  return summary.length <= MAX_CONTROLLER_APPROVAL_SUMMARY
+    ? summary
+    : `${summary.slice(0, MAX_CONTROLLER_APPROVAL_SUMMARY - 1)}…`;
+}
+
+function controllerApprovalSummary(subject: Record<string, unknown>): string | null {
+  if (subject.kind === "command") {
+    const rawCommand = typeof subject.command === "string" ? subject.command.trim() : "";
+    if (rawCommand.length === 0) return null;
+    const command = controllerCommandContainsSensitiveMaterial(rawCommand)
+      ? "a redacted command"
+      : boundedString(rawCommand, MAX_PROMPT);
+    if (!command) return null;
+    const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
+      ? safePathBasename(subject.cwd)
+      : null;
+    return boundedApprovalSummary(cwd
+      ? `wants to run:\n\n\`${command}\`\n\nin ${cwd}`
+      : `wants to run:\n\n\`${command}\``);
+  }
+  if (subject.kind === "file_change") {
+    const rawScope = subject.writeScope;
+    if (rawScope === null || rawScope === undefined || rawScope === "") return "wants to write files";
+    return boundedApprovalSummary(`wants to write files under ${safePathBasename(rawScope)}`);
+  }
+  return null;
+}
+
+function controllerApprovalDecisions(candidate: Record<string, unknown>): ControllerApprovalDecision[] | null {
+  const offered = Array.isArray(candidate.availableDecisions)
+    ? candidate.availableDecisions
+    : Array.isArray(candidate.decisions) ? candidate.decisions : null;
+  if (!offered) return null;
+  const decisions = CONTROLLER_APPROVAL_DECISIONS.filter((decision) => offered.includes(decision));
+  return decisions.length > 0 ? [...decisions] : null;
+}
+
+function parseControllerQuestionProjection(interactionId: string, payload: unknown): ControllerInteraction {
+  const question = parsePendingQuestion(interactionId, payload);
+  const bounded = question?.questions.every((item) =>
+    item.id.length <= MAX_CONTROLLER_QUESTION_ID &&
+    item.options.every((option) => option.value.length <= MAX_CONTROLLER_OPTION_VALUE),
+  );
+  return question && bounded
+    ? { kind: "user_question", interactionId, questions: question.questions }
+    : { kind: "unsupported", interactionId };
+}
+
+function parseControllerApprovalProjection(
+  interactionId: string,
+  candidate: Record<string, unknown>,
+): ControllerInteraction {
+  const subject = candidate.subject;
+  const summary = typeof subject === "object" && subject !== null
+    ? controllerApprovalSummary(subject as Record<string, unknown>)
+    : null;
+  const decisions = controllerApprovalDecisions(candidate);
+  return summary && decisions
+    ? { kind: "approval", interactionId, summary, decisions }
+    : { kind: "unsupported", interactionId };
+}
+
+/**
+ * Parses the exact BB interaction payload into the smaller projection that is
+ * safe to persist and present outside BB.
+ */
+export function parseControllerInteraction(
+  interactionId: unknown,
+  payload: unknown,
+): ControllerInteraction | null {
+  if (
+    typeof interactionId !== "string" ||
+    interactionId.length === 0 ||
+    interactionId.length > MAX_CONTROLLER_INTERACTION_ID
+  ) return null;
+  if (typeof payload !== "object" || payload === null) return { kind: "unsupported", interactionId };
+  const candidate = payload as Record<string, unknown>;
+  if (candidate.kind === "user_question") return parseControllerQuestionProjection(interactionId, payload);
+  if (candidate.kind !== "approval") return { kind: "unsupported", interactionId };
+  return parseControllerApprovalProjection(interactionId, candidate);
+}
+
 /**
  * Telegram callback data is capped at 64 bytes, and BB option values alone run
  * past that, so buttons carry a digest of the option they stand for and the
@@ -98,6 +225,14 @@ export function questionOptionToken(
 ): string {
   return createHash("sha256")
     .update(`controller-question:${interactionId}:${questionId}:${optionValue}`, "utf8")
+    .digest("base64url")
+    .slice(0, 32);
+}
+
+/** A callback-sized token derived from one exact generic controller choice. */
+export function controllerInteractionToken(interactionId: string, ...choice: string[]): string {
+  return createHash("sha256")
+    .update(`controller-interaction:${interactionId}:${choice.join(":")}`, "utf8")
     .digest("base64url")
     .slice(0, 32);
 }
