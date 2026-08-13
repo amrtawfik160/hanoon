@@ -278,7 +278,15 @@ describe("unsafe candidate redaction", () => {
 
   it.each([
     ["raw callback", `m:${"a".repeat(32)}`],
+    ["operation callback", `o:${"b".repeat(32)}`],
+    ["question callback", `q:${"c".repeat(32)}`],
+    ["controller interaction callback", `i:${"d".repeat(32)}`],
+    ["thread interaction callback", `w:${"e".repeat(32)}`],
     ["encoded callback", `m%3A${"b".repeat(32)}`],
+    ["encoded operation callback", `o%3A${"c".repeat(32)}`],
+    ["encoded question callback", `q%3A${"d".repeat(32)}`],
+    ["encoded controller interaction callback", `i%3A${"e".repeat(32)}`],
+    ["encoded thread interaction callback", `w%3A${"f".repeat(32)}`],
     ["repeatedly encoded callback", `m%25253A${"c".repeat(32)}`],
   ])("rejects and erases %s material", (_label, unsafeToken) => {
     const unsafeText = `Internal material: ${unsafeToken}`;
@@ -380,6 +388,63 @@ describe("unsafe candidate redaction", () => {
     });
     expect(serialized).not.toContain(assembledUnsafeText);
     for (const segment of segments) expect(serialized).not.toContain(segment.text);
+  });
+
+  it.each([
+    ["base64 credential assignment", Buffer.from("api_key=TOP_SECRET_VALUE_12345", "utf8").toString("base64"), "api_key=TOP_SECRET_VALUE_12345"],
+    ["base64url credential assignment", Buffer.from("api_key=TOP_SECRET_VALUE_12345", "utf8").toString("base64url"), "api_key=TOP_SECRET_VALUE_12345"],
+    ["base64 bearer credential", Buffer.from(`Bearer ghp_${"G".repeat(28)}`, "utf8").toString("base64"), `Bearer ghp_${"G".repeat(28)}`],
+  ])("rejects and erases bounded %s", (_label, encoded, decoded) => {
+    const validation = validateControllerFinalization(
+      textFinalization(`Encoded provider output: ${encoded}`),
+      emptyFinalizationContext(),
+    );
+    const serialized = JSON.stringify(validation);
+
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(serialized).not.toContain(encoded);
+    expect(serialized).not.toContain(decoded);
+  });
+
+  it("rejects base64 credential material split across rendered segments", () => {
+    const decoded = "api_key=TOP_SECRET_VALUE_12345";
+    const encoded = Buffer.from(decoded, "utf8").toString("base64url");
+    const midpoint = Math.floor(encoded.length / 2);
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "Encoded provider output: " + encoded.slice(0, midpoint) },
+        claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: encoded.slice(midpoint) }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+
+    const validation = validateControllerFinalization(candidate, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state"),
+    ));
+    const serialized = JSON.stringify(validation);
+
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(serialized).not.toContain(encoded);
+    expect(serialized).not.toContain(decoded);
+  });
+
+  it("uses the fixed projection when base64 credential material is in a non-text field", () => {
+    const decoded = "api_key=TOP_SECRET_VALUE_12345";
+    const encoded = Buffer.from(decoded, "utf8").toString("base64url");
+    const candidate = claimFinalization({
+      subjectRef: encoded,
+    });
+
+    const validation = validateControllerFinalization(candidate, emptyFinalizationContext());
+
+    expect(validation).toMatchObject({
+      outcome: "rejected",
+      code: "invalid_contract",
+      storedCandidate: textFinalization("[redacted]"),
+    });
+    expect(JSON.stringify(validation)).not.toContain(encoded);
+    expect(JSON.stringify(validation)).not.toContain(decoded);
   });
 });
 
@@ -691,6 +756,99 @@ describe("claim outcome compatibility", () => {
   });
 });
 
+describe("fail-closed operational claim binding", () => {
+  it.each([
+    ["generic completion", "Everything is done."],
+    ["build success", "The build succeeded."],
+    ["CI success", "CI is green."],
+    ["rollout success", "The rollout succeeded."],
+    ["finished work", "The work is finished."],
+  ] as const)("rejects %s when declared as an observed state without its outcome", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["generic completion", "Everything is done.", "observed_state", "project_state"],
+    ["build success", "The build succeeded.", "execution_result", "command_result"],
+    ["CI success", "CI is green.", "pipeline_outcome", "pipeline_outcome"],
+    ["rollout success", "The rollout succeeded.", "pipeline_outcome", "pipeline_outcome"],
+    ["finished work", "The work is finished.", "observed_state", "project_state"],
+  ] as const)("accepts %s when its claim kind and evidence carry the assertion", (_label, text, kind, proofKind) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Everything is done.",
+    "The build succeeded.",
+    "CI is green.",
+    "The rollout succeeded.",
+    "The work is finished.",
+  ])("rejects an unclaimed operational paraphrase: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Working on it now.",
+    "I'm working on it now.",
+    "The work is in progress.",
+  ])("rejects process-only wording even when carried by a claim: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "uncertainty", outcome: "uncertain", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      "process_only",
+    );
+  });
+
+  it("rejects an operational assertion split across a text and claim boundary", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "The build suc" },
+        claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: "ceeded." }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+
+    expectRejection(
+      candidate,
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      "proof_incompatible",
+    );
+  });
+
+  it("rejects process-only wording split across a text and claim boundary", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "Working on" },
+        claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: " it now." }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+
+    expectRejection(
+      candidate,
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      "process_only",
+    );
+  });
+
+  it("does not let a compatible kind hide an incompatible operational paraphrase", () => {
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text: "The rollout succeeded." }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+});
+
 describe("bounded text heuristics", () => {
   it.each([
     "I'll check this.",
@@ -848,7 +1006,7 @@ describe("bounded text heuristics", () => {
     expectRejection(candidate, emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
 
-  it("stops plain-text assertion concatenation at claim boundaries", () => {
+  it("rejects an operational assertion concatenated across a claim boundary", () => {
     const candidate: ControllerFinalization = {
       disposition: "answered",
       segments: [
@@ -857,9 +1015,9 @@ describe("bounded text heuristics", () => {
       ],
       obligationRefs: [],
     };
-    expect(validateControllerFinalization(candidate, contextWithEvidence(
+    expectRejection(candidate, contextWithEvidence(
       evidenceRow("evidence:1", "project_state"),
-    ))).toMatchObject({ outcome: "accepted" });
+    ), "proof_incompatible");
   });
 
   it("allows a high-impact assertion when it is carried by a compatible claim segment", () => {

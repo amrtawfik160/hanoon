@@ -150,11 +150,12 @@ export function controllerFinalizationCorrection(code: FinalizationRejectionCode
 }
 
 const PROCESS_OBJECT_WORD = "(?!(?:and|then|if)\\b)[a-z0-9_'/:-]+";
-const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigat(?:e|ing)|work\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
+const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigat(?:e|ing)|work(?:ing)?\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
 const PROCESS_CLAUSE = new RegExp(
   `^(?:(?:i(?:'ll| will| am|'m)|let me)\\s+)?${PROCESS_ACTION}[.!]?$`,
   "i",
 );
+const PROCESS_STATUS_CLAUSE = /^(?:the\s+)?(?:work|task|job|operation)\s+(?:is|remains?)\s+(?:in\s+progress|underway|ongoing)[.!]?$/i;
 const FOLLOW_UP_OBJECT_WORD = "[a-z0-9_'/:-]+";
 const CONCRETE_FOLLOW_UP = new RegExp(
   `\\b(?:get\\s+back\\s+to\\s+you|follow\\s+up)\\s+(?:with|when|after|once)\\s+${FOLLOW_UP_OBJECT_WORD}(?:\\s+${FOLLOW_UP_OBJECT_WORD}){0,11}\\b`,
@@ -175,31 +176,140 @@ const NON_SUCCESS_CLAUSE = [
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
   /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
 ];
-const HIGH_IMPACT_SUCCESS = [
-  /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
-  /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
-  /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
-  /\b(?:all\s+)?tests?(?:\s+suite)?\s+(?:pass|passed|succeed|succeeded|complete|completed)\b/i,
-  /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
-  /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i,
-  /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i,
-  /\b(?:the\s+)?(?:branch|pull request|change)\s+(?:is|was|has been|had been)\s+merged\b/i,
-  /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
-  /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:deleted|removed|purged)\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+installed\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${CREDENTIAL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:rotated|updated|created|issued|changed)\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"),
-  new RegExp(`\\b${MONEY_AMOUNT}\\s+${PASSIVE_AUXILIARY}\\s+(?:spent|paid)\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
-  /\b(?:the\s+)?(?:deployment|release)\s+(?:succeeded|passed|completed|finished)\b/i,
-  /\b(?:the\s+)?(?:thread|job)(?:\s+[a-z][a-z0-9_-]*){0,3}\s+(?:succeeded|completed|finished|passed)\b/i,
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:started|stopped|restarted|retried|cancelled|canceled|resumed|paused|queued|created|deleted|removed)\\s+(?:the\\s+)?(?:thread|job)\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:sent|posted|delivered)\\s+(?:a\\s+)?(?:message|request|instruction)\\s+to\\s+(?:the\\s+)?(?:thread|job)\\b`, "i"),
-  /\b(?:the\s+)?(?:thread|job)\s+(?:is|was|has been|had been)\s+(?:started|stopped|restarted|retried|cancelled|canceled|resumed|paused|queued|created|deleted|removed)\b/i,
+type OperationalAssertion = Readonly<{
+  pattern: RegExp;
+  kinds: readonly ControllerClaimKind[];
+}>;
+
+const OPERATIONAL_SUCCESS_STATE = "(?:done|complete|completed|finished|successful|succeeded|passed|green|live|healthy|verified|ready|all\\s+set)";
+const OPERATIONAL_STATE_LINK = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)?";
+const GENERIC_COMPLETION_SUBJECT = "(?:everything|all(?:\\s+(?:the\\s+)?(?:work|tasks?|items?))?|the\\s+(?:work|task|job|operation))";
+
+/**
+ * The same bounded assertion table drives both sides of the contract: a
+ * sentence is blocked when it is plain text, and a claim must use a kind and
+ * successful evidence that are entitled to carry the matched wording. The
+ * patterns describe operational grammar rather than whole-message whitelist
+ * strings, so ordinary prose remains expressive while paraphrased success
+ * wording is still attached to typed evidence.
+ */
+const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
+  {
+    pattern: /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
+    kinds: ["workspace_change"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
+    kinds: ["workspace_change"],
+  },
+  {
+    pattern: /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
+    kinds: ["execution_result"],
+  },
+  {
+    pattern: /\b(?:all\s+)?tests?(?:\s+suite)?\s+(?:pass|passed|succeed|succeeded|complete|completed)\b/i,
+    kinds: ["execution_result"],
+  },
+  {
+    pattern: /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:branch|pull request|change)\s+(?:is|was|has been|had been)\s+merged\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}" + DOMAIN_OBJECT + "\\b", "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:the\\s+)?" + DOMAIN_OBJECT + "\\s+" + PASSIVE_AUXILIARY + "\\s+(?:deleted|removed|purged)\\b", "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}" + INSTALL_OBJECT + "\\b", "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:the\\s+)?" + INSTALL_OBJECT + "\\s+" + PASSIVE_AUXILIARY + "\\s+installed\\b", "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?" + CREDENTIAL_OBJECT + "\\b", "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:the\\s+)?" + CREDENTIAL_OBJECT + "\\s+" + PASSIVE_AUXILIARY + "\\s+(?:rotated|updated|created|issued|changed)\\b", "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+" + MONEY_AMOUNT + "\\b", "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b" + MONEY_AMOUNT + "\\s+" + PASSIVE_AUXILIARY + "\\s+(?:spent|paid)\\b", "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}" + PURCHASE_OBJECT + "\\b", "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:deployment|release)\s+(?:succeeded|passed|completed|finished)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:thread|job)(?:\s+[a-z][a-z0-9_-]*){0,3}\s+(?:succeeded|completed|finished|passed)\b/i,
+    kinds: ["observed_state"],
+  },
+  {
+    pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?(?:started|stopped|restarted|retried|cancelled|canceled|resumed|paused|queued|created|deleted|removed)\\s+(?:the\\s+)?(?:thread|job)\\b", "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?(?:sent|posted|delivered)\\s+(?:a\\s+)?(?:message|request|instruction)\\s+to\\s+(?:the\\s+)?(?:thread|job)\\b", "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:thread|job)\s+(?:is|was|has been|had been)\s+(?:started|stopped|restarted|retried|cancelled|canceled|resumed|paused|queued|created|deleted|removed)\b/i,
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp("\\b" + GENERIC_COMPLETION_SUBJECT + "\\s+" + OPERATIONAL_STATE_LINK + "\\s*" + OPERATIONAL_SUCCESS_STATE + "\\b", "i"),
+    kinds: ["observed_state"],
+  },
+  {
+    pattern: new RegExp("\\b(?:the\\s+)?(?:build|compile|compilation|artifact)\\s+" + OPERATIONAL_STATE_LINK + "\\s*" + OPERATIONAL_SUCCESS_STATE + "\\b", "i"),
+    kinds: ["execution_result"],
+  },
+  {
+    pattern: new RegExp("\\b(?:ci|continuous integration|pipeline)\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished)\\b", "i"),
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: new RegExp("\\b(?:the\\s+)?checks?\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished)\\b", "i"),
+    kinds: ["execution_result", "pipeline_outcome"],
+  },
+  {
+    pattern: new RegExp("\\b(?:the\\s+)?(?:rollout|release|deployment)\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished|live|healthy|verified)\\b", "i"),
+    kinds: ["pipeline_outcome"],
+  },
 ];
 
 export function renderControllerFinalization(candidate: ControllerFinalization): string {
@@ -330,6 +440,75 @@ function textClauses(text: string): string[] {
     .filter((clause) => clause.length > 0);
 }
 
+type OperationalMatch = Readonly<{
+  assertion: OperationalAssertion;
+  start: number;
+  end: number;
+}>;
+
+function operationalMatchesIn(clause: string): OperationalMatch[] {
+  if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) return [];
+  const matches: OperationalMatch[] = [];
+  for (const assertion of OPERATIONAL_ASSERTIONS) {
+    const flags = assertion.pattern.flags.includes("g") ? assertion.pattern.flags : `${assertion.pattern.flags}g`;
+    const scanner = new RegExp(assertion.pattern.source, flags);
+    let match = scanner.exec(clause);
+    while (match !== null) {
+      if (match[0].length === 0) {
+        scanner.lastIndex += 1;
+      } else {
+        matches.push({ assertion, start: match.index, end: match.index + match[0].length });
+      }
+      match = scanner.exec(clause);
+    }
+  }
+  return matches;
+}
+
+type SourceTextSpan = Readonly<{ text: string; start: number }>;
+
+function trimmedSourceSpan(text: string, start: number, end: number, offset: number): SourceTextSpan | null {
+  const raw = text.slice(start, end);
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  return {
+    text: trimmed,
+    start: offset + start + (raw.length - raw.trimStart().length),
+  };
+}
+
+function sentenceSourceSpans(text: string): SourceTextSpan[] {
+  const sentences: SourceTextSpan[] = [];
+  const sentencePattern = /[^.!?\r\n]+[.!?]?/g;
+  let sentenceMatch = sentencePattern.exec(text);
+  while (sentenceMatch !== null) {
+    const span = trimmedSourceSpan(text, sentenceMatch.index, sentenceMatch.index + sentenceMatch[0].length, 0);
+    if (span) sentences.push(span);
+    sentenceMatch = sentencePattern.exec(text);
+  }
+  return sentences;
+}
+
+function splitOperationalSentence(sentence: SourceTextSpan): SourceTextSpan[] {
+  const clauses: SourceTextSpan[] = [];
+  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/gi;
+  let cursor = 0;
+  let separator = clauseSeparator.exec(sentence.text);
+  while (separator !== null) {
+    const span = trimmedSourceSpan(sentence.text, cursor, separator.index, sentence.start);
+    if (span) clauses.push(span);
+    cursor = separator.index + separator[0].length;
+    separator = clauseSeparator.exec(sentence.text);
+  }
+  const span = trimmedSourceSpan(sentence.text, cursor, sentence.text.length, sentence.start);
+  if (span) clauses.push(span);
+  return clauses;
+}
+
+function operationalClauseSpans(text: string): SourceTextSpan[] {
+  return sentenceSourceSpans(text).flatMap(splitOperationalSentence);
+}
+
 function isConcreteFollowUp(sentence: string): boolean {
   return CONTROLLER_COMMITMENT.test(sentence)
     && !NON_AFFIRMATIVE_FOLLOW_UP.test(sentence)
@@ -339,12 +518,51 @@ function isConcreteFollowUp(sentence: string): boolean {
 function isProcessOnly(candidate: ControllerFinalization, renderedMessage: string): boolean {
   const clauses = textClauses(renderedMessage);
   if (candidate.disposition === "deferred") return !normalizedSentences(renderedMessage).some(isConcreteFollowUp);
-  return clauses.length > 0 && clauses.every((clause) => PROCESS_CLAUSE.test(clause));
+  return clauses.length > 0 && clauses.every((clause) => PROCESS_CLAUSE.test(clause) || PROCESS_STATUS_CLAUSE.test(clause));
 }
 
 function clauseHasHighImpactSuccess(clause: string): boolean {
-  if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) return false;
-  return HIGH_IMPACT_SUCCESS.some((pattern) => pattern.test(clause));
+  return operationalMatchesIn(clause).length > 0;
+}
+
+type FinalizationSegmentSpan = Readonly<{
+  start: number;
+  end: number;
+  segment: ControllerFinalization["segments"][number];
+}>;
+
+function finalizationSegmentSpans(candidate: ControllerFinalization): FinalizationSegmentSpan[] {
+  const spans: FinalizationSegmentSpan[] = [];
+  let offset = 0;
+  for (const segment of candidate.segments) {
+    spans.push({ start: offset, end: offset + segment.text.length, segment });
+    offset += segment.text.length;
+  }
+  return spans;
+}
+
+/**
+ * The owner reads the rendered concatenation, so an operational assertion must
+ * be located there rather than screened independently per segment. A match that
+ * crosses a text/claim boundary cannot be attributed to one typed claim and is
+ * rejected closed; a complete match in plain text is left to the unclaimed-text
+ * branch below.
+ */
+function hasIncompatibleClaimText(candidate: ControllerFinalization, renderedMessage: string): boolean {
+  const segmentSpans = finalizationSegmentSpans(candidate);
+  for (const sourceSpan of operationalClauseSpans(renderedMessage)) {
+    const clause = sourceSpan.text.replace(/[’‘]/g, "'");
+    for (const match of operationalMatchesIn(clause)) {
+      const assertionStart = sourceSpan.start + match.start;
+      const assertionEnd = sourceSpan.start + match.end;
+      const touched = segmentSpans.filter((span) => span.start < assertionEnd && span.end > assertionStart);
+      if (touched.length === 0 || touched.every((span) => span.segment.type === "text")) continue;
+      const onlySegment = touched.length === 1 ? touched[0]!.segment : null;
+      if (!onlySegment || onlySegment.type !== "claim") return true;
+      if (!match.assertion.kinds.includes(onlySegment.kind) || onlySegment.outcome !== "succeeded") return true;
+    }
+  }
+  return false;
 }
 
 function plainTextRuns(candidate: ControllerFinalization): string[] {
@@ -386,13 +604,16 @@ function contextRejectionCode(
 }
 
 function claimRejectionCode(
-  candidateClaims: readonly ControllerClaim[],
+  candidate: ControllerFinalization,
+  renderedMessage: string,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
+  const candidateClaims = claims(candidate);
   if (hasDuplicateEvidenceReference(candidateClaims)) return "duplicate_evidence_reference";
   if (hasMissingEvidence(candidateClaims, context)) return "evidence_missing";
   if (hasSubjectMismatch(candidateClaims, context)) return "subject_mismatch";
   if (hasProofIncompatibility(candidateClaims, context)) return "proof_incompatible";
+  if (hasIncompatibleClaimText(candidate, renderedMessage)) return "proof_incompatible";
   return null;
 }
 
@@ -414,7 +635,7 @@ function semanticRejectionCode(
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
   return contextRejectionCode(context)
-    ?? claimRejectionCode(claims(candidate), context)
+    ?? claimRejectionCode(candidate, renderedMessage, context)
     ?? dispositionRejectionCode(candidate, context)
     ?? (isProcessOnly(candidate, renderedMessage) ? "process_only" : null)
     ?? (hasUnclaimedHighImpactText(candidate) ? "high_impact_text_unclaimed" : null);

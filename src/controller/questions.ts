@@ -41,6 +41,8 @@ const MAX_DESCRIPTION = 200;
 const MAX_CONTROLLER_TEXT = 4_000;
 const MAX_CANONICAL_SCAN = 16_384;
 const MAX_PERCENT_DECODE_LAYERS = 3;
+const MIN_BASE64_TOKEN_LENGTH = 16;
+const MAX_BASE64_TOKEN_LENGTH = 4_096;
 
 const CREDENTIAL_QUERY_KEY = [
   "access[_-]?token",
@@ -64,7 +66,7 @@ const CREDENTIAL_QUERY_KEY = [
 ].join("|");
 
 const SENSITIVE_CONTROLLER_TEXT_PATTERNS = [
-  /m:[A-Za-z0-9_-]{32}/u,
+  /(?:m|o|q|i|w):[A-Za-z0-9_-]{32}/u,
   /\bbearer\s+\S+/iu,
   new RegExp(`\\b(?:${CREDENTIAL_QUERY_KEY}|credential)\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|\\S+)`, "iu"),
   /\b(?:access|refresh|id)\s+token|\bclient\s+secret|\bapi\s+key|\bauth(?:orization)?\s+(?:token|key)|\bsession\s+token|\bprivate\s+key/iu,
@@ -136,6 +138,39 @@ function canonicalForms(value: string): string[] | null {
   return current.includes("%") ? null : [...new Set(forms)];
 }
 
+const BASE64_TOKEN = /(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{16,}={0,2})(?![A-Za-z0-9+/_-])/gu;
+
+function decodeBoundedBase64Token(token: string): string | null {
+  if (token.length < MIN_BASE64_TOKEN_LENGTH || token.length > MAX_BASE64_TOKEN_LENGTH) return null;
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/u.test(token)) return null;
+
+  const padding = token.match(/=+$/u)?.[0].length ?? 0;
+  const body = padding > 0 ? token.slice(0, -padding) : token;
+  if (body.length % 4 === 1) return null;
+  const usesUrlAlphabet = /[-_]/u.test(body);
+  const usesStandardAlphabet = /[+/]/u.test(body);
+  if (usesUrlAlphabet && usesStandardAlphabet) return null;
+
+  const standardBody = usesUrlAlphabet ? body.replace(/-/gu, "+").replace(/_/gu, "/") : body;
+  const normalized = `${standardBody}${"=".repeat((4 - (standardBody.length % 4)) % 4)}`;
+  const bytes = Buffer.from(normalized, "base64");
+  if (bytes.length === 0) return null;
+  if (bytes.toString("base64").replace(/=+$/u, "") !== standardBody) return null;
+  return bytes.toString("utf8");
+}
+
+function containsEncodedSensitiveText(value: string): boolean {
+  BASE64_TOKEN.lastIndex = 0;
+  let match = BASE64_TOKEN.exec(value);
+  while (match !== null) {
+    const decoded = decodeBoundedBase64Token(match[1]);
+    if (decoded && SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(decoded))) return true;
+    match = BASE64_TOKEN.exec(value);
+  }
+  BASE64_TOKEN.lastIndex = 0;
+  return false;
+}
+
 function hasProtectedBasename(value: string): boolean {
   const basename = value.replaceAll("\\", "/").split("/").filter(Boolean).at(-1);
   if (!basename) return true;
@@ -157,6 +192,9 @@ export function canonicalControllerText(
   if (!forms) return null;
   if (mode === "path" && forms.some(hasProtectedBasename)) return null;
   if (forms.some((form) => SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form)))) {
+    return null;
+  }
+  if (forms.some(containsEncodedSensitiveText)) {
     return null;
   }
   const canonical = forms.at(-1);
