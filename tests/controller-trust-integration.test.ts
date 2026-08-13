@@ -4,23 +4,29 @@ import { createHash } from "node:crypto";
 import { afterAll, expect, it, vi } from "vitest";
 import plugin from "../server";
 import { controllerSpawnTitle } from "../src/controller/bb-controller";
-import {
-  CONTROLLER_INSTRUCTIONS,
-  CONTROLLER_INSTRUCTION_SENTINEL,
-} from "../src/controller/instructions";
-import { controllerInteractionToken } from "../src/controller/questions";
 import type { TelegramUpdate } from "../src/telegram/types";
 import { openStore, type StoredOutbox } from "../src/storage/store";
 import { policyFixture } from "./helpers";
 import { submittedControllerFixture } from "./support/controller-trust-fixtures";
 
 const NOW = 2_000;
-const LEASE_MS = 30_000;
 const RECOVERY_PROMPT = "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";
 const RAW_PROVIDER_SENTINEL = "RAW PROVIDER PROSE MUST NOT SHIP";
 const NATURAL_RESPONSE = "The enabled project is available.";
 const DENIAL_RESPONSE = "The requested command was denied.";
 const OWNER_OVERLAY = "Prefer concise summaries.";
+const REQUIRED_CONTROLLER_INSTRUCTION_SENTINEL = "telegram-agent:controller-instructions:v1";
+const REQUIRED_CONTROLLER_SAFETY_CLAUSES = [
+  "BB-native approvals supported by the Telegram bridge arrive in Telegram as one-use Allow once/Deny.",
+  "Never approve for the owner or bypass BB or machine limits.",
+  "An explicit owner decision is required before connector installation, credential mutation or rotation, spending, destructive external action, or irreversible external write.",
+  "Never claim implementation, tests, review, validation, merge, deployment, or production succeeded without same-turn durable evidence.",
+] as const;
+const APPROVAL_INTERACTION_ID = "permission-command-1";
+const CROSS_INTERACTION_ID = "permission-command-other";
+const EXPECTED_ALLOW_CALLBACK_TOKEN = "j-DHFpFkoo28dsuXbR77FduVIx1Kzj6G";
+const EXPECTED_DENY_CALLBACK_TOKEN = "tEzmE4MpKu8qkZs3Rx5MpaFxuvVQzOqM";
+const EXPECTED_CROSS_DENY_CALLBACK_TOKEN = "aFrH5D9oQr3X24DchDtE993YklWN34eG";
 
 // These are independent expected values. They are intentionally not imported
 // from the controller execution profile or tool manifest under test.
@@ -40,6 +46,26 @@ function assertIndependentArtifactHashes(): void {
   )).toBe(EXPECTED_LIST_PROJECTS_RESULT_SHA256);
   expect(directSha256("{\"command\":\"npm test\",\"cwd\":\"/workspace\",\"type\":\"commandExecution\"}")).toBe(EXPECTED_COMMAND_ARGS_SHA256);
   expect(directSha256("{\"approvalStatus\":\"denied\",\"exitCode\":1,\"status\":\"failed\"}")).toBe(EXPECTED_COMMAND_RESULT_SHA256);
+}
+
+function independentControllerInteractionToken(interactionId: string, decision: string): string {
+  return createHash("sha256")
+    .update(`controller-interaction:${interactionId}:${decision}`, "utf8")
+    .digest("base64url")
+    .slice(0, 32);
+}
+
+function assertIndependentCallbackTokens(): void {
+  expect(independentControllerInteractionToken(APPROVAL_INTERACTION_ID, "allow_once"))
+    .toBe(EXPECTED_ALLOW_CALLBACK_TOKEN);
+  expect(independentControllerInteractionToken(APPROVAL_INTERACTION_ID, "deny"))
+    .toBe(EXPECTED_DENY_CALLBACK_TOKEN);
+  expect(independentControllerInteractionToken(CROSS_INTERACTION_ID, "deny"))
+    .toBe(EXPECTED_CROSS_DENY_CALLBACK_TOKEN);
+}
+
+function countOccurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
 }
 
 // The real plugin uses Date.now() for capability fences while the fixture and
@@ -81,6 +107,10 @@ type ProductionFixture = Readonly<{
   bb: BbPluginApi;
   harness: ControllerTrustFixture["harness"];
 }>;
+type ServiceRun = Readonly<{
+  controller: AbortController;
+  done: Promise<void>;
+}>;
 type EventRow = Record<string, unknown> & {
   threadId: string;
   seq: number;
@@ -89,6 +119,11 @@ type EventRow = Record<string, unknown> & {
 };
 type OrderEntry =
   | "callback-persistence"
+  | "callback-nudge-wake"
+  | "executor-wait-barrier"
+  | "restarted-wait-barrier"
+  | "effective-setting-change"
+  | "nudge-wake"
   | "reopen"
   | "provider-get"
   | "provider-resolve"
@@ -112,6 +147,11 @@ type FakeControllerSdkState = {
   callbackReceived: boolean;
   preReopenGetBlocked: boolean;
   preReopenGetAborted: boolean;
+  restartGate: boolean;
+  restartedWaitBarrierReached: boolean;
+  effectiveSettingChanged: boolean;
+  continuationSendCount: number;
+  initialInteractionReadCount: number;
   providerGetCount: number;
   providerResolveCount: number;
   providerId: string;
@@ -265,7 +305,9 @@ function stubControllerSdk(
       .slice(0, Number(input.limit ?? "100"));
   });
   harness.sdk.stub("threads.send", async (input: Record<string, unknown>) => {
+    state.continuationSendCount += 1;
     if (!state.afterReopen) throw new Error("continuation was sent before the restart proof");
+    expect(state.effectiveSettingChanged).toBe(true);
     expect(input).toEqual(expectedContinuationRequest(state.threadId));
     expect(input).not.toHaveProperty("providerId");
     expect(input).not.toHaveProperty("serviceTier");
@@ -294,7 +336,15 @@ function stubControllerSdk(
     // return the fixture interaction regardless of what production requested.
     expect(input.threadId).toBe(state.threadId);
     expect(input.interactionId).toBe(interactionId);
+    if (!state.callbackReceived) state.initialInteractionReadCount += 1;
+    if (state.restartGate && !state.effectiveSettingChanged) {
+      state.restartedWaitBarrierReached = true;
+      state.orderLedger.push("restarted-wait-barrier");
+      throw new Error("restart wait barrier: await effective setting nudge");
+    }
     if (state.callbackReceived && !state.afterReopen) {
+      state.orderLedger.push("callback-nudge-wake");
+      state.orderLedger.push("executor-wait-barrier");
       state.preReopenGetBlocked = true;
       return new Promise<Record<string, unknown>>((resolve) => {
         const release = (): void => {
@@ -307,6 +357,9 @@ function stubControllerSdk(
     }
     if (state.afterReopen) {
       state.providerGetCount += 1;
+      if (state.effectiveSettingChanged && !state.orderLedger.includes("nudge-wake")) {
+        state.orderLedger.push("nudge-wake");
+      }
       state.orderLedger.push(state.interactionStatus === "pending" ? "provider-get" : "provider-terminal-read");
     }
     return fakeControllerInteraction(state, interactionId);
@@ -317,6 +370,7 @@ function stubControllerSdk(
     resolution: Record<string, unknown>;
   }) => {
     expect(state.afterReopen).toBe(true);
+    expect(state.effectiveSettingChanged).toBe(true);
     expect(input.threadId).toBe(state.threadId);
     expect(input.interactionId).toBe(interactionId);
     expect(input.resolution).toEqual({ decision: "deny" });
@@ -419,11 +473,18 @@ async function assertProductionWiring(
   expect(configured.tools.map((tool) => tool.name)).toEqual(EXPECTED_CONTROLLER_TOOL_NAMES);
   expect(configured.skills).toEqual([]);
   if (configured.instructions === null) throw new Error("controller instructions were not configured");
-  const expectedInstructions = `${CONTROLLER_INSTRUCTIONS}\n\nHow this owner has asked you to work — their wording, and it outranks style guidance above, never a boundary:\n${OWNER_OVERLAY}`;
-  expect(configured.instructions).toBe(expectedInstructions);
-  expect(configured.instructions).toContain("telegram-agent:controller-instructions:v1");
-  expect(configured.instructions).toContain(OWNER_OVERLAY);
-  expect(CONTROLLER_INSTRUCTION_SENTINEL).toBe("telegram-agent:controller-instructions:v1");
+  expect(configured.instructions.startsWith(`${REQUIRED_CONTROLLER_INSTRUCTION_SENTINEL}\n`)).toBe(true);
+  expect(countOccurrences(configured.instructions, REQUIRED_CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
+  for (const clause of REQUIRED_CONTROLLER_SAFETY_CLAUSES) {
+    expect(configured.instructions).toContain(clause);
+  }
+  expect(configured.instructions).not.toContain("Allow all session");
+  expect(configured.instructions).not.toContain("allow_for_session");
+  expect(configured.instructions).not.toContain("full permissions by design");
+  const overlaySuffix = `How this owner has asked you to work — their wording, and it outranks style guidance above, never a boundary:\n${OWNER_OVERLAY}`;
+  expect(configured.instructions.endsWith(`\n\n${overlaySuffix}`)).toBe(true);
+  expect(countOccurrences(configured.instructions, OWNER_OVERLAY)).toBe(1);
+  expect(new TextEncoder().encode(OWNER_OVERLAY).byteLength).toBeLessThanOrEqual(600);
 
   await fixture.harness.behavior.setSettings({ botToken: null });
   await expect(fixture.harness.behavior.resolveAgentConfiguration(context)).resolves.toEqual({
@@ -644,6 +705,10 @@ async function waitForCondition<T>(read: () => T, attempts = 2_000): Promise<T> 
   throw lastError;
 }
 
+async function flushMicrotasks(count = 20): Promise<void> {
+  for (let turn = 0; turn < count; turn += 1) await Promise.resolve();
+}
+
 async function stopService(run: { controller: AbortController; done: Promise<void> }): Promise<void> {
   run.controller.abort();
   await run.done;
@@ -654,6 +719,16 @@ async function nudgeExecutor(
   maxConcurrentJobs: "4" | "5",
 ): Promise<void> {
   await fixture.harness.behavior.setSettings({ maxConcurrentJobs });
+}
+
+async function triggerEffectiveSettingNudge(
+  fixture: ProductionFixture,
+  state: FakeControllerSdkState,
+): Promise<void> {
+  state.effectiveSettingChanged = true;
+  state.afterReopen = true;
+  state.orderLedger.push("effective-setting-change");
+  await fixture.harness.behavior.setSettings({ maxConcurrentJobs: "4" });
 }
 
 it("accepts an evidence-bound natural answer through registered tools, reconciliation, and one reply outbox", async () => {
@@ -677,6 +752,11 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
     callbackReceived: false,
     preReopenGetBlocked: false,
     preReopenGetAborted: false,
+    restartGate: false,
+    restartedWaitBarrierReached: false,
+    effectiveSettingChanged: false,
+    continuationSendCount: 0,
+    initialInteractionReadCount: 0,
     providerGetCount: 0,
     providerResolveCount: 0,
     providerId: "claude-code",
@@ -765,6 +845,8 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
   const recording = recordingTelegramTransport();
   vi.stubGlobal("fetch", recording.fetch);
   const executorRun = fixture.harness.behavior.runService("job-executor");
+  let replayHost: ProductionFixture | null = null;
+  let replayRun: ServiceRun | null = null;
   try {
     await waitForCondition(() => expect(finalOutbox(fixture.store, fixture.turn.id)).toEqual(expect.objectContaining({
       status: "sent",
@@ -875,35 +957,42 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
     });
 
     await stopService(executorRun);
-    const replayHost = await fixture.harness.lifecycle.reload(async (bb) => {
+    const reloadedHost = await fixture.harness.lifecycle.reload(async (bb) => {
       await plugin(bb);
     });
+    replayHost = reloadedHost;
     const replayStore = openStore(replayHost.bb.storage, replayHost.bb.storage.kv, () => NOW);
     stubControllerSdk(replayHost.harness, state);
     await assertProductionWiring(replayHost, replayStore, state);
-    const replayRun = replayHost.harness.behavior.runService("job-executor");
+    replayRun = replayHost.harness.behavior.runService("job-executor");
     try {
       await waitForCondition(() => expect(replayStore.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({ status: "sent" }));
     } finally {
-      await stopService(replayRun);
+      if (!replayRun.controller.signal.aborted) await stopService(replayRun);
     }
     expect(recording.sentMessages).toHaveLength(1);
     expect(recording.editedMessages).toHaveLength(0);
     expect(replayStore.listOutbox(128)).toHaveLength(1);
-    await replayHost.harness.lifecycle.dispose();
   } finally {
+    if (replayRun !== null && !replayRun.controller.signal.aborted) await stopService(replayRun);
     if (!executorRun.controller.signal.aborted) await stopService(executorRun);
+    if (replayHost !== null) {
+      await replayHost.harness.lifecycle.dispose();
+    } else {
+      await fixture.harness.lifecycle.dispose();
+    }
     vi.unstubAllGlobals();
   }
 });
 
 it("restarts across a Telegram approval, resolves the exact BB interaction once, and finalizes only from denial evidence", async () => {
   assertIndependentArtifactHashes();
+  assertIndependentCallbackTokens();
   const fixture = submittedControllerFixture();
   fixture.store.setControllerOverlay({ text: OWNER_OVERLAY, now: NOW });
   const controller = fixture.store.getControllerForOwner("7", "7");
   if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
-  const interactionId = "permission-command-1";
+  const interactionId = APPROVAL_INTERACTION_ID;
   const pendingEvent = eventRow(controller.threadId, 1, "system/permissionGrant/lifecycle", {
     interactionId,
     status: "pending",
@@ -922,6 +1011,11 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
     callbackReceived: false,
     preReopenGetBlocked: false,
     preReopenGetAborted: false,
+    restartGate: false,
+    restartedWaitBarrierReached: false,
+    effectiveSettingChanged: false,
+    continuationSendCount: 0,
+    initialInteractionReadCount: 0,
     providerGetCount: 0,
     providerResolveCount: 0,
     providerId: "claude-code",
@@ -939,6 +1033,8 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
   vi.stubGlobal("fetch", recording.fetch);
   const executorRun = fixture.harness.behavior.runService("job-executor");
   let ingressRun: { controller: AbortController; done: Promise<void> } | null = null;
+  let restartedHost: ProductionFixture | null = null;
+  let restartedExecutor: ServiceRun | null = null;
   try {
     const prompt = await waitForCondition(() => {
       const candidate = recording.sentMessages.find((message) => Array.isArray(
@@ -947,8 +1043,12 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       if (!candidate) throw new Error("actual registered executor did not send the approval prompt");
       return candidate;
     });
-    const allowToken = controllerInteractionToken(interactionId, "allow_once");
-    const denyToken = controllerInteractionToken(interactionId, "deny");
+    const allowToken = EXPECTED_ALLOW_CALLBACK_TOKEN;
+    const denyToken = EXPECTED_DENY_CALLBACK_TOKEN;
+    const wrongDenyToken = EXPECTED_CROSS_DENY_CALLBACK_TOKEN;
+    expect(`i:${allowToken}`).toBe(`i:${independentControllerInteractionToken(interactionId, "allow_once")}`);
+    expect(`i:${denyToken}`).toBe(`i:${independentControllerInteractionToken(interactionId, "deny")}`);
+    expect(wrongDenyToken).not.toBe(denyToken);
     expect(prompt).toEqual({
       chatId: "7",
       messageId: 900,
@@ -987,6 +1087,50 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       status: "sent",
       attempts: 1,
     });
+    await waitForCondition(() => expect(state.initialInteractionReadCount).toBeGreaterThan(0));
+    await flushMicrotasks();
+    expect(state.initialInteractionReadCount).toBe(1);
+    expect(state.continuationSendCount).toBe(0);
+    expect(storedInteractionState(fixture.db, interactionId)).toEqual(expect.objectContaining({
+      state: "pending",
+      answer_json: null,
+      delivered_at: null,
+    }));
+    const wrongCallbackGetCount = fixture.harness.inspection.sdk.callsTo("threads.interactions.get").length;
+    const wrongCallbackEvents = [...state.events];
+    const wrongCallbackThreadStatuses = [...state.threadStatuses];
+
+    recording.queueCallback(telegramCallback(wrongDenyToken, 70_000, prompt.messageId));
+    ingressRun = fixture.harness.behavior.runService("telegram-ingress");
+    await waitForCondition(() => expect(fixture.store.getOutbox("callback:callback-70000")).toMatchObject({
+      status: "pending",
+      attempts: 0,
+    }));
+    await stopService(ingressRun);
+    ingressRun = null;
+    expect(storedInteractionState(fixture.db, interactionId)).toEqual(expect.objectContaining({
+      interaction_id: interactionId,
+      state: "pending",
+      answer_json: null,
+      delivered_at: null,
+    }));
+    expect(state.providerResolveCount).toBe(0);
+    expect(state.continuationSendCount).toBe(0);
+    expect(fixture.harness.inspection.sdk.callsTo("threads.interactions.get")).toHaveLength(wrongCallbackGetCount);
+    expect(fixture.harness.inspection.sdk.callsTo("threads.interactions.resolve")).toEqual([]);
+    expect(state.events).toEqual(wrongCallbackEvents);
+    expect(state.threadStatuses).toEqual(wrongCallbackThreadStatuses);
+    expect(recording.sentMessages).toEqual([prompt]);
+    expect(recording.editedMessages).toEqual([]);
+    expect(recording.callbackAnswers).toEqual([]);
+    exactOutbox(fixture.store, {
+      logicalKey: "callback:callback-70000",
+      chatId: "7",
+      messageId: null,
+      payload: { text: "That interaction is no longer open." },
+      status: "pending",
+      attempts: 0,
+    });
 
     recording.queueCallback(telegramCallback(denyToken, 70_001, prompt.messageId));
     ingressRun = fixture.harness.behavior.runService("telegram-ingress");
@@ -1014,14 +1158,21 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       attempts: 0,
     });
     await waitForCondition(() => expect(state.preReopenGetBlocked).toBe(true));
+    expect(state.orderLedger).toEqual([
+      "callback-persistence",
+      "callback-nudge-wake",
+      "executor-wait-barrier",
+    ]);
     expect(state.providerResolveCount).toBe(0);
     await stopService(ingressRun);
     ingressRun = null;
     await stopService(executorRun);
 
-    const restarted = await fixture.harness.lifecycle.reload(async (bb) => {
+    const reloadedHost = await fixture.harness.lifecycle.reload(async (bb) => {
       await plugin(bb);
     });
+    restartedHost = reloadedHost;
+    state.restartGate = true;
     state.afterReopen = true;
     state.orderLedger.push("reopen");
     expect(state.preReopenGetAborted).toBe(true);
@@ -1029,28 +1180,40 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
     expect(state.maxSeq).toBe(1);
     expect(state.interactionStatus).toBe("pending");
     expect(state.interactionResolution).toBeNull();
-    const restartedStore = openStore(restarted.bb.storage, restarted.bb.storage.kv, () => NOW);
-    await assertProductionWiring(restarted, restartedStore, state);
-    stubControllerSdk(restarted.harness, state, interactionId);
-    const restartedExecutor = restarted.harness.behavior.runService("job-executor");
+    const restartedStore = openStore(restartedHost.bb.storage, restartedHost.bb.storage.kv, () => NOW);
+    await assertProductionWiring(restartedHost, restartedStore, state);
+    stubControllerSdk(restartedHost.harness, state, interactionId);
+    const restartedExecutorRun = restartedHost.harness.behavior.runService("job-executor");
+    restartedExecutor = restartedExecutorRun;
     try {
+      await waitForCondition(() => expect(state.restartedWaitBarrierReached).toBe(true));
+      expect(state.continuationSendCount).toBe(0);
+      expect(storedInteractionState(restartedHost.bb.storage.database(), interactionId)).toEqual(expect.objectContaining({
+        state: "answered",
+        answer_json: '{"decision":"deny"}',
+        delivered_at: null,
+      }));
+      expect(state.providerResolveCount).toBe(0);
+      expect(state.events).toEqual([pendingEvent]);
+      await triggerEffectiveSettingNudge(restartedHost, state);
       await waitForCondition(() => expect(state.providerResolveCount).toBe(1));
-      await waitForCondition(() => expect(storedInteractionState(restarted.bb.storage.database(), interactionId)).toMatchObject({
+      await waitForCondition(() => expect(storedInteractionState(reloadedHost.bb.storage.database(), interactionId)).toMatchObject({
         state: "delivered",
         delivered_at: NOW,
       }));
-      expect(restarted.harness.inspection.sdk.callsTo("threads.interactions.get")).toEqual([
+      expect(restartedHost.harness.inspection.sdk.callsTo("threads.interactions.get")).toEqual([
+        [{ threadId: controller.threadId, interactionId, signal: expect.any(AbortSignal) }],
         [{ threadId: controller.threadId, interactionId, signal: expect.any(AbortSignal) }],
         [{ threadId: controller.threadId, interactionId, signal: expect.any(AbortSignal) }],
       ]);
-      expect(restarted.harness.inspection.sdk.callsTo("threads.interactions.resolve")).toEqual([[
+      expect(restartedHost.harness.inspection.sdk.callsTo("threads.interactions.resolve")).toEqual([[
         {
           threadId: controller.threadId,
           interactionId,
           resolution: { decision: "deny" },
         },
       ]]);
-      expect(storedInteractionState(restarted.bb.storage.database(), interactionId)).toEqual(expect.objectContaining({
+      expect(storedInteractionState(restartedHost.bb.storage.database(), interactionId)).toEqual(expect.objectContaining({
         interaction_id: interactionId,
         state: "delivered",
         answer_json: '{"decision":"deny"}',
@@ -1065,16 +1228,21 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       )]);
       expect(state.orderLedger).toEqual([
         "callback-persistence",
+        "callback-nudge-wake",
+        "executor-wait-barrier",
         "reopen",
+        "restarted-wait-barrier",
+        "effective-setting-change",
+        "nudge-wake",
         "provider-get",
         "provider-resolve",
         "resolved-lifecycle",
         "provider-terminal-read",
       ]);
 
-      await nudgeExecutor(restarted, "5");
+      await restartedHost.harness.behavior.setSettings({ maxConcurrentJobs: "5" });
       await waitForCondition(() => expect(state.orderLedger).toContain("continuation-send"));
-      expect(restarted.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect(restartedHost.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
         expectedContinuationRequest(controller.threadId),
       ]]);
       expect(state.events.slice(0, 2)).toEqual([pendingEvent, eventRow(
@@ -1090,7 +1258,12 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       ]);
       expect(state.orderLedger).toEqual([
         "callback-persistence",
+        "callback-nudge-wake",
+        "executor-wait-barrier",
         "reopen",
+        "restarted-wait-barrier",
+        "effective-setting-change",
+        "nudge-wake",
         "provider-get",
         "provider-resolve",
         "resolved-lifecycle",
@@ -1099,7 +1272,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         "continuation-events",
       ]);
 
-      await nudgeExecutor(restarted, "4");
+      await restartedHost.harness.behavior.setSettings({ maxConcurrentJobs: "4" });
       const denialEvidence = await waitForCondition(() => {
         const rows = restartedStore.listControllerEvidence(fixture.turn.id, 128);
         const row = rows.find((candidate) => candidate.sourceKind === "bb_item");
@@ -1128,7 +1301,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       assertNoRawProviderProse(restartedStore.listControllerEvidence(fixture.turn.id, 128));
 
       const denialCandidate = finalizationClaim(denialEvidence.ref);
-      const finalization = parseToolResult(await restarted.harness.behavior.callAgentTool(
+      const finalization = parseToolResult(await restartedHost.harness.behavior.callAgentTool(
         "telegram_agent_respond",
         denialCandidate,
         controllerContext(restartedStore, new AbortController().signal),
@@ -1152,7 +1325,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         validatedAt: NOW,
         consumedAt: null,
       });
-      expect(storedControllerTurn(restarted.bb.storage.database(), fixture.turn.id)).toMatchObject({
+      expect(storedControllerTurn(restartedHost.bb.storage.database(), fixture.turn.id)).toMatchObject({
         state: "submitted",
         dispatch_after_seq: 2,
         bb_event_seq: 5,
@@ -1164,7 +1337,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       });
 
       state.status = "idle";
-      await nudgeExecutor(restarted, "5");
+      await restartedHost.harness.behavior.setSettings({ maxConcurrentJobs: "5" });
       await waitForCondition(() => expect(restartedStore.getControllerTurn(fixture.turn.id)).toMatchObject({
         state: "completed",
         responseText: DENIAL_RESPONSE,
@@ -1189,10 +1362,16 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       ]);
       expect(finalMessage.messageId).toBe(901);
       expect(recording.editedMessages).toEqual([]);
-      expect(recording.callbackAnswers).toEqual([{
-        callbackQueryId: "callback-70001",
-        payload: { callback_query_id: "callback-70001", text: "Got it." },
-      }]);
+      expect(recording.callbackAnswers).toEqual([
+        {
+          callbackQueryId: "callback-70000",
+          payload: { callback_query_id: "callback-70000", text: "That interaction is no longer open." },
+        },
+        {
+          callbackQueryId: "callback-70001",
+          payload: { callback_query_id: "callback-70001", text: "Got it." },
+        },
+      ]);
       expect(recording.drafts.every((draft) => draft.payload.text !== RAW_PROVIDER_SENTINEL)).toBe(true);
       await waitForCondition(() => expect(restartedStore.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({
         status: "sent",
@@ -1218,6 +1397,14 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         attempts: 1,
       });
       exactOutbox(restartedStore, {
+        logicalKey: "callback:callback-70000",
+        chatId: "7",
+        messageId: null,
+        payload: { text: "That interaction is no longer open." },
+        status: "sent",
+        attempts: 1,
+      });
+      exactOutbox(restartedStore, {
         logicalKey: "callback:callback-70001",
         chatId: "7",
         messageId: null,
@@ -1233,7 +1420,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         status: "sent",
         attempts: 1,
       });
-      expect(restartedStore.listOutbox(128)).toHaveLength(3);
+      expect(restartedStore.listOutbox(128)).toHaveLength(4);
       expect(restartedStore.getAcceptedControllerFinalization(fixture.turn.id)).toEqual({
         id: 1,
         ref: "finalization:1",
@@ -1251,7 +1438,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         ownerText: fixture.turn.inputText,
         agentText: DENIAL_RESPONSE,
       }]);
-      expect(storedControllerTurn(restarted.bb.storage.database(), fixture.turn.id)).toMatchObject({
+      expect(storedControllerTurn(restartedHost.bb.storage.database(), fixture.turn.id)).toMatchObject({
         state: "completed",
         dispatch_after_seq: 2,
         bb_event_seq: 5,
@@ -1266,7 +1453,12 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       });
       expect(state.orderLedger).toEqual([
         "callback-persistence",
+        "callback-nudge-wake",
+        "executor-wait-barrier",
         "reopen",
+        "restarted-wait-barrier",
+        "effective-setting-change",
+        "nudge-wake",
         "provider-get",
         "provider-resolve",
         "resolved-lifecycle",
@@ -1279,7 +1471,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       expect(state.providerResolveCount).toBe(1);
       expect(state.providerGetCount).toBe(2);
       assertRegisteredControllerMapping(recording, state);
-      expect(storedInteractionState(restarted.bb.storage.database(), interactionId)).toMatchObject({ state: "delivered" });
+      expect(storedInteractionState(restartedHost.bb.storage.database(), interactionId)).toMatchObject({ state: "delivered" });
       const ownerVisible = {
         evidence: restartedStore.listControllerEvidence(fixture.turn.id, 128),
         finalization: restartedStore.getAcceptedControllerFinalization(fixture.turn.id),
@@ -1295,10 +1487,10 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       };
       assertNoRawProviderProse(ownerVisible);
 
-      await stopService(restartedExecutor);
+      await stopService(restartedExecutorRun);
       const sentCount = recording.sentMessages.length + recording.editedMessages.length;
       const resolvedCount = state.providerResolveCount;
-      const replayRun = restarted.harness.behavior.runService("job-executor");
+      const replayRun = restartedHost.harness.behavior.runService("job-executor");
       try {
         await waitForCondition(() => expect(restartedStore.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({ status: "sent" }));
       } finally {
@@ -1306,10 +1498,15 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       }
       expect(recording.sentMessages.length + recording.editedMessages.length).toBe(sentCount);
       expect(state.providerResolveCount).toBe(resolvedCount);
-      expect(restarted.harness.inspection.sdk.callsTo("threads.interactions.resolve")).toHaveLength(1);
+      expect(restartedHost.harness.inspection.sdk.callsTo("threads.interactions.resolve")).toHaveLength(1);
       expect(state.orderLedger).toEqual([
         "callback-persistence",
+        "callback-nudge-wake",
+        "executor-wait-barrier",
         "reopen",
+        "restarted-wait-barrier",
+        "effective-setting-change",
+        "nudge-wake",
         "provider-get",
         "provider-resolve",
         "resolved-lifecycle",
@@ -1319,13 +1516,18 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         "finalization",
         "final-delivery",
       ]);
-      await restarted.harness.lifecycle.dispose();
     } finally {
-      if (!restartedExecutor.controller.signal.aborted) await stopService(restartedExecutor);
+      if (!restartedExecutorRun.controller.signal.aborted) await stopService(restartedExecutorRun);
     }
   } finally {
     if (ingressRun !== null && !ingressRun.controller.signal.aborted) await stopService(ingressRun);
     if (!executorRun.controller.signal.aborted) await stopService(executorRun);
+    if (restartedExecutor !== null && !restartedExecutor.controller.signal.aborted) await stopService(restartedExecutor);
+    if (restartedHost !== null) {
+      await restartedHost.harness.lifecycle.dispose();
+    } else {
+      await fixture.harness.lifecycle.dispose();
+    }
     vi.unstubAllGlobals();
   }
 });
