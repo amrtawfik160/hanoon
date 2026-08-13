@@ -56,6 +56,10 @@ function boundedIdentifier(rawIdentifier: unknown, characterLimit: number): rawI
     [...rawIdentifier].length <= characterLimit && Buffer.byteLength(rawIdentifier, "utf8") <= characterLimit * 4;
 }
 
+export function isSafeControllerInteractionId(rawIdentifier: unknown): rawIdentifier is string {
+  return boundedIdentifier(rawIdentifier, MAX_INTERACTION_ID);
+}
+
 function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
@@ -91,7 +95,7 @@ function parseQuestion(raw: unknown): ControllerQuestion | null {
  * with, so it is treated as absent rather than parked on.
  */
 export function parsePendingQuestion(interactionId: unknown, payload: unknown): ControllerPendingQuestion | null {
-  if (!boundedIdentifier(interactionId, MAX_INTERACTION_ID)) return null;
+  if (!isSafeControllerInteractionId(interactionId)) return null;
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind !== "user_question" || !Array.isArray(candidate.questions)) return null;
@@ -267,7 +271,7 @@ function controllerApprovalSummary(subject: unknown): string | null {
  * controller may retain. Lifecycle payloads are deliberately not accepted here.
  */
 export function parseControllerInteraction(interactionId: unknown, payload: unknown): ControllerInteraction | null {
-  if (!boundedIdentifier(interactionId, MAX_INTERACTION_ID) ||
+  if (!isSafeControllerInteractionId(interactionId) ||
     typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind === "user_question") {

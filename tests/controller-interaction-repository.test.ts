@@ -3,8 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { resolve } from "node:path";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
-import { expect, it } from "vitest";
-import { questionOptionToken } from "../src/controller/questions";
+import { expect, it, vi } from "vitest";
+import { ControllerInteractionService } from "../src/controller/interaction-service";
+import { parseControllerInteraction, questionOptionToken, threadDecisionToken } from "../src/controller/questions";
 import { ControllerInteractionRepository } from "../src/storage/controller-interaction-repository";
 import type { ControllerInteraction } from "../src/controller/questions";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
@@ -202,6 +203,58 @@ it("keeps the oldest active interaction parked and promotes the next only after 
   expect(db.prepare("SELECT awaiting_interaction_id FROM controller_turns WHERE id = 'turn-1'").get()).toEqual({ awaiting_interaction_id: "int-later" });
 });
 
+it("selects and promotes only the current generation after a controller rollover", async () => {
+  const { db, repository } = fixture();
+  const staleApproval = {
+    kind: "approval" as const,
+    interactionId: "approval-generation-a",
+    summary: "wants to write a protected path",
+    decisions: ["deny" as const],
+  };
+  expect(record(repository, staleApproval, "turn-1", 2)).toBe(true);
+  expect(repository.answerByToken({
+    token: threadDecisionToken(staleApproval.interactionId, "deny"), userId: "7", chatId: "7", now: 3,
+  })).toMatchObject({ ok: true, interactionId: staleApproval.interactionId });
+
+  db.prepare("UPDATE controller_generations SET ended_at = 4 WHERE id = 'gen-current'").run();
+  db.prepare("UPDATE controller_threads SET bb_thread_id = 'thr-next' WHERE controller_key = 'owner-7-controller'").run();
+  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at) VALUES ('gen-next', 'owner-7-controller', 'thr-next', 4)").run();
+  const activeApproval = { ...staleApproval, interactionId: "approval-generation-b" };
+  expect(repository.record({
+    ...fence,
+    now: 5,
+    turnId: "turn-1",
+    controllerKey: "owner-7-controller",
+    bbThreadId: "thr-next",
+    controllerGenerationId: "gen-next",
+    interaction: activeApproval,
+  })).toBe(true);
+
+  expect(repository.getPending("owner-7-controller")).toMatchObject({ interactionId: activeApproval.interactionId });
+  expect(repository.getAnswered("owner-7-controller")).toBeNull();
+  expect(db.prepare("SELECT awaiting_interaction_id FROM controller_turns WHERE id = 'turn-1'").get())
+    .toEqual({ awaiting_interaction_id: activeApproval.interactionId });
+
+  expect(repository.answerByToken({
+    token: threadDecisionToken(activeApproval.interactionId, "deny"), userId: "7", chatId: "7", now: 6,
+  })).toMatchObject({ ok: true, interactionId: activeApproval.interactionId });
+  expect(repository.getAnswered("owner-7-controller")).toMatchObject({ interactionId: activeApproval.interactionId });
+  const get = vi.fn(async () => ({ id: activeApproval.interactionId, threadId: "thr-next", status: "pending" }));
+  const resolveInteraction = vi.fn(async () => ({ id: activeApproval.interactionId, threadId: "thr-next", status: "resolved" }));
+  const service = new ControllerInteractionService({
+    store: repository,
+    interactions: { get, resolve: resolveInteraction } as never,
+    clock: () => 7,
+  });
+  await expect(service.deliverAnswered({
+    ...fence, now: 7, controllerKey: "owner-7-controller",
+  })).resolves.toBe(true);
+  expect(get).toHaveBeenCalledWith(expect.objectContaining({ interactionId: activeApproval.interactionId, threadId: "thr-next" }));
+  expect(resolveInteraction).toHaveBeenCalledWith(expect.objectContaining({ interactionId: activeApproval.interactionId, threadId: "thr-next" }));
+  expect(db.prepare("SELECT awaiting_interaction_id FROM controller_turns WHERE id = 'turn-1'").get())
+    .toEqual({ awaiting_interaction_id: null });
+});
+
 it("orders equal timestamps by id and does not let out-of-order settlement skip the current row", () => {
   const { db, repository } = fixture();
   expect(record(repository, { ...question, interactionId: "z-later-id" }, "turn-1", 2)).toBe(true);
@@ -312,15 +365,90 @@ it("fails owner and executor mutations closed when the source has two open gener
   expect(record(repository)).toBe(true);
   db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at) VALUES ('gen-second', 'owner-7-controller', 'thr-current', 2)").run();
 
+  expect(repository.getPending("owner-7-controller")).toBeNull();
   expect(repository.answerByToken({ token: questionOptionToken("int-question", "q1", "yes"), userId: "7", chatId: "7", now: 3 }))
     .toEqual({ ok: false, reason: "stale" });
   expect(repository.sourceIsActive({ ...fence, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(false);
   expect(repository.markResolved({ ...fence, now: 3, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(false);
   db.prepare("UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = 3 WHERE interaction_id = 'int-question'")
     .run(JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }));
+  expect(repository.getAnswered("owner-7-controller")).toBeNull();
   expect(repository.markDelivered({ ...fence, now: 4, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(false);
   expect(db.prepare("SELECT state, answer_json, delivered_at FROM controller_interactions WHERE interaction_id = 'int-question'").get())
     .toEqual({ state: "answered", answer_json: JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }), delivered_at: null });
+});
+
+it("accepts an 800-byte Unicode interaction id through durable answer and settlement", () => {
+  const { db, repository } = fixture();
+  const interactionId = "🙂".repeat(200);
+  const interaction = parseControllerInteraction(interactionId, {
+    kind: "approval",
+    subject: { kind: "file_change", writeScope: "src/controller/questions.ts" },
+    availableDecisions: ["deny"],
+  });
+  expect([...interactionId]).toHaveLength(200);
+  expect(Buffer.byteLength(interactionId, "utf8")).toBe(800);
+  expect(interaction).toMatchObject({ kind: "approval", interactionId });
+  if (!interaction) throw new Error("boundary interaction was not projected");
+
+  expect(record(repository, interaction)).toBe(true);
+  expect(repository.getPending("owner-7-controller")).toMatchObject({ interactionId });
+  expect(repository.answerByToken({
+    token: threadDecisionToken(interactionId, "deny"), userId: "7", chatId: "7", now: 3,
+  })).toMatchObject({ ok: true, interactionId });
+  expect(repository.getAnswered("owner-7-controller")).toMatchObject({ interactionId });
+  expect(repository.sourceIsActive({
+    ...fence, now: 4, interactionId, turnId: "turn-1", bbThreadId: "thr-current",
+  })).toBe(true);
+  expect(repository.markDelivered({
+    ...fence, now: 4, interactionId, turnId: "turn-1", bbThreadId: "thr-current",
+  })).toBe(true);
+  expect(db.prepare("SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?").get(interactionId))
+    .toEqual({ state: "delivered", delivered_at: 4 });
+});
+
+it("accepts an 800-byte Unicode interaction id through external resolution settlement", () => {
+  const { db, repository } = fixture();
+  const externallyResolvedId = "🌍".repeat(200);
+  const externallyResolved = parseControllerInteraction(externallyResolvedId, { kind: "plugin" });
+  if (!externallyResolved) throw new Error("resolved boundary interaction was not projected");
+  expect(record(repository, externallyResolved, "turn-1", 5)).toBe(true);
+  expect(repository.markResolved({
+    ...fence, now: 6, interactionId: externallyResolvedId, turnId: "turn-1", bbThreadId: "thr-current",
+  })).toBe(true);
+  expect(db.prepare("SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?").get(externallyResolvedId))
+    .toEqual({ state: "delivered", delivered_at: 6 });
+});
+
+it("rejects interaction ids above the code-point and UTF-8 byte limits at every repository boundary", () => {
+  const { db, repository } = fixture();
+  const interactionId = "🙂".repeat(201);
+  const interaction = {
+    kind: "unsupported" as const,
+    interactionId,
+    metadata: { sourceKind: "plugin" },
+  };
+  expect([...interactionId]).toHaveLength(201);
+  expect(Buffer.byteLength(interactionId, "utf8")).toBeGreaterThan(800);
+  expect(parseControllerInteraction(interactionId, { kind: "plugin" })).toBeNull();
+  expect(record(repository, interaction)).toBe(false);
+  expect(db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 0 });
+  db.prepare(
+    `INSERT INTO controller_interactions
+       (interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id, kind, payload_json, state, asked_at)
+     VALUES (?, 'turn-1', 'owner-7-controller', 'thr-current', 'gen-current', 'unsupported', ?, 'pending', 2)`,
+  ).run(interactionId, JSON.stringify(interaction));
+  expect(repository.sourceIsActive({
+    ...fence, interactionId, turnId: "turn-1", bbThreadId: "thr-current",
+  })).toBe(false);
+  expect(repository.markResolved({
+    ...fence, interactionId, turnId: "turn-1", bbThreadId: "thr-current",
+  })).toBe(false);
+  expect(repository.markDelivered({
+    ...fence, interactionId, turnId: "turn-1", bbThreadId: "thr-current",
+  })).toBe(false);
+  expect(db.prepare("SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?").get(interactionId))
+    .toEqual({ state: "pending", delivered_at: null });
 });
 
 it("reconstructs pending repository state after closing and reopening file-backed SQLite", () => {

@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   isSafeControllerApprovalSummary,
+  isSafeControllerInteractionId,
   nextUnansweredQuestion,
   questionOptionToken,
   threadDecisionToken,
@@ -86,6 +87,18 @@ type InteractionRow = {
 };
 
 const interactionStates = "'pending', 'answered'";
+const activeInteractionRelations = `
+  JOIN controller_turns AS turn ON turn.id = interaction.turn_id
+    AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
+  JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
+    AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
+  JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
+    AND generation.controller_key = interaction.controller_key AND generation.thread_id = interaction.bb_thread_id
+    AND generation.ended_at IS NULL`;
+const uniqueOpenGeneration = `(SELECT COUNT(*) FROM controller_generations AS open_generation
+  WHERE open_generation.controller_key = interaction.controller_key
+    AND open_generation.thread_id = interaction.bb_thread_id
+    AND open_generation.ended_at IS NULL) = 1`;
 
 function isSafeIdentifier(identifier: string): boolean {
   return identifier.length > 0 && identifier.length <= 200;
@@ -122,7 +135,7 @@ function validQuestion(rawQuestion: unknown): boolean {
 }
 
 function validInteraction(rawInteraction: unknown, row: InteractionRow): rawInteraction is ControllerInteraction {
-  if (!plainRecord(rawInteraction) || !boundedText(rawInteraction.interactionId, 200, 800) ||
+  if (!plainRecord(rawInteraction) || !isSafeControllerInteractionId(rawInteraction.interactionId) ||
     rawInteraction.interactionId !== row.interaction_id || rawInteraction.kind !== row.kind) return false;
   if (rawInteraction.kind === "user_question") {
     if (!exactKeys(rawInteraction, ["kind", "interactionId", "questions"]) || !Array.isArray(rawInteraction.questions) ||
@@ -208,7 +221,7 @@ function validLifecycle(row: InteractionRow, interaction: ControllerInteraction,
 
 function parseRow(row: InteractionRow): ControllerInteractionRecord | null {
   const rawInteraction = safeJson(row.payload_json);
-  if (!isSafeIdentifier(row.turn_id) || !isSafeIdentifier(row.controller_key) ||
+  if (!isSafeControllerInteractionId(row.interaction_id) || !isSafeIdentifier(row.turn_id) || !isSafeIdentifier(row.controller_key) ||
     (row.bb_thread_id !== null && !isSafeIdentifier(row.bb_thread_id)) ||
     (row.controller_generation_id !== null && !isSafeIdentifier(row.controller_generation_id)) ||
     !validInteraction(rawInteraction, row) || !safeTimestamp(row.asked_at) || !safeTimestamp(row.answered_at) || !safeTimestamp(row.delivered_at)) return null;
@@ -240,7 +253,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   }): boolean {
     if (!this.validFence(input) || !isSafeIdentifier(input.turnId) || !isSafeIdentifier(input.controllerKey) ||
       !isSafeIdentifier(input.bbThreadId) || !isSafeIdentifier(input.controllerGenerationId) ||
-      !isSafeIdentifier(input.interaction.interactionId) || !validInteraction(input.interaction, {
+      !isSafeControllerInteractionId(input.interaction.interactionId) || !validInteraction(input.interaction, {
         interaction_id: input.interaction.interactionId,
         kind: input.interaction.kind,
       } as InteractionRow)) return false;
@@ -266,7 +279,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   }
 
   public markResolved(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
-    if (!this.validFence(input) || !isSafeIdentifier(input.interactionId) || !isSafeIdentifier(input.turnId) || !isSafeIdentifier(input.bbThreadId)) return false;
+    if (!this.validFence(input) || !isSafeControllerInteractionId(input.interactionId) || !isSafeIdentifier(input.turnId) || !isSafeIdentifier(input.bbThreadId)) return false;
     return this.db.transaction((): boolean => {
       if (!this.currentLease(input) || !this.activeInteraction(input) || !this.validStoredRow(input.interactionId)) return false;
       const changed = this.db.prepare(
@@ -330,25 +343,13 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
 
   public getPending(controllerKey: string): ControllerInteractionRecord | null {
     if (!isSafeIdentifier(controllerKey)) return null;
-    const row = this.db.prepare(
-      `SELECT interaction.* FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
-          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
-       WHERE interaction.controller_key = ? AND interaction.state = 'pending'
-       ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC LIMIT 1`,
-    ).get(controllerKey) as InteractionRow | undefined;
+    const row = this.oldestActiveInteraction(controllerKey, "pending");
     return row ? parseRow(row) : null;
   }
 
   public getAnswered(controllerKey: string): ControllerInteractionDelivery | null {
     if (!isSafeIdentifier(controllerKey)) return null;
-    const row = this.db.prepare(
-      `SELECT interaction.* FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
-          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
-       WHERE interaction.controller_key = ? AND interaction.state = 'answered'
-       ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC LIMIT 1`,
-    ).get(controllerKey) as InteractionRow | undefined;
+    const row = this.oldestActiveInteraction(controllerKey, "answered");
     if (!row) return null;
     const record = parseRow(row);
     if (!record || record.bbThreadId === null || record.controllerGenerationId === null || record.answer === null) return null;
@@ -356,7 +357,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   }
 
   public markDelivered(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
-    if (!this.validFence(input) || !isSafeIdentifier(input.interactionId) || !isSafeIdentifier(input.turnId) || !isSafeIdentifier(input.bbThreadId)) return false;
+    if (!this.validFence(input) || !isSafeControllerInteractionId(input.interactionId) || !isSafeIdentifier(input.turnId) || !isSafeIdentifier(input.bbThreadId)) return false;
     return this.db.transaction(() => {
       if (!this.currentLease(input) || !this.activeInteraction(input) || !this.validStoredRow(input.interactionId)) return false;
       const changed = this.db.prepare(
@@ -370,23 +371,14 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
 
   /** Read-only fence used immediately before external BB effects. */
   public sourceIsActive(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
-    if (!this.validFence(input)) return false;
+    if (!this.validFence(input) || !isSafeControllerInteractionId(input.interactionId)) return false;
     return this.db.transaction(() => this.db.prepare(
       `SELECT 1 FROM executor_lease AS lease
         JOIN controller_interactions AS interaction ON interaction.interaction_id = ? AND interaction.turn_id = ? AND interaction.bb_thread_id = ?
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
-          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
-          AND turn.lease_owner = lease.owner_id AND turn.lease_generation = lease.generation
-        JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
-          AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
-        JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
-          AND generation.controller_key = interaction.controller_key AND generation.thread_id = interaction.bb_thread_id
-          AND generation.ended_at IS NULL
+        ${activeInteractionRelations}
        WHERE lease.singleton = 1 AND lease.owner_id = ? AND lease.generation = ? AND lease.lease_expires_at > ?
-         AND (SELECT COUNT(*) FROM controller_generations AS open_generation
-               WHERE open_generation.controller_key = interaction.controller_key
-                 AND open_generation.thread_id = interaction.bb_thread_id
-                 AND open_generation.ended_at IS NULL) = 1`,
+         AND turn.lease_owner = lease.owner_id AND turn.lease_generation = lease.generation
+         AND ${uniqueOpenGeneration}`,
     ).get(input.interactionId, input.turnId, input.bbThreadId, input.ownerId, input.generation, input.now) !== undefined).immediate();
   }
 
@@ -428,24 +420,25 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     return {};
   }
 
+  private oldestActiveInteraction(controllerKey: string, state: Exclude<ControllerInteractionState, "delivered">): InteractionRow | undefined {
+    return this.db.prepare(
+      `SELECT interaction.* FROM controller_interactions AS interaction
+        ${activeInteractionRelations}
+       WHERE interaction.controller_key = ? AND interaction.state = ?
+         AND ${uniqueOpenGeneration}
+       ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC LIMIT 1`,
+    ).get(controllerKey, state) as InteractionRow | undefined;
+  }
+
   private ownedPending(userId: string, chatId: string, controllerKey?: string): InteractionRow[] {
     return this.db.prepare(
       `SELECT interaction.* FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
-          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
-        JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
-          AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
-        JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
-          AND generation.controller_key = interaction.controller_key AND generation.thread_id = interaction.bb_thread_id
-          AND generation.ended_at IS NULL
+        ${activeInteractionRelations}
         JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
           AND owners.telegram_user_id = controller.telegram_user_id AND owners.telegram_chat_id = controller.telegram_chat_id
        WHERE interaction.state = 'pending' AND controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
          AND (? IS NULL OR interaction.controller_key = ?)
-         AND (SELECT COUNT(*) FROM controller_generations AS open_generation
-               WHERE open_generation.controller_key = interaction.controller_key
-                 AND open_generation.thread_id = interaction.bb_thread_id
-                 AND open_generation.ended_at IS NULL) = 1
+         AND ${uniqueOpenGeneration}
        ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC`,
     ).all(userId, chatId, controllerKey ?? null, controllerKey ?? null) as InteractionRow[];
   }
@@ -453,13 +446,13 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   private promote(turnId: string, now: number): void {
     this.db.prepare(
       `UPDATE controller_turns SET awaiting_interaction_id = (
-         SELECT interaction_id FROM controller_interactions
-          WHERE turn_id = ? AND controller_key = (
-            SELECT controller_key FROM controller_turns WHERE id = ?
-          ) AND state IN (${interactionStates})
-          ORDER BY asked_at ASC, interaction_id ASC LIMIT 1
+         SELECT interaction.interaction_id FROM controller_interactions AS interaction
+          ${activeInteractionRelations}
+          WHERE interaction.turn_id = ? AND interaction.state IN (${interactionStates})
+            AND ${uniqueOpenGeneration}
+          ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC LIMIT 1
        ), updated_at = ? WHERE id = ?`,
-    ).run(turnId, turnId, now, turnId);
+    ).run(turnId, now, turnId);
   }
 
   private validFence(input: ControllerLeaseFence): boolean {
@@ -494,18 +487,10 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   private activeInteraction(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
     return this.db.prepare(
       `SELECT 1 FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
-          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
-        JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
-          AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
-        JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
-          AND generation.controller_key = interaction.controller_key AND generation.thread_id = interaction.bb_thread_id AND generation.ended_at IS NULL
+        ${activeInteractionRelations}
        WHERE interaction.interaction_id = ? AND interaction.turn_id = ? AND interaction.bb_thread_id = ?
          AND turn.lease_owner = ? AND turn.lease_generation = ?
-         AND (SELECT COUNT(*) FROM controller_generations AS open_generation
-               WHERE open_generation.controller_key = interaction.controller_key
-                 AND open_generation.thread_id = interaction.bb_thread_id
-                 AND open_generation.ended_at IS NULL) = 1`,
+         AND ${uniqueOpenGeneration}`,
     ).get(input.interactionId, input.turnId, input.bbThreadId, input.ownerId, input.generation) !== undefined;
   }
 
