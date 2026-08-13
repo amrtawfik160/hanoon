@@ -27,7 +27,7 @@ type ControllerInteractionApi = Readonly<{
 }>;
 
 type FencedInteractionStore = ControllerInteractionStore & Readonly<{
-  isExecutorFenceCurrent: (input: ControllerLeaseFence) => boolean;
+  isExecutorLeaseCurrent: (ownerId: string, generation: number, now: number) => boolean;
 }>;
 
 export class ControllerInteractionService {
@@ -108,7 +108,7 @@ export class ControllerInteractionService {
   }
 
   private fenceIsCurrent(fence: ControllerLeaseFence): boolean {
-    return this.store.isExecutorFenceCurrent(fence);
+    return this.store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, fence.now);
   }
 
   private matches(

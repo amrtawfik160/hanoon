@@ -1,8 +1,10 @@
 import type Database from "better-sqlite3";
 import type { ControllerLeaseFence } from "../controller/models";
 import {
+  canonicalControllerText,
   controllerInteractionToken,
   parseControllerInteraction,
+  parseControllerInteractionResolution,
   nextUnansweredQuestion,
   questionOptionToken,
   type ControllerInteraction,
@@ -150,57 +152,45 @@ function parsePersistedInteraction(
   }
   if (kind === "user_question") {
     const parsed = parseControllerInteraction(interactionId, payload);
-    return parsed?.kind === "user_question" ? parsed : null;
+    return parsed?.kind === "user_question" || parsed?.kind === "unsupported" ? parsed : null;
   }
   if (kind === "unsupported") return { kind: "unsupported", interactionId };
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
-  if (candidate.kind !== "approval" || typeof candidate.summary !== "string" ||
-    candidate.summary.length === 0 || candidate.summary.length > MAX_APPROVAL_SUMMARY) return null;
+  const summary = canonicalControllerText(candidate.summary, MAX_APPROVAL_SUMMARY);
+  if (candidate.kind !== "approval" || !summary || summary !== candidate.summary) return null;
   if (!Array.isArray(candidate.decisions)) return null;
-  const decisions = candidate.decisions.filter(
-    (decision): decision is "allow_once" | "deny" => decision === "allow_once" || decision === "deny",
-  );
-  if (decisions.length === 0 || decisions.length !== candidate.decisions.length ||
+  const decisions = candidate.decisions;
+  if (decisions.length === 0 || decisions.some((decision) => decision !== "allow_once" && decision !== "deny") ||
     new Set(decisions).size !== decisions.length) return null;
   return {
     kind: "approval",
     interactionId,
-    summary: candidate.summary,
-    decisions,
+    summary,
+    decisions: decisions as ("allow_once" | "deny")[],
   };
 }
 
-function parseAnswer(row: InteractionRow): Record<string, unknown> | null {
+function parseAnswer(
+  interaction: ControllerInteraction,
+  row: InteractionRow,
+): Record<string, unknown> | null {
   if (row.answer_json === null) return null;
   try {
     const parsed = JSON.parse(row.answer_json) as unknown;
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-    const candidate = parsed as Record<string, unknown>;
-    // The migration preserves the old answer map byte-for-byte. Normalize it
-    // only at the repository boundary so the BB adapter always receives the
-    // generic resolution envelope.
-    if (row.kind === "approval") return candidate;
-    return candidate.kind === "user_answer"
-      ? candidate
-      : { kind: "user_answer", answers: candidate as ControllerQuestionAnswers };
+    return parseControllerInteractionResolution(interaction, parsed);
   } catch {
     // A corrupt answer cannot be retried against BB safely.
     return null;
   }
 }
 
-function parseUserAnswers(row: InteractionRow): ControllerQuestionAnswers {
-  const resolution = parseAnswer(row);
-  if (!resolution || resolution.kind !== "user_answer" || typeof resolution.answers !== "object" ||
-    resolution.answers === null || Array.isArray(resolution.answers)) return {};
-  return resolution.answers as ControllerQuestionAnswers;
-}
-
 function parseStoredRow(row: InteractionRow): ControllerInteractionRecord | null {
   if (row.bb_thread_id === null || row.controller_generation_id === null) return null;
   const interaction = parsePersistedInteraction(row.interaction_id, row.kind, row.payload_json);
   if (!interaction) return null;
+  const resolution = row.answer_json === null ? null : parseAnswer(interaction, row);
+  if (row.answer_json !== null && !resolution) return null;
   return {
     interactionId: row.interaction_id,
     turnId: row.turn_id,
@@ -208,7 +198,9 @@ function parseStoredRow(row: InteractionRow): ControllerInteractionRecord | null
     bbThreadId: row.bb_thread_id,
     controllerGenerationId: row.controller_generation_id,
     interaction,
-    answers: interaction.kind === "user_question" ? parseUserAnswers(row) : {},
+    answers: interaction.kind === "user_question" && resolution?.kind === "user_answer"
+      ? resolution.answers as ControllerQuestionAnswers
+      : {},
     askedAt: row.asked_at,
   };
 }
@@ -257,11 +249,13 @@ function textAnswer(
   if (interaction.kind !== "user_question") return null;
   const next = nextUnansweredQuestion(interaction.questions, answers);
   if (!next || !next.question.allowFreeText) return null;
+  const safeText = canonicalControllerText(text, MAX_TEXT);
+  if (!safeText) return null;
   return {
     questionId: next.question.id,
     resolution: {
       kind: "user_answer",
-      answers: { [next.question.id]: { selected: [], freeText: text } },
+      answers: { [next.question.id]: { selected: [], freeText: safeText } },
     },
   };
 }
@@ -288,7 +282,8 @@ function mergedOwnerResolution(
 export class ControllerInteractionRepository implements ControllerInteractionStore {
   public constructor(private readonly db: SqliteDatabase) {}
 
-  public isExecutorFenceCurrent(input: ControllerLeaseFence): boolean {
+  public isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean {
+    const input = { ownerId, generation, now };
     assertFence(input);
     return this.executorFenceIsCurrent(input);
   }
@@ -392,6 +387,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     if (typeof input.text !== "string" || input.text.trim().length === 0 || input.text.length > MAX_TEXT) {
       throw new TypeError("text must be between 1 and 4000 characters");
     }
+    if (!canonicalControllerText(input.text, MAX_TEXT)) return { ok: false, reason: "stale" };
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): ControllerInteractionAnswer => {
       const row = this.db.prepare(
@@ -411,6 +407,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
             AND generation.thread_id = controller.bb_thread_id
             AND generation.ended_at IS NULL
           WHERE interaction.controller_key = ?
+            AND turn.controller_key = interaction.controller_key
             AND interaction.state = 'pending'
             AND interaction.kind = 'user_question'
             AND controller.telegram_user_id = ?
@@ -442,7 +439,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     const row = this.currentInteractionRow(controllerKey, "answered");
     if (!row || row.answer_json === null || row.answered_at === null) return null;
     const stored = parseStoredRow(row);
-    const resolution = parseAnswer(row);
+    const resolution = stored ? parseAnswer(stored.interaction, row) : null;
     if (!stored || !resolution) return null;
     return { ...stored, resolution, answeredAt: row.answered_at };
   }
@@ -467,11 +464,16 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     input: ControllerLeaseFence,
     query: FencedTurnQuery,
   ): FencedTurn | undefined {
-    if (!this.executorFenceIsCurrent(input)) return undefined;
     return this.db.prepare(
       `SELECT controller.controller_key, controller.bb_thread_id,
               generation.id AS controller_generation_id
          FROM controller_turns AS turn
+         JOIN executor_lease AS lease
+           ON lease.singleton = 1
+          AND lease.owner_id = ?
+          AND lease.generation = ?
+          AND lease.lease_expires_at IS NOT NULL
+          AND lease.lease_expires_at > ?
          JOIN controller_threads AS controller
            ON controller.controller_key = turn.controller_key
           AND controller.state = 'active'
@@ -482,14 +484,20 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
           AND generation.thread_id = controller.bb_thread_id
           AND generation.ended_at IS NULL
         WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
           AND (SELECT COUNT(*) FROM controller_generations AS open_generation
                 WHERE open_generation.controller_key = controller.controller_key
                   AND open_generation.ended_at IS NULL) = 1`,
     ).get(
+      input.ownerId,
+      input.generation,
+      input.now,
       query.bbThreadId,
       query.generationId,
       query.turnId,
       query.controllerKey,
+      input.ownerId,
+      input.generation,
     ) as FencedTurn | undefined;
   }
 
@@ -501,7 +509,9 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
       `SELECT interaction.*
          FROM controller_interactions AS interaction
          JOIN controller_turns AS turn
-           ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+           ON turn.id = interaction.turn_id
+          AND turn.state = 'submitted'
+          AND turn.controller_key = interaction.controller_key
          JOIN controller_threads AS controller
            ON controller.controller_key = interaction.controller_key
           AND controller.state = 'active'
@@ -526,7 +536,9 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
       `SELECT interaction.*
          FROM controller_interactions AS interaction
          JOIN controller_turns AS turn
-           ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+           ON turn.id = interaction.turn_id
+          AND turn.state = 'submitted'
+          AND turn.controller_key = interaction.controller_key
          JOIN controller_threads AS controller
            ON controller.controller_key = interaction.controller_key
           AND controller.state = 'active'
@@ -556,13 +568,15 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     now: number,
   ): ControllerInteractionAnswer {
     const settled = mergedOwnerResolution(stored.interaction, stored.answers, matched);
+    const resolution = parseControllerInteractionResolution(stored.interaction, settled.resolution);
+    if (!resolution) return { ok: false, reason: "stale" };
     const updated = this.db.prepare(
       `UPDATE controller_interactions
           SET state = ?, answer_json = ?, answered_at = ?
         WHERE interaction_id = ? AND turn_id = ? AND controller_key = ? AND state = 'pending'`,
     ).run(
       settled.complete ? "answered" : "pending",
-      JSON.stringify(settled.resolution),
+      JSON.stringify(resolution),
       settled.complete ? now : null,
       row.interaction_id,
       stored.turnId,
@@ -575,7 +589,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         interactionId: stored.interactionId,
         turnId: stored.turnId,
         controllerKey: stored.controllerKey,
-        resolution: settled.resolution,
+        resolution,
       }
       : { ok: false, reason: "stale" };
   }

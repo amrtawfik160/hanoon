@@ -860,6 +860,60 @@ SELECT 'legacy_active_source_identity', CASE WHEN NOT EXISTS (
      )
 ) THEN 1 ELSE 0 END;
 
+INSERT INTO controller_interaction_migration_guard (invariant, valid)
+SELECT 'legacy_partial_answers', CASE WHEN NOT EXISTS (
+  SELECT 1
+    FROM controller_questions AS question
+   WHERE question.state IN ('pending', 'answered')
+     AND (
+       json_valid(question.questions_json) <> 1
+       OR json_type(question.questions_json) <> 'array'
+       OR EXISTS (
+         SELECT 1 FROM json_each(question.questions_json) AS question_item
+          WHERE json_type(question_item.value) <> 'object'
+             OR json_type(question_item.value, '$.id') <> 'text'
+             OR length(trim(COALESCE(json_extract(question_item.value, '$.id'), ''))) = 0
+             OR json_type(question_item.value, '$.options') <> 'array'
+       )
+       OR (
+         question.answers_json IS NOT NULL
+         AND (
+           json_valid(question.answers_json) <> 1
+           OR json_type(question.answers_json) <> 'object'
+           OR EXISTS (
+             SELECT 1 FROM json_each(question.answers_json) AS answer
+              WHERE json_type(answer.value) <> 'object'
+                 OR NOT EXISTS (
+                   SELECT 1
+                     FROM json_each(question.questions_json) AS question_item
+                    WHERE json_extract(question_item.value, '$.id') = answer.key
+                 )
+                 OR json_type(answer.value, '$.selected') <> 'array'
+                 OR EXISTS (
+                   SELECT 1
+                     FROM json_each(json(json_extract(answer.value, '$.selected'))) AS selected
+                    WHERE selected.type <> 'text'
+                       OR NOT EXISTS (
+                         SELECT 1
+                           FROM json_each(question.questions_json) AS question_item
+                           JOIN json_each(json(json_extract(question_item.value, '$.options'))) AS option
+                            ON json_extract(question_item.value, '$.id') = answer.key
+                          WHERE json_extract(option.value, '$.value') = selected.value
+                       )
+                 )
+                 OR (
+                   json_type(answer.value, '$.freeText') IS NOT NULL
+                   AND (
+                     json_type(answer.value, '$.freeText') <> 'text'
+                     OR length(COALESCE(json_extract(answer.value, '$.freeText'), '')) > 4000
+                   )
+                 )
+           )
+         )
+       )
+     )
+) THEN 1 ELSE 0 END;
+
 INSERT INTO controller_interactions (
   interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
   kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
@@ -877,17 +931,19 @@ SELECT
     'questions', json(question.questions_json)
   ),
   question.state,
-  CASE WHEN question.state = 'pending' THEN NULL ELSE question.answers_json END,
+  CASE WHEN question.state IN ('pending', 'answered') THEN question.answers_json ELSE NULL END,
   question.asked_at,
   question.answered_at,
   CASE WHEN question.state = 'delivered' THEN COALESCE(question.answered_at, question.asked_at) ELSE NULL END
 FROM controller_questions AS question
 LEFT JOIN controller_threads AS current_thread
-  ON current_thread.controller_key = question.controller_key
+  ON question.state <> 'delivered'
+ AND current_thread.controller_key = question.controller_key
  AND current_thread.state = 'active'
  AND current_thread.bb_thread_id IS NOT NULL
 LEFT JOIN controller_generations AS open_generation
-  ON open_generation.controller_key = question.controller_key
+  ON question.state <> 'delivered'
+ AND open_generation.controller_key = question.controller_key
  AND open_generation.thread_id = current_thread.bb_thread_id
  AND open_generation.ended_at IS NULL;
 

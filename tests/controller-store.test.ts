@@ -89,7 +89,7 @@ it("pins the exact shipped and controller trust migration bytes in order", () =>
     "4ec9eb259bbdce396ac0026c13ebd84ec71f25433092827cc9aae5fe903505d3",
   );
   expect(sha256(ALL_MIGRATIONS[29]!)).toBe(
-    "58eeb3c849ac5bbe7902eba39b1cedb9a25b0a3dfd4fbea73c88e1599fe493b9",
+    "d9afb52a02808d9d15c909afb30b87f7968fda5982a5d4359ce75549fdbb2c27",
   );
 });
 

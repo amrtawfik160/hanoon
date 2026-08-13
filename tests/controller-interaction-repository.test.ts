@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import {
   ControllerInteractionRepository,
+  type ControllerInteractionAnswer,
   type ControllerInteraction,
 } from "../src/storage/controller-interaction-repository";
 import {
@@ -62,6 +64,12 @@ function questionPayload(prompt = "Which option should I use?"): Record<string, 
       ],
     }],
   };
+}
+
+function questionPayloadQuestion(): Record<string, unknown> {
+  const question = (questionPayload().questions as unknown[])[0];
+  if (typeof question !== "object" || question === null) throw new Error("question fixture is malformed");
+  return question as Record<string, unknown>;
 }
 
 function currentInteractionFixture(): CurrentFixture {
@@ -155,7 +163,11 @@ function legacyQuestionDatabaseFixture() {
     turnId,
     threadId,
     generationId,
-    insertQuestion(state: "pending" | "answered" | "delivered", interactionId = "legacy_interaction") {
+    insertQuestion(
+      state: "pending" | "answered" | "delivered",
+      interactionId = "legacy_interaction",
+      answersJson = state === "pending" ? "{}" : JSON.stringify({ question_1: { selected: ["first"] } }),
+    ) {
       db.prepare(
         `INSERT INTO controller_questions (
            interaction_id, turn_id, controller_key, questions_json, state, answers_json, asked_at, answered_at
@@ -166,7 +178,7 @@ function legacyQuestionDatabaseFixture() {
         controllerKey,
         JSON.stringify(questionPayload().questions),
         state,
-        state === "pending" ? "{}" : JSON.stringify({ question_1: { selected: ["first"] } }),
+        answersJson,
         state === "pending" ? 2_000 : 2_001,
         state === "pending" ? null : 2_002,
       );
@@ -216,6 +228,116 @@ function recordInput(fixture: CurrentFixture, interaction: ControllerInteraction
   };
 }
 
+type InteractionRaceResult = ControllerInteractionAnswer;
+type InteractionRaceWorker = Readonly<{
+  child: ChildProcess;
+  result: Promise<InteractionRaceResult>;
+}>;
+
+function interactionRaceWorkerSource(): string {
+  return String.raw`
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { ControllerInteractionRepository } from "REPOSITORY_MODULE";
+
+const [dbPath, barrierDir, label, action, token] = process.argv.slice(2);
+if (!dbPath || !barrierDir || !label || !action) throw new Error("interaction race arguments are incomplete");
+const db = new Database(dbPath);
+db.pragma("busy_timeout = 5000");
+db.pragma("foreign_keys = ON");
+const repository = new ControllerInteractionRepository(db);
+writeFileSync(join(barrierDir, "ready-" + label), "ready");
+const wait = () => {
+  while (!existsSync(join(barrierDir, "go"))) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+};
+wait();
+const result = action === "button"
+  ? repository.answerByToken({ token, userId: "7", chatId: "70", now: 2_100 })
+  : repository.answerWithText({ controllerKey: "owner-7-controller", userId: "7", chatId: "70", text: "ordinary answer", now: 2_100 });
+process.stdout.write(JSON.stringify(result) + "\n");
+db.close();
+`;
+}
+
+function waitForInteractionRaceFile(path: string, timeoutMs = 5_000): Promise<void> {
+  return new Promise((resolveWait, rejectWait) => {
+    const startedAt = Date.now();
+    const poll = () => {
+      if (existsSync(path)) return resolveWait();
+      if (Date.now() - startedAt >= timeoutMs) return rejectWait(new Error(`interaction race barrier timed out: ${path}`));
+      setTimeout(poll, 5);
+    };
+    poll();
+  });
+}
+
+function startInteractionRaceWorker(
+  scriptPath: string,
+  fixture: CurrentFixture,
+  barrierDir: string,
+  label: string,
+  action: "button" | "text",
+  token = "",
+): InteractionRaceWorker {
+  const child = spawn(resolve("node_modules/.bin/vite-node"), [
+    "--script",
+    scriptPath,
+    fixture.db.name,
+    barrierDir,
+    label,
+    action,
+    token,
+  ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const result = new Promise<InteractionRaceResult>((resolveResult, rejectResult) => {
+    child.once("error", rejectResult);
+    child.once("close", (code) => {
+      if (code !== 0) {
+        rejectResult(new Error(`interaction race worker exited ${code}: ${stderr || stdout}`));
+        return;
+      }
+      const line = stdout.trim().split("\n").at(-1);
+      if (!line) {
+        rejectResult(new Error(`interaction race worker returned no result: ${stderr}`));
+        return;
+      }
+      try {
+        resolveResult(JSON.parse(line) as InteractionRaceResult);
+      } catch (error) {
+        rejectResult(new Error(`interaction race worker returned invalid JSON: ${stdout}`, { cause: error }));
+      }
+    });
+  });
+  return { child, result };
+}
+
+async function runInteractionRace(
+  fixture: CurrentFixture,
+  interaction: ControllerInteraction,
+  workers: readonly { label: string; action: "button" | "text"; token?: string }[],
+): Promise<InteractionRaceResult[]> {
+  const barrierDir = mkdtempSync(join(tmpdir(), "controller-interaction-race-"));
+  const scriptPath = join(barrierDir, "worker.ts");
+  writeFileSync(scriptPath, interactionRaceWorkerSource().replace("REPOSITORY_MODULE", resolve("src/storage/controller-interaction-repository.ts")));
+  const handles = workers.map((worker) => startInteractionRaceWorker(scriptPath, fixture, barrierDir, worker.label, worker.action, worker.token));
+  try {
+    await Promise.all(workers.map((worker) => waitForInteractionRaceFile(join(barrierDir, `ready-${worker.label}`))));
+    writeFileSync(join(barrierDir, "go"), "go");
+    return await Promise.all(handles.map((handle) => handle.result));
+  } finally {
+    for (const handle of handles) {
+      if (handle.child.exitCode === null) handle.child.kill("SIGKILL");
+    }
+    rmSync(barrierDir, { recursive: true, force: true });
+  }
+}
+
 it("pins the shipped migration bytes and appends the interaction migration", () => {
   expect(ALL_MIGRATIONS).toHaveLength(30);
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
@@ -256,9 +378,24 @@ it("copies legacy questions once, preserves their table, and restores the active
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 1 });
 });
 
+it("preserves and exposes a valid partial pending legacy answer", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  const partial = JSON.stringify({ question_1: { selected: [], freeText: "keep this answer" } });
+  fixture.insertQuestion("pending", "legacy_partial_interaction", partial);
+
+  fixture.migrateRemaining();
+
+  expect(fixture.db.prepare(
+    "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get("legacy_partial_interaction")).toEqual({ state: "pending", answer_json: partial });
+  expect(new ControllerInteractionRepository(fixture.db).getPending(fixture.controllerKey)).toMatchObject({
+    interactionId: "legacy_partial_interaction",
+    answers: { question_1: { selected: [], freeText: "keep this answer" } },
+  });
+});
+
 it("copies a delivered legacy row with null source identity", () => {
   const fixture = legacyQuestionDatabaseFixture();
-  fixture.db.prepare("UPDATE controller_threads SET bb_thread_id = NULL, state = 'pending_spawn'").run();
   fixture.insertQuestion("delivered");
 
   fixture.migrateRemaining();
@@ -293,6 +430,47 @@ it.each([
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_questions").get()).toEqual({ count: 1 });
 });
 
+it.each([
+  ["missing current controller thread", (fixture: ReturnType<typeof legacyQuestionDatabaseFixture>) => {
+    fixture.db.prepare("UPDATE controller_threads SET bb_thread_id = NULL, state = 'pending_spawn'").run();
+  }],
+  ["ambiguous open generation", (fixture: ReturnType<typeof legacyQuestionDatabaseFixture>) => {
+    fixture.db.prepare(
+      `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+       VALUES ('gen_legacy_ambiguous_answered', ?, 'thr_legacy_other', 2, NULL, NULL)`,
+    ).run(fixture.controllerKey);
+  }],
+] as const)("rolls back an answered legacy row for %s identity", (_name, changeSource) => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion("answered", "legacy_answered_identity");
+  changeSource(fixture);
+
+  expect(() => fixture.migrateRemaining()).toThrow();
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: SHIPPED_MIGRATION_COUNT,
+  });
+  expect(fixture.db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+  ).get()).toBeUndefined();
+});
+
+it.each([
+  ["invalid JSON", "{not-json"],
+  ["unknown question", JSON.stringify({ unknown: { selected: ["first"] } })],
+  ["unknown option", JSON.stringify({ question_1: { selected: ["third"] } })],
+] as const)("rolls back a pending legacy row with %s answers", (_name, answersJson) => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion("pending", "legacy_invalid_partial", answersJson);
+
+  expect(() => fixture.migrateRemaining()).toThrow();
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: SHIPPED_MIGRATION_COUNT,
+  });
+  expect(fixture.db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+  ).get()).toBeUndefined();
+});
+
 it("projects only safe controller approval decisions", () => {
   expect(parseControllerInteraction("approval_1", approvalPayload())).toEqual({
     kind: "approval",
@@ -305,6 +483,10 @@ it("projects only safe controller approval decisions", () => {
 it.each([
   ["a credential in the middle of the command", "echo before API_KEY=secret-value && echo after", "a redacted command"],
   ["callback-shaped command material", "curl --callback https://example.test/hook?token=secret-value", "a redacted command"],
+  ["a percent-encoded callback", "curl https%3A%2F%2Fexample.test%2Fcallback%3Ftoken%3Dsecret-value", "a redacted command"],
+  ["a percent-encoded credential URL", "open https%3A%2F%2Fuser%3Apass%40example.test", "a redacted command"],
+  ["a Unicode-normalized secret assignment", "ＰＡＳＳＷＯＲＤ＝secret-value", "a redacted command"],
+  ["a shell environment assignment", "FOO=bar npm test", "a redacted command"],
 ] as const)("redacts %s as a whole", (_name, command, expectedCommand) => {
   const projection = parseControllerInteraction("approval_secret", approvalPayload({
     subject: {
@@ -339,6 +521,10 @@ it.each([
   ["a safe basename", "/workspace/project/src/index.ts", "index.ts"],
   ["the filesystem root", "/", "a protected path"],
   ["a traversal to a secret file", "../../.env", "a protected path"],
+  ["a credentials suffix", "/workspace/credentials.json", "a protected path"],
+  ["a local environment file", "/workspace/.env.local", "a protected path"],
+  ["a private key suffix", "/workspace/private-key.txt", "a protected path"],
+  ["the shadow password file", "/etc/shadow", "a protected path"],
 ] as const)("confines %s to %s", (_name, writeScope, expectedPath) => {
   const projection = parseControllerInteraction("approval_path", {
     kind: "approval",
@@ -367,6 +553,85 @@ it("bounds oversized question values without persisting unbounded text", () => {
   expect(projection).toMatchObject({ kind: "user_question" });
   if (!projection || projection.kind !== "user_question") return;
   expect(projection.questions[0]?.prompt).toHaveLength(400);
+});
+
+it.each([
+  ["a callback in the prompt", questionPayload("please visit https%3A%2F%2Fexample.test%2Fcallback")],
+  ["a secret in an option label", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), options: [{ value: "first", label: "API_KEY=secret", description: null }] }],
+  }],
+  ["a credential in an option value", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), options: [{ value: "https%3A%2F%2Fuser%3Apass%40host", label: "First", description: null }] }],
+  }],
+] as const)("makes %s an unsupported projection", (_name, payload) => {
+  expect(parseControllerInteraction("unsafe_question", payload)).toEqual({
+    kind: "unsupported",
+    interactionId: "unsafe_question",
+  });
+});
+
+it("stores unsafe questions only as an unsupported projection", () => {
+  const fixture = currentInteractionFixture();
+  const unsafe: ControllerInteraction = {
+    kind: "user_question",
+    interactionId: "unsafe_persisted_question",
+    questions: [{
+      id: "question_1",
+      prompt: "callback https://example.test/hook",
+      shortLabel: null,
+      multiSelect: false,
+      allowFreeText: true,
+      options: [{ value: "first", label: "First", description: null }],
+    }],
+  };
+  expect(fixture.repository.record(recordInput(fixture, unsafe))).toBe(true);
+  expect(fixture.repository.getPending(fixture.controllerKey)).toMatchObject({
+    interaction: { kind: "unsupported", interactionId: unsafe.interactionId },
+  });
+  expect(fixture.db.prepare("SELECT payload_json FROM controller_interactions WHERE interaction_id = ?")
+    .get(unsafe.interactionId)).toMatchObject({ payload_json: expect.not.stringContaining("https://example.test/hook") });
+  closeCurrentFixture(fixture);
+});
+
+it("does not write unsafe owner text but keeps ordinary bounded text supported", () => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("unsafe_owner_text");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+
+  expect(fixture.repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "ＡＰＩ＿ＫＥＹ＝secret-value",
+    now: 2_100,
+  })).toEqual({ ok: false, reason: "stale" });
+  expect(fixture.db.prepare("SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?")
+    .get(interaction.interactionId)).toEqual({ state: "pending", answer_json: null });
+
+  expect(fixture.repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "use the first route",
+    now: 2_101,
+  })).toMatchObject({ ok: true, complete: true });
+  closeCurrentFixture(fixture);
+});
+
+it.each([
+  ["a corrupt approval envelope", "approval", JSON.stringify({ decision: "allow_once", grantedPermissions: "all" })],
+  ["a corrupt question answer", "question", JSON.stringify({ kind: "user_answer", answers: { question_1: { selected: ["unknown"] } } })],
+] as const)("fails closed on %s when reading persisted answers", (_name, kind, answerJson) => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction(`corrupt_${kind}`, kind === "approval" ? "approval" : "user_question");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  fixture.db.prepare(
+    "UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = ? WHERE interaction_id = ?",
+  ).run(answerJson, 2_100, interaction.interactionId);
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).toBeNull();
+  closeCurrentFixture(fixture);
 });
 
 it("records one identity and keeps an older interaction as the pointer", () => {
@@ -409,6 +674,63 @@ it.each([
     ...override,
   })).toBe(false);
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 0 });
+  closeCurrentFixture(fixture);
+});
+
+it("requires the submitted turn to adopt the executor lease before recording", () => {
+  const fixture = currentInteractionFixture();
+  fixture.db.prepare(
+    "UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = ?",
+  ).run(fixture.turnId);
+
+  expect(fixture.repository.record(recordInput(fixture, controllerInteraction("turn_lease_record")))).toBe(false);
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 0 });
+  closeCurrentFixture(fixture);
+});
+
+it("requires the submitted turn to retain the executor lease before resolving", () => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("turn_lease_resolve");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  fixture.db.prepare(
+    "UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = ?",
+  ).run(fixture.turnId);
+
+  expect(fixture.repository.markResolved({
+    ...fixture.fence,
+    now: 2_100,
+    interactionId: interaction.interactionId,
+    turnId: fixture.turnId,
+    bbThreadId: fixture.threadId,
+  })).toBe(false);
+  expect(fixture.db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = ?")
+    .get(interaction.interactionId)).toEqual({ state: "pending" });
+  closeCurrentFixture(fixture);
+});
+
+it("requires the submitted turn to retain the executor lease before delivery", () => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("turn_lease_deliver", "approval");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.answerByToken({
+    token: controllerInteractionToken(interaction.interactionId, "deny"),
+    userId: "7",
+    chatId: "70",
+    now: 2_100,
+  })).toMatchObject({ ok: true, complete: true });
+  fixture.db.prepare(
+    "UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = ?",
+  ).run(fixture.turnId);
+
+  expect(fixture.repository.markDelivered({
+    ...fixture.fence,
+    now: 2_200,
+    interactionId: interaction.interactionId,
+    turnId: fixture.turnId,
+    bbThreadId: fixture.threadId,
+  })).toBe(false);
+  expect(fixture.db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = ?")
+    .get(interaction.interactionId)).toEqual({ state: "answered" });
   closeCurrentFixture(fixture);
 });
 
@@ -536,6 +858,46 @@ it("rejects wrong or revoked owner identities", () => {
   closeCurrentFixture(fixture);
 });
 
+it("fails closed when an interaction is cross-bound to a different controller", () => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("cross_bound_owner");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  const otherControllerKey = "owner-7-controller-other";
+  const otherThreadId = "thr_controller_other";
+  const otherGenerationId = "gen_controller_other";
+  fixture.db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, project_id, host_id,
+       bb_thread_id, state, pending_spawn_token, last_error, created_at, updated_at
+     ) VALUES (?, '7', '70', 'proj_1', 'host_1', ?, 'active', NULL, NULL, 1, 1)`,
+  ).run(otherControllerKey, otherThreadId);
+  fixture.db.prepare(
+    `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+     VALUES (?, ?, ?, 1, NULL, NULL)`,
+  ).run(otherGenerationId, otherControllerKey, otherThreadId);
+  fixture.db.prepare(
+    `UPDATE controller_interactions
+        SET controller_key = ?, bb_thread_id = ?, controller_generation_id = ?
+      WHERE interaction_id = ?`,
+  ).run(otherControllerKey, otherThreadId, otherGenerationId, interaction.interactionId);
+
+  expect(fixture.repository.getPending(otherControllerKey)).toBeNull();
+  expect(fixture.repository.answerByToken({
+    token: questionOptionToken(interaction.interactionId, "question_1", "first"),
+    userId: "7",
+    chatId: "70",
+    now: 2_100,
+  })).toEqual({ ok: false, reason: "stale" });
+  expect(fixture.repository.answerWithText({
+    controllerKey: otherControllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "ordinary answer",
+    now: 2_101,
+  })).toEqual({ ok: false, reason: "stale" });
+  closeCurrentFixture(fixture);
+});
+
 it("allows exactly one winner for a two-connection button race", () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("interaction_button_race", "approval");
@@ -587,6 +949,34 @@ it("allows exactly one winner for a two-connection button versus text race", () 
     secondary.close();
     closeCurrentFixture(fixture);
   }
+});
+
+it("allows exactly one winner for a barrier-backed independent-worker button race", async () => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("interaction_worker_button_race", "approval");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  const results = await runInteractionRace(fixture, interaction, [
+    { label: "allow", action: "button", token: controllerInteractionToken(interaction.interactionId, "allow_once") },
+    { label: "deny", action: "button", token: controllerInteractionToken(interaction.interactionId, "deny") },
+  ]);
+  expect(results.filter((result) => result.ok)).toHaveLength(1);
+  expect(fixture.db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = ?")
+    .get(interaction.interactionId)).toEqual({ state: "answered" });
+  closeCurrentFixture(fixture);
+});
+
+it("allows exactly one winner for a barrier-backed independent-worker button versus text race", async () => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("interaction_worker_text_race");
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  const results = await runInteractionRace(fixture, interaction, [
+    { label: "button", action: "button", token: questionOptionToken(interaction.interactionId, "question_1", "first") },
+    { label: "text", action: "text" },
+  ]);
+  expect(results.filter((result) => result.ok)).toHaveLength(1);
+  expect(fixture.db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = ?")
+    .get(interaction.interactionId)).toEqual({ state: "answered" });
+  closeCurrentFixture(fixture);
 });
 
 it.each([

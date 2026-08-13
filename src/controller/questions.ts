@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { containsCredentialLikeText } from "../domain/state-machine";
 
 /** One selectable answer to a question the controller thread asked. */
 export type ControllerQuestionOption = {
@@ -39,36 +38,139 @@ const MAX_OPTIONS = 6;
 const MAX_PROMPT = 400;
 const MAX_LABEL = 60;
 const MAX_DESCRIPTION = 200;
+const MAX_CONTROLLER_TEXT = 4_000;
+const MAX_CANONICAL_SCAN = 16_384;
+const MAX_PERCENT_DECODE_LAYERS = 3;
+
+const SENSITIVE_CONTROLLER_TEXT_PATTERNS = [
+  /\bbearer\s+\S+/iu,
+  /\b(?:api[_-]?key|password|secret|token|credential)\s*[:=]\s*\S+/iu,
+  /\b(?:secret|token|password|credential)\b\s+(?:is\s+)?\S+/iu,
+  /(?:^|[\s;|&])(?:export\s+)?[A-Z_][A-Z0-9_]*=\S+/u,
+  /(?:^|[\s"'`])(?:export\s+)?[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|KEY|AUTH)[A-Z0-9_]*\s*=\s*\S+/iu,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/iu,
+  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|(?:sk|rk)-[A-Za-z0-9_-]{16,})\b/u,
+  /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/u,
+  /(?:https?|wss?):\/\/[^\s/@]+:[^\s/@]+@/iu,
+  /(?:https?|wss?):\/\/[^\s]*[?&](?:token|secret|password|api[_-]?key|credential|auth)=/iu,
+  /(?:callback|webhook)/iu,
+  /\b(?:curl|wget|httpie)\b[^\n]*(?:https?|wss?):\/\//iu,
+];
+
+const PROTECTED_BASENAME_MARKERS = [
+  ".env",
+  "credential",
+  "secret",
+  "private",
+  "shadow",
+  "passwd",
+  "password",
+  "token",
+  "id_rsa",
+  "authorized_keys",
+  ".pem",
+  ".p12",
+  ".pfx",
+  ".key",
+];
+
+function canonicalForms(value: string): string[] | null {
+  const forms: string[] = [];
+  let current = value.normalize("NFKC").trim();
+  if (current.length === 0 || current.length > MAX_CANONICAL_SCAN) return null;
+  forms.push(current);
+  for (let layer = 0; layer < MAX_PERCENT_DECODE_LAYERS; layer += 1) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(current).normalize("NFKC").trim();
+    } catch {
+      break;
+    }
+    if (decoded.length === 0 || decoded.length > MAX_CANONICAL_SCAN) return null;
+    forms.push(decoded);
+    if (decoded === current) break;
+    current = decoded;
+  }
+  return [...new Set(forms)];
+}
+
+function hasProtectedBasename(value: string): boolean {
+  const basename = value.replaceAll("\\", "/").split("/").filter(Boolean).at(-1);
+  if (!basename) return true;
+  const normalized = basename.toLowerCase();
+  return PROTECTED_BASENAME_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+/**
+ * Canonicalizes bounded controller text and scans every decoded form before
+ * clipping. A null result is never safe to persist or present.
+ */
+export function canonicalControllerText(
+  value: unknown,
+  limit: number,
+  mode: "text" | "path" = "text",
+): string | null {
+  if (typeof value !== "string") return null;
+  const forms = canonicalForms(value);
+  if (!forms) return null;
+  if (mode === "path" && forms.some(hasProtectedBasename)) return null;
+  if (forms.some((form) => SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form)))) {
+    return null;
+  }
+  const canonical = forms.at(-1);
+  if (!canonical) return null;
+  return canonical.length <= limit ? canonical : `${canonical.slice(0, limit - 1)}…`;
+}
+
+function boundedIdentity(value: unknown, limit: number): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.normalize("NFKC").trim();
+  if (normalized.length === 0 || normalized.length > limit) return null;
+  return canonicalControllerText(normalized, limit);
+}
 
 function boundedString(value: unknown, limit: number): string | null {
-  if (typeof value !== "string") return null;
-  const text = value.trim();
-  if (text.length === 0) return null;
-  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+  return canonicalControllerText(value, limit);
 }
 
 function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const value = typeof candidate.value === "string" ? candidate.value : null;
+  const value = boundedIdentity(candidate.value, 256);
   const label = boundedString(candidate.label, MAX_LABEL);
   if (!value || !label) return null;
-  return { value, label, description: boundedString(candidate.description, MAX_DESCRIPTION) };
+  const description = candidate.description === undefined || candidate.description === null
+    ? null
+    : boundedString(candidate.description, MAX_DESCRIPTION);
+  if (candidate.description !== undefined && candidate.description !== null && !description) return null;
+  return { value, label, description };
+}
+
+function parseQuestionOptions(raw: unknown): ControllerQuestionOption[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.length > MAX_OPTIONS) return null;
+  const options = raw.map(parseOption);
+  if (options.some((option) => option === null)) return null;
+  const parsedOptions = options.filter((option): option is ControllerQuestionOption => option !== null);
+  return new Set(parsedOptions.map((option) => option.value)).size === parsedOptions.length ? parsedOptions : null;
 }
 
 function parseQuestion(raw: unknown): ControllerQuestion | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const id = typeof candidate.id === "string" && candidate.id.length > 0 ? candidate.id : null;
+  const id = boundedIdentity(candidate.id, 128);
   const prompt = boundedString(candidate.prompt, MAX_PROMPT);
   if (!id || !prompt) return null;
-  const options = Array.isArray(candidate.options)
-    ? candidate.options.slice(0, MAX_OPTIONS).map(parseOption).filter((option): option is ControllerQuestionOption => option !== null)
-    : [];
+  const options = parseQuestionOptions(candidate.options);
+  if (!options) return null;
+  const shortLabel = candidate.shortLabel === undefined || candidate.shortLabel === null
+    ? null
+    : boundedString(candidate.shortLabel, MAX_LABEL);
+  if (candidate.shortLabel !== undefined && candidate.shortLabel !== null && !shortLabel) return null;
   return {
     id,
     prompt,
-    shortLabel: boundedString(candidate.shortLabel, MAX_LABEL),
+    shortLabel,
     multiSelect: candidate.multiSelect === true,
     allowFreeText: candidate.allowFreeText !== false,
     options,
@@ -85,12 +187,14 @@ export function parsePendingQuestion(interactionId: unknown, payload: unknown): 
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind !== "user_question" || !Array.isArray(candidate.questions)) return null;
-  const questions = candidate.questions
-    .slice(0, MAX_QUESTIONS)
-    .map(parseQuestion)
-    .filter((question): question is ControllerQuestion => question !== null);
-  if (questions.length === 0) return null;
-  return { interactionId, questions };
+  if (candidate.questions.length > MAX_QUESTIONS) return null;
+  const questions = candidate.questions.map(parseQuestion);
+  if (questions.some((question) => question === null)) return null;
+  const parsedQuestions = questions.filter((question): question is ControllerQuestion => question !== null);
+  if (parsedQuestions.length === 0 || new Set(parsedQuestions.map((question) => question.id)).size !== parsedQuestions.length) {
+    return null;
+  }
+  return { interactionId, questions: parsedQuestions };
 }
 
 const CONTROLLER_APPROVAL_DECISIONS: readonly ControllerApprovalDecision[] = ["allow_once", "deny"];
@@ -99,33 +203,14 @@ const MAX_CONTROLLER_APPROVAL_SUMMARY = 400;
 const MAX_CONTROLLER_QUESTION_ID = 128;
 const MAX_CONTROLLER_OPTION_VALUE = 256;
 const PROTECTED_PATH_TEXT = "a protected path";
-const SENSITIVE_COMMAND_PATTERNS = [
-  /\bbearer\s+\S+/i,
-  /\b(?:api[_-]?key|password|secret|token|credential)\s*[:=]\s*\S+/i,
-  /\b(?:secret|token|password|credential)\b\s+(?:is\s+)?\S+/i,
-  /[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|APIKEY)[A-Z0-9_]*\s*[:=]\s*\S+/i,
-  /(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=[^\s]+/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,
-  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,})\b/,
-  /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/,
-  /\b(?:https?|wss?):\/\/[^\s/@]+:[^\s/@]+@/i,
-  /\b(?:callback|webhook)\b/i,
-  /\b(?:curl|wget|httpie)\b[^\n]*(?:https?|wss?):\/\//i,
-];
-
-function controllerCommandContainsSensitiveMaterial(command: string): boolean {
-  return containsCredentialLikeText(command) || SENSITIVE_COMMAND_PATTERNS.some((pattern) => pattern.test(command));
-}
 
 function safePathBasename(value: unknown): string {
-  if (typeof value !== "string") return PROTECTED_PATH_TEXT;
-  const normalized = value.replaceAll("\\", "/").trim();
+  const canonical = canonicalControllerText(value, 80, "path");
+  if (!canonical) return PROTECTED_PATH_TEXT;
+  const normalized = canonical.replaceAll("\\", "/").trim();
   const segments = normalized.split("/").filter((segment) => segment.length > 0);
   const basename = segments.at(-1);
   if (!basename || basename === "." || basename === ".." || segments.includes("..")) return PROTECTED_PATH_TEXT;
-  if (/^(?:\.env|.*(?:credentials?|secrets?|private[_-]?key|\.pem|\.key))$/i.test(basename)) {
-    return PROTECTED_PATH_TEXT;
-  }
   if (!/^[A-Za-z0-9._-]{1,80}$/.test(basename)) return PROTECTED_PATH_TEXT;
   return basename;
 }
@@ -140,9 +225,7 @@ function controllerApprovalSummary(subject: Record<string, unknown>): string | n
   if (subject.kind === "command") {
     const rawCommand = typeof subject.command === "string" ? subject.command.trim() : "";
     if (rawCommand.length === 0) return null;
-    const command = controllerCommandContainsSensitiveMaterial(rawCommand)
-      ? "a redacted command"
-      : boundedString(rawCommand, MAX_PROMPT);
+    const command = canonicalControllerText(rawCommand, MAX_PROMPT) ?? "a redacted command";
     if (!command) return null;
     const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
       ? safePathBasename(subject.cwd)
@@ -211,6 +294,99 @@ export function parseControllerInteraction(
   if (candidate.kind === "user_question") return parseControllerQuestionProjection(interactionId, payload);
   if (candidate.kind !== "approval") return { kind: "unsupported", interactionId };
   return parseControllerApprovalProjection(interactionId, candidate);
+}
+
+function strictAnswerText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.normalize("NFKC").trim();
+  if (normalized.length === 0 || normalized.length > MAX_CONTROLLER_TEXT) return null;
+  return canonicalControllerText(normalized, MAX_CONTROLLER_TEXT);
+}
+
+function parseSelectedOptions(
+  question: ControllerQuestion,
+  selectedValue: unknown,
+): string[] | null {
+  if (!Array.isArray(selectedValue) || selectedValue.some((option) => typeof option !== "string")) return null;
+  const selected = selectedValue as string[];
+  if (!question.multiSelect && selected.length > 1) return null;
+  if (new Set(selected).size !== selected.length) return null;
+  return selected.every((option) => question.options.some((candidate) => candidate.value === option))
+    ? [...selected]
+    : null;
+}
+
+function parseQuestionAnswer(
+  question: ControllerQuestion,
+  rawAnswer: unknown,
+): ControllerQuestionAnswers[string] | null {
+  if (typeof rawAnswer !== "object" || rawAnswer === null || Array.isArray(rawAnswer)) return null;
+  const candidate = rawAnswer as Record<string, unknown>;
+  const keys = Object.keys(candidate);
+  if (keys.some((key) => key !== "selected" && key !== "freeText") || !("selected" in candidate)) return null;
+  const selected = parseSelectedOptions(question, candidate.selected);
+  if (!selected) return null;
+  const parsed: ControllerQuestionAnswers[string] = { selected };
+  if (!("freeText" in candidate)) return parsed;
+  if (!question.allowFreeText) return null;
+  const freeText = strictAnswerText(candidate.freeText);
+  return freeText ? { ...parsed, freeText } : null;
+}
+
+function parseControllerQuestionAnswers(
+  value: unknown,
+  questions: readonly ControllerQuestion[],
+): ControllerQuestionAnswers | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const byId = new Map(questions.map((question) => [question.id, question]));
+  const answers: ControllerQuestionAnswers = {};
+  for (const [questionId, rawAnswer] of Object.entries(candidate)) {
+    const question = byId.get(questionId);
+    const parsed = question ? parseQuestionAnswer(question, rawAnswer) : null;
+    if (!parsed) return null;
+    answers[questionId] = parsed;
+  }
+  return answers;
+}
+
+function parseApprovalResolution(
+  interaction: Extract<ControllerInteraction, { kind: "approval" }>,
+  value: unknown,
+): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.decision === "allow_once" && Object.keys(candidate).length === 2 &&
+    candidate.grantedPermissions === null && interaction.decisions.includes("allow_once")) {
+    return { decision: "allow_once", grantedPermissions: null };
+  }
+  if (candidate.decision === "deny" && Object.keys(candidate).length === 1 && interaction.decisions.includes("deny")) {
+    return { decision: "deny" };
+  }
+  return null;
+}
+
+function parseQuestionResolution(
+  interaction: Extract<ControllerInteraction, { kind: "user_question" }>,
+  value: unknown,
+): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const answerMap = candidate.kind === "user_answer"
+    ? Object.keys(candidate).length === 2 && "answers" in candidate ? candidate.answers : null
+    : value;
+  const answers = parseControllerQuestionAnswers(answerMap, interaction.questions);
+  return answers ? { kind: "user_answer", answers } : null;
+}
+
+/** Validates the exact durable resolution envelope against one stored interaction. */
+export function parseControllerInteractionResolution(
+  interaction: ControllerInteraction,
+  value: unknown,
+): Record<string, unknown> | null {
+  if (interaction.kind === "approval") return parseApprovalResolution(interaction, value);
+  if (interaction.kind === "user_question") return parseQuestionResolution(interaction, value);
+  return null;
 }
 
 /**

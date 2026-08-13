@@ -16,6 +16,25 @@ import { controllerInteractionToken } from "../src/controller/questions";
 
 const FENCE = { ownerId: "executor", generation: 1, now: 2_000 };
 
+class LeaseLossRepository extends ControllerInteractionRepository {
+  private calls = 0;
+
+  public constructor(
+    private readonly database: Database.Database,
+    private readonly loseOnCall: number,
+  ) {
+    super(database);
+  }
+
+  public override isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean {
+    this.calls += 1;
+    if (this.calls === this.loseOnCall) {
+      this.database.prepare("UPDATE executor_lease SET owner_id = 'successor', generation = 2 WHERE singleton = 1").run();
+    }
+    return super.isExecutorLeaseCurrent(ownerId, generation, now);
+  }
+}
+
 function setup() {
   const directory = mkdtempSync(join(tmpdir(), "telegram-controller-interaction-service-"));
   const db = new Database(join(directory, "service.sqlite"));
@@ -66,6 +85,7 @@ function setup() {
   });
   return {
     db,
+    dbPath: db.name,
     directory,
     repository,
     controllerKey,
@@ -86,6 +106,9 @@ function setup() {
     close() {
       db.close();
       rmSync(directory, { recursive: true, force: true });
+    },
+    closeDatabase() {
+      db.close();
     },
   };
 }
@@ -176,12 +199,87 @@ it("does not contact BB from a stale executor fence", async () => {
   fixture.close();
 });
 
+it("fails closed when the fence is lost immediately before authoritative resolve", async () => {
+  const fixture = setup();
+  let current = remote(fixture, "pending");
+  const resolve = vi.fn(async () => {
+    current = remote(fixture, "resolved");
+    return current;
+  });
+  const get = vi.fn(async () => current);
+  const repository = new LeaseLossRepository(fixture.db, 3);
+  const service = new ControllerInteractionService({ store: repository, interactions: { get, resolve } });
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
+  expect(resolve).not.toHaveBeenCalled();
+  expect(repository.getAnswered(fixture.controllerKey)).not.toBeNull();
+  fixture.close();
+});
+
+it("fails closed when the fence is lost immediately before local mark-delivered", async () => {
+  const fixture = setup();
+  const { get, resolve } = fixture.service(remote(fixture, "resolved"));
+  const repository = new LeaseLossRepository(fixture.db, 3);
+  const service = new ControllerInteractionService({ store: repository, interactions: { get, resolve } });
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
+  expect(resolve).not.toHaveBeenCalled();
+  expect(repository.getAnswered(fixture.controllerKey)).not.toBeNull();
+  fixture.close();
+});
+
+it("keeps an ambiguous resolve available for an authoritative retry", async () => {
+  const fixture = setup();
+  let current = remote(fixture, "pending");
+  const resolve = vi.fn(async () => remote(fixture, "resolving"));
+  const first = fixture.service(current, resolve);
+
+  await expect(first.service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
+  expect(resolve).toHaveBeenCalledTimes(1);
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).not.toBeNull();
+
+  current = remote(fixture, "resolved");
+  const secondGet = vi.fn(async () => current);
+  const secondResolve = vi.fn(async () => current);
+  const secondService = new ControllerInteractionService({
+    store: fixture.repository,
+    interactions: { get: secondGet, resolve: secondResolve },
+  });
+  await expect(secondService.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(true);
+  expect(secondGet).toHaveBeenCalledTimes(1);
+  expect(secondResolve).not.toHaveBeenCalled();
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).toBeNull();
+  fixture.close();
+});
+
+it("recovers the durable answer after a real database close and reopen", async () => {
+  const fixture = setup();
+  const dbPath = fixture.dbPath;
+  const directory = fixture.directory;
+  fixture.closeDatabase();
+  const reopened = new Database(dbPath);
+  reopened.pragma("busy_timeout = 5000");
+  reopened.pragma("foreign_keys = ON");
+  const repository = new ControllerInteractionRepository(reopened);
+  const get = vi.fn(async () => remote(fixture, "resolved"));
+  const resolve = vi.fn(async () => remote(fixture, "resolved"));
+  const service = new ControllerInteractionService({ store: repository, interactions: { get, resolve } });
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(true);
+  expect(get).toHaveBeenCalledTimes(1);
+  expect(resolve).not.toHaveBeenCalled();
+  expect(repository.getAnswered(fixture.controllerKey)).toBeNull();
+  reopened.close();
+  rmSync(directory, { recursive: true, force: true });
+});
+
 it("does not resolve twice after a crash between BB resolution and local delivery", async () => {
   const fixture = setup();
   let current = remote(fixture, "pending");
   const resolve = vi.fn(async () => {
     current = remote(fixture, "resolved");
     fixture.db.prepare("UPDATE executor_lease SET owner_id = 'successor', generation = 2 WHERE singleton = 1").run();
+    fixture.db.prepare("UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = ?").run(fixture.turnId);
     return current;
   });
   const firstGet = vi.fn(async () => current);
