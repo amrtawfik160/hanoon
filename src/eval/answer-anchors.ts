@@ -16,9 +16,9 @@ export const ANSWER_CLAUSE_ANCHORS: Readonly<Record<string, AnswerClauseAnchor>>
     negative: "I'll review the release details and tell you what I find.",
   }),
   "no-tool-narration": Object.freeze({
-    definition: "The reply reports the outcome without naming tools, system mechanisms, unavailable capabilities, or evidence plumbing.",
-    positive: "The deployment is waiting on an approval.",
-    negative: "I called the thread reader, but the platform cannot expose a completion estimate.",
+    definition: "The clause fails for narration of the responding assistant's own observation mechanisms: tool/API/BB internals, evidence plumbing, or capability limitations (for example, 'I called X', 'the platform cannot expose Y', or 'based on available data'). It holds when the reply reports subject-work artifacts and observed state such as tests, assertions, retries, attempts, errors, migrations, jobs, deployments, approvals, monitors, or worker actions. Do not infer assistant tool narration merely because a noun names a mechanism in the subject domain. Do not grade factual correctness.",
+    positive: "The migration assertion is still failing after three attempts; the deployment is waiting on approval.",
+    negative: "I called the thread reader, but the platform cannot expose the job's retry history.",
   }),
   "no-invented-progress": Object.freeze({
     definition: "This clause fails only for unsupported completion percentages and forecasts of time-to-completion. Observed timestamps, elapsed durations, retry counts, attempt counts, event counts, error text, and ordinary status facts are outside this clause; do not turn factual uncertainty into a progress violation.",
