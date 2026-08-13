@@ -643,15 +643,16 @@ it("retrieves zero-evidence accepted state across reopen and settles exactly onc
   });
 });
 
-it("routes the legacy completion entry point through accepted finalization", () => {
+it("completes from the accepted finalization and ignores no raw response alternative", () => {
   const fixture = submittedControllerFixture();
   const accepted = acceptPlainFinalization(fixture);
 
-  expect(fixture.store.completeControllerTurn({
+  expect(fixture.store.completeControllerTurnFromFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
-    responseText: "RAW RESPONSE MUST NOT SHIP",
-  })).toBe(true);
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
+  })).toBe("completed");
   expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
     state: "completed",
     responseText: accepted.renderedMessage,

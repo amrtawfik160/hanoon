@@ -13,6 +13,7 @@ import {
   subjectsContradict,
 } from "../src/storage/memory-ranking";
 import { MemoryCurationService, recallOutcome } from "../src/services/memory-curation-service";
+import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 const CONTROLLER_KEY = "owner-7-controller";
@@ -64,7 +65,7 @@ function completedTurn(
     })).toBe(true);
   }
   store.markControllerTurnSubmitted({ ...fence, turnId: turn.id });
-  store.completeControllerTurn({ ...fence, turnId: turn.id, responseText: "an answer" });
+  completeAcceptedControllerTurn(store, turn, fence, "an answer");
   // Released so a later turn in the same test can take the singleton lease.
   store.releaseExecutorLease(fence.ownerId, fence.generation, now);
   return turn;

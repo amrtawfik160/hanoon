@@ -5,6 +5,7 @@ import type { ControllerTurnRecord } from "../src/controller/models";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore } from "../src/storage/store";
+import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -240,7 +241,7 @@ it("claims exactly one FIFO turn while a controller turn is dispatching or submi
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: first.id, ...fence })).toBe(true);
   expect(store.claimNextControllerTurn(fence)).toBeNull();
-  expect(store.completeControllerTurn({ turnId: first.id, ...fence, responseText: "Hello." })).toBe(true);
+  completeAcceptedControllerTurn(store, first, fence, "Hello.");
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ updateId: 202, ordinal: 2 });
 });
 
@@ -685,7 +686,7 @@ it("keeps one durable Telegram message id from controller placeholder through li
   const edit = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
   expect(edit).toHaveLength(1);
   expect(store.completeOutbox(edit[0]!.logicalKey, fence.ownerId, fence.generation, 501, fence.now)).toBe(true);
-  expect(store.completeControllerTurn({ turnId: turn.id, responseText: "Hello final", ...fence })).toBe(true);
+  completeAcceptedControllerTurn(store, turn, fence, "Hello final");
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     messageId: 501,
     status: "pending",
@@ -799,7 +800,7 @@ it("fails and retires a submitted controller turn in one fenced operation", () =
     .toBe("I couldn't complete that controller turn safely. Please resend your request.");
 });
 
-it("sends a controller answer as Telegram HTML so its formatting renders", () => {
+it("sends the accepted controller answer as the durable finalization text", () => {
   const { store } = fixture();
   const turn = store.enqueueControllerTurn(turnInput(701));
   const fence = acquire(store);
@@ -821,15 +822,11 @@ it("sends a controller answer as Telegram HTML so its formatting renders", () =>
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
 
-  expect(store.completeControllerTurn({
-    turnId: turn.id,
-    ...fence,
-    responseText: "**Reduce complexity** — active\n- one item",
-  })).toBe(true);
+  completeAcceptedControllerTurn(store, turn, fence, "**Reduce complexity** — active\n- one item");
 
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
-    text: "<b>Reduce complexity</b> — active\n• one item",
-    parse_mode: "HTML",
+    text: "**Reduce complexity** — active\n- one item",
+    disable_web_page_preview: true,
   });
 });
 

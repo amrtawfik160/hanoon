@@ -1875,11 +1875,6 @@ export interface TelegramAgentStore {
     error: string;
     ownerMessage?: string;
   }): boolean;
-  completeControllerTurn(input: ControllerLeaseFence & {
-    turnId: string;
-    responseText: string;
-    leaseMs?: number;
-  }): boolean;
   failControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     error: string;
@@ -4405,65 +4400,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.ownerMessage),
         input.now,
       );
-      return true;
-    }).immediate();
-  }
-
-  public completeControllerTurn(input: ControllerLeaseFence & {
-    turnId: string;
-    responseText: string;
-    leaseMs?: number;
-  }): boolean {
-    this.assertControllerMutation(input);
-    const accepted = this.controllerEvidenceRepository.getAcceptedFinalization(input.turnId);
-    if (accepted) {
-      if (accepted.bbEventHighWaterSeq === null) return false;
-      const turn = this.getControllerTurn(input.turnId);
-      if (!turn) return false;
-      return this.completeControllerTurnFromFinalization({
-        ownerId: input.ownerId,
-        generation: input.generation,
-        now: input.now,
-        turnId: input.turnId,
-        controllerKey: turn.controllerKey,
-        bbHighWaterSeq: accepted.bbEventHighWaterSeq,
-      }) === "completed";
-    }
-    assertControllerText(input.responseText, "controller response");
-    return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const row = this.db.prepare(
-        `SELECT turn.*, controller.telegram_chat_id FROM controller_turns AS turn
-           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
-           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
-            AND owners.telegram_user_id = controller.telegram_user_id
-            AND owners.telegram_chat_id = controller.telegram_chat_id
-          WHERE turn.id = ? AND turn.state = 'submitted'`,
-      ).get(input.turnId) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
-      if (!row) return false;
-      const updated = this.db.prepare(
-        `UPDATE controller_turns
-            SET state = 'completed', response_text = ?, stream_text = ?,
-                stream_phase = 'complete', last_error = NULL,
-                completed_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'submitted'`,
-      ).run(input.responseText, input.responseText, input.now, input.now, input.turnId);
-      if (updated.changes !== 1) return false;
-      // The digest commits with the turn, so a crash can never leave a delivered
-      // answer that the next thread has no record of.
-      this.appendControllerDigestRow({
-        controllerKey: row.controller_key,
-        ordinal: row.ordinal,
-        ownerText: row.input_text,
-        agentText: input.responseText,
-        now: input.now,
-      });
-      const outbox: OutboxInput = {
-        logicalKey: `controller:${input.turnId}:reply`,
-        chatId: row.telegram_chat_id,
-        payload: { ...formattedMessage(input.responseText), disable_web_page_preview: true },
-      };
-      persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();
   }

@@ -7,6 +7,7 @@ import {
   TelegramPresenceCoordinator,
 } from "../src/services/telegram-presence";
 import type { JobLaneSnapshot } from "../src/services/job-lane-runner";
+import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -82,11 +83,7 @@ describe("Telegram presence target resolution", () => {
       chatId: "70",
     });
 
-    expect(queued.store.completeControllerTurn({
-      ...queued.fence,
-      turnId: queued.turn.id,
-      responseText: "Done.",
-    })).toBe(true);
+    completeAcceptedControllerTurn(queued.store, queued.turn, queued.fence, "Done.");
     expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toBeNull();
   });
 

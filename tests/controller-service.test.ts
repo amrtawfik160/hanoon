@@ -14,6 +14,7 @@ import {
   type ControllerExecutionProfile,
 } from "../src/controller/execution-profile";
 import { LunaControllerService } from "../src/controller/service";
+import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
 
 const evidenceProjector = {
   reconcile: vi.fn(async (...args: unknown[]) => ({
@@ -1439,7 +1440,7 @@ it("reports a streaming turn only while its answer is still arriving", async () 
   expect(store.markControllerTurnSubmitted({ ...claim, turnId: turn.id })).toBe(true);
   expect(service.isStreaming()).toBe(true);
 
-  expect(store.completeControllerTurn({ ...claim, turnId: turn.id, responseText: "Answered." })).toBe(true);
+  completeAcceptedControllerTurn(store, turn, claim, "Answered.");
   expect(service.isStreaming()).toBe(false);
 });
 

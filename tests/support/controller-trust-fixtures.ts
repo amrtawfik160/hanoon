@@ -2,9 +2,9 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { expect, vi } from "vitest";
 import { hashSecret } from "../../src/crypto";
-import type { ControllerTurnRecord } from "../../src/controller/models";
+import type { ControllerLeaseFence, ControllerTurnRecord } from "../../src/controller/models";
 import { registerControllerTools } from "../../src/controller/tools";
-import { openStore } from "../../src/storage/store";
+import { openStore, type TelegramAgentStore } from "../../src/storage/store";
 import { policyFixture } from "../helpers";
 
 let fixtureNumber = 0;
@@ -128,6 +128,41 @@ export function validEvidenceInput(turn: ControllerTurnRecord) {
     proofKinds: ["project_state"] as const,
     subjectRefs: ["project:proj_1"] as const,
   };
+}
+
+export function completeAcceptedControllerTurn(
+  store: TelegramAgentStore,
+  turnOrId: ControllerTurnRecord | string,
+  fence: ControllerLeaseFence,
+  responseText: string,
+): void {
+  const turn = typeof turnOrId === "string" ? store.getControllerTurn(turnOrId) : turnOrId;
+  if (!turn) throw new Error("controller completion fixture turn is missing");
+  if (!store.adoptSubmittedControllerTurnFence({ ...fence, turnId: turn.id })) {
+    throw new Error("controller completion fixture could not adopt the submitted turn");
+  }
+  const accepted = store.proposeControllerFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: responseText }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") {
+    throw new Error(`controller completion fixture finalization was ${accepted.outcome}`);
+  }
+  const current = store.getControllerTurn(turn.id);
+  if (!current) throw new Error("controller completion fixture turn disappeared");
+  const completed = store.completeControllerTurnFromFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbHighWaterSeq: current.evidenceEventSeq,
+  });
+  if (completed !== "completed") throw new Error(`controller completion fixture returned ${completed}`);
 }
 
 export function insertControllerTestJob(

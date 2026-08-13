@@ -16,6 +16,7 @@ import type { WorkerLiveness } from "../src/domain/models";
 import { AutonomyRepository } from "../src/storage/autonomy-repository";
 import { AutonomyScheduler } from "../src/autonomy/scheduler";
 import { policyFixture } from "./helpers";
+import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -1354,13 +1355,11 @@ describe("singleton job executor", () => {
       controller: {
         reconcile: vi.fn(async (fence) => {
           if (loop === 1) {
-            expect(store.completeControllerTurn({
+            completeAcceptedControllerTurn(store, turnId, {
               ownerId: fence.ownerId,
               generation: fence.generation,
               now: 2_000,
-              turnId,
-              responseText: "Final answer",
-            })).toBe(true);
+            }, "Final answer");
           }
           return true;
         }),
@@ -1408,13 +1407,11 @@ describe("singleton job executor", () => {
           // The owner reads the answer and immediately asks the next question,
           // while Telegram still shows the previous 30-second preview.
           if (loop === 1) {
-            expect(store.completeControllerTurn({
+            completeAcceptedControllerTurn(store, firstTurnId, {
               ownerId: fence.ownerId,
               generation: fence.generation,
               now: 2_000,
-              turnId: firstTurnId,
-              responseText: "First answer",
-            })).toBe(true);
+            }, "First answer");
             submitAnotherControllerTurn(store, fence, 901, 2_000);
           }
           return true;

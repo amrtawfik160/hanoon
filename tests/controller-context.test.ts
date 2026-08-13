@@ -7,6 +7,7 @@ import {
   composeTurnInput,
   detectStandingInstruction,
 } from "../src/controller/context";
+import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
 
 const NOW = 1_800_000_000_000;
 
@@ -158,11 +159,7 @@ describe("conversation digest durability", () => {
     })).toBe(true);
     expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
 
-    expect(store.completeControllerTurn({
-      ...fence,
-      turnId: turn.id,
-      responseText: "Two threads are running.",
-    })).toBe(true);
+    completeAcceptedControllerTurn(store, turn, fence, "Two threads are running.");
 
     expect(store.readControllerDigest("owner-7-controller", 5)).toEqual([
       { ownerText: "what is running?", agentText: "Two threads are running." },
