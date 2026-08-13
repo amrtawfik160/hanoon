@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import * as controllerScenarioContract from "../src/eval/controller-scenario-contract";
 import {
   aggregateControllerEvaluation,
   parseControllerScenarioCorpus,
@@ -122,4 +123,116 @@ describe("controller scenario contract", () => {
       ],
     });
   });
+
+  it.each([
+    ["scenario version", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({ ...currentTrial, scenarioVersion: currentTrial.scenarioVersion + 1 })),
+      scenarios: report.scenarios,
+    })],
+    ["outer task tools", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, outerTaskTools: ["different-task-tool"] },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["provider", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, provider: "different-provider" },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["context digest", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, contextSha256: "1".repeat(64) },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["budget", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        budget: { ...currentTrial.budget, maxTokens: currentTrial.budget.maxTokens + 1 },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["grader version", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        outcome: { ...currentTrial.outcome, graderVersion: currentTrial.outcome.graderVersion + 1 },
+      })),
+      scenarios: report.scenarios,
+    })],
+  ] as const)("rejects a fixed comparison with a different %s", (_difference, mutate) => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations;
+    expect(typeof compare).toBe("function");
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial()],
+    });
+    const after = mutate(baseline) as typeof baseline;
+    expect(() => (compare as (input: unknown) => unknown)({ baseline, after })).toThrow(/comparable|scenario|budget|grader|tool|provider/i);
+  });
+
+  it("reports comparable denominators and new scenarios without averaging safety failures", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations;
+    expect(typeof compare).toBe("function");
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial(), trial({ trial: 2 })],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [
+        trial(),
+        trial({ trial: 2, outcome: { ...baseTrial.outcome, status: "failed" } }),
+        trial({ scenarioId: "new-safety-case" }),
+      ],
+    });
+    const comparison = (compare as (input: unknown) => {
+      status: string;
+      common: Array<{ baseline: { passed: number; denominator: number }; after: { passed: number; denominator: number } }>;
+      newScenarios: Array<{ scenarioId: string; denominator: number }>;
+      intervention: { baseline: unknown; after: unknown };
+    })({ baseline, after });
+
+    expect(comparison).toMatchObject({
+      status: "comparable",
+      common: [{ scenarioId: "plain-conversation", baseline: { passed: 2, denominator: 2 }, after: { passed: 1, denominator: 2 } }],
+      newScenarios: [{ scenarioId: "new-safety-case", denominator: 1 }],
+    });
+    expect(comparison.intervention.baseline).toBeDefined();
+    expect(comparison.intervention.after).toBeDefined();
+    expect(comparison).not.toHaveProperty("percentage");
+    expect(comparison).not.toHaveProperty("average");
+  });
+
+  it("rejects a common scenario whose trial denominators differ", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial(), trial({ trial: 2 })],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial()],
+    });
+
+    expect(() => (compare as (input: unknown) => unknown)({ baseline, after }))
+      .toThrow(/trial|denominator|comparable/i);
+  });
 });
+
+type ControllerScenarioContractReport = ReturnType<typeof aggregateControllerEvaluation>;

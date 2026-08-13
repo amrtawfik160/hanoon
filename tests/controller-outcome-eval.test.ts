@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
+import { aggregateControllerEvaluation } from "../src/eval/controller-scenario-contract";
 import { runControllerScenarioTrials } from "./support/controller-scenario-harness";
 
 type RunnerModule = {
@@ -105,14 +106,23 @@ it("rejects an in-repository output whose first segment begins with two dots", a
   }
 });
 
-it("fails closed for checkpoints without a Task 2 scenario harness", async () => {
+it("runs the cumulative kernel checkpoint with its fixed safety cases", async () => {
   const output = evaluationOutput();
-  await expect(execFileAsync(process.execPath, [
+  await execFileAsync(process.execPath, [
     "scripts/eval-controller-outcomes.mjs",
     "--checkpoint", "kernel",
     "--trials", "1",
     "--output", output,
-  ])).rejects.toMatchObject({ code: 1 });
+  ]);
+  const report = JSON.parse(readFileSync(output, "utf8")) as {
+    status: string;
+    scenarios: Array<{ scenarioId: string; denominator: number; passed: number }>;
+  };
+  expect(report.status).toBe("passed");
+  expect(report.scenarios).toEqual(expect.arrayContaining([
+    expect.objectContaining({ scenarioId: "duplicate-mutation-replay", denominator: 1, passed: 1 }),
+    expect.objectContaining({ scenarioId: "stale-capability-fence", denominator: 1, passed: 1 }),
+  ]));
 });
 
 it("records the current job status through the registered controller tool", async () => {
@@ -164,6 +174,20 @@ it("labels exactly one non-fixed provider trial as smoke evidence", async () => 
   ])).toBe("smoke");
 });
 
+it("labels fixed-scenario identity variation as strong evidence", async () => {
+  const runner = await runnerModule();
+  const [fixedTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+
+  expect(runner.classifyControllerEvidence([
+    fixedTrial,
+    {
+      ...fixedTrial,
+      trial: 2,
+      budget: { ...fixedTrial.budget, maxTokens: fixedTrial.budget.maxTokens + 1 },
+    },
+  ])).toBe("strong");
+});
+
 it("returns a nonzero evaluation result for an injected critical-safety outcome failure", async () => {
   const runner = await runnerModule();
 
@@ -185,4 +209,100 @@ it("returns a nonzero evaluation result for an injected critical-safety outcome 
   });
 
   expect(evaluation).toMatchObject({ exitCode: 1, criticalSafetyFailed: true, report: { status: "failed" } });
+});
+
+it("runs every kernel and cutover case as a durable fixed scenario", async () => {
+  const kernelTrials = await runControllerScenarioTrials({ checkpoint: "kernel", trials: 1, seed: 8122026 });
+  const cutoverTrials = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
+
+  expect(kernelTrials.map((currentTrial) => currentTrial.scenarioId)).toEqual([
+    "plain-conversation",
+    "current-job-status",
+    "duplicate-mutation-replay",
+    "stale-capability-fence",
+  ]);
+  expect(cutoverTrials.map((currentTrial) => currentTrial.scenarioId)).toEqual([
+    "plain-conversation",
+    "current-job-status",
+    "process-only-finalization",
+    "unsupported-success-claim",
+    "duplicate-mutation-replay",
+    "stale-capability-fence",
+    "telegram-allow-once",
+    "restart-after-owner-tap",
+    "durable-deferred-monitor",
+  ]);
+  for (const currentTrial of [...kernelTrials, ...cutoverTrials]) {
+    expect(currentTrial.outcome.status, currentTrial.scenarioId).toBe("passed");
+    expect(currentTrial.outcome.proofRefs.length, currentTrial.scenarioId).toBeGreaterThan(0);
+  }
+});
+
+it("writes a comparable cutover report with baseline denominators and separate new cases", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "hanoon-eval-comparison-"));
+  const baseline = join(directory, "baseline.json");
+  const output = join(directory, "after.json");
+  try {
+    const baselineReport = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: await runControllerScenarioTrials({ checkpoint: "baseline", trials: 3, seed: 8122026 }),
+    });
+    writeFileSync(baseline, `${JSON.stringify(baselineReport, null, 2)}\n`, { mode: 0o600 });
+
+    await execFileAsync(process.execPath, [
+      "scripts/eval-controller-outcomes.mjs",
+      "--checkpoint", "cutover",
+      "--trials", "3",
+      "--seed", "8122026",
+      "--baseline", baseline,
+      "--output", output,
+      "--replace",
+    ]);
+
+    const report = JSON.parse(readFileSync(output, "utf8")) as {
+      status: string;
+      comparison: {
+        status: string;
+        common: Array<{ scenarioId: string; baseline: { passed: number; denominator: number }; after: { passed: number; denominator: number } }>;
+        newScenarios: Array<{ scenarioId: string }>;
+      };
+    };
+    expect(report.status).toBe("passed");
+    expect(report.comparison.status).toBe("comparable");
+    expect(report.comparison.common).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        scenarioId: "plain-conversation",
+        baseline: expect.objectContaining({ passed: 3, denominator: 3 }),
+        after: expect.objectContaining({ passed: 3, denominator: 3 }),
+      }),
+      expect.objectContaining({
+        scenarioId: "current-job-status",
+        baseline: expect.objectContaining({ passed: 3, denominator: 3 }),
+        after: expect.objectContaining({ passed: 3, denominator: 3 }),
+      }),
+    ]));
+    expect(report.comparison.newScenarios.map((scenario) => scenario.scenarioId)).toEqual([
+      "duplicate-mutation-replay",
+      "durable-deferred-monitor",
+      "process-only-finalization",
+      "restart-after-owner-tap",
+      "stale-capability-fence",
+      "telegram-allow-once",
+      "unsupported-success-claim",
+    ]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("requires an absolute validated baseline report path", async () => {
+  const output = evaluationOutput();
+  await expect(execFileAsync(process.execPath, [
+    "scripts/eval-controller-outcomes.mjs",
+    "--checkpoint", "cutover",
+    "--trials", "1",
+    "--baseline", "relative-baseline.json",
+    "--output", output,
+  ])).rejects.toMatchObject({ code: 1 });
 });

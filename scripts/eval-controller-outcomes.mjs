@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, openSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
@@ -16,27 +16,32 @@ function fail(message) {
 }
 
 function valueAfter(argv, index, flag) {
-  const value = argv[index + 1];
-  if (!value || value.startsWith("--")) fail(`${flag} requires a value`);
-  return value;
+  const argumentValue = argv[index + 1];
+  if (!argumentValue || argumentValue.startsWith("--")) fail(`${flag} requires a value`);
+  return argumentValue;
 }
 
 function parseArguments(argv) {
-  const options = { checkpoint: null, trials: null, seed: 8122026, output: null, replace: false };
+  const options = { checkpoint: null, trials: null, seed: 8122026, baseline: null, output: null, replace: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--replace") { options.replace = true; continue; }
     if (flag === "--checkpoint") { options.checkpoint = valueAfter(argv, index, flag); index += 1; continue; }
     if (flag === "--trials") { options.trials = Number(valueAfter(argv, index, flag)); index += 1; continue; }
     if (flag === "--seed") { options.seed = Number(valueAfter(argv, index, flag)); index += 1; continue; }
+    if (flag === "--baseline") { options.baseline = valueAfter(argv, index, flag); index += 1; continue; }
     if (flag === "--output") { options.output = valueAfter(argv, index, flag); index += 1; continue; }
     fail(`unknown argument ${flag}`);
   }
   if (!options.checkpoint || !["baseline", "kernel", "cutover"].includes(options.checkpoint)) fail("--checkpoint must be baseline, kernel, or cutover");
   if (!Number.isInteger(options.trials) || options.trials < 1 || options.trials > 512) fail("--trials must be an integer between 1 and 512");
   if (!Number.isInteger(options.seed) || options.seed < 0 || options.seed > 2147483647) fail("--seed must be a non-negative 32-bit integer");
+  if (options.baseline !== null && !isAbsolute(options.baseline)) fail("--baseline must be an absolute path");
   if (!options.output || !isAbsolute(options.output)) fail("--output must be an absolute path");
-  return { ...options, output: resolve(options.output) };
+  const output = resolve(options.output);
+  const baseline = options.baseline === null ? null : resolve(options.baseline);
+  if (baseline !== null && baseline === output) fail("--baseline and --output must be different paths");
+  return { ...options, baseline, output };
 }
 
 function isInsideRoot(path) {
@@ -87,18 +92,62 @@ function writeReport(path, content, replace) {
   chmodSync(path, mode);
 }
 
+function readValidatedBaseline(path) {
+  if (!isAbsolute(path)) throw new Error("--baseline must be an absolute path");
+  let report;
+  try {
+    if (!statSync(path).isFile()) throw new Error("baseline is not a regular file");
+    report = contract.parseControllerEvaluationReport(JSON.parse(readFileSync(path, "utf8")));
+  } catch (error) {
+    throw new Error(`baseline report is not valid: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (report.label !== "fixed") throw new Error("baseline report must have fixed label");
+  if (report.trials.some((trial) => trial.harness.dirty)) throw new Error("baseline report contains dirty trials");
+  return report;
+}
+
+function fixedScenarioIdentity(trial) {
+  return JSON.stringify({
+    scenarioDefinitionSha256: trial.scenarioDefinitionSha256 ?? null,
+    outerTaskTools: trial.harness.outerTaskTools ?? [],
+    provider: trial.harness.provider,
+    model: trial.harness.model,
+    reasoningLevel: trial.harness.reasoningLevel,
+    serviceTier: trial.harness.serviceTier,
+    permissionMode: trial.harness.permissionMode,
+    budget: trial.budget,
+    graders: {
+      outcome: [trial.outcome.graderId, trial.outcome.graderVersion],
+      trace: [trial.trace.graderId, trial.trace.graderVersion],
+      answer: [trial.answer.graderId, trial.answer.graderVersion],
+    },
+  });
+}
+
+function hasFixedScenarioIdentityVariation(trials) {
+  const identitiesByScenario = new Map();
+  for (const trial of trials) {
+    const key = `${trial.scenarioId}:${trial.scenarioVersion}`;
+    const identities = identitiesByScenario.get(key) ?? new Set();
+    identities.add(fixedScenarioIdentity(trial));
+    identitiesByScenario.set(key, identities);
+  }
+  return [...identitiesByScenario.values()].some((identities) => identities.size > 1);
+}
+
 export function classifyControllerEvidence(trials) {
   const nonFixedTrials = trials.filter((trial) => (
     trial.harness.provider !== "fake-bb" || trial.harness.model !== "scripted-controller"
   )).length;
-  if (nonFixedTrials === 0) return "fixed";
-  return nonFixedTrials === 1 ? "smoke" : "strong";
+  if (nonFixedTrials > 0) return nonFixedTrials === 1 ? "smoke" : "strong";
+  return hasFixedScenarioIdentityVariation(trials) ? "strong" : "fixed";
 }
 
 export async function evaluateControllerOutcomes(options, dependencies = {}) {
   if (!allowedOutput(options.output)) {
     throw new Error("--output must be outside the repository or under .superpowers/");
   }
+  const baseline = options.baseline ? readValidatedBaseline(options.baseline) : null;
   const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
   const priorCommit = process.env.HANOON_EVAL_COMMIT;
   const priorDirty = process.env.HANOON_EVAL_DIRTY;
@@ -118,10 +167,24 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     else process.env.HANOON_EVAL_DIRTY = priorDirty;
   }
   const validatedTrials = trials.map(contract.parseControllerScenarioTrial);
-  const report = contract.aggregateControllerEvaluation({
+  const baseReport = contract.aggregateControllerEvaluation({
     label: classifyControllerEvidence(validatedTrials),
     trials: validatedTrials,
   });
+  const comparison = baseline
+    ? contract.compareControllerEvaluations({
+        baseline,
+        after: baseReport,
+        scenarioDefinitions: harness.loadControllerScenarioCorpus().cases.map((scenarioCase) => ({
+          id: scenarioCase.id,
+          scenarioVersion: scenarioCase.scenarioVersion,
+          criticalSafety: scenarioCase.criticalSafety,
+        })),
+      })
+    : null;
+  const report = comparison
+    ? contract.attachControllerComparison(baseReport, comparison)
+    : baseReport;
   contract.controllerEvaluationReportSchema.parse(report);
   writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace);
   const scenarios = new Map(harness.loadControllerScenarioCorpus().cases.map((scenarioCase) => [

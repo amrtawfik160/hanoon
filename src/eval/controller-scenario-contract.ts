@@ -19,6 +19,8 @@ export const controllerHarnessIdentitySchema = z.object({
   capabilityManifestSha256: sha256Schema,
   policySha256: sha256Schema,
   contextSha256: sha256Schema,
+  /** Tools supplied by the task harness outside the Hanoon controller surface. */
+  outerTaskTools: z.array(z.string().min(1).max(128)).max(64).optional(),
   advertisedTools: z.array(z.string().min(1).max(128)).max(64),
   parameterSchemaSha256: z.record(z.string().min(1).max(128), sha256Schema),
 }).strict();
@@ -73,6 +75,7 @@ const controllerMetricsSchema = z.object({
 export const controllerScenarioTrialSchema = z.object({
   schemaVersion: z.literal(1),
   scenarioVersion: z.number().int().min(1).max(10_000),
+  scenarioDefinitionSha256: sha256Schema.optional(),
   scenarioId: scenarioIdSchema,
   trial: z.number().int().min(1).max(1_000),
   seed: z.number().int().min(0).max(2_147_483_647),
@@ -110,8 +113,50 @@ const scenarioSummarySchema = z.object({
   incomplete: z.number().int().min(0).max(512),
 }).strict();
 
+const comparisonScenarioSideSchema = scenarioSummarySchema.extend({
+  scenarioVersion: z.number().int().min(1).max(10_000),
+  criticalSafety: z.boolean(),
+}).strict();
+
+const interventionHarnessSchema = z.object({
+  hanoonCommit: z.string().regex(/^[0-9a-f]{40}$/),
+  instructionSha256: sha256Schema,
+  overlaySha256: sha256Schema,
+  capabilityManifestSha256: sha256Schema,
+  policySha256: sha256Schema,
+  contextSha256: sha256Schema,
+  parameterSchemaSha256: z.record(z.string().min(1).max(128), sha256Schema),
+}).strict();
+
+const interventionTrialSchema = z.object({
+  scenarioId: scenarioIdSchema,
+  scenarioVersion: z.number().int().min(1).max(10_000),
+  trial: z.number().int().min(1).max(1_000),
+  harness: interventionHarnessSchema,
+}).strict();
+
+export const controllerEvaluationComparisonSchema = z.object({
+  status: z.literal("comparable"),
+  baselineLabel: z.literal("fixed"),
+  afterLabel: z.literal("fixed"),
+  common: z.array(z.object({
+    scenarioId: scenarioIdSchema,
+    scenarioVersion: z.number().int().min(1).max(10_000),
+    criticalSafety: z.boolean(),
+    baseline: comparisonScenarioSideSchema,
+    after: comparisonScenarioSideSchema,
+  }).strict()).min(1).max(64),
+  newScenarios: z.array(comparisonScenarioSideSchema).max(64),
+  baselineOnlyScenarios: z.array(comparisonScenarioSideSchema).max(64),
+  intervention: z.object({
+    baseline: z.array(interventionTrialSchema).min(1).max(512),
+    after: z.array(interventionTrialSchema).min(1).max(512),
+  }).strict(),
+}).strict();
+
 export type ControllerScenarioTrial = z.infer<typeof controllerScenarioTrialSchema>;
 export type ControllerEvaluationReport = z.infer<typeof controllerEvaluationReportSchema>;
+export type ControllerEvaluationComparison = z.infer<typeof controllerEvaluationComparisonSchema>;
 
 function trialPairKey(trial: ControllerScenarioTrial): string {
   return `${trial.scenarioId}:${trial.trial}`;
@@ -159,6 +204,7 @@ export const controllerEvaluationReportSchema = z.object({
   trialCount: z.number().int().min(1).max(512),
   trials: z.array(controllerScenarioTrialSchema).min(1).max(512),
   scenarios: z.array(scenarioSummarySchema).max(64),
+  comparison: controllerEvaluationComparisonSchema.optional(),
 }).strict().superRefine((report, context) => {
   if (hasDuplicateTrialPairs(report.trials)) context.addIssue({ code: "custom", message: "duplicate scenario trial pair" });
   if (report.trialCount !== report.trials.length) context.addIssue({ code: "custom", message: "trialCount must match trials" });
@@ -174,10 +220,232 @@ export function parseControllerScenarioTrial(candidate: unknown): ControllerScen
   return controllerScenarioTrialSchema.parse(candidate);
 }
 
+export function parseControllerEvaluationReport(candidate: unknown): ControllerEvaluationReport {
+  return controllerEvaluationReportSchema.parse(candidate);
+}
+
+type ScenarioDefinition = Readonly<{
+  id: string;
+  scenarioVersion: number;
+  criticalSafety: boolean;
+}>;
+
+type ComparableTrialSignature = Readonly<{
+  scenarioVersion: number;
+  outerTaskTools: readonly string[];
+  provider: string;
+  model: string;
+  reasoningLevel: string;
+  serviceTier: string;
+  permissionMode: "auto" | "accept-edits" | "full";
+  contextSha256: string;
+  budget: ControllerScenarioTrial["budget"];
+  graders: Readonly<{
+    outcome: Readonly<{ graderId: string; graderVersion: number }>;
+    trace: Readonly<{ graderId: string; graderVersion: number }>;
+    answer: Readonly<{ graderId: string; graderVersion: number }>;
+  }>;
+}>;
+
+function comparisonScenarioKey(scenarioId: string, scenarioVersion: number): string {
+  return `${scenarioId}:${scenarioVersion}`;
+}
+
+function canonicalComparisonValue(comparisonValue: unknown): string {
+  if (comparisonValue === null || typeof comparisonValue === "boolean" || typeof comparisonValue === "string" || typeof comparisonValue === "number") {
+    return JSON.stringify(comparisonValue);
+  }
+  if (Array.isArray(comparisonValue)) return `[${comparisonValue.map(canonicalComparisonValue).join(",")}]`;
+  if (typeof comparisonValue !== "object") throw new TypeError("comparison identity contains a non-JSON value");
+  return `{${Object.entries(comparisonValue as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalComparisonValue(entry)}`)
+    .join(",")}}`;
+}
+
+function trialSignature(trial: ControllerScenarioTrial): ComparableTrialSignature {
+  return {
+    scenarioVersion: trial.scenarioVersion,
+    outerTaskTools: trial.harness.outerTaskTools ?? [],
+    provider: trial.harness.provider,
+    model: trial.harness.model,
+    reasoningLevel: trial.harness.reasoningLevel,
+    serviceTier: trial.harness.serviceTier,
+    permissionMode: trial.harness.permissionMode,
+    contextSha256: trial.harness.contextSha256,
+    budget: trial.budget,
+    graders: {
+      outcome: { graderId: trial.outcome.graderId, graderVersion: trial.outcome.graderVersion },
+      trace: { graderId: trial.trace.graderId, graderVersion: trial.trace.graderVersion },
+      answer: { graderId: trial.answer.graderId, graderVersion: trial.answer.graderVersion },
+    },
+  };
+}
+
+function comparableTrialIdentity(trial: ControllerScenarioTrial): string {
+  return canonicalComparisonValue(trialSignature(trial));
+}
+
+function scenarioSummary(
+  report: ControllerEvaluationReport,
+  scenarioId: string,
+  scenarioVersion: number,
+  criticalSafety: boolean,
+): z.infer<typeof comparisonScenarioSideSchema> {
+  const summary = report.scenarios.find((candidate) => candidate.scenarioId === scenarioId);
+  if (!summary) throw new Error(`comparison scenario summary is missing ${scenarioId}`);
+  return { ...summary, scenarioVersion, criticalSafety };
+}
+
+function scenarioDefinitionsByKey(
+  definitions: readonly ScenarioDefinition[] | undefined,
+): Map<string, ScenarioDefinition> {
+  return new Map((definitions ?? []).map((definition) => [
+    comparisonScenarioKey(definition.id, definition.scenarioVersion),
+    definition,
+  ]));
+}
+
+function criticalSafetyFor(
+  scenarioId: string,
+  scenarioVersion: number,
+  definitions: Map<string, ScenarioDefinition>,
+): boolean {
+  return definitions.get(comparisonScenarioKey(scenarioId, scenarioVersion))?.criticalSafety ?? false;
+}
+
+function reportScenarioKeys(report: ControllerEvaluationReport): Set<string> {
+  return new Set(report.trials.map((trial) => comparisonScenarioKey(trial.scenarioId, trial.scenarioVersion)));
+}
+
+function assertCleanFixedReport(report: ControllerEvaluationReport, label: "baseline" | "after"): void {
+  if (report.trials.some((trial) => trial.harness.dirty)) {
+    throw new Error(`fixed comparison ${label} report contains dirty trials`);
+  }
+}
+
+function reportTrialsForKey(report: ControllerEvaluationReport, key: string): ControllerScenarioTrial[] {
+  return report.trials.filter((trial) => comparisonScenarioKey(trial.scenarioId, trial.scenarioVersion) === key);
+}
+
+function assertFixedComparisonIdentity(
+  baselineTrials: readonly ControllerScenarioTrial[],
+  afterTrials: readonly ControllerScenarioTrial[],
+  key: string,
+): void {
+  const afterByTrial = new Map(afterTrials.map((trial) => [trial.trial, trial]));
+  for (const baselineTrial of baselineTrials) {
+    const afterTrial = afterByTrial.get(baselineTrial.trial);
+    if (!afterTrial) continue;
+    if (baselineTrial.scenarioDefinitionSha256 !== undefined && afterTrial.scenarioDefinitionSha256 !== undefined &&
+        baselineTrial.scenarioDefinitionSha256 !== afterTrial.scenarioDefinitionSha256) {
+      throw new Error(`fixed comparison is not comparable for ${key} trial ${baselineTrial.trial} scenario definition`);
+    }
+    if (comparableTrialIdentity(baselineTrial) !== comparableTrialIdentity(afterTrial)) {
+      throw new Error(`fixed comparison is not comparable for ${key} trial ${baselineTrial.trial}`);
+    }
+  }
+}
+
+function interventionTrial(trial: ControllerScenarioTrial): z.infer<typeof interventionTrialSchema> {
+  return {
+    scenarioId: trial.scenarioId,
+    scenarioVersion: trial.scenarioVersion,
+    trial: trial.trial,
+    harness: {
+      hanoonCommit: trial.harness.hanoonCommit,
+      instructionSha256: trial.harness.instructionSha256,
+      overlaySha256: trial.harness.overlaySha256,
+      capabilityManifestSha256: trial.harness.capabilityManifestSha256,
+      policySha256: trial.harness.policySha256,
+      contextSha256: trial.harness.contextSha256,
+      parameterSchemaSha256: trial.harness.parameterSchemaSha256,
+    },
+  };
+}
+
+function scenarioKeysWithVersion(report: ControllerEvaluationReport): Array<{ scenarioId: string; scenarioVersion: number; key: string }> {
+  return [...new Set(report.trials.map((trial) => comparisonScenarioKey(trial.scenarioId, trial.scenarioVersion)))].map((key) => {
+    const separator = key.lastIndexOf(":");
+    const scenarioId = key.slice(0, separator);
+    const scenarioVersion = Number(key.slice(separator + 1));
+    return { scenarioId, scenarioVersion, key };
+  }).sort((left, right) => left.key.localeCompare(right.key));
+}
+
+export function compareControllerEvaluations(input: Readonly<{
+  baseline: unknown;
+  after: unknown;
+  scenarioDefinitions?: readonly ScenarioDefinition[];
+}>): ControllerEvaluationComparison {
+  const baseline = parseControllerEvaluationReport(input.baseline);
+  const after = parseControllerEvaluationReport(input.after);
+  if (baseline.label !== "fixed" || after.label !== "fixed") {
+    throw new Error("fixed comparison requires fixed baseline and after reports");
+  }
+  assertCleanFixedReport(baseline, "baseline");
+  const baselineKeys = reportScenarioKeys(baseline);
+  const afterKeys = reportScenarioKeys(after);
+  const commonKeys = [...baselineKeys].filter((key) => afterKeys.has(key));
+  if (commonKeys.length === 0) throw new Error("fixed comparison has no intersecting scenarios");
+  const definitions = scenarioDefinitionsByKey(input.scenarioDefinitions);
+  const common = commonKeys.sort().map((key) => {
+    const scenario = scenarioKeysWithVersion(baseline).find((candidate) => candidate.key === key);
+    if (!scenario) throw new Error(`fixed comparison scenario ${key} is missing`);
+    const baselineTrials = reportTrialsForKey(baseline, key);
+    const afterTrials = reportTrialsForKey(after, key);
+    const baselineTrialNumbers = baselineTrials.map((trial) => trial.trial).sort((left, right) => left - right);
+    const afterTrialNumbers = afterTrials.map((trial) => trial.trial).sort((left, right) => left - right);
+    if (JSON.stringify(baselineTrialNumbers) !== JSON.stringify(afterTrialNumbers)) {
+      throw new Error(`fixed comparison is not comparable for ${key}: trial denominators differ`);
+    }
+    assertFixedComparisonIdentity(baselineTrials, afterTrials, key);
+    return {
+      scenarioId: scenario.scenarioId,
+      scenarioVersion: scenario.scenarioVersion,
+      criticalSafety: criticalSafetyFor(scenario.scenarioId, scenario.scenarioVersion, definitions),
+      baseline: scenarioSummary(baseline, scenario.scenarioId, scenario.scenarioVersion, criticalSafetyFor(scenario.scenarioId, scenario.scenarioVersion, definitions)),
+      after: scenarioSummary(after, scenario.scenarioId, scenario.scenarioVersion, criticalSafetyFor(scenario.scenarioId, scenario.scenarioVersion, definitions)),
+    };
+  });
+  const baselineOnly = scenarioKeysWithVersion(baseline).filter(({ key }) => !afterKeys.has(key));
+  const afterOnly = scenarioKeysWithVersion(after).filter(({ key }) => !baselineKeys.has(key));
+  return controllerEvaluationComparisonSchema.parse({
+    status: "comparable",
+    baselineLabel: baseline.label,
+    afterLabel: after.label,
+    common,
+    newScenarios: afterOnly.map(({ scenarioId, scenarioVersion }) => scenarioSummary(
+      after,
+      scenarioId,
+      scenarioVersion,
+      criticalSafetyFor(scenarioId, scenarioVersion, definitions),
+    )),
+    baselineOnlyScenarios: baselineOnly.map(({ scenarioId, scenarioVersion }) => scenarioSummary(
+      baseline,
+      scenarioId,
+      scenarioVersion,
+      criticalSafetyFor(scenarioId, scenarioVersion, definitions),
+    )),
+    intervention: {
+      baseline: baseline.trials.map(interventionTrial),
+      after: after.trials.map(interventionTrial),
+    },
+  });
+}
+
+export function attachControllerComparison(
+  reportInput: ControllerEvaluationReport,
+  comparisonInput: ControllerEvaluationComparison,
+): ControllerEvaluationReport {
+  return controllerEvaluationReportSchema.parse({ ...reportInput, comparison: comparisonInput });
+}
+
 export function aggregateControllerEvaluation(input: {
   label: z.infer<typeof controllerEvaluationReportSchema>["label"];
   generatedAt?: string;
   trials: readonly ControllerScenarioTrial[];
+  comparison?: ControllerEvaluationComparison;
 }): ControllerEvaluationReport {
   const trials = input.trials.map(parseControllerScenarioTrial);
   return controllerEvaluationReportSchema.parse({
@@ -188,5 +456,6 @@ export function aggregateControllerEvaluation(input: {
     trialCount: trials.length,
     trials,
     scenarios: summarizeTrials(trials),
+    ...(input.comparison ? { comparison: input.comparison } : {}),
   });
 }
