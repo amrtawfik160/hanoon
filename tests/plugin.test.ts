@@ -2,8 +2,9 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import { expect, it, vi } from "vitest";
 import plugin from "../server";
 import { hashSecret } from "../src/crypto";
-import { BbControllerAdapter } from "../src/controller/bb-controller";
-import { CONTROLLER_INSTRUCTION_SENTINEL } from "../src/controller/instructions";
+import { BbControllerAdapter, controllerSpawnTitle } from "../src/controller/bb-controller";
+import { CONTROLLER_INSTRUCTION_SENTINEL, CONTROLLER_INSTRUCTIONS } from "../src/controller/instructions";
+import { CONTROLLER_TOOL_NAMES } from "../src/controller/tools";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
 import { ApprovalService } from "../src/services/approval-service";
 import { openStore } from "../src/storage/store";
@@ -68,16 +69,40 @@ it("registers configurable controller execution settings with safe defaults", as
   });
 });
 
+it("retains executable controller operating guidance alongside the trust boundaries", () => {
+  const guidance = CONTROLLER_INSTRUCTIONS.toLowerCase();
+  for (const behavior of [
+    /open a new thread.*message a running thread.*stop or retry/s,
+    /guarded job.*list projects.*start, inspect, retry, or cancel/s,
+    /independent pieces.*send them out together/s,
+    /choose_job.*bounded candidate ids.*do not .*guess/s,
+    /awaiting_confirmation.*awaitingowner.*false.*queued/s,
+    /set one instead of promising/s,
+    /fired monitor.*do it.*message the owner/s,
+    /future self in full.*only that text/s,
+    /project.*recall.*project id/s,
+    /bb <command> --help.*--json.*--machine/s,
+    /do the bb work yourself.*never send the owner into the bb app/s,
+    /routine tool narration out.*opaque third-party/s,
+  ]) {
+    expect(guidance).toMatch(behavior);
+  }
+  expect(guidance).not.toContain("full permissions");
+  expect(guidance).not.toContain("install and configure it");
+  expect(guidance).toContain("one-use allow once/deny");
+});
+
 it("keeps standing instructions in configuration and owner content in the first input", async () => {
   const { bb, harness } = await loadPlugin();
   await harness.behavior.setSettings({ botToken: "123:test-token" });
   const store = openStore(bb.storage);
-  const now = 10_000;
+  const now = Date.now();
   const pairingSecret = "controller-trust-kernel-pair";
   store.createPairingCode(hashSecret(pairingSecret), now, now + 60_000);
   expect(store.pairOwnerWithCode(hashSecret(pairingSecret), "7", "7", now)).toEqual({ ok: true });
   const overlay = "Always show me the PR link.";
   store.setControllerOverlay({ text: overlay, now });
+  expect(store.getControllerOverlay()).toBe(overlay);
   const turn = store.enqueueControllerTurn({
     controllerKey: "owner-7-controller",
     telegramUserId: "7",
@@ -100,13 +125,37 @@ it("keeps standing instructions in configuration and owner content in the first 
     gitRemoteUrl: null,
     sources: [{ id: "src_personal", isDefault: true, hostId: "host_personal" }],
   }]);
-  harness.sdk.stub("threads.spawn", async () => ({ id: "thr_trust_kernel", environmentId: "env_personal" }));
+  let preReturnTools: string[] | null = null;
+  let preReturnSkills: string[] | null = null;
+  let preReturnInstructions: string | null = null;
+  harness.sdk.stub("threads.spawn", async (request) => {
+    const requestedTitle = (request as { title?: unknown }).title;
+    const title = typeof requestedTitle === "string" ? requestedTitle : null;
+    if (title === null) throw new Error("missing tokenized controller spawn title");
+    const preReturn = await harness.behavior.resolveAgentConfiguration({
+      thread: { id: "thr_trust_kernel", title, parentThreadId: null, sourceThreadId: null },
+      project: { id: "proj_personal", kind: "personal", name: "Personal", gitRemoteUrl: null },
+      environment: { id: "env_personal", name: null, path: "/personal", workspaceProvisionType: "personal", branchName: null },
+      host: { id: "host_personal", name: "Personal host" },
+      provider: { id: "claude-code", model: "claude-opus-5[1m]" },
+      origin: { kind: null, pluginId: bb.pluginId },
+    });
+    preReturnTools = preReturn.tools.map((tool) => tool.name);
+    preReturnSkills = [...preReturn.skills];
+    preReturnInstructions = preReturn.instructions;
+    expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+    return { id: "thr_trust_kernel", environmentId: "env_personal" };
+  });
   const adapter = new BbControllerAdapter({
     sdk: bb.sdk,
     pluginId: bb.pluginId,
     executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
   });
   const location = await adapter.spawn(turn, controller, AbortSignal.timeout(1_000));
+  expect(preReturnTools).toEqual(CONTROLLER_TOOL_NAMES);
+  expect(preReturnSkills).toEqual([]);
+  expect(preReturnInstructions).toContain(CONTROLLER_INSTRUCTION_SENTINEL);
+  expect(preReturnInstructions).toContain(overlay);
   expect(store.markControllerSpawned({ ...fence, turnId: turn.id, ...location })).toBe(true);
 
   const configured = await harness.behavior.resolveAgentConfiguration({
@@ -120,7 +169,10 @@ it("keeps standing instructions in configuration and owner content in the first 
   if (configured.instructions === null) throw new Error("missing controller instructions");
   expect(configured.instructions).toContain(overlay);
   const spawnCall = harness.inspection.sdk.callsTo("threads.spawn").at(-1)?.[0];
-  if (!spawnCall || typeof spawnCall !== "object" || !("input" in spawnCall)) throw new Error("missing controller spawn input");
+  if (!spawnCall || typeof spawnCall !== "object" || !("input" in spawnCall) || !("title" in spawnCall)) {
+    throw new Error("missing controller spawn input");
+  }
+  expect(spawnCall.title).toBe(controllerSpawnTitle(controller.controllerKey, turn.id, "proj_personal"));
   const firstInput = (spawnCall as { input: Array<{ type: string; text?: string; mentions?: string[] }> }).input;
 
   expect(countOccurrences(`${configured.instructions}\n${turn.inputText}`, CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
@@ -138,6 +190,53 @@ it("registers the bounded concurrent job cap as a select setting", async () => {
     options: ["1", "2", "3", "4", "5", "6", "7", "8"],
     default: "5",
   });
+});
+
+it("adopts one exact tokenized controller title and rejects spoofed or ambiguous candidates", async () => {
+  const { bb, harness } = await loadPlugin();
+  harness.sdk.stub("projects.list", async () => [{
+    id: "proj_personal",
+    kind: "personal",
+    name: "Personal",
+    gitRemoteUrl: null,
+    sources: [{ id: "src_personal", isDefault: true, hostId: "host_personal" }],
+  }]);
+  const exactTitle = controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal");
+  const candidate = {
+    id: "thr_tokenized",
+    projectId: "proj_personal",
+    providerId: "claude-code",
+    status: "idle",
+    title: exactTitle,
+    visibility: "hidden",
+    originPluginId: bb.pluginId,
+    archivedAt: null,
+    deletedAt: null,
+  };
+  harness.sdk.stub("threads.list", async () => [candidate]);
+  const adapter = new BbControllerAdapter({
+    sdk: bb.sdk,
+    pluginId: bb.pluginId,
+    executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  });
+  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toMatchObject({
+    threadId: "thr_tokenized",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  });
+
+  harness.sdk.stub("threads.list", async () => [{
+    ...candidate,
+    title: "Telegram Codex controller owner-7-controller",
+  }]);
+  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toBeNull();
+
+  harness.sdk.stub("threads.list", async () => [{ ...candidate, title: `${exactTitle}-suffix-spoof` }]);
+  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toBeNull();
+
+  harness.sdk.stub("threads.list", async () => [candidate, { ...candidate, id: "thr_tokenized_other" }]);
+  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000)))
+    .rejects.toThrow(/multiple|ambiguous/i);
 });
 
 it("keeps the Telegram polling timeout out of user-facing settings", async () => {

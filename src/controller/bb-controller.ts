@@ -14,7 +14,13 @@ import {
   type ControllerQuestionAnswers,
 } from "./questions";
 
-export type ControllerLocation = { threadId: string; projectId: string; hostId: string };
+export type ControllerLocation = {
+  threadId: string;
+  projectId: string;
+  hostId: string;
+  /** The pending token carried by a tokenized spawn title, when available. */
+  spawnToken?: string;
+};
 export type ControllerStatus =
   | "idle"
   | "active"
@@ -241,9 +247,40 @@ function controllerTitle(controllerKey: string): string {
   return `Telegram Codex controller ${controllerKey}`;
 }
 
-export function isControllerThreadTitle(title: string | null, controllerKey: string): boolean {
-  return title === controllerTitle(controllerKey) ||
-    title === `Telegram Luna controller ${controllerKey}`;
+const CONTROLLER_SPAWN_TITLE_MARKER = " [pending-spawn:";
+const CONTROLLER_SPAWN_TITLE_END = "]";
+const CONTROLLER_TITLE_PART = /^[A-Za-z0-9_-]{1,128}$/;
+
+export type ControllerSpawnTitleIdentity = Readonly<{
+  controllerKey: string;
+  pendingSpawnToken: string;
+  projectId: string;
+}>;
+
+export function controllerSpawnTitle(
+  controllerKey: string,
+  pendingSpawnToken: string,
+  projectId: string,
+): string {
+  return `${controllerTitle(controllerKey)}${CONTROLLER_SPAWN_TITLE_MARKER}${pendingSpawnToken};project:${projectId}${CONTROLLER_SPAWN_TITLE_END}`;
+}
+
+export function parseControllerSpawnTitle(title: string | null): ControllerSpawnTitleIdentity | null {
+  if (typeof title !== "string") return null;
+  const match = /^Telegram Codex controller ([A-Za-z0-9_-]{1,128}) \[pending-spawn:([A-Za-z0-9_-]{1,128});project:([A-Za-z0-9_.:-]{1,256})\]$/.exec(title);
+  if (!match || !CONTROLLER_TITLE_PART.test(match[1]!) || !CONTROLLER_TITLE_PART.test(match[2]!)) return null;
+  return {
+    controllerKey: match[1]!,
+    pendingSpawnToken: match[2]!,
+    projectId: match[3]!,
+  };
+}
+
+export function isControllerThreadTitle(title: string | null, controllerKey: string, projectId?: string): boolean {
+  if (title === controllerTitle(controllerKey) || title === `Telegram Luna controller ${controllerKey}`) return true;
+  const identity = parseControllerSpawnTitle(title);
+  return identity?.controllerKey === controllerKey &&
+    (projectId === undefined || identity.projectId === projectId);
 }
 
 export class BbControllerAdapter implements ControllerAdapterMethods {
@@ -271,6 +308,9 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       throw error;
     }
     const execution = this.dependencies.executionProfile();
+    if (controller.pendingSpawnToken === null) {
+      throw new Error("Controller spawn token is missing");
+    }
     const input = await this.promptInput(
       personal.projectId,
       turn.inputText,
@@ -279,7 +319,11 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     );
     const thread = await this.dependencies.sdk.threads.spawn({
       projectId: personal.projectId,
-      title: controllerTitle(controller.controllerKey),
+      title: controllerSpawnTitle(
+        controller.controllerKey,
+        controller.pendingSpawnToken,
+        personal.projectId,
+      ),
       visibility: "hidden",
       input,
       environment: {
@@ -289,7 +333,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       },
       ...controllerExecutionArguments(execution, { includeProvider: true }),
     });
-    return { threadId: thread.id, ...personal };
+    return { threadId: thread.id, ...personal, spawnToken: controller.pendingSpawnToken };
   }
 
   public async send(
@@ -478,19 +522,28 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       originPluginId: this.dependencies.pluginId,
       signal,
     });
-    const candidates = threads.filter((thread) =>
-      isControllerThreadTitle(thread.title, controllerKey) &&
-      thread.projectId === personal.projectId &&
-      thread.providerId === controllerProviderFor(this.dependencies.executionProfile().model) &&
-      thread.status !== "error" && thread.status !== "stopping" &&
-      thread.visibility === "hidden" &&
-      thread.originPluginId === this.dependencies.pluginId &&
-      thread.archivedAt === null &&
-      thread.deletedAt === null
-    );
+    const candidates = threads.flatMap((thread) => {
+      const identity = parseControllerSpawnTitle(thread.title);
+      if (
+        !identity || identity.controllerKey !== controllerKey ||
+        identity.projectId !== personal.projectId ||
+        thread.projectId !== personal.projectId ||
+        thread.providerId !== controllerProviderFor(this.dependencies.executionProfile().model) ||
+        thread.status === "error" || thread.status === "stopping" ||
+        thread.visibility !== "hidden" ||
+        thread.originPluginId !== this.dependencies.pluginId ||
+        thread.archivedAt !== null ||
+        thread.deletedAt !== null
+      ) return [];
+      return [{ thread, identity }];
+    });
     if (candidates.length > 1) throw new Error("Multiple ambiguous BB controller spawn candidates exist");
     const candidate = candidates[0];
-    return candidate ? { threadId: candidate.id, ...personal } : null;
+    return candidate ? {
+      threadId: candidate.thread.id,
+      ...personal,
+      spawnToken: candidate.identity.pendingSpawnToken,
+    } : null;
   }
 
   private async promptInput(

@@ -6,6 +6,7 @@ import { openStore } from "../src/storage/store";
 import {
   BbControllerAdapter,
   ControllerImagePreparationError,
+  controllerSpawnTitle,
   type ControllerAdapter,
 } from "../src/controller/bb-controller";
 import {
@@ -357,7 +358,7 @@ it("uses the configured execution profile for initial and later controller turns
 
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
     providerId: "codex",
-    title: "Telegram Codex controller owner-7-controller",
+    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal"),
     ...executionProfile,
     executionInputSources: {
       providerId: "explicit",
@@ -428,7 +429,7 @@ it("adopts only one exact plugin-origin hidden spawn candidate", async () => {
     projectId: "proj_personal",
     providerId: "claude-code",
     status: "idle",
-    title: "Telegram Luna controller owner-7-controller",
+    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal"),
     visibility: "hidden",
     originPluginId: "telegram-agent",
     archivedAt: null,
@@ -1649,6 +1650,7 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     threadId: "thr_fresh_after_poison",
     projectId: "proj_personal",
     hostId: "host_personal",
+    spawnToken: next.id,
   }));
   const adapter: ControllerAdapter = {
     spawn,

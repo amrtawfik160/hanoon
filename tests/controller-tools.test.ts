@@ -7,6 +7,8 @@ import { hashSecret } from "../src/crypto";
 import { admitConfirmedJob, policyFixture, sha } from "./helpers";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../src/controller/tools";
+import { controllerSpawnTitle, parseControllerSpawnTitle } from "../src/controller/bb-controller";
+import { CONTROLLER_INSTRUCTION_SENTINEL } from "../src/controller/instructions";
 import { canonicalControllerJson, sha256ControllerJson } from "../src/controller/capability-executor";
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
 import { ControllerEvidenceProjector } from "../src/controller/evidence-projector";
@@ -194,6 +196,31 @@ function fixture(options: { active?: boolean } = {}) {
   };
   if (!options.active) deactivate();
   return { bb, harness, store, turn, activate, deactivate };
+}
+
+function pendingConfigurationFixture() {
+  const { bb, harness } = createFakePluginHost({
+    pluginId: `telegram-controller-pending-${fixtureNumber++}`,
+    agentSkillIds: [...BUNDLED_SKILL_IDS],
+  });
+  const store = openStore(bb.storage, bb.storage.kv, () => 10_000);
+  store.createPairingCode(hashSecret("pair-pending"), 1_000, 20_000);
+  expect(store.pairOwnerWithCode(hashSecret("pair-pending"), "7", "7", 1_001)).toEqual({ ok: true });
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 7_901,
+    inputText: "What is running right now?",
+    now: 2_000,
+  });
+  const lease = store.acquireExecutorLease("pending-executor", 10_000, 30_000);
+  if (!lease.acquired) throw new Error("missing pending controller lease");
+  const fence = { ownerId: "pending-executor", generation: lease.generation, now: 10_000 };
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  const controller = store.getControllerForOwner("7", "7");
+  if (!controller?.pendingSpawnToken) throw new Error("missing pending controller token");
+  return { bb, harness, store, turn, controller, fence };
 }
 
 it("preserves the exact Task 6 metadata and adds the bounded evidence-index schema", () => {
@@ -784,7 +811,7 @@ it("rejects unmapped controllers and disabled projects while allowing another qu
 });
 
 it("registers the exact controller tools and keeps them off unrelated sessions", async () => {
-  const { bb, harness, store } = fixture({ active: true });
+  const { bb, harness, store, turn } = fixture({ active: true });
   const notify = vi.fn();
   const requestThreadOperation = vi.fn(async (input: {
     kind: "steer_thread" | "stop_thread" | "retry_thread";
@@ -864,6 +891,13 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     ...context,
     provider: { id: "acp-grok", model: "grok" },
   })).tools).toEqual([]);
+  expect((await harness.behavior.resolveAgentConfiguration({
+    ...context,
+    thread: {
+      ...context.thread,
+      title: controllerSpawnTitle("owner-7-controller", turn.id, "proj_personal"),
+    },
+  })).tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
 
   await expect(harness.behavior.callAgentTool(
     "telegram_agent_list_projects",
@@ -934,6 +968,63 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   expect(startedJob).toBeDefined();
   expect(store.getAdmission(startedJob!.id)).toMatchObject({ state: "queued" });
   expect(notify).toHaveBeenCalledOnce();
+});
+
+it("authorizes one exact pending spawn identity before the BB thread mapping exists", async () => {
+  const { bb, harness, store, turn, controller, fence } = pendingConfigurationFixture();
+  const pendingSpawnToken = controller.pendingSpawnToken;
+  if (!pendingSpawnToken) throw new Error("missing pending controller token");
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+  const title = controllerSpawnTitle(controller.controllerKey, pendingSpawnToken, "proj_personal");
+  expect(parseControllerSpawnTitle(title)).toEqual({
+    controllerKey: controller.controllerKey,
+    pendingSpawnToken,
+    projectId: "proj_personal",
+  });
+  expect(store.getControllerForPendingSpawn({
+    controllerKey: controller.controllerKey,
+    turnId: turn.id,
+    pendingSpawnToken,
+    now: fence.now,
+  })).toMatchObject({ state: "pending_spawn", threadId: null });
+  const context = {
+    thread: { id: "thr_pre_return", title, parentThreadId: null, sourceThreadId: null },
+    project: { id: "proj_personal", kind: "personal" as const, name: "Personal", gitRemoteUrl: null },
+    environment: { id: "env_personal", name: null, path: "/personal", workspaceProvisionType: "personal" as const, branchName: null },
+    host: { id: "host_personal", name: "Host" },
+    provider: { id: "claude-code", model: "claude-opus-5[1m]" },
+    origin: { kind: null, pluginId: bb.pluginId },
+  };
+  const configured = await harness.behavior.resolveAgentConfiguration(context);
+  expect(configured.tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  expect(configured.skills).toEqual([]);
+  expect(configured.instructions).toContain(CONTROLLER_INSTRUCTION_SENTINEL);
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+
+  const forgedContexts = [
+    { ...context, thread: { ...context.thread, title: `${title} suffix-spoof` } },
+    { ...context, thread: { ...context.thread, title: `prefix-spoof ${title}` } },
+    { ...context, thread: { ...context.thread, title: controllerSpawnTitle("owner-8-controller", pendingSpawnToken, "proj_personal") } },
+    { ...context, thread: { ...context.thread, title: controllerSpawnTitle(controller.controllerKey, "controller-turn-wrong", "proj_personal") } },
+    { ...context, origin: { kind: "fork" as const, pluginId: bb.pluginId } },
+    { ...context, origin: { kind: null, pluginId: "other-plugin" } },
+    { ...context, provider: { id: "acp-grok", model: "grok" } },
+    { ...context, project: { ...context.project, id: "proj_other" } },
+    { ...context, project: { ...context.project, kind: "standard" as const } },
+    { ...context, environment: { ...context.environment, workspaceProvisionType: "managed-worktree" as const } },
+  ];
+  for (const forged of forgedContexts) {
+    const rejected = await harness.behavior.resolveAgentConfiguration(forged);
+    expect(rejected).toMatchObject({ tools: [], skills: [] });
+    expect(rejected.instructions).toBeNull();
+  }
 });
 
 it("routes verified implementation attempts through their exact durable effect before and after thread persistence", async () => {

@@ -33,6 +33,28 @@ function acquire(store: ReturnType<typeof openStore>) {
   return { ownerId: "executor", generation: lease.generation, now: 2_000, leaseMs: 30_000 };
 }
 
+function pendingSpawnFixture(updateId = 901) {
+  const { bb, store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(updateId));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  const controller = store.getControllerForOwner("7", "7");
+  if (!controller?.pendingSpawnToken) throw new Error("missing pending controller spawn token");
+  return {
+    bb,
+    store,
+    turn,
+    controller,
+    fence,
+    identity: {
+      controllerKey: controller.controllerKey,
+      turnId: turn.id,
+      pendingSpawnToken: controller.pendingSpawnToken,
+      now: fence.now,
+    },
+  };
+}
+
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
@@ -212,6 +234,122 @@ it("claims exactly one FIFO turn while a controller turn is dispatching or submi
   expect(store.claimNextControllerTurn(fence)).toBeNull();
   expect(store.completeControllerTurn({ turnId: first.id, ...fence, responseText: "Hello." })).toBe(true);
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ updateId: 202, ordinal: 2 });
+});
+
+it("resolves only the exact live pending controller spawn identity", () => {
+  const { store, identity, controller } = pendingSpawnFixture();
+
+  expect(store.getControllerForPendingSpawn(identity)).toMatchObject({
+    controllerKey: controller.controllerKey,
+    state: "pending_spawn",
+    threadId: null,
+    pendingSpawnToken: identity.pendingSpawnToken,
+  });
+
+  const forged = [
+    { ...identity, controllerKey: "owner-8-controller" },
+    { ...identity, turnId: "controller-turn-999" },
+    { ...identity, pendingSpawnToken: "controller-turn-999" },
+  ];
+  for (const candidate of forged) {
+    expect(store.getControllerForPendingSpawn(candidate)).toBeNull();
+  }
+});
+
+it.each([
+  ["queued turn", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    value.bb.storage.database().prepare(
+      "UPDATE controller_turns SET state = 'queued' WHERE id = ?",
+    ).run(value.turn.id);
+  }],
+  ["wrong turn lease owner", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    value.bb.storage.database().prepare(
+      "UPDATE controller_turns SET lease_owner = 'other-executor' WHERE id = ?",
+    ).run(value.turn.id);
+  }],
+  ["expired executor lease", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    value.bb.storage.database().prepare(
+      "UPDATE executor_lease SET lease_expires_at = ? WHERE singleton = 1",
+    ).run(value.identity.now);
+  }],
+  ["taken-over executor lease", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    expect(value.store.releaseExecutorLease(value.fence.ownerId, value.fence.generation, value.identity.now)).toBe(true);
+    const successor = value.store.acquireExecutorLease("successor-executor", value.identity.now, 30_000);
+    expect(successor).toMatchObject({ acquired: true });
+  }],
+  ["revoked owner", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    expect(value.store.revokeOwner(value.identity.now + 1)).toBe(true);
+  }],
+  ["revoked controller", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    value.bb.storage.database().prepare(
+      "UPDATE controller_threads SET state = 'revoked' WHERE controller_key = ?",
+    ).run(value.controller.controllerKey);
+  }],
+  ["mapped controller", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    expect(value.store.markControllerSpawned({
+      ...value.fence,
+      turnId: value.turn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      threadId: "thr_already_mapped",
+    })).toBe(true);
+  }],
+] as const)("fails closed for a %s pending-spawn adversary", (_label, mutate) => {
+  const value = pendingSpawnFixture();
+  mutate(value);
+  expect(value.store.getControllerForPendingSpawn(value.identity)).toBeNull();
+});
+
+it("fences controller mapping to the exact pending turn token and one unmapped controller", () => {
+  const value = pendingSpawnFixture();
+
+  value.bb.storage.database().prepare(
+    "UPDATE controller_threads SET pending_spawn_token = ? WHERE controller_key = ?",
+  ).run("controller-turn-other", value.controller.controllerKey);
+  expect(value.store.markControllerSpawned({
+    ...value.fence,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_wrong_token",
+  })).toBe(false);
+  expect(value.store.getControllerForOwner("7", "7")).toMatchObject({
+    state: "pending_spawn",
+    threadId: null,
+    pendingSpawnToken: "controller-turn-other",
+  });
+
+  value.bb.storage.database().prepare(
+    "UPDATE controller_threads SET pending_spawn_token = ? WHERE controller_key = ?",
+  ).run(value.turn.id, value.controller.controllerKey);
+  expect(value.store.markControllerSpawned({
+    ...value.fence,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_wrong_spawn_token",
+    spawnToken: "controller-turn-other",
+  })).toBe(false);
+  expect(value.store.markControllerSpawned({
+    ...value.fence,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_first_mapping",
+    spawnToken: value.turn.id,
+  })).toBe(true);
+  expect(value.store.markControllerSpawned({
+    ...value.fence,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_second_mapping",
+  })).toBe(false);
+  expect(value.store.getControllerForOwner("7", "7")).toMatchObject({
+    state: "active",
+    threadId: "thr_first_mapping",
+    pendingSpawnToken: null,
+  });
 });
 
 it("counts a retryable image preparation failure while returning the turn to the queue", () => {

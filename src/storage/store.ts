@@ -1715,6 +1715,12 @@ export interface TelegramAgentStore {
     now: number;
   }): ControllerTurnRecord;
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
+  getControllerForPendingSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    pendingSpawnToken: string;
+    now: number;
+  }): ControllerThreadRecord | null;
   getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null;
   getControllerTurn(turnId: string): ControllerTurnRecord | null;
   adoptSubmittedControllerTurnFence(
@@ -1750,6 +1756,7 @@ export interface TelegramAgentStore {
     projectId: string;
     hostId: string;
     threadId: string;
+    spawnToken?: string;
     leaseMs?: number;
   }): boolean;
   markControllerTurnSubmitted(input: ControllerLeaseFence & {
@@ -3214,6 +3221,45 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return row ? parseControllerThread(row) : null;
   }
 
+  public getControllerForPendingSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    pendingSpawnToken: string;
+    now: number;
+  }): ControllerThreadRecord | null {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerIdentifier(input.pendingSpawnToken, "pendingSpawnToken");
+    assertNonNegativeInteger(input.now, "now");
+    const row = this.db.prepare(
+      `SELECT controller.* FROM controller_threads AS controller
+         JOIN controller_turns AS turn
+           ON turn.id = ? AND turn.controller_key = controller.controller_key
+         JOIN owners ON owners.singleton = 1
+          AND owners.revoked_at IS NULL
+          AND owners.telegram_user_id = controller.telegram_user_id
+          AND owners.telegram_chat_id = controller.telegram_chat_id
+         JOIN executor_lease AS lease ON lease.singleton = 1
+        WHERE controller.controller_key = ?
+          AND controller.state = 'pending_spawn'
+          AND controller.bb_thread_id IS NULL
+          AND controller.pending_spawn_token = ?
+          AND turn.state = 'dispatching'
+          AND turn.lease_owner IS NOT NULL
+          AND turn.lease_owner = lease.owner_id
+          AND turn.lease_generation = lease.generation
+          AND lease.owner_id IS NOT NULL
+          AND lease.lease_expires_at IS NOT NULL
+          AND lease.lease_expires_at > ?`,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.pendingSpawnToken,
+      input.now,
+    ) as ControllerThreadRow | undefined;
+    return row ? parseControllerThread(row) : null;
+  }
+
   public getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null {
     assertCanonicalPositiveDecimal(userId, "userId");
     assertCanonicalPositiveDecimal(chatId, "chatId");
@@ -3493,6 +3539,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     projectId: string;
     hostId: string;
     threadId: string;
+    spawnToken?: string;
     leaseMs?: number;
   }): boolean {
     this.assertControllerMutation(input);
@@ -3506,12 +3553,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         !turn || turn.state !== "dispatching" ||
         turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation
       ) return false;
+      if (input.spawnToken !== undefined && input.spawnToken !== input.turnId) return false;
       const spawned = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = ?, host_id = ?, bb_thread_id = ?, state = 'active',
                 pending_spawn_token = NULL, last_error = NULL, updated_at = ?
-          WHERE controller_key = ?`,
-      ).run(input.projectId, input.hostId, input.threadId, input.now, turn.controller_key).changes === 1;
+          WHERE controller_key = ? AND state = 'pending_spawn' AND bb_thread_id IS NULL
+            AND pending_spawn_token = ?`,
+      ).run(input.projectId, input.hostId, input.threadId, input.now, turn.controller_key, input.turnId).changes === 1;
       if (spawned) {
         this.db.prepare(
           `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
@@ -4168,10 +4217,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const retired = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
-                state = 'pending_spawn', pending_spawn_token = NULL,
+                state = 'pending_spawn', pending_spawn_token = (
+                  SELECT id FROM controller_turns
+                   WHERE controller_key = ? AND state = 'dispatching'
+                     AND lease_owner = ? AND lease_generation = ?
+                   ORDER BY ordinal ASC LIMIT 1
+                ),
                 last_error = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id = ?`,
-      ).run(input.now, input.controllerKey, input.expectedThreadId).changes === 1;
+      ).run(
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        input.now,
+        input.controllerKey,
+        input.expectedThreadId,
+      ).changes === 1;
       if (retired) {
         this.db.prepare(
           `UPDATE controller_generations SET ended_at = ?, end_reason = ?

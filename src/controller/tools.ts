@@ -17,7 +17,7 @@ import { parseProductionStageSnapshot, productionCommandIdentity } from "../serv
 import { validationCommandIdentity } from "../services/effect-runner";
 import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../bb/validation";
 import { CONTROLLER_PROVIDERS } from "./execution-profile";
-import { isControllerThreadTitle } from "./bb-controller";
+import { isControllerThreadTitle, parseControllerSpawnTitle } from "./bb-controller";
 import { MAX_CONTROLLER_OVERLAY, composeControllerInstructions } from "./instructions";
 import {
   parseWorkerThreadTitle,
@@ -1665,16 +1665,34 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   for (const registration of pendingRegistrations) registration.register();
 
   bb.agents.configure((context) => {
-    const controller = dependencies.store.getControllerByThreadId(context.thread.id);
-    const candidate = controller !== null &&
-      controller.projectId === context.project.id &&
-      controller.hostId === context.host.id &&
-      context.origin.kind === null &&
+    const mappedController = dependencies.store.getControllerByThreadId(context.thread.id);
+    const activeMappedController = mappedController?.state === "active" && mappedController.threadId !== null
+      ? mappedController
+      : null;
+    const spawnIdentity = parseControllerSpawnTitle(context.thread.title);
+    const pendingController = activeMappedController === null && spawnIdentity !== null
+      ? dependencies.store.getControllerForPendingSpawn({
+        controllerKey: spawnIdentity.controllerKey,
+        turnId: spawnIdentity.pendingSpawnToken,
+        pendingSpawnToken: spawnIdentity.pendingSpawnToken,
+        now: dependencies.now(),
+      })
+      : null;
+    const commonContext = context.origin.kind === null &&
       context.origin.pluginId === bb.pluginId &&
       (CONTROLLER_PROVIDERS as readonly string[]).includes(context.provider.id) &&
       context.project.kind === "personal" &&
-      context.environment.workspaceProvisionType === "personal" &&
-      isControllerThreadTitle(context.thread.title, controller.controllerKey);
+      context.environment.workspaceProvisionType === "personal";
+    const candidate = commonContext && (
+      (activeMappedController !== null &&
+        activeMappedController.projectId === context.project.id &&
+        activeMappedController.hostId === context.host.id &&
+        isControllerThreadTitle(context.thread.title, activeMappedController.controllerKey, activeMappedController.projectId)) ||
+      (pendingController !== null && spawnIdentity !== null &&
+        spawnIdentity.controllerKey === pendingController.controllerKey &&
+        spawnIdentity.pendingSpawnToken === pendingController.pendingSpawnToken &&
+        spawnIdentity.projectId === context.project.id)
+    );
     if (candidate) {
       return {
         tools: [...CONTROLLER_TOOL_NAMES],
