@@ -165,9 +165,11 @@ const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|too
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
+/** A bounded optional perfect marker shared by every first-person success form. */
+const ACTIVE_PERFECT_MARKER = "(?:(?:have|had)\\s+)?";
 // Bounded to a couple of qualifiers, so "the unit tests" and "the tests you
 // allowed" both read as the test suite while a long unrelated clause does not.
-const TEST_OBJECT = "(?:the\\s+)?(?:[a-z]+\\s+){0,2}tests?\\b";
+const TEST_OBJECT = "(?:the\\s+)?(?:(?:[a-z]+\\s+){0,2}tests?|test\\s+suite)\\b";
 /** A question mark ending the part that carries the wording. */
 const QUESTION_SIBLING = /\?\s*$/;
 /**
@@ -231,6 +233,8 @@ const ELIDED_SPEAKER = /^\s*(?:ran|run)\b/;
 
 /** The verbs a success assertion uses when it has no auxiliary of its own. */
 const SIMPLE_PAST_VERB = /\b(?:passed|succeeded|completed|implemented|fixed|shipped|merged|deployed|deleted|removed|purged|installed|rotated|updated|created|issued|changed|spent|paid|purchased|ran|run)\b/;
+/** Finite auxiliaries end the subject phrase even when they do not carry number. */
+const FINITE_AUXILIARY = /\b(?:is|are|was|were|has|have|had)\b/;
 /** Auxiliaries that state their subject's number outright. */
 const PLURAL_AUXILIARY = /\b(?:are|were|have)\b/;
 const SINGULAR_AUXILIARY = /\b(?:is|was|has)\b/;
@@ -251,8 +255,9 @@ function isPluralNoun(head: string): boolean {
  * inverts the number and lets a singular tag confirm a plural assertion.
  */
 function nominalHead(text: string): string {
-  const verb = SIMPLE_PAST_VERB.exec(text);
-  const before = verb ? text.slice(0, verb.index) : text;
+  const boundaries = [FINITE_AUXILIARY.exec(text)?.index, SIMPLE_PAST_VERB.exec(text)?.index]
+    .filter((index): index is number => index !== undefined);
+  const before = boundaries.length > 0 ? text.slice(0, Math.min(...boundaries)) : text;
   return [...before.matchAll(/[a-z]+/g)].at(-1)?.[0] ?? "";
 }
 
@@ -320,13 +325,13 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
   pattern: RegExp;
   kinds: readonly ControllerClaimKind[];
 }>[] = [
-  { pattern: /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i, kinds: ["workspace_change"] },
+  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:implemented|fixed|shipped)\\b`, "i"), kinds: ["workspace_change"] },
   {
     pattern: /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
     kinds: ["workspace_change"],
   },
   {
-    pattern: /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
+    pattern: new RegExp(`\\b${TEST_OBJECT}\\s+(?:${PASSIVE_AUXILIARY}\\s+)?(?:passed|succeeded|completed)\\b`, "i"),
     kinds: ["execution_result"],
   },
   // Saying the tests were *run* is as strong as saying they passed, and the
@@ -335,7 +340,7 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
   // keeps this narrow: it reads a clause that leads with the verb, not every
   // later mention of running something.
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:ran|run)\\s+${TEST_OBJECT}`, "i"),
+    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:ran|run)\\s+${TEST_OBJECT}`, "i"),
     kinds: ["execution_result"],
   },
   {
@@ -346,14 +351,14 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
     pattern: /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
     kinds: ["pipeline_outcome"],
   },
-  { pattern: /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i, kinds: ["pipeline_outcome"] },
-  { pattern: /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i, kinds: ["pipeline_outcome"] },
+  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:approved|completed)\\s+(?:the\\s+)?review\\b`, "i"), kinds: ["pipeline_outcome"] },
+  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}merged\\s+(?:the\\s+)?(?:branch|pull request|change)\\b`, "i"), kinds: ["pipeline_outcome"] },
   {
     pattern: /\b(?:the\s+)?(?:branch|pull request|change)\s+(?:is|was|has been|had been)\s+merged\b/i,
     kinds: ["pipeline_outcome"],
   },
   {
-    pattern: /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
+    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}deployed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}(?:service|deployment|production)\\b`, "i"),
     kinds: ["pipeline_outcome"],
   },
   {
@@ -361,7 +366,7 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
     kinds: ["pipeline_outcome"],
   },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
     kinds: ["workspace_change", "external_mutation"],
   },
   {
@@ -369,7 +374,7 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
     kinds: ["workspace_change", "external_mutation"],
   },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
     kinds: ["workspace_change", "external_mutation"],
   },
   {
@@ -377,17 +382,17 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
     kinds: ["workspace_change", "external_mutation"],
   },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
     kinds: ["external_mutation"],
   },
   {
     pattern: new RegExp(`\\b(?:the\\s+)?${CREDENTIAL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:rotated|updated|created|issued|changed)\\b`, "i"),
     kinds: ["external_mutation"],
   },
-  { pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"), kinds: ["external_mutation"] },
+  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"), kinds: ["external_mutation"] },
   { pattern: new RegExp(`\\b${MONEY_AMOUNT}\\s+${PASSIVE_AUXILIARY}\\s+(?:spent|paid)\\b`, "i"), kinds: ["external_mutation"] },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
     kinds: ["external_mutation"],
   },
 ];
@@ -548,7 +553,10 @@ function sentenceSpans(text: string): SourceSpan[] {
     index += 1;
   }
   pushSpan(spans, text, 0, start, text.length);
-  return spans;
+  // A second terminator is not a second sentence. Ignoring punctuation-only
+  // spans keeps the original offsets while preventing "I'll investigate.."
+  // (or punctuation after CRLF) from manufacturing a non-process clause.
+  return spans.filter((span) => !/^[.!?]+$/.test(span.text));
 }
 
 const CLAUSE_SEPARATOR = /\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/gi;

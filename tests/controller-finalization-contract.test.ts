@@ -1082,6 +1082,11 @@ describe("bounded text heuristics", () => {
     "I'll work on the migration.",
     "I’ll investigate and get back to you.",
     "I'll investigate. I'll get back to you.",
+    "I'll investigate..",
+    "I'll investigate...",
+    "I'll investigate!!",
+    "I'll investigate. .",
+    "I'll investigate.\r\n...",
   ])("rejects process-only statement: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "process_only");
   });
@@ -1179,6 +1184,48 @@ describe("bounded text heuristics", () => {
   ])("rejects unclaimed high-impact assertion: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
+
+  const ACTIVE_PAST_PERFECT_ASSERTIONS = [
+    ["I had implemented the fix.", "I hadn't implemented the fix?", "I had implemented the fix, hadn't I?", "I had implemented the fix, hadn't we?"],
+    ["We had fixed the change.", "We hadn't fixed the change?", "We had fixed the change, hadn't we?", "We had fixed the change, hadn't I?"],
+    ["I had shipped the feature.", "I hadn't shipped the feature?", "I had shipped the feature, hadn't I?", "I had shipped the feature, hadn't we?"],
+    ["I had run the unit tests.", "I hadn't run the unit tests?", "I had run the unit tests, hadn't I?", "I had run the unit tests, hadn't we?"],
+    ["We had completed the review.", "We hadn't completed the review?", "We had completed the review, hadn't we?", "We had completed the review, hadn't I?"],
+    ["I had merged the branch.", "I hadn't merged the branch?", "I had merged the branch, hadn't I?", "I had merged the branch, hadn't we?"],
+    ["We had deployed the service to production.", "We hadn't deployed the service to production?", "We had deployed the service to production, hadn't we?", "We had deployed the service to production, hadn't I?"],
+    ["I had deleted the stale records.", "I hadn't deleted the stale records?", "I had deleted the stale records, hadn't I?", "I had deleted the stale records, hadn't we?"],
+    ["We had installed the package.", "We hadn't installed the package?", "We had installed the package, hadn't we?", "We had installed the package, hadn't I?"],
+    ["I had rotated the API keys.", "I hadn't rotated the API keys?", "I had rotated the API keys, hadn't I?", "I had rotated the API keys, hadn't we?"],
+    ["We had spent USD 500.", "We hadn't spent USD 500?", "We had spent USD 500, hadn't we?", "We had spent USD 500, hadn't I?"],
+    ["I had purchased the service.", "I hadn't purchased the service?", "I had purchased the service, hadn't I?", "I had purchased the service, hadn't we?"],
+  ] as const;
+
+  it.each(ACTIVE_PAST_PERFECT_ASSERTIONS)(
+    "screens active past-perfect success consistently: %s",
+    (assertion, negatedQuestion, agreeingTag, mismatchedTag) => {
+      const observed = contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
+      expectRejection(textFinalization(assertion), emptyFinalizationContext(), "high_impact_text_unclaimed");
+      expectRejection(
+        claimFinalization({ kind: "observed_state", outcome: "observed", text: assertion }),
+        observed,
+        "proof_incompatible",
+      );
+      for (const text of [negatedQuestion, agreeingTag]) {
+        expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+          .toMatchObject({ outcome: "accepted" });
+        expect(validateControllerFinalization(
+          claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+          observed,
+        )).toMatchObject({ outcome: "accepted" });
+      }
+      expectRejection(textFinalization(mismatchedTag), emptyFinalizationContext(), "high_impact_text_unclaimed");
+      expectRejection(
+        claimFinalization({ kind: "observed_state", outcome: "observed", text: mismatchedTag }),
+        observed,
+        "proof_incompatible",
+      );
+    },
+  );
 
   it.each([
     "Should I deploy the service?",
@@ -1336,6 +1383,10 @@ describe("tag agreement across subjects and auxiliaries", () => {
     ["The fix has been implemented", ["has it"]],
     ["The credentials have been rotated", ["have they"]],
     ["The fix had been implemented", ["had it"]],
+    ["The API key had been rotated", ["had it"]],
+    ["The API keys had been rotated", ["had they"]],
+    ["The data had been deleted", ["had they"]],
+    ["The unit tests had been completed", ["had they"]],
   ];
 
   it.each(CASES)("accepts only the agreeing pair for %s", (assertion, allowed) => {
@@ -1360,6 +1411,38 @@ describe("tag agreement across subjects and auxiliaries", () => {
         "high_impact_text_unclaimed",
       );
     }
+  });
+
+  it.each([
+    ["a singular contraction", "The API key had been rotated, hadn't it?"],
+    ["a plural contraction", "The API keys had been rotated, hadn't they?"],
+    ["a singular curly contraction", "The package had been installed, hadn’t it?"],
+    ["a plural curly contraction", "The unit tests had been completed, hadn’t they?"],
+    ["a singular inverted tag", "The API key had been rotated, had it not?"],
+    ["a plural inverted tag", "The data had been deleted, had they not?"],
+  ] as const)("accepts %s on plain-text and incompatible-claim paths", (_scenario, text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["a singular contraction with a plural pronoun", "The API key had been rotated, hadn't they?"],
+    ["a plural contraction with a singular pronoun", "The API keys had been rotated, hadn't it?"],
+    ["a singular curly contraction with a plural pronoun", "The package had been installed, hadn’t they?"],
+    ["a plural curly contraction with a singular pronoun", "The unit tests had been completed, hadn’t it?"],
+    ["a singular inverted tag with a plural pronoun", "The API key had been rotated, had they not?"],
+    ["a plural inverted tag with a singular pronoun", "The data had been deleted, had it not?"],
+  ] as const)("rejects %s on plain-text and incompatible-claim paths", (_scenario, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
   });
 });
 
@@ -1396,6 +1479,29 @@ describe("source-preserving clause offsets", () => {
         claimFinalization({ kind: "observed_state", outcome: "observed", text }), observed(),
       )).toMatchObject({ outcome: "accepted" });
     }
+  });
+
+  it("keeps punctuation runs and CRLF from moving later assertion offsets", () => {
+    const observedContext = observed();
+    for (const text of [
+      "Earlier note!!\r\nThe API keys had been rotated, hadn't it?",
+      "Earlier note. .\r\nThe unit tests had been completed, hadn’t it?",
+    ]) {
+      expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+      expectRejection(
+        claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+        observedContext,
+        "proof_incompatible",
+      );
+    }
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "observed_state",
+        outcome: "observed",
+        text: "Earlier note...\r\nThe API keys had been rotated, hadn't they?",
+      }),
+      observedContext,
+    )).toMatchObject({ outcome: "accepted" });
   });
 
   it("screens each occurrence of a repeated clause against its own tag", () => {
