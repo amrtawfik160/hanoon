@@ -1087,6 +1087,9 @@ describe("bounded text heuristics", () => {
     "I'll investigate!!",
     "I'll investigate. .",
     "I'll investigate.\r\n...",
+    "I'll investigate…",
+    "Let me investigate…",
+    "I’ll investigate… and get back to you…",
   ])("rejects process-only statement: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "process_only");
   });
@@ -1098,6 +1101,9 @@ describe("bounded text heuristics", () => {
     "I can investigate if you want me to.",
     "I'll investigate. SQLite is the simplest choice.",
     "I'll investigate. Should I follow up?",
+    "I'll investigate… SQLite is the simplest choice.",
+    "Should I investigate…?",
+    "The result is useful…",
   ])("does not broaden process-only detection to: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
@@ -1226,6 +1232,80 @@ describe("bounded text heuristics", () => {
       );
     },
   );
+
+  const PERFECT_SUCCESS_CASES = [
+    ["contracted implementation", "I’d implemented the fix.", "workspace_change", "workspace_change"],
+    ["ASCII present-perfect implementation", "I've implemented the fix.", "workspace_change", "workspace_change"],
+    ["curly present-perfect implementation", "I’ve implemented the fix.", "workspace_change", "workspace_change"],
+    ["two-adverb implementation", "I had already successfully implemented the fix.", "workspace_change", "workspace_change"],
+    ["unlisted adverb implementation", "I had definitely implemented the fix.", "workspace_change", "workspace_change"],
+    ["adverbial passive implementation", "The fix had already been implemented.", "workspace_change", "workspace_change"],
+    ["contracted nominal implementation", "The fix’s been implemented.", "workspace_change", "workspace_change"],
+    ["contracted BE implementation", "The fix’s complete.", "workspace_change", "workspace_change"],
+    ["contracted test run", "We'd run the unit tests.", "execution_result", "command_result"],
+    ["curly present-perfect test run", "We’ve run the unit tests.", "execution_result", "command_result"],
+    ["intransitive passed tests", "The tests had passed.", "execution_result", "command_result"],
+    ["contracted intransitive tests", "The tests’ve passed.", "execution_result", "command_result"],
+    ["intransitive successful tests", "The tests had succeeded.", "execution_result", "command_result"],
+    ["adverbial passive tests", "The unit tests had already been completed.", "execution_result", "command_result"],
+    ["adverbial active review", "I had already completed the review.", "pipeline_outcome", "pipeline_outcome"],
+    ["intransitive passed review", "The review had passed.", "pipeline_outcome", "pipeline_outcome"],
+    ["contracted adverbial review", "The review’s already passed.", "pipeline_outcome", "pipeline_outcome"],
+    ["two-adverb review", "The review had finally fully passed.", "pipeline_outcome", "pipeline_outcome"],
+    ["passive review", "The review had been approved.", "pipeline_outcome", "pipeline_outcome"],
+    ["contracted merge", "I’d merged the branch.", "pipeline_outcome", "pipeline_outcome"],
+    ["passive merge", "The pull request had been merged.", "pipeline_outcome", "pipeline_outcome"],
+    ["contracted BE merge", "The branch’s merged.", "pipeline_outcome", "pipeline_outcome"],
+    ["contracted deployment", "We'd deployed the service to production.", "pipeline_outcome", "pipeline_outcome"],
+    ["intransitive deployment", "The deployment had succeeded in production.", "pipeline_outcome", "pipeline_outcome"],
+    ["adverbial passive deployment", "The service had already been deployed.", "pipeline_outcome", "pipeline_outcome"],
+    ["present-state adverbial deployment", "The service is now live.", "pipeline_outcome", "pipeline_outcome"],
+    ["contracted BE deployment", "The deployment’s still live.", "pipeline_outcome", "pipeline_outcome"],
+    ["contracted deletion", "I'd deleted the stale records.", "external_mutation", "external_mutation"],
+    ["passive deletion", "The records had been deleted.", "external_mutation", "external_mutation"],
+    ["contracted plural BE deletion", "The records’re deleted.", "external_mutation", "external_mutation"],
+    ["contracted installation", "We’d installed the package.", "external_mutation", "external_mutation"],
+    ["passive installation", "The package had been installed.", "external_mutation", "external_mutation"],
+    ["adverbial credential rotation", "I had already rotated the API keys.", "external_mutation", "external_mutation"],
+    ["adverbial passive credential rotation", "The API keys had already been rotated.", "external_mutation", "external_mutation"],
+    ["contracted passive credential rotation", "The API keys’ve been rotated.", "external_mutation", "external_mutation"],
+    ["contracted spend", "We'd spent USD 500.", "external_mutation", "external_mutation"],
+    ["passive spend", "USD 500 had been spent.", "external_mutation", "external_mutation"],
+    ["contracted purchase", "I’d purchased the service.", "external_mutation", "external_mutation"],
+    ["passive purchase", "The service had been purchased.", "external_mutation", "external_mutation"],
+    ["contracted nominal purchase", "The service’d been purchased.", "external_mutation", "external_mutation"],
+    ["contracted adverbial nominal purchase", "The service’d already been purchased.", "external_mutation", "external_mutation"],
+  ] as const satisfies readonly (readonly [string, string, ControllerClaimKind, ControllerProofKind])[];
+
+  it.each(PERFECT_SUCCESS_CASES)(
+    "screens %s on plain and incompatible paths, then accepts its compatible claim",
+    (_scenario, text, kind, proofKind) => {
+      expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+      expectRejection(
+        claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+        contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+        "proof_incompatible",
+      );
+      expect(validateControllerFinalization(
+        claimFinalization({ kind, outcome: "succeeded", text }),
+        contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      )).toMatchObject({ outcome: "accepted" });
+    },
+  );
+
+  it.each([
+    "I'd like to implement the fix.",
+    "The tests had not passed.",
+    "The review had failed.",
+    "The deployment had probably succeeded in production.",
+    "The deployment had seemingly succeeded in production.",
+    "The tests had possibly already passed.",
+    "The service had never been purchased.",
+    "We had discussed purchasing the service.",
+  ])("does not broaden perfect success detection to: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
 
   it.each([
     "Should I deploy the service?",
@@ -1387,6 +1467,19 @@ describe("tag agreement across subjects and auxiliaries", () => {
     ["The API keys had been rotated", ["had they"]],
     ["The data had been deleted", ["had they"]],
     ["The unit tests had been completed", ["had they"]],
+    ["I’d implemented the fix", ["had i"]],
+    ["We'd run the unit tests", ["had we"]],
+    ["I've implemented the fix", ["have i"]],
+    ["We’ve run the unit tests", ["have we"]],
+    ["The API keys had already been rotated", ["had they"]],
+    ["The tests’ve passed", ["have they"]],
+    ["The review’s already passed", ["has it"]],
+    ["The API keys’ve been rotated", ["have they"]],
+    ["The service’d already been purchased", ["had it"]],
+    ["The fix’s complete", ["is it"]],
+    ["The branch’s merged", ["is it"]],
+    ["The deployment’s still live", ["is it"]],
+    ["The records’re deleted", ["are they"]],
   ];
 
   it.each(CASES)("accepts only the agreeing pair for %s", (assertion, allowed) => {
@@ -1437,6 +1530,38 @@ describe("tag agreement across subjects and auxiliaries", () => {
     ["a singular inverted tag with a plural pronoun", "The API key had been rotated, had they not?"],
     ["a plural inverted tag with a singular pronoun", "The data had been deleted, had it not?"],
   ] as const)("rejects %s on plain-text and incompatible-claim paths", (_scenario, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["an ASCII contracted speaker", "I'd implemented the fix, hadn't I?"],
+    ["a curly contracted speaker", "I’d implemented the fix, hadn’t I?"],
+    ["a contracted plural speaker", "We'd run the unit tests, hadn't we?"],
+    ["an adverbial nominal", "The API keys had already been rotated, hadn't they?"],
+    ["contracted intransitive tests", "The tests’ve passed, haven't they?"],
+    ["a contracted adverbial review", "The review’s already passed, hasn't it?"],
+    ["contracted passive credentials", "The API keys’ve been rotated, haven't they?"],
+    ["a contracted adverbial purchase", "The service’d already been purchased, hadn't it?"],
+  ] as const)("accepts the agreeing past-perfect tag for %s", (_scenario, text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["an ASCII contracted speaker", "I'd implemented the fix, hadn't we?"],
+    ["a curly contracted speaker", "I’d implemented the fix, hadn’t we?"],
+    ["a contracted plural speaker", "We'd run the unit tests, hadn't I?"],
+    ["an adverbial nominal", "The API keys had already been rotated, hadn't it?"],
+    ["contracted intransitive tests", "The tests’ve passed, hasn't it?"],
+    ["a contracted adverbial review", "The review’s already passed, haven't they?"],
+    ["contracted passive credentials", "The API keys’ve been rotated, hasn't it?"],
+    ["a contracted adverbial purchase", "The service’d already been purchased, hadn't they?"],
+  ] as const)("rejects the mismatched past-perfect tag for %s", (_scenario, text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
     expectRejection(
       claimFinalization({ kind: "observed_state", outcome: "observed", text }),

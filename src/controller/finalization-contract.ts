@@ -149,7 +149,7 @@ export function controllerFinalizationCorrection(code: FinalizationRejectionCode
 const PROCESS_OBJECT_WORD = "(?!(?:and|then|if)\\b)[a-z0-9_'/:-]+";
 const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigate|work\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
 const PROCESS_CLAUSE = new RegExp(
-  `^(?:(?:i(?:'ll| will)|let me)\\s+)?${PROCESS_ACTION}[.!]?$`,
+  `^(?:(?:i(?:'ll| will)|let me)\\s+)?${PROCESS_ACTION}[.!…]?$`,
   "i",
 );
 const FOLLOW_UP_OBJECT_WORD = "[a-z0-9_'/:-]+";
@@ -163,10 +163,24 @@ const DOMAIN_OBJECT = "(?:files?|records?|data|resources?|jobs?|monitors?|projec
 const INSTALL_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?)";
 const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?|deployments?|resources?)";
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
-const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
-/** A bounded optional perfect marker shared by every first-person success form. */
-const ACTIVE_PERFECT_MARKER = "(?:(?:have|had)\\s+)?";
+const SUCCESS_ADVERB = "(?:already|just|now|still|[a-z]+ly)";
+const ACTIVE_SUCCESS_PREFIX = `(?:i|we)(?:(?:\\s+(?:have|had)|['’](?:ve|d)))?\\s+(?:(?:${SUCCESS_ADVERB})\\s+){0,2}`;
+const PERFECT_AUXILIARY = `(?:has|have|had)(?:\\s+${SUCCESS_ADVERB}){0,2}`;
+const PERFECT_LINK = `(?:\\s+${PERFECT_AUXILIARY}|['’](?:s|ve|d)(?:\\s+${SUCCESS_ADVERB}){0,2})`;
+const PASSIVE_AUXILIARY = `(?:(?:is|are|was|were)(?:\\s+${SUCCESS_ADVERB}){0,2}|(?:has|have|had)(?:\\s+${SUCCESS_ADVERB}){0,2}\\s+been)`;
+const CONTRACTED_BE_LINK = `['’](?:s|re)(?:\\s+${SUCCESS_ADVERB}){0,2}`;
+const PASSIVE_LINK = `(?:\\s+${PASSIVE_AUXILIARY}|${CONTRACTED_BE_LINK}|['’](?:s|ve|d)(?:\\s+${SUCCESS_ADVERB}){0,2}\\s+been)`;
+const CONTRACTED_PAST_PERFECT = new RegExp(`\\w['’]d(?:\\s+${SUCCESS_ADVERB}){0,2}(?:\\s+been)?\\b`, "i");
+const CONTRACTED_PRESENT_PERFECT = new RegExp(
+  `(?:\\b(?:i|we)['’]ve\\b|\\w['’](?:s|ve)(?:\\s+${SUCCESS_ADVERB}){0,2}` +
+  `(?:\\s+been|\\s+(?:passed|succeeded|completed))\\b)`,
+  "i",
+);
+const CONTRACTED_PRESENT_BE = new RegExp(
+  `\\w${CONTRACTED_BE_LINK}\\s+(?:complete|implemented|fixed|shipped|merged|deployed|live|healthy|verified|deleted|removed|purged|installed|rotated|updated|created|issued|changed|spent|paid|purchased)\\b`,
+  "i",
+);
 // Bounded to a couple of qualifiers, so "the unit tests" and "the tests you
 // allowed" both read as the test suite while a long unrelated clause does not.
 const TEST_OBJECT = "(?:the\\s+)?(?:(?:[a-z]+\\s+){0,2}tests?|test\\s+suite)\\b";
@@ -234,7 +248,7 @@ const ELIDED_SPEAKER = /^\s*(?:ran|run)\b/;
 /** The verbs a success assertion uses when it has no auxiliary of its own. */
 const SIMPLE_PAST_VERB = /\b(?:passed|succeeded|completed|implemented|fixed|shipped|merged|deployed|deleted|removed|purged|installed|rotated|updated|created|issued|changed|spent|paid|purchased|ran|run)\b/;
 /** Finite auxiliaries end the subject phrase even when they do not carry number. */
-const FINITE_AUXILIARY = /\b(?:is|are|was|were|has|have|had)\b/;
+const FINITE_AUXILIARY = /\b(?:is|are|was|were|has|have|had)\b|['’](?:s|re|ve|d)\b/;
 /** Auxiliaries that state their subject's number outright. */
 const PLURAL_AUXILIARY = /\b(?:are|were|have)\b/;
 const SINGULAR_AUXILIARY = /\b(?:is|was|has)\b/;
@@ -274,8 +288,9 @@ function tagSubject(text: string): TagSubject {
 }
 
 function tagAuxiliaries(text: string): Record<TagSubject, readonly string[]> {
-  if (/\bhad\b/.test(text)) return PAST_PERFECT;
-  if (/\b(?:has|have)\b/.test(text)) return PERFECT;
+  if (/\bhad\b/.test(text) || CONTRACTED_PAST_PERFECT.test(text)) return PAST_PERFECT;
+  if (/\b(?:has|have)\b/.test(text) || CONTRACTED_PRESENT_PERFECT.test(text)) return PERFECT;
+  if (CONTRACTED_PRESENT_BE.test(text)) return PRESENT_BE;
   if (/\b(?:is|are)\b/.test(text)) return PRESENT_BE;
   if (/\b(?:was|were)\b/.test(text)) return PAST_BE;
   return SIMPLE_PAST;
@@ -308,7 +323,7 @@ const NON_SUCCESS_SIBLING = [
   /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
   /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
-  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
+  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|seemingly|apparently|arguably|supposedly|ostensibly|appears?|seems?)\b/i,
 ];
 /**
  * Every high-impact success assertion, with the claim kinds under which it can
@@ -325,13 +340,13 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
   pattern: RegExp;
   kinds: readonly ControllerClaimKind[];
 }>[] = [
-  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:implemented|fixed|shipped)\\b`, "i"), kinds: ["workspace_change"] },
+  { pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}(?:implemented|fixed|shipped)\\b`, "i"), kinds: ["workspace_change"] },
   {
-    pattern: /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
+    pattern: new RegExp(`\\b(?:the\\s+)?(?:fix|change|feature|implementation|code)${PASSIVE_LINK}\\s+(?:implemented|fixed|shipped|complete|completed)\\b`, "i"),
     kinds: ["workspace_change"],
   },
   {
-    pattern: new RegExp(`\\b${TEST_OBJECT}\\s+(?:${PASSIVE_AUXILIARY}\\s+)?(?:passed|succeeded|completed)\\b`, "i"),
+    pattern: new RegExp(`\\b${TEST_OBJECT}(?:${PASSIVE_LINK}|${PERFECT_LINK})?\\s+(?:passed|succeeded|completed)\\b`, "i"),
     kinds: ["execution_result"],
   },
   // Saying the tests were *run* is as strong as saying they passed, and the
@@ -340,7 +355,7 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
   // keeps this narrow: it reads a clause that leads with the verb, not every
   // later mention of running something.
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:ran|run)\\s+${TEST_OBJECT}`, "i"),
+    pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}(?:ran|run)\\s+${TEST_OBJECT}`, "i"),
     kinds: ["execution_result"],
   },
   {
@@ -348,51 +363,55 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
     kinds: ["execution_result"],
   },
   {
-    pattern: /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
+    pattern: new RegExp(`\\b(?:the\\s+)?review(?:${PASSIVE_LINK}|${PERFECT_LINK})?\\s+(?:complete|completed|passed|approved)\\b`, "i"),
     kinds: ["pipeline_outcome"],
   },
-  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:approved|completed)\\s+(?:the\\s+)?review\\b`, "i"), kinds: ["pipeline_outcome"] },
-  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}merged\\s+(?:the\\s+)?(?:branch|pull request|change)\\b`, "i"), kinds: ["pipeline_outcome"] },
+  { pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}(?:approved|completed)\\s+(?:the\\s+)?review\\b`, "i"), kinds: ["pipeline_outcome"] },
+  { pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}merged\\s+(?:the\\s+)?(?:branch|pull request|change)\\b`, "i"), kinds: ["pipeline_outcome"] },
   {
-    pattern: /\b(?:the\s+)?(?:branch|pull request|change)\s+(?:is|was|has been|had been)\s+merged\b/i,
-    kinds: ["pipeline_outcome"],
-  },
-  {
-    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}deployed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}(?:service|deployment|production)\\b`, "i"),
+    pattern: new RegExp(`\\b(?:the\\s+)?(?:branch|pull request|change)${PASSIVE_LINK}\\s+merged\\b`, "i"),
     kinds: ["pipeline_outcome"],
   },
   {
-    pattern: /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
+    pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}deployed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}(?:service|deployment|production)\\b`, "i"),
     kinds: ["pipeline_outcome"],
   },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b(?:the\\s+)?(?:service|deployment|production)(?:${PASSIVE_LINK}\\s+(?:deployed|live|healthy|verified)|(?:${PERFECT_LINK})?\\s+succeeded(?:\\s+in\\s+production)?)\\b`, "i"),
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
     kinds: ["workspace_change", "external_mutation"],
   },
   {
-    pattern: new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:deleted|removed|purged)\\b`, "i"),
+    pattern: new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}${PASSIVE_LINK}\\s+(?:deleted|removed|purged)\\b`, "i"),
     kinds: ["workspace_change", "external_mutation"],
   },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
     kinds: ["workspace_change", "external_mutation"],
   },
   {
-    pattern: new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+installed\\b`, "i"),
+    pattern: new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}${PASSIVE_LINK}\\s+installed\\b`, "i"),
     kinds: ["workspace_change", "external_mutation"],
   },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
     kinds: ["external_mutation"],
   },
   {
-    pattern: new RegExp(`\\b(?:the\\s+)?${CREDENTIAL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:rotated|updated|created|issued|changed)\\b`, "i"),
+    pattern: new RegExp(`\\b(?:the\\s+)?${CREDENTIAL_OBJECT}${PASSIVE_LINK}\\s+(?:rotated|updated|created|issued|changed)\\b`, "i"),
     kinds: ["external_mutation"],
   },
-  { pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"), kinds: ["external_mutation"] },
-  { pattern: new RegExp(`\\b${MONEY_AMOUNT}\\s+${PASSIVE_AUXILIARY}\\s+(?:spent|paid)\\b`, "i"), kinds: ["external_mutation"] },
+  { pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"), kinds: ["external_mutation"] },
+  { pattern: new RegExp(`\\b${MONEY_AMOUNT}${PASSIVE_LINK}\\s+(?:spent|paid)\\b`, "i"), kinds: ["external_mutation"] },
   {
-    pattern: new RegExp(`\\b(?:i|we)\\s+${ACTIVE_PERFECT_MARKER}purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
+    pattern: new RegExp(`\\b${ACTIVE_SUCCESS_PREFIX}purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp(`\\b(?:the\\s+)?${PURCHASE_OBJECT}${PASSIVE_LINK}\\s+purchased\\b`, "i"),
     kinds: ["external_mutation"],
   },
 ];
@@ -526,7 +545,7 @@ function pushSpan(spans: SourceSpan[], text: string, offset: number, from: numbe
   spans.push({ text: trimmed, start: offset + from + (raw.length - raw.trimStart().length) });
 }
 
-const SENTENCE_TERMINATOR = new Set([".", "!", "?"]);
+const SENTENCE_TERMINATOR = new Set([".", "!", "?", "…"]);
 
 /**
  * Sentence spans over the original text. A line break ends a sentence just as a
@@ -556,7 +575,7 @@ function sentenceSpans(text: string): SourceSpan[] {
   // A second terminator is not a second sentence. Ignoring punctuation-only
   // spans keeps the original offsets while preventing "I'll investigate.."
   // (or punctuation after CRLF) from manufacturing a non-process clause.
-  return spans.filter((span) => !/^[.!?]+$/.test(span.text));
+  return spans.filter((span) => !/^[.!?…]+$/.test(span.text));
 }
 
 const CLAUSE_SEPARATOR = /\s*(?:,\s*)?\b(?:and|but|however|which|while|then)\b\s+|;\s*/gi;
