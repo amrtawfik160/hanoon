@@ -235,6 +235,14 @@ function expectLegacyMigrationRollback(
   fixture: ReturnType<typeof legacyQuestionDatabaseFixture>,
   originalRows: unknown[],
 ): void {
+  const migrationIds = (fixture.db.prepare(
+    "SELECT id FROM _bb_migrations ORDER BY id",
+  ).all() as Array<{ id: number }>).map((row) => row.id);
+  expect(migrationIds).toEqual([
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 21, 22, 23, 24, 25, 26, 27, 28,
+  ]);
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
     count: SHIPPED_MIGRATION_COUNT,
   });
@@ -562,7 +570,25 @@ it.each([
 const SHELL_ASSIGNMENT_TEXTS = [
   ["a command-substitution assignment", "$(lowercase=plain-value command)"],
   ["a quoted-script assignment", "sh -c 'lowercase=plain-value command'"],
+  ["an exported generic assignment", "export lowercase=plain-value"],
+  ["a backtick-nested generic assignment", "sh -c `lowercase=plain-value command`"],
 ] as const;
+
+const RAW_TOKEN_SIGNATURES = [
+  ["AKIA access key", `AKIA${"A".repeat(16)}`],
+  ["sk- token", `sk-${"A".repeat(20)}`],
+  ["rk- token", `rk-${"A".repeat(20)}`],
+  ...(["p", "o", "u", "s", "r"] as const).map((prefix) => [
+    `GitHub gh${prefix} token`,
+    `gh${prefix}_${"A".repeat(20)}`,
+  ] as const),
+  ["Telegram bot token", `1234567890:${"A".repeat(35)}`],
+] as const;
+
+const EMBEDDED_RAW_TOKEN_TEXTS = RAW_TOKEN_SIGNATURES.map(([name, token]) => [
+  `an embedded ${name}`,
+  `prefix${token}suffix`,
+] as const);
 
 const SHELL_ASSIGNMENT_LEGACY_PROJECTIONS = SHELL_ASSIGNMENT_TEXTS.flatMap(([name, unsafeText]) => [
   [`${name} in the prompt`, "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = unsafeText; }), "{}"],
@@ -579,16 +605,7 @@ const SHELL_ASSIGNMENT_LEGACY_PROJECTIONS = SHELL_ASSIGNMENT_TEXTS.flatMap(([nam
   })],
 ] as const);
 
-const RAW_TOKEN_LEGACY_PROJECTIONS = [
-  ["an AKIA access key", `AKIA${"A".repeat(16)}`],
-  ["an sk token", `sk-${"A".repeat(20)}`],
-  ["an rk token", `rk-${"A".repeat(20)}`],
-  ...(["p", "o", "u", "s", "r"] as const).map((prefix) => [
-    `a GitHub gh${prefix} token`,
-    `gh${prefix}_${"A".repeat(20)}`,
-  ] as const),
-  ["a Telegram bot token", `1234567890:${"A".repeat(35)}`],
-].map(([name, unsafeText]) => [
+const RAW_TOKEN_LEGACY_PROJECTIONS = [...RAW_TOKEN_SIGNATURES, ...EMBEDDED_RAW_TOKEN_TEXTS].map(([name, unsafeText]) => [
   name,
   "pending",
   legacyQuestionsJson((questions) => { questions[0]!.prompt = unsafeText; }),
@@ -748,6 +765,7 @@ it.each([
   ["a lowercase double-quoted assignment", 'lowercase="quoted value"'],
   ["an empty generic assignment", "lowercase="],
   ...SHELL_ASSIGNMENT_TEXTS,
+  ...EMBEDDED_RAW_TOKEN_TEXTS,
   ["an embedded callback nonce", `prefixxm:${"A".repeat(32)}suffix`],
 ] as const)("rejects %s at every controller text boundary", (_name, unsafeText) => {
   const commandProjection = parseControllerInteraction("boundary_command", approvalPayload({
@@ -818,6 +836,7 @@ it.each([
   ["a nested credential URL", `open https://outer.test/?next=${encodeURIComponent("https://inner.test/?client_secret=secret-value")}`],
   ["a lowercase quoted assignment", "run secret='secret-value'"],
   ["a lowercase double-quoted assignment", 'run api_key="secret-value"'],
+  ...RAW_TOKEN_SIGNATURES.map(([name, token]) => [`a standalone ${name}`, `run ${token}`] as const),
 ] as const)("redacts %s before clipping", (_name, command) => {
   const projection = parseControllerInteraction("approval_vocabulary", approvalPayload({
     subject: { kind: "command", command, cwd: "/workspace/project" },
