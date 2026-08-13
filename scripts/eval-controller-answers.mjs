@@ -35,6 +35,7 @@ import {
   buildClauseAssessment,
   buildClauseJudgePrompt,
   detectExplicitClauseViolation,
+  isExactAnswerReleaseCorpus,
   parseAnswerExpectations,
   parseClauseVerdict,
   parseLiveGateArtifact,
@@ -499,8 +500,21 @@ async function main() {
   const { cases } = JSON.parse(readFileSync(CASES_PATH, "utf8"));
   const expectations = parseAnswerExpectations(JSON.parse(readFileSync(EXPECTATIONS_PATH, "utf8")));
   const expectationsById = new Map(expectations.cases.map((each) => [each.id, each]));
-  if (cases.length !== ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount || expectations.cases.length !== ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount) {
-    fail(`answer corpus must contain exactly ${ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount} cases`);
+  const goldenSha256 = sha256File(CASES_PATH);
+  const expectationsSha256 = sha256File(EXPECTATIONS_PATH);
+  if (
+    !isExactAnswerReleaseCorpus({
+      caseIds: cases.map((testCase) => testCase.id),
+      goldenSha256,
+      expectationsSha256,
+    })
+    || !isExactAnswerReleaseCorpus({
+      caseIds: expectations.cases.map((testCase) => testCase.id),
+      goldenSha256,
+      expectationsSha256,
+    })
+  ) {
+    fail("checked-in answer corpus does not match the pinned release corpus");
   }
   const selected = options.only ? cases.filter((each) => each.id === options.only) : cases;
   if (selected.length === 0) fail(`no case matched ${options.only}`);
@@ -563,8 +577,8 @@ async function main() {
     caseResults,
     infrastructureErrors,
     runtimeAudit,
-    goldenSha256: sha256File(CASES_PATH),
-    expectationsSha256: sha256File(EXPECTATIONS_PATH),
+    goldenSha256,
+    expectationsSha256,
   });
   const forbiddenValues = selected.flatMap((testCase) => [testCase.ownerMessage, testCase.answer]);
   writeLiveGateArtifact(artifactPath, artifact, forbiddenValues);

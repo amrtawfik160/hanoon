@@ -61,7 +61,31 @@ export const ANSWER_CLAUSE_IDS: readonly AnswerClauseId[] = Object.freeze(
 export const ANSWER_LIVE_GATE_RELEASE_CORPUS = Object.freeze({
   caseCount: 7,
   clauseCount: 7 * ANSWER_CLAUSES.length,
+  caseIds: Object.freeze([
+    "status-good",
+    "status-narrates-tools",
+    "status-invents-eta",
+    "process-only",
+    "dead-end-referral",
+    "bounded-uncertainty",
+    "bad-news-plainly",
+  ]),
+  goldenSha256: "05cb2da1e88ba767e07f7ed22389fe39ae278acd9f8f3c5879851cf17dd2370b",
+  expectationsSha256: "0876bcb014fd595337fe35b21906c46e5ac3b0d89d02220a839da2cb7aabcd7b",
 } as const);
+
+export function isExactAnswerReleaseCorpus(input: {
+  caseIds: readonly string[];
+  goldenSha256: string;
+  expectationsSha256: string;
+}): boolean {
+  const expectedCaseIds = ANSWER_LIVE_GATE_RELEASE_CORPUS.caseIds;
+  return input.goldenSha256 === ANSWER_LIVE_GATE_RELEASE_CORPUS.goldenSha256
+    && input.expectationsSha256 === ANSWER_LIVE_GATE_RELEASE_CORPUS.expectationsSha256
+    && input.caseIds.length === expectedCaseIds.length
+    && new Set(input.caseIds).size === expectedCaseIds.length
+    && expectedCaseIds.every((caseId) => input.caseIds.includes(caseId));
+}
 
 export type AnswerJudgeSpawnInput = Readonly<{
   project: string;
@@ -525,6 +549,11 @@ export function parseLiveGateArtifact(
   if (parsed.status === "passed" && (
     parsed.selectedCaseCount !== ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount
     || parsed.selectedClauseCount !== ANSWER_LIVE_GATE_RELEASE_CORPUS.clauseCount
+    || !isExactAnswerReleaseCorpus({
+      caseIds: parsedCases.map((candidate) => candidate.id),
+      goldenSha256: parsed.goldenSha256 as string,
+      expectationsSha256: parsed.expectationsSha256 as string,
+    })
     || parsed.infrastructureErrors.length > 0
     || aggregate.cases.agreed !== aggregate.cases.total
     || aggregate.clauses.agreed !== aggregate.clauses.total

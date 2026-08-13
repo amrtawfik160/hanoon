@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { join } from "node:path";
@@ -22,6 +22,17 @@ import {
 
 const repositoryRoot = join(import.meta.dirname, "..");
 const execFileAsync = promisify(execFile);
+const RELEASE_CASE_IDS = [
+  "status-good",
+  "status-narrates-tools",
+  "status-invents-eta",
+  "process-only",
+  "dead-end-referral",
+  "bounded-uncertainty",
+  "bad-news-plainly",
+];
+const RELEASE_GOLDEN_SHA256 = "05cb2da1e88ba767e07f7ed22389fe39ae278acd9f8f3c5879851cf17dd2370b";
+const RELEASE_EXPECTATIONS_SHA256 = "0876bcb014fd595337fe35b21906c46e5ac3b0d89d02220a839da2cb7aabcd7b";
 
 type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "infra" | "ambiguous-spawn" | "spawn-error";
 
@@ -126,6 +137,56 @@ async function runWithFakeBb(caseId: string, mode: FakeBbMode, status = "idle") 
   }
 }
 
+function copyAnswerEvalFixture(directory: string, mutateAnswers: (fixture: Record<string, any>) => void, mutateExpectations: (fixture: Record<string, any>) => void): string {
+  const pluginRoot = join(directory, "answer-eval-plugin");
+  mkdirSync(join(pluginRoot, "scripts"), { recursive: true });
+  mkdirSync(join(pluginRoot, "src", "eval"), { recursive: true });
+  mkdirSync(join(pluginRoot, "evals"), { recursive: true });
+  copyFileSync(join(repositoryRoot, "scripts/eval-controller-answers.mjs"), join(pluginRoot, "scripts/eval-controller-answers.mjs"));
+  copyFileSync(join(repositoryRoot, "src/eval/answer-contract.ts"), join(pluginRoot, "src/eval/answer-contract.ts"));
+  copyFileSync(join(repositoryRoot, "src/eval/answer-anchors.ts"), join(pluginRoot, "src/eval/answer-anchors.ts"));
+  copyFileSync(join(repositoryRoot, "src/eval/answer-anchors.js"), join(pluginRoot, "src/eval/answer-anchors.js"));
+  const answers = JSON.parse(readFileSync(join(repositoryRoot, "evals/answers.json"), "utf8")) as Record<string, any>;
+  const expectations = JSON.parse(readFileSync(join(repositoryRoot, "evals/answer-expectations.json"), "utf8")) as Record<string, any>;
+  mutateAnswers(answers);
+  mutateExpectations(expectations);
+  writeFileSync(join(pluginRoot, "evals/answers.json"), `${JSON.stringify(answers)}\n`);
+  writeFileSync(join(pluginRoot, "evals/answer-expectations.json"), `${JSON.stringify(expectations)}\n`);
+  return join(pluginRoot, "scripts/eval-controller-answers.mjs");
+}
+
+async function runWithMismatchedAnswerCorpus(
+  mutateAnswers: (fixture: Record<string, any>) => void,
+  mutateExpectations: (fixture: Record<string, any>) => void,
+) {
+  const directory = mkdtempSync(join(tmpdir(), "answer-corpus-test-"));
+  const logPath = join(directory, "bb-commands.jsonl");
+  const artifactPath = join(directory, "live-gate.json");
+  fakeBbPath(directory, "all-hold");
+  const scriptPath = copyAnswerEvalFixture(directory, mutateAnswers, mutateExpectations);
+  try {
+    const result = await execFileAsync(process.execPath, [
+      scriptPath,
+      "--project", "proj_fake",
+      "--case", "status-good",
+      "--artifact", artifactPath,
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${directory}${process.env.PATH ? `:${process.env.PATH}` : ""}`,
+        ANSWER_EVAL_FAKE_BB_LOG: logPath,
+        ANSWER_EVAL_FAKE_BB_MODE: "all-hold",
+        BB_THREAD_ID: "thr_test_origin",
+      },
+      maxBuffer: 2 * 1024 * 1024,
+      timeout: 120_000,
+    });
+    return { directory, logPath, artifactPath, result };
+  } catch (error) {
+    return { directory, logPath, artifactPath, error };
+  }
+}
+
 function buildReleasePassedArtifact(): Record<string, any> {
   const clauses = ANSWER_CLAUSES.map((clause) => ({
     id: clause.id,
@@ -139,12 +200,12 @@ function buildReleasePassedArtifact(): Record<string, any> {
     schemaVersion: "answer-live-gate-v1",
     rubricVersion: ANSWER_RUBRIC_VERSION,
     judgeProfile: ANSWER_JUDGE_PROFILE,
-    goldenSha256: "a".repeat(64),
-    expectationsSha256: "b".repeat(64),
-    selectedCaseCount: 7,
-    selectedClauseCount: 7 * ANSWER_CLAUSES.length,
-    cases: Array.from({ length: 7 }, (_, index) => ({
-      id: `synthetic-case-${index + 1}`,
+    goldenSha256: RELEASE_GOLDEN_SHA256,
+    expectationsSha256: RELEASE_EXPECTATIONS_SHA256,
+    selectedCaseCount: RELEASE_CASE_IDS.length,
+    selectedClauseCount: RELEASE_CASE_IDS.length * ANSWER_CLAUSES.length,
+    cases: RELEASE_CASE_IDS.map((id) => ({
+      id,
       expected: "pass",
       result: "pass",
       matchesGolden: true,
@@ -159,8 +220,11 @@ function buildReleasePassedArtifact(): Record<string, any> {
       cleanup: { judgeThreads: "complete", workspaces: "complete" },
     },
     aggregate: {
-      cases: { agreed: 7, total: 7 },
-      clauses: { agreed: 7 * ANSWER_CLAUSES.length, total: 7 * ANSWER_CLAUSES.length },
+      cases: { agreed: RELEASE_CASE_IDS.length, total: RELEASE_CASE_IDS.length },
+      clauses: {
+        agreed: RELEASE_CASE_IDS.length * ANSWER_CLAUSES.length,
+        total: RELEASE_CASE_IDS.length * ANSWER_CLAUSES.length,
+      },
     },
     status: "passed",
   };
@@ -168,6 +232,43 @@ function buildReleasePassedArtifact(): Record<string, any> {
 
 it("accepts a complete release-shaped artifact", () => {
   expect(parseLiveGateArtifact(JSON.stringify(buildReleasePassedArtifact()))).not.toBeNull();
+});
+
+it.each([
+  ["case ID", (artifact: Record<string, any>) => { artifact.cases[0].id = "substituted-case"; }],
+  ["golden hash", (artifact: Record<string, any>) => { artifact.goldenSha256 = "a".repeat(64); }],
+  ["expectations hash", (artifact: Record<string, any>) => { artifact.expectationsSha256 = "b".repeat(64); }],
+])("rejects a passed artifact with a substituted release %s", (_label, mutateArtifact) => {
+  const artifact = buildReleasePassedArtifact();
+  mutateArtifact(artifact);
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
+});
+
+it("keeps failed diagnostic artifacts parseable without release corpus binding", () => {
+  const artifact = buildReleasePassedArtifact();
+  artifact.status = "failed";
+  artifact.cases[0].id = "diagnostic-case";
+  artifact.goldenSha256 = "c".repeat(64);
+  artifact.expectationsSha256 = "d".repeat(64);
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).not.toBeNull();
+});
+
+it.each([
+  ["golden", (fixture: Record<string, any>) => { fixture._doc += " changed"; }, () => {}],
+  ["expectations", () => {}, (fixture: Record<string, any>) => { fixture.cases[1].clauses["no-tool-narration"] = true; }],
+])("rejects a checked-in %s corpus mismatch before judging", async (_label, mutateAnswers, mutateExpectations) => {
+  const run = await runWithMismatchedAnswerCorpus(mutateAnswers, mutateExpectations);
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
+    expect(run.error).toMatchObject({ stderr: expect.stringContaining("release corpus") });
+    expect(readFileSync(run.logPath, "utf8")).toBe("");
+    expect(existsSync(run.artifactPath)).toBe(false);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
+  }
 });
 
 it("keeps every clause id unique and stable", () => {
