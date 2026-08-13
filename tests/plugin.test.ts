@@ -2,11 +2,18 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import { expect, it, vi } from "vitest";
 import plugin from "../server";
 import { hashSecret } from "../src/crypto";
+import { BbControllerAdapter } from "../src/controller/bb-controller";
+import { CONTROLLER_INSTRUCTION_SENTINEL } from "../src/controller/instructions";
+import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
 import { ApprovalService } from "../src/services/approval-service";
 import { openStore } from "../src/storage/store";
 import { policyFixture, sha } from "./helpers";
 
 let pluginNumber = 0;
+
+function countOccurrences(text: string, needle: string): number {
+  return needle.length === 0 ? 0 : text.split(needle).length - 1;
+}
 
 async function loadPlugin() {
   const { bb, harness } = createFakePluginHost({
@@ -55,9 +62,71 @@ it("registers configurable controller execution settings with safe defaults", as
     controllerPermissionMode: {
       type: "select",
       options: ["auto", "accept-edits", "full"],
-      default: "full",
+      default: "auto",
+      description: "Fresh controller turns default to auto; supported BB-native approvals are routed to Telegram as one-use Allow once/Deny choices, while BB and the execution machine continue to enforce their permission limits.",
     },
   });
+});
+
+it("keeps standing instructions in configuration and owner content in the first input", async () => {
+  const { bb, harness } = await loadPlugin();
+  await harness.behavior.setSettings({ botToken: "123:test-token" });
+  const store = openStore(bb.storage);
+  const now = 10_000;
+  const pairingSecret = "controller-trust-kernel-pair";
+  store.createPairingCode(hashSecret(pairingSecret), now, now + 60_000);
+  expect(store.pairOwnerWithCode(hashSecret(pairingSecret), "7", "7", now)).toEqual({ ok: true });
+  const overlay = "Always show me the PR link.";
+  store.setControllerOverlay({ text: overlay, now });
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 12_001,
+    inputText: "What is running right now?",
+    now,
+  });
+  const lease = store.acquireExecutorLease("controller-trust-kernel-test", now, 30_000);
+  if (!lease.acquired) throw new Error("missing controller test lease");
+  const fence = { ownerId: "controller-trust-kernel-test", generation: lease.generation, now };
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  const controller = store.getControllerForOwner("7", "7");
+  if (!controller) throw new Error("missing controller record");
+
+  harness.sdk.stub("projects.list", async () => [{
+    id: "proj_personal",
+    kind: "personal",
+    name: "Personal",
+    gitRemoteUrl: null,
+    sources: [{ id: "src_personal", isDefault: true, hostId: "host_personal" }],
+  }]);
+  harness.sdk.stub("threads.spawn", async () => ({ id: "thr_trust_kernel", environmentId: "env_personal" }));
+  const adapter = new BbControllerAdapter({
+    sdk: bb.sdk,
+    pluginId: bb.pluginId,
+    executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  });
+  const location = await adapter.spawn(turn, controller, AbortSignal.timeout(1_000));
+  expect(store.markControllerSpawned({ ...fence, turnId: turn.id, ...location })).toBe(true);
+
+  const configured = await harness.behavior.resolveAgentConfiguration({
+    thread: { id: location.threadId, title: "Telegram Codex controller owner-7-controller", parentThreadId: null, sourceThreadId: null },
+    project: { id: location.projectId, kind: "personal", name: "Personal", gitRemoteUrl: null },
+    environment: { id: "env_personal", name: null, path: "/personal", workspaceProvisionType: "personal", branchName: null },
+    host: { id: location.hostId, name: "Personal host" },
+    provider: { id: "codex", model: "gpt-5.6-luna" },
+    origin: { kind: null, pluginId: bb.pluginId },
+  });
+  if (configured.instructions === null) throw new Error("missing controller instructions");
+  expect(configured.instructions).toContain(overlay);
+  const spawnCall = harness.inspection.sdk.callsTo("threads.spawn").at(-1)?.[0];
+  if (!spawnCall || typeof spawnCall !== "object" || !("input" in spawnCall)) throw new Error("missing controller spawn input");
+  const firstInput = (spawnCall as { input: Array<{ type: string; text?: string; mentions?: string[] }> }).input;
+
+  expect(countOccurrences(`${configured.instructions}\n${turn.inputText}`, CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
+  expect(countOccurrences(configured.instructions, overlay)).toBe(1);
+  expect(firstInput).toEqual([{ type: "text", text: turn.inputText, mentions: [] }]);
+  expect(firstInput[0]?.text).not.toContain(CONTROLLER_INSTRUCTION_SENTINEL);
 });
 
 it("registers the bounded concurrent job cap as a select setting", async () => {

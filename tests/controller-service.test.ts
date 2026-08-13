@@ -172,15 +172,16 @@ function agentDelta(seq: number, delta: string) {
 
 it("spawns the hidden personal controller on the configured model and provider", async () => {
   const { adapter, spawn } = sdkFixture();
+  const turn = turnRecord();
 
-  await adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000));
+  await adapter.spawn(turn, controllerRecord(), AbortSignal.timeout(1_000));
 
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
     projectId: "proj_personal",
     providerId: "claude-code",
     model: "claude-opus-5[1m]",
     reasoningLevel: "xhigh",
-    permissionMode: "full",
+    permissionMode: "auto",
     visibility: "hidden",
     environment: {
       type: "host",
@@ -193,7 +194,7 @@ it("spawns the hidden personal controller on the configured model and provider",
       reasoningLevel: "explicit",
       permissionMode: "explicit",
     },
-    input: [{ type: "text", text: expect.stringContaining("What projects can you work on?"), mentions: [] }],
+    input: [{ type: "text", text: turn.inputText, mentions: [] }],
   }));
 });
 
@@ -207,7 +208,7 @@ it("keeps the configured execution tuple on later controller turns", async () =>
     mode: "start",
     model: "claude-opus-5[1m]",
     reasoningLevel: "xhigh",
-    permissionMode: "full",
+    permissionMode: "auto",
     executionInputSources: {
       model: "explicit",
       reasoningLevel: "explicit",
@@ -376,6 +377,22 @@ it("uses the configured execution profile for initial and later controller turns
       permissionMode: "explicit",
     },
   }));
+});
+
+it("preserves an explicitly configured full permission mode on spawn and send", async () => {
+  const executionProfile: ControllerExecutionProfile = {
+    model: "claude-opus-5[1m]",
+    reasoningLevel: "xhigh",
+    serviceTier: "default",
+    permissionMode: "full",
+  };
+  const { adapter, spawn, send } = sdkFixture({ executionProfile });
+
+  await adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000));
+  await adapter.send("thr_controller", "Show active threads", AbortSignal.timeout(1_000));
+
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: "full" }));
+  expect(send).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: "full" }));
 });
 
 it("fails closed when an unbound personal project has multiple connected hosts", async () => {

@@ -5,6 +5,7 @@ import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { openStore } from "../src/storage/store";
 import {
   CONTROLLER_INSTRUCTIONS,
+  CONTROLLER_INSTRUCTION_SENTINEL,
   MAX_CONTROLLER_OVERLAY,
   composeControllerInstructions,
 } from "../src/controller/instructions";
@@ -18,6 +19,10 @@ function fixture() {
   store.createPairingCode(hashSecret("pair"), 1_000, 10_000);
   expect(store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001)).toEqual({ ok: true });
   return { bb, store };
+}
+
+function countOccurrences(text: string, needle: string): number {
+  return needle.length === 0 ? 0 : text.split(needle).length - 1;
 }
 
 it("appends the overlay migration after every shipped one", () => {
@@ -36,6 +41,29 @@ it("layers the owner's wording after the fixed instructions, never before", () =
   expect(composed).toContain("Always show me the PR link.");
   // A boundary stated above must not be reorderable by anything the overlay says.
   expect(composed.indexOf("Merging a pull request")).toBeLessThan(composed.indexOf("Always show me"));
+});
+
+it("keeps one stable instruction sentinel before one owner overlay", () => {
+  const overlay = "Always show me the PR link.";
+  const composed = composeControllerInstructions(overlay);
+
+  expect(CONTROLLER_INSTRUCTIONS.startsWith(`${CONTROLLER_INSTRUCTION_SENTINEL}\n`)).toBe(true);
+  expect(countOccurrences(CONTROLLER_INSTRUCTIONS, CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
+  expect(countOccurrences(composed, CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
+  expect(countOccurrences(composed, overlay)).toBe(1);
+  expect(composed.indexOf(overlay)).toBeGreaterThan(CONTROLLER_INSTRUCTIONS.length);
+});
+
+it("states the enforced owner-turn and Telegram approval boundaries", () => {
+  expect(CONTROLLER_INSTRUCTIONS).toContain("telegram_agent_respond");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("same-turn evidence");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("durable job or monitor obligation");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("connector installation");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("credential mutation or rotation");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("Allow once");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("Deny");
+  expect(CONTROLLER_INSTRUCTIONS).not.toContain("full permissions");
+  expect(CONTROLLER_INSTRUCTIONS).not.toContain("install and configure it");
 });
 
 it("stores, replaces, and clears the working style", () => {

@@ -103,7 +103,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     controllerPermissionMode: {
       type: "select",
       label: "Controller permission mode",
-      description: "BB and the execution machine still enforce their permission limits.",
+      description: "Fresh controller turns default to auto; supported BB-native approvals are routed to Telegram as one-use Allow once/Deny choices, while BB and the execution machine continue to enforce their permission limits.",
       options: [...CONTROLLER_PERMISSION_MODES],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
     },

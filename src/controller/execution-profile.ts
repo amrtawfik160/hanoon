@@ -51,10 +51,9 @@ export const DEFAULT_CONTROLLER_EXECUTION_PROFILE: ControllerExecutionProfile = 
   model: "claude-opus-5[1m]",
   reasoningLevel: "xhigh",
   serviceTier: "default",
-  // The owner drives this agent from Telegram and does not watch the BB app, so
-  // an approval prompt rendered there is a dead end rather than a safeguard.
-  // Merges and production still gate on a one-use Telegram approval.
-  permissionMode: "full",
+  // Fresh or unset settings use BB's automatic mode; supported approvals can
+  // reach Telegram while BB and the execution machine keep enforcing limits.
+  permissionMode: "auto",
 };
 
 type ExecutionArguments = {

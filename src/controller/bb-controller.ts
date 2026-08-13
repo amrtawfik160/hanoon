@@ -5,7 +5,6 @@ import {
   type ControllerThreadRecord,
   type ControllerTurnRecord,
 } from "./models";
-import { buildInitialControllerPrompt } from "./instructions";
 import {
   controllerExecutionArguments,
   controllerProviderFor,
@@ -274,7 +273,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     const execution = this.dependencies.executionProfile();
     const input = await this.promptInput(
       personal.projectId,
-      buildInitialControllerPrompt(turn.inputText),
+      turn.inputText,
       turn.image,
       signal,
     );

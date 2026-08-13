@@ -19,16 +19,16 @@ it("defaults controller execution when only public connection settings are prese
     controllerModel: "claude-opus-5[1m]",
     controllerReasoningLevel: "xhigh",
     controllerServiceTier: "default",
-    controllerPermissionMode: "full",
+    controllerPermissionMode: "auto",
   });
 });
 
-it("preserves a non-default controller execution profile", () => {
+it.each(["auto", "accept-edits", "full"] as const)("preserves an explicit controller permission mode: %s", (permissionMode) => {
   const parsed = parseGlobalConfig(globalValues({
     controllerModel: "gpt-5.6-terra",
     controllerReasoningLevel: "high",
     controllerServiceTier: "default",
-    controllerPermissionMode: "accept-edits",
+    controllerPermissionMode: permissionMode,
     maxConcurrentJobs: undefined,
   }));
 
@@ -38,7 +38,7 @@ it("preserves a non-default controller execution profile", () => {
     controllerModel: "gpt-5.6-terra",
     controllerReasoningLevel: "high",
     controllerServiceTier: "default",
-    controllerPermissionMode: "accept-edits",
+    controllerPermissionMode: permissionMode,
   });
 });
 
