@@ -33,29 +33,13 @@ export type ControllerInteractionReference = Readonly<{
   status: "pending" | "resolved" | "interrupted";
 }>;
 
-/** How many distinct interactions one event window may report. */
-export const MAX_CONTROLLER_INTERACTION_REFERENCES = 8;
-
 /**
- * Trims an oversized window to the references that matter most. Settlements
- * come first: dropping one leaves a durable row parked on an interaction BB has
- * already closed, and a parked row suppresses every other kind of progress.
- * Among the rest the newest win, because the block BB is actually waiting on is
- * the last thing the stream said.
+ * How many distinct interactions one event window may report. The cap bounds
+ * the work of a single pass; it never discards anything. A window that reaches
+ * the cap stops before the event introducing the next interaction and reports a
+ * cursor that stops there too, so the remainder is still unread work.
  */
-function boundedReferences(
-  all: readonly ControllerInteractionReference[],
-): readonly ControllerInteractionReference[] {
-  if (all.length <= MAX_CONTROLLER_INTERACTION_REFERENCES) return all;
-  const settled = all.filter((reference) => reference.status !== "pending")
-    .slice(-MAX_CONTROLLER_INTERACTION_REFERENCES);
-  const pendingBudget = MAX_CONTROLLER_INTERACTION_REFERENCES - settled.length;
-  const pending = pendingBudget === 0
-    ? []
-    : all.filter((reference) => reference.status === "pending").slice(-pendingBudget);
-  const kept = new Set([...settled, ...pending]);
-  return all.filter((reference) => kept.has(reference));
-}
+export const MAX_CONTROLLER_INTERACTION_REFERENCES = 8;
 
 export type ControllerEventObservation = {
   latestSeq: number;
@@ -281,7 +265,8 @@ export class BbControllerAdapter implements ControllerAdapter {
     let toolCalls = 0;
     let commandFailures = 0;
     let totalTokens = 0;
-    for (let page = 0; page < MAX_CONTROLLER_EVENT_PAGES; page += 1) {
+    let windowFull = false;
+    for (let page = 0; page < MAX_CONTROLLER_EVENT_PAGES && !windowFull; page += 1) {
       const rows = await this.dependencies.sdk.threads.events.list({
         threadId,
         afterSeq: String(latestSeq),
@@ -289,6 +274,13 @@ export class BbControllerAdapter implements ControllerAdapter {
         signal,
       });
       for (const row of rows) {
+        // Stopping *before* this event, cursor included, is what makes the cap
+        // bounded rather than lossy: everything from here on stays unread until
+        // a later pass, instead of being silently skipped over.
+        if (this.introducesInteractionBeyondWindow(row, interactions)) {
+          windowFull = true;
+          break;
+        }
         latestSeq = Math.max(latestSeq, row.seq);
         if (row.type === "turn/input/accepted") inputAccepted = true;
         if (row.type === "item/agentMessage/delta") assistantOutputObserved = true;
@@ -327,11 +319,29 @@ export class BbControllerAdapter implements ControllerAdapter {
       toolActivityObserved,
       completed,
       error,
-      interactions: boundedReferences([...interactions.values()]),
+      interactions: [...interactions.values()],
       toolCalls,
       commandFailures,
       totalTokens,
     };
+  }
+
+  /**
+   * True when reading this event would push the window past its interaction
+   * cap. Only a lifecycle event naming an interaction the window has not seen
+   * yet can do that; a further report about one already in the window costs
+   * nothing, and neither does any other kind of event.
+   */
+  private introducesInteractionBeyondWindow(
+    row: { type: string; data: unknown },
+    interactions: ReadonlyMap<string, ControllerInteractionReference>,
+  ): boolean {
+    if (interactions.size < MAX_CONTROLLER_INTERACTION_REFERENCES) return false;
+    if (row.type !== "system/userQuestion/lifecycle" && row.type !== "system/permissionGrant/lifecycle") {
+      return false;
+    }
+    const reference = interactionReference(row.type, row.data);
+    return reference !== null && !interactions.has(reference.interactionId);
   }
 
   public async findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null> {

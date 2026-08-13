@@ -35,7 +35,7 @@ function stubInteractionService(
 ): ControllerInteractionReconciler {
   return {
     deliverAnswered: vi.fn(async () => false),
-    fetchPending: vi.fn(async () => null),
+    fetchPending: vi.fn(async () => ({ outcome: "invalid" as const })),
     ...overrides,
   };
 }

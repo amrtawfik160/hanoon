@@ -12,7 +12,7 @@ import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { projectControllerStream } from "./stream";
 import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
-import type { ControllerInteractionService } from "./interaction-service";
+import type { ControllerInteractionFetch, ControllerInteractionService } from "./interaction-service";
 import {
   ControllerEvidenceProjectorError,
   type ControllerEvidenceReconciler,
@@ -697,19 +697,22 @@ export class LunaControllerService {
       controller.threadId!,
     );
     if (!generation) return false;
+    const settle = (interactionId: string): boolean => {
+      const settled = this.dependencies.store.markControllerInteractionResolved({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        interactionId,
+        turnId: turn.id,
+        bbThreadId: controller.threadId!,
+      });
+      // Refusing to settle a row this turn is parked on would consume BB's
+      // only word that the block is over. A reference for something never
+      // recorded is ordinary and settles nothing. The parked id is re-read
+      // because settling an earlier reference in this window promotes it.
+      return settled || this.awaitingInteractionId(turn) !== interactionId;
+    };
     for (const reference of references) {
       if (reference.status !== "pending") {
-        const settled = this.dependencies.store.markControllerInteractionResolved({
-          ...fenceAt(fence, this.dependencies.clock.now()),
-          interactionId: reference.interactionId,
-          turnId: turn.id,
-          bbThreadId: controller.threadId!,
-        });
-        // Refusing to settle a row this turn is parked on would consume BB's
-        // only word that the block is over. A reference for something never
-        // recorded is ordinary and settles nothing. The parked id is re-read
-        // because settling an earlier reference in this window promotes it.
-        if (!settled && this.awaitingInteractionId(turn) === reference.interactionId) return false;
+        if (!settle(reference.interactionId)) return false;
         continue;
       }
       const source = {
@@ -720,9 +723,9 @@ export class LunaControllerService {
         controllerGenerationId: generation.id,
       };
       if (!this.dependencies.store.controllerInteractionSourceCanRecord(source)) return false;
-      let interaction: ControllerInteraction | null;
+      let fetched: ControllerInteractionFetch;
       try {
-        interaction = await this.dependencies.interactionService.fetchPending({
+        fetched = await this.dependencies.interactionService.fetchPending({
           bbThreadId: controller.threadId!,
           interactionId: reference.interactionId,
           signal,
@@ -730,14 +733,22 @@ export class LunaControllerService {
       } catch {
         return false;
       }
-      if (!interaction) continue;
+      // Nothing was established about this block, so the pass may not claim to
+      // have read past the event that named it.
+      if (fetched.outcome === "invalid") return false;
+      // The stream still called it open, but BB says otherwise and BB is the
+      // authority. Settling here is safe, and a no-op when nothing is recorded.
+      if (fetched.outcome === "settled") {
+        if (!settle(reference.interactionId)) return false;
+        continue;
+      }
       // A refused record means the fence moved or the row disagrees with what
       // BB just returned. Advancing the cursor past it would lose the owner's
       // only view of the block, so the pass fails instead.
       if (!this.dependencies.store.recordControllerInteraction({
         ...source,
         now: this.dependencies.clock.now(),
-        interaction,
+        interaction: fetched.interaction,
       })) return false;
     }
     return true;

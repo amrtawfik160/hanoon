@@ -6,6 +6,20 @@ import { parseControllerInteraction, type ControllerInteraction } from "./questi
 type Interactions = BbPluginApi["sdk"]["threads"]["interactions"];
 
 /**
+ * What an authoritative read of one lifecycle reference established. These are
+ * kept apart because they call for opposite handling: a projection is durable
+ * progress, a settlement closes the block, and an invalid read is a reason to
+ * come back rather than to move on.
+ */
+export type ControllerInteractionFetch =
+  /** BB confirmed the exact interaction is open, with the safe projection of it. */
+  | { outcome: "pending"; interaction: ControllerInteraction }
+  /** BB itself says the block is over, whatever the event stream still claims. */
+  | { outcome: "settled" }
+  /** BB answered about something else, or with something unreadable. */
+  | { outcome: "invalid" };
+
+/**
  * Delivers a durable owner decision only after BB proves the exact interaction
  * still belongs to the persisted hidden-controller generation.
  */
@@ -25,15 +39,23 @@ export class ControllerInteractionService {
     bbThreadId: string;
     interactionId: string;
     signal?: AbortSignal;
-  }): Promise<ControllerInteraction | null> {
+  }): Promise<ControllerInteractionFetch> {
     const current = await this.dependencies.interactions.get({
       threadId: input.bbThreadId,
       interactionId: input.interactionId,
       signal: input.signal,
     });
-    if (current.id !== input.interactionId || current.threadId !== input.bbThreadId ||
-      current.status !== "pending") return null;
-    return parseControllerInteraction(input.interactionId, current.payload);
+    // An answer about a different interaction, or on a different thread, says
+    // nothing at all about the one that was asked for.
+    if (current.id !== input.interactionId || current.threadId !== input.bbThreadId) {
+      return { outcome: "invalid" };
+    }
+    if (current.status === "resolved" || current.status === "interrupted") return { outcome: "settled" };
+    // `resolving` is in flight: neither open to record nor closed to settle, so
+    // the reference is read again on a later pass.
+    if (current.status !== "pending") return { outcome: "invalid" };
+    const interaction = parseControllerInteraction(input.interactionId, current.payload);
+    return interaction ? { outcome: "pending", interaction } : { outcome: "invalid" };
   }
 
   public async deliverAnswered(input: ControllerLeaseFence & { controllerKey: string; signal?: AbortSignal }): Promise<boolean> {

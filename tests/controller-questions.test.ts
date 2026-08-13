@@ -106,7 +106,13 @@ function permissionEvent(seq: number, status: string, subjectKind = "permission_
 function adapterFixture(options: { events?: unknown[] } = {}) {
   const resolve = vi.fn(async () => ({ id: INTERACTION_ID, status: "resolving" }));
   const send = vi.fn(async () => ({ ok: true }));
-  const eventsList = vi.fn(async () => options.events ?? []);
+  // BB pages events strictly after the cursor, so a fixture that ignored
+  // `afterSeq` could never show whether a bounded window resumes correctly.
+  const eventsList = vi.fn(async ({ afterSeq }: { afterSeq?: string } = {}) => {
+    const rows = (options.events ?? []) as { seq: number }[];
+    const after = Number(afterSeq ?? "0");
+    return Number.isFinite(after) ? rows.filter((row) => row.seq > after) : rows;
+  });
   const sdk = {
     projects: { list: vi.fn(async () => []) },
     hosts: { list: vi.fn(async () => []) },
@@ -555,6 +561,98 @@ it("ignores an authoritative interaction whose returned identity does not match"
 
   expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBeNull();
   expect(store.getPendingControllerInteraction("owner-7-controller")).toBeNull();
+  // A reply about some other interaction proves nothing about this one, so the
+  // cursor may not move past the event that named it.
+  expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(0);
+});
+
+it("refuses to advance the cursor past an interaction BB could not describe", async () => {
+  const fixture = storeFixture("service-malformed-payload");
+  const { store, fence } = fixture;
+  const turn = submittedTurn(store, fence);
+  const adapter = serviceAdapter({
+    events: vi.fn(async () => ({
+      latestSeq: 5, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false,
+      completed: false, error: null,
+      interactions: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
+      toolCalls: 0, commandFailures: 0, totalTokens: 0,
+    })),
+  });
+  // A payload that is not an object at all cannot be projected into anything,
+  // safe or unsafe, so it is invalid rather than unsupported.
+  const get = vi.fn(async () => ({
+    id: INTERACTION_ID, threadId: "thr_controller", status: "pending", payload: "not-an-object",
+  }));
+  const interactionService = interactionServiceFor(fixture, { get, resolve: vi.fn() }, () => 3_000);
+  const service = new LunaControllerService({
+    store, adapter, evidenceProjector, interactionService, clock: { now: () => 3_000 },
+  });
+  const signal = AbortSignal.timeout(2_000);
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  expect(store.getPendingControllerInteraction("owner-7-controller")).toBeNull();
+  expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(0);
+});
+
+it("records an unanswerable but identified interaction so the cursor can move on", async () => {
+  const fixture = storeFixture("service-unsupported-progress");
+  const { store, fence } = fixture;
+  const turn = submittedTurn(store, fence);
+  const adapter = serviceAdapter({
+    events: vi.fn(async () => ({
+      latestSeq: 5, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false,
+      completed: false, error: null,
+      interactions: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
+      toolCalls: 0, commandFailures: 0, totalTokens: 0,
+    })),
+  });
+  const get = vi.fn(async () => ({
+    id: INTERACTION_ID, threadId: "thr_controller", status: "pending",
+    payload: { kind: "some_new_block" },
+  }));
+  const interactionService = interactionServiceFor(fixture, { get, resolve: vi.fn() }, () => 3_000);
+  const service = new LunaControllerService({
+    store, adapter, evidenceProjector, interactionService, clock: { now: () => 3_000 },
+  });
+  const signal = AbortSignal.timeout(2_000);
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  expect(store.getPendingControllerInteraction("owner-7-controller")).toMatchObject({
+    interactionId: INTERACTION_ID,
+  });
+  expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(5);
+});
+
+it("settles rather than skips an interaction BB has authoritatively closed", async () => {
+  const fixture = storeFixture("service-authoritative-settled");
+  const { store, fence } = fixture;
+  const turn = submittedTurn(store, fence);
+  recordInteraction(store, fence, turn.id, questionInteraction(), 3_000);
+  const adapter = serviceAdapter({
+    events: vi.fn(async () => ({
+      latestSeq: 5, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false,
+      completed: false, error: null,
+      interactions: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
+      toolCalls: 0, commandFailures: 0, totalTokens: 0,
+    })),
+  });
+  // The stream still called it pending, but BB itself says it is over. BB wins.
+  const get = vi.fn(async () => ({
+    id: INTERACTION_ID, threadId: "thr_controller", status: "resolved", payload: questionPayload(),
+  }));
+  const interactionService = interactionServiceFor(fixture, { get, resolve: vi.fn() }, () => 3_100);
+  const service = new LunaControllerService({
+    store, adapter, evidenceProjector, interactionService, clock: { now: () => 3_100 },
+  });
+  const signal = AbortSignal.timeout(2_000);
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  expect(store.getPendingControllerInteraction("owner-7-controller")).toBeNull();
+  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBeNull();
+  expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(5);
 });
 
 it("delivers the owner's answer to BB before any evidence work and only once", async () => {
@@ -968,7 +1066,7 @@ it("retires a turn whose interaction boundary stays unreadable, and not before",
   });
 });
 
-it("keeps the newest lifecycle references when one window reports more than the cap", async () => {
+it("stops a window before a ninth distinct interaction instead of dropping references", async () => {
   const events = Array.from({ length: 12 }, (_value, index) => {
     const event = permissionEvent(index + 1, "pending");
     return { ...event, data: { ...event.data, interactionId: `pint_bulk_${index}` } };
@@ -977,14 +1075,36 @@ it("keeps the newest lifecycle references when one window reports more than the 
 
   const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
 
-  expect(observation.interactions).toHaveLength(8);
-  // The interaction BB is actually blocked on is the last thing the stream
-  // said, so the cap must never be what discards it.
-  expect(observation.interactions.at(-1)?.interactionId).toBe("pint_bulk_11");
-  expect(observation.interactions[0]?.interactionId).toBe("pint_bulk_4");
+  expect(observation.interactions.map((reference) => reference.interactionId)).toEqual(
+    Array.from({ length: 8 }, (_value, index) => `pint_bulk_${index}`),
+  );
+  // The cursor may only claim the events this window actually read. The ninth
+  // interaction's event was not processed, so seq 9 is still unread work.
+  expect(observation.latestSeq).toBe(8);
 });
 
-it("never drops a settlement reference to make room for newer pending ones", async () => {
+it("delivers twelve interaction references over bounded passes with no skipped seq", async () => {
+  const events = Array.from({ length: 12 }, (_value, index) => {
+    const event = permissionEvent(index + 1, "pending");
+    return { ...event, data: { ...event.data, interactionId: `pint_bulk_${index}` } };
+  });
+  const { adapter } = adapterFixture({ events });
+
+  const seen: string[] = [];
+  let cursor = 0;
+  for (let pass = 0; pass < 5; pass += 1) {
+    const observation = await adapter.events("thr_controller", cursor, AbortSignal.timeout(1_000));
+    expect(observation.interactions.length).toBeLessThanOrEqual(8);
+    for (const reference of observation.interactions) seen.push(reference.interactionId);
+    if (observation.latestSeq === cursor) break;
+    cursor = observation.latestSeq;
+  }
+
+  expect(seen).toEqual(Array.from({ length: 12 }, (_value, index) => `pint_bulk_${index}`));
+  expect(cursor).toBe(12);
+});
+
+it("never loses a settlement to a window boundary", async () => {
   const settled = permissionEvent(1, "resolved");
   const events = [
     { ...settled, data: { ...settled.data, interactionId: "pint_settled" } },
@@ -995,14 +1115,47 @@ it("never drops a settlement reference to make room for newer pending ones", asy
   ];
   const { adapter } = adapterFixture({ events });
 
-  const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
+  const first = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
+  const second = await adapter.events("thr_controller", first.latestSeq, AbortSignal.timeout(1_000));
 
-  expect(observation.interactions).toHaveLength(8);
   // Losing this one would leave its durable row parked on a block BB closed.
-  expect(observation.interactions[0]).toEqual({
+  expect(first.interactions[0]).toEqual({
     interactionId: "pint_settled", kind: "approval", status: "resolved",
   });
-  expect(observation.interactions.at(-1)?.interactionId).toBe("pint_open_9");
+  expect([...first.interactions, ...second.interactions].map((reference) => reference.interactionId))
+    .toEqual(["pint_settled", ...Array.from({ length: 10 }, (_value, index) => `pint_open_${index}`)]);
+});
+
+it("counts only the metrics of the events a bounded window actually read", async () => {
+  const events = [
+    ...Array.from({ length: 9 }, (_value, index) => {
+      const event = permissionEvent(index + 1, "pending");
+      return { ...event, data: { ...event.data, interactionId: `pint_metric_${index}` } };
+    }),
+    {
+      id: "t10", threadId: "thr_controller", seq: 10, createdAt: 10, scope: { kind: "turn" },
+      type: "item/started", data: { item: { type: "commandExecution" } },
+    },
+    {
+      id: "t11", threadId: "thr_controller", seq: 11, createdAt: 11, scope: { kind: "turn" },
+      type: "turn/completed", data: {},
+    },
+  ];
+  const { adapter } = adapterFixture({ events });
+
+  const first = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
+
+  // Seq 9 onward was never read, so claiming its tool call or its completion
+  // would report work this pass did not observe.
+  expect(first.latestSeq).toBe(8);
+  expect(first.toolCalls).toBe(0);
+  expect(first.completed).toBe(false);
+
+  const second = await adapter.events("thr_controller", first.latestSeq, AbortSignal.timeout(1_000));
+
+  expect(second.latestSeq).toBe(11);
+  expect(second.toolCalls).toBe(1);
+  expect(second.completed).toBe(true);
 });
 
 it("keeps retrying an undeliverable owner answer instead of retiring the turn", async () => {
@@ -1046,10 +1199,19 @@ it("stays inside the reference cap even when settlements fill the whole window",
   ];
   const { adapter } = adapterFixture({ events });
 
-  const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
+  const first = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
 
-  expect(observation.interactions).toHaveLength(8);
-  expect(observation.interactions.every((reference) => reference.status === "resolved")).toBe(true);
+  expect(first.interactions).toHaveLength(8);
+  expect(first.interactions.every((reference) => reference.status === "resolved")).toBe(true);
+
+  // The ninth settlement and every live block behind it are still waiting, not
+  // discarded, so a later pass is what delivers them.
+  const second = await adapter.events("thr_controller", first.latestSeq, AbortSignal.timeout(1_000));
+
+  expect(second.interactions.map((reference) => reference.interactionId)).toEqual([
+    "pint_done_8",
+    ...Array.from({ length: 5 }, (_value, index) => `pint_live_${index}`),
+  ]);
 });
 
 it("never retires a parked turn for a transient BB boundary failure", async () => {

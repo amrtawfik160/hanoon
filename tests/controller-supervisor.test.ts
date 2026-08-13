@@ -26,7 +26,7 @@ import {
 } from "../src/controller/supervisor";
 
 function stubInteractionService(): ControllerInteractionReconciler {
-  return { deliverAnswered: vi.fn(async () => false), fetchPending: vi.fn(async () => null) };
+  return { deliverAnswered: vi.fn(async () => false), fetchPending: vi.fn(async () => ({ outcome: "invalid" as const })) };
 }
 
 const evidenceProjector: ControllerEvidenceReconciler = {
