@@ -32,6 +32,9 @@ const MAX_OPTIONS = 6;
 const MAX_PROMPT = 400;
 const MAX_LABEL = 60;
 const MAX_DESCRIPTION = 200;
+const MAX_INTERACTION_ID = 200;
+const MAX_QUESTION_ID = 120;
+const MAX_OPTION_VALUE = 120;
 
 function boundedString(value: unknown, limit: number): string | null {
   if (typeof value !== "string") return null;
@@ -43,7 +46,7 @@ function boundedString(value: unknown, limit: number): string | null {
 function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const value = typeof candidate.value === "string" ? candidate.value : null;
+  const value = typeof candidate.value === "string" && candidate.value.length > 0 && candidate.value.length <= MAX_OPTION_VALUE ? candidate.value : null;
   const label = boundedString(candidate.label, MAX_LABEL);
   if (!value || !label) return null;
   return { value, label, description: boundedString(candidate.description, MAX_DESCRIPTION) };
@@ -52,7 +55,7 @@ function parseOption(raw: unknown): ControllerQuestionOption | null {
 function parseQuestion(raw: unknown): ControllerQuestion | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const id = typeof candidate.id === "string" && candidate.id.length > 0 ? candidate.id : null;
+  const id = typeof candidate.id === "string" && candidate.id.length > 0 && candidate.id.length <= MAX_QUESTION_ID ? candidate.id : null;
   const prompt = boundedString(candidate.prompt, MAX_PROMPT);
   if (!id || !prompt) return null;
   const options = Array.isArray(candidate.options)
@@ -74,7 +77,7 @@ function parseQuestion(raw: unknown): ControllerQuestion | null {
  * with, so it is treated as absent rather than parked on.
  */
 export function parsePendingQuestion(interactionId: unknown, payload: unknown): ControllerPendingQuestion | null {
-  if (typeof interactionId !== "string" || interactionId.length === 0) return null;
+  if (typeof interactionId !== "string" || interactionId.length === 0 || interactionId.length > MAX_INTERACTION_ID) return null;
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind !== "user_question" || !Array.isArray(candidate.questions)) return null;

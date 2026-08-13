@@ -18,8 +18,8 @@ function fixture() {
   ).run();
   db.prepare(
     `INSERT INTO controller_turns
-       (id, telegram_update_id, controller_key, ordinal, input_text, state, submitted_at, created_at, updated_at)
-     VALUES ('turn-1', 1, 'owner-7-controller', 1, 'question', 'submitted', 1, 1, 1)`,
+       (id, telegram_update_id, controller_key, ordinal, input_text, state, lease_owner, lease_generation, submitted_at, created_at, updated_at)
+     VALUES ('turn-1', 1, 'owner-7-controller', 1, 'question', 'submitted', 'executor', 1, 1, 1, 1)`,
   ).run();
   db.prepare(
     `INSERT INTO controller_generations (id, controller_key, thread_id, started_at)
@@ -82,4 +82,10 @@ it("rejects stale executor identity and a revoked or mismatched owner", () => {
   expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "8", chatId: "7", text: "yes", now: 3 })).toEqual({ ok: false, reason: "stale" });
   db.prepare("UPDATE owners SET revoked_at = 3").run();
   expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "yes", now: 3 })).toEqual({ ok: false, reason: "stale" });
+});
+
+it("does not bind a record unless the submitted turn is held by the exact executor lease", () => {
+  const { db, repository } = fixture();
+  db.prepare("UPDATE controller_turns SET lease_owner = 'other', lease_generation = 2 WHERE id = 'turn-1'").run();
+  expect(record(repository)).toBe(false);
 });

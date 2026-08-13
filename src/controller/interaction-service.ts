@@ -18,6 +18,9 @@ export class ControllerInteractionService {
   public async deliverAnswered(input: ControllerLeaseFence & { controllerKey: string; signal?: AbortSignal }): Promise<boolean> {
     const delivery = this.dependencies.store.getAnswered(input.controllerKey);
     if (!delivery) return false;
+    if (!this.dependencies.store.sourceIsActive({
+      ...input, interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
+    })) return false;
     const current = await this.dependencies.interactions.get({
       threadId: delivery.bbThreadId,
       interactionId: delivery.interactionId,
@@ -25,7 +28,7 @@ export class ControllerInteractionService {
     });
     if (current.threadId !== delivery.bbThreadId || current.id !== delivery.interactionId) return false;
     if (current.status === "resolved" || current.status === "interrupted") {
-      return this.dependencies.store.markDelivered({
+      return this.dependencies.store.markResolved({
         ...input,
         now: this.dependencies.clock(),
         interactionId: delivery.interactionId,
@@ -34,6 +37,9 @@ export class ControllerInteractionService {
       });
     }
     if (current.status !== "pending") return false;
+    if (!this.dependencies.store.sourceIsActive({
+      ...input, interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
+    })) return false;
     const resolved = await this.dependencies.interactions.resolve({
       threadId: delivery.bbThreadId,
       interactionId: delivery.interactionId,

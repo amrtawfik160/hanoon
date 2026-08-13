@@ -101,7 +101,7 @@ it("pins the exact shipped and controller trust migration bytes in order", () =>
   expect(sha256(ALL_MIGRATIONS[28]!)).toBe(
     "4ec9eb259bbdce396ac0026c13ebd84ec71f25433092827cc9aae5fe903505d3",
   );
-  expect(sha256(ALL_MIGRATIONS[29]!)).toBe("39144716098a1436b8b55ac5d8b05cfaec01a41d62802a1b3152c34981e08045");
+  expect(sha256(ALL_MIGRATIONS[29]!)).toBe("fb97937ba61125ffeb21c3594ea321f726232285811d7ed2d56f453d7a950f3c");
 });
 
 it("requires controller trust state on the public turn record", () => {

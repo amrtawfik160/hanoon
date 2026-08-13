@@ -60,6 +60,7 @@ export interface ControllerInteractionStore {
   }): ControllerInteractionAnswer;
   getPending(controllerKey: string): ControllerInteractionRecord | null;
   getAnswered(controllerKey: string): ControllerInteractionDelivery | null;
+  sourceIsActive(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean;
   markDelivered(input: ControllerLeaseFence & {
     interactionId: string;
     turnId: string;
@@ -230,6 +231,11 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     }).immediate();
   }
 
+  /** Read-only fence used immediately before external BB effects. */
+  public sourceIsActive(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
+    return this.validFence(input) && this.currentLease(input) && this.activeInteraction(input);
+  }
+
   private answerQuestion(record: ControllerInteractionRecord, answers: ControllerQuestionAnswers, now: number): ControllerInteractionAnswer {
     if (record.interaction.kind !== "user_question") return { ok: false, reason: "stale" };
     const complete = nextUnansweredQuestion(record.interaction.questions, answers) === null;
@@ -265,6 +271,10 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
       `SELECT interaction.* FROM controller_interactions AS interaction
         JOIN controller_turns AS turn ON turn.id = interaction.turn_id AND turn.state = 'submitted'
         JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
+          AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
+        JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
+          AND generation.controller_key = interaction.controller_key AND generation.thread_id = interaction.bb_thread_id
+          AND generation.ended_at IS NULL
         JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
           AND owners.telegram_user_id = controller.telegram_user_id AND owners.telegram_chat_id = controller.telegram_chat_id
        WHERE interaction.state = 'pending' AND controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
@@ -300,8 +310,9 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key AND controller.bb_thread_id = ?
         JOIN controller_generations AS generation ON generation.id = ? AND generation.controller_key = turn.controller_key
           AND generation.thread_id = controller.bb_thread_id AND generation.ended_at IS NULL
-       WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'`,
-    ).get(input.bbThreadId, input.controllerGenerationId, input.turnId, input.controllerKey) !== undefined;
+       WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+         AND turn.lease_owner = ? AND turn.lease_generation = ?`,
+    ).get(input.bbThreadId, input.controllerGenerationId, input.turnId, input.controllerKey, input.ownerId, input.generation) !== undefined;
   }
 
   private activeInteraction(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
@@ -311,7 +322,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key AND controller.bb_thread_id = interaction.bb_thread_id
         JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
           AND generation.controller_key = interaction.controller_key AND generation.thread_id = interaction.bb_thread_id AND generation.ended_at IS NULL
-       WHERE interaction.interaction_id = ? AND interaction.turn_id = ? AND interaction.bb_thread_id = ?`,
-    ).get(input.interactionId, input.turnId, input.bbThreadId) !== undefined;
+       WHERE interaction.interaction_id = ? AND interaction.turn_id = ? AND interaction.bb_thread_id = ?
+         AND turn.lease_owner = ? AND turn.lease_generation = ?`,
+    ).get(input.interactionId, input.turnId, input.bbThreadId, input.ownerId, input.generation) !== undefined;
   }
 }

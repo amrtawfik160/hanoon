@@ -829,8 +829,11 @@ SELECT CASE WHEN EXISTS (
   SELECT 1
     FROM controller_questions AS question
     JOIN controller_threads AS controller ON controller.controller_key = question.controller_key
+    JOIN controller_turns AS turn ON turn.id = question.turn_id
    WHERE question.state IN ('pending', 'answered')
      AND (
+       turn.controller_key <> question.controller_key OR turn.state <> 'submitted' OR
+       controller.state <> 'active' OR controller.bb_thread_id IS NULL OR
        controller.bb_thread_id IS NULL OR
        (SELECT COUNT(*) FROM controller_generations AS generation
          WHERE generation.controller_key = question.controller_key

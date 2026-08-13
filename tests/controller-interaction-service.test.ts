@@ -47,7 +47,8 @@ it("reads the exact BB interaction before resolving a durable answer", async () 
       interaction: { kind: "approval", interactionId: "approval-1", summary: "wants to write file.ts", decisions: ["allow_once"] },
       answer: { decision: "allow_once", grantedPermissions: null }, askedAt: 1, answeredAt: 2, deliveredAt: null,
     })),
-    markDelivered: vi.fn(() => true),
+    markDelivered: vi.fn(() => true), markResolved: vi.fn(() => true),
+    sourceIsActive: vi.fn(() => true),
   };
   const interactions = {
     get: vi.fn(async () => {
@@ -78,7 +79,8 @@ it("adopts an already resolved interaction without sending a second resolution",
       interaction: { kind: "approval", interactionId: "approval-1", summary: "wants to write file.ts", decisions: ["deny"] },
       answer: { decision: "deny" }, askedAt: 1, answeredAt: 2, deliveredAt: null,
     })),
-    markDelivered: vi.fn(() => true),
+    markDelivered: vi.fn(() => true), markResolved: vi.fn(() => true),
+    sourceIsActive: vi.fn(() => true),
   };
   const interactions = {
     get: vi.fn(async () => ({ id: "approval-1", threadId: "thread-1", status: "resolved" })),
@@ -87,5 +89,17 @@ it("adopts an already resolved interaction without sending a second resolution",
   const service = new ControllerInteractionService({ store: store as never, interactions: interactions as never, clock: () => 3 });
 
   await expect(service.deliverAnswered({ ownerId: "executor", generation: 1, now: 2, controllerKey: "owner-7-controller" })).resolves.toBe(true);
+  expect(interactions.resolve).not.toHaveBeenCalled();
+});
+
+it("does no BB I/O when the durable interaction fence is stale", async () => {
+  const store = {
+    getAnswered: vi.fn(() => ({ interactionId: "approval-1", turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thread-1", controllerGenerationId: "generation-1", state: "answered", interaction: { kind: "approval", interactionId: "approval-1", summary: "safe", decisions: ["deny"] }, answer: { decision: "deny" }, askedAt: 1, answeredAt: 2, deliveredAt: null })),
+    sourceIsActive: vi.fn(() => false), markDelivered: vi.fn(() => true), markResolved: vi.fn(() => true),
+  };
+  const interactions = { get: vi.fn(), resolve: vi.fn() };
+  const service = new ControllerInteractionService({ store: store as never, interactions: interactions as never, clock: () => 3 });
+  await expect(service.deliverAnswered({ ownerId: "stale", generation: 99, now: 2, controllerKey: "owner-7-controller" })).resolves.toBe(false);
+  expect(interactions.get).not.toHaveBeenCalled();
   expect(interactions.resolve).not.toHaveBeenCalled();
 });
