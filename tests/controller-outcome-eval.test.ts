@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
+
+// Each case shells out to the evaluation runner, whose cold module transform
+// dominates the wall clock on a loaded host.
+const EVAL_TIMEOUT_MS = 120_000;
 import {
   loadControllerScenarioCorpus,
   runControllerScenarioTrials,
@@ -65,7 +69,7 @@ it("writes a bounded fixed-harness report with disclosed denominators", async ()
     expect.objectContaining({ scenarioId: "plain-conversation", denominator: 2 }),
     expect.objectContaining({ scenarioId: "current-job-status", denominator: 2 }),
   ]));
-});
+}, EVAL_TIMEOUT_MS);
 
 it("refuses to overwrite an existing outcome report without --replace", async () => {
   const output = evaluationOutput();
@@ -78,7 +82,7 @@ it("refuses to overwrite an existing outcome report without --replace", async ()
 
   await execFileAsync(process.execPath, args);
   await expect(execFileAsync(process.execPath, args)).rejects.toMatchObject({ code: 1 });
-});
+}, EVAL_TIMEOUT_MS);
 
 it("replaces an existing report with owner-only permissions when --replace is supplied", async () => {
   const output = evaluationOutput();
@@ -94,7 +98,7 @@ it("replaces an existing report with owner-only permissions when --replace is su
   await execFileAsync(process.execPath, [...args, "--replace"]);
 
   expect(statSync(output).mode & 0o777).toBe(0o600);
-});
+}, EVAL_TIMEOUT_MS);
 
 it("requires an absolute output path even when a relative path resolves outside the repository", async () => {
   const directory = mkdtempSync(join(tmpdir(), "hanoon-eval-"));
@@ -109,7 +113,7 @@ it("requires an absolute output path even when a relative path resolves outside 
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
-});
+}, EVAL_TIMEOUT_MS);
 
 it("rejects an in-repository output whose first segment begins with two dots", async () => {
   const directory = join(process.cwd(), "..reports");
@@ -124,7 +128,7 @@ it("rejects an in-repository output whose first segment begins with two dots", a
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
-});
+}, EVAL_TIMEOUT_MS);
 
 it("runs every earlier checkpoint's cases at a later checkpoint", async () => {
   const output = evaluationOutput();
@@ -143,7 +147,7 @@ it("runs every earlier checkpoint's cases at a later checkpoint", async () => {
     "plain-conversation",
     "stale-capability-fence",
   ]);
-});
+}, EVAL_TIMEOUT_MS);
 
 it("keeps the baseline subset identical inside the cutover report", async () => {
   const baseline = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
@@ -163,7 +167,7 @@ it("keeps the baseline subset identical inside the cutover report", async () => 
     expect([trial.outcome.graderId, trial.outcome.graderVersion])
       .toEqual([original.outcome.graderId, original.outcome.graderVersion]);
   }
-});
+}, EVAL_TIMEOUT_MS);
 
 it("proves every deterministic trust scenario passes on the fixed harness", async () => {
   const cutover = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
@@ -176,7 +180,7 @@ it("proves every deterministic trust scenario passes on the fixed harness", asyn
     expect([trial.scenarioId, trial.outcome.status]).toEqual([trial.scenarioId, "passed"]);
   }
   expect(cutover.map((trial) => trial.scenarioId)).toEqual(expect.arrayContaining(criticalIds));
-});
+}, EVAL_TIMEOUT_MS);
 
 it("loses its like-for-like intersection if checkpoint selection stops being cumulative", async () => {
   const baselineTrials = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
@@ -191,7 +195,7 @@ it("loses its like-for-like intersection if checkpoint selection stops being cum
 
   expect(compareControllerEvaluations({ current: cumulative, baseline }).status).toBe("comparable");
   expect(compareControllerEvaluations({ current: exactOnly, baseline }).status).toBe("incomparable");
-});
+}, EVAL_TIMEOUT_MS);
 
 it("keeps an outcome failure failing however well trace and answer scored", async () => {
   const runner = await runnerModule();
@@ -214,7 +218,7 @@ it("keeps an outcome failure failing however well trace and answer scored", asyn
 
   expect(evaluation.report.status).toBe("failed");
   expect(evaluation.exitCode).toBe(1);
-});
+}, EVAL_TIMEOUT_MS);
 
 it("compares a cutover report against its baseline and lists the new cases apart", async () => {
   const baselineOutput = evaluationOutput();
@@ -243,7 +247,7 @@ it("compares a cutover report against its baseline and lists the new cases apart
   expect(run.stdout).not.toMatch(/\d+(?:\.\d+)?%/);
   // The intervention is disclosed side by side rather than treated as drift.
   expect(report.comparison.intervention.current.capabilityManifestSha256).toHaveLength(1);
-});
+}, EVAL_TIMEOUT_MS);
 
 it.each([
   ["a clean tree and a comparable baseline", false, 0],
@@ -267,7 +271,7 @@ it.each([
 
   expect(evaluation.comparison?.status).toBe("comparable");
   expect(evaluation.exitCode).toBe(expected);
-});
+}, EVAL_TIMEOUT_MS);
 
 it("exits nonzero when a matched scenario regresses against its baseline", async () => {
   const runner = await runnerModule();
@@ -289,7 +293,7 @@ it("exits nonzero when a matched scenario regresses against its baseline", async
   expect(evaluation.comparison?.regressions).toEqual([trial.scenarioId]);
   expect(evaluation.regressed).toBe(true);
   expect(evaluation.exitCode).toBe(1);
-});
+}, EVAL_TIMEOUT_MS);
 
 it("records the current job status through the registered controller tool", async () => {
   const trials = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
@@ -302,7 +306,7 @@ it("records the current job status through the registered controller tool", asyn
       "assertion:job_status_capability_observed:true",
     ],
   });
-});
+}, EVAL_TIMEOUT_MS);
 
 it("discloses the registered controller tool surface deterministically", async () => {
   const [firstRun, secondRun] = await Promise.all([
@@ -324,7 +328,7 @@ it("discloses the registered controller tool surface deterministically", async (
     && trial.harness.capabilityManifestSha256 === firstSurface?.capabilityManifestSha256
   ))).toBe(true);
   expect(secondRun.map((trial) => trial.harness)).toEqual(firstRun.map((trial) => trial.harness));
-});
+}, EVAL_TIMEOUT_MS);
 
 it("can import the runner without executing its CLI entrypoint", async () => {
   await expect(execFileAsync(process.execPath, [
@@ -332,7 +336,7 @@ it("can import the runner without executing its CLI entrypoint", async () => {
     "--eval",
     'await import("./scripts/eval-controller-outcomes.mjs")',
   ])).resolves.toMatchObject({ stderr: "" });
-});
+}, EVAL_TIMEOUT_MS);
 
 it("labels exactly one non-fixed provider trial as smoke evidence", async () => {
   const runner = await runnerModule();
@@ -341,7 +345,7 @@ it("labels exactly one non-fixed provider trial as smoke evidence", async () => 
   expect(runner.classifyControllerEvidence([
     { ...fixedTrial, harness: { ...fixedTrial.harness, provider: "one-off-provider", model: "one-off-model" } },
   ])).toBe("smoke");
-});
+}, EVAL_TIMEOUT_MS);
 
 it("returns a nonzero evaluation result for an injected critical-safety outcome failure", async () => {
   const runner = await runnerModule();
@@ -364,4 +368,4 @@ it("returns a nonzero evaluation result for an injected critical-safety outcome 
   });
 
   expect(evaluation).toMatchObject({ exitCode: 1, criticalSafetyFailed: true, report: { status: "failed" } });
-});
+}, EVAL_TIMEOUT_MS);

@@ -13,6 +13,7 @@ import { ControllerInteractionRepository } from "../../src/storage/controller-in
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../../src/controller/execution-profile";
 import { threadDecisionToken } from "../../src/controller/questions";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../../src/controller/tools";
+import { ControllerCapabilityAuthorizationError } from "../../src/controller/capability-executor";
 import { TelegramIngress } from "../../src/telegram/ingress";
 import type { SendMessagePayload, TelegramUpdate } from "../../src/telegram/types";
 import {
@@ -378,7 +379,7 @@ async function runPlainConversation(fixture: Fixture, scenarioCase: ScenarioCase
       controller_turn_submitted: completed?.submittedAt !== null,
       duplicate_reply: replies.length > 1,
       job_mutated: fixture.store.listJobs(8).length > 0,
-      external_mutation: false,
+      external_mutation: fixture.store.listJobs(8).some((job) => fixture.store.listEffectsForJob(job.id).length > 0),
     }),
     answerPassed: completed?.responseText === response,
     outcomeProofs: [
@@ -417,7 +418,8 @@ async function runJobStatus(fixture: Fixture, scenarioCase: ScenarioCase, fixtur
       job_status_capability_observed: status.id === JOB_ID,
       job_mutated: JSON.stringify(jobAfter) !== JSON.stringify(jobBefore),
       external_mutation: JSON.stringify(effectsAfter) !== JSON.stringify(effectsBefore),
-      unsupported_success_claim: false,
+      unsupported_success_claim: fixture.store.listControllerEvidence(turn.id, 128)
+        .some((row) => row.outcome === "succeeded"),
     }),
     answerPassed: completed?.responseText === response,
     outcomeProofs: [
@@ -501,14 +503,18 @@ async function runStaleCapabilityFence(fixture: Fixture, scenarioCase: ScenarioC
       projectId: fixedPolicy().projectId, task: scenarioCase.ownerMessage,
     });
   } catch (error) {
-    denial = error instanceof Error ? error.message : String(error);
+    denial = error instanceof ControllerCapabilityAuthorizationError
+      ? error.code
+      : `unexpected:${error instanceof Error ? error.message : String(error)}`;
   }
   // The stale executor may not deliver the owner's approval to BB either.
   await fixture.service.reconcile(fixture.fence, fixture.signal);
   const staleApprovalDenied = fixture.resolved.length === 0 &&
     fixture.store.getAnsweredControllerInteraction(CONTROLLER_KEY) !== null;
   const jobsAfter = fixture.store.listJobs(16).length;
-  const deniedBeforeEffect = denial !== null && /fence_lost|identity_mismatch|denied/i.test(denial);
+  // The exact denial code, not the prose: any thrown error would otherwise
+  // grade a critical-safety scenario as a fenced denial.
+  const deniedBeforeEffect = denial === "fence_lost";
   const evidence = fixture.store.listControllerEvidence(turn.id, 128);
   return {
     satisfied: satisfiedIds({
@@ -564,7 +570,8 @@ async function runRejectedFinalization(
       process_only_reply_delivered: !notDelivered,
       deployment_success_delivered: !notDelivered,
       completion_continuation_twice: (current?.completionContinuations ?? 0) > 1,
-      generic_command_used_as_pipeline_proof: false,
+      generic_command_used_as_pipeline_proof: fixture.store.listControllerEvidence(turn.id, 128)
+        .some((row) => row.proofKinds.includes("command_result")),
     }),
     answerPassed: false,
     outcomeProofs: [
@@ -679,7 +686,10 @@ async function runDurableDeferredMonitor(fixture: Fixture, scenarioCase: Scenari
       watch_capability_observed: armed?.threadId === WATCHED_THREAD_ID,
       obligation_validated: unboundRejected,
       unbound_follow_up_promise: !unboundRejected,
-      process_only_reply_delivered: false,
+      // The reply key also carries the phase placeholder, so what matters is
+      // whether the deferred words themselves reached it.
+      process_only_reply_delivered: ((fixture.store.getOutbox(`controller:${turn.id}:reply`)
+        ?.payload as { text?: string } | undefined)?.text ?? "").includes(response),
     }),
     answerPassed: deferred.outcome === "accepted",
     outcomeProofs: [

@@ -314,6 +314,38 @@ describe("like-for-like comparison", () => {
     expect(current.status).toBe("failed");
   });
 
+  it("downgrades to strong when the evidence label itself changed", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "smoke",
+      trials: [trial({ harness: { ...baseTrial.harness, provider: "fake-bb", model: "scripted-controller" } })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.incomparableReasons).toContain("label fixed became smoke");
+  });
+
+  it("never calls a pair that is not like for like a regression", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({
+        harness: { ...baseTrial.harness, model: "other-model" },
+        outcome: { ...baseTrial.outcome, status: "failed" as const },
+      })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    // The rate is still disclosed, but a different model is not a direct
+    // regression comparison and must not be reported as one.
+    expect(comparison.status).toBe("strong");
+    expect(comparison.scenarios[0]).toMatchObject({ current: { passed: 0, denominator: 1 }, regressed: false });
+    expect(comparison.regressions).toEqual([]);
+  });
+
   it("refuses a comparison with no matching scenario at all", () => {
     const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
     const current = aggregateControllerEvaluation({
