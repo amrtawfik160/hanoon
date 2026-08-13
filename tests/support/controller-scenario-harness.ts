@@ -3,7 +3,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { BbControllerAdapter } from "../../src/controller/bb-controller";
-import { LunaControllerService } from "../../src/controller/service";
+import {
+  CONTROLLER_COMPLETION_RECOVERY_PROMPT,
+  LunaControllerService,
+} from "../../src/controller/service";
 import { ControllerEvidenceProjector } from "../../src/controller/evidence-projector";
 import { ControllerInteractionService } from "../../src/controller/interaction-service";
 import { ControllerInteractionRepository } from "../../src/storage/controller-interaction-repository";
@@ -165,7 +168,8 @@ function scenarioFixture(fixtureId: string, phaseOverrides: Partial<ThreadPhase>
     events: phaseOverrides.events ?? [],
     interaction: phaseOverrides.interaction ?? { id: INTERACTION_ID, threadId: THREAD_ID, status: "pending", payload: null },
   };
-  const resolved: string[] = [];
+  const resolved: unknown[] = [];
+  const sent: string[] = [];
   harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => (threadId === WATCHED_THREAD_ID
     ? {
       id: WATCHED_THREAD_ID,
@@ -207,9 +211,13 @@ function scenarioFixture(fixtureId: string, phaseOverrides: Partial<ThreadPhase>
     }
     return phase.interaction;
   });
-  harness.sdk.stub("threads.interactions.resolve", async (input: { interactionId: string }) => {
-    resolved.push(input.interactionId);
+  harness.sdk.stub("threads.interactions.resolve", async (input: unknown) => {
+    resolved.push(input);
     return { id: INTERACTION_ID, threadId: THREAD_ID, status: "resolved" };
+  });
+  harness.sdk.stub("threads.send", async (input: { input?: { text?: string }[] }) => {
+    for (const part of input.input ?? []) if (typeof part.text === "string") sent.push(part.text);
+    return { ok: true };
   });
 
   const evidenceProjector = new ControllerEvidenceProjector({
@@ -251,7 +259,7 @@ function scenarioFixture(fixtureId: string, phaseOverrides: Partial<ThreadPhase>
     harness.behavior.callAgentTool(name, args, { threadId: THREAD_ID, projectId: PROJECT_ID });
 
   return {
-    bb, harness, store, phase, fence, signal, adapter, toolSurface, resolved, callTool,
+    bb, harness, store, phase, fence, signal, adapter, toolSurface, resolved, sent, callTool,
     service: makeService(store),
     makeService,
     reopen: () => openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW),
@@ -334,13 +342,21 @@ const APPROVAL_INTERACTION = {
   },
 };
 
+/**
+ * What a scenario observed to hold, named by the corpus's own assertion ids.
+ * Grading reads the declared required and forbidden sets rather than a hardcoded
+ * per-scenario verdict, so changing a corpus assertion changes the result.
+ */
 type Grades = Readonly<{
-  outcomePassed: boolean;
-  tracePassed: boolean;
+  satisfied: readonly string[];
   answerPassed: boolean;
   outcomeProofs: string[];
   traceProofs: string[];
 }>;
+
+function satisfiedIds(observations: Readonly<Record<string, boolean>>): string[] {
+  return Object.entries(observations).filter(([, held]) => held).map(([id]) => id);
+}
 
 async function runPlainConversation(fixture: Fixture, scenarioCase: ScenarioCase, fixtureId: string, updateId: number): Promise<Grades> {
   const turn = submitTurn(fixture, scenarioCase, updateId);
@@ -353,9 +369,17 @@ async function runPlainConversation(fixture: Fixture, scenarioCase: ScenarioCase
   const reply = fixture.store.getOutbox(`controller:${turn.id}:reply`);
   const digest = fixture.store.readControllerDigest(CONTROLLER_KEY, 8);
   const turns = fixture.store.listControllerTurns(CONTROLLER_KEY, 8);
+  const replies = fixture.store.listControllerTurns(CONTROLLER_KEY, 8).filter((entry) => entry.responseText !== null);
   return {
-    outcomePassed: completed?.state === "completed" && turns.length === 1 && digest.length === 1 && reply !== null,
-    tracePassed: completed?.submittedAt !== null,
+    satisfied: satisfiedIds({
+      controller_turn_completed: completed?.state === "completed",
+      reply_outbox_once: reply !== null && replies.length === 1,
+      digest_once: digest.length === 1,
+      controller_turn_submitted: completed?.submittedAt !== null,
+      duplicate_reply: replies.length > 1,
+      job_mutated: fixture.store.listJobs(8).length > 0,
+      external_mutation: false,
+    }),
     answerPassed: completed?.responseText === response,
     outcomeProofs: [
       proof(`${fixtureId}:completed:${completed?.state}`),
@@ -381,11 +405,20 @@ async function runJobStatus(fixture: Fixture, scenarioCase: ScenarioCase, fixtur
   const reply = fixture.store.getOutbox(`controller:${turn.id}:reply`);
   const jobAfter = fixture.store.getJob(JOB_ID);
   const effectsAfter = fixture.store.listEffectsForJob(JOB_ID);
+  // The reported state must match the durable job row, not the string this
+  // harness just composed from the tool's own projection.
+  const reportedTruthfully = jobBefore !== null && status.state === jobBefore.state &&
+    completed?.responseText?.includes(jobBefore.state) === true;
   return {
-    outcomePassed: completed?.responseText?.includes(status.state) === true &&
-      JSON.stringify(jobAfter) === JSON.stringify(jobBefore) &&
-      JSON.stringify(effectsAfter) === JSON.stringify(effectsBefore) && reply !== null,
-    tracePassed: true,
+    satisfied: satisfiedIds({
+      actual_job_state_reported: reportedTruthfully,
+      job_state_unchanged: JSON.stringify(jobAfter) === JSON.stringify(jobBefore),
+      reply_outbox_once: reply !== null,
+      job_status_capability_observed: status.id === JOB_ID,
+      job_mutated: JSON.stringify(jobAfter) !== JSON.stringify(jobBefore),
+      external_mutation: JSON.stringify(effectsAfter) !== JSON.stringify(effectsBefore),
+      unsupported_success_claim: false,
+    }),
     answerPassed: completed?.responseText === response,
     outcomeProofs: [
       proof(`${fixtureId}:job:${jobAfter?.state ?? "missing"}`),
@@ -419,8 +452,15 @@ async function runDuplicateMutationReplay(fixture: Fixture, scenarioCase: Scenar
     JSON.stringify(first.job) === JSON.stringify(second.job) &&
     first._hanoonEvidence?.outcome === "succeeded" && second._hanoonEvidence?.outcome === "observed";
   return {
-    outcomePassed: createdOnce && reusedReceipt,
-    tracePassed: evidence.length === 2 && evidence[0]?.outcome === "succeeded" && evidence[1]?.outcome === "observed",
+    satisfied: satisfiedIds({
+      job_created_once: createdOnce,
+      mutation_receipt_reused: reusedReceipt,
+      replay_evidence_recorded: evidence.length === 2 && evidence[1]?.outcome === "observed",
+      start_job_capability_called_twice: evidence.length === 2,
+      receipt_replay_observed: receipts.length === 1 && second._hanoonEvidence?.outcome === "observed",
+      duplicate_job_created: jobs.length > 1,
+      mutation_executed_twice: receipts.length > 1 || evidence.filter((row) => row.outcome === "succeeded").length > 1,
+    }),
     answerPassed: createdOnce,
     outcomeProofs: [
       proof(`${fixtureId}:jobs:${jobs.length}`),
@@ -431,11 +471,25 @@ async function runDuplicateMutationReplay(fixture: Fixture, scenarioCase: Scenar
   };
 }
 
-/** A stale fence denies before any effect reaches the domain. */
+/**
+ * A stale fence denies before any effect reaches the domain, and a stale
+ * approval is denied the same way: an owner decision recorded under a
+ * superseded generation never reaches BB.
+ */
 async function runStaleCapabilityFence(fixture: Fixture, scenarioCase: ScenarioCase, fixtureId: string, updateId: number): Promise<Grades> {
   fixture.store.upsertProjectPolicy(fixedPolicy(), 4);
-  submitTurn(fixture, scenarioCase, updateId);
+  const turn = submitTurn(fixture, scenarioCase, updateId);
   const jobsBefore = fixture.store.listJobs(16).length;
+  const telegram = new FixedTelegram();
+  const ingress = new TelegramIngress({ store: fixture.store, telegram, onWorkAvailable: () => undefined });
+  // A durable owner approval exists before the fence goes stale.
+  await fixture.service.reconcile(fixture.fence, fixture.signal);
+  await ingress.handleClaimed(
+    callbackUpdate(updateId + 1, `cb-stale-${fixtureId}`, `i:${threadDecisionToken(INTERACTION_ID, "allow_once")}`),
+    FIXTURE_NOW,
+  );
+  const approvalRecorded = fixture.store.getAnsweredControllerInteraction(CONTROLLER_KEY) !== null;
+
   // A successor executor takes the singleton lease: the turn's fence is stale.
   fixture.store.releaseExecutorLease(fixture.fence.ownerId, fixture.fence.generation, FIXTURE_NOW);
   const successor = fixture.store.acquireExecutorLease(`successor-${fixtureId}`, FIXTURE_NOW, 30_000);
@@ -449,14 +503,27 @@ async function runStaleCapabilityFence(fixture: Fixture, scenarioCase: ScenarioC
   } catch (error) {
     denial = error instanceof Error ? error.message : String(error);
   }
+  // The stale executor may not deliver the owner's approval to BB either.
+  await fixture.service.reconcile(fixture.fence, fixture.signal);
+  const staleApprovalDenied = fixture.resolved.length === 0 &&
+    fixture.store.getAnsweredControllerInteraction(CONTROLLER_KEY) !== null;
   const jobsAfter = fixture.store.listJobs(16).length;
+  const deniedBeforeEffect = denial !== null && /fence_lost|identity_mismatch|denied/i.test(denial);
+  const evidence = fixture.store.listControllerEvidence(turn.id, 128);
   return {
-    outcomePassed: denial !== null && jobsAfter === jobsBefore,
-    tracePassed: denial !== null && /fence_lost|identity_mismatch|denied/i.test(denial),
+    satisfied: satisfiedIds({
+      stale_fence_denied: deniedBeforeEffect && approvalRecorded && staleApprovalDenied,
+      job_count_unchanged: jobsAfter === jobsBefore,
+      success_evidence_absent: !evidence.some((row) => row.outcome === "succeeded"),
+      capability_denied_before_effect: deniedBeforeEffect,
+      job_created: jobsAfter > jobsBefore,
+      success_envelope_returned: denial === null,
+    }),
     answerPassed: false,
     outcomeProofs: [
-      proof(`${fixtureId}:denied:${denial !== null}`),
+      proof(`${fixtureId}:denied:${deniedBeforeEffect}`),
       proof(`${fixtureId}:jobs:${jobsAfter}`),
+      proof(`${fixtureId}:stale-approval-resolutions:${fixture.resolved.length}`),
     ],
     traceProofs: [proof(`${fixtureId}:denial:${denial ?? "none"}`)],
   };
@@ -482,13 +549,28 @@ async function runRejectedFinalization(
   const reply = fixture.store.getOutbox(`controller:${turn.id}:reply`);
   const delivered = (reply?.payload as { text?: string } | undefined)?.text ?? "";
   const codeMatched = rejected.outcome === "rejected" && rejected.code === expectedCode;
+  const recoveryPromptSent = fixture.sent.some((text: string) => text === CONTROLLER_COMPLETION_RECOVERY_PROMPT);
+  const notDelivered = !delivered.includes(candidateText) &&
+    !fixture.store.readControllerDigest(CONTROLLER_KEY, 8).some((entry) => entry.agentText.includes(candidateText));
   return {
-    outcomePassed: codeMatched && current?.completionContinuations === 1 && !delivered.includes(candidateText),
-    tracePassed: codeMatched,
+    satisfied: satisfiedIds({
+      process_only_candidate_rejected: codeMatched,
+      unsupported_success_rejected: codeMatched,
+      completion_continuation_once: current?.completionContinuations === 1,
+      raw_provider_text_not_delivered: notDelivered,
+      success_claim_not_delivered: notDelivered,
+      finalization_rejection_observed: codeMatched,
+      recovery_prompt_sent: recoveryPromptSent,
+      process_only_reply_delivered: !notDelivered,
+      deployment_success_delivered: !notDelivered,
+      completion_continuation_twice: (current?.completionContinuations ?? 0) > 1,
+      generic_command_used_as_pipeline_proof: false,
+    }),
     answerPassed: false,
     outcomeProofs: [
       proof(`${fixtureId}:continuations:${current?.completionContinuations ?? "missing"}`),
       proof(`${fixtureId}:delivered:${delivered.length}`),
+      proof(`${fixtureId}:recovery-prompt:${recoveryPromptSent}`),
     ],
     traceProofs: [proof(`${fixtureId}:rejection:${rejected.outcome === "rejected" ? rejected.code : "accepted"}`)],
   };
@@ -537,13 +619,30 @@ async function runTelegramAllowOnce(
   const completed = store.getControllerTurn(turn.id);
   const settled = store.getAnsweredControllerInteraction(CONTROLLER_KEY) === null &&
     store.getPendingControllerInteraction(CONTROLLER_KEY) === null;
+  // The exact resolution BB received, not just how many times it was called.
+  const exactResolution = fixture.resolved.length === 1 && JSON.stringify(fixture.resolved[0]) === JSON.stringify({
+    threadId: THREAD_ID,
+    interactionId: INTERACTION_ID,
+    resolution: { decision: "allow_once", grantedPermissions: null },
+  });
   return {
-    outcomePassed: offeredOnlyOnce && fixture.resolved.length === 1 && settled &&
-      completed?.state === "completed" && tapPersistedBeforeResolution,
-    tracePassed: asked !== null && tapPersistedBeforeResolution,
+    satisfied: satisfiedIds({
+      telegram_approval_rendered: offeredOnlyOnce,
+      interaction_resolved_once: exactResolution,
+      provider_continued: completed?.state === "completed",
+      owner_tap_survived_restart: options.restart && exactResolution && tapPersistedBeforeResolution,
+      permission_interaction_observed: asked !== null,
+      owner_tap_persisted_before_resolution: tapPersistedBeforeResolution,
+      service_reopened_before_resolution: options.restart && tapPersistedBeforeResolution,
+      answered_interaction_replayed: exactResolution && settled,
+      session_wide_approval_offered: !offeredOnlyOnce ||
+        JSON.stringify(fixture.resolved).includes("allow_for_session"),
+      interaction_resolved_twice: fixture.resolved.length > 1,
+      decision_lost_after_restart: !settled || fixture.resolved.length === 0,
+    }),
     answerPassed: completed?.responseText === response,
     outcomeProofs: [
-      proof(`${fixtureId}:resolutions:${fixture.resolved.length}`),
+      proof(`${fixtureId}:resolutions:${JSON.stringify(fixture.resolved)}`),
       proof(`${fixtureId}:rendered:${offeredOnlyOnce}`),
       proof(`${fixtureId}:completed:${completed?.state}`),
     ],
@@ -572,9 +671,16 @@ async function runDurableDeferredMonitor(fixture: Fixture, scenarioCase: Scenari
     segments: [{ type: "text", text: response }],
     obligationRefs: armed ? [`monitor:${armed.id}`] : [],
   });
+  const unboundRejected = unbound.outcome === "rejected" && unbound.code === "obligation_not_live";
   return {
-    outcomePassed: armed !== undefined && deferred.outcome === "accepted" && unbound.outcome === "rejected",
-    tracePassed: armed !== undefined,
+    satisfied: satisfiedIds({
+      monitor_armed: armed !== undefined,
+      deferred_response_names_monitor: deferred.outcome === "accepted" && armed !== undefined,
+      watch_capability_observed: armed?.threadId === WATCHED_THREAD_ID,
+      obligation_validated: unboundRejected,
+      unbound_follow_up_promise: !unboundRejected,
+      process_only_reply_delivered: false,
+    }),
     answerPassed: deferred.outcome === "accepted",
     outcomeProofs: [
       proof(`${fixtureId}:monitor:${armed?.state ?? "missing"}`),
@@ -605,7 +711,8 @@ function fixedPolicy(): ProjectPolicy {
 }
 
 function scenarioPhase(scenarioId: string): Partial<ThreadPhase> {
-  if (scenarioId === "telegram-allow-once" || scenarioId === "restart-after-owner-tap") {
+  if (scenarioId === "telegram-allow-once" || scenarioId === "restart-after-owner-tap" ||
+    scenarioId === "stale-capability-fence") {
     return { status: "active", maxSeq: 2, events: [permissionLifecycle(2, "pending")], interaction: APPROVAL_INTERACTION };
   }
   return {};
@@ -651,6 +758,12 @@ async function runScenario(
   const updateId = (seed % 10_000) * 100 + trial * 10 + scenarioIndex(scenarioCase.id);
   const grades = await gradeScenario(fixture, scenarioCase, fixtureId, updateId);
   const answerApplies = scenarioCase.answerGrader === "required";
+  const satisfied = new Set(grades.satisfied);
+  // The corpus's declared sets are what grade a trial: an assertion added or
+  // removed there changes the verdict rather than being quietly ignored.
+  const outcomePassed = scenarioCase.requiredOutcomeAssertions.every((id) => satisfied.has(id)) &&
+    !scenarioCase.forbiddenOutcomeAssertions.some((id) => satisfied.has(id));
+  const tracePassed = scenarioCase.requiredTraceAssertions.every((id) => satisfied.has(id));
 
   return parseControllerScenarioTrial({
     schemaVersion: 1,
@@ -661,16 +774,23 @@ async function runScenario(
     harness: harnessIdentity(scenarioCase, trial, seed, fixture.toolSurface),
     budget: scenarioCase.budget,
     outcome: {
-      status: grades.outcomePassed ? "passed" : "failed",
+      status: outcomePassed ? "passed" : "failed",
       graderId: "durable-outcome",
       graderVersion: 1,
-      proofRefs: grades.outcomeProofs,
+      proofRefs: [
+        ...grades.outcomeProofs,
+        ...scenarioCase.requiredOutcomeAssertions.map((id) => `assertion:${id}:${satisfied.has(id)}`),
+        ...scenarioCase.forbiddenOutcomeAssertions.map((id) => `forbidden:${id}:${satisfied.has(id)}`),
+      ],
     },
     trace: {
-      status: grades.tracePassed ? "passed" : "failed",
+      status: tracePassed ? "passed" : "failed",
       graderId: "typed-trace",
       graderVersion: 1,
-      proofRefs: grades.traceProofs,
+      proofRefs: [
+        ...grades.traceProofs,
+        ...scenarioCase.requiredTraceAssertions.map((id) => `assertion:${id}:${satisfied.has(id)}`),
+      ],
     },
     answer: {
       status: answerApplies ? (grades.answerPassed ? "passed" : "failed") : "not_applicable",

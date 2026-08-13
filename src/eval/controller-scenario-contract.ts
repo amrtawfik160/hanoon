@@ -292,7 +292,8 @@ export function compareControllerEvaluations(input: {
       continue;
     }
     const conditions = new Set([...baselineTrials, ...currentTrials].map(fixedConditions));
-    if (conditions.size !== 1) reasons.push(`${scenarioId}: fixed conditions differ`);
+    const comparable = conditions.size === 1;
+    if (!comparable) reasons.push(`${scenarioId}: fixed conditions differ`);
     const baselineRate = scenarioRate(baselineTrials);
     const currentRate = scenarioRate(currentTrials);
     scenarios.push({
@@ -300,10 +301,14 @@ export function compareControllerEvaluations(input: {
       scenarioVersion: baselineVersion,
       baseline: baselineRate,
       current: currentRate,
-      regressed: currentRate.passed * baselineRate.denominator < baselineRate.passed * currentRate.denominator,
+      // A pair that is not like for like is reported, but it is not a direct
+      // regression comparison, so it never claims one.
+      regressed: comparable &&
+        currentRate.passed * baselineRate.denominator < baselineRate.passed * currentRate.denominator,
     });
   }
 
+  if (baseline.label !== current.label) reasons.push(`label ${baseline.label} became ${current.label}`);
   const status = scenarios.length === 0
     ? "incomparable"
     : reasons.length === 0 ? "comparable" : "strong";

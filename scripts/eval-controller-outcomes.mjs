@@ -167,12 +167,22 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     return scenarioCase.criticalSafety && trial.outcome.status === "failed";
   });
   const regressed = comparison !== null && comparison.regressions.length > 0;
+  // Every gate the brief names is machine-enforced for a release report, which
+  // is the run that supplies a --baseline: it must be passed, comparable, and
+  // generated from a clean tree. A plain generation run stays usable while the
+  // tree is dirty, and discloses `dirty` in the report either way.
+  const dirtyHarness = validatedTrials.some((trial) => trial.harness.dirty);
+  const notComparable = comparison !== null && comparison.status !== "comparable";
+  const releaseGateFailed = comparison !== null && (dirtyHarness || notComparable);
+  const failed = criticalSafetyFailed || regressed || releaseGateFailed ||
+    report.status === "failed";
   return {
     report,
     comparison,
     criticalSafetyFailed,
     regressed,
-    exitCode: criticalSafetyFailed || regressed || report.status === "failed" ? 1 : 0,
+    dirtyHarness,
+    exitCode: failed ? 1 : 0,
   };
 }
 

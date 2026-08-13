@@ -34,7 +34,7 @@ type RunnerModule = {
     criticalSafetyFailed: boolean;
     regressed: boolean;
     report: { status: string };
-    comparison: { regressions: string[] } | null;
+    comparison: { status: string; regressions: string[] } | null;
   }>;
 };
 
@@ -228,7 +228,9 @@ it("compares a cutover report against its baseline and lists the new cases apart
     "scripts/eval-controller-outcomes.mjs",
     "--checkpoint", "cutover", "--trials", "1",
     "--output", cutoverOutput, "--baseline", baselineOutput,
-  ]);
+    // A compared run is the release gate, so it exits nonzero from the dirty
+    // working tree these tests run in; its stdout and report still hold.
+  ]).catch((error: { stdout: string }) => error);
 
   const report = JSON.parse(readFileSync(cutoverOutput, "utf8"));
   expect(report.comparison.status).toBe("comparable");
@@ -241,6 +243,30 @@ it("compares a cutover report against its baseline and lists the new cases apart
   expect(run.stdout).not.toMatch(/\d+(?:\.\d+)?%/);
   // The intervention is disclosed side by side rather than treated as drift.
   expect(report.comparison.intervention.current.capabilityManifestSha256).toHaveLength(1);
+});
+
+it.each([
+  ["a clean tree and a comparable baseline", false, 0],
+  ["a dirty tree", true, 1],
+])("gates a compared release report on %s", async (_name, dirty, expected) => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const clean = { ...trial, harness: { ...trial.harness, hanoonCommit: "a".repeat(40), dirty } };
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output: evaluationOutput(),
+    replace: false,
+    baseline: "/tmp/injected-baseline.json",
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty }),
+    runTrials: async () => [clean],
+    readBaseline: () => JSON.stringify(aggregateControllerEvaluation({ label: "fixed", trials: [clean] })),
+  });
+
+  expect(evaluation.comparison?.status).toBe("comparable");
+  expect(evaluation.exitCode).toBe(expected);
 });
 
 it("exits nonzero when a matched scenario regresses against its baseline", async () => {
@@ -271,7 +297,10 @@ it("records the current job status through the registered controller tool", asyn
 
   expect(statusTrial?.trace).toMatchObject({
     status: "passed",
-    proofRefs: [expect.stringMatching(/^tool-call:telegram_agent_job_status:1:sha256:[0-9a-f]{64}$/)],
+    proofRefs: [
+      expect.stringMatching(/^tool-call:telegram_agent_job_status:1:sha256:[0-9a-f]{64}$/),
+      "assertion:job_status_capability_observed:true",
+    ],
   });
 });
 
