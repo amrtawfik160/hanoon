@@ -923,6 +923,23 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   }));
 
   expect(verifiedPipelineOutcome(fixture.store, job)).toBe(true);
+  registerControllerTools(fixture.bb, {
+    store: fixture.store,
+    sdk: fixture.bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 2_002,
+  });
+  const controller = fixture.store.getControllerForOwner("7", "7");
+  if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
+  const mergedStatus = JSON.parse(await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    { jobId: job.id },
+    { threadId: controller.threadId, projectId: controller.projectId },
+  ) as string) as { _hanoonEvidence: { outcome: string; proofKinds: string[] } };
+  expect(mergedStatus._hanoonEvidence).toMatchObject({ outcome: "succeeded" });
+  expect(mergedStatus._hanoonEvidence.proofKinds).toContain("pipeline_outcome");
   const finalTest = fixture.store.getLatestPipelineStageAttempt(job.id, "FINAL_TEST");
   if (!finalTest?.outcome) throw new Error("real final validation outcome disappeared");
   const originalOutcome = finalTest.outcome;
@@ -942,16 +959,6 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   writeOutcome({ ...originalOutcome, requiredChecks: [{ name: "test", bucket: "pass" }] });
   expect(verifiedPipelineOutcome(fixture.store, job)).toBe(false);
   writeOutcome({ ...originalOutcome, completedAt: "not-a-date" });
-  registerControllerTools(fixture.bb, {
-    store: fixture.store,
-    sdk: fixture.bb.sdk,
-    threadOperations: { request: vi.fn() },
-    health: () => ({ ok: true }),
-    notify: vi.fn(),
-    now: () => 2_002,
-  });
-  const controller = fixture.store.getControllerForOwner("7", "7");
-  if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
   const status = JSON.parse(await fixture.harness.behavior.callAgentTool(
     "telegram_agent_job_status",
     { jobId: job.id },
@@ -1127,7 +1134,7 @@ it("projects the remaining memory, monitor, health, scorecard, and style rows fr
 
   const health = await call("telegram_agent_health", {});
   expect(health._hanoonEvidence).toMatchObject({
-    outcome: "observed",
+    outcome: "succeeded",
     proofKinds: ["health_snapshot"],
     subjectRefs: [`controller:${fixture.turn.controllerKey}`],
   });

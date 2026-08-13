@@ -43,6 +43,8 @@ const MAX_CANONICAL_SCAN = 16_384;
 const MAX_PERCENT_DECODE_LAYERS = 3;
 const MIN_BASE64_TOKEN_LENGTH = 16;
 const MAX_BASE64_TOKEN_LENGTH = 4_096;
+const MAX_ENCODING_DEPTH = 4;
+const MAX_ENCODING_NODES = 64;
 const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 const CREDENTIAL_QUERY_KEY = [
@@ -140,6 +142,9 @@ function canonicalForms(value: string): string[] | null {
 }
 
 const BASE64_TOKEN = /(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{16,}={0,2})(?![A-Za-z0-9+/_-])/gu;
+const UUID_TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
+const UNICODE_ESCAPE = /\\u\{([0-9a-f]{1,6})\}|\\u([0-9a-f]{4})|%u([0-9a-f]{4})/giu;
 
 function decodeBoundedBase64Token(token: string): string | null {
   if (token.length < MIN_BASE64_TOKEN_LENGTH || token.length > MAX_BASE64_TOKEN_LENGTH) return null;
@@ -166,15 +171,68 @@ function decodeBoundedBase64Token(token: string): string | null {
   }
 }
 
-function containsEncodedSensitiveText(value: string): boolean {
+function decodedUnicodeForm(value: string): string | null {
+  let changed = false;
+  const decoded = value.replace(UNICODE_ESCAPE, (_match, braced: string | undefined, fixed: string | undefined, percent: string | undefined) => {
+    const hex = braced ?? fixed ?? percent;
+    if (!hex) return _match;
+    const codePoint = Number.parseInt(hex, 16);
+    if (!Number.isSafeInteger(codePoint) || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+      return _match;
+    }
+    changed = true;
+    return String.fromCodePoint(codePoint);
+  });
+  return changed ? decoded : null;
+}
+
+function unicodeCanonicalForms(value: string): string[] {
+  const normalized = value.normalize("NFKC");
+  const forms = [normalized, normalized.replace(DEFAULT_IGNORABLES, "")];
+  const decoded = decodedUnicodeForm(forms[1]!);
+  if (decoded) forms.push(decoded, decoded.replace(DEFAULT_IGNORABLES, ""));
+  return [...new Set(forms)].filter((form) => form.length > 0 && form.length <= MAX_CANONICAL_SCAN);
+}
+
+function decodedBase64Tokens(value: string): string[] {
+  const decoded: string[] = [];
   BASE64_TOKEN.lastIndex = 0;
   let match = BASE64_TOKEN.exec(value);
   while (match !== null) {
-    const decoded = decodeBoundedBase64Token(match[1]);
-    if (decoded && SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(decoded))) return true;
+    const token = match[1];
+    if (token && !UUID_TOKEN.test(token)) {
+      const text = decodeBoundedBase64Token(token);
+      if (text) decoded.push(text);
+    }
     match = BASE64_TOKEN.exec(value);
   }
   BASE64_TOKEN.lastIndex = 0;
+  return decoded;
+}
+
+function containsEncodedSensitiveText(value: string): boolean {
+  const queue: Array<{ value: string; depth: number }> = [{ value, depth: 0 }];
+  const visited = new Set<string>();
+  let nodes = 0;
+  while (queue.length > 0) {
+    const node = queue.shift();
+    if (!node) break;
+    const key = String(node.depth) + ":" + node.value;
+    if (visited.has(key)) continue;
+    visited.add(key);
+    nodes += 1;
+    if (nodes > MAX_ENCODING_NODES) return true;
+    const forms = canonicalForms(node.value);
+    if (!forms) {
+      if (node.depth > 0 && /(?:%|\\u|%u)/iu.test(node.value)) return true;
+      continue;
+    }
+    for (const form of forms.flatMap(unicodeCanonicalForms)) {
+      if (SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form))) return true;
+      if (node.depth >= MAX_ENCODING_DEPTH) continue;
+      for (const decoded of decodedBase64Tokens(form)) queue.push({ value: decoded, depth: node.depth + 1 });
+    }
+  }
   return false;
 }
 
@@ -338,6 +396,20 @@ function safePathBasename(value: unknown): string {
   return basename;
 }
 
+function hasUnsupportedCommandPath(command: string): boolean {
+  if (/(?:^|[\s"'=(])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s"';&|),]*/u.test(command)) return true;
+  if (/(?:^|[\s"'=(\\/])\.\.(?:[\\/]|$)/u.test(command)) return true;
+  return command.split(/\s+/u).some((token) => {
+    const candidate = token.replace(/^[("'\\x60]+|["'\\x60,;)]+$/gu, "");
+    const path = candidate.includes("=") ? candidate.slice(candidate.lastIndexOf("=") + 1) : candidate;
+    if (!/[\\/]/u.test(path) || /^(?:https?|wss?):\/\//iu.test(path)) return false;
+    return path.replaceAll("\\", "/").split("/").filter(Boolean).some((segment) => {
+      const normalized = segment.toLowerCase();
+      return PROTECTED_BASENAME_MARKERS.some((marker) => normalized.includes(marker));
+    });
+  });
+}
+
 function boundedApprovalSummary(summary: string): string | null {
   return Array.from(summary).length <= MAX_CONTROLLER_APPROVAL_SUMMARY ? summary : null;
 }
@@ -346,6 +418,7 @@ function controllerApprovalSummary(subject: Record<string, unknown>): string | n
   if (subject.kind === "command") {
     const rawCommand = typeof subject.command === "string" ? subject.command : "";
     if (rawCommand.length === 0) return null;
+    if (hasUnsupportedCommandPath(rawCommand)) return null;
     const command = canonicalControllerText(rawCommand, MAX_PROMPT);
     if (!command || command !== rawCommand || command.includes("`") || /[\r\n\u0000-\u001f\u007f]/u.test(command)) return null;
     const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
@@ -363,10 +436,21 @@ function controllerApprovalSummary(subject: Record<string, unknown>): string | n
   return null;
 }
 
+function canonicalAvailableDecisions(candidate: Record<string, unknown>): string[] | null {
+  if (!Object.hasOwn(candidate, "availableDecisions") || !Array.isArray(candidate.availableDecisions)) return null;
+  const offered = candidate.availableDecisions;
+  if (!offered.every((decision): decision is string => typeof decision === "string")) return null;
+  if (Object.hasOwn(candidate, "decisions")) {
+    if (!Array.isArray(candidate.decisions) || !candidate.decisions.every((decision) => typeof decision === "string") ||
+        candidate.decisions.length !== offered.length || candidate.decisions.some((decision, index) => decision !== offered[index])) {
+      return null;
+    }
+  }
+  return [...offered];
+}
+
 function controllerApprovalDecisions(candidate: Record<string, unknown>): ControllerApprovalDecision[] | null {
-  const offered = Object.hasOwn(candidate, "availableDecisions") && Array.isArray(candidate.availableDecisions)
-    ? candidate.availableDecisions
-    : Object.hasOwn(candidate, "decisions") && Array.isArray(candidate.decisions) ? candidate.decisions : null;
+  const offered = canonicalAvailableDecisions(candidate);
   if (!offered) return null;
   const decisions = CONTROLLER_APPROVAL_DECISIONS.filter((decision) => offered.includes(decision));
   return decisions.length > 0 ? [...decisions] : null;
@@ -642,6 +726,7 @@ const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
 function approvalSummary(subject: Record<string, unknown>): string | null {
   if (subject.kind === "command") {
     const rawCommand = typeof subject.command === "string" ? subject.command : "";
+    if (hasUnsupportedCommandPath(rawCommand)) return null;
     const command = canonicalControllerText(rawCommand, MAX_PROMPT);
     if (!command || command !== rawCommand || command.includes("`") || /[\r\n\u0000-\u001f\u007f]/u.test(command)) return null;
     const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
@@ -678,7 +763,7 @@ export function parseThreadInteraction(interactionId: unknown, payload: unknown)
   const summary = typeof subject === "object" && subject !== null
     ? approvalSummary(subject as Record<string, unknown>)
     : null;
-  const offered = Array.isArray(candidate.availableDecisions) ? candidate.availableDecisions : null;
+  const offered = canonicalAvailableDecisions(candidate);
   if (!offered) return { kind: "unsupported", interactionId };
   const decisions = (Object.keys(APPROVAL_LABELS) as ThreadApprovalDecision[])
     .filter((decision) => offered.includes(decision));

@@ -897,6 +897,29 @@ describe("fail-closed operational claim binding", () => {
       "proof_incompatible",
     );
   });
+
+  it.each([
+    ["a deployment assertion", "The service was configured.", "execution_result", "command_result"],
+    ["a release assertion", "The release was deployed.", "workspace_change", "workspace_change"],
+  ] as const)("does not let %s ride on a broad command/file proof", (_label, text, kind, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("requires a positive typed health observation for a healthy claim", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "health_assessment", outcome: "succeeded", text: "The agent is healthy." }),
+      contextWithEvidence(evidenceRow("evidence:1", "health_snapshot", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+    expectRejection(
+      claimFinalization({ kind: "health_assessment", outcome: "succeeded", text: "The agent is healthy." }),
+      contextWithEvidence(evidenceRow("evidence:1", "health_snapshot", "interrupted")),
+      "proof_incompatible",
+    );
+  });
 });
 
 describe("bounded text heuristics", () => {
@@ -1094,6 +1117,20 @@ describe("bounded text heuristics", () => {
         text: "The deployment succeeded in production.",
       }),
       contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Ｔｈｅ ｂｕｉｌｄ ｓｕｃｃｅｅｄｅｄ.",
+    "The bui\u200Bld succeeded.",
+  ])("rejects Unicode-obfuscated operational prose: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it("does not reject ordinary prose merely because it uses Unicode text", () => {
+    expect(validateControllerFinalization(
+      textFinalization("Full-width typography is fine for this note."),
+      emptyFinalizationContext(),
     )).toMatchObject({ outcome: "accepted" });
   });
 });

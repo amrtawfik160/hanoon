@@ -10,6 +10,7 @@ import {
   questionOptionToken,
   renderQuestion,
   renderControllerInteraction,
+  parseThreadInteraction,
 } from "../src/controller/questions";
 
 const INTERACTION_ID = "pint_4k97457aun";
@@ -305,6 +306,19 @@ it("renders controller questions, approvals, and unsupported interactions with t
 
   const unsupported = renderControllerInteraction({ kind: "unsupported", interactionId: INTERACTION_ID });
   expect(unsupported).not.toHaveProperty("reply_markup");
+});
+
+it.each([
+  { decisions: ["allow_once", "deny"] },
+  { availableDecisions: "allow_once", decisions: ["allow_once", "deny"] },
+  { availableDecisions: ["allow_once"], decisions: ["deny"] },
+  { availableDecisions: ["allow_once", 7] },
+] as const)("requires the own canonical decision list for worker approvals: %#", (fields) => {
+  expect(parseThreadInteraction("worker_approval_boundary", {
+    kind: "approval",
+    subject: { kind: "command", command: "npm test", cwd: "/workspace/project" },
+    ...fields,
+  })).toEqual({ kind: "unsupported", interactionId: "worker_approval_boundary" });
 });
 
 function storeFixture(name: string) {

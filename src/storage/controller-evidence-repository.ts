@@ -433,7 +433,8 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
         `SELECT completion_continuations FROM controller_turns
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
-            AND accepted_finalization_id IS NULL AND evidence_event_seq = ?`,
+            AND accepted_finalization_id IS NULL AND steer_reservation_turn_id IS NULL
+            AND evidence_event_seq = ?`,
       ).get(
         input.turnId,
         input.controllerKey,
@@ -449,7 +450,8 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
                 evidence_event_seq = ?, stream_text = '', stream_phase = 'thinking', updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
-            AND accepted_finalization_id IS NULL AND completion_continuations = 0
+            AND accepted_finalization_id IS NULL AND steer_reservation_turn_id IS NULL
+            AND completion_continuations = 0
             AND evidence_event_seq = ?`,
       ).run(
         input.bbHighWaterSeq,
@@ -483,7 +485,8 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
          FROM controller_turns AS turn
          JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
         WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
-          AND turn.lease_owner = ? AND turn.lease_generation = ?`,
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.steer_reservation_turn_id IS NULL`,
     ).get(
       input.turnId,
       input.controllerKey,
@@ -650,6 +653,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       `SELECT evidence_event_seq FROM controller_turns
         WHERE id = ? AND controller_key = ? AND state = 'submitted'
           AND lease_owner = ? AND lease_generation = ?
+          AND steer_reservation_turn_id IS NULL
           AND (? = 1 OR accepted_finalization_id IS NULL)`,
     ).get(
       input.turnId,

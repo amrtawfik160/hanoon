@@ -401,8 +401,8 @@ async function runInteractionRace(
   }
 }
 
-it("pins the shipped migration bytes and appends the interaction migration", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(30);
+it("pins the shipped migration bytes and appends the interaction and steer migrations", () => {
+  expect(ALL_MIGRATIONS).toHaveLength(31);
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
   );
@@ -411,6 +411,7 @@ it("pins the shipped migration bytes and appends the interaction migration", () 
   );
   expect(ALL_MIGRATIONS[29]).toContain("CREATE TABLE controller_interactions");
   expect(ALL_MIGRATIONS[29]).toContain("CHECK (state = 'delivered'");
+  expect(ALL_MIGRATIONS[30]).toContain("steer_reservation_turn_id");
 });
 
 it("copies legacy questions once, preserves their table, and restores the active pointer", () => {
@@ -760,6 +761,19 @@ it("projects only safe controller approval decisions", () => {
 });
 
 it.each([
+  ["legacy-only decisions", { decisions: ["allow_once", "deny"] }],
+  ["a malformed canonical field", { availableDecisions: "allow_once", decisions: ["allow_once", "deny"] }],
+  ["conflicting canonical and legacy fields", {
+    availableDecisions: ["allow_once"],
+    decisions: ["deny"],
+  }],
+  ["a non-string canonical decision", { availableDecisions: ["allow_once", 7] }],
+] as const)("rejects %s without a valid canonical availableDecisions array", (_name, overrides) => {
+  expect(parseControllerInteraction("approval_decision_boundary", approvalPayload(overrides)))
+    .toEqual({ kind: "unsupported", interactionId: "approval_decision_boundary" });
+});
+
+it.each([
   ["a lowercase plain assignment", "lowercase=plain-value"],
   ["a lowercase single-quoted assignment", "lowercase='quoted value'"],
   ["a lowercase double-quoted assignment", 'lowercase="quoted value"'],
@@ -825,6 +839,39 @@ it.each([
   expect(JSON.stringify(projection)).not.toContain("secret-value");
   expect(JSON.stringify(projection)).not.toContain("API_TOKEN");
   expect(JSON.stringify(projection)).not.toContain("secret output");
+});
+
+it.each([
+  ["Base64 of percent-encoded credentials", Buffer.from(encodeURIComponent("API_KEY=secret-value"), "utf8").toString("base64")],
+  ["nested Base64url of Unicode-normalized credentials", Buffer.from("ＰＡＳＳＷＯＲＤ＝secret-value", "utf8").toString("base64url")],
+] as const)("recursively rejects %s", (_name, encodedCommand) => {
+  const projection = parseControllerInteraction("approval_nested_encoding", approvalPayload({
+    subject: { kind: "command", command: `printf ${encodedCommand}`, cwd: "/workspace/project" },
+  }));
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_nested_encoding" });
+});
+
+it("keeps an opaque UUID command actionable while scanning encoded text", () => {
+  expect(parseControllerInteraction("approval_uuid", approvalPayload({
+    subject: {
+      kind: "command",
+      command: "echo 550e8400-e29b-41d4-a716-446655440000",
+      cwd: "/workspace/project",
+    },
+  }))).toMatchObject({ kind: "approval" });
+});
+
+it.each([
+  ["an absolute workspace path", "cat /workspace/project/README.md"],
+  ["a private path", "cat /private/data/report.txt"],
+  ["a traversal path", "cat ../notes.txt"],
+  ["a Windows absolute path", String.raw`type C:\workspace\project\README.md`],
+] as const)("rejects %s in an approval command without rewriting its identity", (_name, command) => {
+  const projection = parseControllerInteraction("approval_command_path", approvalPayload({
+    subject: { kind: "command", command, cwd: "/workspace/project" },
+  }));
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_command_path" });
+  expect(JSON.stringify(projection)).not.toContain(command);
 });
 
 it.each([

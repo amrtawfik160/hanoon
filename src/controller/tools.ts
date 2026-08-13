@@ -930,7 +930,7 @@ function jobProjectionEvidence(
   return {
     outcome: mutation !== "read" && changed
       ? "succeeded"
-      : verifiedPipeline && current?.state === "complete"
+      : verifiedPipeline && (current?.state === "merged" || current?.state === "complete")
         ? "succeeded"
         : verifiedPipeline ? "interrupted" : "observed",
     proofKinds,
@@ -1073,7 +1073,14 @@ async function projectTrustedEvidence(
     }
     case "telegram_agent_cancel_watch":
       return { outcome: domain.cancelled === true ? "succeeded" : "observed", proofKinds: ["monitor_state"], subjectRefs: resolution.scope.entityRefs };
-    case "telegram_agent_health":
+    case "telegram_agent_health": {
+      const report = recordValue(domain);
+      return {
+        outcome: report?.ok === true ? "succeeded" : "interrupted",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: [`controller:${authorized.controller.controllerKey}`],
+      };
+    }
     case "telegram_agent_scorecard":
       return { outcome: "observed", proofKinds: ["health_snapshot"], subjectRefs: [`controller:${authorized.controller.controllerKey}`] };
     case "telegram_agent_delegate": {
@@ -1360,6 +1367,11 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         threadId: params.threadId,
         text: params.text,
         signal: context.signal,
+        assertCanSend: (thread) => {
+          if (thread.originPluginId === bb.pluginId || dependencies.store.findJobByThreadId(thread.id) !== null) {
+            throw new Error("Direct controller messaging cannot target a plugin-owned or job-owned worker thread");
+          }
+        },
       });
     },
   });

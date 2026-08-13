@@ -1029,6 +1029,10 @@ UPDATE controller_turns AS turn
 DROP TABLE controller_interaction_migration_guard;
 `] as const;
 
+export const CONTROLLER_STEER_RESERVATION_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN steer_reservation_turn_id TEXT;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -1060,4 +1064,5 @@ export const ALL_MIGRATIONS = [
   ...PRODUCTION_HEALTH_MIGRATIONS,
   ...CONTROLLER_TRUST_MIGRATIONS,
   ...CONTROLLER_INTERACTION_MIGRATIONS,
+  ...CONTROLLER_STEER_RESERVATION_MIGRATIONS,
 ] as const;

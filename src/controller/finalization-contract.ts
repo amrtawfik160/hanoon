@@ -176,6 +176,7 @@ const NON_SUCCESS_CLAUSE = [
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
   /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
 ];
+const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
   kinds: readonly ControllerClaimKind[];
@@ -195,12 +196,24 @@ const GENERIC_COMPLETION_SUBJECT = "(?:everything|all(?:\\s+(?:the\\s+)?(?:work|
  */
 const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   {
-    pattern: /\b(?:implemented|fixed|repaired|resolved|addressed|handled|changed|updated|modified|shipped|deployed|released|rolled\s+out|merged|built|compiled|tested|verified|validated|published|promoted|provisioned|configured|enabled|activated|executed|launched|landed)\b/i,
-    kinds: ["execution_result", "workspace_change", "external_mutation", "pipeline_outcome"],
+    pattern: /\b(?:implemented|fixed|repaired|resolved|addressed|handled|changed|updated|modified)\b/i,
+    kinds: ["workspace_change"],
   },
   {
-    pattern: /\b(?:done|complete|completed|finished|successful|succeeded|passed|green|live|healthy|verified|ready|resolved|wrapped\s+up|good\s+to\s+go|went\s+smoothly|cleared\s+(?:its|the)\s+(?:final\s+)?gate)\b/i,
-    kinds: ["execution_result", "workspace_change", "external_mutation", "pipeline_outcome", "health_assessment"],
+    pattern: /\b(?:built|compiled|tested|verified|validated|executed)\b/i,
+    kinds: ["execution_result"],
+  },
+  {
+    pattern: /\b(?:shipped|deployed|released|rolled\s+out|merged|published|promoted|provisioned|configured|enabled|activated|launched|landed)\b/i,
+    kinds: ["external_mutation", "pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:done|complete|completed|finished|successful|succeeded|passed|green|live|resolved|wrapped\s+up|good\s+to\s+go|went\s+smoothly|cleared\s+(?:its|the)\s+(?:final\s+)?gate)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:agent|system|service|health(?:\s+check)?|monitoring)\s+(?:is|was|has\s+been|had\s+been)?\s*(?:healthy|ready|good\s+to\s+go)\b/i,
+    kinds: ["health_assessment"],
   },
   {
     pattern: /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
@@ -443,7 +456,8 @@ function hasProofIncompatibility(
 }
 
 function normalizedSentences(text: string): string[] {
-  const normalized = text.replace(/[’‘]/g, "'").replace(/[\r\n]+/g, " ");
+  const normalized = text.normalize("NFKC").replace(OPERATIONAL_DEFAULT_IGNORABLES, "")
+    .replace(/[’‘]/g, "'").replace(/[\r\n]+/g, " ");
   return (normalized.match(/[^.!?]+[.!?]?/g) ?? [normalized])
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
@@ -479,6 +493,16 @@ function operationalMatchesIn(clause: string): OperationalMatch[] {
     }
   }
   return matches;
+}
+
+function effectiveOperationalMatches(clause: string): OperationalMatch[] {
+  const matches = operationalMatchesIn(clause);
+  return matches.filter((match) => !matches.some((other) => (
+    other !== match &&
+    other.start <= match.start &&
+    other.end >= match.end &&
+    other.end - other.start > match.end - match.start
+  )));
 }
 
 type SourceTextSpan = Readonly<{ text: string; start: number }>;
@@ -523,6 +547,13 @@ function splitOperationalSentence(sentence: SourceTextSpan): SourceTextSpan[] {
 
 function operationalClauseSpans(text: string): SourceTextSpan[] {
   return sentenceSourceSpans(text).flatMap(splitOperationalSentence);
+}
+
+function hasObfuscatedOperationalAssertion(text: string): boolean {
+  const normalized = text.normalize("NFKC");
+  const canonical = normalized.replace(OPERATIONAL_DEFAULT_IGNORABLES, "");
+  if (canonical === text) return false;
+  return operationalClauseSpans(canonical).some((span) => clauseHasHighImpactSuccess(span.text));
 }
 
 function isConcreteFollowUp(sentence: string): boolean {
@@ -570,7 +601,7 @@ function hasIncompatibleClaimText(candidate: ControllerFinalization, renderedMes
   const segmentSpans = finalizationSegmentSpans(candidate);
   for (const sourceSpan of operationalClauseSpans(renderedMessage)) {
     const clause = sourceSpan.text.replace(/[’‘]/g, "'");
-    for (const match of operationalMatchesIn(clause)) {
+    for (const match of effectiveOperationalMatches(clause)) {
       const assertionStart = sourceSpan.start + match.start;
       const assertionEnd = sourceSpan.start + match.end;
       const touched = segmentSpans.filter((span) => span.start < assertionEnd && span.end > assertionStart);
@@ -631,6 +662,7 @@ function claimRejectionCode(
   if (hasMissingEvidence(candidateClaims, context)) return "evidence_missing";
   if (hasSubjectMismatch(candidateClaims, context)) return "subject_mismatch";
   if (hasProofIncompatibility(candidateClaims, context)) return "proof_incompatible";
+  if (candidateClaims.length > 0 && hasObfuscatedOperationalAssertion(renderedMessage)) return "proof_incompatible";
   if (hasIncompatibleClaimText(candidate, renderedMessage)) return "proof_incompatible";
   return null;
 }

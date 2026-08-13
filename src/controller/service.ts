@@ -293,7 +293,13 @@ export class LunaControllerService {
           ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
           : null;
         if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
-          if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
+          if (signal.aborted || !this.dependencies.store.reserveControllerSteer({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            runningTurnId: turn.id,
+            waitingTurnId: waiting.id,
+            controllerKey: turn.controllerKey,
+            expectedThreadId: controller.threadId,
+          })) return true;
           try {
             await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
           } catch {
@@ -301,13 +307,15 @@ export class LunaControllerService {
             // it once the turn in flight finishes.
             this.dependencies.store.recordControllerSteerFailure({
               ...fenceAt(fence, this.dependencies.clock.now()),
-              turnId: waiting.id,
+              runningTurnId: turn.id,
+              waitingTurnId: waiting.id,
             });
             return true;
           }
           this.dependencies.store.foldControllerTurnIntoRunning({
             ...fenceAt(fence, this.dependencies.clock.now()),
-            turnId: waiting.id,
+            runningTurnId: turn.id,
+            waitingTurnId: waiting.id,
           });
           return true;
         }

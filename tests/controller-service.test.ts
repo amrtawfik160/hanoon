@@ -1164,6 +1164,95 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
   expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["completed", "submitted"]);
 });
 
+it("reserves a steer before the provider call so finalization cannot win the race", async () => {
+  const { store, fence } = serviceFixture();
+  const running = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 68, inputText: "first" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const waiting = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 69, inputText: "second" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: running.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_steer_race",
+    spawnToken: running.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: running.id })).toBe(true);
+
+  let finalizationDuringSteer: ReturnType<typeof store.proposeControllerFinalization> | null = null;
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({
+      threadId: "unused",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: spawnTurn.id,
+    })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      pendingQuestion: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => {
+      finalizationDuringSteer = store.proposeControllerFinalization({
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: 2_003,
+        turnId: running.id,
+        controllerKey: running.controllerKey,
+        candidate: {
+          disposition: "answered",
+          segments: [{ type: "text", text: "A raced final answer." }],
+          obligationRefs: [],
+        },
+      });
+    }),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(finalizationDuringSteer).toMatchObject({ outcome: "stale" });
+  expect(store.getAcceptedControllerFinalization(running.id)).toBeNull();
+  expect(adapter.steer).toHaveBeenCalledWith("thr_steer_race", "second", fence.signal);
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "completed" });
+  expect(store.proposeControllerFinalization({
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_004,
+    turnId: running.id,
+    controllerKey: running.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "The steer was folded." }],
+      obligationRefs: [],
+    },
+  })).toMatchObject({ outcome: "accepted" });
+});
+
 it("does not steer a queued owner message after the executor lease is lost", async () => {
   const { store, fence } = serviceFixture();
   const running = store.enqueueControllerTurn({

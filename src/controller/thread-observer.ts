@@ -217,8 +217,10 @@ export async function sendToVisibleThread(input: {
   threadId: string;
   text: string;
   signal: AbortSignal;
+  assertCanSend?(thread: Awaited<ReturnType<BbSdk["threads"]["get"]>>): void;
 }) {
   const thread = await assertVisibleThreadScope(input);
+  input.assertCanSend?.(thread);
   await input.sdk.threads.send({
     threadId: input.threadId,
     mode: "auto",

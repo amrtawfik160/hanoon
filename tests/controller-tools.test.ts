@@ -573,7 +573,7 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
       name: "telegram_agent_health",
       params: () => ({}),
       expected: () => ({
-        outcome: "observed",
+        outcome: "succeeded",
         proofKinds: ["health_snapshot"],
         subjectRefs: ["controller:owner-7-controller"],
       }),
@@ -1452,6 +1452,29 @@ it("does not expose a synthetic schedule scope in interrupted evidence", async (
   });
 });
 
+it("binds health evidence to the report's positive or negative state", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: false, problems: ["executor lease is not current"] }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+
+  const result = parseToolWithEvidence(await harness.behavior.callAgentTool(
+    "telegram_agent_health",
+    {},
+    controllerToolContext,
+  ));
+  expect(result._hanoonEvidence).toMatchObject({
+    outcome: "interrupted",
+    proofKinds: ["health_snapshot"],
+    subjectRefs: ["controller:owner-7-controller"],
+  });
+});
+
 it("denies a valid enabled policy stored under a different project identity", async () => {
   const { bb, harness, store } = fixture({ active: true });
   const mismatched = policyFixture({ projectId: "proj_other", alias: "other" });
@@ -1606,6 +1629,40 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     { threadId: "thr_hidden", text: "leak" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   )).rejects.toThrow(/scope|not visible/i);
+});
+
+it("rejects direct controller messaging to plugin-owned and durable job-owned worker threads", async () => {
+  const { bb, harness, store, activate, deactivate } = fixture({ active: true });
+  deactivate();
+  const { job } = advanceToImplementation(store, "job_direct_message_guard");
+  const worker = store.applyJobEvent(job.id, job.version, {
+    type: "IMPLEMENTATION_CREATED", threadId: "thr_job_owned", environmentId: "env_worker",
+  }, 1_006);
+  expect(store.findJobByThreadId(worker.implementationThreadId!)).toMatchObject({ id: worker.id });
+  activate();
+  const send = vi.fn(async () => ({ ok: true }));
+  harness.sdk.stub("threads.send", send);
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread({ id: threadId, originPluginId: threadId === "thr_plugin_owned" ? bb.pluginId : null }),
+    canSpawnChild: true,
+  }));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+
+  for (const threadId of ["thr_plugin_owned", "thr_job_owned"]) {
+    await expect(harness.behavior.callAgentTool(
+      "telegram_agent_send_to_thread",
+      { threadId, text: "bypass worker control" },
+      controllerToolContext,
+    )).rejects.toThrow(/worker|job|controller/i);
+  }
+  expect(send).not.toHaveBeenCalled();
 });
 
 it("uses the authorized project host once and interrupts replay after cross-project projection failure", async () => {

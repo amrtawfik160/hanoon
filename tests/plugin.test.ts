@@ -363,6 +363,63 @@ it("adopts one exact tokenized controller title and rejects spoofed or ambiguous
   await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000))).resolves.toBeNull();
 });
 
+it("pages controller recovery candidates, aggregates exact matches, and fails closed at the page cap", async () => {
+  const { bb, harness } = await loadPlugin();
+  harness.sdk.stub("projects.list", async () => [{
+    id: "proj_personal",
+    kind: "personal",
+    name: "Personal",
+    gitRemoteUrl: null,
+    sources: [{ id: "src_personal", isDefault: true, hostId: "host_personal" }],
+  }]);
+  const exactTitle = controllerSpawnTitle("owner-7-controller", "controller-turn-2", "proj_personal", "host_personal", "claude-code");
+  const candidate = {
+    id: "thr_tokenized_later",
+    projectId: "proj_personal",
+    providerId: "claude-code",
+    status: "idle",
+    title: exactTitle,
+    visibility: "hidden",
+    originPluginId: bb.pluginId,
+    environmentHostId: "host_personal",
+    archivedAt: null,
+    deletedAt: null,
+  };
+  const calls: Array<{ offset?: number; limit?: number }> = [];
+  harness.sdk.stub("threads.list", async (args: { offset?: number; limit?: number }) => {
+    calls.push({
+      offset: typeof args?.offset === "number" ? args.offset : undefined,
+      limit: typeof args?.limit === "number" ? args.limit : undefined,
+    });
+    const offset = typeof args?.offset === "number" ? args.offset : 0;
+    if (offset === 0) return Array.from({ length: 100 }, (_, index) => ({ ...candidate, id: `spoof_${index}`, title: "not a controller" }));
+    if (offset === 100) return [candidate];
+    return [];
+  });
+  const adapter = new BbControllerAdapter({
+    sdk: bb.sdk,
+    pluginId: bb.pluginId,
+    executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  });
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000)))
+    .resolves.toMatchObject({ threadId: "thr_tokenized_later" });
+  expect(calls).toEqual([
+    { offset: 0, limit: 100 },
+    { offset: 100, limit: 100 },
+  ]);
+
+  harness.sdk.stub("threads.list", async (args: { offset?: number }) => {
+    const offset = typeof args?.offset === "number" ? args.offset : 0;
+    return Array.from({ length: 100 }, (_, index) => ({
+      ...candidate,
+      id: `full_page_${offset}_${index}`,
+      title: "not a controller",
+    }));
+  });
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-2", AbortSignal.timeout(1_000)))
+    .rejects.toThrow(/page cap|bounded/i);
+});
+
 it("keeps the Telegram polling timeout out of user-facing settings", async () => {
   const { harness } = await loadPlugin();
 

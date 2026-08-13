@@ -63,7 +63,7 @@ function sha256(text: string): string {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(30);
+  expect(ALL_MIGRATIONS).toHaveLength(31);
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -102,6 +102,7 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[28]).toContain("evidence_high_water_id INTEGER NOT NULL");
   expect(ALL_MIGRATIONS[29]).toContain("CREATE TABLE controller_interactions");
   expect(ALL_MIGRATIONS[29]).toContain("controller_generation_id");
+  expect(ALL_MIGRATIONS[30]).toContain("steer_reservation_turn_id");
 });
 
 it("pins the exact shipped and controller trust migration bytes in order", () => {
@@ -113,6 +114,9 @@ it("pins the exact shipped and controller trust migration bytes in order", () =>
   );
   expect(sha256(ALL_MIGRATIONS[29]!)).toBe(
     "a02875eab12120926d87ea4e759944dc6646c33b7dd019cc71edf016d28b7410",
+  );
+  expect(sha256(ALL_MIGRATIONS[30]!)).toBe(
+    "96447664d9ed7afbc789407f482af4eb1880efaacd52fb0c91379098f6a18235",
   );
 });
 

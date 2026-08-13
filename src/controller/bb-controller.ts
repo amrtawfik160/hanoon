@@ -110,6 +110,8 @@ export type ControllerAdapter = ControllerAdapterMethods;
 
 export const CONTROLLER_EVENT_PAGE_LIMIT = 100;
 export const MAX_CONTROLLER_EVENT_PAGES = 50;
+const CONTROLLER_THREAD_PAGE_LIMIT = 100;
+const MAX_CONTROLLER_THREAD_PAGES = 50;
 const MAX_CONTROLLER_INTERACTION_REFERENCES = 256;
 
 // Reasoning, plain messages, and plan updates are the model thinking out loud.
@@ -559,37 +561,51 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
   ): Promise<ControllerLocation | null> {
     const personal = await this.resolvePersonalProject(signal);
     const providerId = controllerProviderFor(this.dependencies.executionProfile().model);
-    const threads = await this.dependencies.sdk.threads.list({
-      projectId: personal.projectId,
-      includeHidden: true,
-      originPluginId: this.dependencies.pluginId,
-      signal,
-    });
-    const candidates = threads.flatMap((thread) => {
-      const identity = parseControllerSpawnTitle(thread.title);
-      if (
-        !identity || identity.controllerKey !== controllerKey ||
-        identity.pendingSpawnToken !== pendingSpawnToken ||
-        identity.projectId !== personal.projectId ||
-        identity.hostId !== personal.hostId ||
-        identity.providerId !== providerId ||
-        thread.projectId !== personal.projectId ||
-        thread.environmentHostId !== personal.hostId ||
-        thread.providerId !== providerId ||
-        thread.status === "error" || thread.status === "stopping" ||
-        thread.visibility !== "hidden" ||
-        thread.originPluginId !== this.dependencies.pluginId ||
-        thread.archivedAt !== null ||
-        thread.deletedAt !== null
-      ) return [];
-      return [{ thread, identity }];
-    });
-    if (candidates.length > 1) throw new Error("Multiple ambiguous BB controller spawn candidates exist");
-    const candidate = candidates[0];
+    const candidates = new Map<string, ControllerSpawnTitleIdentity>();
+    let offset = 0;
+    for (let page = 0; page < MAX_CONTROLLER_THREAD_PAGES; page += 1) {
+      const threads = await this.dependencies.sdk.threads.list({
+        projectId: personal.projectId,
+        includeHidden: true,
+        originPluginId: this.dependencies.pluginId,
+        limit: CONTROLLER_THREAD_PAGE_LIMIT,
+        offset,
+        signal,
+      });
+      if (threads.length > CONTROLLER_THREAD_PAGE_LIMIT) {
+        throw new Error("Controller thread recovery returned an oversized page");
+      }
+      for (const thread of threads) {
+        const identity = parseControllerSpawnTitle(thread.title);
+        if (
+          !identity || identity.controllerKey !== controllerKey ||
+          identity.pendingSpawnToken !== pendingSpawnToken ||
+          identity.projectId !== personal.projectId ||
+          identity.hostId !== personal.hostId ||
+          identity.providerId !== providerId ||
+          thread.projectId !== personal.projectId ||
+          thread.environmentHostId !== personal.hostId ||
+          thread.providerId !== providerId ||
+          thread.status === "error" || thread.status === "stopping" ||
+          thread.visibility !== "hidden" ||
+          thread.originPluginId !== this.dependencies.pluginId ||
+          thread.archivedAt !== null ||
+          thread.deletedAt !== null
+        ) continue;
+        candidates.set(thread.id, identity);
+      }
+      if (threads.length < CONTROLLER_THREAD_PAGE_LIMIT) break;
+      offset += threads.length;
+      if (page + 1 === MAX_CONTROLLER_THREAD_PAGES) {
+        throw new Error("Controller thread recovery page cap exhausted");
+      }
+    }
+    if (candidates.size > 1) throw new Error("Multiple ambiguous BB controller spawn candidates exist");
+    const candidate = [...candidates.entries()][0];
     return candidate ? {
-      threadId: candidate.thread.id,
+      threadId: candidate[0],
       ...personal,
-      spawnToken: candidate.identity.pendingSpawnToken,
+      spawnToken: candidate[1].pendingSpawnToken,
     } : null;
   }
 
