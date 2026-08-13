@@ -1,5 +1,9 @@
 import type Database from "better-sqlite3";
 import {
+  ControllerInteractionRepository,
+  type ControllerInteractionStore,
+} from "./controller-interaction-repository";
+import {
   CONTROLLER_PROOF_KINDS,
   type ControllerLeaseFence,
   type ControllerProofKind,
@@ -210,8 +214,21 @@ const EVIDENCE_OUTCOMES: ReadonlySet<string> = new Set([
   "denied",
 ]);
 
+/** Exactly the two reads that establish whether an owner boundary is live. */
+type ControllerInteractionBoundaryReader = Pick<ControllerInteractionStore, "getPending" | "getAnswered">;
+
 export class ControllerEvidenceRepository implements ControllerNativeEvidenceWriter {
-  public constructor(private readonly db: SqliteDatabase) {}
+  private readonly interactions: ControllerInteractionBoundaryReader;
+
+  public constructor(
+    private readonly db: SqliteDatabase,
+    interactions?: ControllerInteractionBoundaryReader,
+  ) {
+    // The interaction seam is the only thing that knows what makes a durable
+    // interaction row live, so this repository borrows it rather than asking
+    // the same question with a second, weaker query.
+    this.interactions = interactions ?? new ControllerInteractionRepository(db);
+  }
 
   public adoptSubmittedTurnFence(
     input: ControllerLeaseFence & Readonly<{ turnId: string }>,
@@ -590,12 +607,12 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     turn: FinalizationTurnRow,
   ): boolean {
     // Generic interactions are the only active owner-question path. A delivered
-    // row is no longer a boundary: BB has already heard that answer.
-    const interaction = this.db.prepare(
-      `SELECT 1 FROM controller_interactions
-        WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered') LIMIT 1`,
-    ).get(input.turnId, input.controllerKey);
-    if (interaction) return true;
+    // row is no longer a boundary: BB has already heard that answer. Both reads
+    // go through the interaction seam, so a row on a thread the controller has
+    // left, from an ended or ambiguous generation, or with a payload that no
+    // longer parses is not a boundary the owner can be standing on.
+    if (this.interactions.getPending(input.controllerKey)?.turnId === input.turnId) return true;
+    if (this.interactions.getAnswered(input.controllerKey)?.turnId === input.turnId) return true;
     const operation = this.db.prepare(
       `SELECT 1 FROM thread_operations
         WHERE owner_user_id = ? AND owner_chat_id = ?

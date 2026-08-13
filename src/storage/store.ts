@@ -2911,8 +2911,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     private readonly clock: () => number,
   ) {
     this.autonomyRepository = new AutonomyRepository(db);
-    this.controllerEvidenceRepository = new ControllerEvidenceRepository(db);
     this.controllerInteractionRepository = new ControllerInteractionRepository(db);
+    // One interaction seam for the whole store: what counts as a live owner
+    // boundary is decided in exactly one place.
+    this.controllerEvidenceRepository = new ControllerEvidenceRepository(
+      db,
+      this.controllerInteractionRepository,
+    );
   }
 
   private currentNow(): number {
