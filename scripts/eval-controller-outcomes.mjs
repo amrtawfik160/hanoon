@@ -150,8 +150,14 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
       process.stdout.write(
         `${scenario.scenarioId} baseline ${contract.formatControllerRate(scenario.baseline)}` +
         ` current ${contract.formatControllerRate(scenario.current)}` +
+        // Printed rates read as a result unless the line says otherwise, so a
+        // pair that cannot be compared says so on the same line as its numbers.
+        `${scenario.comparable ? "" : " NOT-COMPARABLE"}` +
         `${scenario.regressed ? " REGRESSED" : ""}\n`,
       );
+    }
+    for (const reason of comparison.incomparableReasons) {
+      process.stdout.write(`reason ${reason}\n`);
     }
     if (comparison.currentOnly.length > 0) {
       process.stdout.write(`current-only ${comparison.currentOnly.join(",")}\n`);

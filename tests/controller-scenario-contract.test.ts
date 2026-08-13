@@ -308,6 +308,7 @@ describe("like-for-like comparison", () => {
       scenarioVersion: 1,
       baseline: { passed: 2, denominator: 2 },
       current: { passed: 2, denominator: 2 },
+      comparable: true,
       regressed: false,
     }]);
     // Kernel and cutover cases are listed apart and never counted as lift.
@@ -378,6 +379,73 @@ describe("like-for-like comparison", () => {
 
     expect(comparison.status).toBe("strong");
     expect(comparison.incomparableReasons.length).toBeGreaterThan(0);
+  });
+
+  it("refuses to call an unscoreable baseline comparable", () => {
+    // A baseline whose metrics were never established scores 0 for reasons that
+    // have nothing to do with behaviour. Rating the current run against it would
+    // read as improvement when nothing was measured to improve on.
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ metrics: metrics({ terminalFailureClass: "metrics_unavailable" }) })],
+    });
+    const current = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.incomparableReasons).toContain("plain-conversation: baseline metrics unavailable");
+    expect(comparison.scenarios).toEqual([{
+      scenarioId: "plain-conversation",
+      scenarioVersion: 1,
+      baseline: { passed: 0, denominator: 1 },
+      current: { passed: 1, denominator: 1 },
+      // The pair is disclosed, and explicitly marked as not a rate comparison.
+      comparable: false,
+      regressed: false,
+    }]);
+  });
+
+  it("names the current run when it is the side without metrics", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ metrics: metrics({ terminalFailureClass: "metrics_unavailable" }) })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.incomparableReasons).toContain("plain-conversation: current metrics unavailable");
+  });
+
+  it("stays comparable when both sides measured their metrics the same way", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("comparable");
+    expect(comparison.scenarios[0]).toMatchObject({ comparable: true });
+  });
+
+  it("becomes incomparable when the only shared scenario is unscoreable", () => {
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ metrics: metrics({ terminalFailureClass: "metrics_unavailable" }) })],
+    });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial(), trial({ trial: 2, scenarioId: "cutover-case" })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    // Nothing here supports a rate comparison, so the report says so outright
+    // rather than resting on a single unscoreable pair.
+    expect(comparison.status).toBe("strong");
+    expect(comparison.scenarios.every((scenario) => !scenario.comparable)).toBe(true);
+    expect(comparison.regressions).toEqual([]);
   });
 
   it("downgrades to strong when a budget or grader version differs", () => {

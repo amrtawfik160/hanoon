@@ -267,6 +267,12 @@ export const controllerComparisonSchema = z.object({
     scenarioVersion: z.number().int().min(1).max(10_000),
     baseline: rateSchema,
     current: rateSchema,
+    /**
+     * Whether these two rates may be read against each other at all. A pair is
+     * still disclosed when it may not, so the numbers stay visible without
+     * standing as a comparison.
+     */
+    comparable: z.boolean(),
     regressed: z.boolean(),
   }).strict()).max(64),
   regressions: z.array(scenarioIdSchema).max(64),
@@ -284,6 +290,11 @@ function scenarioRate(trials: readonly ControllerScenarioTrial[]): z.infer<typeo
     passed: trials.filter((trial) => trialClassification(trial) === "passed").length,
     denominator: trials.length,
   };
+}
+
+/** True when every trial established the metrics its scenario asked for. */
+function trialsAreMeasured(trials: readonly ControllerScenarioTrial[]): boolean {
+  return trials.every((trial) => trial.metrics.terminalFailureClass !== METRICS_UNAVAILABLE);
 }
 
 function distinct(values: readonly string[]): string[] {
@@ -355,8 +366,18 @@ export function compareControllerEvaluations(input: {
       continue;
     }
     const conditions = new Set([...baselineTrials, ...currentTrials].map(fixedConditions));
-    const comparable = conditions.size === 1;
-    if (!comparable) reasons.push(`${scenarioId}: fixed conditions differ`);
+    const conditionsMatch = conditions.size === 1;
+    if (!conditionsMatch) reasons.push(`${scenarioId}: fixed conditions differ`);
+    // A side whose metrics were never established did not score 0 on merit: it
+    // was never scored. Reading the other side's rate against it would present
+    // the gap as behaviour, so measurement availability is itself a condition
+    // the two sides must share.
+    const baselineMeasured = trialsAreMeasured(baselineTrials);
+    const currentMeasured = trialsAreMeasured(currentTrials);
+    if (baselineMeasured !== currentMeasured) {
+      reasons.push(`${scenarioId}: ${baselineMeasured ? "current" : "baseline"} metrics unavailable`);
+    }
+    const comparable = conditionsMatch && baselineMeasured === currentMeasured;
     const baselineRate = scenarioRate(baselineTrials);
     const currentRate = scenarioRate(currentTrials);
     scenarios.push({
@@ -364,8 +385,10 @@ export function compareControllerEvaluations(input: {
       scenarioVersion: baselineVersion,
       baseline: baselineRate,
       current: currentRate,
+      comparable,
       // A pair that is not like for like is reported, but it is not a direct
-      // regression comparison, so it never claims one.
+      // regression comparison, so it never claims one — and for the same reason
+      // it never claims an improvement either.
       regressed: comparable &&
         currentRate.passed * baselineRate.denominator < baselineRate.passed * currentRate.denominator,
     });

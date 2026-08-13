@@ -41,7 +41,12 @@ type RunnerModule = {
     metricsUnavailable: boolean;
     identityGateFailed: boolean;
     report: { status: string };
-    comparison: { status: string; regressions: string[]; incomparableReasons: string[] } | null;
+    comparison: {
+      status: string;
+      regressions: string[];
+      incomparableReasons: string[];
+      scenarios: { scenarioId: string; comparable: boolean }[];
+    } | null;
   }>;
 };
 
@@ -311,6 +316,36 @@ it("never relabels an unlike pair as comparable, and fails the release gate inst
 
   expect(evaluation.comparison?.status).toBe("strong");
   expect(evaluation.comparison?.incomparableReasons.join(" ")).toContain("fixed conditions differ");
+  expect(evaluation.exitCode).toBe(1);
+}, EVAL_TIMEOUT_MS);
+
+it("refuses to release against a baseline whose metrics were never established", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const current = { ...trial, harness: { ...trial.harness, hanoonCommit: "a".repeat(40) } };
+  const unscoreableBaseline = aggregateControllerEvaluation({
+    label: "fixed",
+    trials: [{
+      ...current,
+      metrics: { ...current.metrics, terminalFailureClass: "metrics_unavailable" as const },
+    }],
+  });
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline", trials: 1, seed: 8122026, output: evaluationOutput(), replace: false,
+    baseline: "/tmp/injected-unscoreable-baseline.json",
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [current],
+    readBaseline: () => JSON.stringify(unscoreableBaseline),
+  });
+
+  expect(evaluation.comparison?.status).toBe("strong");
+  expect(evaluation.comparison?.incomparableReasons)
+    .toContain(`${current.scenarioId}: baseline metrics unavailable`);
+  expect(evaluation.comparison?.scenarios.every((scenario) => !scenario.comparable)).toBe(true);
+  // Nothing here is a regression, and nothing here is an improvement either.
+  expect(evaluation.comparison?.regressions).toEqual([]);
+  expect(evaluation.regressed).toBe(false);
   expect(evaluation.exitCode).toBe(1);
 }, EVAL_TIMEOUT_MS);
 
