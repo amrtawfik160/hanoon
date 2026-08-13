@@ -22,17 +22,28 @@ function hasUnsafeCallbackMaterial(text: string): boolean {
  * keyword screen would see.
  */
 const CLI_CREDENTIAL_FLAG = [
-  // Attached (`-ualice:hunter2`), joined (`-u=alice`), or separated (`-u alice`).
-  // Attached is the form that reads least like a secret, which is exactly why it
-  // has to be covered. A separated value that is itself a flag is not a
-  // credential, so `-p -h db` stays readable while `-phunter2` does not.
-  /(?:^|\s)-[up](?:=\S+|[^\s=-]\S*|\s+[^\s-]\S*)/,
-  // The long form stays delimiter-bound. Without that, any option whose name
-  // merely begins with one of these words — `--user-agent`, `--passthrough` —
-  // would read as a credential.
-  /(?:^|\s)--(?:user|username|password|pass|token|api[-_]?key|apikey|auth|secret|credential)s?(?:\s+|=)\S+/i,
+  // Basic and proxy auth pass a `user:secret` pair, attached (`-ualice:pw`),
+  // joined (`-u=alice:pw`), or separated (`-u alice:pw`). Requiring the pair is
+  // what keeps `sort -u names.txt` and `docker run -u 1000` readable: those are
+  // the same letter doing an unrelated job.
+  /(?:^|\s)-[uU](?:\s+|=)?[^\s:=-][^\s:]*:\S+/,
+  // The password flag's secret is written straight onto it (`mysql -phunter2`)
+  // or joined to it (`-p=hunter2`). A separated value is left alone, so
+  // `docker run -p 8080:8080` stays readable and `mysql -p -h db` is not
+  // mistaken for one.
+  /(?:^|\s)-p(?:=\S+|[^\s=-]\S*)/,
+  // The long form stays delimiter-bound and the option names are exact. A
+  // generic prefix allowance would read `--no-user` and `--fake-password` as
+  // credentials, so the proxy spellings are listed rather than inferred.
+  /(?:^|\s)--(?:proxy-user|proxy-password|proxy-auth|user|username|password|pass|token|api[-_]?key|apikey|auth|secret|credential)s?(?:\s+|=)\S+/i,
   /(?:^|\s)-H(?:\s+|=)['"]?\s*authorization\s*:/i,
 ];
+
+/**
+ * A URI carrying its own credentials. Any scheme counts: a database, broker, or
+ * object-store URI hands over a live password exactly as an https one does.
+ */
+const CREDENTIAL_URI = /[a-z][a-z0-9+.-]*:\/\/[^\s/@]*:[^\s/@]*@/i;
 
 /**
  * File names that are secrets by convention. Approving a write to one is not
@@ -58,7 +69,8 @@ const SENSITIVE_PATH_NAME = [
  */
 export function isUnsafeProviderText(text: string): boolean {
   return containsCredentialLikeText(text) || hasUnsafeCallbackMaterial(text) ||
-    CLI_CREDENTIAL_FLAG.some((pattern) => pattern.test(text));
+    CLI_CREDENTIAL_FLAG.some((pattern) => pattern.test(text)) ||
+    CREDENTIAL_URI.test(text);
 }
 
 /** True when a bare file name is one that conventionally holds a secret. */

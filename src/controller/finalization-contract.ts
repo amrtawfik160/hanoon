@@ -168,8 +168,15 @@ const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?
 // Bounded to a couple of qualifiers, so "the unit tests" and "the tests you
 // allowed" both read as the test suite while a long unrelated clause does not.
 const TEST_OBJECT = "(?:the\\s+)?(?:[a-z]+\\s+){0,2}tests?\\b";
-/** A trailing question mark governs the whole sentence it ends. */
-const QUESTION_CLAUSE = /\?\s*$/;
+/** A question mark ending the part that carries the wording. */
+const QUESTION_SIBLING = /\?\s*$/;
+/**
+ * The short confirmations that turn a statement into a question about itself.
+ * They are the one thing allowed to carry question scope backwards, because
+ * "The tests passed, right?" asks about the assertion — whereas "The tests
+ * passed: what should I do next?" asserts it and then asks something else.
+ */
+const TAG_QUESTION = /^\s*(?:right|correct|ok|okay|yes|no|yeah|isn't it|is it|wasn't it|didn't it|didn't they|weren't they|aren't they|don't you think)\s*\?\s*$/i;
 /**
  * Polarity that belongs to the comma sibling actually carrying the wording. A
  * comma does not let one half of a sentence vouch for the other: "I did not
@@ -181,7 +188,6 @@ const NON_SUCCESS_SIBLING = [
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
   /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
 ];
-const NON_SUCCESS_CLAUSE = [QUESTION_CLAUSE, ...NON_SUCCESS_SIBLING];
 /**
  * Every high-impact success assertion, with the claim kinds under which it can
  * honestly be made. Outside a claim these are the patterns that must not appear
@@ -450,10 +456,18 @@ function assertionSiblings(clause: string): { text: string; start: number }[] {
  * that a negated first half cannot suppress an affirmative second half.
  */
 function assertionIsSuppressed(clause: string, start: number, end: number): boolean {
-  if (QUESTION_CLAUSE.test(clause)) return true;
-  return assertionSiblings(clause)
-    .filter((sibling) => sibling.start < end && sibling.start + sibling.text.length > start)
-    .some((sibling) => NON_SUCCESS_SIBLING.some((pattern) => pattern.test(sibling.text)));
+  const siblings = assertionSiblings(clause);
+  const overlapping = siblings
+    .map((sibling, index) => ({ ...sibling, index }))
+    .filter((sibling) => sibling.start < end && sibling.start + sibling.text.length > start);
+  if (overlapping.some((sibling) => NON_SUCCESS_SIBLING.some((pattern) => pattern.test(sibling.text)))) {
+    return true;
+  }
+  // Question scope is local too: the part carrying the wording is itself a
+  // question, or the part right after it is a tag confirming that same wording.
+  if (overlapping.some((sibling) => QUESTION_SIBLING.test(sibling.text))) return true;
+  const last = overlapping.at(-1);
+  return last !== undefined && TAG_QUESTION.test(siblings[last.index + 1]?.text ?? "");
 }
 
 /**

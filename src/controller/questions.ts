@@ -261,7 +261,6 @@ function containsApprovalSecret(commandText: string): boolean {
   if (decoded.includes("%")) return true;
   if (isUnsafeProviderText(decoded)) return true;
   return /\b(?:bearer|authorization|token|secret|password|api[_-]?key|callback(?:[-_ ]?(?:url|nonce|code))?)\b/i.test(decoded) ||
-    /(?:https?|ssh):\/\/[^\s/@]*:[^\s/@]*@/i.test(decoded) ||
     /[?&](?:token|secret|key|callback|nonce|code)=[^&\s]+/i.test(decoded) ||
     /\b[a-z_][a-z0-9_]*=[^\s]+/i.test(decoded) ||
     /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%/.test(decoded) ||

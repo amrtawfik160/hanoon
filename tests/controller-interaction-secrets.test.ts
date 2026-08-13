@@ -158,10 +158,19 @@ it.each([
 it.each([
   ["a compact basic-auth flag", "curl -ualice:hunter2 https://example.com/api"],
   ["a compact password flag", "mysql -phunter2 -h db.internal"],
+  ["a joined password flag", "mysql -p=hunter2 -h db.internal"],
   ["a compact long-form flag", "deploy --token=abcdefghijklmnop"],
   ["a percent-encoded compact flag", "curl -u%61lice:hunter2 https://example.com"],
   ["a doubly-encoded compact flag", "curl -u%2561lice:hunter2 https://example.com"],
   ["a token-shaped argument", "deploy sk-abcdefghijklmnop"],
+  ["compact proxy auth", "curl -Uproxyuser:hunter2 https://example.com"],
+  ["separated proxy auth", "curl -U proxyuser:hunter2 https://example.com"],
+  ["a long-form proxy credential", "curl --proxy-user proxyuser:hunter2 https://example.com"],
+  ["a joined long-form proxy credential", "curl --proxy-user=proxyuser:hunter2 https://example.com"],
+  ["a database URI credential", "psql postgresql://alice:hunter2@db.internal/app"],
+  ["an AMQP URI credential", "worker amqp://alice:hunter2@broker:5672"],
+  ["an encoded database URI credential", "psql postgresql://alice:hunter2%40db.internal/app"],
+  ["a doubly-encoded proxy credential", "curl -U%2570roxyuser:hunter2 https://example.com"],
 ] as const)("makes an approval carrying %s unsupported", (_scenario, command) => {
   const projected = parseControllerInteraction(INTERACTION_ID, {
     kind: "approval",
@@ -200,6 +209,18 @@ it.each([
   ["another unrelated long option", "stream --passthrough --tokenizer word"],
   ["a bare short flag with no value", "mysql -p"],
   ["a short flag followed by another flag", "mysql -p -h db.internal"],
+  ["a unique-sort flag", "sort -u names.txt"],
+  ["an upgrade flag", "pip install -U requests"],
+  ["a port mapping", "docker run -p 8080:8080 app"],
+  ["a numeric user flag", "docker run -u 1000 app"],
+  ["a credential-free URI", "curl https://example.com/api/v1"],
+  ["a scp-style remote", "scp build.tar deploy@host:/srv"],
+  // Prefix controls for the exact-name long form. They deliberately avoid the
+  // words the pre-existing keyword screen already refuses on sight, so what they
+  // test is the option-name rule and nothing else.
+  ["a negated long option", "provision --no-user bob"],
+  ["a prefixed long option", "provision --superuser-check on"],
+  ["a suffixed long option", "curl --user-agent hanoon https://example.com"],
 ] as const)("still offers a decision on %s", (_scenario, command) => {
   expect(parseControllerInteraction(INTERACTION_ID, {
     kind: "approval",
@@ -339,32 +360,44 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
   const logged: string[] = [];
   const consoleMethods = ["log", "info", "warn", "error", "debug", "trace"] as const;
   const originalConsole = consoleMethods.map((method) => [method, console[method]] as const);
-  // The exact method objects, not bound wrappers: restoring a wrapper would
-  // leave a different function on the global stream, which is a mutation this
-  // test has no business making. Nothing here calls them, so no binding is
-  // needed either.
-  const originalStdout = process.stdout.write;
-  const originalStderr = process.stderr.write;
-  for (const method of consoleMethods) {
-    console[method] = ((...parts: unknown[]) => { logged.push(parts.map(String).join(" ")); }) as typeof console.log;
-  }
-  process.stdout.write = ((chunk: unknown) => { logged.push(String(chunk)); return true; }) as typeof process.stdout.write;
-  process.stderr.write = ((chunk: unknown) => { logged.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  // `write` is inherited from the stream prototype, so assigning to it creates an
+  // own property that assigning the original value back would leave behind.
+  // Ownership is captured with the value and undone the same way it was made.
+  const streams = [process.stdout, process.stderr].map((stream) => ({
+    stream,
+    write: stream.write,
+    owned: Object.hasOwn(stream, "write"),
+    descriptor: Object.getOwnPropertyDescriptor(stream, "write"),
+  }));
   const canary = "controller-secret-log-canary";
   let reconciled: boolean;
   try {
+    // Every mutation happens inside the try, so a failure part-way through
+    // patching still reaches the restore below.
+    for (const method of consoleMethods) {
+      console[method] = ((...parts: unknown[]) => { logged.push(parts.map(String).join(" ")); }) as typeof console.log;
+    }
+    for (const { stream } of streams) {
+      stream.write = ((chunk: unknown) => { logged.push(String(chunk)); return true; }) as typeof stream.write;
+    }
     reconciled = await service.reconcile({ ...fence, signal }, signal);
     console.log(canary);
   } finally {
     for (const [method, original] of originalConsole) console[method] = original;
-    process.stdout.write = originalStdout;
-    process.stderr.write = originalStderr;
+    for (const { stream, owned, descriptor } of streams) {
+      if (owned && descriptor) Object.defineProperty(stream, "write", descriptor);
+      else delete (stream as { write?: unknown }).write;
+    }
   }
   expect(reconciled).toBe(true);
-  // Restored by identity, not merely by behaviour: this test must leave the
-  // global streams and console exactly as it found them.
-  expect(process.stdout.write).toBe(originalStdout);
-  expect(process.stderr.write).toBe(originalStderr);
+  // Restored by identity *and* by ownership: this test must leave the global
+  // streams and console exactly as it found them, down to whether `write` was
+  // its own property or inherited.
+  for (const { stream, write, owned, descriptor } of streams) {
+    expect(stream.write).toBe(write);
+    expect(Object.hasOwn(stream, "write")).toBe(owned);
+    expect(Object.getOwnPropertyDescriptor(stream, "write")).toEqual(descriptor);
+  }
   for (const [method, original] of originalConsole) expect(console[method]).toBe(original);
   // The observer is demonstrably live, so the absence checks below mean something.
   expect(logged.join("\n")).toContain(canary);

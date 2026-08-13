@@ -864,6 +864,34 @@ describe("claim outcome compatibility", () => {
   });
 
   it.each([
+    ["a colon", "The tests passed: what should I do next?"],
+    ["an em dash", "The tests passed — what should I do next?"],
+    ["an en dash", "The tests passed – what should I do next?"],
+    ["a semicolon", "The tests passed; what should I do next?"],
+    ["a comma", "The tests passed, what should I do next?"],
+  ] as const)("does not let an unrelated question after %s suppress the success", (_scenario, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["a bare tag question", "The tests passed, right?"],
+    ["a confirming tag", "The tests passed, correct?"],
+    ["a plural tag", "The tests passed, didn't they?"],
+    ["a question about the assertion itself", "Did the tests pass?"],
+    ["a question in the asserting part", "The tests passed?"],
+  ] as const)("still accepts %s", (_scenario, text) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
     ["a question spanning siblings", "The tests passed, right?"],
     ["a negation in the same sibling", "I did not deploy production."],
     ["a future in the same sibling", "I will deploy production."],
