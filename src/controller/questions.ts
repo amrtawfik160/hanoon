@@ -42,17 +42,41 @@ const MAX_CONTROLLER_TEXT = 4_000;
 const MAX_CANONICAL_SCAN = 16_384;
 const MAX_PERCENT_DECODE_LAYERS = 3;
 
+const CREDENTIAL_QUERY_KEY = [
+  "access[_-]?token",
+  "refresh[_-]?token",
+  "id[_-]?token",
+  "client[_-]?secret",
+  "api[_-]?key",
+  "authorization",
+  "auth(?:[_-]?(?:token|key))?",
+  "session(?:[_-]?token)?",
+  "private(?:[_-]?key)?",
+  "credentials?",
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "key",
+  "jwt",
+  "signature",
+  "sig",
+].join("|");
+
 const SENSITIVE_CONTROLLER_TEXT_PATTERNS = [
+  /(?:^|[^A-Za-z0-9_])m:[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/u,
   /\bbearer\s+\S+/iu,
-  /\b(?:api[_-]?key|password|secret|token|credential)\s*[:=]\s*\S+/iu,
-  /\b(?:secret|token|password|credential)\b\s+(?:is\s+)?\S+/iu,
+  new RegExp(`\\b(?:${CREDENTIAL_QUERY_KEY}|credential)\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|\\S+)`, "iu"),
+  /\b(?:access|refresh|id)\s+token|\bclient\s+secret|\bapi\s+key|\bauth(?:orization)?\s+(?:token|key)|\bsession\s+token|\bprivate\s+key/iu,
+  /\b(?:authorization|auth|session|private\s+key|credentials?|password|passwd|secret|token|key|jwt|signature|sig)\b\s+(?:is\s+)?\S+/iu,
   /(?:^|[\s;|&])(?:export\s+)?[A-Z_][A-Z0-9_]*=\S+/u,
   /(?:^|[\s"'`])(?:export\s+)?[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|KEY|AUTH)[A-Z0-9_]*\s*=\s*\S+/iu,
+  new RegExp(`(?:^|[\\s;|&"'])(?:export\\s+)?(?:${CREDENTIAL_QUERY_KEY})\\s*=\\s*(?:"[^"]*"|'[^']*'|\\S+)`, "iu"),
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/iu,
   /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|(?:sk|rk)-[A-Za-z0-9_-]{16,})\b/u,
   /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/u,
   /(?:https?|wss?):\/\/[^\s/@]+:[^\s/@]+@/iu,
-  /(?:https?|wss?):\/\/[^\s]*[?&](?:token|secret|password|api[_-]?key|credential|auth)=/iu,
+  new RegExp(`(?:https?|wss?):\\/\\/[^\\s]*[?&](?:${CREDENTIAL_QUERY_KEY})(?:=|%3d)`, "iu"),
   /(?:callback|webhook)/iu,
   /\b(?:curl|wget|httpie)\b[^\n]*(?:https?|wss?):\/\//iu,
 ];
@@ -67,31 +91,49 @@ const PROTECTED_BASENAME_MARKERS = [
   "password",
   "token",
   "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "id_dsa",
+  "id_x25519",
+  "id_xmss",
+  "ssh_host_",
+  "known_hosts",
   "authorized_keys",
+  "certificate",
+  "cert",
   ".pem",
   ".p12",
   ".pfx",
+  ".crt",
+  ".cer",
+  ".der",
+  ".pub",
   ".key",
 ];
 
+function decodeCanonicalForm(value: string): string | null {
+  if (/%(?![0-9a-f]{2})/iu.test(value)) return null;
+  try {
+    const decoded = decodeURIComponent(value).normalize("NFKC").trim();
+    return decoded.length > 0 && decoded.length <= MAX_CANONICAL_SCAN ? decoded : null;
+  } catch (error) {
+    if (error instanceof URIError) return null;
+    throw error;
+  }
+}
+
 function canonicalForms(value: string): string[] | null {
-  const forms: string[] = [];
   let current = value.normalize("NFKC").trim();
   if (current.length === 0 || current.length > MAX_CANONICAL_SCAN) return null;
-  forms.push(current);
-  for (let layer = 0; layer < MAX_PERCENT_DECODE_LAYERS; layer += 1) {
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(current).normalize("NFKC").trim();
-    } catch {
-      break;
-    }
-    if (decoded.length === 0 || decoded.length > MAX_CANONICAL_SCAN) return null;
+  const forms = [current];
+  for (let layer = 0; layer < MAX_PERCENT_DECODE_LAYERS && current.includes("%"); layer += 1) {
+    const decoded = decodeCanonicalForm(current);
+    if (!decoded) return null;
     forms.push(decoded);
     if (decoded === current) break;
     current = decoded;
   }
-  return [...new Set(forms)];
+  return current.includes("%") ? null : [...new Set(forms)];
 }
 
 function hasProtectedBasename(value: string): boolean {
@@ -136,18 +178,19 @@ function boundedString(value: unknown, limit: number): string | null {
 function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
+  if (!Object.hasOwn(candidate, "value") || !Object.hasOwn(candidate, "label")) return null;
   const value = boundedIdentity(candidate.value, 256);
   const label = boundedString(candidate.label, MAX_LABEL);
   if (!value || !label) return null;
-  const description = candidate.description === undefined || candidate.description === null
+  const hasDescription = Object.hasOwn(candidate, "description");
+  const description = !hasDescription || candidate.description === null
     ? null
     : boundedString(candidate.description, MAX_DESCRIPTION);
-  if (candidate.description !== undefined && candidate.description !== null && !description) return null;
+  if (hasDescription && candidate.description !== null && !description) return null;
   return { value, label, description };
 }
 
 function parseQuestionOptions(raw: unknown): ControllerQuestionOption[] | null {
-  if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw) || raw.length > MAX_OPTIONS) return null;
   const options = raw.map(parseOption);
   if (options.some((option) => option === null)) return null;
@@ -155,24 +198,41 @@ function parseQuestionOptions(raw: unknown): ControllerQuestionOption[] | null {
   return new Set(parsedOptions.map((option) => option.value)).size === parsedOptions.length ? parsedOptions : null;
 }
 
+function parseQuestionFlags(candidate: Record<string, unknown>): { multiSelect: boolean; allowFreeText: boolean } | null {
+  const hasMultiSelect = Object.hasOwn(candidate, "multiSelect");
+  const hasFreeText = Object.hasOwn(candidate, "allowFreeText");
+  if (hasMultiSelect && typeof candidate.multiSelect !== "boolean") return null;
+  if (hasFreeText && typeof candidate.allowFreeText !== "boolean") return null;
+  return {
+    multiSelect: hasMultiSelect && candidate.multiSelect === true,
+    allowFreeText: !hasFreeText || candidate.allowFreeText !== false,
+  };
+}
+
+function parseQuestionShortLabel(candidate: Record<string, unknown>): string | null {
+  if (!Object.hasOwn(candidate, "shortLabel") || candidate.shortLabel === null) return null;
+  return boundedString(candidate.shortLabel, MAX_LABEL);
+}
+
 function parseQuestion(raw: unknown): ControllerQuestion | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
+  if (!Object.hasOwn(candidate, "id") || !Object.hasOwn(candidate, "prompt") || !Object.hasOwn(candidate, "options")) return null;
   const id = boundedIdentity(candidate.id, 128);
   const prompt = boundedString(candidate.prompt, MAX_PROMPT);
-  if (!id || !prompt) return null;
+  if (!id || RESERVED_QUESTION_IDS.has(id) || !prompt) return null;
+  const flags = parseQuestionFlags(candidate);
+  if (!flags) return null;
   const options = parseQuestionOptions(candidate.options);
   if (!options) return null;
-  const shortLabel = candidate.shortLabel === undefined || candidate.shortLabel === null
-    ? null
-    : boundedString(candidate.shortLabel, MAX_LABEL);
-  if (candidate.shortLabel !== undefined && candidate.shortLabel !== null && !shortLabel) return null;
+  const shortLabel = parseQuestionShortLabel(candidate);
+  if (Object.hasOwn(candidate, "shortLabel") && candidate.shortLabel !== null && !shortLabel) return null;
   return {
     id,
     prompt,
     shortLabel,
-    multiSelect: candidate.multiSelect === true,
-    allowFreeText: candidate.allowFreeText !== false,
+    multiSelect: flags.multiSelect,
+    allowFreeText: flags.allowFreeText,
     options,
   };
 }
@@ -186,7 +246,8 @@ export function parsePendingQuestion(interactionId: unknown, payload: unknown): 
   if (typeof interactionId !== "string" || interactionId.length === 0) return null;
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
-  if (candidate.kind !== "user_question" || !Array.isArray(candidate.questions)) return null;
+  if (!Object.hasOwn(candidate, "kind") || candidate.kind !== "user_question" ||
+    !Object.hasOwn(candidate, "questions") || !Array.isArray(candidate.questions)) return null;
   if (candidate.questions.length > MAX_QUESTIONS) return null;
   const questions = candidate.questions.map(parseQuestion);
   if (questions.some((question) => question === null)) return null;
@@ -203,6 +264,21 @@ const MAX_CONTROLLER_APPROVAL_SUMMARY = 400;
 const MAX_CONTROLLER_QUESTION_ID = 128;
 const MAX_CONTROLLER_OPTION_VALUE = 256;
 const PROTECTED_PATH_TEXT = "a protected path";
+const RESERVED_QUESTION_IDS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "toString",
+  "valueOf",
+  "hasOwnProperty",
+  "isPrototypeOf",
+  "propertyIsEnumerable",
+  "toLocaleString",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
 
 function safePathBasename(value: unknown): string {
   const canonical = canonicalControllerText(value, 80, "path");
@@ -243,9 +319,9 @@ function controllerApprovalSummary(subject: Record<string, unknown>): string | n
 }
 
 function controllerApprovalDecisions(candidate: Record<string, unknown>): ControllerApprovalDecision[] | null {
-  const offered = Array.isArray(candidate.availableDecisions)
+  const offered = Object.hasOwn(candidate, "availableDecisions") && Array.isArray(candidate.availableDecisions)
     ? candidate.availableDecisions
-    : Array.isArray(candidate.decisions) ? candidate.decisions : null;
+    : Object.hasOwn(candidate, "decisions") && Array.isArray(candidate.decisions) ? candidate.decisions : null;
   if (!offered) return null;
   const decisions = CONTROLLER_APPROVAL_DECISIONS.filter((decision) => offered.includes(decision));
   return decisions.length > 0 ? [...decisions] : null;
@@ -291,6 +367,7 @@ export function parseControllerInteraction(
   ) return null;
   if (typeof payload !== "object" || payload === null) return { kind: "unsupported", interactionId };
   const candidate = payload as Record<string, unknown>;
+  if (!Object.hasOwn(candidate, "kind")) return { kind: "unsupported", interactionId };
   if (candidate.kind === "user_question") return parseControllerQuestionProjection(interactionId, payload);
   if (candidate.kind !== "approval") return { kind: "unsupported", interactionId };
   return parseControllerApprovalProjection(interactionId, candidate);
@@ -323,11 +400,11 @@ function parseQuestionAnswer(
   if (typeof rawAnswer !== "object" || rawAnswer === null || Array.isArray(rawAnswer)) return null;
   const candidate = rawAnswer as Record<string, unknown>;
   const keys = Object.keys(candidate);
-  if (keys.some((key) => key !== "selected" && key !== "freeText") || !("selected" in candidate)) return null;
+  if (keys.some((key) => key !== "selected" && key !== "freeText") || !Object.hasOwn(candidate, "selected")) return null;
   const selected = parseSelectedOptions(question, candidate.selected);
   if (!selected) return null;
   const parsed: ControllerQuestionAnswers[string] = { selected };
-  if (!("freeText" in candidate)) return parsed;
+  if (!Object.hasOwn(candidate, "freeText")) return parsed;
   if (!question.allowFreeText) return null;
   const freeText = strictAnswerText(candidate.freeText);
   return freeText ? { ...parsed, freeText } : null;
@@ -336,9 +413,16 @@ function parseQuestionAnswer(
 function parseControllerQuestionAnswers(
   value: unknown,
   questions: readonly ControllerQuestion[],
+  state: "pending" | "answered",
 ): ControllerQuestionAnswers | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
+  const questionIds = questions.map((question) => question.id);
+  if (new Set(questionIds).size !== questionIds.length ||
+    questionIds.some((questionId) => RESERVED_QUESTION_IDS.has(questionId))) return null;
+  const answerIds = Object.keys(candidate);
+  if (state === "answered" && (answerIds.length !== questionIds.length ||
+    questionIds.some((questionId) => !Object.hasOwn(candidate, questionId)))) return null;
   const byId = new Map(questions.map((question) => [question.id, question]));
   const answers: ControllerQuestionAnswers = {};
   for (const [questionId, rawAnswer] of Object.entries(candidate)) {
@@ -356,11 +440,13 @@ function parseApprovalResolution(
 ): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
-  if (candidate.decision === "allow_once" && Object.keys(candidate).length === 2 &&
-    candidate.grantedPermissions === null && interaction.decisions.includes("allow_once")) {
+  if (Object.hasOwn(candidate, "decision") && candidate.decision === "allow_once" && Object.keys(candidate).length === 2 &&
+    Object.hasOwn(candidate, "grantedPermissions") && candidate.grantedPermissions === null &&
+    interaction.decisions.includes("allow_once")) {
     return { decision: "allow_once", grantedPermissions: null };
   }
-  if (candidate.decision === "deny" && Object.keys(candidate).length === 1 && interaction.decisions.includes("deny")) {
+  if (Object.hasOwn(candidate, "decision") && candidate.decision === "deny" && Object.keys(candidate).length === 1 &&
+    interaction.decisions.includes("deny")) {
     return { decision: "deny" };
   }
   return null;
@@ -369,13 +455,14 @@ function parseApprovalResolution(
 function parseQuestionResolution(
   interaction: Extract<ControllerInteraction, { kind: "user_question" }>,
   value: unknown,
+  state: "pending" | "answered",
 ): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
-  const answerMap = candidate.kind === "user_answer"
-    ? Object.keys(candidate).length === 2 && "answers" in candidate ? candidate.answers : null
+  const answerMap = Object.hasOwn(candidate, "kind") && candidate.kind === "user_answer"
+    ? Object.keys(candidate).length === 2 && Object.hasOwn(candidate, "answers") ? candidate.answers : null
     : value;
-  const answers = parseControllerQuestionAnswers(answerMap, interaction.questions);
+  const answers = parseControllerQuestionAnswers(answerMap, interaction.questions, state);
   return answers ? { kind: "user_answer", answers } : null;
 }
 
@@ -383,9 +470,10 @@ function parseQuestionResolution(
 export function parseControllerInteractionResolution(
   interaction: ControllerInteraction,
   value: unknown,
+  state: "pending" | "answered" = "pending",
 ): Record<string, unknown> | null {
   if (interaction.kind === "approval") return parseApprovalResolution(interaction, value);
-  if (interaction.kind === "user_question") return parseQuestionResolution(interaction, value);
+  if (interaction.kind === "user_question") return parseQuestionResolution(interaction, value, state);
   return null;
 }
 
@@ -537,7 +625,7 @@ export function nextUnansweredQuestion(
   questions: readonly ControllerQuestion[],
   answers: ControllerQuestionAnswers,
 ): { question: ControllerQuestion; index: number } | null {
-  const index = questions.findIndex((question) => !(question.id in answers));
+  const index = questions.findIndex((question) => !Object.hasOwn(answers, question.id));
   const question = questions[index];
   return question ? { question, index } : null;
 }

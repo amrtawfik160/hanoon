@@ -14,6 +14,7 @@ import {
 } from "../src/storage/controller-interaction-repository";
 import {
   controllerInteractionToken,
+  parseControllerInteractionResolution,
   parseControllerInteraction,
   questionOptionToken,
 } from "../src/controller/questions";
@@ -22,6 +23,35 @@ const SHIPPED_MIGRATION_COUNT = 29;
 const CURRENT_OWNER = "executor";
 const CURRENT_GENERATION = 1;
 const CURRENT_NOW = 2_000;
+const SENSITIVE_QUERY_KEYS = [
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "client_secret",
+  "api_key",
+  "auth",
+  "authorization",
+  "auth_token",
+  "session",
+  "session_token",
+  "private",
+  "private_key",
+  "credentials",
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "key",
+  "jwt",
+  "signature",
+  "sig",
+] as const;
+
+function percentEncodeLayers(value: string, layers: number): string {
+  let encoded = value;
+  for (let index = 0; index < layers; index += 1) encoded = encodeURIComponent(encoded);
+  return encoded;
+}
 
 type CurrentFixture = {
   db: Database.Database;
@@ -70,6 +100,12 @@ function questionPayloadQuestion(): Record<string, unknown> {
   const question = (questionPayload().questions as unknown[])[0];
   if (typeof question !== "object" || question === null) throw new Error("question fixture is malformed");
   return question as Record<string, unknown>;
+}
+
+function legacyQuestionsJson(edit?: (questions: Record<string, unknown>[]) => void): string {
+  const questions = JSON.parse(JSON.stringify(questionPayload().questions)) as Record<string, unknown>[];
+  edit?.(questions);
+  return JSON.stringify(questions);
 }
 
 function currentInteractionFixture(): CurrentFixture {
@@ -167,6 +203,7 @@ function legacyQuestionDatabaseFixture() {
       state: "pending" | "answered" | "delivered",
       interactionId = "legacy_interaction",
       answersJson = state === "pending" ? "{}" : JSON.stringify({ question_1: { selected: ["first"] } }),
+      questionsJson = JSON.stringify(questionPayload().questions),
     ) {
       db.prepare(
         `INSERT INTO controller_questions (
@@ -176,7 +213,7 @@ function legacyQuestionDatabaseFixture() {
         interactionId,
         turnId,
         controllerKey,
-        JSON.stringify(questionPayload().questions),
+        questionsJson,
         state,
         answersJson,
         state === "pending" ? 2_000 : 2_001,
@@ -401,8 +438,14 @@ it("copies a delivered legacy row with null source identity", () => {
   fixture.migrateRemaining();
 
   expect(fixture.db.prepare(
-    "SELECT state, bb_thread_id, controller_generation_id, delivered_at FROM controller_interactions",
-  ).get()).toEqual({ state: "delivered", bb_thread_id: null, controller_generation_id: null, delivered_at: 2_002 });
+    "SELECT state, bb_thread_id, controller_generation_id, answer_json, delivered_at FROM controller_interactions",
+  ).get()).toEqual({
+    state: "delivered",
+    bb_thread_id: null,
+    controller_generation_id: null,
+    answer_json: null,
+    delivered_at: 2_002,
+  });
 });
 
 it.each([
@@ -471,6 +514,72 @@ it.each([
   ).get()).toBeUndefined();
 });
 
+const INVALID_LEGACY_PROJECTIONS = [
+  ["missing prompt", "pending", legacyQuestionsJson((questions) => { delete questions[0]!.prompt; }), "{}"],
+  ["empty question list", "pending", "[]", "{}"],
+  ["too many questions", "pending", legacyQuestionsJson((questions) => {
+    for (let index = 2; index <= 5; index += 1) questions.push({ ...questions[0], id: `question_${index}` });
+  }), "{}"],
+  ["duplicate question id", "pending", legacyQuestionsJson((questions) => { questions.push({ ...questions[0] }); }), "{}"],
+  ["reserved question id", "pending", legacyQuestionsJson((questions) => { questions[0]!.id = "__proto__"; }), "{}"],
+  ["missing options array", "pending", legacyQuestionsJson((questions) => { delete questions[0]!.options; }), "{}"],
+  ["too many options", "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as unknown[];
+    options.push(...options, ...options, ...options, ...options);
+  }), "{}"],
+  ["duplicate option value", "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[1]!.value = options[0]!.value;
+  }), "{}"],
+  ["invalid boolean type", "pending", legacyQuestionsJson((questions) => { questions[0]!.multiSelect = "false"; }), "{}"],
+  ["invalid option type", "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[0]!.label = 7;
+  }), "{}"],
+  ["unsafe projection text", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "access_token=secret-value"; }), "{}"],
+  ["unsafe option text", "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[0]!.description = "https://inner.test/?private_key=secret-value";
+  }), "{}"],
+  ["standalone auth query", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "https://example.test/?auth=abc"; }), "{}"],
+  ["standalone session query", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "https://example.test/?session=abc"; }), "{}"],
+  ["standalone private query", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "https://example.test/?private=abc"; }), "{}"],
+  ["standalone key query", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "https://example.test/?key=abc"; }), "{}"],
+  ["standalone credential query", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "https://example.test/?credential=abc"; }), "{}"],
+  ["invalid selected shape", "pending", legacyQuestionsJson(), JSON.stringify({ question_1: { selected: "first" } })],
+  ["duplicate selected option", "pending", legacyQuestionsJson(), JSON.stringify({ question_1: { selected: ["first", "first"] } })],
+  ["unknown answer field", "pending", legacyQuestionsJson(), JSON.stringify({ question_1: { selected: [], note: "unexpected" } })],
+  ["unsafe answer text", "pending", legacyQuestionsJson(), JSON.stringify({ question_1: { selected: [], freeText: "m:" + "A".repeat(32) } })],
+  ["malformed percent projection", "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = "echo %ZZ"; }), "{}"],
+  ["encoded callback option", "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[0]!.label = "https%3A%2F%2Fexample.test%2Fcallback";
+  }), "{}"],
+  ["nested encoded answer", "pending", legacyQuestionsJson(), JSON.stringify({
+    question_1: { selected: [], freeText: percentEncodeLayers("https://inner.test/?token=abc", 2) },
+  })],
+  ["incomplete answered map", "answered", legacyQuestionsJson((questions) => {
+    questions.push({ ...questions[0], id: "question_2" });
+  }), JSON.stringify({ question_1: { selected: ["first"] } })],
+] as const;
+
+it.each(INVALID_LEGACY_PROJECTIONS)(
+  "rolls back an active legacy row with %s",
+  (_name, state, questionsJson, answersJson) => {
+    const fixture = legacyQuestionDatabaseFixture();
+    fixture.insertQuestion(state, "legacy_invalid_projection", answersJson, questionsJson);
+
+    expect(() => fixture.migrateRemaining()).toThrow();
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+      count: SHIPPED_MIGRATION_COUNT,
+    });
+    expect(fixture.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+    ).get()).toBeUndefined();
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_questions").get()).toEqual({ count: 1 });
+  },
+);
+
 it("projects only safe controller approval decisions", () => {
   expect(parseControllerInteraction("approval_1", approvalPayload())).toEqual({
     kind: "approval",
@@ -508,6 +617,33 @@ it.each([
   expect(JSON.stringify(projection)).not.toContain("secret output");
 });
 
+it.each([
+  ["a raw callback nonce", `printf m:${"A".repeat(32)}`],
+  ["a once-encoded callback nonce", `printf ${percentEncodeLayers(`m:${"A".repeat(32)}`, 1)}`],
+  ["a deeply encoded callback nonce", `printf ${percentEncodeLayers(`m:${"A".repeat(32)}`, 3)}`],
+  ...SENSITIVE_QUERY_KEYS.map((key) => [`the ${key} credential query`, `open https://example.test/?${key}=secret-value`] as const),
+  ["a nested credential URL", `open https://outer.test/?next=${encodeURIComponent("https://inner.test/?client_secret=secret-value")}`],
+  ["a lowercase quoted assignment", "run secret='secret-value'"],
+  ["a lowercase double-quoted assignment", 'run api_key="secret-value"'],
+] as const)("redacts %s before clipping", (_name, command) => {
+  const projection = parseControllerInteraction("approval_vocabulary", approvalPayload({
+    subject: { kind: "command", command, cwd: "/workspace/project" },
+  }));
+  expect(projection).toMatchObject({ kind: "approval", summary: expect.stringContaining("a redacted command") });
+  expect(JSON.stringify(projection)).not.toContain("secret-value");
+});
+
+it.each([
+  ["malformed percent encoding", "echo %ZZ"],
+  ["residual percent encoding", "echo%20safe%25"],
+  ["excess percent encoding", `printf ${percentEncodeLayers(`m:${"A".repeat(32)}`, 4)}`],
+] as const)("fails closed on %s", (_name, command) => {
+  const projection = parseControllerInteraction("approval_bad_percent", approvalPayload({
+    subject: { kind: "command", command, cwd: "/workspace/project" },
+  }));
+  expect(projection).toMatchObject({ kind: "approval", summary: expect.stringContaining("a redacted command") });
+});
+
 it("redacts credential material beyond the bounded command summary", () => {
   const command = `${"echo safe ".repeat(60)} API_KEY=secret-value`;
   const projection = parseControllerInteraction("approval_late_secret", approvalPayload({
@@ -525,6 +661,12 @@ it.each([
   ["a local environment file", "/workspace/.env.local", "a protected path"],
   ["a private key suffix", "/workspace/private-key.txt", "a protected path"],
   ["the shadow password file", "/etc/shadow", "a protected path"],
+  ["an Ed25519 private key", "/workspace/.ssh/id_ed25519", "a protected path"],
+  ["an ECDSA private key", "/workspace/.ssh/id_ecdsa", "a protected path"],
+  ["a DSA private key", "/workspace/.ssh/id_dsa", "a protected path"],
+  ["an SSH host key", "/etc/ssh/ssh_host_rsa_key", "a protected path"],
+  ["an SSH host certificate", "/etc/ssh/ssh_host_rsa_key-cert", "a protected path"],
+  ["a certificate file", "/workspace/client.crt", "a protected path"],
 ] as const)("confines %s to %s", (_name, writeScope, expectedPath) => {
   const projection = parseControllerInteraction("approval_path", {
     kind: "approval",
@@ -569,6 +711,40 @@ it.each([
   expect(parseControllerInteraction("unsafe_question", payload)).toEqual({
     kind: "unsupported",
     interactionId: "unsafe_question",
+  });
+});
+
+it.each([
+  ["a sensitive question id", { ...questionPayload(), questions: [{ ...questionPayloadQuestion(), id: `m:${"A".repeat(32)}` }] }],
+  ["a sensitive short label", { ...questionPayload(), questions: [{ ...questionPayloadQuestion(), shortLabel: "access_token='secret'" }] }],
+  ["a sensitive option description", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), options: [{ value: "first", label: "First", description: "https://inner.test/?private_key=secret" }] }],
+  }],
+  ["a missing options array", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), options: undefined }],
+  }],
+  ["an invalid multi-select type", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), multiSelect: "false" }],
+  }],
+  ["an invalid free-text type", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), allowFreeText: "true" }],
+  }],
+  ["an empty option description", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), options: [{ value: "first", label: "First", description: "" }] }],
+  }],
+  ["a malformed percent option value", {
+    ...questionPayload(),
+    questions: [{ ...questionPayloadQuestion(), options: [{ value: "%ZZ", label: "First", description: null }] }],
+  }],
+] as const)("makes %s an unsupported projection across all question fields", (_name, payload) => {
+  expect(parseControllerInteraction("unsafe_question_field", payload)).toEqual({
+    kind: "unsupported",
+    interactionId: "unsafe_question_field",
   });
 });
 
@@ -621,6 +797,27 @@ it("does not write unsafe owner text but keeps ordinary bounded text supported",
 });
 
 it.each([
+  "m:" + "A".repeat(32),
+  "access_token=secret-value",
+  "echo%20safe%25",
+] as const)("does not persist unsafe owner free text: %s", (text) => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction(`unsafe_owner_${text.slice(0, 8)}`);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+
+  expect(fixture.repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text,
+    now: 2_100,
+  })).toEqual({ ok: false, reason: "stale" });
+  expect(fixture.db.prepare("SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?")
+    .get(interaction.interactionId)).toEqual({ state: "pending", answer_json: null });
+  closeCurrentFixture(fixture);
+});
+
+it.each([
   ["a corrupt approval envelope", "approval", JSON.stringify({ decision: "allow_once", grantedPermissions: "all" })],
   ["a corrupt question answer", "question", JSON.stringify({ kind: "user_answer", answers: { question_1: { selected: ["unknown"] } } })],
 ] as const)("fails closed on %s when reading persisted answers", (_name, kind, answerJson) => {
@@ -631,6 +828,61 @@ it.each([
     "UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = ? WHERE interaction_id = ?",
   ).run(answerJson, 2_100, interaction.interactionId);
   expect(fixture.repository.getAnswered(fixture.controllerKey)).toBeNull();
+  closeCurrentFixture(fixture);
+});
+
+it.each(["__proto__", "constructor", "prototype", "toString"] as const)(
+  "rejects a prototype-reserved question id: %s",
+  (questionId) => {
+    const payload = questionPayload();
+    payload.questions = [{ ...questionPayloadQuestion(), id: questionId }];
+    expect(parseControllerInteraction(`reserved_${questionId}`, payload)).toEqual({
+      kind: "unsupported",
+      interactionId: `reserved_${questionId}`,
+    });
+  },
+);
+
+it("uses own answer fields and requires a complete map for answered questions", () => {
+  const fixture = currentInteractionFixture();
+  const base = controllerInteraction("state_aware_answers");
+  if (base.kind !== "user_question") throw new Error("question fixture has the wrong kind");
+  const interaction: ControllerInteraction = {
+    ...base,
+    questions: [
+      base.questions[0]!,
+      { ...base.questions[0]!, id: "question_2", prompt: "Which second option should I use?" },
+    ],
+  };
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+
+  const partial = { kind: "user_answer", answers: { question_1: { selected: ["first"] } } };
+  expect(parseControllerInteractionResolution(interaction, partial, "pending")).not.toBeNull();
+  expect(parseControllerInteractionResolution(interaction, partial, "answered")).toBeNull();
+  fixture.db.prepare(
+    "UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = ? WHERE interaction_id = ?",
+  ).run(JSON.stringify(partial), 2_100, interaction.interactionId);
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).toBeNull();
+
+  const complete = {
+    kind: "user_answer",
+    answers: {
+      question_1: { selected: ["first"] },
+      question_2: { selected: ["second"] },
+    },
+  };
+  fixture.db.prepare("UPDATE controller_interactions SET answer_json = ? WHERE interaction_id = ?")
+    .run(JSON.stringify(complete), interaction.interactionId);
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).toMatchObject({
+    answers: complete.answers,
+    resolution: complete,
+  });
+
+  const inheritedAnswer = Object.create({ selected: [] }) as Record<string, unknown>;
+  expect(parseControllerInteractionResolution(interaction, {
+    kind: "user_answer",
+    answers: { question_1: inheritedAnswer, question_2: { selected: ["second"] } },
+  }, "pending")).toBeNull();
   closeCurrentFixture(fixture);
 });
 

@@ -35,6 +35,24 @@ class LeaseLossRepository extends ControllerInteractionRepository {
   }
 }
 
+class TransitionFenceLossRepository extends ControllerInteractionRepository {
+  public constructor(
+    private readonly database: Database.Database,
+    private readonly turnId: string,
+  ) {
+    super(database);
+  }
+
+  protected override beforeExecutorInteractionTransition(): void {
+    this.database.prepare(
+      "UPDATE executor_lease SET owner_id = 'successor', generation = 2 WHERE singleton = 1",
+    ).run();
+    this.database.prepare(
+      "UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = ?",
+    ).run(this.turnId);
+  }
+}
+
 function setup() {
   const directory = mkdtempSync(join(tmpdir(), "telegram-controller-interaction-service-"));
   const db = new Database(join(directory, "service.sqlite"));
@@ -216,14 +234,16 @@ it("fails closed when the fence is lost immediately before authoritative resolve
   fixture.close();
 });
 
-it("fails closed when the fence is lost immediately before local mark-delivered", async () => {
+it("fails closed when the fence is lost at the repository mark-delivered transition", async () => {
   const fixture = setup();
   const { get, resolve } = fixture.service(remote(fixture, "resolved"));
-  const repository = new LeaseLossRepository(fixture.db, 3);
+  const repository = new TransitionFenceLossRepository(fixture.db, fixture.turnId);
   const service = new ControllerInteractionService({ store: repository, interactions: { get, resolve } });
 
   await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
   expect(resolve).not.toHaveBeenCalled();
+  expect(fixture.db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = ?")
+    .get(fixture.interaction.interactionId)).toEqual({ state: "answered" });
   expect(repository.getAnswered(fixture.controllerKey)).not.toBeNull();
   fixture.close();
 });

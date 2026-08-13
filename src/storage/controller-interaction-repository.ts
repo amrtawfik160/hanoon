@@ -178,7 +178,7 @@ function parseAnswer(
   if (row.answer_json === null) return null;
   try {
     const parsed = JSON.parse(row.answer_json) as unknown;
-    return parseControllerInteractionResolution(interaction, parsed);
+    return parseControllerInteractionResolution(interaction, parsed, row.state === "answered" ? "answered" : "pending");
   } catch {
     // A corrupt answer cannot be retried against BB safely.
     return null;
@@ -229,7 +229,7 @@ function answerForInteraction(
     return null;
   }
   for (const question of interaction.questions) {
-    if (question.id in answers) continue;
+    if (Object.hasOwn(answers, question.id)) continue;
     for (const option of question.options) {
       if (questionOptionToken(interaction.interactionId, question.id, option.value) !== token) continue;
       return {
@@ -568,7 +568,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     now: number,
   ): ControllerInteractionAnswer {
     const settled = mergedOwnerResolution(stored.interaction, stored.answers, matched);
-    const resolution = parseControllerInteractionResolution(stored.interaction, settled.resolution);
+    const resolution = parseControllerInteractionResolution(stored.interaction, settled.resolution, "pending");
     if (!resolution) return { ok: false, reason: "stale" };
     const updated = this.db.prepare(
       `UPDATE controller_interactions
@@ -618,12 +618,28 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         generationId: row.controller_generation_id,
       });
       if (!turn) return false;
+      this.beforeExecutorInteractionTransition();
       const updated = this.db.prepare(
         `UPDATE controller_interactions
             SET state = 'delivered', delivered_at = ?
           WHERE interaction_id = ? AND turn_id = ? AND controller_key = ?
             AND bb_thread_id = ? AND controller_generation_id = ?
-            AND state IN (${statePlaceholders})`,
+            AND state IN (${statePlaceholders})
+            AND EXISTS (
+              SELECT 1 FROM executor_lease AS lease
+               WHERE lease.singleton = 1
+                 AND lease.owner_id = ? AND lease.generation = ?
+                 AND lease.lease_expires_at IS NOT NULL
+                 AND lease.lease_expires_at > ?
+            )
+            AND EXISTS (
+              SELECT 1 FROM controller_turns AS submitted_turn
+               WHERE submitted_turn.id = ?
+                 AND submitted_turn.controller_key = ?
+                 AND submitted_turn.state = 'submitted'
+                 AND submitted_turn.lease_owner = ?
+                 AND submitted_turn.lease_generation = ?
+            )`,
       ).run(
         input.now,
         input.interactionId,
@@ -632,12 +648,21 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         turn.bb_thread_id,
         turn.controller_generation_id,
         ...states,
+        input.ownerId,
+        input.generation,
+        input.now,
+        input.turnId,
+        turn.controller_key,
+        input.ownerId,
+        input.generation,
       );
       if (updated.changes !== 1) return false;
       this.refreshAwaitingPointer(input.turnId, input.now, input.interactionId);
       return true;
     }).immediate();
   }
+
+  protected beforeExecutorInteractionTransition(): void {}
 
   private refreshAwaitingPointer(turnId: string, now: number, deliveredInteractionId?: string): void {
     const pointer = this.db.prepare(
