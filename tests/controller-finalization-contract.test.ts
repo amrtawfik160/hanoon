@@ -32,6 +32,7 @@ function emptyFinalizationContext(
 ): ControllerFinalizationValidationContext {
   return {
     acceptedAlready: false,
+    invocationInFlight: false,
     revisionCount: 0,
     evidenceLimitExceeded: false,
     evidenceByRef: new Map(),

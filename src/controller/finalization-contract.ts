@@ -77,7 +77,7 @@ type ControllerClaim = Extract<ControllerFinalization["segments"][number], { typ
 
 export type ControllerFinalizationValidationContext = Readonly<{
   acceptedAlready: boolean;
-  invocationInFlight?: boolean;
+  invocationInFlight: boolean;
   revisionCount: number;
   evidenceLimitExceeded: boolean;
   evidenceByRef: ReadonlyMap<EvidenceRef, Readonly<{
