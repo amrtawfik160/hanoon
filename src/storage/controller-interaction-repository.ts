@@ -60,6 +60,7 @@ export interface ControllerInteractionStore {
   }): ControllerInteractionAnswer;
   getPending(controllerKey: string): ControllerInteractionRecord | null;
   getAnswered(controllerKey: string): ControllerInteractionDelivery | null;
+  sourceCanRecord(input: ControllerLeaseFence & { turnId: string; controllerKey: string; bbThreadId: string; controllerGenerationId: string }): boolean;
   sourceIsActive(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean;
   markDelivered(input: ControllerLeaseFence & {
     interactionId: string;
@@ -250,6 +251,12 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
           AND generation.ended_at IS NULL
        WHERE lease.singleton = 1 AND lease.owner_id = ? AND lease.generation = ? AND lease.lease_expires_at > ?`,
     ).get(input.interactionId, input.turnId, input.bbThreadId, input.ownerId, input.generation, input.now) !== undefined).immediate();
+  }
+
+  /** Read-only fence for a lifecycle ref before it has a durable interaction row. */
+  public sourceCanRecord(input: ControllerLeaseFence & { turnId: string; controllerKey: string; bbThreadId: string; controllerGenerationId: string }): boolean {
+    if (!this.validFence(input)) return false;
+    return this.db.transaction(() => this.activeSource(input) && this.currentLease(input)).immediate();
   }
 
   private answerQuestion(record: ControllerInteractionRecord, answers: ControllerQuestionAnswers, now: number): ControllerInteractionAnswer {

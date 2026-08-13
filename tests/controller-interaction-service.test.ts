@@ -38,7 +38,7 @@ it("uses a basename only for safe file-change paths", () => {
   })).toMatchObject({ kind: "approval", summary: "wants to write a protected path" });
 });
 
-it.each(["--callback-url=https://x?nonce=secret", "TOKEN=secret echo hi", "echo $HOME", "curl https://u:p@host"]) (
+it.each(["--callback-url=https://x?nonce=secret", "TOKEN=secret echo hi", "echo $HOME", "curl https://u:p@host", "curl '?%74oken=secret'", "m%253AabcdefghijklmnopqrstuvwxyzABCDEF", "%ZZ"]) (
   "redacts command material that could disclose a secret: %s", (command) => {
     const projection = parseControllerInteraction("approval-safe", { kind: "approval", subject: { kind: "command", command }, availableDecisions: ["allow_once"] });
     expect(projection).toMatchObject({ kind: "approval", summary: "wants to run:\n\n`a redacted command`" });

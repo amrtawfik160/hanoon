@@ -91,6 +91,20 @@ it("does not bind a record unless the submitted turn is held by the exact execut
   expect(record(repository)).toBe(false);
 });
 
+it("revalidates a new lifecycle source before its interaction exists", () => {
+  const { db, repository } = fixture();
+  expect(repository.sourceCanRecord({ ...fence, turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thr-current", controllerGenerationId: "gen-current" })).toBe(true);
+  db.prepare("UPDATE executor_lease SET generation = 2 WHERE singleton = 1").run();
+  expect(repository.sourceCanRecord({ ...fence, turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thr-current", controllerGenerationId: "gen-current" })).toBe(false);
+});
+
+it("accepts only an identical duplicate lifecycle replay", () => {
+  const { repository } = fixture();
+  expect(record(repository)).toBe(true);
+  expect(record(repository)).toBe(true);
+  expect(record(repository, { ...question, questions: [{ ...question.questions[0]!, prompt: "different" }] })).toBe(false);
+});
+
 it("does not let a token or free text skip the oldest pending interaction", () => {
   const { repository } = fixture();
   expect(record(repository, { kind: "approval", interactionId: "older", summary: "safe", decisions: ["deny"] }, "turn-1", 1)).toBe(true);

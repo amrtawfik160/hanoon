@@ -177,12 +177,24 @@ function containsApprovalSecret(value: string): boolean {
   } catch {
     return true;
   }
-  return /\b(?:bearer|authorization|token|secret|password|api[_-]?key|callback(?:[-_ ]?(?:url|nonce|code))?)\b/i.test(value) ||
-    /(?:https?|ssh):\/\/[^\s/@]*:[^\s/@]*@/i.test(value) ||
-    /[?&](?:token|secret|key|callback|nonce|code)=[^&\s]+/i.test(value) ||
-    /\b[a-z_][a-z0-9_]*=[^\s]+/i.test(value) ||
-    /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%/.test(value) ||
-    /(?:env|environment)\b/i.test(value);
+  let decoded = value;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!decoded.includes("%")) break;
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      return true;
+    }
+  }
+  if (decoded.includes("%")) return true;
+  return /\b(?:bearer|authorization|token|secret|password|api[_-]?key|callback(?:[-_ ]?(?:url|nonce|code))?)\b/i.test(decoded) ||
+    /(?:https?|ssh):\/\/[^\s/@]*:[^\s/@]*@/i.test(decoded) ||
+    /[?&](?:token|secret|key|callback|nonce|code)=[^&\s]+/i.test(decoded) ||
+    /\b[a-z_][a-z0-9_]*=[^\s]+/i.test(decoded) ||
+    /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%/.test(decoded) ||
+    /(?:env|environment)\b/i.test(decoded);
 }
 
 function safeApprovalPath(value: unknown): string | null {
