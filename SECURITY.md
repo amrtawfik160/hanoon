@@ -35,7 +35,9 @@ The plugin can:
 
 ## Controller trust boundary
 
-Every owner-visible reply from the conversational agent is an accepted structured finalization bound to evidence gathered in that same turn. A claim without compatible evidence, an answer whose evidence advanced after acceptance, or a deferred promise with no live durable obligation is rejected rather than delivered. Raw provider prose reaches no draft, stored answer, digest, outbox row, finalization row, or Telegram reply; BB retains its own provider transcript separately.
+Every owner-visible reply from the conversational agent is an accepted structured finalization bound to evidence gathered in that same turn. A claim without compatible evidence, an answer whose evidence advanced after acceptance, or a deferred promise with no live durable obligation is rejected rather than delivered. Unstructured assistant prose reaches no draft, stored answer, digest, outbox row, finalization row, or Telegram reply; BB retains its own provider transcript separately.
+
+Interaction projections are the one bounded exception, and they are not prose. When BB blocks the thread on a question or a permission prompt, the plugin must carry the provider's own wording — the prompt, the option labels, the command being approved — because that is what the owner is being asked about. Each of those fields is length-bounded and passes a single fail-closed credential and callback screen before it is stored or sent. A field that fails the screen is not redacted in place: the whole interaction is downgraded to an unanswerable notice that names no provider text at all, so a leak cannot be traded for answerability.
 
 The controller runs against an enforced manifest of exactly 23 Hanoon capabilities, and denials are decided before any effect. That manifest bounds Hanoon's own tools only. Work the provider performs natively inside BB, or through an opaque third-party tool that emits no BB interaction and no evidence boundary, is outside it: **Hanoon claims no policy over an action it never sees.**
 

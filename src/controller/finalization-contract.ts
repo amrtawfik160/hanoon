@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { containsCredentialLikeText } from "../domain/state-machine";
-import { assertNoRawMergeCallback } from "../storage/job-persistence";
+import { isUnsafeProviderText } from "./credential-policy";
 import { CONTROLLER_PROOF_KINDS, type ControllerProofKind } from "./models";
 
 export const CONTROLLER_CLAIM_KINDS = [
@@ -217,19 +216,9 @@ function fixedStorageProjection(): ControllerFinalization {
   };
 }
 
-function hasUnsafeCallbackMaterial(candidateString: string): boolean {
-  try {
-    assertNoRawMergeCallback(candidateString, "controller finalization");
-    return false;
-  } catch (error) {
-    if (error instanceof TypeError) return true;
-    throw error;
-  }
-}
-
-function isUnsafeCandidateString(candidateString: string): boolean {
-  return containsCredentialLikeText(candidateString) || hasUnsafeCallbackMaterial(candidateString);
-}
+// A finalization segment and a question prompt reach the same owner through the
+// same Telegram message, so they are screened by the same rule.
+const isUnsafeCandidateString = isUnsafeProviderText;
 
 function nonTextCandidateStrings(candidate: ControllerFinalization): string[] {
   return [

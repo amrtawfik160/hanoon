@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { assertNoRawMergeCallback } from "../storage/job-persistence";
+import { isUnsafeProviderText } from "./credential-policy";
 
 /** One selectable answer to a question the controller thread asked. */
 export type ControllerQuestionOption = {
@@ -37,10 +37,17 @@ const MAX_INTERACTION_ID = 200;
 const MAX_QUESTION_ID = 120;
 const MAX_OPTION_VALUE = 120;
 
+/**
+ * Every bounded string in this module comes from the provider, so the credential
+ * screen belongs here rather than at each call site: a field that cannot be
+ * shown safely is simply absent, and the callers already know what to do with an
+ * absent field.
+ */
 function boundedString(rawText: unknown, limit: number, byteLimit = limit * 4): string | null {
   if (typeof rawText !== "string") return null;
   const text = rawText.trim();
   if (text.length === 0) return null;
+  if (isUnsafeProviderText(text)) return null;
   const characters = [...text];
   if (characters.length <= limit && Buffer.byteLength(text, "utf8") <= byteLimit) return text;
   const kept: string[] = [];
@@ -64,10 +71,36 @@ function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
   const value = typeof candidate.value === "string" && [...candidate.value].length > 0 &&
-    [...candidate.value].length <= MAX_OPTION_VALUE && Buffer.byteLength(candidate.value, "utf8") <= MAX_OPTION_VALUE * 4 ? candidate.value : null;
+    [...candidate.value].length <= MAX_OPTION_VALUE && Buffer.byteLength(candidate.value, "utf8") <= MAX_OPTION_VALUE * 4 &&
+    !isUnsafeProviderText(candidate.value) ? candidate.value : null;
   const label = boundedString(candidate.label, MAX_LABEL, 64);
   if (!value || !label) return null;
   return { value, label, description: boundedString(candidate.description, MAX_DESCRIPTION) };
+}
+
+function unsafeRawString(value: unknown): boolean {
+  return typeof value === "string" && isUnsafeProviderText(value);
+}
+
+/**
+ * True when any field of a question payload carries credential or callback
+ * material. A provider emitting a secret in one field is not a provider whose
+ * other fields should be rendered anyway, so this screens the whole payload and
+ * the callers downgrade all of it rather than quietly dropping the bad field.
+ */
+function questionPayloadIsUnsafe(candidate: Record<string, unknown>): boolean {
+  const questions = Array.isArray(candidate.questions) ? candidate.questions : [];
+  return questions.some((rawQuestion) => {
+    if (typeof rawQuestion !== "object" || rawQuestion === null) return false;
+    const question = rawQuestion as Record<string, unknown>;
+    if ([question.id, question.prompt, question.shortLabel].some(unsafeRawString)) return true;
+    const options = Array.isArray(question.options) ? question.options : [];
+    return options.some((rawOption) => {
+      if (typeof rawOption !== "object" || rawOption === null) return false;
+      const option = rawOption as Record<string, unknown>;
+      return [option.value, option.label, option.description].some(unsafeRawString);
+    });
+  });
 }
 
 function parseQuestion(raw: unknown): ControllerQuestion | null {
@@ -213,11 +246,7 @@ function approvalSummary(subject: Record<string, unknown>): string | null {
 }
 
 function containsApprovalSecret(commandText: string): boolean {
-  try {
-    assertNoRawMergeCallback(commandText, "command");
-  } catch {
-    return true;
-  }
+  if (isUnsafeProviderText(commandText)) return true;
   let decoded = commandText;
   for (let depth = 0; depth < 4; depth += 1) {
     if (!decoded.includes("%")) break;
@@ -278,6 +307,9 @@ export function parseControllerInteraction(interactionId: unknown, payload: unkn
     typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind === "user_question") {
+    if (questionPayloadIsUnsafe(candidate)) {
+      return { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
+    }
     if (!Array.isArray(candidate.questions) || candidate.questions.length === 0 || candidate.questions.length > MAX_QUESTIONS ||
       candidate.questions.some((rawQuestion) => {
         if (typeof rawQuestion !== "object" || rawQuestion === null) return true;
@@ -377,6 +409,7 @@ export function parseThreadInteraction(interactionId: unknown, payload: unknown)
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind === "user_question") {
+    if (questionPayloadIsUnsafe(candidate)) return { kind: "unsupported", interactionId };
     const question = parsePendingQuestion(interactionId, payload);
     return question
       ? { kind: "user_question", interactionId, questions: question.questions }
