@@ -1,22 +1,9 @@
+import { CONTROLLER_PROOF_KINDS } from "./proof-kinds.js";
 import type { SupervisorReason } from "./supervisor";
 
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
-export const CONTROLLER_PROOF_KINDS = [
-  "project_state",
-  "job_state",
-  "thread_state",
-  "monitor_state",
-  "memory_state",
-  "command_result",
-  "tool_result",
-  "workspace_change",
-  "external_mutation",
-  "pipeline_outcome",
-  "obligation",
-  "retrieved_content",
-  "health_snapshot",
-] as const;
+export { CONTROLLER_PROOF_KINDS } from "./proof-kinds.js";
 export type ControllerProofKind = (typeof CONTROLLER_PROOF_KINDS)[number];
 export const CONTROLLER_IMAGE_MIME_TYPES = [
   "image/jpeg",

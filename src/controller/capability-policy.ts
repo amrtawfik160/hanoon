@@ -1,9 +1,8 @@
 import type { ControllerProofKind } from "./models";
-
-// Native Node ESM needs the exact .ts path, while the bundler config rejects a literal .ts specifier.
-const { CONTROLLER_PROOF_KINDS } = await import(
-  new URL("./models.ts", import.meta.url).href
-) as typeof import("./models");
+// The shared runtime vocabulary, imported statically from the plain-JavaScript
+// module both this file and `models` re-export, so one specifier resolves for
+// native Node ESM and for the bundle alike.
+import { CONTROLLER_PROOF_KINDS } from "./proof-kinds.js";
 
 export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_list_projects",

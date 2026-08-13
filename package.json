@@ -10,12 +10,18 @@
   "bb": {
     "name": "Telegram Agent",
     "description": "Talk to a configurable Codex controller and run reviewed BB implementation jobs from Telegram.",
-    "branding": { "icon": "Bot" },
+    "branding": {
+      "icon": "Bot"
+    },
     "server": "./server.ts",
-    "skills": ["skills/workflow-kit", "skills/guards", "skills/delivery"]
+    "skills": [
+      "skills/workflow-kit",
+      "skills/guards",
+      "skills/delivery"
+    ]
   },
   "scripts": {
-    "build": "npm run skills:verify && bb plugin build",
+    "build": "npm run skills:verify && bb plugin build && npm run verify:artifact",
     "skills:sync": "node scripts/sync-workflow-skills.mjs",
     "skills:verify": "node scripts/verify-skill-bundle.mjs",
     "typecheck": "tsc -p tsconfig.json",
@@ -23,7 +29,8 @@
     "test:watch": "vitest",
     "eval:controller": "node scripts/eval-controller-outcomes.mjs",
     "eval:answers": "node scripts/eval-controller-answers.mjs",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "verify:artifact": "node scripts/verify-built-artifact.mjs"
   },
   "devDependencies": {
     "@bb/plugin-sdk": "file:vendor/bb-plugin-sdk-0.4.1.tgz",

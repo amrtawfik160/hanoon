@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   CONTROLLER_CAPABILITIES,
@@ -447,6 +448,28 @@ describe("controller capability manifest", () => {
       frozenAfter: false,
       valueUnchanged: true,
     });
+  });
+
+  it("keeps one runtime proof vocabulary shared by models and the manifest", async () => {
+    const [models, vocabulary] = await Promise.all([
+      import("../src/controller/models"),
+      import("../src/controller/proof-kinds.js"),
+    ]);
+    // The same object, not a copy: two arrays could drift apart silently.
+    expect(models.CONTROLLER_PROOF_KINDS).toBe(vocabulary.CONTROLLER_PROOF_KINDS);
+  });
+
+  it("imports no TypeScript source path that would not survive bundling", () => {
+    // A dynamic import of a .ts file resolves from source and from the test
+    // runner, then fails only at activation from dist/, after a build that
+    // reported success. The built-artifact smoke check catches it; this says
+    // which line to look at.
+    const sources = execFileSync("git", ["ls-files", "src", "server.ts"], { encoding: "utf8" })
+      .split("\n")
+      .filter((path) => path.endsWith(".ts"));
+    expect(sources.length).toBeGreaterThan(20);
+    const offenders = sources.filter((path) => /import\s*\(\s*[^)]*\.ts["'`)]/.test(readFileSync(path, "utf8")));
+    expect(offenders).toEqual([]);
   });
 
   it("pins the complete Slice 1 tool and data-class vocabularies", () => {
