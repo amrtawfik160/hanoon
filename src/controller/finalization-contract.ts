@@ -165,12 +165,17 @@ const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|too
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
 const SUCCESS_ADVERB = "(?:already|just|now|still|[a-z]+ly)";
+const SUCCESS_ADVERB_LINK = `\\s+${SUCCESS_ADVERB}`;
+const BOUNDED_SUCCESS_ADVERBS = `(?:${SUCCESS_ADVERB_LINK}){0,2}`;
+// Distribute at most two qualifiers across either side of "been" without
+// turning an arbitrary-length adverb chain into a success assertion.
+const PERFECT_PASSIVE_TAIL = `(?:\\s+been${BOUNDED_SUCCESS_ADVERBS}|${SUCCESS_ADVERB_LINK}\\s+been(?:${SUCCESS_ADVERB_LINK})?|(?:${SUCCESS_ADVERB_LINK}){2}\\s+been)`;
 const ACTIVE_SUCCESS_PREFIX = `(?:i|we)(?:(?:\\s+(?:have|had)|['’](?:ve|d)))?\\s+(?:(?:${SUCCESS_ADVERB})\\s+){0,2}`;
-const PERFECT_AUXILIARY = `(?:has|have|had)(?:\\s+${SUCCESS_ADVERB}){0,2}`;
-const PERFECT_LINK = `(?:\\s+${PERFECT_AUXILIARY}|['’](?:s|ve|d)(?:\\s+${SUCCESS_ADVERB}){0,2})`;
-const PASSIVE_AUXILIARY = `(?:(?:is|are|was|were)(?:\\s+${SUCCESS_ADVERB}){0,2}|(?:has|have|had)(?:\\s+${SUCCESS_ADVERB}){0,2}\\s+been)`;
-const CONTRACTED_BE_LINK = `['’](?:s|re)(?:\\s+${SUCCESS_ADVERB}){0,2}`;
-const PASSIVE_LINK = `(?:\\s+${PASSIVE_AUXILIARY}|${CONTRACTED_BE_LINK}|['’](?:s|ve|d)(?:\\s+${SUCCESS_ADVERB}){0,2}\\s+been)`;
+const PERFECT_AUXILIARY = `(?:has|have|had)${BOUNDED_SUCCESS_ADVERBS}`;
+const PERFECT_LINK = `(?:\\s+${PERFECT_AUXILIARY}|['’](?:s|ve|d)${BOUNDED_SUCCESS_ADVERBS})`;
+const PASSIVE_AUXILIARY = `(?:(?:is|are|was|were)${BOUNDED_SUCCESS_ADVERBS}|(?:has|have|had)${PERFECT_PASSIVE_TAIL})`;
+const CONTRACTED_BE_LINK = `['’](?:s|re)${BOUNDED_SUCCESS_ADVERBS}`;
+const PASSIVE_LINK = `(?:\\s+${PASSIVE_AUXILIARY}|${CONTRACTED_BE_LINK}|['’](?:s|ve|d)${PERFECT_PASSIVE_TAIL})`;
 const CONTRACTED_PAST_PERFECT = new RegExp(`\\w['’]d(?:\\s+${SUCCESS_ADVERB}){0,2}(?:\\s+been)?\\b`, "i");
 const CONTRACTED_PRESENT_PERFECT = new RegExp(
   `(?:\\b(?:i|we)['’]ve\\b|\\w['’](?:s|ve)(?:\\s+${SUCCESS_ADVERB}){0,2}` +
@@ -323,7 +328,7 @@ const NON_SUCCESS_SIBLING = [
   /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
   /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
-  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|seemingly|apparently|arguably|supposedly|ostensibly|appears?|seems?)\b/i,
+  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|likely|seemingly|apparently|arguably|supposedly|ostensibly|reportedly|allegedly|potentially|presumably|conceivably|appears?|seems?)\b/i,
 ];
 /**
  * Every high-impact success assertion, with the claim kinds under which it can
