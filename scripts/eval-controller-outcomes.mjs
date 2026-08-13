@@ -196,6 +196,7 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     // A report whose trials disagree about the outer task surface did not run
     // one experiment, so it cannot describe itself as one.
     outerTaskTools: [...trial.harness.outerTaskTools].sort(),
+    evaluatorSha256: trial.harness.evaluatorSha256,
     instructionSha256: trial.harness.instructionSha256,
     overlaySha256: trial.harness.overlaySha256,
     capabilityManifestSha256: trial.harness.capabilityManifestSha256,

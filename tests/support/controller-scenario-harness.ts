@@ -104,6 +104,39 @@ function parseJobStatusProjection(result: unknown): JobStatusProjection {
 }
 
 /**
+ * The evaluator's own implementation, read from the exact source files that
+ * grade a trial. A literal here would defeat the point: the digest has to move
+ * when the measuring instrument does, so two reports graded by different
+ * evaluator code cannot be read as one series.
+ */
+function evaluatorSha256(): string {
+  const sources = ["./controller-scenario-harness.ts", "../../src/eval/controller-scenario-contract.ts"]
+    .map((relative) => fileURLToPath(new URL(relative, import.meta.url)))
+    .sort()
+    .map((path) => `${path.split("/").at(-1)}:${sha256(readFileSync(path, "utf8"))}`);
+  return sha256(sources.join("\n"));
+}
+
+/**
+ * The scenario exactly as defined: what was asked, what it costs, and what it
+ * is graded against. A changed definition is a changed experiment.
+ */
+function scenarioDefinitionSha256(scenarioCase: ScenarioCase): string {
+  return sha256(canonicalJson({
+    id: scenarioCase.id,
+    scenarioVersion: scenarioCase.scenarioVersion,
+    checkpoint: scenarioCase.checkpoint,
+    criticalSafety: scenarioCase.criticalSafety,
+    ownerMessage: scenarioCase.ownerMessage,
+    budget: scenarioCase.budget,
+    requiredOutcomeAssertions: [...scenarioCase.requiredOutcomeAssertions],
+    forbiddenOutcomeAssertions: [...scenarioCase.forbiddenOutcomeAssertions],
+    requiredTraceAssertions: [...scenarioCase.requiredTraceAssertions],
+    answerGrader: scenarioCase.answerGrader,
+  }));
+}
+
+/**
  * The digest of the project policies actually in force for this trial, in a
  * canonical order so two runs over the same policies agree and a changed policy
  * cannot pass for the same conditions. Disabled policies are deliberately
@@ -181,6 +214,7 @@ function harnessIdentity(input: {
     // registered controller path directly, with no outer agent and therefore no
     // task tools outside Hanoon's own capabilities for it to reach.
     outerTaskTools: [],
+    evaluatorSha256: evaluatorSha256(),
   };
 }
 
@@ -881,6 +915,7 @@ async function runScenario(
     harness: harnessIdentity({
       scenarioCase, trial, seed, phase, toolSurface: fixture.toolSurface, store: fixture.store,
     }),
+    scenarioDefinitionSha256: scenarioDefinitionSha256(scenarioCase),
     budget: scenarioCase.budget,
     outcome: {
       status: outcomePassed ? "passed" : "failed",

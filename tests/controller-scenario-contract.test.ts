@@ -53,7 +53,9 @@ const baseTrial: ControllerScenarioTrial = {
     advertisedTools: [],
     parameterSchemaSha256: {},
     outerTaskTools: [],
+    evaluatorSha256: "9".repeat(64),
   },
+  scenarioDefinitionSha256: "7".repeat(64),
   budget: { maxTurns: 2, maxToolCalls: 8, maxTokens: 20_000, maxWallMs: 30_000, maxCostUsd: null },
   outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: [] },
   trace: { status: "passed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: [] },
@@ -663,5 +665,59 @@ describe("like-for-like comparison", () => {
     });
 
     expect(compareControllerEvaluations({ current, baseline }).status).toBe("incomparable");
+  });
+});
+
+describe("scenario definition and evaluator identity", () => {
+  it("requires a scenario definition digest and an evaluator digest", () => {
+    const { scenarioDefinitionSha256, ...withoutDefinition } = baseTrial;
+    expect(scenarioDefinitionSha256).toHaveLength(64);
+    expect(() => parseControllerScenarioTrial(withoutDefinition)).toThrow(/scenarioDefinitionSha256/);
+    const { evaluatorSha256, ...withoutEvaluator } = baseTrial.harness;
+    expect(evaluatorSha256).toHaveLength(64);
+    expect(() => parseControllerScenarioTrial({ ...baseTrial, harness: withoutEvaluator }))
+      .toThrow(/evaluatorSha256/);
+  });
+
+  it.each([
+    ["the scenario definition", { scenarioDefinitionSha256: "1".repeat(64) }],
+    ["the trial seed", { seed: 4_242 }],
+  ] as const)("downgrades to strong when %s changes", (_scenario, override) => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({ label: "fixed", trials: [trial(override)] });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.incomparableReasons.length).toBeGreaterThan(0);
+    expect(comparison.scenarios[0]).toMatchObject({ comparable: false, regressed: false });
+  });
+
+  it("downgrades to strong when the evaluator implementation changes", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ harness: { ...baseTrial.harness, evaluatorSha256: "2".repeat(64) } })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.scenarios[0]).toMatchObject({ comparable: false });
+  });
+
+  it("keeps the dynamic trial context a disclosed intervention, not a fixed condition", () => {
+    // Phase context varies per trial by design; making it a fixed condition
+    // would make every report incomparable with itself.
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ harness: { ...baseTrial.harness, contextSha256: "3".repeat(64) } })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("comparable");
+    expect(comparison.intervention.current.contextSha256).toEqual(["3".repeat(64)]);
   });
 });

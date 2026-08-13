@@ -29,6 +29,12 @@ export const controllerHarnessIdentitySchema = z.object({
    */
   outerTaskTools: z.array(z.string().min(1).max(128)).max(64)
     .refine(unique, "outer task tools must be unique"),
+  /**
+   * The evaluator's own implementation. A grader that changed is a different
+   * measuring instrument, so this is a fixed condition rather than something to
+   * disclose: two reports produced by different evaluators are not one series.
+   */
+  evaluatorSha256: sha256Schema,
 }).strict();
 
 export const controllerTrialBudgetSchema = z.object({
@@ -125,6 +131,12 @@ export const controllerScenarioTrialSchema = z.object({
   trial: z.number().int().min(1).max(1_000),
   seed: z.number().int().min(0).max(2_147_483_647),
   harness: controllerHarnessIdentitySchema,
+  /**
+   * The scenario as it was defined for this trial — its inputs, budget, and the
+   * assertion sets it is graded against. A changed definition is a changed
+   * experiment, so comparisons hold it constant rather than averaging across it.
+   */
+  scenarioDefinitionSha256: sha256Schema,
   budget: controllerTrialBudgetSchema,
   outcome: controllerLayerGradeSchema.extend({ status: scenarioLayerStatusSchema }),
   trace: controllerLayerGradeSchema.extend({ status: scenarioLayerStatusSchema }),
@@ -337,6 +349,11 @@ function interventionOf(report: ControllerEvaluationReport): z.infer<typeof inte
  */
 function fixedConditions(trial: ControllerScenarioTrial): string {
   return JSON.stringify({
+    // What was asked, how it was measured, and with what randomness: change any
+    // of them and the two runs answer different questions.
+    scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
+    evaluatorSha256: trial.harness.evaluatorSha256,
+    seed: trial.seed,
     // The outer task surface belongs here, not to the intervention: it is what
     // the agent could reach beyond Hanoon, and changing it changes the task.
     outerTaskTools: [...trial.harness.outerTaskTools].sort(),
