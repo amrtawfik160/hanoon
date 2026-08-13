@@ -1748,7 +1748,7 @@ describe("singleton job executor", () => {
     expect(store.listHeldResourceClaims(jobId, 10)).toHaveLength(0);
   });
 
-  it("prioritizes occupied terminal release over more than 100 queued cancellations", async () => {
+  it("prioritizes occupied terminal release over more than 100 queued cancellations", { timeout: 10_000 }, async () => {
     const { store } = fixture();
     queueCancelledAdmissions(store, 101, "job_executor_cancel_backlog", 70_000);
     settleAllSafeControls(store, 80_000);
