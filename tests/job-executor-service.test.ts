@@ -1890,5 +1890,8 @@ describe("singleton job executor", () => {
 
     expect(store.getAdmission(jobId)?.state).toBe("released");
     expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(0);
-  });
+    // Draining a 101-deep cancellation backlog against a real SQLite store is
+    // the slowest case in this file; it needs more than the default budget
+    // without loosening the budget for every other test.
+  }, 15_000);
 });
