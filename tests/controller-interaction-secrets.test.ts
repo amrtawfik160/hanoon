@@ -15,7 +15,6 @@ import {
   parseThreadInteraction,
   renderControllerInteraction,
 } from "../src/controller/questions";
-import { TelegramIngress } from "../src/telegram/ingress";
 import { policyFixture } from "./helpers";
 import type { ControllerEvidenceReconciler } from "../src/controller/evidence-projector";
 
@@ -156,6 +155,71 @@ it.each([
   expect(renderControllerInteraction(projected!)?.reply_markup).toBeUndefined();
 });
 
+it.each([
+  ["a compact basic-auth flag", "curl -ualice:hunter2 https://example.com/api"],
+  ["a compact password flag", "mysql -phunter2 -h db.internal"],
+  ["a compact long-form flag", "deploy --token=abcdefghijklmnop"],
+  ["a percent-encoded compact flag", "curl -u%61lice:hunter2 https://example.com"],
+  ["a doubly-encoded compact flag", "curl -u%2561lice:hunter2 https://example.com"],
+  ["a token-shaped argument", "deploy sk-abcdefghijklmnop"],
+] as const)("makes an approval carrying %s unsupported", (_scenario, command) => {
+  const projected = parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "command", command },
+    availableDecisions: ["allow_once", "deny"],
+  });
+
+  expect(projected).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "approval" },
+  });
+  expect(renderControllerInteraction(projected!)?.reply_markup).toBeUndefined();
+  expect(JSON.stringify(projected)).not.toContain("hunter2");
+});
+
+it.each([
+  ["a token-shaped basename", "sk-abcdefghijklmnop"],
+  ["a token-shaped basename in a directory", "config/rk-abcdefghijklmnop"],
+] as const)("makes an approval to write %s unsupported", (_scenario, writeScope) => {
+  // The command screen already knew this shape; the path screen must not have
+  // its own, weaker idea of what a secret looks like.
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "file_change", writeScope },
+    availableDecisions: ["allow_once", "deny"],
+  })).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "approval" },
+  });
+});
+
+it.each([
+  ["a listing flag", "ls -la src"],
+  ["an archive flag", "tar -xzf release.tar.gz"],
+  ["a commit message flag", "git commit -m fix"],
+  ["an ordinary script", "npm run build"],
+  ["an unrelated long option", "curl --user-agent hanoon https://example.com"],
+  ["another unrelated long option", "stream --passthrough --tokenizer word"],
+  ["a bare short flag with no value", "mysql -p"],
+  ["a short flag followed by another flag", "mysql -p -h db.internal"],
+] as const)("still offers a decision on %s", (_scenario, command) => {
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "command", command },
+    availableDecisions: ["allow_once", "deny"],
+  })).toMatchObject({ kind: "approval" });
+});
+
+it.each([
+  ["an ordinary source file", "src/controller/service.ts"],
+  ["a lockfile", "package-lock.json"],
+  ["a name that merely starts with s", "skills/index.md"],
+] as const)("still offers a decision on writing %s", (_scenario, writeScope) => {
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "file_change", writeScope },
+    availableDecisions: ["allow_once", "deny"],
+  })).toMatchObject({ kind: "approval" });
+});
+
 it("still offers exactly Allow once and Deny for a safe command and a safe path", () => {
   const command = parseControllerInteraction(INTERACTION_ID, {
     kind: "approval",
@@ -241,15 +305,6 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     id: INTERACTION_ID, threadId: THREAD_ID, status: "pending", payload: leaked,
   }));
 
-  // Wired into the ingress audit logger, so the log assertion below is a real
-  // observation rather than a claim about an array nothing writes to.
-  const logged: string[] = [];
-  new TelegramIngress({
-    store,
-    telegram: { sendMessage: async () => ({ message_id: 1 }), editMessage: async () => {}, answerCallback: async () => {} } as never,
-    auditLogger: (record) => { logged.push(JSON.stringify(record)); },
-    onWorkAvailable: () => undefined,
-  });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY, telegramUserId: OWNER, telegramChatId: OWNER,
     updateId: 300, inputText: "ship it", now: 2_000,
@@ -275,7 +330,35 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     clock: { now: () => 2_100 },
   });
 
-  await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
+  // The reconciliation path takes no logger and calls no console, so the only
+  // honest sink to watch is the process output anything there would have to use.
+  // It is captured across the whole reconcile, and a canary proves the capture is
+  // live — otherwise "no marker was logged" would also be true of an observer
+  // that sees nothing at all, which is what the previous version of this
+  // assertion amounted to.
+  const logged: string[] = [];
+  const consoleMethods = ["log", "info", "warn", "error", "debug", "trace"] as const;
+  const originalConsole = consoleMethods.map((method) => [method, console[method]] as const);
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  for (const method of consoleMethods) {
+    console[method] = ((...parts: unknown[]) => { logged.push(parts.map(String).join(" ")); }) as typeof console.log;
+  }
+  process.stdout.write = ((chunk: unknown) => { logged.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: unknown) => { logged.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  const canary = "controller-secret-log-canary";
+  let reconciled: boolean;
+  try {
+    reconciled = await service.reconcile({ ...fence, signal }, signal);
+    console.log(canary);
+  } finally {
+    for (const [method, original] of originalConsole) console[method] = original;
+    process.stdout.write = originalStdout;
+    process.stderr.write = originalStderr;
+  }
+  expect(reconciled).toBe(true);
+  // The observer is demonstrably live, so the absence checks below mean something.
+  expect(logged.join("\n")).toContain(canary);
 
   const recorded = store.getPendingControllerInteraction(CONTROLLER_KEY);
   expect(recorded?.interaction).toEqual({

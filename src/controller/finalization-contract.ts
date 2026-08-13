@@ -417,14 +417,29 @@ type HighImpactMatch = Readonly<{
   end: number;
 }>;
 
-/** The comma-separated parts of a clause, with where each one starts. */
-function commaSiblings(clause: string): { text: string; start: number }[] {
+/**
+ * The punctuation that separates one assertion from the next inside a clause.
+ * A colon or a dash joins two independent statements as readily as a comma does
+ * — "Staging failed: production is live" reports a failure *and* a deployment —
+ * so polarity must not carry across one.
+ */
+const SIBLING_BOUNDARY = /[,:;\u2013\u2014]/;
+
+/** The parts of a clause that assert separately, with where each one starts. */
+function assertionSiblings(clause: string): { text: string; start: number }[] {
   const siblings: { text: string; start: number }[] = [];
   let start = 0;
-  for (const text of clause.split(",")) {
-    siblings.push({ text, start });
-    start += text.length + 1;
+  let current = "";
+  for (const character of clause) {
+    if (SIBLING_BOUNDARY.test(character)) {
+      siblings.push({ text: current, start });
+      start += current.length + character.length;
+      current = "";
+      continue;
+    }
+    current += character;
   }
+  siblings.push({ text: current, start });
   return siblings;
 }
 
@@ -436,7 +451,7 @@ function commaSiblings(clause: string): { text: string; start: number }[] {
  */
 function assertionIsSuppressed(clause: string, start: number, end: number): boolean {
   if (QUESTION_CLAUSE.test(clause)) return true;
-  return commaSiblings(clause)
+  return assertionSiblings(clause)
     .filter((sibling) => sibling.start < end && sibling.start + sibling.text.length > start)
     .some((sibling) => NON_SUCCESS_SIBLING.some((pattern) => pattern.test(sibling.text)));
 }

@@ -836,6 +836,34 @@ describe("claim outcome compatibility", () => {
   });
 
   it.each([
+    ["a comma", "Staging failed, production is live."],
+    ["a colon", "Staging failed: production is live."],
+    ["an em dash", "Staging failed — production is live."],
+    ["an en dash", "Staging failed – production is live."],
+    ["a semicolon", "Staging failed; production is live."],
+    ["a colon before a test run", "Linting failed: the tests passed."],
+  ] as const)("does not let a failure before %s vouch for the success after it", (_scenario, text) => {
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    ["a negation after a colon", "Note: I did not deploy production."],
+    ["a hedge after an em dash", "Checked staging — production may be live."],
+    ["a future after a semicolon", "Staging is ready; I will deploy production."],
+    ["a question after a colon", "One thing: did the tests pass?"],
+  ] as const)("still accepts %s", (_scenario, text) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
     ["a question spanning siblings", "The tests passed, right?"],
     ["a negation in the same sibling", "I did not deploy production."],
     ["a future in the same sibling", "I will deploy production."],

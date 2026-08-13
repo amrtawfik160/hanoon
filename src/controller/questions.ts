@@ -259,6 +259,7 @@ function containsApprovalSecret(commandText: string): boolean {
     }
   }
   if (decoded.includes("%")) return true;
+  if (isUnsafeProviderText(decoded)) return true;
   return /\b(?:bearer|authorization|token|secret|password|api[_-]?key|callback(?:[-_ ]?(?:url|nonce|code))?)\b/i.test(decoded) ||
     /(?:https?|ssh):\/\/[^\s/@]*:[^\s/@]*@/i.test(decoded) ||
     /[?&](?:token|secret|key|callback|nonce|code)=[^&\s]+/i.test(decoded) ||
@@ -278,7 +279,7 @@ export function isSafeControllerApprovalSummary(summary: unknown): summary is st
   const command = /^wants to run:\n\n`([^`]*)`$/.exec(summary)?.[1];
   if (command !== undefined) return command.length > 0 && [...command].length <= MAX_PROMPT && !containsApprovalSecret(command);
   const basename = /^wants to write ([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/.exec(summary)?.[1];
-  return basename !== undefined && !isSensitiveApprovalPathName(basename);
+  return basename !== undefined && !isSensitiveApprovalPathName(basename) && !isUnsafeProviderText(basename);
 }
 
 function safeApprovalPath(rawPath: unknown): string | null {
@@ -287,9 +288,11 @@ function safeApprovalPath(rawPath: unknown): string | null {
     rawPath.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
   const basename = rawPath.split("/").at(-1)!;
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(basename)) return null;
-  // A file whose name is a secret by convention is not made safe by being a
-  // well-formed name.
-  return isSensitiveApprovalPathName(basename) ? null : basename;
+  // A file whose name is a secret by convention, or whose name is itself shaped
+  // like a token, is not made safe by being a well-formed name. The token shape
+  // comes from the same central screen the command path uses, so the two cannot
+  // drift apart.
+  return isSensitiveApprovalPathName(basename) || isUnsafeProviderText(basename) ? null : basename;
 }
 
 /**
