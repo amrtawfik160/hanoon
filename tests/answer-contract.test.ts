@@ -7,13 +7,16 @@ import { expect, it } from "vitest";
 import {
   ANSWER_CLAUSES,
   ANSWER_CLAUSE_IDS,
+  ANSWER_LIVE_GATE_RELEASE_CORPUS,
   ANSWER_JUDGE_PROFILE,
   ANSWER_RUBRIC_VERSION,
   type AnswerClauseId,
   buildAnswerJudgeSpawnArgs,
   buildClauseAssessment,
   buildClauseJudgePrompt,
+  answerFinalInputSha256,
   detectExplicitClauseViolation,
+  assertAnswerEvaluationWriteIdentity,
   parseAnswerExpectations,
   parseClauseVerdict,
   parseLiveGateArtifact,
@@ -200,8 +203,11 @@ function buildReleasePassedArtifact(): Record<string, any> {
     schemaVersion: "answer-live-gate-v1",
     rubricVersion: ANSWER_RUBRIC_VERSION,
     judgeProfile: ANSWER_JUDGE_PROFILE,
+    hanoonCommit: "a".repeat(40),
+    dirty: false,
     goldenSha256: RELEASE_GOLDEN_SHA256,
     expectationsSha256: RELEASE_EXPECTATIONS_SHA256,
+    finalInputSha256: ANSWER_LIVE_GATE_RELEASE_CORPUS.finalInputSha256,
     selectedCaseCount: RELEASE_CASE_IDS.length,
     selectedClauseCount: RELEASE_CASE_IDS.length * ANSWER_CLAUSES.length,
     cases: RELEASE_CASE_IDS.map((id) => ({
@@ -234,6 +240,31 @@ it("accepts a complete release-shaped artifact", () => {
   expect(parseLiveGateArtifact(JSON.stringify(buildReleasePassedArtifact()))).not.toBeNull();
 });
 
+it("requires passed artifacts to carry repository and final-input identity", () => {
+  const artifact = buildReleasePassedArtifact();
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).not.toBeNull();
+
+  for (const field of ["hanoonCommit", "dirty", "finalInputSha256"]) {
+    const missing = { ...artifact };
+    delete missing[field];
+    expect(parseLiveGateArtifact(JSON.stringify(missing)), field).toBeNull();
+  }
+});
+
+it("rejects repository or final-input drift at the artifact write boundary", () => {
+  const initial = {
+    hanoonCommit: "a".repeat(40),
+    dirty: false,
+    goldenSha256: "b".repeat(64),
+    expectationsSha256: "c".repeat(64),
+    finalInputSha256: "d".repeat(64),
+  } as const;
+  expect(() => assertAnswerEvaluationWriteIdentity(initial, initial)).not.toThrow();
+  expect(() => assertAnswerEvaluationWriteIdentity(initial, { ...initial, dirty: true })).toThrow(/dirty/i);
+  expect(() => assertAnswerEvaluationWriteIdentity(initial, { ...initial, hanoonCommit: "e".repeat(40) })).toThrow(/commit/i);
+  expect(() => assertAnswerEvaluationWriteIdentity(initial, { ...initial, finalInputSha256: "e".repeat(64) })).toThrow(/input/i);
+});
+
 it.each([
   ["case ID", (artifact: Record<string, any>) => { artifact.cases[0].id = "substituted-case"; }],
   ["golden hash", (artifact: Record<string, any>) => { artifact.goldenSha256 = "a".repeat(64); }],
@@ -250,6 +281,11 @@ it("keeps failed diagnostic artifacts parseable without release corpus binding",
   artifact.cases[0].id = "diagnostic-case";
   artifact.goldenSha256 = "c".repeat(64);
   artifact.expectationsSha256 = "d".repeat(64);
+  artifact.finalInputSha256 = answerFinalInputSha256({
+    goldenSha256: artifact.goldenSha256,
+    expectationsSha256: artifact.expectationsSha256,
+    caseIds: artifact.cases.map((candidate: { id: string }) => candidate.id),
+  });
   expect(parseLiveGateArtifact(JSON.stringify(artifact))).not.toBeNull();
 });
 
@@ -795,6 +831,12 @@ it("ships golden cases covering both a passing and a failing shape of every kind
     expect(each.ownerMessage.length).toBeGreaterThan(0);
     expect(each.answer.length).toBeGreaterThan(0);
   }
+});
+
+it("binds the release corpus to exactly seven cases and 42 clauses", () => {
+  expect(ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount).toBe(7);
+  expect(ANSWER_LIVE_GATE_RELEASE_CORPUS.clauseCount).toBe(42);
+  expect(ANSWER_LIVE_GATE_RELEASE_CORPUS.caseIds).toEqual(RELEASE_CASE_IDS);
 });
 
 it("keeps dead-end referral's golden answer and expectations independent", () => {

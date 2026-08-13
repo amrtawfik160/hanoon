@@ -6,7 +6,7 @@
  * Every clause without such a violation is graded in its own hidden BB thread,
  * so a model's opinion about one rule cannot contaminate another rule.
  */
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -31,6 +31,8 @@ import {
   ANSWER_JUDGE_PROFILE,
   ANSWER_RUBRIC_VERSION,
   auditJudgeEventLog,
+  answerFinalInputSha256,
+  assertAnswerEvaluationWriteIdentity,
   buildAnswerJudgeSpawnArgs,
   buildClauseAssessment,
   buildClauseJudgePrompt,
@@ -56,6 +58,69 @@ const RECONCILIATION_DELAY_MS = 100;
 
 function fail(message) {
   throw new Error(message);
+}
+
+function readGitIdentity() {
+  return {
+    hanoonCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: pluginRoot, encoding: "utf8" }).trim(),
+    dirty: execFileSync("git", ["status", "--porcelain"], { cwd: pluginRoot, encoding: "utf8" }).trim() !== "",
+  };
+}
+
+function readAnswerCorpusFiles() {
+  const { cases } = JSON.parse(readFileSync(CASES_PATH, "utf8"));
+  const expectations = parseAnswerExpectations(JSON.parse(readFileSync(EXPECTATIONS_PATH, "utf8")));
+  return {
+    cases,
+    expectationsById: new Map(expectations.cases.map((each) => [each.id, each])),
+    expectationsCaseIds: expectations.cases.map((testCase) => testCase.id),
+    goldenSha256: sha256File(CASES_PATH),
+    expectationsSha256: sha256File(EXPECTATIONS_PATH),
+  };
+}
+
+function releaseCorpusMatches(caseIds, goldenSha256, expectationsSha256) {
+  return isExactAnswerReleaseCorpus({
+    caseIds,
+    goldenSha256,
+    expectationsSha256,
+    finalInputSha256: answerFinalInputSha256({ goldenSha256, expectationsSha256, caseIds }),
+  });
+}
+
+function assertPinnedAnswerCorpus(corpus) {
+  const caseIds = corpus.cases.map((testCase) => testCase.id);
+  if (!releaseCorpusMatches(caseIds, corpus.goldenSha256, corpus.expectationsSha256)
+    || !releaseCorpusMatches(corpus.expectationsCaseIds, corpus.goldenSha256, corpus.expectationsSha256)) {
+    fail("checked-in answer corpus does not match the pinned release corpus");
+  }
+  if (corpus.expectationsById.size !== corpus.cases.length || corpus.cases.some((testCase) => !corpus.expectationsById.has(testCase.id))) {
+    fail("expectation artifact does not cover exactly the golden cases");
+  }
+}
+
+function selectAnswerCorpus(corpus, only) {
+  const selected = only ? corpus.cases.filter((each) => each.id === only) : corpus.cases;
+  if (selected.length === 0) fail(`no case matched ${only}`);
+  for (const testCase of selected) {
+    const expectation = corpus.expectationsById.get(testCase.id);
+    if (!expectation || expectation.aggregate !== testCase.expect) fail(`expectation artifact mismatch for case ${testCase.id}`);
+  }
+  return {
+    ...corpus,
+    selected,
+    finalInputSha256: answerFinalInputSha256({
+      goldenSha256: corpus.goldenSha256,
+      expectationsSha256: corpus.expectationsSha256,
+      caseIds: selected.map((testCase) => testCase.id),
+    }),
+  };
+}
+
+function readAnswerCorpus(only) {
+  const corpus = readAnswerCorpusFiles();
+  assertPinnedAnswerCorpus(corpus);
+  return selectAnswerCorpus(corpus, only);
 }
 
 function readArguments(argv) {
@@ -435,7 +500,7 @@ function buildLiveGateCaseResult(testCase, expectation, result) {
   };
 }
 
-function buildLiveGateArtifact({ selected, caseResults, infrastructureErrors, runtimeAudit, goldenSha256, expectationsSha256 }) {
+function buildLiveGateArtifact({ selected, caseResults, infrastructureErrors, runtimeAudit, hanoonCommit, dirty, goldenSha256, expectationsSha256, finalInputSha256 }) {
   const selectedClauseCount = selected.length * ANSWER_CLAUSES.length;
   const clauseAgreed = caseResults.reduce((total, caseResult) => total + caseResult.clauses.filter((clause) => clause.result !== null && clause.result === clause.expected).length, 0);
   const caseAgreed = caseResults.filter((caseResult) => caseResult.matchesGolden).length;
@@ -443,8 +508,11 @@ function buildLiveGateArtifact({ selected, caseResults, infrastructureErrors, ru
     schemaVersion: ANSWER_LIVE_GATE_SCHEMA_VERSION,
     rubricVersion: ANSWER_RUBRIC_VERSION,
     judgeProfile: ANSWER_JUDGE_PROFILE,
+    hanoonCommit,
+    dirty,
     goldenSha256,
     expectationsSha256,
+    finalInputSha256,
     selectedCaseCount: selected.length,
     selectedClauseCount,
     cases: caseResults,
@@ -473,7 +541,8 @@ function buildLiveGateArtifact({ selected, caseResults, infrastructureErrors, ru
   };
 }
 
-function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues) {
+function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, assertCurrentInputs) {
+  assertCurrentInputs?.();
   const serialized = `${JSON.stringify(artifact, null, 2)}\n`;
   if (!parseLiveGateArtifact(serialized, forbiddenValues)) throw new Error("live gate artifact failed schema or secret validation");
   const temporaryPath = `${artifactPath}.${process.pid}.${randomUUID()}.tmp`;
@@ -497,34 +566,10 @@ function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues) {
 async function main() {
   const options = readArguments(process.argv.slice(2));
   const artifactPath = assertExternalArtifactPath(options.artifact);
-  const { cases } = JSON.parse(readFileSync(CASES_PATH, "utf8"));
-  const expectations = parseAnswerExpectations(JSON.parse(readFileSync(EXPECTATIONS_PATH, "utf8")));
-  const expectationsById = new Map(expectations.cases.map((each) => [each.id, each]));
-  const goldenSha256 = sha256File(CASES_PATH);
-  const expectationsSha256 = sha256File(EXPECTATIONS_PATH);
-  if (
-    !isExactAnswerReleaseCorpus({
-      caseIds: cases.map((testCase) => testCase.id),
-      goldenSha256,
-      expectationsSha256,
-    })
-    || !isExactAnswerReleaseCorpus({
-      caseIds: expectations.cases.map((testCase) => testCase.id),
-      goldenSha256,
-      expectationsSha256,
-    })
-  ) {
-    fail("checked-in answer corpus does not match the pinned release corpus");
-  }
-  const selected = options.only ? cases.filter((each) => each.id === options.only) : cases;
-  if (selected.length === 0) fail(`no case matched ${options.only}`);
-  if (expectations.cases.length !== cases.length || cases.some((testCase) => !expectationsById.has(testCase.id))) {
-    fail("expectation artifact does not cover exactly the golden cases");
-  }
-  for (const testCase of selected) {
-    const expectation = expectationsById.get(testCase.id);
-    if (!expectation || expectation.aggregate !== testCase.expect) fail(`expectation artifact mismatch for case ${testCase.id}`);
-  }
+  const corpus = readAnswerCorpus(options.only);
+  const initialIdentity = readGitIdentity();
+  if (initialIdentity.dirty) fail("answer evaluator repository is dirty; refusing live evaluation");
+  const { selected, expectationsById, goldenSha256, expectationsSha256, finalInputSha256 } = corpus;
 
   process.stdout.write(`answer judge rubric ${ANSWER_RUBRIC_VERSION}; profile ${JSON.stringify(ANSWER_JUDGE_PROFILE)}; clause concurrency ${CLAUSE_CONCURRENCY}\n`);
   const runtimeAudit = createRuntimeAudit();
@@ -577,11 +622,31 @@ async function main() {
     caseResults,
     infrastructureErrors,
     runtimeAudit,
+    hanoonCommit: initialIdentity.hanoonCommit,
+    dirty: initialIdentity.dirty,
     goldenSha256,
     expectationsSha256,
+    finalInputSha256,
   });
   const forbiddenValues = selected.flatMap((testCase) => [testCase.ownerMessage, testCase.answer]);
-  writeLiveGateArtifact(artifactPath, artifact, forbiddenValues);
+  writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, () => {
+    const finalIdentity = readGitIdentity();
+    const finalCorpus = readAnswerCorpus(options.only);
+    assertAnswerEvaluationWriteIdentity(
+      {
+        ...initialIdentity,
+        goldenSha256,
+        expectationsSha256,
+        finalInputSha256,
+      },
+      {
+        ...finalIdentity,
+        goldenSha256: finalCorpus.goldenSha256,
+        expectationsSha256: finalCorpus.expectationsSha256,
+        finalInputSha256: finalCorpus.finalInputSha256,
+      },
+    );
+  });
 
   if (options.only) {
     process.stdout.write("diagnostic --case selection: artifact is incomplete and cannot be release-passed\n");

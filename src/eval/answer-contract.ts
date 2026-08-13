@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { ANSWER_CLAUSE_ANCHORS } from "./answer-anchors.js";
 
 export type AnswerClauseId =
@@ -57,34 +58,79 @@ export const ANSWER_CLAUSE_IDS: readonly AnswerClauseId[] = Object.freeze(
   ANSWER_CLAUSES.map((clause) => clause.id),
 );
 
+const ANSWER_RELEASE_CASE_IDS = Object.freeze([
+  "status-good",
+  "status-narrates-tools",
+  "status-invents-eta",
+  "process-only",
+  "dead-end-referral",
+  "bounded-uncertainty",
+  "bad-news-plainly",
+]);
+const ANSWER_RELEASE_GOLDEN_SHA256 = "05cb2da1e88ba767e07f7ed22389fe39ae278acd9f8f3c5879851cf17dd2370b";
+const ANSWER_RELEASE_EXPECTATIONS_SHA256 = "0876bcb014fd595337fe35b21906c46e5ac3b0d89d02220a839da2cb7aabcd7b";
+
+export function answerFinalInputSha256(input: {
+  goldenSha256: string;
+  expectationsSha256: string;
+  caseIds: readonly string[];
+}): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      goldenSha256: input.goldenSha256,
+      expectationsSha256: input.expectationsSha256,
+      caseIds: input.caseIds,
+    }), "utf8")
+    .digest("hex");
+}
+
+export type AnswerEvaluationWriteIdentity = Readonly<{
+  hanoonCommit: string;
+  dirty: boolean;
+  goldenSha256: string;
+  expectationsSha256: string;
+  finalInputSha256: string;
+}>;
+
+export function assertAnswerEvaluationWriteIdentity(
+  initial: AnswerEvaluationWriteIdentity,
+  current: AnswerEvaluationWriteIdentity,
+): void {
+  if (current.hanoonCommit !== initial.hanoonCommit) {
+    throw new Error("answer evaluator source commit changed before artifact write");
+  }
+  if (current.dirty !== initial.dirty || current.dirty) {
+    throw new Error("answer evaluator repository became dirty before artifact write");
+  }
+  if (current.goldenSha256 !== initial.goldenSha256
+    || current.expectationsSha256 !== initial.expectationsSha256
+    || current.finalInputSha256 !== initial.finalInputSha256) {
+    throw new Error("answer evaluator final input changed before artifact write");
+  }
+}
+
 // The evaluator checks the checked-in fixtures against this release corpus before judging.
 export const ANSWER_LIVE_GATE_RELEASE_CORPUS = Object.freeze({
   caseCount: 7,
   clauseCount: 7 * ANSWER_CLAUSES.length,
-  caseIds: Object.freeze([
-    "status-good",
-    "status-narrates-tools",
-    "status-invents-eta",
-    "process-only",
-    "dead-end-referral",
-    "bounded-uncertainty",
-    "bad-news-plainly",
-  ]),
-  goldenSha256: "05cb2da1e88ba767e07f7ed22389fe39ae278acd9f8f3c5879851cf17dd2370b",
-  expectationsSha256: "0876bcb014fd595337fe35b21906c46e5ac3b0d89d02220a839da2cb7aabcd7b",
+  caseIds: ANSWER_RELEASE_CASE_IDS,
+  goldenSha256: ANSWER_RELEASE_GOLDEN_SHA256,
+  expectationsSha256: ANSWER_RELEASE_EXPECTATIONS_SHA256,
+  finalInputSha256: "61596d741a3d31c2d73d80aa3a55121b68dd34e92d2216aacf1fb476e9324d66",
 } as const);
 
 export function isExactAnswerReleaseCorpus(input: {
   caseIds: readonly string[];
   goldenSha256: string;
   expectationsSha256: string;
+  finalInputSha256: string;
 }): boolean {
   const expectedCaseIds = ANSWER_LIVE_GATE_RELEASE_CORPUS.caseIds;
   return input.goldenSha256 === ANSWER_LIVE_GATE_RELEASE_CORPUS.goldenSha256
     && input.expectationsSha256 === ANSWER_LIVE_GATE_RELEASE_CORPUS.expectationsSha256
+    && input.finalInputSha256 === ANSWER_LIVE_GATE_RELEASE_CORPUS.finalInputSha256
     && input.caseIds.length === expectedCaseIds.length
-    && new Set(input.caseIds).size === expectedCaseIds.length
-    && expectedCaseIds.every((caseId) => input.caseIds.includes(caseId));
+    && JSON.stringify(input.caseIds) === JSON.stringify(expectedCaseIds);
 }
 
 export type AnswerJudgeSpawnInput = Readonly<{
@@ -170,6 +216,9 @@ export type LiveGateCaseResult = Readonly<{
 export type LiveGateArtifact = Readonly<{
   schemaVersion: typeof ANSWER_LIVE_GATE_SCHEMA_VERSION;
   rubricVersion: typeof ANSWER_RUBRIC_VERSION;
+  hanoonCommit: string;
+  dirty: boolean;
+  finalInputSha256: string;
   judgeProfile: typeof ANSWER_JUDGE_PROFILE;
   goldenSha256: string;
   expectationsSha256: string;
@@ -530,11 +579,16 @@ export function parseLiveGateArtifact(
   if (!isRecord(parsed) || containsForbiddenValue(parsed, forbiddenValues)) return null;
   if (!hasExactKeys(parsed, [
     "aggregate", "audit", "cases", "expectationsSha256", "goldenSha256",
-    "infrastructureErrors", "judgeProfile", "rubricVersion", "schemaVersion",
+    "finalInputSha256", "hanoonCommit", "dirty", "infrastructureErrors", "judgeProfile", "rubricVersion", "schemaVersion",
     "selectedCaseCount", "selectedClauseCount", "status",
   ])) return null;
   if (parsed.schemaVersion !== ANSWER_LIVE_GATE_SCHEMA_VERSION || parsed.rubricVersion !== ANSWER_RUBRIC_VERSION) return null;
-  if (!isPinnedJudgeProfile(parsed.judgeProfile) || !isSha256(parsed.goldenSha256) || !isSha256(parsed.expectationsSha256)) return null;
+  if (!isPinnedJudgeProfile(parsed.judgeProfile)
+    || !isSha256(parsed.goldenSha256)
+    || !isSha256(parsed.expectationsSha256)
+    || !isSha256(parsed.finalInputSha256)
+    || !isCommitSha(parsed.hanoonCommit)
+    || typeof parsed.dirty !== "boolean") return null;
   if (!isNonNegativeInteger(parsed.selectedCaseCount) || !isNonNegativeInteger(parsed.selectedClauseCount) || parsed.selectedClauseCount !== parsed.selectedCaseCount * ANSWER_CLAUSES.length) return null;
   if (parsed.selectedCaseCount === 0) return null;
   if (!Array.isArray(parsed.cases) || parsed.cases.length !== parsed.selectedCaseCount) return null;
@@ -542,6 +596,11 @@ export function parseLiveGateArtifact(
   if (cases.some((candidate) => candidate === null)) return null;
   const parsedCases = cases as LiveGateCaseResult[];
   if (new Set(parsedCases.map((candidate) => candidate.id)).size !== parsedCases.length) return null;
+  if (parsed.finalInputSha256 !== answerFinalInputSha256({
+    goldenSha256: parsed.goldenSha256 as string,
+    expectationsSha256: parsed.expectationsSha256 as string,
+    caseIds: parsedCases.map((candidate) => candidate.id),
+  })) return null;
   if (!Array.isArray(parsed.infrastructureErrors) || parsed.infrastructureErrors.some((candidate) => !isInfrastructureError(candidate))) return null;
   const audit = parseLiveGateAudit(parsed.audit);
   const aggregate = parseLiveGateAggregate(parsed.aggregate, parsed.selectedCaseCount, parsed.selectedClauseCount);
@@ -553,7 +612,9 @@ export function parseLiveGateArtifact(
       caseIds: parsedCases.map((candidate) => candidate.id),
       goldenSha256: parsed.goldenSha256 as string,
       expectationsSha256: parsed.expectationsSha256 as string,
+      finalInputSha256: parsed.finalInputSha256 as string,
     })
+    || parsed.dirty !== false
     || parsed.infrastructureErrors.length > 0
     || aggregate.cases.agreed !== aggregate.cases.total
     || aggregate.clauses.agreed !== aggregate.clauses.total
@@ -631,6 +692,10 @@ function isPinnedJudgeProfile(input: unknown): input is typeof ANSWER_JUDGE_PROF
 
 function isSha256(input: unknown): input is string {
   return typeof input === "string" && /^[a-f0-9]{64}$/.test(input);
+}
+
+function isCommitSha(input: unknown): input is string {
+  return typeof input === "string" && /^[a-f0-9]{40}$/.test(input);
 }
 
 function isNonNegativeInteger(input: unknown): input is number {

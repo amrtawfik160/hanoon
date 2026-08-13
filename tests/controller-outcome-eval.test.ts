@@ -295,6 +295,71 @@ it("rejects a required answer grader relabeled not_applicable before writing", a
 });
 
 it.each([
+  ["a required fact is false", (sourceTrial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => ({
+    ...sourceTrial,
+    evidenceRecords: sourceTrial.evidenceRecords?.map((record, index) => index === 0
+      ? { ...record, observed: false }
+      : record),
+  })],
+  ["a passed layer omits required proof", (sourceTrial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => ({
+    ...sourceTrial,
+    outcome: { ...sourceTrial.outcome, proofRefs: sourceTrial.outcome.proofRefs.slice(0, 1) },
+  })],
+] as const)("rejects a current trial when %s", async (_label, mutate) => {
+  const runner = await runnerModule();
+  const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const output = evaluationOutput();
+  const invalidTrial = mutate({ ...sourceTrial, harness: { ...sourceTrial.harness, dirty: false } });
+
+  await expect(runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: true,
+  }, {
+    readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+    runTrials: async () => [invalidTrial],
+  })).rejects.toThrow(/evidence|observed|proof|complete/i);
+
+  expect(existsSync(output)).toBe(false);
+});
+
+it("validates a fixed baseline against current scenario applicability before comparison", async () => {
+  const runner = await runnerModule();
+  const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const cleanTrial = { ...sourceTrial, harness: { ...sourceTrial.harness, dirty: false } };
+  const directory = mkdtempSync(join(tmpdir(), "hanoon-invalid-applicability-baseline-"));
+  const baselinePath = join(directory, "baseline.json");
+  const output = join(directory, "after.json");
+  try {
+    const invalidBaseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{
+        ...cleanTrial,
+        answer: { ...cleanTrial.answer, status: "not_applicable" as const, proofRefs: [] },
+      }],
+    });
+    writeFileSync(baselinePath, `${JSON.stringify(invalidBaseline, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(runner.evaluateControllerOutcomes({
+      checkpoint: "baseline",
+      trials: 1,
+      seed: 8122026,
+      baseline: baselinePath,
+      output,
+      replace: true,
+    }, {
+      readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+      runTrials: async () => [cleanTrial],
+    })).rejects.toThrow(/applicability|answer|not_applicable|required/i);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it.each([
   ["scenario definition identity", (trial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => ({
     ...trial,
     scenarioDefinitionSha256: undefined,
@@ -402,6 +467,13 @@ it("disposes every repeated scenario resource, including restart scenarios", asy
   expect(after.created - before.created).toBe(18);
   expect(after.disposed - before.disposed).toBe(18);
   expect(after.active).toBe(0);
+});
+
+it("initializes each scenario through the production plugin entrypoint", async () => {
+  const before = controllerScenarioResourceStats();
+  await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const after = controllerScenarioResourceStats();
+  expect(after.productionPluginInitializations - before.productionPluginInitializations).toBe(2);
 });
 
 it("uses a real fake-host lifecycle reload for restart-after-owner-tap", async () => {
@@ -536,6 +608,11 @@ it.each(["outcome", "trace", "answer"] as const)(
       harness: { ...sourceTrial.harness, dirty: false },
       [layer]: { ...sourceTrial[layer], status: "incomplete" as const, proofRefs: [] },
     } as typeof sourceTrial;
+    if (layer === "answer") {
+      trial.evidenceRecords = trial.evidenceRecords?.map((record) => record.layer === "answer"
+        ? { ...record, observed: false }
+        : record);
+    }
     const output = evaluationOutput();
 
     const evaluation = await runner.evaluateControllerOutcomes({
@@ -626,6 +703,14 @@ it("requires stale approval settlement denial and zero-effect proof in the fixed
     "fact:stale-capability-fence:outcome:stale_approval_denied",
     "fact:stale-capability-fence:outcome:stale_approval_no_effect",
   ]));
+  const noEffectRecord = staleTrial.evidenceRecords?.find(
+    (record) => record.assertion === "stale_approval_no_effect",
+  );
+  expect(noEffectRecord?.facts).toMatchObject({
+    staleApprovalStateBefore: "confirmed",
+    staleApprovalStateAfter: "confirmed",
+    staleApprovalExternalCalls: 0,
+  });
 });
 
 it("runs every kernel and cutover case as a durable fixed scenario", async () => {

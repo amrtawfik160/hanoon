@@ -92,7 +92,7 @@ function writeReport(path, content, replace) {
   chmodSync(path, mode);
 }
 
-function readValidatedBaseline(path) {
+function readValidatedBaseline(path, scenarioCorpus) {
   if (!isAbsolute(path)) throw new Error("--baseline must be an absolute path");
   let report;
   try {
@@ -103,9 +103,8 @@ function readValidatedBaseline(path) {
   }
   if (report.label !== "fixed") throw new Error("baseline report must have fixed label");
   if (report.trials.some((trial) => trial.harness.dirty)) throw new Error("baseline report contains dirty trials");
-  for (const trial of report.trials) {
-    contract.validateControllerScenarioTrialEvidence(trial);
-  }
+  const validation = contract.validateControllerScenarioTrialsAgainstCorpus(report.trials, scenarioCorpus);
+  for (const trial of validation.trials) contract.validateControllerScenarioTrialBudget(trial);
   return report;
 }
 
@@ -164,7 +163,8 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
   if (!allowedOutput(options.output)) {
     throw new Error("--output must be outside the repository or under .superpowers/");
   }
-  const baseline = options.baseline ? readValidatedBaseline(options.baseline) : null;
+  const scenarioCorpus = harness.loadControllerScenarioCorpus();
+  const baseline = options.baseline ? readValidatedBaseline(options.baseline, scenarioCorpus) : null;
   const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
   const priorCommit = process.env.HANOON_EVAL_COMMIT;
   const priorDirty = process.env.HANOON_EVAL_DIRTY;
@@ -183,7 +183,6 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     if (priorDirty === undefined) delete process.env.HANOON_EVAL_DIRTY;
     else process.env.HANOON_EVAL_DIRTY = priorDirty;
   }
-  const scenarioCorpus = harness.loadControllerScenarioCorpus();
   const currentValidation = contract.validateControllerScenarioTrialsAgainstCorpus(trials, scenarioCorpus);
   const validatedTrials = currentValidation.trials.map(contract.validateControllerScenarioTrialBudget);
   assertCurrentEvaluationIdentity(validatedTrials, identity);
@@ -195,6 +194,7 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     ? contract.compareControllerEvaluations({
         baseline,
         after: baseReport,
+        scenarioCorpus,
         scenarioDefinitions: scenarioCorpus.cases.map((scenarioCase) => ({
           id: scenarioCase.id,
           scenarioVersion: scenarioCase.scenarioVersion,

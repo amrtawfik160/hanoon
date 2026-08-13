@@ -443,25 +443,117 @@ function currentScenarioDefinition(
   return scenarioCase;
 }
 
+function expectedEvidenceRefsByLayer(
+  trial: ControllerScenarioTrial,
+  scenarioCase: ControllerScenarioCase,
+) {
+  return {
+    outcome: [
+      ...scenarioCase.requiredOutcomeAssertions,
+      ...scenarioCase.forbiddenOutcomeAssertions,
+    ].map((assertion) => `fact:${trial.scenarioId}:outcome:${assertion}`),
+    trace: scenarioCase.requiredTraceAssertions
+      .map((assertion) => `fact:${trial.scenarioId}:trace:${assertion}`),
+    answer: scenarioCase.answerGrader === "required"
+      ? [`fact:${trial.scenarioId}:answer:answer_grader`]
+      : [],
+  } as const;
+}
+
+function assertEvidenceRecordsPresent(
+  trial: ControllerScenarioTrial,
+  recordsByRef: ReadonlyMap<string, ControllerScenarioEvidenceRecord>,
+  expectedRefs: readonly string[],
+): void {
+  for (const expectedRef of expectedRefs) {
+    const record = recordsByRef.get(expectedRef);
+    if (!record) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing evidence record ${expectedRef}`);
+    }
+    if (Object.keys(record.facts).length === 0) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} evidence record ${expectedRef} has incomplete proof facts`);
+    }
+  }
+}
+
+function assertOutcomeFactsObserved(
+  trial: ControllerScenarioTrial,
+  recordsByRef: ReadonlyMap<string, ControllerScenarioEvidenceRecord>,
+  assertions: readonly string[],
+  expectedObserved: boolean,
+): void {
+  for (const assertion of assertions) {
+    const ref = `fact:${trial.scenarioId}:outcome:${assertion}`;
+    if (recordsByRef.get(ref)?.observed !== expectedObserved) {
+      const state = expectedObserved ? "was not observed" : "was observed";
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} outcome fact ${ref} ${state}`);
+    }
+  }
+}
+
+function assertTraceFactsObserved(
+  trial: ControllerScenarioTrial,
+  recordsByRef: ReadonlyMap<string, ControllerScenarioEvidenceRecord>,
+  assertions: readonly string[],
+): void {
+  for (const assertion of assertions) {
+    const ref = `fact:${trial.scenarioId}:trace:${assertion}`;
+    if (recordsByRef.get(ref)?.observed !== true) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} required trace fact ${ref} was not observed`);
+    }
+  }
+}
+
+function assertAnswerApplicability(
+  trial: ControllerScenarioTrial,
+  scenarioCase: ControllerScenarioCase,
+  recordsByRef: ReadonlyMap<string, ControllerScenarioEvidenceRecord>,
+): void {
+  if (scenarioCase.answerGrader === "required") {
+    if (trial.answer.status === "not_applicable") {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} cannot relabel a required answer grader as not_applicable`);
+    }
+    const answerRecord = recordsByRef.get(`fact:${trial.scenarioId}:answer:answer_grader`);
+    const answerObserved = trial.answer.status === "passed";
+    if (answerRecord?.observed !== answerObserved) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} answer fact does not match answer layer status`);
+    }
+  } else if (trial.answer.status !== "not_applicable") {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} has an answer grader where the corpus marks it not_applicable`);
+  }
+}
+
+function assertPassedLayerProofRefs(
+  trial: ControllerScenarioTrial,
+  layerName: "outcome" | "trace" | "answer",
+  layer: ControllerScenarioTrial["outcome"] | ControllerScenarioTrial["trace"] | ControllerScenarioTrial["answer"],
+  expectedRefs: readonly string[],
+): void {
+  if (layer.status !== "passed") return;
+  const actualRefs = new Set(layer.proofRefs);
+  if (actualRefs.size !== expectedRefs.length || expectedRefs.some((ref) => !actualRefs.has(ref))) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} ${layerName} proof is incomplete or not bound to all declared facts`);
+  }
+}
+
 function assertExpectedEvidenceRecords(
   trial: ControllerScenarioTrial,
   scenarioCase: ControllerScenarioCase,
 ): void {
-  const expectedEvidenceRefs = [
-    ...scenarioCase.requiredOutcomeAssertions.map((assertion) => `fact:${trial.scenarioId}:outcome:${assertion}`),
-    ...scenarioCase.forbiddenOutcomeAssertions.map((assertion) => `fact:${trial.scenarioId}:outcome:${assertion}`),
-    ...scenarioCase.requiredTraceAssertions.map((assertion) => `fact:${trial.scenarioId}:trace:${assertion}`),
-    ...(scenarioCase.answerGrader === "required" ? [`fact:${trial.scenarioId}:answer:answer_grader`] : []),
-  ];
-  const actualEvidenceRefs = new Set(trial.evidenceRecords?.map((record) => record.ref));
-  for (const expectedRef of expectedEvidenceRefs) {
-    if (!actualEvidenceRefs.has(expectedRef)) {
-      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing evidence record ${expectedRef}`);
-    }
-  }
-  if (scenarioCase.answerGrader === "required" && trial.answer.status === "not_applicable") {
-    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} cannot relabel a required answer grader as not_applicable`);
-  }
+  const recordsByRef = new Map((trial.evidenceRecords ?? []).map((record) => [record.ref, record]));
+  const expectedByLayer = expectedEvidenceRefsByLayer(trial, scenarioCase);
+  assertEvidenceRecordsPresent(trial, recordsByRef, [
+    ...expectedByLayer.outcome,
+    ...expectedByLayer.trace,
+    ...expectedByLayer.answer,
+  ]);
+  assertOutcomeFactsObserved(trial, recordsByRef, scenarioCase.requiredOutcomeAssertions, true);
+  assertOutcomeFactsObserved(trial, recordsByRef, scenarioCase.forbiddenOutcomeAssertions, false);
+  assertTraceFactsObserved(trial, recordsByRef, scenarioCase.requiredTraceAssertions);
+  assertAnswerApplicability(trial, scenarioCase, recordsByRef);
+  assertPassedLayerProofRefs(trial, "outcome", trial.outcome, expectedByLayer.outcome);
+  assertPassedLayerProofRefs(trial, "trace", trial.trace, expectedByLayer.trace);
+  assertPassedLayerProofRefs(trial, "answer", trial.answer, expectedByLayer.answer);
 }
 
 export function validateControllerScenarioTrialAgainstCorpus(
@@ -673,6 +765,7 @@ export function compareControllerEvaluations(input: Readonly<{
   baseline: unknown;
   after: unknown;
   scenarioDefinitions?: readonly ScenarioDefinition[];
+  scenarioCorpus?: ReturnType<typeof parseControllerScenarioCorpus>;
 }>): ControllerEvaluationComparison {
   const baseline = parseControllerEvaluationReport(input.baseline);
   const after = parseControllerEvaluationReport(input.after);
@@ -683,6 +776,12 @@ export function compareControllerEvaluations(input: Readonly<{
   assertCleanFixedReport(after, "after");
   assertFixedReportEvidence(baseline, "baseline");
   assertFixedReportEvidence(after, "after");
+  if (input.scenarioCorpus) {
+    const baselineValidation = validateControllerScenarioTrialsAgainstCorpus(baseline.trials, input.scenarioCorpus);
+    const afterValidation = validateControllerScenarioTrialsAgainstCorpus(after.trials, input.scenarioCorpus);
+    baselineValidation.trials.forEach(validateControllerScenarioTrialBudget);
+    afterValidation.trials.forEach(validateControllerScenarioTrialBudget);
+  }
   const baselineKeys = reportScenarioKeys(baseline);
   const afterKeys = reportScenarioKeys(after);
   const commonKeys = [...baselineKeys].filter((key) => afterKeys.has(key));

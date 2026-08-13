@@ -13,8 +13,9 @@ import type {
   ControllerInteractionSnapshot,
 } from "../../src/controller/bb-controller";
 import { ControllerInteractionService } from "../../src/controller/interaction-service";
+import { ThreadOperationService } from "../../src/controller/operations";
 import { LunaControllerService } from "../../src/controller/service";
-import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../../src/controller/tools";
+import { CONTROLLER_TOOL_NAMES } from "../../src/controller/tools";
 import { CONTROLLER_CAPABILITIES } from "../../src/controller/capability-policy";
 import { ControllerEvidenceProjector } from "../../src/controller/evidence-projector";
 import { buildTurnContext } from "../../src/controller/context";
@@ -47,8 +48,10 @@ import { hashSecret } from "../../src/crypto";
 import { openStore } from "../../src/storage/store";
 import { TelegramIngress } from "../../src/telegram/ingress";
 import { encodeCallbackData } from "../../src/telegram/view";
+import type { SendMessagePayload } from "../../src/telegram/types";
 import type { ProjectPolicy } from "../../src/domain/models";
 import type { TelegramAgentStore } from "../../src/storage/store";
+import plugin from "../../server";
 
 const FIXTURE_NOW = 1_000;
 const CONTROLLER_KEY = "owner-7-controller";
@@ -59,19 +62,44 @@ let scenarioResourcesCreated = 0;
 let scenarioResourcesDisposed = 0;
 let scenarioResourcesActive = 0;
 let scenarioLifecycleReloads = 0;
+let scenarioProductionPluginInitializations = 0;
+
+const SCENARIO_PLUGIN_SETTINGS = Object.freeze({
+  botToken: "123:test-token",
+  bbAppBaseUrl: "",
+  maxConcurrentJobs: "5",
+  controllerModel: "gpt-5.6-sol",
+  controllerReasoningLevel: "max",
+  controllerServiceTier: "fast",
+  controllerPermissionMode: "auto",
+  extractionModel: "inherit",
+  systemUpkeep: "disabled",
+});
 
 export function controllerScenarioResourceStats(): Readonly<{
   created: number;
   disposed: number;
   active: number;
   lifecycleReloads: number;
+  productionPluginInitializations: number;
 }> {
   return {
     created: scenarioResourcesCreated,
     disposed: scenarioResourcesDisposed,
     active: scenarioResourcesActive,
     lifecycleReloads: scenarioLifecycleReloads,
+    productionPluginInitializations: scenarioProductionPluginInitializations,
   };
+}
+
+async function createScenarioPluginHost(pluginId: string) {
+  const host = createFakePluginHost({
+    pluginId,
+    settings: SCENARIO_PLUGIN_SETTINGS,
+  });
+  await plugin(host.bb);
+  scenarioProductionPluginInitializations += 1;
+  return host;
 }
 
 function beginScenarioResources(): void {
@@ -576,6 +604,13 @@ function redactedAssertionFacts(
     replayOutcome: facts.replayOutcome,
     recoveryPromptCount: facts.recoveryPromptTexts.length,
     providerContinuationCount: facts.providerContinuationTexts.length,
+    staleApprovalSettlementDenied: facts.staleApprovalSettlementDenied,
+    staleApprovalStateBefore: facts.staleApprovalStateBefore,
+    staleApprovalStateAfter: facts.staleApprovalStateAfter,
+    staleApprovalExternalCalls: facts.staleApprovalExternalCalls,
+    staleApprovalResolutionAttempts: facts.staleApprovalResolutionAttempts,
+    staleApprovalOutboxCountBefore: facts.staleApprovalOutboxCountBefore,
+    staleApprovalOutboxCountAfter: facts.staleApprovalOutboxCountAfter,
     telegramApprovalRendered: facts.telegramApprovalRendered,
     interactionRowState: facts.interactionRowState,
     successfulResolutionCount: facts.successfulResolutionCount,
@@ -636,8 +671,8 @@ export const CONTROLLER_ASSERTION_REGISTRY: Readonly<Record<string, ScenarioAsse
   mutation_executed_twice: (facts) => facts.receipts.length > 1 || facts.jobSourceUpdateCount > 1,
   stale_fence_denied: (facts) => facts.denialCode === "fence_lost",
   stale_approval_denied: (facts) => facts.staleApprovalSettlementDenied,
-  stale_approval_no_effect: (facts) => facts.staleApprovalStateBefore === "answered"
-    && facts.staleApprovalStateAfter === "answered"
+  stale_approval_no_effect: (facts) => facts.staleApprovalStateBefore === "confirmed"
+    && facts.staleApprovalStateAfter === "confirmed"
     && facts.staleApprovalExternalCalls === 0
     && facts.staleApprovalResolutionAttempts === 0
     && facts.staleApprovalOutboxCountBefore === facts.staleApprovalOutboxCountAfter,
@@ -881,7 +916,7 @@ async function runScenario(
     return runExtendedScenario(scenarioCase, trial, seed, startedAt);
   }
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
-  const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-eval-${fixtureId}` });
+  const { bb, harness } = await createScenarioPluginHost(`telegram-controller-eval-${fixtureId}`);
   beginScenarioResources();
   try {
     const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
@@ -889,7 +924,7 @@ async function runScenario(
   const paired = store.pairOwnerWithCode(hashSecret(`pair:${fixtureId}`), OWNER_ID, OWNER_ID, 2);
   if (!paired.ok) throw new Error("fixed scenario owner could not be paired");
   const executionOwnerId = `eval-${fixtureId}`;
-  const lease = store.acquireExecutorLease(executionOwnerId, FIXTURE_NOW, 30_000);
+  const lease = store.acquireExecutorLease(executionOwnerId, Date.now(), 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
   const signal = AbortSignal.timeout(2_000);
   harness.sdk.stub("threads.get", async () => ({
@@ -911,17 +946,7 @@ async function runScenario(
     sdk: bb.sdk,
     store,
     clock: { now: () => FIXTURE_NOW },
-    hanoonToolNames: CONTROLLER_TOOL_NAMES,
-  });
-  registerControllerTools(bb, {
-    store,
-    sdk: bb.sdk,
-    evidenceProjector,
-    threadOperations: { request: async () => { throw new Error("thread operations are not part of this baseline"); } },
-    health: () => ({ status: "ok" }),
-    notify: () => undefined,
-    now: () => FIXTURE_NOW,
-    controllerProviderId: () => "codex",
+    hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
   });
   const toolSurface = registeredToolSurface(harness.registrations.agentTools);
 
@@ -1039,7 +1064,7 @@ async function runExtendedScenario(
   startedAt: number,
 ): Promise<ControllerScenarioTrial> {
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
-  const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-eval-${fixtureId}` });
+  const { bb, harness } = await createScenarioPluginHost(`telegram-controller-eval-${fixtureId}`);
   let activeHarness = harness;
   beginScenarioResources();
   try {
@@ -1053,18 +1078,34 @@ async function runExtendedScenario(
   if (!paired.ok) throw new Error("fixed scenario owner could not be paired");
 
   const executionOwnerId = `eval-${fixtureId}`;
-  const lease = store.acquireExecutorLease(executionOwnerId, FIXTURE_NOW, 30_000);
+  const lease = store.acquireExecutorLease(executionOwnerId, Date.now(), 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
   const signal = AbortSignal.timeout(2_000);
   const threadId = "thr_fixed_controller";
   const projectId = "proj_fixed";
   const toolContext = { threadId, projectId, signal };
+  const externalTargetThreadId = "thr_external_target";
 
-  harness.sdk.stub("threads.get", async () => ({
-    id: threadId,
-    projectId,
-    environmentId: "env_fixed_controller",
-  }));
+  harness.sdk.stub("threads.get", async ({ threadId: requestedThreadId }) => {
+    if (requestedThreadId === externalTargetThreadId) return {
+      id: externalTargetThreadId,
+      projectId: "proj_external",
+      environmentId: "env_external",
+      hostId: "host_external",
+      title: "External target",
+      titleFallback: null,
+      status: "active",
+      visibility: "visible",
+      archivedAt: null,
+      deletedAt: null,
+      originPluginId: null,
+    };
+    return {
+      id: threadId,
+      projectId,
+      environmentId: "env_fixed_controller",
+    };
+  });
   harness.sdk.stub("environments.get", async () => ({
     id: "env_fixed_controller",
     projectId,
@@ -1082,17 +1123,7 @@ async function runExtendedScenario(
     sdk: bb.sdk,
     store,
     clock: { now: () => FIXTURE_NOW },
-    hanoonToolNames: CONTROLLER_TOOL_NAMES,
-  });
-  registerControllerTools(bb, {
-    store,
-    sdk: bb.sdk,
-    evidenceProjector,
-    threadOperations: { request: async () => { throw new Error("thread operations are not part of this fixed scenario"); } },
-    health: () => ({ status: "ok" }),
-    notify: () => undefined,
-    now: () => FIXTURE_NOW,
-    controllerProviderId: () => "codex",
+    hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
   });
   const toolSurface = registeredToolSurface(harness.registrations.agentTools);
 
@@ -1329,60 +1360,68 @@ async function runExtendedScenario(
 
   if (scenarioCase.id === "stale-capability-fence") {
     const jobsBefore = store.listJobs(100).length;
-    const controllerGeneration = store.listControllerGenerations(CONTROLLER_KEY, 1)[0];
-    if (!controllerGeneration) throw new Error("fixed stale scenario has no controller generation");
-    const staleApprovalId = `stale_approval_${seed}_${trial}`;
-    const recordedApproval = store.recordControllerInteraction({
-      ownerId: executionOwnerId,
-      generation: lease.generation,
-      now: FIXTURE_NOW,
-      turnId: turn.id,
-      controllerKey: CONTROLLER_KEY,
-      bbThreadId: threadId,
-      controllerGenerationId: controllerGeneration.id,
-      interaction: {
-        kind: "approval",
-        interactionId: staleApprovalId,
-        summary: "Run the fixture command once.",
-        decisions: ["allow_once", "deny"],
+    const operationMessages: SendMessagePayload[] = [];
+    const staleApprovalService = new ThreadOperationService({
+      store,
+      sdk: bb.sdk,
+      telegram: {
+        sendMessage: async (_chatId, payload) => {
+          operationMessages.push(payload);
+          return { message_id: 9001 };
+        },
       },
+      pluginId: bb.pluginId,
+      clock: { now: () => FIXTURE_NOW },
     });
-    if (recordedApproval !== "recorded") throw new Error("fixed stale scenario approval could not be recorded");
-    const answeredApproval = store.answerControllerInteractionByToken({
-      token: controllerInteractionToken(staleApprovalId, "allow_once"),
-      userId: OWNER_ID,
-      chatId: OWNER_ID,
-      now: FIXTURE_NOW + 1,
+    const requestedOperation = await staleApprovalService.request({
+      kind: "stop_thread",
+      threadId: externalTargetThreadId,
+      signal,
     });
-    if (!answeredApproval.ok) throw new Error("fixed stale scenario approval could not be answered");
-    const staleApprovalStateBefore = store.getAnsweredControllerInteraction(CONTROLLER_KEY) ? "answered" : null;
+    if (requestedOperation.state !== "awaiting_confirmation" || operationMessages.length !== 1) {
+      throw new Error("fixed stale scenario did not request a production approval-required thread operation");
+    }
+    const pendingOperation = store.getThreadOperation(requestedOperation.id);
+    if (!pendingOperation || pendingOperation.confirmationMessageId === null) {
+      throw new Error("fixed stale scenario approval operation was not durably awaiting confirmation");
+    }
+    const operationCallbackData = operationMessages[0]?.reply_markup?.inline_keyboard[0]?.[0]?.callback_data;
+    if (!operationCallbackData) throw new Error("fixed stale scenario approval had no owner callback");
+    const operationIngress = new TelegramIngress({
+      store,
+      telegram: {
+        sendMessage: async () => ({ message_id: 9002 }),
+        editMessage: async () => undefined,
+        answerCallback: async () => undefined,
+      },
+      onWorkAvailable: () => undefined,
+    });
+    await operationIngress.handleClaimed({
+      update_id: seed * 10_000 + trial + 50_000,
+      callback_query: {
+        id: `${fixtureId}-operation-confirm`,
+        from: { id: 7, is_bot: false },
+        message: { message_id: pendingOperation.confirmationMessageId, chat: { id: 7, type: "private" } },
+        data: operationCallbackData,
+      },
+    }, FIXTURE_NOW + 1);
+    const staleApprovalStateBefore = store.getThreadOperation(requestedOperation.id)?.state ?? null;
+    if (staleApprovalStateBefore !== "confirmed") throw new Error("fixed stale scenario approval operation was not confirmed by Telegram ingress");
     const staleApprovalOutboxCountBefore = store.listOutbox(256).length;
     let staleApprovalExternalCalls = 0;
     let staleApprovalResolutionAttempts = 0;
-    const staleApprovalService = new ControllerInteractionService({
-      store: controllerInteractionStore(store),
-      clock: { now: () => FIXTURE_NOW },
-      interactions: {
-        get: async () => {
-          staleApprovalExternalCalls += 1;
-          return { id: staleApprovalId, threadId, status: "pending" };
-        },
-        resolve: async () => {
-          staleApprovalExternalCalls += 1;
-          staleApprovalResolutionAttempts += 1;
-          return { id: staleApprovalId, threadId, status: "resolved" };
-        },
-      },
+    harness.sdk.stub("threads.stop", async () => {
+      staleApprovalExternalCalls += 1;
+      return { id: externalTargetThreadId, status: "stopped" };
     });
     if (!store.releaseExecutorLease(executionOwnerId, lease.generation, FIXTURE_NOW)) {
       throw new Error("fixed scenario lease could not be released");
     }
-    const staleApprovalSettlementDenied = !(await staleApprovalService.deliverAnswered(
-      CONTROLLER_KEY,
-      { ownerId: executionOwnerId, generation: lease.generation, now: FIXTURE_NOW },
+    const staleApprovalSettlementDenied = !(await staleApprovalService.processOne(
+      { ownerId: executionOwnerId, generation: lease.generation, signal },
       signal,
     ));
-    const staleApprovalStateAfter = store.getAnsweredControllerInteraction(CONTROLLER_KEY) ? "answered" : null;
+    const staleApprovalStateAfter = store.getThreadOperation(requestedOperation.id)?.state ?? null;
     const staleApprovalOutboxCountAfter = store.listOutbox(256).length;
     let denialCode: string | null = null;
     try {
@@ -1467,24 +1506,10 @@ async function runExtendedScenario(
     if (scenarioCase.id === "restart-after-owner-tap") {
       let reloadedStore: TelegramAgentStore | null = null;
       const reloadedHost = await harness.lifecycle.reload(async (restartedBb) => {
+        await plugin(restartedBb);
+        scenarioProductionPluginInitializations += 1;
         const reopenedStore = openStore(restartedBb.storage, restartedBb.storage.kv, () => FIXTURE_NOW);
         reloadedStore = reopenedStore;
-        const reloadedEvidenceProjector = new ControllerEvidenceProjector({
-          sdk: restartedBb.sdk,
-          store: reopenedStore,
-          clock: { now: () => FIXTURE_NOW },
-          hanoonToolNames: CONTROLLER_TOOL_NAMES,
-        });
-        registerControllerTools(restartedBb, {
-          store: reopenedStore,
-          sdk: restartedBb.sdk,
-          evidenceProjector: reloadedEvidenceProjector,
-          threadOperations: { request: async () => { throw new Error("thread operations are not part of this fixed scenario"); } },
-          health: () => ({ status: "ok" }),
-          notify: () => undefined,
-          now: () => FIXTURE_NOW,
-          controllerProviderId: () => "codex",
-        });
       });
       const reopenedStore: TelegramAgentStore | null = reloadedStore as TelegramAgentStore | null;
       if (reopenedStore === null) throw new Error("controller scenario lifecycle reload did not reopen its store");
@@ -1513,7 +1538,7 @@ async function runExtendedScenario(
         sdk: activeBb.sdk,
         store: reopenedStore,
         clock: { now: () => FIXTURE_NOW },
-        hanoonToolNames: CONTROLLER_TOOL_NAMES,
+        hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
       });
       const reloadedInteractionService = new ControllerInteractionService({
         store: controllerInteractionStore(reopenedStore),
