@@ -790,6 +790,63 @@ describe("claim outcome compatibility", () => {
     );
   });
 
+  it("does not let an earlier legitimate occurrence mask a later split one", () => {
+    // The same wording twice in one clause: the first occurrence is properly
+    // carried, and scanning only the first would let the second slip past.
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [
+          {
+            type: "claim", text: "The tests passed, ", kind: "execution_result", outcome: "succeeded",
+            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
+          },
+          { type: "text", text: "the tests pa" },
+          {
+            type: "claim", text: "ssed.", kind: "uncertainty", outcome: "uncertain",
+            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
+          },
+        ],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["a negated sibling", "I did not deploy staging, I deployed production."],
+    ["a failed sibling", "The staging deploy failed, I deployed production."],
+    ["a future sibling", "I will deploy staging, I deployed production."],
+    ["an uncertain sibling", "Staging may be stale, I deployed production."],
+    ["a negated sibling before a test run", "I did not run the linter, the tests passed."],
+  ] as const)("does not let %s vouch for the success beside it", (_scenario, text) => {
+    // Polarity belongs to the sibling that carries the wording. A comma does not
+    // let "I did not deploy staging" speak for "I deployed production".
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      textFinalization(text),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it.each([
+    ["a question spanning siblings", "The tests passed, right?"],
+    ["a negation in the same sibling", "I did not deploy production."],
+    ["a future in the same sibling", "I will deploy production."],
+    ["a hedge in the same sibling", "The deployment may be live."],
+  ] as const)("still accepts %s", (_scenario, text) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
   it("accepts a high-impact assertion wholly inside one compatible succeeded claim", () => {
     expect(validateControllerFinalization(
       {

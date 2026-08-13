@@ -168,13 +168,20 @@ const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?
 // Bounded to a couple of qualifiers, so "the unit tests" and "the tests you
 // allowed" both read as the test suite while a long unrelated clause does not.
 const TEST_OBJECT = "(?:the\\s+)?(?:[a-z]+\\s+){0,2}tests?\\b";
-const NON_SUCCESS_CLAUSE = [
-  /\?\s*$/,
+/** A trailing question mark governs the whole sentence it ends. */
+const QUESTION_CLAUSE = /\?\s*$/;
+/**
+ * Polarity that belongs to the comma sibling actually carrying the wording. A
+ * comma does not let one half of a sentence vouch for the other: "I did not
+ * deploy staging, I deployed production" still asserts the deployment.
+ */
+const NON_SUCCESS_SIBLING = [
   /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
   /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
   /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
 ];
+const NON_SUCCESS_CLAUSE = [QUESTION_CLAUSE, ...NON_SUCCESS_SIBLING];
 /**
  * Every high-impact success assertion, with the claim kinds under which it can
  * honestly be made. Outside a claim these are the patterns that must not appear
@@ -401,18 +408,62 @@ function isProcessOnly(candidate: ControllerFinalization, renderedMessage: strin
 }
 
 function clauseHasHighImpactSuccess(clause: string): boolean {
-  return highImpactAssertionsIn(clause).length > 0;
+  return highImpactMatchesIn(clause).length > 0;
+}
+
+type HighImpactMatch = Readonly<{
+  assertion: (typeof HIGH_IMPACT_ASSERTIONS)[number];
+  start: number;
+  end: number;
+}>;
+
+/** The comma-separated parts of a clause, with where each one starts. */
+function commaSiblings(clause: string): { text: string; start: number }[] {
+  const siblings: { text: string; start: number }[] = [];
+  let start = 0;
+  for (const text of clause.split(",")) {
+    siblings.push({ text, start });
+    start += text.length + 1;
+  }
+  return siblings;
 }
 
 /**
- * The high-impact assertions a clause actually makes. A clause that is a
- * question, a negation, a failure, an intention, or a hedge asserts nothing, so
- * the same non-success controls that keep such wording out of the plain-text
- * screen keep it out of this one.
+ * True when the wording at this span asserts nothing after all — the sentence is
+ * a question, or the sibling carrying the wording negates, fails, defers, or
+ * hedges it. Polarity is read from the sibling rather than the whole clause so
+ * that a negated first half cannot suppress an affirmative second half.
  */
-function highImpactAssertionsIn(clause: string): readonly (typeof HIGH_IMPACT_ASSERTIONS)[number][] {
-  if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) return [];
-  return HIGH_IMPACT_ASSERTIONS.filter((assertion) => assertion.pattern.test(clause));
+function assertionIsSuppressed(clause: string, start: number, end: number): boolean {
+  if (QUESTION_CLAUSE.test(clause)) return true;
+  return commaSiblings(clause)
+    .filter((sibling) => sibling.start < end && sibling.start + sibling.text.length > start)
+    .some((sibling) => NON_SUCCESS_SIBLING.some((pattern) => pattern.test(sibling.text)));
+}
+
+/**
+ * Every high-impact assertion a clause makes, with where each one sits. All
+ * occurrences are scanned, not just the first: one properly carried mention of a
+ * wording must not vouch for a second mention elsewhere in the same clause.
+ */
+function highImpactMatchesIn(clause: string): HighImpactMatch[] {
+  const matches: HighImpactMatch[] = [];
+  for (const assertion of HIGH_IMPACT_ASSERTIONS) {
+    const scanner = new RegExp(
+      assertion.pattern.source,
+      assertion.pattern.flags.includes("g") ? assertion.pattern.flags : `${assertion.pattern.flags}g`,
+    );
+    let match = scanner.exec(clause);
+    while (match !== null) {
+      if (match[0].length === 0) {
+        scanner.lastIndex += 1;
+      } else if (!assertionIsSuppressed(clause, match.index, match.index + match[0].length)) {
+        matches.push({ assertion, start: match.index, end: match.index + match[0].length });
+      }
+      match = scanner.exec(clause);
+    }
+  }
+  return matches;
 }
 
 type SegmentSpan = Readonly<{
@@ -464,12 +515,9 @@ function clauseSpans(renderedMessage: string): { clause: string; start: number }
 function hasIncompatibleClaimText(candidate: ControllerFinalization, renderedMessage: string): boolean {
   const spans = segmentSpans(candidate);
   for (const { clause, start } of clauseSpans(renderedMessage)) {
-    if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) continue;
-    for (const assertion of HIGH_IMPACT_ASSERTIONS) {
-      const match = assertion.pattern.exec(clause);
-      if (!match) continue;
-      const assertionStart = start + match.index;
-      const assertionEnd = assertionStart + match[0].length;
+    for (const { assertion, start: matchStart, end: matchEnd } of highImpactMatchesIn(clause)) {
+      const assertionStart = start + matchStart;
+      const assertionEnd = start + matchEnd;
       const touched = spans.filter((span) => span.start < assertionEnd && span.end > assertionStart);
       if (touched.every((span) => span.segment.type === "text")) continue;
       const only = touched.length === 1 ? touched[0]!.segment : null;
