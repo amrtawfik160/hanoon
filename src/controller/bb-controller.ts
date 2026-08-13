@@ -102,6 +102,18 @@ const TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
 type BbSdk = BbPluginApi["sdk"];
 type ControllerPromptInput = Parameters<BbSdk["threads"]["send"]>[0]["input"];
 
+/**
+ * A lifecycle event the plugin cannot turn into a bounded reference. It is a
+ * boundary failure rather than a parse detail: the thread is blocked on
+ * something, and the plugin may not read past it without being able to say what.
+ */
+export class ControllerEventBoundaryError extends Error {
+  public constructor() {
+    super("Controller lifecycle event could not be projected into a bounded reference");
+    this.name = "ControllerEventBoundaryError";
+  }
+}
+
 export class ControllerImagePreparationError extends Error {
   public constructor(public readonly retryable: boolean) {
     super("Controller image could not be prepared");
@@ -110,9 +122,10 @@ export class ControllerImagePreparationError extends Error {
 }
 
 /**
- * Reads a lifecycle row into the bounded reference the plugin may act on. A
- * status the plugin cannot settle (`resolving`) is deliberately not a reference:
- * the durable row stays exactly as it is until BB reaches a final state.
+ * Reads a lifecycle row into the bounded reference the plugin may act on, or
+ * null when it cannot. Null is never "ignore this row": a status the plugin
+ * cannot settle (`resolving`) or an identity it cannot bound still names a live
+ * block, so the caller fails the window rather than reading past it.
  */
 function interactionReference(
   eventType: "system/userQuestion/lifecycle" | "system/permissionGrant/lifecycle",
@@ -281,6 +294,20 @@ export class BbControllerAdapter implements ControllerAdapter {
           windowFull = true;
           break;
         }
+        // Lifecycle rows are settled before the cursor moves past them. A row
+        // whose identity or status cannot be projected still names a boundary
+        // the thread is blocked on; consuming it would advance the cursor past
+        // the owner's only view of that block and let the turn terminalize as
+        // though nothing were waiting. The whole window fails instead, so the
+        // row stays unread and the caller retries or retires loudly.
+        if (row.type === "system/userQuestion/lifecycle" || row.type === "system/permissionGrant/lifecycle") {
+          const reference = interactionReference(row.type, row.data);
+          if (!reference) throw new ControllerEventBoundaryError();
+          // The same interaction reports every step of its life on this stream,
+          // so the last word about it wins: a later "resolved" retires it.
+          interactions.delete(reference.interactionId);
+          interactions.set(reference.interactionId, reference);
+        }
         latestSeq = Math.max(latestSeq, row.seq);
         if (row.type === "turn/input/accepted") inputAccepted = true;
         if (row.type === "item/agentMessage/delta") assistantOutputObserved = true;
@@ -299,15 +326,6 @@ export class BbControllerAdapter implements ControllerAdapter {
         }
         if (row.type === "system/error" || row.type === "provider/error") {
           error = "Controller provider turn failed";
-        }
-        // The same interaction reports every step of its life on this stream,
-        // so the last word about it wins: a later "resolved" retires it.
-        if (row.type === "system/userQuestion/lifecycle" || row.type === "system/permissionGrant/lifecycle") {
-          const reference = interactionReference(row.type, row.data);
-          if (reference) {
-            interactions.delete(reference.interactionId);
-            interactions.set(reference.interactionId, reference);
-          }
         }
       }
       if (rows.length < CONTROLLER_EVENT_PAGE_LIMIT) break;

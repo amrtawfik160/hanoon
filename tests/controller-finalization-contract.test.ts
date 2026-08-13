@@ -704,6 +704,128 @@ describe("claim outcome compatibility", () => {
     )).toMatchObject({ outcome: "accepted" });
   });
 
+  it.each([
+    ["a test run", "The tests passed.", "execution_result", "command_result"],
+    ["an implementation", "I implemented the fix.", "workspace_change", "workspace_change"],
+    ["a merge", "I merged the branch.", "pipeline_outcome", "pipeline_outcome"],
+    ["a credential rotation", "I rotated the credentials.", "external_mutation", "external_mutation"],
+  ] as const)("refuses %s asserted under a non-succeeded outcome", (_scenario, text, kind, proofKind) => {
+    // The right kind is not enough: success wording under a failed, observed, or
+    // uncertain declaration is still a success claim the declaration disowns.
+    for (const outcome of ["failed", "observed", "uncertain"] as const) {
+      expectRejection(
+        claimFinalization({ kind, outcome, text, evidenceRefs: ["evidence:1"] }),
+        contextWithEvidence(evidenceRow("evidence:1", proofKind, outcome === "failed" ? "failed" : "observed")),
+        "proof_incompatible",
+      );
+    }
+    expect(validateControllerFinalization(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("keeps genuinely negative wording compatible with a failed outcome", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "failed",
+        text: "The tests failed.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "failed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["text then claim", [
+      { type: "text" as const, text: "The fix is imple" },
+      { type: "claim" as const, text: "mented.", kind: "uncertainty" as const, outcome: "uncertain" as const,
+        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
+    ]],
+    ["claim then text", [
+      { type: "claim" as const, text: "The fix is imple", kind: "uncertainty" as const, outcome: "uncertain" as const,
+        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
+      { type: "text" as const, text: "mented." },
+    ]],
+    ["claim then claim", [
+      { type: "claim" as const, text: "The fix is imple", kind: "uncertainty" as const, outcome: "uncertain" as const,
+        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
+      { type: "claim" as const, text: "mented.", kind: "uncertainty" as const, outcome: "uncertain" as const,
+        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
+    ]],
+    ["three segments", [
+      { type: "text" as const, text: "The fix is " },
+      { type: "claim" as const, text: "imple", kind: "uncertainty" as const, outcome: "uncertain" as const,
+        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
+      { type: "text" as const, text: "mented." },
+    ]],
+  ])("refuses a high-impact assertion split across %s", (_scenario, segments) => {
+    // The owner reads the concatenation, so that is what must be proved.
+    expectRejection(
+      { disposition: "answered", segments, obligationRefs: [] },
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it("does not let a legitimate assertion elsewhere mask a split one", () => {
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [
+          {
+            type: "claim", text: "I implemented the fix.", kind: "workspace_change", outcome: "succeeded",
+            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
+          },
+          { type: "text", text: " The fix is imple" },
+          {
+            type: "claim", text: "mented.", kind: "uncertainty", outcome: "uncertain",
+            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
+          },
+        ],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "workspace_change", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("accepts a high-impact assertion wholly inside one compatible succeeded claim", () => {
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [
+          { type: "text", text: "Good news. " },
+          {
+            type: "claim", text: "I implemented the fix.", kind: "workspace_change", outcome: "succeeded",
+            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
+          },
+          { type: "text", text: " Anything else?" },
+        ],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "workspace_change", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("leaves ordinary multi-segment prose alone", () => {
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [
+          { type: "text", text: "The project has " },
+          {
+            type: "claim", text: "three worker profiles", kind: "observed_state", outcome: "observed",
+            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
+          },
+          { type: "text", text: " configured." },
+        ],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
   it("screens a clause joined by a conjunction, not only a new sentence", () => {
     expectRejection(
       claimFinalization({
@@ -958,7 +1080,7 @@ describe("bounded text heuristics", () => {
     expectRejection(candidate, emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
 
-  it("stops plain-text assertion concatenation at claim boundaries", () => {
+  it("does not let a claim boundary launder an assertion the owner still reads whole", () => {
     const candidate: ControllerFinalization = {
       disposition: "answered",
       segments: [
@@ -967,9 +1089,10 @@ describe("bounded text heuristics", () => {
       ],
       obligationRefs: [],
     };
+    // The owner reads "The fix is implemented." however it was assembled.
     expect(validateControllerFinalization(candidate, contextWithEvidence(
       evidenceRow("evidence:1", "project_state"),
-    ))).toMatchObject({ outcome: "accepted" });
+    ))).toMatchObject({ outcome: "rejected", code: "proof_incompatible" });
   });
 
   it("allows a high-impact assertion when it is carried by a compatible claim segment", () => {

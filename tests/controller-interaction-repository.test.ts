@@ -208,7 +208,7 @@ it("selects and promotes only the current generation after a controller rollover
   const staleApproval = {
     kind: "approval" as const,
     interactionId: "approval-generation-a",
-    summary: "wants to write a protected path",
+    summary: "wants to write config.ts",
     decisions: ["deny" as const],
   };
   expect(record(repository, staleApproval, "turn-1", 2)).toBe(true);
@@ -518,7 +518,7 @@ it("does not persist an unsafe approval sentinel supplied outside the parser", (
 
 it("does not let a token or free text skip the oldest pending interaction", () => {
   const { repository } = fixture();
-  expect(record(repository, { kind: "approval", interactionId: "older", summary: "wants to write a protected path", decisions: ["deny"] }, "turn-1", 1)).toBe(true);
+  expect(record(repository, { kind: "approval", interactionId: "older", summary: "wants to write config.ts", decisions: ["deny"] }, "turn-1", 1)).toBe(true);
   expect(record(repository, question, "turn-1", 2)).toBe(true);
   expect(repository.answerByToken({ token: questionOptionToken("int-question", "q1", "yes"), userId: "7", chatId: "7", now: 3 })).toEqual({ ok: false, reason: "stale" });
   expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "yes", now: 3 })).toEqual({ ok: false, reason: "stale" });

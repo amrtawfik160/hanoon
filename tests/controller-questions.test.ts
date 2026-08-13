@@ -185,12 +185,44 @@ it("reports an unrecognised permission subject as an unsupported reference", asy
   ]);
 });
 
-it("ignores a lifecycle status the plugin cannot act on", async () => {
-  const { adapter } = adapterFixture({ events: [lifecycleEvent(5, "resolving")] });
+it.each([
+  ["a status the plugin cannot act on", { status: "resolving" }],
+  ["an unknown status", { status: "who-knows" }],
+  ["an interaction id it cannot bound", { interactionId: "x".repeat(4_000) }],
+  ["a missing interaction id", { interactionId: undefined }],
+])("refuses to read past a lifecycle row carrying %s", async (_scenario, overrides) => {
+  const event = lifecycleEvent(5, "pending");
+  const { adapter } = adapterFixture({
+    events: [{ ...event, data: { ...event.data, ...overrides } }],
+  });
+
+  // Consuming this row would advance the cursor past a block the plugin cannot
+  // describe, losing it for good. Failing the whole window keeps it unread.
+  await expect(adapter.events("thr_controller", 0, AbortSignal.timeout(1_000)))
+    .rejects.toThrow(/lifecycle/i);
+});
+
+it("reads a window whose lifecycle rows are all projectable", async () => {
+  const { adapter } = adapterFixture({ events: [lifecycleEvent(5, "pending")] });
 
   const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
 
-  expect(observation.interactions).toEqual([]);
+  expect(observation.latestSeq).toBe(5);
+  expect(observation.interactions).toHaveLength(1);
+});
+
+it("keeps the cursor behind a malformed lifecycle row that follows good events", async () => {
+  const malformed = lifecycleEvent(6, "resolving");
+  const { adapter } = adapterFixture({
+    events: [
+      { id: "t5", threadId: "thr_controller", seq: 5, createdAt: 5, scope: { kind: "turn" },
+        type: "turn/input/accepted", data: {} },
+      malformed,
+    ],
+  });
+
+  await expect(adapter.events("thr_controller", 0, AbortSignal.timeout(1_000)))
+    .rejects.toThrow(/lifecycle/i);
 });
 
 it("steers a busy controller thread instead of starting a competing turn", async () => {
@@ -564,6 +596,44 @@ it("ignores an authoritative interaction whose returned identity does not match"
   // A reply about some other interaction proves nothing about this one, so the
   // cursor may not move past the event that named it.
   expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(0);
+});
+
+it("cannot complete a turn or advance the cursor on a malformed lifecycle row", async () => {
+  const fixture = storeFixture("service-malformed-lifecycle");
+  const { store, fence } = fixture;
+  const turn = submittedTurn(store, fence);
+  // The real adapter over a stream whose only lifecycle row is unprojectable.
+  const malformed = lifecycleEvent(5, "resolving");
+  const sdkAdapter = new BbControllerAdapter({
+    sdk: {
+      threads: {
+        get: vi.fn(async () => ({
+          id: "thr_controller", status: "active", providerId: "claude-code",
+          archivedAt: null, deletedAt: null,
+        })),
+        timeline: vi.fn(async () => ({ maxSeq: 5 })),
+        events: { list: vi.fn(async () => [malformed]) },
+        send: vi.fn(), spawn: vi.fn(), list: vi.fn(async () => []),
+        interactions: { get: vi.fn(), resolve: vi.fn(), list: vi.fn(async () => []) },
+      },
+      projects: { list: vi.fn(async () => []) },
+      hosts: { list: vi.fn(async () => []) },
+    } as unknown as BbPluginApi["sdk"],
+    pluginId: "telegram-agent",
+    executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+  });
+  const service = new LunaControllerService({
+    store, adapter: sdkAdapter, evidenceProjector,
+    interactionService: interactionServiceFor(fixture, { get: vi.fn(), resolve: vi.fn() }, () => 3_000),
+    clock: { now: () => 3_000 },
+  });
+  const signal = AbortSignal.timeout(2_000);
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  const observed = store.getControllerTurn(turn.id);
+  expect(observed?.bbEventSeq).toBe(0);
+  expect(observed?.state).toBe("submitted");
 });
 
 it("refuses to advance the cursor past an interaction BB could not describe", async () => {

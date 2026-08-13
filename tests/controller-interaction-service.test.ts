@@ -47,11 +47,12 @@ it("projects a safe approval while removing session approval and command credent
     availableDecisions: ["allow_once", "allow_for_session", "deny"],
   });
 
+  // An approval the plugin cannot state safely offers no decision at all: a
+  // button beside unreadable text is a choice made blind.
   expect(interaction).toEqual({
-    kind: "approval",
+    kind: "unsupported",
     interactionId: "approval-1",
-    summary: "wants to run:\n\n`a redacted command`",
-    decisions: ["allow_once", "deny"],
+    metadata: { sourceKind: "approval" },
   });
 });
 
@@ -103,13 +104,13 @@ it("uses a basename only for safe file-change paths", () => {
     kind: "approval",
     subject: { kind: "file_change", writeScope: "/root/.env" },
     availableDecisions: ["allow_once", "deny"],
-  })).toMatchObject({ kind: "approval", summary: "wants to write a protected path" });
+  })).toMatchObject({ kind: "unsupported", metadata: { sourceKind: "approval" } });
 });
 
 it.each(["--callback-url=https://x?nonce=secret", "TOKEN=secret echo hi", "echo $HOME", "curl https://u:p@host", "curl '?%74oken=secret'", "m%253AabcdefghijklmnopqrstuvwxyzABCDEF", "%ZZ"]) (
-  "redacts command material that could disclose a secret: %s", (command) => {
+  "refuses to offer a decision on command material that could disclose a secret: %s", (command) => {
     const projection = parseControllerInteraction("approval-safe", { kind: "approval", subject: { kind: "command", command }, availableDecisions: ["allow_once"] });
-    expect(projection).toMatchObject({ kind: "approval", summary: "wants to run:\n\n`a redacted command`" });
+    expect(projection).toMatchObject({ kind: "unsupported", metadata: { sourceKind: "approval" } });
     expect(JSON.stringify(projection)).not.toContain("secret");
   },
 );
@@ -190,12 +191,12 @@ it.each([
   "./secret",
   "src/../secret",
   "src//secret",
-])("projects unsafe file path %s as protected", (writeScope) => {
+])("refuses to offer a decision on unsafe file path %s", (writeScope) => {
   expect(parseControllerInteraction("approval-path", {
     kind: "approval",
     subject: { kind: "file_change", writeScope },
     availableDecisions: ["deny"],
-  })).toMatchObject({ kind: "approval", summary: "wants to write a protected path" });
+  })).toMatchObject({ kind: "unsupported", metadata: { sourceKind: "approval" } });
 });
 
 it("rejects question and option counts above the projection limits", () => {

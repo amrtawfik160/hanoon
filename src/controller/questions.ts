@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isUnsafeProviderText } from "./credential-policy";
+import { isSensitiveApprovalPathName, isUnsafeProviderText } from "./credential-policy";
 
 /** One selectable answer to a question the controller thread asked. */
 export type ControllerQuestionOption = {
@@ -269,11 +269,16 @@ function containsApprovalSecret(commandText: string): boolean {
 
 export function isSafeControllerApprovalSummary(summary: unknown): summary is string {
   if (typeof summary !== "string" || Buffer.byteLength(summary, "utf8") > 4_000) return false;
-  if (summary === "wants to run:\n\n`a redacted command`" || summary === "wants to write a protected path") return true;
+  // The projection no longer produces a redacted placeholder — an approval it
+  // cannot state becomes unsupported — so a stored row carrying one is a row
+  // this build could not have written and is not accepted back.
+  if (summary === "wants to run:\n\n`a redacted command`" || summary === "wants to write a protected path") {
+    return false;
+  }
   const command = /^wants to run:\n\n`([^`]*)`$/.exec(summary)?.[1];
   if (command !== undefined) return command.length > 0 && [...command].length <= MAX_PROMPT && !containsApprovalSecret(command);
   const basename = /^wants to write ([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/.exec(summary)?.[1];
-  return basename !== undefined;
+  return basename !== undefined && !isSensitiveApprovalPathName(basename);
 }
 
 function safeApprovalPath(rawPath: unknown): string | null {
@@ -281,19 +286,30 @@ function safeApprovalPath(rawPath: unknown): string | null {
     /^[A-Za-z]:/.test(rawPath) || rawPath === "~" || rawPath.startsWith("~/") || rawPath.includes("\\") ||
     rawPath.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
   const basename = rawPath.split("/").at(-1)!;
-  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(basename) ? basename : null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(basename)) return null;
+  // A file whose name is a secret by convention is not made safe by being a
+  // well-formed name.
+  return isSensitiveApprovalPathName(basename) ? null : basename;
 }
 
+/**
+ * The bounded approval the owner may act on, or null when there is no safe way
+ * to describe it. Null is deliberate rather than a redacted placeholder: a
+ * button that says "Allow once" beside text the owner cannot read is a decision
+ * made blind, so an approval the plugin cannot state becomes an unsupported
+ * interaction with no provider text and no buttons at all.
+ */
 function controllerApprovalSummary(subject: unknown): string | null {
   if (typeof subject !== "object" || subject === null) return null;
   const candidate = subject as Record<string, unknown>;
   if (candidate.kind === "command" && typeof candidate.command === "string") {
-    return containsApprovalSecret(candidate.command) || candidate.command.includes("`") || candidate.command.length === 0 || candidate.command.length > MAX_PROMPT
-      ? "wants to run:\n\n`a redacted command`"
-      : `wants to run:\n\n\`${candidate.command}\``;
+    if (containsApprovalSecret(candidate.command) || candidate.command.includes("`") ||
+      candidate.command.length === 0 || candidate.command.length > MAX_PROMPT) return null;
+    return `wants to run:\n\n\`${candidate.command}\``;
   }
   if (candidate.kind === "file_change") {
-    return `wants to write ${safeApprovalPath(candidate.writeScope) ?? "a protected path"}`;
+    const path = safeApprovalPath(candidate.writeScope);
+    return path === null ? null : `wants to write ${path}`;
   }
   return null;
 }

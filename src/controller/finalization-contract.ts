@@ -415,18 +415,69 @@ function highImpactAssertionsIn(clause: string): readonly (typeof HIGH_IMPACT_AS
   return HIGH_IMPACT_ASSERTIONS.filter((assertion) => assertion.pattern.test(clause));
 }
 
+type SegmentSpan = Readonly<{
+  start: number;
+  end: number;
+  segment: ControllerFinalization["segments"][number];
+}>;
+
+/** Where each segment's text lands in the message the owner actually reads. */
+function segmentSpans(candidate: ControllerFinalization): SegmentSpan[] {
+  const spans: SegmentSpan[] = [];
+  let offset = 0;
+  for (const segment of candidate.segments) {
+    spans.push({ start: offset, end: offset + segment.text.length, segment });
+    offset += segment.text.length;
+  }
+  return spans;
+}
+
+/** Each clause of the rendered message, with where it sits in that message. */
+function clauseSpans(renderedMessage: string): { clause: string; start: number }[] {
+  const spans: { clause: string; start: number }[] = [];
+  let cursor = 0;
+  for (const clause of textClauses(renderedMessage)) {
+    const start = renderedMessage.indexOf(clause, cursor);
+    if (start < 0) continue;
+    spans.push({ clause, start });
+    cursor = start + clause.length;
+  }
+  return spans;
+}
+
 /**
- * True when a claim's own words assert something its declared kind cannot
- * carry — "I merged the branch" filed as an observation of project state. The
- * proof rules already bound what evidence a kind admits, so pinning the kind to
- * the wording is what stops a mutation from being proved by having looked.
+ * True when a high-impact assertion the owner will read is not carried by a
+ * claim entitled to make it.
  *
- * Each clause is judged on its own, because a claim that reads state and
- * announces a merge in the same breath is still announcing a merge.
+ * The assertion is located in the rendered message rather than segment by
+ * segment, because the owner reads the concatenation: "The fix is imple" in a
+ * text segment followed by "mented." in a claim is the sentence "The fix is
+ * implemented", and splitting it must not launder it past the proof rules. An
+ * assertion may only stand if the whole of it sits inside a single claim whose
+ * kind admits that wording and whose outcome actually declares success — the
+ * right kind under a failed, observed, or uncertain outcome is a success claim
+ * its own declaration disowns.
+ *
+ * An assertion lying wholly in plain text is left to the unclaimed-text rule,
+ * which is what reports it.
  */
-function hasIncompatibleClaimText(candidateClaims: readonly ControllerClaim[]): boolean {
-  return candidateClaims.some((claim) => textClauses(claim.text).some((clause) =>
-    highImpactAssertionsIn(clause).some((assertion) => !assertion.kinds.includes(claim.kind))));
+function hasIncompatibleClaimText(candidate: ControllerFinalization, renderedMessage: string): boolean {
+  const spans = segmentSpans(candidate);
+  for (const { clause, start } of clauseSpans(renderedMessage)) {
+    if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) continue;
+    for (const assertion of HIGH_IMPACT_ASSERTIONS) {
+      const match = assertion.pattern.exec(clause);
+      if (!match) continue;
+      const assertionStart = start + match.index;
+      const assertionEnd = assertionStart + match[0].length;
+      const touched = spans.filter((span) => span.start < assertionEnd && span.end > assertionStart);
+      if (touched.every((span) => span.segment.type === "text")) continue;
+      const only = touched.length === 1 ? touched[0]!.segment : null;
+      if (!only || only.type !== "claim") return true;
+      if (!assertion.kinds.includes(only.kind) || only.outcome !== "succeeded") return true;
+    }
+  }
+  return false;
 }
 
 function plainTextRuns(candidate: ControllerFinalization): string[] {
@@ -467,14 +518,16 @@ function contextRejectionCode(
 }
 
 function claimRejectionCode(
-  candidateClaims: readonly ControllerClaim[],
+  candidate: ControllerFinalization,
+  renderedMessage: string,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
+  const candidateClaims = claims(candidate);
   if (hasDuplicateEvidenceReference(candidateClaims)) return "duplicate_evidence_reference";
   if (hasMissingEvidence(candidateClaims, context)) return "evidence_missing";
   if (hasSubjectMismatch(candidateClaims, context)) return "subject_mismatch";
   if (hasProofIncompatibility(candidateClaims, context)) return "proof_incompatible";
-  if (hasIncompatibleClaimText(candidateClaims)) return "proof_incompatible";
+  if (hasIncompatibleClaimText(candidate, renderedMessage)) return "proof_incompatible";
   return null;
 }
 
@@ -496,7 +549,7 @@ function semanticRejectionCode(
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
   return contextRejectionCode(context)
-    ?? claimRejectionCode(claims(candidate), context)
+    ?? claimRejectionCode(candidate, renderedMessage, context)
     ?? dispositionRejectionCode(candidate, context)
     ?? (isProcessOnly(candidate, renderedMessage) ? "process_only" : null)
     ?? (hasUnclaimedHighImpactText(candidate) ? "high_impact_text_unclaimed" : null);

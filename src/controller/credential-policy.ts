@@ -26,6 +26,35 @@ function hasUnsafeCallbackMaterial(text: string): boolean {
  * Fail-closed by construction — anything carrying credential or callback
  * material is unsafe, and callers downgrade rather than redact in place.
  */
+/**
+ * Command-line ways of handing a credential to a program without ever writing
+ * the word "password". `curl -u alice:hunter2` carries a live secret that no
+ * keyword screen would see.
+ */
+const CLI_CREDENTIAL_FLAG = [
+  /(?:^|\s)-[up](?:\s+|=)\S+/,
+  /(?:^|\s)--(?:user|username|password|pass|token|api[-_]?key|apikey|auth|secret|credential)s?(?:\s+|=)\S+/i,
+  /(?:^|\s)-H(?:\s+|=)['"]?\s*authorization\s*:/i,
+];
+
+/**
+ * File names that are secrets by convention. Approving a write to one is not
+ * something to render as an ordinary path.
+ */
+const SENSITIVE_PATH_NAME = [
+  /^\.?env(?:\..+)?$/i,
+  /^\.(?:npmrc|netrc|pgpass|htpasswd|pypirc|dockercfg)$/i,
+  /^id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$/i,
+  /^(?:credentials?|secrets?|passwords?|tokens?)(?:\..+)?$/i,
+  /\.(?:pem|key|p12|pfx|jks|keystore|asc|gpg|ppk)$/i,
+];
+
 export function isUnsafeProviderText(text: string): boolean {
-  return containsCredentialLikeText(text) || hasUnsafeCallbackMaterial(text);
+  return containsCredentialLikeText(text) || hasUnsafeCallbackMaterial(text) ||
+    CLI_CREDENTIAL_FLAG.some((pattern) => pattern.test(text));
+}
+
+/** True when a bare file name is one that conventionally holds a secret. */
+export function isSensitiveApprovalPathName(basename: string): boolean {
+  return SENSITIVE_PATH_NAME.some((pattern) => pattern.test(basename));
 }

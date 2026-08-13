@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
@@ -8,7 +9,13 @@ import { ControllerInteractionService } from "../src/controller/interaction-serv
 import { ControllerInteractionRepository } from "../src/storage/controller-interaction-repository";
 import { LunaControllerService } from "../src/controller/service";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
-import { parseControllerInteraction, parseThreadInteraction } from "../src/controller/questions";
+import {
+  isSafeControllerApprovalSummary,
+  parseControllerInteraction,
+  parseThreadInteraction,
+  renderControllerInteraction,
+} from "../src/controller/questions";
+import { TelegramIngress } from "../src/telegram/ingress";
 import { policyFixture } from "./helpers";
 import type { ControllerEvidenceReconciler } from "../src/controller/evidence-projector";
 
@@ -99,15 +106,81 @@ it.each([
   expect(JSON.stringify(projected)).not.toContain(SECRETS[field]);
 });
 
-it("downgrades an approval whose command carries a credential", () => {
+it.each([
+  ["a bearer header", `curl -H "Authorization: Bearer ${SECRETS.approval}"`],
+  ["CLI basic auth", "curl -u alice:hunter2 https://example.com/api"],
+  ["a long-form credential flag", "deploy --token abcdefghijklmnop"],
+  ["an inline assignment", "API_KEY=abcdef ./deploy.sh"],
+  ["a percent-encoded secret", "curl https://example.com/?token=%41%42%43%44"],
+  ["backticks", "echo `whoami`"],
+  ["an empty command", ""],
+  ["an over-long command", `echo ${"x".repeat(500)}`],
+] as const)("makes an approval carrying %s unsupported, with no buttons", (_scenario, command) => {
   const projected = parseControllerInteraction(INTERACTION_ID, {
     kind: "approval",
-    subject: { kind: "command", command: `curl -H "Authorization: Bearer ${SECRETS.approval}"` },
+    subject: { kind: "command", command },
     availableDecisions: ["allow_once", "deny"],
   });
 
-  expect(projected).toMatchObject({ kind: "approval", summary: "wants to run:\n\n`a redacted command`" });
-  expect(JSON.stringify(projected)).not.toContain(SECRETS.approval);
+  // An actionable button beside text the owner cannot read is a decision made
+  // blind, so the whole interaction is downgraded rather than redacted.
+  expect(projected).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "approval" },
+  });
+  const rendered = renderControllerInteraction(projected!);
+  expect(rendered?.reply_markup).toBeUndefined();
+  expect(JSON.stringify({ projected, rendered })).not.toContain(SECRETS.approval);
+  expect(JSON.stringify({ projected, rendered })).not.toContain("hunter2");
+  expect(JSON.stringify({ projected, rendered })).not.toContain("redacted");
+});
+
+it.each([
+  ["a dotfile environment file", ".env"],
+  ["an environment file variant", "env.production"],
+  ["stored credentials", "credentials.json"],
+  ["a private key", "id_rsa"],
+  ["a PEM file", "server.pem"],
+  ["an npm token file", ".npmrc"],
+  ["an absolute path", "/etc/shadow"],
+  ["a traversal", "../../etc/passwd"],
+] as const)("makes an approval to write %s unsupported, with no buttons", (_scenario, writeScope) => {
+  const projected = parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "file_change", writeScope },
+    availableDecisions: ["allow_once", "deny"],
+  });
+
+  expect(projected).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "approval" },
+  });
+  expect(renderControllerInteraction(projected!)?.reply_markup).toBeUndefined();
+});
+
+it("still offers exactly Allow once and Deny for a safe command and a safe path", () => {
+  const command = parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "command", command: "npm test" },
+    availableDecisions: ["allow_once", "deny"],
+  });
+  expect(command).toMatchObject({ kind: "approval", summary: "wants to run:\n\n`npm test`" });
+  expect(renderControllerInteraction(command!)?.reply_markup?.inline_keyboard.map((row) => row[0]?.text))
+    .toEqual(["Allow once", "Deny"]);
+
+  const path = parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "file_change", writeScope: "src/index.ts" },
+    availableDecisions: ["allow_once", "deny"],
+  });
+  expect(path).toMatchObject({ kind: "approval", summary: "wants to write index.ts" });
+  expect(renderControllerInteraction(path!)?.reply_markup?.inline_keyboard).toHaveLength(2);
+});
+
+it("refuses to persist a redacted placeholder as an approval summary", () => {
+  // The projection no longer produces these, so the durable validator must no
+  // longer accept them either.
+  expect(isSafeControllerApprovalSummary("wants to run:\n\n`a redacted command`")).toBe(false);
+  expect(isSafeControllerApprovalSummary("wants to write a protected path")).toBe(false);
+  expect(isSafeControllerApprovalSummary("wants to run:\n\n`npm test`")).toBe(true);
 });
 
 it("still projects an ordinary safe question and approval in full", () => {
@@ -168,7 +241,15 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     id: INTERACTION_ID, threadId: THREAD_ID, status: "pending", payload: leaked,
   }));
 
+  // Wired into the ingress audit logger, so the log assertion below is a real
+  // observation rather than a claim about an array nothing writes to.
   const logged: string[] = [];
+  new TelegramIngress({
+    store,
+    telegram: { sendMessage: async () => ({ message_id: 1 }), editMessage: async () => {}, answerCallback: async () => {} } as never,
+    auditLogger: (record) => { logged.push(JSON.stringify(record)); },
+    onWorkAvailable: () => undefined,
+  });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY, telegramUserId: OWNER, telegramChatId: OWNER,
     updateId: 300, inputText: "ship it", now: 2_000,
@@ -207,14 +288,22 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     .all() as { payload_json: string }[];
   expect(payloadRows).toHaveLength(1);
   const outbox = JSON.stringify(store.listOutbox(50));
-  const wholeDatabase = database
-    .prepare("SELECT group_concat(sql, ' ') AS schema FROM sqlite_master")
-    .get() as { schema: string | null };
+  // Every row of every table, plus the file on disk: a leak into any column of
+  // any table shows up here, which the schema DDL alone could never reveal.
+  const tables = database
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+    .all() as { name: string }[];
+  expect(tables.length).toBeGreaterThan(5);
+  const everyRow = tables
+    .map((table) => JSON.stringify(database.prepare(`SELECT * FROM "${table.name}"`).all()))
+    .join("\n");
+  const rawDatabaseBytes = readFileSync(database.name);
 
   for (const marker of ALL_MARKERS) {
     expect(payloadRows[0]!.payload_json).not.toContain(marker);
     expect(outbox).not.toContain(marker);
-    expect(wholeDatabase.schema ?? "").not.toContain(marker);
+    expect(everyRow).not.toContain(marker);
+    expect(rawDatabaseBytes.includes(Buffer.from(marker, "utf8"))).toBe(false);
     expect(logged.join("\n")).not.toContain(marker);
   }
   // The owner is still told the thread is blocked, just not with the secret.
