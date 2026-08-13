@@ -772,16 +772,27 @@ describe("fail-closed operational claim binding", () => {
   });
 
   it.each([
-    ["generic completion", "Everything is done.", "observed_state", "project_state"],
+    ["generic completion", "Everything is done.", "pipeline_outcome", "pipeline_outcome"],
     ["build success", "The build succeeded.", "execution_result", "command_result"],
     ["CI success", "CI is green.", "pipeline_outcome", "pipeline_outcome"],
     ["rollout success", "The rollout succeeded.", "pipeline_outcome", "pipeline_outcome"],
-    ["finished work", "The work is finished.", "observed_state", "project_state"],
+    ["finished work", "The work is finished.", "pipeline_outcome", "pipeline_outcome"],
   ] as const)("accepts %s when its claim kind and evidence carry the assertion", (_label, text, kind, proofKind) => {
     expect(validateControllerFinalization(
       claimFinalization({ kind, outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Everything is done.",
+    "The work is finished.",
+  ])("does not treat one successful project-state observation as proof of total completion: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "succeeded")),
+      "proof_incompatible",
+    );
   });
 
   it.each([

@@ -292,7 +292,7 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   },
   {
     pattern: new RegExp("\\b" + GENERIC_COMPLETION_SUBJECT + "\\s+" + OPERATIONAL_STATE_LINK + "\\s*" + OPERATIONAL_SUCCESS_STATE + "\\b", "i"),
-    kinds: ["observed_state"],
+    kinds: ["pipeline_outcome"],
   },
   {
     pattern: new RegExp("\\b(?:the\\s+)?(?:build|compile|compilation|artifact)\\s+" + OPERATIONAL_STATE_LINK + "\\s*" + OPERATIONAL_SUCCESS_STATE + "\\b", "i"),
