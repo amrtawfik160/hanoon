@@ -7,13 +7,13 @@ Date: 2026-08-12
 Compared baselines:
 
 - Hanoon at commit `8652692` (`bb-plugin-telegram-agent`)
-- Valor at commit `a13a31a083746d0c66e8cba17b84fea82c8b8096`
+- The comparison project at commit `a13a31a083746d0c66e8cba17b84fea82c8b8096`
 
 ## Verdict
 
 The Hanoon direction is correct, but the original sequencing was not strong enough to approve unchanged.
 
-The recommended architecture is a BB-native thin trust kernel followed by measured expansion. Hanoon should adapt Valor's implemented ideas where evaluation shows they improve outcomes—schema-first exits, bounded recovery, context fidelity modes, hybrid recall, telemetry, and budgets—while retaining BB as the provider/session/worktree harness and retaining SQLite effects, claims, approvals, and receipts as the authority.
+The recommended architecture is a BB-native thin trust kernel followed by measured expansion. Hanoon should adapt the comparison project's implemented ideas where evaluation shows they improve outcomes—schema-first exits, bounded recovery, context fidelity modes, hybrid recall, telemetry, and budgets—while retaining BB as the provider/session/worktree harness and retaining SQLite effects, claims, approvals, and receipts as the authority.
 
 Two items move into Slice 1 before broader autonomy:
 
@@ -22,7 +22,7 @@ Two items move into Slice 1 before broader autonomy:
 
 This changes the roadmap from “build breadth, then measure and generalize safety” to “establish the trust and measurement kernel, then add breadth only when it produces measured lift.” It does not authorize implementation.
 
-No source or code comparison proves that Hanoon is already more capable than Valor. That claim becomes defensible only after both systems are evaluated on the same task corpus, harness disclosure, tool access, model settings, and budget. Until then, “Valor-class breadth with stronger transactional safety” is a target, not a benchmark result.
+No source or code comparison proves that Hanoon is already more capable than the comparison project. That claim becomes defensible only after both systems are evaluated on the same task corpus, harness disclosure, tool access, model settings, and budget. Until then, “comparison-class breadth with stronger transactional safety” is a target, not a benchmark result.
 
 ## Method and limits
 
@@ -40,7 +40,7 @@ Concurrent uncommitted Hanoon production changes were not treated as part of the
 
 | Choice | Benefit | Cost and risk | Decision |
 | --- | --- | --- | --- |
-| Copy Valor's bridge, worker, subprocess harness, and ledger topology | Fast feature-name parity and a mature reference implementation | Duplicates BB ownership, adds Redis/process recovery, imports fail-open completion paths, and increases the number of authorities | Rejected |
+| Copy the comparison project's bridge, worker, subprocess harness, and ledger topology | Fast feature-name parity and a mature reference implementation | Duplicates BB ownership, adds Redis/process recovery, imports fail-open completion paths, and increases the number of authorities | Rejected |
 | Keep the original seven slices unchanged | Preserves the safe BB-native direction | Defers outcome evaluation to Slice 3 and generalized capability metadata to Slice 7, after the first autonomous behavior change | Rejected as sequenced |
 | BB-native thin trust kernel plus evaluation-first expansion | Preserves Hanoon's transactional strengths, uses BB primitives, and makes each later capability earn its complexity | Requires a small evaluation and policy foundation before visible breadth | Selected |
 
@@ -55,7 +55,7 @@ Design response:
 - keep the conversational controller model-directed;
 - keep merge, deployment, approvals, effects, and workflow advancement deterministic;
 - do not add another agent framework or provider runner;
-- do not add multi-agent roles merely to match Valor's role count.
+- do not add multi-agent roles merely to match the comparison project's role count.
 
 Sources: [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents), [A practical guide to building agents](https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/).
 
@@ -156,13 +156,13 @@ Design response:
 
 Sources: [Temporal Workflow Definition](https://docs.temporal.io/workflow-definition), [Temporal Activities](https://docs.temporal.io/activities).
 
-## Valor code audit
+## Comparison-project code audit
 
-The following observations refer to Valor commit `a13a31a083746d0c66e8cba17b84fea82c8b8096`.
+The following observations refer to comparison-project commit `a13a31a083746d0c66e8cba17b84fea82c8b8096`.
 
 ### Mechanisms to adapt
 
-| Valor mechanism | Observed source | Hanoon adaptation |
+| Comparison-project mechanism | Observed source | Hanoon adaptation |
 | --- | --- | --- |
 | Schema-first route with a bounded route enum and fallback telemetry | `agent/session_runner/router.py`, `PM_TURN_JSON_SCHEMA`; `agent/session_runner/runner.py`, `_classify_turn` | Use a stricter plugin-owned finalization tool whose acceptance is bound to current evidence; record every rejection and missing-finalizer continuation |
 | Normalized turn result and event seam | `agent/session_runner/harness/base.py`, `TurnRequest`, `TurnResult`, `TurnEvent`, `HarnessAdapter` | Reuse the conceptual normalization, but consume BB's provider/thread/item APIs instead of implementing another CLI adapter |
@@ -172,25 +172,25 @@ The following observations refer to Valor commit `a13a31a083746d0c66e8cba17b84fe
 | Schema fallback and completion-refusal metrics | `agent/session_runner/router.py`; `agent/session_runner/runner.py` | Add finalization acceptance, rejection, continuation, evidence-coverage, and unsupported-claim metrics |
 | Iterative prompt hypothesis and evaluation loop | `scripts/autoexperiment.py`, `ExperimentRunner` | Run only in an actual isolated BB worktree/branch, cap spend, use multiple trials, and emit a proposal or reviewed job rather than editing live configuration |
 
-Valor also documents useful operating principles in `CLAUDE.md`: context is a first-class resource, tools should be minimal and distinct, independent tasks may run concurrently, and repository rules should be mechanically enforced. Those principles are retained without copying Valor's runtime topology.
+The comparison project also documents useful operating principles in `CLAUDE.md`: context is a first-class resource, tools should be minimal and distinct, independent tasks may run concurrently, and repository rules should be mechanically enforced. Those principles are retained without copying the comparison project's runtime topology.
 
 ### Mechanisms not to copy
 
 #### Duplicate process and provider ownership
 
-Valor's bridge, Redis queue, standalone worker, CLI subprocess harness, resume-handle persistence, watchdog, and worktree manager solve responsibilities BB already owns for Hanoon. Copying them would introduce two session authorities and two recovery systems.
+the comparison project's bridge, Redis queue, standalone worker, CLI subprocess harness, resume-handle persistence, watchdog, and worktree manager solve responsibilities BB already owns for Hanoon. Copying them would introduce two session authorities and two recovery systems.
 
 Decision: BB remains the sole provider, thread, interaction, host, environment, and worktree harness.
 
 #### Fail-open completion
 
-`agent/session_runner/completion_guard.py` explicitly allows completion when the ledger query fails, when the ledger is empty, when a terminal pull-request state is unavailable, or when a free-form structured `blocked_reason` is present. This avoids wedging Valor but permits an unverified terminal result.
+`agent/session_runner/completion_guard.py` explicitly allows completion when the ledger query fails, when the ledger is empty, when a terminal pull-request state is unavailable, or when a free-form structured `blocked_reason` is present. This avoids wedging that system but permits an unverified terminal result.
 
 Decision: Hanoon's finalization remains fail-closed for success claims. A blocker may end an attempt only as a blocker outcome, never as successful completion, and it must not manufacture missing evidence.
 
 #### Raw or prefix-fallback delivery
 
-Valor correctly prefers structured routing and measures fallback, but `agent/session_runner/runner.py` can still deliver regex-classified payloads and floor-deliver prefixless wrap-up text.
+The comparison project correctly prefers structured routing and measures fallback, but `agent/session_runner/runner.py` can still deliver regex-classified payloads and floor-deliver prefixless wrap-up text.
 
 Decision: Hanoon delivers only an accepted structured finalization. A provider may receive one bounded corrective continuation; raw provider prose never becomes the durable Telegram answer.
 
@@ -281,7 +281,7 @@ Project context is a short map into structured source-of-truth documents and cur
 
 ## Power scorecard
 
-“More powerful than Valor” is evaluated across outcomes, not feature count:
+“More powerful than the comparison project” is evaluated across outcomes, not feature count:
 
 | Dimension | Required measure |
 | --- | --- |
@@ -296,7 +296,7 @@ Project context is a short map into structured source-of-truth documents and cur
 | Review quality | Defects found independently, remediation cycles, escaped regression rate |
 | Operator experience | Telegram decision completion, notification duplication, unresolved hidden interaction count |
 
-Two reports are needed for any direct Valor comparison:
+Two reports are needed for any direct comparison:
 
 1. a controlled comparison with the same tasks, tools, models, and budgets; and
 2. a strong-elicitation comparison where each system uses its best credible configuration and reports the differing harness and budget.

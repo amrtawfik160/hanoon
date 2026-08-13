@@ -101,7 +101,7 @@ The controller never writes an authoritative outcome directly. It invokes a capa
 
 ## Power target
 
-Hanoon targets Valor-class breadth through context rollover, durable memory, evaluated provider/model routing, fallback and health circuits, reusable workflow graphs, capability policy, rich artifacts, trace replay, outcome evaluations, and adaptive orchestration.
+Hanoon targets comparison-class breadth through context rollover, durable memory, evaluated provider/model routing, fallback and health circuits, reusable workflow graphs, capability policy, rich artifacts, trace replay, outcome evaluations, and adaptive orchestration.
 
 Hanoon is designed to exceed a process-centric harness where its existing architecture is stronger: the owner can operate it remotely from Telegram; BB supplies native provider sessions, interactions, hosts, environments, and worktrees; and the plugin binds autonomous work to transactional effects, resource claims, exact-head review, one-use approvals, deployment receipts, and duplicate-safe delivery. This is a design target, not a measured superiority claim. Power is measured by recoverable completed outcomes, safety, cost per successful outcome, and evidence under a disclosed harness and budget—not by the number of subprocess or prompt-management features copied into the plugin.
 
@@ -139,7 +139,7 @@ Each slice produces working software and an independently reviewable release. Sl
 
 ## Research-adjusted execution strategy
 
-The external research and Valor audit select a thin-kernel sequence:
+The external research and comparison-project audit select a thin-kernel sequence:
 
 1. **Trust and measure.** Slice 1 makes every Hanoon capability explicit, gates side effects before execution, validates the only owner-visible final action, and records a before/after outcome baseline.
 2. **Prove existing autonomy.** Slice 2 turns the current skill, milestone, acceptance, and scorecard contracts into durable evidence.
@@ -149,7 +149,7 @@ The external research and Valor audit select a thin-kernel sequence:
 6. **Generalize deterministic execution.** Slice 6 moves predictable transitions into recipes while keeping provider and external calls as fenced effects.
 7. **Expand the surface.** Slice 7 adds artifacts and connectors only through the capability, approval, credential, evidence, and evaluation contracts established earlier.
 
-The roadmap borrows Valor's schema-first exits, context fidelity modes, bounded recovery, hybrid-retrieval hypothesis, telemetry, and budgets. It deliberately does not copy Valor's bridge/Redis/worker/process topology, fail-open completion cases, regex or prefixless answer delivery, raw unknown telemetry payloads, or active-checkout prompt experiments.
+The roadmap borrows the comparison project's schema-first exits, context fidelity modes, bounded recovery, hybrid-retrieval hypothesis, telemetry, and budgets. It deliberately does not copy the comparison project's bridge/Redis/worker/process topology, fail-open completion cases, regex or prefixless answer delivery, raw unknown telemetry payloads, or active-checkout prompt experiments.
 
 ## Common data and module boundaries
 
