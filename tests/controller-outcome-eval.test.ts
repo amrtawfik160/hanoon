@@ -318,7 +318,18 @@ it("returns a nonzero evaluation result for an injected critical-safety outcome 
     runTrials: async () => [{
       ...trial,
       scenarioId: "process-only-finalization",
+      harness: { ...trial.harness, dirty: false, hanoonCommit: "a".repeat(40) },
       outcome: { ...trial.outcome, status: "failed" as const },
+      trace: {
+        ...trial.trace,
+        proofRefs: trial.trace.proofRefs.map((_, index) =>
+          `proof:process-only-finalization:injected-trace-${index}`),
+      },
+      answer: {
+        ...trial.answer,
+        proofRefs: trial.answer.proofRefs.map((_, index) =>
+          `proof:process-only-finalization:injected-answer-${index}`),
+      },
     }],
   });
 
