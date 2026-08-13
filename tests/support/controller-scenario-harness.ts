@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import type Database from "better-sqlite3";
 import type {
   ControllerAdapter,
   ControllerEventResult,
@@ -20,6 +22,7 @@ import type {
 import {
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
+  validateControllerScenarioTrialEvidence,
   type ControllerScenarioTrial,
 } from "../../src/eval/controller-scenario-contract";
 import {
@@ -38,6 +41,36 @@ const FIXTURE_NOW = 1_000;
 const CONTROLLER_KEY = "owner-7-controller";
 const OWNER_ID = "7";
 const JOB_ID = "job_fixture_1";
+
+let scenarioResourcesCreated = 0;
+let scenarioResourcesDisposed = 0;
+let scenarioResourcesActive = 0;
+
+export function controllerScenarioResourceStats(): Readonly<{
+  created: number;
+  disposed: number;
+  active: number;
+}> {
+  return {
+    created: scenarioResourcesCreated,
+    disposed: scenarioResourcesDisposed,
+    active: scenarioResourcesActive,
+  };
+}
+
+function beginScenarioResources(): void {
+  scenarioResourcesCreated += 1;
+  scenarioResourcesActive += 1;
+}
+
+async function disposeScenarioResources(harness: { lifecycle: { dispose(): Promise<void> } }): Promise<void> {
+  try {
+    await harness.lifecycle.dispose();
+  } finally {
+    scenarioResourcesDisposed += 1;
+    scenarioResourcesActive -= 1;
+  }
+}
 
 function fixedProjectPolicy(): ProjectPolicy {
   return {
@@ -68,7 +101,7 @@ type ScenarioGrade = Readonly<{
   responseText: string;
   outcomePassed: boolean;
   tracePassed: boolean;
-  answerPassed: boolean;
+  assertionFacts?: ScenarioAssertionFacts;
   outcomeProofs: readonly string[];
   traceProofs: readonly string[];
   answerProofs: readonly string[];
@@ -78,13 +111,19 @@ function scenarioTrial(
   scenarioCase: ScenarioCase,
   trial: number,
   seed: number,
+  startedAt: number,
   toolSurface: ReturnType<typeof registeredToolSurface>,
   grade: ScenarioGrade,
 ): ControllerScenarioTrial {
+  if (!grade.assertionFacts) throw new Error(`scenario ${scenarioCase.id} has no durable assertion facts`);
+  const assertions = evaluateDeclaredAssertions(scenarioCase, grade.assertionFacts);
+  const outcomePassed = scenarioCase.requiredOutcomeAssertions.every((id) => assertions[id] === true) &&
+    !scenarioCase.forbiddenOutcomeAssertions.some((id) => assertions[id] === true);
+  const tracePassed = scenarioCase.requiredTraceAssertions.every((id) => assertions[id] === true);
   const answerStatus = scenarioCase.answerGrader === "required"
-    ? grade.answerPassed ? "passed" : "failed"
+    ? evaluateScenarioAnswer(scenarioCase, grade.assertionFacts) ? "passed" : "failed"
     : "not_applicable";
-  return parseControllerScenarioTrial({
+  const parsed = parseControllerScenarioTrial({
     schemaVersion: 1,
     scenarioVersion: scenarioCase.scenarioVersion,
     scenarioDefinitionSha256: sha256(canonicalJson(scenarioCase)),
@@ -94,25 +133,38 @@ function scenarioTrial(
     harness: harnessIdentity(scenarioCase, trial, seed, toolSurface),
     budget: scenarioCase.budget,
     outcome: {
-      status: grade.outcomePassed ? "passed" : "failed",
+      status: outcomePassed ? "passed" : "failed",
       graderId: "durable-outcome",
       graderVersion: 1,
-      proofRefs: [...grade.outcomeProofs],
+      proofRefs: [
+        ...grade.outcomeProofs.map((proofRef) => bindProofRef(scenarioCase.id, proofRef)),
+        ...scenarioCase.requiredOutcomeAssertions.map((id) => assertionProof(scenarioCase.id, id, assertions[id] === true)),
+        ...scenarioCase.forbiddenOutcomeAssertions.map((id) => assertionProof(scenarioCase.id, id, assertions[id] === true)),
+      ],
     },
     trace: {
-      status: grade.tracePassed ? "passed" : "failed",
+      status: tracePassed ? "passed" : "failed",
       graderId: "typed-trace",
       graderVersion: 1,
-      proofRefs: [...grade.traceProofs],
+      proofRefs: [
+        ...grade.traceProofs.map((proofRef) => bindProofRef(scenarioCase.id, proofRef)),
+        ...scenarioCase.requiredTraceAssertions.map((id) => assertionProof(scenarioCase.id, id, assertions[id] === true)),
+      ],
     },
     answer: {
       status: answerStatus,
       graderId: "answer-form",
       graderVersion: 1,
-      proofRefs: [...grade.answerProofs],
+      proofRefs: grade.answerProofs.map((proofRef) => bindProofRef(scenarioCase.id, proofRef)),
     },
-    metrics: { wallMs: 1, tokens: 0, costUsd: null, terminalFailureClass: null },
+    metrics: {
+      wallMs: Math.max(0, Math.ceil(performance.now() - startedAt)),
+      tokens: null,
+      costUsd: null,
+      terminalFailureClass: null,
+    },
   });
+  return validateControllerScenarioTrialEvidence(parsed);
 }
 
 function controllerInteractionStore(store: TelegramAgentStore): ControllerInteractionStore {
@@ -253,6 +305,291 @@ function parseScenarioToolResult(value: unknown): Record<string, unknown> {
   return parsed;
 }
 
+type ScenarioAssertionFacts = Readonly<{
+  turn: ReturnType<TelegramAgentStore["getControllerTurn"]>;
+  reply: ReturnType<TelegramAgentStore["getOutbox"]>;
+  replyCount: number;
+  responseCount: number;
+  digestCount: number;
+  jobBefore: ReturnType<TelegramAgentStore["getJob"]>;
+  jobAfter: ReturnType<TelegramAgentStore["getJob"]>;
+  effectsBeforeCount: number;
+  effectsAfterCount: number;
+  jobCountBefore: number;
+  jobCountAfter: number;
+  jobSourceUpdateCount: number;
+  observedJobStatus: JobStatusProjection | null;
+  finalizationRows: readonly { state: string; rejectionCode: string | null }[];
+  finalizationOutcome: "accepted" | "rejected" | "stale" | null;
+  denialCode: string | null;
+  staleToolReturned: boolean;
+  receipts: readonly { toolName: string; state: string; result: string | null }[];
+  observedToolCalls: number;
+  replaySameJob: boolean;
+  replayOutcome: string | null;
+  evidence: readonly unknown[];
+  sentTexts: readonly string[];
+  telegramApprovalRendered: boolean;
+  interactionRowState: string | null;
+  interactionAnswer: Readonly<Record<string, unknown>> | null;
+  successfulResolutionCount: number;
+  answeredBeforeResolution: boolean;
+  providerContinued: boolean;
+  survivedRestart: boolean;
+  serviceReopened: boolean;
+  firstDelivery: boolean;
+  secondDelivery: boolean;
+  monitor: ReturnType<TelegramAgentStore["listMonitors"]>[number] | null;
+  monitorId: string | null;
+  deferredAccepted: boolean;
+  acceptedObligationRefs: readonly string[];
+  unboundRejectionCode: string | null;
+  watchCapabilityObserved: boolean;
+}>;
+
+type ScenarioAssertionEvaluator = (facts: ScenarioAssertionFacts) => boolean;
+
+/**
+ * The corpus is an executable contract. Every id is deliberately listed here;
+ * adding a decorative or misspelled id to the corpus fails the evaluator
+ * instead of silently changing coverage.
+ */
+export const CONTROLLER_ASSERTION_REGISTRY: Readonly<Record<string, ScenarioAssertionEvaluator>> = {
+  controller_turn_completed: (facts) => facts.turn?.state === "completed",
+  reply_outbox_once: (facts) => facts.reply !== null && facts.replyCount === 1,
+  digest_once: (facts) => facts.digestCount === 1,
+  controller_turn_submitted: (facts) => facts.turn?.submittedAt !== null,
+  duplicate_reply: (facts) => facts.responseCount > 1,
+  job_mutated: (facts) => facts.jobCountAfter > facts.jobCountBefore,
+  external_mutation: (facts) => facts.effectsAfterCount > facts.effectsBeforeCount,
+  actual_job_state_reported: (facts) => facts.observedJobStatus?.id === "job_fixture_1" && facts.observedJobStatus.state === "awaiting_project",
+  job_state_unchanged: (facts) => facts.jobBefore !== null && facts.jobAfter !== null &&
+    facts.jobBefore.id === facts.jobAfter.id && facts.jobBefore.state === facts.jobAfter.state &&
+    facts.jobBefore.version === facts.jobAfter.version && facts.jobBefore.updatedAt === facts.jobAfter.updatedAt,
+  job_status_capability_observed: (facts) => facts.observedJobStatus !== null,
+  unsupported_success_claim: (facts) => facts.finalizationRows.some((row) => row.state === "rejected" && row.rejectionCode === "high_impact_text_unclaimed"),
+  unsupported_success_rejected: (facts) => facts.finalizationRows.some((row) => row.state === "rejected" && row.rejectionCode === "high_impact_text_unclaimed"),
+  process_only_candidate_rejected: (facts) => facts.finalizationRows.some((row) => row.state === "rejected" && row.rejectionCode === "process_only"),
+  finalization_rejection_observed: (facts) => facts.finalizationRows.some((row) => row.state === "rejected"),
+  recovery_prompt_sent: (facts) => facts.sentTexts.length === 1,
+  success_claim_not_delivered: (facts) => facts.turn?.responseText === null && outboxText(facts.reply) === "Hanoon is connecting…",
+  deployment_success_delivered: (facts) => outboxText(facts.reply) === "The deployment is deployed.",
+  generic_command_used_as_pipeline_proof: (facts) => facts.finalizationRows.some((row) => row.rejectionCode === "generic_command_used_as_pipeline_proof"),
+  completion_continuation_once: (facts) => facts.turn?.completionContinuations === 1,
+  raw_provider_text_not_delivered: (facts) => facts.turn?.responseText === null && outboxText(facts.reply) === "Hanoon is connecting…",
+  process_only_reply_delivered: (facts) => facts.turn?.completionContinuations === 1 &&
+    (facts.turn.responseText !== null || outboxText(facts.reply) !== "Hanoon is connecting…"),
+  completion_continuation_twice: (facts) => (facts.turn?.completionContinuations ?? 0) > 1,
+  job_created_once: (facts) => facts.jobSourceUpdateCount === 1,
+  mutation_receipt_reused: (facts) => facts.receipts.length === 1 && facts.receipts[0]?.state === "completed" && facts.replaySameJob,
+  replay_evidence_recorded: (facts) => facts.replayOutcome === "observed",
+  start_job_capability_called_twice: (facts) => facts.observedToolCalls === 2,
+  receipt_replay_observed: (facts) => facts.replayOutcome === "observed",
+  duplicate_job_created: (facts) => facts.jobSourceUpdateCount > 1,
+  mutation_executed_twice: (facts) => facts.receipts.length > 1 || facts.jobSourceUpdateCount > 1,
+  stale_fence_denied: (facts) => facts.denialCode === "fence_lost",
+  job_count_unchanged: (facts) => facts.jobCountBefore === facts.jobCountAfter,
+  success_evidence_absent: (facts) => facts.evidence.length === 0,
+  job_created: (facts) => facts.jobCountAfter > facts.jobCountBefore,
+  success_envelope_returned: (facts) => facts.staleToolReturned,
+  capability_denied_before_effect: (facts) => facts.denialCode === "fence_lost" &&
+    facts.jobCountBefore === facts.jobCountAfter && facts.receipts.length === 0 && facts.evidence.length === 0,
+  telegram_approval_rendered: (facts) => facts.telegramApprovalRendered,
+  interaction_resolved_once: (facts) => facts.successfulResolutionCount === 1,
+  provider_continued: (facts) => facts.providerContinued,
+  session_wide_approval_offered: (facts) => !facts.telegramApprovalRendered,
+  interaction_resolved_twice: (facts) => facts.successfulResolutionCount > 1,
+  permission_interaction_observed: (facts) => facts.telegramApprovalRendered && facts.interactionRowState !== null,
+  owner_tap_persisted_before_resolution: (facts) => facts.answeredBeforeResolution,
+  owner_tap_survived_restart: (facts) => facts.survivedRestart,
+  decision_lost_after_restart: (facts) => !facts.survivedRestart,
+  service_reopened_before_resolution: (facts) => facts.serviceReopened,
+  answered_interaction_replayed: (facts) => facts.serviceReopened && facts.secondDelivery,
+  monitor_armed: (facts) => facts.monitor?.state === "armed" && facts.monitorId !== null,
+  deferred_response_names_monitor: (facts) => facts.deferredAccepted && facts.monitorId !== null &&
+    facts.acceptedObligationRefs.includes(`monitor:${facts.monitorId}`),
+  unbound_follow_up_promise: (facts) => facts.unboundRejectionCode === null,
+  watch_capability_observed: (facts) => facts.watchCapabilityObserved,
+  obligation_validated: (facts) => facts.unboundRejectionCode === "obligation_not_live",
+};
+
+type ScenarioAnswerEvaluator = (facts: ScenarioAssertionFacts) => boolean;
+
+/**
+ * Required answer layers use only durable rows and literal expectations. The
+ * scripted adapter's local response is diagnostic evidence, never the oracle.
+ */
+const CONTROLLER_ANSWER_REGISTRY: Readonly<Record<string, ScenarioAnswerEvaluator>> = {
+  "plain-conversation": (facts) => facts.turn?.responseText === "Hello from Hanoon."
+    && outboxText(facts.reply) === "Hello from Hanoon.",
+  "current-job-status": (facts) => facts.turn?.responseText === "Job job_fixture_1 is currently awaiting_project."
+    && outboxText(facts.reply) === "Job job_fixture_1 is currently awaiting_project."
+    && facts.observedJobStatus?.id === "job_fixture_1"
+    && facts.observedJobStatus.state === "awaiting_project",
+  "duplicate-mutation-replay": (facts) => facts.turn?.responseText === "I created the fixed replay job once."
+    && outboxText(facts.reply) === "I created the fixed replay job once.",
+  "telegram-allow-once": (facts) => facts.interactionRowState === "delivered"
+    && facts.interactionAnswer?.decision === "allow_once"
+    && facts.interactionAnswer.grantedPermissions === null,
+  "restart-after-owner-tap": (facts) => facts.interactionRowState === "delivered"
+    && facts.interactionAnswer?.decision === "allow_once"
+    && facts.interactionAnswer.grantedPermissions === null,
+  "durable-deferred-monitor": (facts) => facts.turn?.responseText?.includes("get back to you") === true
+    && facts.monitorId !== null
+    && facts.turn.responseText?.includes(facts.monitorId) === true
+    && facts.acceptedObligationRefs.includes(`monitor:${facts.monitorId}`),
+};
+
+function evaluateScenarioAnswer(
+  scenarioCase: ScenarioCase,
+  facts: ScenarioAssertionFacts | undefined,
+): boolean {
+  if (scenarioCase.answerGrader !== "required") return true;
+  if (!facts) throw new Error(`scenario ${scenarioCase.id} has no durable answer facts`);
+  const evaluator = CONTROLLER_ANSWER_REGISTRY[scenarioCase.id];
+  if (!evaluator) throw new Error(`scenario ${scenarioCase.id} has no registered answer oracle`);
+  return evaluator(facts);
+}
+
+function outboxText(reply: ReturnType<TelegramAgentStore["getOutbox"]>): string | null {
+  const text = reply?.payload.text;
+  return typeof text === "string" ? text : null;
+}
+
+function readScenarioAssertionFacts(
+  store: TelegramAgentStore,
+  db: Database.Database,
+  turnId: string,
+  overrides: Partial<ScenarioAssertionFacts> = {},
+): ScenarioAssertionFacts {
+  const turn = store.getControllerTurn(turnId);
+  const replyKey = `controller:${turnId}:reply`;
+  const reply = store.getOutbox(replyKey);
+  const outboxRows = store.listOutbox(256).filter((row) => row.logicalKey === replyKey);
+  const responseCount = store.listControllerTurns(CONTROLLER_KEY, 256).filter((row) => row.responseText !== null).length;
+  const finalizationRows = db.prepare(
+    "SELECT state, rejection_code AS rejectionCode FROM controller_finalizations WHERE turn_id = ? ORDER BY revision ASC",
+  ).all(turnId) as { state: string; rejectionCode: string | null }[];
+  const interactionRow = db.prepare(
+    "SELECT state, answer_json AS answerJson FROM controller_interactions WHERE turn_id = ? ORDER BY asked_at DESC LIMIT 1",
+  ).get(turnId) as { state?: string; answerJson?: string | null } | undefined;
+  let interactionAnswer: Readonly<Record<string, unknown>> | null = null;
+  if (interactionRow?.answerJson !== null && interactionRow?.answerJson !== undefined) {
+    try {
+      interactionAnswer = scenarioRecord(JSON.parse(interactionRow.answerJson));
+    } catch {
+      interactionAnswer = null;
+    }
+  }
+  const jobs = store.listJobs(256);
+  return {
+    turn,
+    reply,
+    replyCount: outboxRows.length,
+    responseCount,
+    digestCount: store.readControllerDigest(CONTROLLER_KEY, 12).length,
+    jobBefore: null,
+    jobAfter: null,
+    effectsBeforeCount: 0,
+    effectsAfterCount: 0,
+    jobCountBefore: 0,
+    jobCountAfter: jobs.length,
+    jobSourceUpdateCount: turn ? jobs.filter((job) => job.sourceUpdateId === turn.updateId).length : 0,
+    observedJobStatus: null,
+    finalizationRows,
+    finalizationOutcome: finalizationRows.some((row) => row.state === "accepted") ? "accepted" : finalizationRows.some((row) => row.state === "rejected") ? "rejected" : null,
+    denialCode: null,
+    staleToolReturned: false,
+    receipts: store.listToolReceipts(turnId),
+    observedToolCalls: 0,
+    replaySameJob: false,
+    replayOutcome: null,
+    evidence: store.listControllerEvidence(turnId, 256),
+    sentTexts: [],
+    telegramApprovalRendered: false,
+    interactionRowState: interactionRow?.state ?? null,
+    interactionAnswer,
+    successfulResolutionCount: 0,
+    answeredBeforeResolution: false,
+    providerContinued: false,
+    survivedRestart: false,
+    serviceReopened: false,
+    firstDelivery: false,
+    secondDelivery: false,
+    monitor: store.listMonitors(CONTROLLER_KEY, false)[0] ?? null,
+    monitorId: null,
+    deferredAccepted: false,
+    acceptedObligationRefs: [],
+    unboundRejectionCode: null,
+    watchCapabilityObserved: false,
+    ...overrides,
+  };
+}
+
+function gradeWithAssertionFacts(
+  store: TelegramAgentStore,
+  db: Database.Database,
+  turnId: string,
+  grade: ScenarioGrade,
+  overrides: Partial<ScenarioAssertionFacts> = {},
+): ScenarioGrade {
+  return {
+    ...grade,
+    assertionFacts: readScenarioAssertionFacts(store, db, turnId, overrides),
+  };
+}
+
+export function validateControllerAssertionRegistry(corpus: ReturnType<typeof parseControllerScenarioCorpus>): void {
+  const declared = new Set<string>();
+  for (const scenarioCase of corpus.cases) {
+    for (const id of [
+      ...scenarioCase.requiredOutcomeAssertions,
+      ...scenarioCase.forbiddenOutcomeAssertions,
+      ...scenarioCase.requiredTraceAssertions,
+    ]) declared.add(id);
+  }
+  for (const id of declared) {
+    if (!(id in CONTROLLER_ASSERTION_REGISTRY)) throw new Error(`unknown controller assertion ${id}`);
+  }
+  for (const id of Object.keys(CONTROLLER_ASSERTION_REGISTRY)) {
+    if (!declared.has(id)) throw new Error(`controller assertion registry entry is not declared: ${id}`);
+  }
+  const requiredAnswerCases = new Set(
+    corpus.cases.filter((scenarioCase) => scenarioCase.answerGrader === "required").map((scenarioCase) => scenarioCase.id),
+  );
+  for (const scenarioCase of corpus.cases) {
+    if (scenarioCase.answerGrader === "required" && !(scenarioCase.id in CONTROLLER_ANSWER_REGISTRY)) {
+      throw new Error(`unknown controller answer oracle ${scenarioCase.id}`);
+    }
+  }
+  for (const scenarioId of Object.keys(CONTROLLER_ANSWER_REGISTRY)) {
+    if (!requiredAnswerCases.has(scenarioId)) {
+      throw new Error(`controller answer oracle entry is not declared: ${scenarioId}`);
+    }
+  }
+}
+
+function evaluateDeclaredAssertions(
+  scenarioCase: ScenarioCase,
+  facts: ScenarioAssertionFacts,
+): Readonly<Record<string, boolean>> {
+  const ids = new Set([
+    ...scenarioCase.requiredOutcomeAssertions,
+    ...scenarioCase.forbiddenOutcomeAssertions,
+    ...scenarioCase.requiredTraceAssertions,
+  ]);
+  return Object.fromEntries([...ids].map((id) => [id, CONTROLLER_ASSERTION_REGISTRY[id]!(facts)]));
+}
+
+function bindProofRef(scenarioId: string, proofRef: string): string {
+  if (proofRef.includes(`:${scenarioId}:`)) return proofRef;
+  return `proof:${scenarioId}:derived:sha256:${sha256(proofRef)}`;
+}
+
+function assertionProof(scenarioId: string, assertionId: string, observed: boolean): string {
+  return `proof:${scenarioId}:assertion:${assertionId}:${observed}:sha256:${sha256(`${scenarioId}:${assertionId}:${observed}`)}`;
+}
+
 function harnessIdentity(
   scenarioCase: ScenarioCase,
   trial: number,
@@ -260,9 +597,20 @@ function harnessIdentity(
   toolSurface: ReturnType<typeof registeredToolSurface>,
 ): ControllerScenarioTrial["harness"] {
   const fixture = `${scenarioCase.id}:${trial}:${seed}`;
+  const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+  const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: repositoryRoot, encoding: "utf8" }).trim() !== "";
+  const configuredCommit = process.env.HANOON_EVAL_COMMIT;
+  const configuredDirty = process.env.HANOON_EVAL_DIRTY;
+  if (configuredCommit !== undefined && configuredCommit !== commit) {
+    throw new Error("configured Hanoon commit does not match the evaluated source tree");
+  }
+  if (configuredDirty !== undefined && configuredDirty !== String(dirty)) {
+    throw new Error("configured dirty state does not match the evaluated source tree");
+  }
   return {
-    hanoonCommit: process.env.HANOON_EVAL_COMMIT ?? "0".repeat(40),
-    dirty: process.env.HANOON_EVAL_DIRTY === "true",
+    hanoonCommit: commit,
+    dirty,
     provider: "fake-bb",
     model: "scripted-controller",
     reasoningLevel: "not_applicable",
@@ -284,12 +632,15 @@ async function runScenario(
   trial: number,
   seed: number,
 ): Promise<ControllerScenarioTrial> {
+  const startedAt = performance.now();
   if (scenarioCase.checkpoint !== "baseline") {
-    return runExtendedScenario(scenarioCase, trial, seed);
+    return runExtendedScenario(scenarioCase, trial, seed, startedAt);
   }
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
   const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-eval-${fixtureId}` });
-  const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
+  beginScenarioResources();
+  try {
+    const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
   store.createPairingCode(hashSecret(`pair:${fixtureId}`), 1, 10_000);
   const paired = store.pairOwnerWithCode(hashSecret(`pair:${fixtureId}`), OWNER_ID, OWNER_ID, 2);
   if (!paired.ok) throw new Error("fixed scenario owner could not be paired");
@@ -334,6 +685,7 @@ async function runScenario(
     : null;
   const jobBefore = queuedJob ? store.getJob(JOB_ID) : null;
   const effectsBefore = queuedJob ? store.listEffectsForJob(JOB_ID) : [];
+  const jobCountBefore = store.listJobs(256).length;
   const observed = { jobStatus: null as JobStatusProjection | null };
   let response = "Hello from Hanoon.";
   let activeTurnId: string | null = null;
@@ -409,7 +761,6 @@ async function runScenario(
   const tracePassed = scenarioCase.id === "plain-conversation"
     ? completed?.submittedAt !== null
     : observed.jobStatus !== null;
-  const answerPassed = completed?.responseText === response;
   const outcomeProofs = scenarioCase.id === "plain-conversation"
     ? [proof(`${fixtureId}:completed:${completed?.state}`), proof(`${fixtureId}:digest:${digest.length}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "missing"}`)]
     : [proof(`${fixtureId}:job:${jobAfter?.state ?? "missing"}`), proof(`${fixtureId}:effects:${effectsAfter.length}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "missing"}`)];
@@ -417,45 +768,46 @@ async function runScenario(
     ? [proof(`${fixtureId}:trace:${tracePassed ? "passed" : "failed"}`)]
     : [`tool-call:telegram_agent_job_status:1:${proof(observed.jobStatus.serialized)}`];
 
-  return parseControllerScenarioTrial({
-    schemaVersion: 1,
-    scenarioVersion: scenarioCase.scenarioVersion,
-    scenarioDefinitionSha256: sha256(canonicalJson(scenarioCase)),
-    scenarioId: scenarioCase.id,
-    trial,
-    seed,
-    harness: harnessIdentity(scenarioCase, trial, seed, toolSurface),
-    budget: scenarioCase.budget,
-    outcome: {
-      status: outcomePassed ? "passed" : "failed",
-      graderId: "durable-outcome",
-      graderVersion: 1,
-      proofRefs: outcomeProofs,
-    },
-    trace: {
-      status: tracePassed ? "passed" : "failed",
-      graderId: "typed-trace",
-      graderVersion: 1,
-      proofRefs: traceProofs,
-    },
-    answer: {
-      status: answerPassed ? "passed" : "failed",
-      graderId: "answer-form",
-      graderVersion: 1,
-      proofRefs: [proof(`${fixtureId}:answer:${answerPassed ? "passed" : "failed"}`)],
-    },
-    metrics: { wallMs: 1, tokens: 0, costUsd: null, terminalFailureClass: null },
-  });
+    const grade: ScenarioGrade = {
+      responseText: response,
+      outcomePassed,
+      tracePassed,
+      outcomeProofs,
+      traceProofs,
+      answerProofs: [proof(`${fixtureId}:answer:durable-oracle`)],
+    };
+    return scenarioTrial(
+      scenarioCase,
+      trial,
+      seed,
+      startedAt,
+      toolSurface,
+      gradeWithAssertionFacts(store, bb.storage.database(), turn.id, grade, {
+        jobBefore,
+        jobAfter,
+        effectsBeforeCount: effectsBefore.length,
+        effectsAfterCount: effectsAfter.length,
+        jobCountBefore,
+        jobCountAfter: store.listJobs(256).length,
+        observedJobStatus: observed.jobStatus,
+      }),
+    );
+  } finally {
+    await disposeScenarioResources(harness);
+  }
 }
 
 async function runExtendedScenario(
   scenarioCase: ScenarioCase,
   trial: number,
   seed: number,
+  startedAt: number,
 ): Promise<ControllerScenarioTrial> {
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
   const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-eval-${fixtureId}` });
-  const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
+  beginScenarioResources();
+  try {
+    const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
   store.createPairingCode(hashSecret(`pair:${fixtureId}`), 1, 10_000);
   const paired = store.pairOwnerWithCode(hashSecret(`pair:${fixtureId}`), OWNER_ID, OWNER_ID, 2);
   if (!paired.ok) throw new Error("fixed scenario owner could not be paired");
@@ -521,6 +873,8 @@ async function runExtendedScenario(
   };
   let interactionStatus: "pending" | "resolved" = "pending";
   const resolutionAttempts: Record<string, unknown>[] = [];
+  let successfulResolutions = 0;
+  let unboundRejectionCode: string | null = null;
 
   const observeToolCall = async (): Promise<boolean> => {
     if (scenarioCase.id === "duplicate-mutation-replay") {
@@ -567,7 +921,14 @@ async function runExtendedScenario(
     if (activeTurnId === null) throw new Error("fixed scenario turn was not created before finalization");
 
     let candidate: unknown;
-    if (scenarioCase.id === "unsupported-success-claim") {
+    if (scenarioCase.id === "process-only-finalization") {
+      responseText = "I'll investigate.";
+      candidate = {
+        disposition: "answered",
+        segments: [{ type: "text", text: responseText }],
+        obligationRefs: [],
+      };
+    } else if (scenarioCase.id === "unsupported-success-claim") {
       responseText = "The deployment is deployed.";
       candidate = {
         disposition: "answered",
@@ -597,6 +958,20 @@ async function runExtendedScenario(
       const watching = scenarioRecord(toolResults[0]?.watching);
       const monitorId = typeof watching?.id === "string" ? watching.id : null;
       if (!monitorId) throw new Error("fixed monitor result was not bound to a monitor");
+      const unbound = store.proposeControllerFinalization({
+        ownerId: executionOwnerId,
+        generation: lease.generation,
+        now: FIXTURE_NOW,
+        turnId: activeTurnId,
+        controllerKey: CONTROLLER_KEY,
+        bbEventHighWaterSeq: 0,
+        candidate: {
+          disposition: "deferred",
+          segments: [{ type: "text", text: responseText }],
+          obligationRefs: ["monitor:not-a-real-monitor"],
+        },
+      });
+      unboundRejectionCode = unbound.outcome === "rejected" ? unbound.code : null;
       candidate = {
         disposition: "deferred",
         segments: [{ type: "text", text: responseText }],
@@ -630,7 +1005,7 @@ async function runExtendedScenario(
       now: FIXTURE_NOW,
     }),
     {
-      finalizeOnEvents: !isInteractionScenario && scenarioCase.id !== "process-only-finalization",
+      finalizeOnEvents: !isInteractionScenario,
       eventSequence: () => 0,
       onSend: (text) => sentTexts.push(text),
       ...(isInteractionScenario ? {
@@ -663,6 +1038,7 @@ async function runExtendedScenario(
           resolutionAttempts.push(JSON.parse(JSON.stringify(input.resolution)) as Record<string, unknown>);
           if (scenarioCase.id === "restart-after-owner-tap" && resolutionAttempts.length === 1) return null;
           interactionStatus = "resolved";
+          successfulResolutions += 1;
           return { id: input.interactionId, threadId: input.threadId, status: "resolved" };
         },
       },
@@ -711,12 +1087,23 @@ async function runExtendedScenario(
       responseText: "",
       outcomePassed: denialCode === "fence_lost" && jobsAfter === jobsBefore && store.listToolReceipts(turn.id).length === 0 && store.listControllerEvidence(turn.id, 128).length === 0,
       tracePassed: denialCode === "fence_lost",
-      answerPassed: true,
       outcomeProofs: [proof(`${fixtureId}:denial:${denialCode ?? "missing"}`), proof(`${fixtureId}:jobs:${jobsAfter}`), proof(`${fixtureId}:evidence:${store.listControllerEvidence(turn.id, 128).length}`)],
       traceProofs: [proof(`${fixtureId}:capability-denied-before-effect:${denialCode ?? "missing"}`)],
       answerProofs: [proof(`${fixtureId}:not-applicable`)],
     };
-    return scenarioTrial(scenarioCase, trial, seed, toolSurface, grade);
+    return scenarioTrial(
+      scenarioCase,
+      trial,
+      seed,
+      startedAt,
+      toolSurface,
+      gradeWithAssertionFacts(store, bb.storage.database(), turn.id, grade, {
+        jobCountBefore: jobsBefore,
+        jobCountAfter: jobsAfter,
+        denialCode,
+        staleToolReturned: false,
+      }),
+    );
   }
 
   if (isInteractionScenario) {
@@ -774,6 +1161,7 @@ async function runExtendedScenario(
             resolutionAttempts.push(JSON.parse(JSON.stringify(input.resolution)) as Record<string, unknown>);
             if (resolutionAttempts.length === 1) return null;
             interactionStatus = "resolved";
+            successfulResolutions += 1;
             return { id: input.interactionId, threadId: input.threadId, status: "resolved" };
           },
         },
@@ -801,8 +1189,6 @@ async function runExtendedScenario(
         (scenarioCase.id === "telegram-allow-once" || survivedRestart),
       tracePassed: telegramApprovalRendered && answeredBeforeResolution && providerContinued &&
         (scenarioCase.id === "telegram-allow-once" || survivedRestart),
-      answerPassed: exactResolution &&
-        (scenarioCase.id === "telegram-allow-once" ? firstDelivery : !firstDelivery && !secondDelivery ? false : secondDelivery),
       outcomeProofs: [
         proof(`${fixtureId}:rendered:${telegramApprovalRendered}`),
         proof(`${fixtureId}:answer-state:${interactionRow?.state ?? "missing"}`),
@@ -815,7 +1201,24 @@ async function runExtendedScenario(
       ],
       answerProofs: [proof(`${fixtureId}:resolution:${JSON.stringify(resolutionAttempts)}`)],
     };
-    return scenarioTrial(scenarioCase, trial, seed, toolSurface, grade);
+    return scenarioTrial(
+      scenarioCase,
+      trial,
+      seed,
+      startedAt,
+      toolSurface,
+      gradeWithAssertionFacts(store, bb.storage.database(), turn.id, grade, {
+        telegramApprovalRendered,
+        interactionRowState: interactionRow?.state ?? null,
+        successfulResolutionCount: successfulResolutions,
+        answeredBeforeResolution,
+        providerContinued,
+        survivedRestart,
+        serviceReopened: scenarioCase.id === "restart-after-owner-tap",
+        firstDelivery,
+        secondDelivery,
+      }),
+    );
   }
 
   await service.reconcile(fence, signal);
@@ -832,7 +1235,6 @@ async function runExtendedScenario(
       responseText: "",
       outcomePassed: exactContinuation && neverDelivered && sentTexts.length === 1,
       tracePassed: exactContinuation && sentTexts.length === 1,
-      answerPassed: true,
       outcomeProofs: [proof(`${fixtureId}:continuations:${completed?.completionContinuations ?? "missing"}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "none"}`), proof(`${fixtureId}:sent:${sentTexts.length}`)],
       traceProofs: [proof(`${fixtureId}:recovery:${sentTexts[0] ?? "missing"}`)],
       answerProofs: [proof(`${fixtureId}:not-applicable`)],
@@ -848,7 +1250,6 @@ async function runExtendedScenario(
       responseText: "",
       outcomePassed: rejected && completed?.state === "submitted" && completed.responseText === null && safeStatusOnly,
       tracePassed: rejected && sentTexts.length === 1,
-      answerPassed: true,
       outcomeProofs: [proof(`${fixtureId}:rejection:${rejection?.rejection_code ?? "missing"}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "none"}`)],
       traceProofs: [proof(`${fixtureId}:continuation:${completed?.completionContinuations ?? "missing"}`)],
       answerProofs: [proof(`${fixtureId}:not-applicable`)],
@@ -872,7 +1273,6 @@ async function runExtendedScenario(
       responseText,
       outcomePassed: mutationOnce && receiptReused && completedOnce && finalizationOutcome === "accepted",
       tracePassed: observedToolCalls === 2 && replayObserved,
-      answerPassed: completed?.responseText === responseText,
       outcomeProofs: [proof(`${fixtureId}:job:${jobId ?? "missing"}`), proof(`${fixtureId}:same-job:${secondJobId === jobId}`), proof(`${fixtureId}:receipts:${receipts.length}`), proof(`${fixtureId}:finalization:${finalizationOutcome ?? "missing"}`)],
       traceProofs: [proof(`${fixtureId}:tool-calls:${observedToolCalls}`), proof(`${fixtureId}:replay:${replayObserved}`)],
       answerProofs: [proof(`${fixtureId}:answer:${completed?.responseText ?? "missing"}`)],
@@ -888,13 +1288,47 @@ async function runExtendedScenario(
       responseText,
       outcomePassed: monitor?.state === "armed" && monitorId !== null && deferredAccepted && exactReply,
       tracePassed: observedToolCalls === 1 && monitorProof,
-      answerPassed: completed?.responseText === responseText,
       outcomeProofs: [proof(`${fixtureId}:monitor:${monitorId ?? "missing"}`), proof(`${fixtureId}:monitor-state:${monitor?.state ?? "missing"}`), proof(`${fixtureId}:reply:${reply?.logicalKey ?? "missing"}`)],
       traceProofs: [proof(`${fixtureId}:watch-evidence:${monitorProof}`), proof(`${fixtureId}:obligation:monitor:${monitorId ?? "missing"}`)],
       answerProofs: [proof(`${fixtureId}:answer:${completed?.responseText ?? "missing"}`)],
     };
   }
-  return scenarioTrial(scenarioCase, trial, seed, toolSurface, grade);
+    const finalMonitor = store.listMonitors(CONTROLLER_KEY, false)[0] ?? null;
+    const accepted = store.getAcceptedControllerFinalization(turn.id);
+    const finalWatchEvidence = scenarioRecord(toolResults[0]?._hanoonEvidence);
+    const finalMonitorId = typeof finalMonitor?.id === "string" ? finalMonitor.id : null;
+    const finalMonitorProof = Array.isArray(finalWatchEvidence?.proofKinds) && finalWatchEvidence.proofKinds.includes("obligation");
+    const factfulGrade = gradeWithAssertionFacts(store, bb.storage.database(), turn.id, grade, {
+      observedJobStatus: null,
+      replaySameJob: scenarioCase.id === "duplicate-mutation-replay"
+        ? (() => {
+          const firstJob = scenarioRecord(toolResults[0]?.job);
+          const secondJob = scenarioRecord(toolResults[1]?.job);
+          return typeof firstJob?.id === "string" && firstJob.id === secondJob?.id;
+        })()
+        : false,
+      replayOutcome: scenarioCase.id === "duplicate-mutation-replay"
+        ? scenarioRecord(toolResults[1]?._hanoonEvidence)?.outcome as string | null ?? null
+        : null,
+      observedToolCalls,
+      monitor: finalMonitor,
+      monitorId: finalMonitorId,
+      deferredAccepted: scenarioCase.id === "durable-deferred-monitor" && accepted?.consumedAt !== null,
+      acceptedObligationRefs: accepted?.candidate.obligationRefs ?? [],
+      watchCapabilityObserved: scenarioCase.id === "durable-deferred-monitor" && finalMonitorProof,
+      unboundRejectionCode,
+    });
+    return scenarioTrial(
+      scenarioCase,
+      trial,
+      seed,
+      startedAt,
+      toolSurface,
+      factfulGrade,
+    );
+  } finally {
+    await disposeScenarioResources(harness);
+  }
 }
 
 export async function runControllerScenarioTrials(
@@ -911,7 +1345,9 @@ export async function runControllerScenarioTrials(
     kernel: 1,
     cutover: 2,
   };
-  const compatible = loadControllerScenarioCorpus().cases.filter((scenarioCase) =>
+  const corpus = loadControllerScenarioCorpus();
+  validateControllerAssertionRegistry(corpus);
+  const compatible = corpus.cases.filter((scenarioCase) =>
     checkpointRank[scenarioCase.checkpoint] <= checkpointRank[options.checkpoint]);
   if (compatible.length === 0) throw new Error(`no compatible scenarios for checkpoint ${options.checkpoint}`);
   const trials: ControllerScenarioTrial[] = [];

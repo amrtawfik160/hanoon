@@ -7,7 +7,7 @@ import {
   composeTurnInput,
   detectStandingInstruction,
 } from "../src/controller/context";
-import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
+import { seedCompletedControllerTurn } from "./support/controller-trust-fixtures";
 
 const NOW = 1_800_000_000_000;
 
@@ -17,7 +17,7 @@ function fixture() {
   const store = openStore(bb.storage, bb.storage.kv, () => NOW);
   store.createPairingCode(hashSecret("pair-context"), NOW - 1_000, NOW + 10_000);
   expect(store.pairOwnerWithPrivateChatCode(hashSecret("pair-context"), "7", "70", NOW - 500)).toEqual({ ok: true });
-  return { store };
+  return { db: bb.storage.database(), store };
 }
 
 describe("standing instruction capture", () => {
@@ -129,7 +129,7 @@ describe("turn context", () => {
 
 describe("conversation digest durability", () => {
   it("records each answered turn so a retired thread does not lose the conversation", () => {
-    const { store } = fixture();
+    const { db, store } = fixture();
     const turn = store.enqueueControllerTurn({
       controllerKey: "owner-7-controller",
       telegramUserId: "7",
@@ -159,7 +159,7 @@ describe("conversation digest durability", () => {
     })).toBe(true);
     expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
 
-    completeAcceptedControllerTurn(store, turn, fence, "Two threads are running.");
+    seedCompletedControllerTurn(db, turn, "Two threads are running.");
 
     expect(store.readControllerDigest("owner-7-controller", 5)).toEqual([
       { ownerText: "what is running?", agentText: "Two threads are running." },

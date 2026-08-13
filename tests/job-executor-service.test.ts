@@ -16,7 +16,7 @@ import type { WorkerLiveness } from "../src/domain/models";
 import { AutonomyRepository } from "../src/storage/autonomy-repository";
 import { AutonomyScheduler } from "../src/autonomy/scheduler";
 import { policyFixture } from "./helpers";
-import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
+import { seedCompletedControllerTurn } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -1334,7 +1334,7 @@ describe("singleton job executor", () => {
   });
 
   it("persists exactly one final controller message after ephemeral draft streaming", async () => {
-    const { store } = fixture();
+    const { db, store } = fixture();
     const turnId = addSubmittedControllerTurn(store);
     const abort = new AbortController();
     const sendMessage = vi.fn(async () => ({ message_id: 777 }));
@@ -1355,11 +1355,7 @@ describe("singleton job executor", () => {
       controller: {
         reconcile: vi.fn(async (fence) => {
           if (loop === 1) {
-            completeAcceptedControllerTurn(store, turnId, {
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-            }, "Final answer");
+            seedCompletedControllerTurn(db, turnId, "Final answer", 2_000);
           }
           return true;
         }),
@@ -1384,7 +1380,7 @@ describe("singleton job executor", () => {
   });
 
   it("reuses one Telegram draft id per chat so a stale preview cannot linger beside the next answer", async () => {
-    const { store } = fixture();
+    const { db, store } = fixture();
     const firstTurnId = addSubmittedControllerTurn(store);
     const abort = new AbortController();
     const sendMessage = vi.fn(async () => ({ message_id: 811 }));
@@ -1407,11 +1403,7 @@ describe("singleton job executor", () => {
           // The owner reads the answer and immediately asks the next question,
           // while Telegram still shows the previous 30-second preview.
           if (loop === 1) {
-            completeAcceptedControllerTurn(store, firstTurnId, {
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-            }, "First answer");
+            seedCompletedControllerTurn(db, firstTurnId, "First answer", 2_000);
             submitAnotherControllerTurn(store, fence, 901, 2_000);
           }
           return true;

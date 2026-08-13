@@ -7,7 +7,7 @@ import {
   TelegramPresenceCoordinator,
 } from "../src/services/telegram-presence";
 import type { JobLaneSnapshot } from "../src/services/job-lane-runner";
-import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
+import { seedCompletedControllerTurn } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -27,7 +27,7 @@ function controllerFixture() {
   const lease = store.acquireExecutorLease("executor", 2_000, 30_000);
   if (!lease.acquired) throw new Error("missing executor lease");
   const fence = { ownerId: "executor", generation: lease.generation, now: 2_000 };
-  return { store, turn, fence };
+  return { db: bb.storage.database(), store, turn, fence };
 }
 
 function jobPresenceStore() {
@@ -83,7 +83,7 @@ describe("Telegram presence target resolution", () => {
       chatId: "70",
     });
 
-    completeAcceptedControllerTurn(queued.store, queued.turn, queued.fence, "Done.");
+    seedCompletedControllerTurn(queued.db, queued.turn, "Done.");
     expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toBeNull();
   });
 

@@ -136,6 +136,8 @@ export function completeAcceptedControllerTurn(
   fence: ControllerLeaseFence,
   responseText: string,
 ): void {
+  // Kept for controller-store/controller-service completion coverage only;
+  // downstream consumers use seedCompletedControllerTurn below.
   const turn = typeof turnOrId === "string" ? store.getControllerTurn(turnOrId) : turnOrId;
   if (!turn) throw new Error("controller completion fixture turn is missing");
   if (!store.adoptSubmittedControllerTurnFence({ ...fence, turnId: turn.id })) {
@@ -163,6 +165,69 @@ export function completeAcceptedControllerTurn(
     bbHighWaterSeq: current.evidenceEventSeq,
   });
   if (completed !== "completed") throw new Error(`controller completion fixture returned ${completed}`);
+}
+
+/**
+ * Seeds the durable state consumed by downstream tests without exercising the
+ * completion implementation they are meant to observe. Completion-specific
+ * tests should continue to use completeAcceptedControllerTurn above.
+ */
+export function seedCompletedControllerTurn(
+  db: Database.Database,
+  turnOrId: ControllerTurnRecord | string,
+  responseText: string,
+  now = 2_000,
+): void {
+  const turnId = typeof turnOrId === "string" ? turnOrId : turnOrId.id;
+  const row = db.prepare(
+    `SELECT turn.id, turn.controller_key, turn.ordinal, turn.input_text,
+            controller.telegram_chat_id, turn.state
+       FROM controller_turns AS turn
+       JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+      WHERE turn.id = ?`,
+  ).get(turnId) as {
+    id: string;
+    controller_key: string;
+    ordinal: number;
+    input_text: string;
+    telegram_chat_id: string;
+    state: string;
+  } | undefined;
+  if (!row) throw new Error("controller seed turn is missing");
+  if (row.state !== "submitted") throw new Error(`controller seed turn is ${row.state}, not submitted`);
+
+  const payloadJson = JSON.stringify({ text: responseText, disable_web_page_preview: true });
+  db.transaction(() => {
+    const completed = db.prepare(
+      `UPDATE controller_turns
+          SET state = 'completed', response_text = ?, stream_text = '',
+              stream_phase = 'complete', last_error = NULL, completed_at = ?, updated_at = ?
+        WHERE id = ? AND state = 'submitted'`,
+    ).run(responseText, now, now, row.id);
+    if (completed.changes !== 1) throw new Error("controller seed turn was not submitted at write time");
+
+    db.prepare(
+      `INSERT INTO controller_digest (controller_key, ordinal, owner_text, agent_text, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (controller_key, ordinal) DO UPDATE
+         SET owner_text = excluded.owner_text, agent_text = excluded.agent_text`,
+    ).run(row.controller_key, row.ordinal, row.input_text, responseText, now);
+
+    db.prepare(
+      `INSERT INTO outbox (
+         logical_key, chat_id, message_id, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)
+       ON CONFLICT(logical_key) DO UPDATE SET
+         chat_id = excluded.chat_id,
+         payload_json = excluded.payload_json,
+         status = 'pending',
+         attempts = 0,
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = NULL,
+         updated_at = excluded.updated_at`,
+    ).run(`controller:${row.id}:reply`, row.telegram_chat_id, payloadJson, now, now, now);
+  }).immediate();
 }
 
 export function insertControllerTestJob(

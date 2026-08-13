@@ -3,9 +3,18 @@ import { chmodSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writ
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { aggregateControllerEvaluation } from "../src/eval/controller-scenario-contract";
-import { runControllerScenarioTrials } from "./support/controller-scenario-harness";
+import {
+  controllerScenarioResourceStats,
+  loadControllerScenarioCorpus,
+  runControllerScenarioTrials,
+  validateControllerAssertionRegistry,
+} from "./support/controller-scenario-harness";
+import {
+  seedCompletedControllerTurn,
+  submittedControllerFixture,
+} from "./support/controller-trust-fixtures";
 
 type RunnerModule = {
   classifyControllerEvidence(trials: Awaited<ReturnType<typeof runControllerScenarioTrials>>): "fixed" | "smoke" | "strong";
@@ -47,6 +56,37 @@ it("writes a bounded fixed-harness report with disclosed denominators", async ()
   ]));
 });
 
+it("seeds downstream completed state without invoking production completion methods", async () => {
+  const fixture = submittedControllerFixture();
+  try {
+    vi.spyOn(fixture.store, "adoptSubmittedControllerTurnFence").mockImplementation(() => {
+      throw new Error("production adoption must not seed this downstream fixture");
+    });
+    vi.spyOn(fixture.store, "proposeControllerFinalization").mockImplementation(() => {
+      throw new Error("production proposal must not seed this downstream fixture");
+    });
+    vi.spyOn(fixture.store, "completeControllerTurnFromFinalization").mockImplementation(() => {
+      throw new Error("production completion must not seed this downstream fixture");
+    });
+
+    seedCompletedControllerTurn(fixture.db, fixture.turn, "independently seeded answer");
+
+    expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
+      state: "completed",
+      responseText: "independently seeded answer",
+    });
+    expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 5)).toEqual([
+      { ownerText: fixture.turn.inputText, agentText: "independently seeded answer" },
+    ]);
+    expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({
+      status: "pending",
+      payload: { text: "independently seeded answer" },
+    });
+  } finally {
+    await fixture.harness.lifecycle.dispose();
+  }
+});
+
 it("refuses to overwrite an existing outcome report without --replace", async () => {
   const output = evaluationOutput();
   const args = [
@@ -76,7 +116,7 @@ it("replaces an existing report with owner-only permissions when --replace is su
   expect(statSync(output).mode & 0o777).toBe(0o600);
 });
 
-it("requires an absolute output path even when a relative path resolves outside the repository", async () => {
+  it("requires an absolute output path even when a relative path resolves outside the repository", async () => {
   const directory = mkdtempSync(join(tmpdir(), "hanoon-eval-"));
   const output = join(directory, "baseline.json");
   try {
@@ -131,8 +171,82 @@ it("records the current job status through the registered controller tool", asyn
 
   expect(statusTrial?.trace).toMatchObject({
     status: "passed",
-    proofRefs: [expect.stringMatching(/^tool-call:telegram_agent_job_status:1:sha256:[0-9a-f]{64}$/)],
+    proofRefs: [
+      expect.stringMatching(/^proof:current-job-status:/),
+      expect.stringMatching(/assertion:job_status_capability_observed:true:sha256:[0-9a-f]{64}$/),
+    ],
   });
+
+});
+
+it("classifies missing fixed identity as strong evidence rather than fixed", async () => {
+  const runner = await runnerModule();
+  const [fixedTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  expect(runner.classifyControllerEvidence([
+    { ...fixedTrial, scenarioDefinitionSha256: undefined },
+  ])).toBe("strong");
+  expect(runner.classifyControllerEvidence([
+    { ...fixedTrial, harness: { ...fixedTrial.harness, outerTaskTools: undefined } },
+  ])).toBe("strong");
+});
+
+it("fails closed when the corpus adds an unknown or decorative assertion", () => {
+  const corpus = loadControllerScenarioCorpus();
+  expect(() => validateControllerAssertionRegistry({
+    ...corpus,
+    cases: corpus.cases.map((scenarioCase, index) => index === 0
+      ? { ...scenarioCase, requiredOutcomeAssertions: [...scenarioCase.requiredOutcomeAssertions, "decorative_assertion"] }
+      : scenarioCase),
+  })).toThrow(/unknown controller assertion/i);
+});
+
+it("fails before writing when the current identity or trial is dirty", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const output = evaluationOutput();
+  await expect(runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: false,
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [{ ...trial, harness: { ...trial.harness, dirty: true, hanoonCommit: "a".repeat(40) } }],
+  })).rejects.toThrow(/dirty/i);
+  expect(() => readFileSync(output, "utf8")).toThrow();
+});
+
+it("records measured wall time and explicit unavailable token usage", async () => {
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  expect(trial.metrics.wallMs).toBeGreaterThan(0);
+  expect(trial.metrics.tokens).toBeNull();
+});
+
+it("disposes every repeated scenario resource, including restart scenarios", async () => {
+  const before = controllerScenarioResourceStats();
+  await runControllerScenarioTrials({ checkpoint: "cutover", trials: 2, seed: 8122026 });
+  const after = controllerScenarioResourceStats();
+  expect(after.created - before.created).toBe(18);
+  expect(after.disposed - before.disposed).toBe(18);
+  expect(after.active).toBe(0);
+});
+
+it("disposes the current resource when trial construction throws", async () => {
+  const before = controllerScenarioResourceStats();
+  const priorCommit = process.env.HANOON_EVAL_COMMIT;
+  process.env.HANOON_EVAL_COMMIT = "f".repeat(40);
+  try {
+    await expect(runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 }))
+      .rejects.toThrow(/configured Hanoon commit/i);
+  } finally {
+    if (priorCommit === undefined) delete process.env.HANOON_EVAL_COMMIT;
+    else process.env.HANOON_EVAL_COMMIT = priorCommit;
+  }
+  const after = controllerScenarioResourceStats();
+  expect(after.created - before.created).toBe(1);
+  expect(after.disposed - before.disposed).toBe(1);
+  expect(after.active).toBe(0);
 });
 
 it("discloses the registered controller tool surface deterministically", async () => {
@@ -235,6 +349,9 @@ it("runs every kernel and cutover case as a durable fixed scenario", async () =>
   for (const currentTrial of [...kernelTrials, ...cutoverTrials]) {
     expect(currentTrial.outcome.status, currentTrial.scenarioId).toBe("passed");
     expect(currentTrial.outcome.proofRefs.length, currentTrial.scenarioId).toBeGreaterThan(0);
+    if (currentTrial.answer.status === "passed") {
+      expect(currentTrial.answer.proofRefs.length, currentTrial.scenarioId).toBeGreaterThan(0);
+    }
   }
 });
 

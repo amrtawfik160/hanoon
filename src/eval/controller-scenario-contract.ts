@@ -37,12 +37,22 @@ const assertionListSchema = z.array(assertionIdSchema).max(16).refine(unique, "a
 const layerStatusSchema = z.enum(["passed", "failed", "incomplete", "not_applicable"]);
 const scenarioLayerStatusSchema = z.enum(["passed", "failed", "incomplete"]);
 const proofReferencesSchema = z.array(z.string().min(1).max(256)).max(128).refine(unique, "proof references must be unique");
-const controllerLayerGradeSchema = z.object({
+const controllerLayerGradeFieldsSchema = z.object({
   status: layerStatusSchema,
   graderId: graderIdSchema,
   graderVersion: z.number().int().min(1).max(10_000),
   proofRefs: proofReferencesSchema,
 }).strict();
+
+function controllerLayerGradeSchemaFor(status: typeof layerStatusSchema | typeof scenarioLayerStatusSchema) {
+  return controllerLayerGradeFieldsSchema.extend({ status }).superRefine((grade, context) => {
+  if (grade.status === "passed" && grade.proofRefs.length === 0) {
+    context.addIssue({ code: "custom", path: ["proofRefs"], message: "passed layers require proof references" });
+  }
+  });
+}
+
+const controllerLayerGradeSchema = controllerLayerGradeSchemaFor(layerStatusSchema);
 
 const controllerScenarioCaseSchema = z.object({
   id: scenarioIdSchema,
@@ -67,7 +77,8 @@ export const controllerScenarioCorpusSchema = z.object({
 
 const controllerMetricsSchema = z.object({
   wallMs: z.number().int().min(0).max(3_600_000),
-  tokens: z.number().int().min(0).max(2_000_000),
+  /** Provider token usage is nullable when the adapter does not expose it. */
+  tokens: z.number().int().min(0).max(2_000_000).nullable(),
   costUsd: z.number().min(0).max(1_000).nullable(),
   terminalFailureClass: z.string().min(1).max(120).nullable(),
 }).strict();
@@ -81,8 +92,8 @@ export const controllerScenarioTrialSchema = z.object({
   seed: z.number().int().min(0).max(2_147_483_647),
   harness: controllerHarnessIdentitySchema,
   budget: controllerTrialBudgetSchema,
-  outcome: controllerLayerGradeSchema.extend({ status: scenarioLayerStatusSchema }),
-  trace: controllerLayerGradeSchema.extend({ status: scenarioLayerStatusSchema }),
+  outcome: controllerLayerGradeSchemaFor(scenarioLayerStatusSchema),
+  trace: controllerLayerGradeSchemaFor(scenarioLayerStatusSchema),
   answer: controllerLayerGradeSchema,
   metrics: controllerMetricsSchema,
 }).strict();
@@ -220,6 +231,29 @@ export function parseControllerScenarioTrial(candidate: unknown): ControllerScen
   return controllerScenarioTrialSchema.parse(candidate);
 }
 
+/**
+ * Validate evidence produced by the current evaluator. Historical reports may
+ * still parse with their older proof spelling, but a new fixed trial must bind
+ * every passed proof to its scenario subject.
+ */
+export function validateControllerScenarioTrialEvidence(
+  candidate: unknown,
+): ControllerScenarioTrial {
+  const trial = parseControllerScenarioTrial(candidate);
+  for (const [layerName, layer] of Object.entries({
+    outcome: trial.outcome,
+    trace: trial.trace,
+    answer: trial.answer,
+  })) {
+    if (layer.status !== "passed") continue;
+    const subjectMarker = `:${trial.scenarioId}:`;
+    if (!layer.proofRefs.every((proofRef) => proofRef.includes(subjectMarker))) {
+      throw new Error(`${layerName} proof references are not subject-bound to ${trial.scenarioId}`);
+    }
+  }
+  return trial;
+}
+
 export function parseControllerEvaluationReport(candidate: unknown): ControllerEvaluationReport {
   return controllerEvaluationReportSchema.parse(candidate);
 }
@@ -264,9 +298,12 @@ function canonicalComparisonValue(comparisonValue: unknown): string {
 }
 
 function trialSignature(trial: ControllerScenarioTrial): ComparableTrialSignature {
+  if (trial.harness.outerTaskTools === undefined) {
+    throw new Error(`fixed comparison trial ${trial.scenarioId}:${trial.trial} is missing outer task tool identity`);
+  }
   return {
     scenarioVersion: trial.scenarioVersion,
-    outerTaskTools: trial.harness.outerTaskTools ?? [],
+    outerTaskTools: trial.harness.outerTaskTools,
     provider: trial.harness.provider,
     model: trial.harness.model,
     reasoningLevel: trial.harness.reasoningLevel,
@@ -324,6 +361,23 @@ function assertCleanFixedReport(report: ControllerEvaluationReport, label: "base
   }
 }
 
+function requiredFixedIdentity(
+  trial: ControllerScenarioTrial,
+  side: "baseline" | "after",
+  key: string,
+): { scenarioDefinitionSha256: string; outerTaskTools: readonly string[] } {
+  if (trial.scenarioDefinitionSha256 === undefined) {
+    throw new Error(`fixed comparison ${side} trial ${key} ${trial.trial} is missing scenario definition identity`);
+  }
+  if (trial.harness.outerTaskTools === undefined) {
+    throw new Error(`fixed comparison ${side} trial ${key} ${trial.trial} is missing outer task tool identity`);
+  }
+  return {
+    scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
+    outerTaskTools: trial.harness.outerTaskTools,
+  };
+}
+
 function reportTrialsForKey(report: ControllerEvaluationReport, key: string): ControllerScenarioTrial[] {
   return report.trials.filter((trial) => comparisonScenarioKey(trial.scenarioId, trial.scenarioVersion) === key);
 }
@@ -337,9 +391,13 @@ function assertFixedComparisonIdentity(
   for (const baselineTrial of baselineTrials) {
     const afterTrial = afterByTrial.get(baselineTrial.trial);
     if (!afterTrial) continue;
-    if (baselineTrial.scenarioDefinitionSha256 !== undefined && afterTrial.scenarioDefinitionSha256 !== undefined &&
-        baselineTrial.scenarioDefinitionSha256 !== afterTrial.scenarioDefinitionSha256) {
+    const baselineIdentity = requiredFixedIdentity(baselineTrial, "baseline", key);
+    const afterIdentity = requiredFixedIdentity(afterTrial, "after", key);
+    if (baselineIdentity.scenarioDefinitionSha256 !== afterIdentity.scenarioDefinitionSha256) {
       throw new Error(`fixed comparison is not comparable for ${key} trial ${baselineTrial.trial} scenario definition`);
+    }
+    if (JSON.stringify(baselineIdentity.outerTaskTools) !== JSON.stringify(afterIdentity.outerTaskTools)) {
+      throw new Error(`fixed comparison is not comparable for ${key} trial ${baselineTrial.trial} outer task tools`);
     }
     if (comparableTrialIdentity(baselineTrial) !== comparableTrialIdentity(afterTrial)) {
       throw new Error(`fixed comparison is not comparable for ${key} trial ${baselineTrial.trial}`);
@@ -384,6 +442,7 @@ export function compareControllerEvaluations(input: Readonly<{
     throw new Error("fixed comparison requires fixed baseline and after reports");
   }
   assertCleanFixedReport(baseline, "baseline");
+  assertCleanFixedReport(after, "after");
   const baselineKeys = reportScenarioKeys(baseline);
   const afterKeys = reportScenarioKeys(after);
   const commonKeys = [...baselineKeys].filter((key) => afterKeys.has(key));

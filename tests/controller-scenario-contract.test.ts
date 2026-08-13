@@ -4,12 +4,14 @@ import {
   aggregateControllerEvaluation,
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
+  validateControllerScenarioTrialEvidence,
   type ControllerScenarioTrial,
 } from "../src/eval/controller-scenario-contract";
 
 const baseTrial: ControllerScenarioTrial = {
   schemaVersion: 1 as const,
   scenarioVersion: 1,
+  scenarioDefinitionSha256: "1".repeat(64),
   scenarioId: "plain-conversation",
   trial: 1,
   seed: 8122026,
@@ -26,14 +28,15 @@ const baseTrial: ControllerScenarioTrial = {
     capabilityManifestSha256: "d".repeat(64),
     policySha256: "e".repeat(64),
     contextSha256: "f".repeat(64),
+    outerTaskTools: [],
     advertisedTools: [],
     parameterSchemaSha256: {},
   },
   budget: { maxTurns: 2, maxToolCalls: 8, maxTokens: 20_000, maxWallMs: 30_000, maxCostUsd: null },
-  outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: [] },
-  trace: { status: "passed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: [] },
+  outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: ["proof:plain-conversation:outcome:sha256:" + "2".repeat(64)] },
+  trace: { status: "passed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: ["proof:plain-conversation:trace:sha256:" + "3".repeat(64)] },
   answer: { status: "not_applicable" as const, graderId: "answer-form", graderVersion: 1, proofRefs: [] },
-  metrics: { wallMs: 1, tokens: 0, costUsd: null, terminalFailureClass: null },
+  metrics: { wallMs: 2, tokens: null, costUsd: null, terminalFailureClass: null },
 };
 
 function trial(overrides: Partial<ControllerScenarioTrial> = {}): ControllerScenarioTrial {
@@ -57,8 +60,8 @@ describe("controller scenario contract", () => {
       generatedAt: "2026-08-12T00:00:00.000Z",
       trials: [trial({
         outcome: { status: "failed", graderId: "durable-outcome", graderVersion: 1, proofRefs: [] },
-        trace: { status: "passed", graderId: "typed-trace", graderVersion: 1, proofRefs: [] },
-        answer: { status: "passed", graderId: "answer-form", graderVersion: 1, proofRefs: [] },
+        trace: { status: "passed", graderId: "typed-trace", graderVersion: 1, proofRefs: ["proof:plain-conversation:trace:sha256:" + "5".repeat(64)] },
+        answer: { status: "passed", graderId: "answer-form", graderVersion: 1, proofRefs: ["proof:plain-conversation:answer:sha256:" + "4".repeat(64)] },
       })],
     });
     expect(report.status).toBe("failed");
@@ -72,6 +75,20 @@ describe("controller scenario contract", () => {
   it("rejects a layer missing its grader identity", () => {
     const candidate = { ...baseTrial, outcome: { status: "passed", proofRefs: [] } };
     expect(() => parseControllerScenarioTrial(candidate)).toThrow(/graderId|graderVersion/);
+  });
+
+  it("rejects passed layers with empty proof references", () => {
+    expect(() => parseControllerScenarioTrial({
+      ...baseTrial,
+      outcome: { ...baseTrial.outcome, proofRefs: [] },
+    })).toThrow(/proof/i);
+  });
+
+  it("rejects a passed layer whose proof is not bound to the scenario subject", () => {
+    expect(() => validateControllerScenarioTrialEvidence({
+      ...baseTrial,
+      outcome: { ...baseTrial.outcome, proofRefs: ["proof:other-scenario:outcome:sha256:" + "6".repeat(64)] },
+    })).toThrow(/subject-bound|plain-conversation/i);
   });
 
   it("rejects an unparseable layer grade", () => {
@@ -125,6 +142,21 @@ describe("controller scenario contract", () => {
   });
 
   it.each([
+    ["scenario definition hash missing on baseline", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map(({ scenarioDefinitionSha256: _ignored, ...currentTrial }) => currentTrial),
+      scenarios: report.scenarios,
+    })],
+    ["scenario definition hash missing on after", (report: ControllerScenarioContractReport) => report],
+    ["outer task tools missing on baseline", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: Object.fromEntries(Object.entries(currentTrial.harness).filter(([key]) => key !== "outerTaskTools")),
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["outer task tools missing on after", (report: ControllerScenarioContractReport) => report],
     ["scenario version", (report: ControllerScenarioContractReport) => ({
       ...report,
       trials: report.trials.map((currentTrial) => ({ ...currentTrial, scenarioVersion: currentTrial.scenarioVersion + 1 })),
@@ -170,7 +202,7 @@ describe("controller scenario contract", () => {
       })),
       scenarios: report.scenarios,
     })],
-  ] as const)("rejects a fixed comparison with a different %s", (_difference, mutate) => {
+  ] as const)("rejects a fixed comparison with %s", (_difference, mutate) => {
     const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations;
     expect(typeof compare).toBe("function");
     const baseline = aggregateControllerEvaluation({
@@ -179,7 +211,26 @@ describe("controller scenario contract", () => {
       trials: [trial()],
     });
     const after = mutate(baseline) as typeof baseline;
-    expect(() => (compare as (input: unknown) => unknown)({ baseline, after })).toThrow(/comparable|scenario|budget|grader|tool|provider/i);
+    const input = _difference.endsWith("on after")
+      ? { baseline, after: _difference.includes("scenario definition")
+        ? { ...baseline, trials: baseline.trials.map(({ scenarioDefinitionSha256: _ignored, ...currentTrial }) => currentTrial) }
+        : { ...baseline, trials: baseline.trials.map((currentTrial) => ({
+          ...currentTrial,
+          harness: Object.fromEntries(Object.entries(currentTrial.harness).filter(([key]) => key !== "outerTaskTools")),
+        })) } }
+      : { baseline: after, after: baseline };
+    expect(() => (compare as (input: unknown) => unknown)(input)).toThrow(/comparable|scenario|budget|grader|tool|provider|identity/i);
+  });
+
+  it("rejects a dirty after report as well as a dirty baseline", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({ label: "fixed", generatedAt: "2026-08-12T00:00:00.000Z", trials: [baseTrial] });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{ ...baseTrial, harness: { ...baseTrial.harness, dirty: true } }],
+    });
+    expect(() => compare({ baseline, after })).toThrow(/dirty/i);
   });
 
   it("reports comparable denominators and new scenarios without averaging safety failures", () => {

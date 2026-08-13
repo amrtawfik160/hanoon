@@ -13,7 +13,7 @@ import {
   subjectsContradict,
 } from "../src/storage/memory-ranking";
 import { MemoryCurationService, recallOutcome } from "../src/services/memory-curation-service";
-import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
+import { seedCompletedControllerTurn } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 const CONTROLLER_KEY = "owner-7-controller";
@@ -23,11 +23,12 @@ function fixture() {
   const store = openStore(bb.storage, bb.storage.kv, () => 2_000);
   store.createPairingCode(hashSecret("pair"), 1_000, 10_000);
   expect(store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001)).toEqual({ ok: true });
-  return { bb, store };
+  return { bb, db: bb.storage.database(), store };
 }
 
 function completedTurn(
   store: TelegramAgentStore,
+  db: ReturnType<typeof fixture>["db"],
   updateId: number,
   inputText: string,
   now: number,
@@ -65,7 +66,7 @@ function completedTurn(
     })).toBe(true);
   }
   store.markControllerTurnSubmitted({ ...fence, turnId: turn.id });
-  completeAcceptedControllerTurn(store, turn, fence, "an answer");
+  seedCompletedControllerTurn(db, turn, "an answer", now);
   // Released so a later turn in the same test can take the singleton lease.
   store.releaseExecutorLease(fence.ownerId, fence.generation, now);
   return turn;
@@ -134,12 +135,12 @@ it("does not let an ordinary restatement retire a neighbouring belief", () => {
 });
 
 it("links a recall to the turn it informed", () => {
-  const { store } = fixture();
+  const { db, store } = fixture();
   store.rememberMemory({
     scope: "owner", kind: "fact", subject: "canary timing",
     body: "the canary needs two minutes", source: "owner", now: 2_000,
   });
-  const turn = completedTurn(store, 501, "how long does the canary take?", 2_001);
+  const turn = completedTurn(store, db, 501, "how long does the canary take?", 2_001);
 
   store.recallMemories({ scope: "owner", query: "canary", limit: 5, now: 2_002, turnId: turn.id });
 
@@ -154,14 +155,14 @@ it.each([
 });
 
 it("demotes what was recalled when the owner's next message corrects it", () => {
-  const { store } = fixture();
+  const { db, store } = fixture();
   const memory = store.rememberMemory({
     scope: "owner", kind: "fact", subject: "canary timing",
     body: "the canary needs two minutes", source: "owner", confidence: 0.7, now: 2_000,
   });
-  const turn = completedTurn(store, 502, "how long does the canary take?", 2_001);
+  const turn = completedTurn(store, db, 502, "how long does the canary take?", 2_001);
   store.recallMemories({ scope: "owner", query: "canary", limit: 5, now: 2_002, turnId: turn.id });
-  completedTurn(store, 503, "never say that, it is ten minutes", 2_003);
+  completedTurn(store, db, 503, "never say that, it is ten minutes", 2_003);
   const service = new MemoryCurationService({ store, clock: { now: () => 2_004 } });
 
   expect(service.processDue()).toBe(true);
@@ -171,14 +172,14 @@ it("demotes what was recalled when the owner's next message corrects it", () => 
 });
 
 it("reinforces what was recalled when the owner moves on", () => {
-  const { store } = fixture();
+  const { db, store } = fixture();
   const memory = store.rememberMemory({
     scope: "owner", kind: "fact", subject: "canary timing",
     body: "the canary needs two minutes", source: "owner", confidence: 0.7, now: 2_000,
   });
-  const turn = completedTurn(store, 504, "how long does the canary take?", 2_001);
+  const turn = completedTurn(store, db, 504, "how long does the canary take?", 2_001);
   store.recallMemories({ scope: "owner", query: "canary", limit: 5, now: 2_002, turnId: turn.id });
-  completedTurn(store, 505, "great, deploy it", 2_003);
+  completedTurn(store, db, 505, "great, deploy it", 2_003);
   const service = new MemoryCurationService({ store, clock: { now: () => 2_004 } });
 
   expect(service.processDue()).toBe(true);
@@ -187,12 +188,12 @@ it("reinforces what was recalled when the owner moves on", () => {
 });
 
 it("leaves a recall unscored until the owner says something next", () => {
-  const { store } = fixture();
+  const { db, store } = fixture();
   store.rememberMemory({
     scope: "owner", kind: "fact", subject: "canary timing",
     body: "the canary needs two minutes", source: "owner", now: 2_000,
   });
-  const turn = completedTurn(store, 506, "how long does the canary take?", 2_001);
+  const turn = completedTurn(store, db, 506, "how long does the canary take?", 2_001);
   store.recallMemories({ scope: "owner", query: "canary", limit: 5, now: 2_002, turnId: turn.id });
   const service = new MemoryCurationService({ store, clock: { now: () => 2_003 } });
 
@@ -280,15 +281,15 @@ it("keeps an unused extracted memory alive far longer than the ranking down-weig
 });
 
 it("does not let a monitor firing count as the owner moving on", () => {
-  const { store } = fixture();
+  const { db, store } = fixture();
   const memory = store.rememberMemory({
     scope: "owner", kind: "fact", subject: "canary timing",
     body: "the canary needs two minutes", source: "owner", confidence: 0.7, now: 2_000,
   });
-  const answered = completedTurn(store, 601, "how long does the canary take?", 2_001);
+  const answered = completedTurn(store, db, 601, "how long does the canary take?", 2_001);
   store.recallMemories({ scope: "owner", query: "canary", limit: 5, now: 2_002, turnId: answered.id });
   // A scheduled monitor fires before the owner has said anything back.
-  completedTurn(store, 602, "A monitor you set has fired.", 2_003, "system");
+  completedTurn(store, db, 602, "A monitor you set has fired.", 2_003, "system");
   const service = new MemoryCurationService({ store, clock: { now: () => 2_004 } });
 
   expect(service.processDue()).toBe(false);
@@ -298,7 +299,7 @@ it("does not let a monitor firing count as the owner moving on", () => {
   expect(store.listUnscoredRecallTurns(10)).toHaveLength(1);
 
   // The owner's real correction, whenever it lands, is what scores that turn.
-  completedTurn(store, 603, "never say that, it is ten minutes", 2_005);
+  completedTurn(store, db, 603, "never say that, it is ten minutes", 2_005);
   expect(new MemoryCurationService({ store, clock: { now: () => 2_006 } }).processDue()).toBe(true);
   expect(store.getMemory(memory.id)?.confidence).toBeCloseTo(0.7 - MEMORY_DEMOTION, 6);
 });

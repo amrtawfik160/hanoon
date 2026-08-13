@@ -108,8 +108,8 @@ function readValidatedBaseline(path) {
 
 function fixedScenarioIdentity(trial) {
   return JSON.stringify({
-    scenarioDefinitionSha256: trial.scenarioDefinitionSha256 ?? null,
-    outerTaskTools: trial.harness.outerTaskTools ?? [],
+    scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
+    outerTaskTools: trial.harness.outerTaskTools,
     provider: trial.harness.provider,
     model: trial.harness.model,
     reasoningLevel: trial.harness.reasoningLevel,
@@ -136,11 +136,25 @@ function hasFixedScenarioIdentityVariation(trials) {
 }
 
 export function classifyControllerEvidence(trials) {
+  const identityIncomplete = trials.some((trial) => (
+    trial.scenarioDefinitionSha256 === undefined || trial.harness.outerTaskTools === undefined
+  ));
+  if (identityIncomplete) return "strong";
   const nonFixedTrials = trials.filter((trial) => (
     trial.harness.provider !== "fake-bb" || trial.harness.model !== "scripted-controller"
   )).length;
   if (nonFixedTrials > 0) return nonFixedTrials === 1 ? "smoke" : "strong";
   return hasFixedScenarioIdentityVariation(trials) ? "strong" : "fixed";
+}
+
+function assertCurrentEvaluationIdentity(trials, identity) {
+  if (identity.dirty) throw new Error("current evaluator identity is dirty; refusing to write a passed artifact");
+  for (const trial of trials) {
+    if (trial.harness.dirty) throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is dirty`);
+    if (trial.harness.hanoonCommit !== identity.commit) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} has an unproven Hanoon commit`);
+    }
+  }
 }
 
 export async function evaluateControllerOutcomes(options, dependencies = {}) {
@@ -166,7 +180,8 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     if (priorDirty === undefined) delete process.env.HANOON_EVAL_DIRTY;
     else process.env.HANOON_EVAL_DIRTY = priorDirty;
   }
-  const validatedTrials = trials.map(contract.parseControllerScenarioTrial);
+  const validatedTrials = trials.map(contract.validateControllerScenarioTrialEvidence);
+  assertCurrentEvaluationIdentity(validatedTrials, identity);
   const baseReport = contract.aggregateControllerEvaluation({
     label: classifyControllerEvidence(validatedTrials),
     trials: validatedTrials,
