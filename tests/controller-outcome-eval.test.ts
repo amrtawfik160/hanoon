@@ -4,17 +4,38 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
-import { runControllerScenarioTrials } from "./support/controller-scenario-harness";
+import {
+  loadControllerScenarioCorpus,
+  runControllerScenarioTrials,
+} from "./support/controller-scenario-harness";
+import {
+  aggregateControllerEvaluation,
+  compareControllerEvaluations,
+} from "../src/eval/controller-scenario-contract";
 
 type RunnerModule = {
   classifyControllerEvidence(trials: Awaited<ReturnType<typeof runControllerScenarioTrials>>): "fixed" | "smoke" | "strong";
   evaluateControllerOutcomes(
-    options: { checkpoint: "baseline"; trials: number; seed: number; output: string; replace: boolean },
+    options: {
+      checkpoint: "baseline";
+      trials: number;
+      seed: number;
+      output: string;
+      replace: boolean;
+      baseline?: string;
+    },
     dependencies: {
       readGitIdentity(): { commit: string; dirty: boolean };
       runTrials(): Promise<Awaited<ReturnType<typeof runControllerScenarioTrials>>>;
+      readBaseline?(path: string): string;
     },
-  ): Promise<{ exitCode: number; criticalSafetyFailed: boolean; report: { status: string } }>;
+  ): Promise<{
+    exitCode: number;
+    criticalSafetyFailed: boolean;
+    regressed: boolean;
+    report: { status: string };
+    comparison: { regressions: string[] } | null;
+  }>;
 };
 
 async function runnerModule(): Promise<RunnerModule> {
@@ -105,14 +126,143 @@ it("rejects an in-repository output whose first segment begins with two dots", a
   }
 });
 
-it("fails closed for checkpoints without a Task 2 scenario harness", async () => {
+it("runs every earlier checkpoint's cases at a later checkpoint", async () => {
   const output = evaluationOutput();
-  await expect(execFileAsync(process.execPath, [
+
+  await execFileAsync(process.execPath, [
     "scripts/eval-controller-outcomes.mjs",
     "--checkpoint", "kernel",
     "--trials", "1",
     "--output", output,
-  ])).rejects.toMatchObject({ code: 1 });
+  ]);
+
+  const report = JSON.parse(readFileSync(output, "utf8"));
+  expect(report.scenarios.map((scenario: { scenarioId: string }) => scenario.scenarioId).sort()).toEqual([
+    "current-job-status",
+    "duplicate-mutation-replay",
+    "plain-conversation",
+    "stale-capability-fence",
+  ]);
+});
+
+it("keeps the baseline subset identical inside the cutover report", async () => {
+  const baseline = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const cutover = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
+  const baselineSubset = cutover.filter((trial) => baseline.some((entry) => entry.scenarioId === trial.scenarioId));
+
+  expect(baselineSubset.map((trial) => trial.scenarioId).sort())
+    .toEqual(baseline.map((trial) => trial.scenarioId).sort());
+  for (const trial of baselineSubset) {
+    const original = baseline.find((entry) => entry.scenarioId === trial.scenarioId)!;
+    // Same scenario version, budget, outer tool surface, and graders: the only
+    // difference a report may show is the intervention itself.
+    expect(trial.scenarioVersion).toBe(original.scenarioVersion);
+    expect(trial.budget).toEqual(original.budget);
+    expect(trial.harness.advertisedTools).toEqual(original.harness.advertisedTools);
+    expect(trial.harness.parameterSchemaSha256).toEqual(original.harness.parameterSchemaSha256);
+    expect([trial.outcome.graderId, trial.outcome.graderVersion])
+      .toEqual([original.outcome.graderId, original.outcome.graderVersion]);
+  }
+});
+
+it("proves every deterministic trust scenario passes on the fixed harness", async () => {
+  const cutover = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
+  const criticalIds = loadControllerScenarioCorpus().cases
+    .filter((scenarioCase) => scenarioCase.criticalSafety)
+    .map((scenarioCase) => scenarioCase.id);
+
+  expect(criticalIds.length).toBeGreaterThanOrEqual(5);
+  for (const trial of cutover) {
+    expect([trial.scenarioId, trial.outcome.status]).toEqual([trial.scenarioId, "passed"]);
+  }
+  expect(cutover.map((trial) => trial.scenarioId)).toEqual(expect.arrayContaining(criticalIds));
+});
+
+it("loses its like-for-like intersection if checkpoint selection stops being cumulative", async () => {
+  const baselineTrials = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const cutoverTrials = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
+  const baseline = aggregateControllerEvaluation({ label: "fixed", trials: baselineTrials });
+  const cumulative = aggregateControllerEvaluation({ label: "fixed", trials: cutoverTrials });
+  // The mutation: selecting the checkpoint exactly instead of cumulatively.
+  const exactOnly = aggregateControllerEvaluation({
+    label: "fixed",
+    trials: cutoverTrials.filter((trial) => !baselineTrials.some((entry) => entry.scenarioId === trial.scenarioId)),
+  });
+
+  expect(compareControllerEvaluations({ current: cumulative, baseline }).status).toBe("comparable");
+  expect(compareControllerEvaluations({ current: exactOnly, baseline }).status).toBe("incomparable");
+});
+
+it("keeps an outcome failure failing however well trace and answer scored", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output: evaluationOutput(),
+    replace: false,
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [{
+      ...trial,
+      outcome: { ...trial.outcome, status: "failed" as const },
+      trace: { ...trial.trace, status: "passed" as const },
+      answer: { ...trial.answer, status: "passed" as const },
+    }],
+  });
+
+  expect(evaluation.report.status).toBe("failed");
+  expect(evaluation.exitCode).toBe(1);
+});
+
+it("compares a cutover report against its baseline and lists the new cases apart", async () => {
+  const baselineOutput = evaluationOutput();
+  const cutoverOutput = evaluationOutput();
+  await execFileAsync(process.execPath, [
+    "scripts/eval-controller-outcomes.mjs",
+    "--checkpoint", "baseline", "--trials", "1", "--output", baselineOutput,
+  ]);
+
+  const run = await execFileAsync(process.execPath, [
+    "scripts/eval-controller-outcomes.mjs",
+    "--checkpoint", "cutover", "--trials", "1",
+    "--output", cutoverOutput, "--baseline", baselineOutput,
+  ]);
+
+  const report = JSON.parse(readFileSync(cutoverOutput, "utf8"));
+  expect(report.comparison.status).toBe("comparable");
+  expect(report.comparison.scenarios.map((scenario: { scenarioId: string }) => scenario.scenarioId).sort())
+    .toEqual(["current-job-status", "plain-conversation"]);
+  expect(report.comparison.regressions).toEqual([]);
+  expect(report.comparison.currentOnly).toContain("telegram-allow-once");
+  // Rates are displayed as passed/denominator, never as a bare percentage.
+  expect(run.stdout).toContain("plain-conversation baseline 1/1 current 1/1");
+  expect(run.stdout).not.toMatch(/\d+(?:\.\d+)?%/);
+  // The intervention is disclosed side by side rather than treated as drift.
+  expect(report.comparison.intervention.current.capabilityManifestSha256).toHaveLength(1);
+});
+
+it("exits nonzero when a matched scenario regresses against its baseline", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial] });
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output: evaluationOutput(),
+    replace: false,
+    baseline: "/tmp/does-not-matter.json",
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [{ ...trial, outcome: { ...trial.outcome, status: "failed" as const } }],
+    readBaseline: () => JSON.stringify(baseline),
+  });
+
+  expect(evaluation.comparison?.regressions).toEqual([trial.scenarioId]);
+  expect(evaluation.regressed).toBe(true);
+  expect(evaluation.exitCode).toBe(1);
 });
 
 it("records the current job status through the registered controller tool", async () => {

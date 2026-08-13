@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, openSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
@@ -22,7 +22,7 @@ function valueAfter(argv, index, flag) {
 }
 
 function parseArguments(argv) {
-  const options = { checkpoint: null, trials: null, seed: 8122026, output: null, replace: false };
+  const options = { checkpoint: null, trials: null, seed: 8122026, output: null, replace: false, baseline: null };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--replace") { options.replace = true; continue; }
@@ -30,13 +30,19 @@ function parseArguments(argv) {
     if (flag === "--trials") { options.trials = Number(valueAfter(argv, index, flag)); index += 1; continue; }
     if (flag === "--seed") { options.seed = Number(valueAfter(argv, index, flag)); index += 1; continue; }
     if (flag === "--output") { options.output = valueAfter(argv, index, flag); index += 1; continue; }
+    if (flag === "--baseline") { options.baseline = valueAfter(argv, index, flag); index += 1; continue; }
     fail(`unknown argument ${flag}`);
   }
   if (!options.checkpoint || !["baseline", "kernel", "cutover"].includes(options.checkpoint)) fail("--checkpoint must be baseline, kernel, or cutover");
   if (!Number.isInteger(options.trials) || options.trials < 1 || options.trials > 512) fail("--trials must be an integer between 1 and 512");
   if (!Number.isInteger(options.seed) || options.seed < 0 || options.seed > 2147483647) fail("--seed must be a non-negative 32-bit integer");
   if (!options.output || !isAbsolute(options.output)) fail("--output must be an absolute path");
-  return { ...options, output: resolve(options.output) };
+  if (options.baseline !== null && !isAbsolute(options.baseline)) fail("--baseline must be an absolute path");
+  return {
+    ...options,
+    output: resolve(options.output),
+    baseline: options.baseline === null ? null : resolve(options.baseline),
+  };
 }
 
 function isInsideRoot(path) {
@@ -48,6 +54,10 @@ function allowedOutput(path) {
   if (!isInsideRoot(path)) return true;
   const relation = relative(root, path);
   return relation === ".superpowers" || relation.startsWith(`.superpowers${sep}`);
+}
+
+function readBaselineReport(path) {
+  return readFileSync(path, "utf8");
 }
 
 function git(args) {
@@ -123,7 +133,30 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     trials: validatedTrials,
   });
   contract.controllerEvaluationReportSchema.parse(report);
-  writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace);
+  // Both reports are validated before anything is compared: an unvalidated
+  // baseline could otherwise make a regression look like a schema difference.
+  const comparison = options.baseline === null || options.baseline === undefined
+    ? null
+    : contract.compareControllerEvaluations({
+      current: report,
+      baseline: contract.controllerEvaluationReportSchema.parse(
+        JSON.parse((dependencies.readBaseline ?? readBaselineReport)(options.baseline)),
+      ),
+    });
+  writeReport(options.output, `${JSON.stringify({ ...report, comparison }, null, 2)}\n`, options.replace);
+  if (comparison !== null) {
+    process.stdout.write(`comparison ${comparison.status}\n`);
+    for (const scenario of comparison.scenarios) {
+      process.stdout.write(
+        `${scenario.scenarioId} baseline ${contract.formatControllerRate(scenario.baseline)}` +
+        ` current ${contract.formatControllerRate(scenario.current)}` +
+        `${scenario.regressed ? " REGRESSED" : ""}\n`,
+      );
+    }
+    if (comparison.currentOnly.length > 0) {
+      process.stdout.write(`current-only ${comparison.currentOnly.join(",")}\n`);
+    }
+  }
   const scenarios = new Map(harness.loadControllerScenarioCorpus().cases.map((scenarioCase) => [
     scenarioCase.id,
     scenarioCase,
@@ -133,10 +166,13 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     if (!scenarioCase) throw new Error(`trial references an unknown scenario ${trial.scenarioId}`);
     return scenarioCase.criticalSafety && trial.outcome.status === "failed";
   });
+  const regressed = comparison !== null && comparison.regressions.length > 0;
   return {
     report,
+    comparison,
     criticalSafetyFailed,
-    exitCode: criticalSafetyFailed || report.status === "failed" ? 1 : 0,
+    regressed,
+    exitCode: criticalSafetyFailed || regressed || report.status === "failed" ? 1 : 0,
   };
 }
 

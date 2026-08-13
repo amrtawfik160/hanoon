@@ -1,10 +1,35 @@
 import { describe, expect, it } from "vitest";
 import {
   aggregateControllerEvaluation,
+  compareControllerEvaluations,
+  controllerCheckpointCases,
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
   type ControllerScenarioTrial,
 } from "../src/eval/controller-scenario-contract";
+
+function baselineCorpus() {
+  const scenarioCase = (id: string, checkpoint: "baseline" | "kernel" | "cutover") => ({
+    id,
+    scenarioVersion: 1,
+    checkpoint,
+    criticalSafety: false,
+    ownerMessage: "hello",
+    budget: { maxTurns: 2, maxToolCalls: 8, maxTokens: 20_000, maxWallMs: 30_000, maxCostUsd: null },
+    requiredOutcomeAssertions: ["controller_turn_completed"],
+    forbiddenOutcomeAssertions: [],
+    requiredTraceAssertions: [],
+    answerGrader: "required",
+  });
+  return {
+    schemaVersion: 1,
+    cases: [
+      scenarioCase("plain-conversation", "baseline"),
+      scenarioCase("kernel-case", "kernel"),
+      scenarioCase("cutover-case", "cutover"),
+    ],
+  };
+}
 
 const baseTrial: ControllerScenarioTrial = {
   schemaVersion: 1 as const,
@@ -121,5 +146,194 @@ describe("controller scenario contract", () => {
         { scenarioId: "plain-conversation", denominator: 2, passed: 1, failed: 0, incomplete: 1 },
       ],
     });
+  });
+});
+
+describe("cumulative checkpoint inclusion", () => {
+  it("runs every earlier checkpoint's cases at each later checkpoint", () => {
+    expect(controllerCheckpointCases("baseline")).toEqual(["baseline"]);
+    expect(controllerCheckpointCases("kernel")).toEqual(["baseline", "kernel"]);
+    expect(controllerCheckpointCases("cutover")).toEqual(["baseline", "kernel", "cutover"]);
+  });
+
+  it("keeps the baseline subset identical at every checkpoint", () => {
+    const corpus = parseControllerScenarioCorpus(baselineCorpus());
+    const included = (checkpoint: "baseline" | "kernel" | "cutover") => corpus.cases
+      .filter((scenarioCase) => controllerCheckpointCases(checkpoint).includes(scenarioCase.checkpoint))
+      .map((scenarioCase) => scenarioCase.id);
+
+    // `--baseline` can only compare like for like if the baseline cases run
+    // unchanged inside the later checkpoints.
+    expect(included("baseline")).toEqual(["plain-conversation"]);
+    expect(included("kernel")).toEqual(["plain-conversation", "kernel-case"]);
+    expect(included("cutover")).toEqual(["plain-conversation", "kernel-case", "cutover-case"]);
+  });
+});
+
+describe("like-for-like comparison", () => {
+  it("compares only matching scenario id and version pairs and reports rates as passed/denominator", () => {
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00Z",
+      trials: [trial(), trial({ trial: 2 })],
+    });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-14T00:00:00Z",
+      trials: [
+        trial({ harness: { ...baseTrial.harness, capabilityManifestSha256: "1".repeat(64) } }),
+        trial({ trial: 2, harness: { ...baseTrial.harness, capabilityManifestSha256: "1".repeat(64) } }),
+        trial({
+          scenarioId: "cutover-case",
+          harness: { ...baseTrial.harness, capabilityManifestSha256: "1".repeat(64) },
+        }),
+      ],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("comparable");
+    expect(comparison.scenarios).toEqual([{
+      scenarioId: "plain-conversation",
+      scenarioVersion: 1,
+      baseline: { passed: 2, denominator: 2 },
+      current: { passed: 2, denominator: 2 },
+      regressed: false,
+    }]);
+    // Kernel and cutover cases are listed apart and never counted as lift.
+    expect(comparison.currentOnly).toEqual(["cutover-case"]);
+    expect(comparison.intervention.current.capabilityManifestSha256).toEqual(["1".repeat(64)]);
+    expect(comparison.intervention.baseline.capabilityManifestSha256).toEqual(["d".repeat(64)]);
+  });
+
+  it("treats a grown Hanoon capability surface as the intervention, not as drift", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({
+        harness: {
+          ...baseTrial.harness,
+          advertisedTools: ["telegram_agent_respond", "telegram_agent_turn_evidence"],
+          parameterSchemaSha256: {
+            telegram_agent_respond: "8".repeat(64),
+            telegram_agent_turn_evidence: "9".repeat(64),
+          },
+          capabilityManifestSha256: "a".repeat(64),
+        },
+      })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    // The kernel exists to add capabilities; treating that as incomparable
+    // would make it impossible to measure against its own baseline.
+    expect(comparison.status).toBe("comparable");
+    expect(comparison.intervention.current.parameterSchemaSha256).toEqual(["8".repeat(64), "9".repeat(64)]);
+  });
+
+  it("treats an intervention digest difference as comparable, not as a reason to refuse", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({
+        harness: {
+          ...baseTrial.harness,
+          hanoonCommit: "9".repeat(40),
+          instructionSha256: "2".repeat(64),
+          overlaySha256: "3".repeat(64),
+          policySha256: "4".repeat(64),
+          contextSha256: "5".repeat(64),
+          capabilityManifestSha256: "6".repeat(64),
+        },
+      })],
+    });
+
+    expect(compareControllerEvaluations({ current, baseline }).status).toBe("comparable");
+  });
+
+  it.each([
+    ["a different provider", { provider: "live-provider" }],
+    ["a different model", { model: "other-model" }],
+    ["a different reasoning level", { reasoningLevel: "high" }],
+    ["a different service tier", { serviceTier: "fast" }],
+    ["a different permission mode", { permissionMode: "full" as const }],
+  ])("downgrades to strong for %s", (_name, harnessOverride) => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ harness: { ...baseTrial.harness, ...harnessOverride } })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.incomparableReasons.length).toBeGreaterThan(0);
+  });
+
+  it("downgrades to strong when a budget or grader version differs", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const budgetChanged = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ budget: { ...baseTrial.budget, maxTokens: 30_000 } })],
+    });
+    const graderChanged = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ outcome: { ...baseTrial.outcome, graderVersion: 2 } })],
+    });
+
+    expect(compareControllerEvaluations({ current: budgetChanged, baseline }).status).toBe("strong");
+    expect(compareControllerEvaluations({ current: graderChanged, baseline }).status).toBe("strong");
+  });
+
+  it("reports a regression that trace and answer success cannot average away", () => {
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial(), trial({ trial: 2 })],
+    });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [
+        trial(),
+        trial({
+          trial: 2,
+          outcome: { ...baseTrial.outcome, status: "failed" as const },
+          trace: { ...baseTrial.trace, status: "passed" as const },
+          answer: { ...baseTrial.answer, status: "passed" as const },
+        }),
+      ],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.scenarios[0]).toMatchObject({
+      baseline: { passed: 2, denominator: 2 },
+      current: { passed: 1, denominator: 2 },
+      regressed: true,
+    });
+    expect(comparison.regressions).toEqual(["plain-conversation"]);
+    expect(current.status).toBe("failed");
+  });
+
+  it("refuses a comparison with no matching scenario at all", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ scenarioId: "cutover-case" })],
+    });
+
+    expect(compareControllerEvaluations({ current, baseline })).toMatchObject({
+      status: "incomparable",
+      scenarios: [],
+    });
+  });
+
+  it("refuses a comparison when a matching scenario changed version", () => {
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ scenarioVersion: 2 })],
+    });
+
+    expect(compareControllerEvaluations({ current, baseline }).status).toBe("incomparable");
   });
 });

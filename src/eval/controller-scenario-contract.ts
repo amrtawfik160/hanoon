@@ -159,12 +159,171 @@ export const controllerEvaluationReportSchema = z.object({
   trialCount: z.number().int().min(1).max(512),
   trials: z.array(controllerScenarioTrialSchema).min(1).max(512),
   scenarios: z.array(scenarioSummarySchema).max(64),
+  /** Present only when a report was generated against a baseline. */
+  comparison: z.lazy(() => controllerComparisonSchema).nullable().optional(),
 }).strict().superRefine((report, context) => {
   if (hasDuplicateTrialPairs(report.trials)) context.addIssue({ code: "custom", message: "duplicate scenario trial pair" });
   if (report.trialCount !== report.trials.length) context.addIssue({ code: "custom", message: "trialCount must match trials" });
   if (report.status !== derivedReportStatus(report.trials)) context.addIssue({ code: "custom", message: "status must match trial outcomes" });
   if (!summariesMatch(report.trials, report.scenarios)) context.addIssue({ code: "custom", message: "scenario summaries must match trials" });
 });
+
+export const CONTROLLER_CHECKPOINTS = ["baseline", "kernel", "cutover"] as const;
+export type ControllerCheckpoint = (typeof CONTROLLER_CHECKPOINTS)[number];
+
+/**
+ * Checkpoint selection is cumulative, not exact. A later checkpoint runs every
+ * earlier checkpoint's cases unchanged, which is the only way `--baseline` has a
+ * real like-for-like intersection to compare.
+ */
+export function controllerCheckpointCases(checkpoint: ControllerCheckpoint): ControllerCheckpoint[] {
+  return CONTROLLER_CHECKPOINTS.slice(0, CONTROLLER_CHECKPOINTS.indexOf(checkpoint) + 1);
+}
+
+const rateSchema = z.object({
+  passed: z.number().int().min(0).max(512),
+  denominator: z.number().int().min(1).max(512),
+}).strict();
+
+const interventionSchema = z.object({
+  hanoonCommit: z.array(z.string().regex(/^[0-9a-f]{40}$/)).min(1).max(64),
+  instructionSha256: z.array(sha256Schema).min(1).max(64),
+  overlaySha256: z.array(sha256Schema).min(1).max(64),
+  capabilityManifestSha256: z.array(sha256Schema).min(1).max(64),
+  policySha256: z.array(sha256Schema).min(1).max(64),
+  contextSha256: z.array(sha256Schema).min(1).max(512),
+  parameterSchemaSha256: z.array(sha256Schema).max(512),
+}).strict();
+
+export const controllerComparisonSchema = z.object({
+  status: z.enum(["comparable", "strong", "incomparable"]),
+  baselineLabel: z.enum(["fixed", "strong", "smoke"]),
+  currentLabel: z.enum(["fixed", "strong", "smoke"]),
+  scenarios: z.array(z.object({
+    scenarioId: scenarioIdSchema,
+    scenarioVersion: z.number().int().min(1).max(10_000),
+    baseline: rateSchema,
+    current: rateSchema,
+    regressed: z.boolean(),
+  }).strict()).max(64),
+  regressions: z.array(scenarioIdSchema).max(64),
+  currentOnly: z.array(scenarioIdSchema).max(64),
+  baselineOnly: z.array(scenarioIdSchema).max(64),
+  incomparableReasons: z.array(z.string().min(1).max(200)).max(32),
+  intervention: z.object({ baseline: interventionSchema, current: interventionSchema }).strict(),
+}).strict();
+
+export type ControllerEvaluationComparison = z.infer<typeof controllerComparisonSchema>;
+
+/** How a scenario's trials scored, as a rate that is never a bare percentage. */
+function scenarioRate(trials: readonly ControllerScenarioTrial[]): z.infer<typeof rateSchema> {
+  return {
+    passed: trials.filter((trial) => trialClassification(trial) === "passed").length,
+    denominator: trials.length,
+  };
+}
+
+function distinct(values: readonly string[]): string[] {
+  return [...new Set(values)].sort();
+}
+
+function interventionOf(report: ControllerEvaluationReport): z.infer<typeof interventionSchema> {
+  return {
+    hanoonCommit: distinct(report.trials.map((trial) => trial.harness.hanoonCommit)),
+    instructionSha256: distinct(report.trials.map((trial) => trial.harness.instructionSha256)),
+    overlaySha256: distinct(report.trials.map((trial) => trial.harness.overlaySha256)),
+    capabilityManifestSha256: distinct(report.trials.map((trial) => trial.harness.capabilityManifestSha256)),
+    policySha256: distinct(report.trials.map((trial) => trial.harness.policySha256)),
+    contextSha256: distinct(report.trials.map((trial) => trial.harness.contextSha256)),
+    parameterSchemaSha256: distinct(report.trials.flatMap((trial) => Object.values(trial.harness.parameterSchemaSha256))),
+  };
+}
+
+/**
+ * The fixed conditions two trials must share to be a direct comparison. The
+ * Hanoon commit and the manifest, policy, instruction, overlay, context, and
+ * parameter-schema digests are deliberately absent — including the advertised
+ * Hanoon tool list those digests cover. They are the intervention being
+ * measured, disclosed side by side: a kernel that adds capabilities would
+ * otherwise be unmeasurable by construction.
+ */
+function fixedConditions(trial: ControllerScenarioTrial): string {
+  return JSON.stringify({
+    provider: trial.harness.provider,
+    model: trial.harness.model,
+    reasoningLevel: trial.harness.reasoningLevel,
+    serviceTier: trial.harness.serviceTier,
+    permissionMode: trial.harness.permissionMode,
+    budget: trial.budget,
+    graders: [trial.outcome, trial.trace, trial.answer].map((grade) => [grade.graderId, grade.graderVersion]),
+  });
+}
+
+function trialsByScenario(report: ControllerEvaluationReport): Map<string, ControllerScenarioTrial[]> {
+  const grouped = new Map<string, ControllerScenarioTrial[]>();
+  for (const trial of report.trials) {
+    grouped.set(trial.scenarioId, [...(grouped.get(trial.scenarioId) ?? []), trial]);
+  }
+  return grouped;
+}
+
+/**
+ * Compares a report against an earlier one over the scenarios they genuinely
+ * share. An outcome failure is a regression that no amount of trace or answer
+ * success can average away.
+ */
+export function compareControllerEvaluations(input: {
+  current: ControllerEvaluationReport;
+  baseline: ControllerEvaluationReport;
+}): ControllerEvaluationComparison {
+  const current = controllerEvaluationReportSchema.parse(input.current);
+  const baseline = controllerEvaluationReportSchema.parse(input.baseline);
+  const currentByScenario = trialsByScenario(current);
+  const baselineByScenario = trialsByScenario(baseline);
+  const reasons: string[] = [];
+  const scenarios: ControllerEvaluationComparison["scenarios"] = [];
+
+  for (const [scenarioId, baselineTrials] of [...baselineByScenario.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const currentTrials = currentByScenario.get(scenarioId);
+    if (!currentTrials) continue;
+    const baselineVersion = baselineTrials[0]!.scenarioVersion;
+    if (currentTrials.some((trial) => trial.scenarioVersion !== baselineVersion)) {
+      reasons.push(`${scenarioId}: scenario version changed`);
+      continue;
+    }
+    const conditions = new Set([...baselineTrials, ...currentTrials].map(fixedConditions));
+    if (conditions.size !== 1) reasons.push(`${scenarioId}: fixed conditions differ`);
+    const baselineRate = scenarioRate(baselineTrials);
+    const currentRate = scenarioRate(currentTrials);
+    scenarios.push({
+      scenarioId,
+      scenarioVersion: baselineVersion,
+      baseline: baselineRate,
+      current: currentRate,
+      regressed: currentRate.passed * baselineRate.denominator < baselineRate.passed * currentRate.denominator,
+    });
+  }
+
+  const status = scenarios.length === 0
+    ? "incomparable"
+    : reasons.length === 0 ? "comparable" : "strong";
+  return controllerComparisonSchema.parse({
+    status,
+    baselineLabel: baseline.label,
+    currentLabel: current.label,
+    scenarios,
+    regressions: scenarios.filter((scenario) => scenario.regressed).map((scenario) => scenario.scenarioId),
+    currentOnly: [...currentByScenario.keys()].filter((scenarioId) => !baselineByScenario.has(scenarioId)).sort(),
+    baselineOnly: [...baselineByScenario.keys()].filter((scenarioId) => !currentByScenario.has(scenarioId)).sort(),
+    incomparableReasons: reasons,
+    intervention: { baseline: interventionOf(baseline), current: interventionOf(current) },
+  });
+}
+
+/** `passed/denominator`, never a bare percentage. */
+export function formatControllerRate(rate: z.infer<typeof rateSchema>): string {
+  return `${rate.passed}/${rate.denominator}`;
+}
 
 export function parseControllerScenarioCorpus(candidate: unknown): z.infer<typeof controllerScenarioCorpusSchema> {
   return controllerScenarioCorpusSchema.parse(candidate);
