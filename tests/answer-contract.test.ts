@@ -4,6 +4,7 @@ import { expect, it } from "vitest";
 import {
   ANSWER_CLAUSES,
   ANSWER_CLAUSE_IDS,
+  buildAnswerJudgeSpawnArgs,
   buildJudgePrompt,
   parseAnswerVerdict,
 } from "../src/eval/answer-contract";
@@ -34,6 +35,18 @@ it("puts the owner message, the answer, and every clause into the judge prompt",
   for (const clause of ANSWER_CLAUSES) expect(prompt).toContain(clause.id);
   // The judge cannot see the systems described, so it must be told not to grade truth.
   expect(prompt).toContain("never grade whether it is factually correct");
+});
+
+it.each([
+  ["with optional model", "model-x", ["thread", "spawn", "--project", "proj_1", "--title", "answer-eval status-good", "--prompt", "judge prompt", "--json", "--model", "model-x"]],
+  ["without optional model", undefined, ["thread", "spawn", "--project", "proj_1", "--title", "answer-eval status-good", "--prompt", "judge prompt", "--json"]],
+] as const)("builds the current BB prompt spawn args %s", (_label, model, expected) => {
+  expect(buildAnswerJudgeSpawnArgs({
+    project: "proj_1",
+    title: "answer-eval status-good",
+    prompt: "judge prompt",
+    ...(model ? { model } : {}),
+  })).toEqual(expected);
 });
 
 it("reads a verdict where every clause holds", () => {

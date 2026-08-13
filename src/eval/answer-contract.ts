@@ -45,6 +45,25 @@ export const ANSWER_CLAUSE_IDS: readonly string[] = Object.freeze(
   ANSWER_CLAUSES.map((clause) => clause.id),
 );
 
+export type AnswerJudgeSpawnInput = Readonly<{
+  project: string;
+  title: string;
+  prompt: string;
+  model?: string;
+}>;
+
+export function buildAnswerJudgeSpawnArgs(input: AnswerJudgeSpawnInput): string[] {
+  const spawnArgs = [
+    "thread", "spawn",
+    "--project", input.project,
+    "--title", input.title,
+    "--prompt", input.prompt,
+    "--json",
+  ];
+  if (input.model) spawnArgs.push("--model", input.model);
+  return spawnArgs;
+}
+
 export type ClauseVerdict = Readonly<{ id: string; holds: boolean; why: string }>;
 export type AnswerVerdict = Readonly<{ clauses: readonly ClauseVerdict[]; passed: boolean }>;
 

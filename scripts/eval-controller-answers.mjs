@@ -16,7 +16,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { buildJudgePrompt, parseAnswerVerdict } from "../src/eval/answer-contract.ts";
+import {
+  buildAnswerJudgeSpawnArgs,
+  buildJudgePrompt,
+  parseAnswerVerdict,
+} from "../src/eval/answer-contract.ts";
 
 const run = promisify(execFile);
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,27 +51,54 @@ async function bb(args) {
   return stdout;
 }
 
+function infrastructureDetail(error, sensitiveValues = []) {
+  const errorRecord = error && typeof error === "object" ? error : {};
+  const capturedStderr = typeof errorRecord.stderr === "string" ? errorRecord.stderr.trim() : "";
+  const exitCode = errorRecord.code === undefined ? "unknown exit" : `exit ${String(errorRecord.code)}`;
+  let detail = capturedStderr || `bb command failed (${exitCode})`;
+  for (const sensitiveValue of sensitiveValues) {
+    if (sensitiveValue) detail = detail.replaceAll(sensitiveValue, "[redacted]");
+  }
+  return detail.replace(/\s+/g, " ").slice(0, 400);
+}
+
 /** One judge thread per case, so no case can contaminate another's grading. */
 async function judge(options, testCase) {
   const prompt = buildJudgePrompt({ ownerMessage: testCase.ownerMessage, answer: testCase.answer });
-  const spawnArgs = [
-    "thread", "spawn",
-    "--project", options.project,
-    "--title", `answer-eval ${testCase.id}`,
-    "--message", prompt,
-    "--json",
-  ];
-  if (options.model) spawnArgs.push("--model", options.model);
-  const spawned = JSON.parse(await bb(spawnArgs));
+  const spawnArgs = buildAnswerJudgeSpawnArgs({
+    project: options.project,
+    title: `answer-eval ${testCase.id}`,
+    prompt,
+    ...(options.model ? { model: options.model } : {}),
+  });
+  const sensitiveValues = [prompt, testCase.ownerMessage, testCase.answer];
+  let spawnOutput;
+  try {
+    spawnOutput = await bb(spawnArgs);
+  } catch (error) {
+    throw new Error(`bb thread spawn failed: ${infrastructureDetail(error, sensitiveValues)}`);
+  }
+  let spawned;
+  try {
+    spawned = JSON.parse(spawnOutput);
+  } catch {
+    throw new Error("bb thread spawn returned invalid JSON");
+  }
   const threadId = spawned?.thread?.id ?? spawned?.id;
   if (!threadId) throw new Error("bb thread spawn did not return a thread id");
   try {
     await bb(["thread", "wait", threadId, "--status", "idle", "--timeout", String(WAIT_SECONDS), "--json"]);
-  } catch {
-    throw new Error(`judge thread ${threadId} did not finish within ${WAIT_SECONDS}s`);
+  } catch (error) {
+    throw new Error(`judge thread ${threadId} did not finish within ${WAIT_SECONDS}s: ${infrastructureDetail(error, sensitiveValues)}`);
   }
-  const verdict = parseAnswerVerdict(await bb(["thread", "output", threadId]));
-  if (!verdict) throw new Error(`judge thread ${threadId} did not return a usable verdict`);
+  let output;
+  try {
+    output = await bb(["thread", "output", threadId]);
+  } catch (error) {
+    throw new Error(`judge thread ${threadId} output failed: ${infrastructureDetail(error, sensitiveValues)}`);
+  }
+  const verdict = parseAnswerVerdict(output);
+  if (!verdict) throw new Error(`judge thread ${threadId} returned an unusable verdict (captured output length ${output.length})`);
   return verdict;
 }
 
@@ -78,14 +109,16 @@ async function main() {
   if (selected.length === 0) fail(`no case matched ${options.only}`);
 
   let agreed = 0;
-  const disagreements = [];
+  const misses = [];
+  const infrastructureErrors = [];
   for (const testCase of selected) {
     let verdict;
     try {
       verdict = await judge(options, testCase);
     } catch (error) {
-      disagreements.push({ id: testCase.id, detail: error instanceof Error ? error.message : "judge failed" });
-      process.stdout.write(`  ERROR  ${testCase.id}\n`);
+      const detail = error instanceof Error ? error.message : "judge failed";
+      infrastructureErrors.push({ id: testCase.id, detail });
+      process.stdout.write(`  ERROR  ${testCase.id}: ${detail}\n`);
       continue;
     }
     const actual = verdict.passed ? "pass" : "fail";
@@ -95,15 +128,21 @@ async function main() {
       process.stdout.write(`  ok     ${testCase.id} (${actual})${broken.length ? ` [${broken.join(", ")}]` : ""}\n`);
       continue;
     }
-    disagreements.push({ id: testCase.id, detail: `expected ${testCase.expect}, judged ${actual}` });
+    misses.push({ id: testCase.id, detail: `expected ${testCase.expect}, judged ${actual}` });
     process.stdout.write(`  MISS   ${testCase.id}: expected ${testCase.expect}, judged ${actual}\n`);
   }
 
-  process.stdout.write(`\nrubric agreement ${agreed}/${selected.length}\n`);
-  if (disagreements.length > 0) {
+  process.stdout.write(`\nrubric agreement ${agreed}/${selected.length - infrastructureErrors.length}\n`);
+  if (infrastructureErrors.length > 0) {
+    process.stdout.write(`infrastructure errors ${infrastructureErrors.length}/${selected.length}; rubric was not invoked for those cases\n`);
+    process.stdout.write("answer evaluation could not judge every selected case; fix infrastructure before trusting the rubric\n");
+  }
+  if (misses.length > 0) {
     // A rubric that misgrades its own golden cases cannot be trusted to grade a
     // prompt change, so this is a failure of the harness, not a soft warning.
     process.stdout.write("the rubric disagreed with its golden cases; recalibrate before trusting it\n");
+  }
+  if (infrastructureErrors.length > 0 || misses.length > 0) {
     process.exit(1);
   }
 }
