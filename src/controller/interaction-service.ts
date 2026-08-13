@@ -124,7 +124,8 @@ export class ControllerInteractionService {
         bbThreadId: answered.bbThreadId,
         controllerGenerationId: answered.controllerGenerationId,
       };
-      return this.store.isControllerInteractionDeliveryFenceCurrent(deliveryFence) ? deliveryFence : null;
+      const predicateCurrent = this.store.isControllerInteractionDeliveryFenceCurrent(deliveryFence);
+      return predicateCurrent && !this.isAborted(signal) ? deliveryFence : null;
     } catch {
       return null;
     }

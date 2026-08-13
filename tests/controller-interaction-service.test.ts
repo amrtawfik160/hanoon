@@ -15,6 +15,7 @@ import {
 import { controllerInteractionToken } from "../src/controller/questions";
 
 const FENCE = { ownerId: "executor", generation: 1, now: 2_000 };
+type DeliveryStage = "before-get" | "before-resolve" | "before-mark";
 
 class LeaseLossRepository extends ControllerInteractionRepository {
   private calls = 0;
@@ -64,18 +65,35 @@ class FreshFenceRepository extends ControllerInteractionRepository {
   }
 }
 
-class ServiceBoundaryRepository extends ControllerInteractionRepository {
+type PredicateBoundaryObservation = Readonly<{
+  call: number;
+  providerStatus: "pending" | "resolved" | null;
+  predicateResult: boolean;
+}>;
+
+class PredicateBoundaryRepository extends ControllerInteractionRepository {
+  public readonly observations: PredicateBoundaryObservation[] = [];
+  private predicateCalls = 0;
+
   public constructor(
     database: Database.Database,
-    private readonly beforeFence: () => void,
+    private readonly stage: DeliveryStage,
+    private readonly providerStatus: () => "pending" | "resolved" | null,
+    private readonly beforePredicate: (observation: Omit<PredicateBoundaryObservation, "predicateResult">) => void,
   ) {
     super(database);
   }
 
-  public override getAnswered(controllerKey: string) {
-    const answered = super.getAnswered(controllerKey);
-    this.beforeFence();
-    return answered;
+  public override isControllerInteractionDeliveryFenceCurrent(
+    input: Parameters<ControllerInteractionRepository["isControllerInteractionDeliveryFenceCurrent"]>[0],
+  ): boolean {
+    const call = ++this.predicateCalls;
+    const targetCall = this.stage === "before-get" ? 1 : 2;
+    const observed = { call, providerStatus: this.providerStatus() } as const;
+    if (call === targetCall) this.beforePredicate(observed);
+    const predicateResult = super.isControllerInteractionDeliveryFenceCurrent(input);
+    this.observations.push({ ...observed, predicateResult });
+    return predicateResult;
   }
 }
 
@@ -493,8 +511,6 @@ it("fails closed when the lease expires at the fresh final delivery boundary", a
   fixture.close();
 });
 
-type DeliveryStage = "before-get" | "before-resolve" | "before-mark";
-
 const DELIVERY_STAGE_INVALIDATIONS = [
   { name: "abort", apply: () => undefined },
   {
@@ -577,20 +593,25 @@ it.each(["before-get", "before-resolve", "before-mark"] as const)(
       const fixture = setup();
       const secondary = openIndependentDatabase(fixture.dbPath);
       const controller = new AbortController();
-      let crossed = false;
-      const crossBoundary = () => {
-        if (crossed) throw new Error("delivery boundary crossed twice");
-        crossed = true;
-        secondary.prepare("SELECT 1").get();
-        if (invalidation.name === "abort") controller.abort();
-        else invalidation.apply(secondary);
-      };
-      const repository = stage === "before-get"
-        ? new ServiceBoundaryRepository(fixture.db, crossBoundary)
-        : fixture.repository;
+      let providerStatus: "pending" | "resolved" | null = null;
+      let hookCalls = 0;
+      const repository = new PredicateBoundaryRepository(
+        fixture.db,
+        stage,
+        () => providerStatus,
+        (observation) => {
+          hookCalls += 1;
+          expect(observation.call).toBe(stage === "before-get" ? 1 : 2);
+          expect(observation.providerStatus).toBe(stage === "before-get" ? null : stage === "before-resolve" ? "pending" : "resolved");
+          secondary.prepare("SELECT 1").get();
+          if (invalidation.name === "abort") controller.abort();
+          else invalidation.apply(secondary);
+        },
+      );
       const get = vi.fn(async () => {
-        if (stage !== "before-get") crossBoundary();
-        return remote(fixture, stage === "before-mark" ? "resolved" : "pending");
+        const status = stage === "before-mark" ? "resolved" : "pending";
+        providerStatus = status;
+        return remote(fixture, status);
       });
       const resolve = vi.fn(async () => remote(fixture, "resolved"));
       const service = new ControllerInteractionService({
@@ -601,12 +622,20 @@ it.each(["before-get", "before-resolve", "before-mark"] as const)(
 
       await expect(service.deliverAnswered(fixture.controllerKey, FENCE, controller.signal)).resolves.toBe(false);
 
-      expect(crossed).toBe(true);
+      expect(hookCalls).toBe(1);
+      expect(repository.observations).toHaveLength(stage === "before-get" ? 1 : 2);
+      expect(repository.observations).toContainEqual({
+        call: stage === "before-get" ? 1 : 2,
+        providerStatus: stage === "before-get" ? null : stage === "before-resolve" ? "pending" : "resolved",
+        predicateResult: invalidation.name === "abort",
+      });
       expect(get).toHaveBeenCalledTimes(stage === "before-get" ? 0 : 1);
       expect(resolve).not.toHaveBeenCalled();
-      expect(fixture.db.prepare(
+      const stored = fixture.db.prepare(
         "SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?",
-      ).get(fixture.interaction.interactionId)).toMatchObject({ delivered_at: null });
+      ).get(fixture.interaction.interactionId) as { state: string; delivered_at: number | null };
+      expect(stored.state).toBe(invalidation.name === "answered-row state change" ? "pending" : "answered");
+      expect(stored.delivered_at).toBeNull();
       secondary.close();
       fixture.close();
     }
