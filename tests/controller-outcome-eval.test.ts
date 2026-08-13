@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
@@ -488,7 +488,7 @@ it("runs every kernel and cutover case as a durable fixed scenario", async () =>
   }
 });
 
-it("fails closed when fixed comparison token evidence is unavailable", { timeout: 30_000 }, async () => {
+it("writes a comparable cutover report when fake metric availability matches", { timeout: 30_000 }, async () => {
   const directory = mkdtempSync(join(tmpdir(), "hanoon-eval-comparison-"));
   const baseline = join(directory, "baseline.json");
   const output = join(directory, "after.json");
@@ -503,7 +503,7 @@ it("fails closed when fixed comparison token evidence is unavailable", { timeout
     });
     writeFileSync(baseline, `${JSON.stringify(baselineReport, null, 2)}\n`, { mode: 0o600 });
 
-    await expect(execFileAsync(process.execPath, [
+    await execFileAsync(process.execPath, [
       "scripts/eval-controller-outcomes.mjs",
       "--checkpoint", "cutover",
       "--trials", "3",
@@ -511,8 +511,39 @@ it("fails closed when fixed comparison token evidence is unavailable", { timeout
       "--baseline", baseline,
       "--output", output,
       "--replace",
-    ])).rejects.toMatchObject({ stderr: expect.stringMatching(/unavailable token budget evidence/) });
-    expect(existsSync(output)).toBe(false);
+    ]);
+
+    const report = JSON.parse(readFileSync(output, "utf8")) as {
+      status: string;
+      comparison: {
+        status: string;
+        common: Array<{ scenarioId: string; baseline: { passed: number; denominator: number }; after: { passed: number; denominator: number } }>;
+        newScenarios: Array<{ scenarioId: string }>;
+      };
+    };
+    expect(report.status).toBe("passed");
+    expect(report.comparison.status).toBe("comparable");
+    expect(report.comparison.common).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        scenarioId: "plain-conversation",
+        baseline: expect.objectContaining({ passed: 3, denominator: 3 }),
+        after: expect.objectContaining({ passed: 3, denominator: 3 }),
+      }),
+      expect.objectContaining({
+        scenarioId: "current-job-status",
+        baseline: expect.objectContaining({ passed: 3, denominator: 3 }),
+        after: expect.objectContaining({ passed: 3, denominator: 3 }),
+      }),
+    ]));
+    expect(report.comparison.newScenarios.map((scenario) => scenario.scenarioId)).toEqual([
+      "duplicate-mutation-replay",
+      "durable-deferred-monitor",
+      "process-only-finalization",
+      "restart-after-owner-tap",
+      "stale-capability-fence",
+      "telegram-allow-once",
+      "unsupported-success-claim",
+    ]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

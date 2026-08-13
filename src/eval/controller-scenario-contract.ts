@@ -430,12 +430,21 @@ function assertComparableTrialBudgetEvidence(
     if (trial.metrics.turns === undefined || trial.metrics.toolCalls === undefined) {
       throw new Error(`fixed comparison ${side} trial ${key}:${trial.trial} lacks measurable turn/tool budget evidence`);
     }
-    if (trial.metrics.tokens === null) {
-      throw new Error(`fixed comparison ${side} trial ${key}:${trial.trial} has unavailable token budget evidence`);
+  }
+  const availabilityFields = [
+    ["token", baselineTrial.metrics.tokens, afterTrial.metrics.tokens],
+    ["cost", baselineTrial.metrics.costUsd, afterTrial.metrics.costUsd],
+  ] as const;
+  for (const [name, baselineMetric, afterMetric] of availabilityFields) {
+    if ((baselineMetric === null) !== (afterMetric === null)) {
+      throw new Error(`fixed comparison ${key} ${name} usage availability differs between baseline and after`);
     }
-    if (trial.budget.maxCostUsd !== null && trial.metrics.costUsd === null) {
-      throw new Error(`fixed comparison ${side} trial ${key}:${trial.trial} has unavailable cost budget evidence`);
-    }
+  }
+  const scriptedFake = (trial: ControllerScenarioTrial): boolean =>
+    trial.harness.provider === "fake-bb" && trial.harness.model === "scripted-controller";
+  if ((baselineTrial.metrics.tokens === null || baselineTrial.metrics.costUsd === null) &&
+      (!scriptedFake(baselineTrial) || !scriptedFake(afterTrial))) {
+    throw new Error(`fixed comparison ${key} has unavailable real-provider usage evidence`);
   }
 }
 

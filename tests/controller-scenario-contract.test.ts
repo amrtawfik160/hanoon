@@ -510,24 +510,67 @@ describe("controller scenario contract", () => {
     })).not.toThrow();
   });
 
-  it("rejects unavailable measured budget evidence from a fixed comparison", () => {
+  it("allows fake scripted trials when token and cost availability is null on both sides", () => {
     const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const unavailableMetrics = { ...baseTrial.metrics, turns: 1, toolCalls: 0, tokens: null, costUsd: null };
     const baseline = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
-      trials: [{ ...baseTrial, metrics: { ...baseTrial.metrics, turns: 1, toolCalls: 0, tokens: null } }],
+      trials: [{ ...baseTrial, metrics: unavailableMetrics }],
     });
     const after = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
-      trials: [{ ...baseTrial, metrics: { ...baseTrial.metrics, turns: 1, toolCalls: 0, tokens: null } }],
+      trials: [{ ...baseTrial, metrics: unavailableMetrics }],
+    });
+
+    expect(compare({
+      baseline,
+      after,
+      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+    })).toMatchObject({ status: "comparable" });
+  });
+
+  it("rejects null-versus-number token availability drift", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{ ...baseTrial, metrics: { ...baseTrial.metrics, tokens: null } }],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [baseTrial],
     });
 
     expect(() => compare({
       baseline,
       after,
       scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
-    })).toThrow(/unavailable|budget|comparable/i);
+    })).toThrow(/availability|token.*usage|comparable/i);
+  });
+
+  it("rejects unavailable token usage for a real provider even when both sides are null", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const realHarness = { ...baseTrial.harness, provider: "codex", model: "gpt-5.6-sol" };
+    const unavailableMetrics = { ...baseTrial.metrics, tokens: null, costUsd: null };
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{ ...baseTrial, harness: realHarness, metrics: unavailableMetrics }],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [{ ...baseTrial, harness: realHarness, metrics: unavailableMetrics }],
+    });
+
+    expect(() => compare({
+      baseline,
+      after,
+      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+    })).toThrow(/real provider|provider usage|unavailable.*real/i);
   });
 });
 
