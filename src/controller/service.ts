@@ -6,7 +6,7 @@ import {
   type ControllerInteractionReference,
   type ControllerInteractionSnapshot,
   type ControllerAdapter,
-  type ControllerSpawnResult,
+  type ControllerLocation,
   type ControllerStatus,
 } from "./bb-controller";
 import { ControllerInteractionService } from "./interaction-service";
@@ -18,7 +18,6 @@ import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
 import {
   ControllerEvidenceProjectorError,
-  type ControllerEvidenceReconciliation,
   type ControllerEvidenceReconciler,
 } from "./evidence-projector";
 
@@ -26,7 +25,7 @@ export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
   adapter: ControllerAdapter;
   interactionService?: ControllerInteractionService;
-  evidenceProjector?: ControllerEvidenceReconciler;
+  evidenceProjector: ControllerEvidenceReconciler;
   clock: { now(): number };
 };
 
@@ -56,28 +55,6 @@ const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
 const CONTROLLER_RECOVERY_PROMPT =
   "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";
 
-function legacyFixtureReconciler(adapter: ControllerAdapter): ControllerEvidenceReconciler | undefined {
-  // Task 7 fixtures carried an `output` method and predate the injected
-  // projector. Keep those unit fixtures runnable without restoring any raw
-  // output path; live BbControllerAdapter instances never have this marker.
-  if (!Object.hasOwn(adapter as object, "output")) return undefined;
-  return {
-    reconcile: async (
-      _controller,
-      turn,
-      _fence,
-      _signal,
-      immutableHighWater,
-    ): Promise<ControllerEvidenceReconciliation> => ({
-      outcome: "reconciled",
-      reconciliationIncomplete: null,
-      fromSeq: turn.evidenceEventSeq,
-      throughSeq: turn.evidenceEventSeq,
-      targetSeq: immutableHighWater ?? turn.evidenceEventSeq,
-    }),
-  };
-}
-
 function retireReason(status: ControllerStatus): string {
   if (status === "missing") return "Thread was deleted or archived";
   if (status === "incompatible") return "Configured model moved the conversation to another provider";
@@ -92,9 +69,7 @@ export class LunaControllerService {
   private readonly dependencies: LunaControllerServiceDependencies;
 
   public constructor(dependencies: LunaControllerServiceDependencies) {
-    this.dependencies = dependencies.evidenceProjector
-      ? dependencies
-      : { ...dependencies, evidenceProjector: legacyFixtureReconciler(dependencies.adapter) };
+    this.dependencies = dependencies;
   }
 
   public async processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
@@ -763,8 +738,8 @@ export class LunaControllerService {
     controller: ControllerThreadRecord,
     fence: EffectFence,
     signal: AbortSignal,
-  ): Promise<ControllerSpawnResult | null> {
-    let candidate: ControllerSpawnResult | null = null;
+  ): Promise<ControllerLocation | null> {
+    let candidate: ControllerLocation | null = null;
     const pendingSpawnToken = controller.pendingSpawnToken;
     if (pendingSpawnToken === null) {
       this.fail(turn, fence, "Controller spawn token is unavailable");

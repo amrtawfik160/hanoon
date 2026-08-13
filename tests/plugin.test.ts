@@ -69,6 +69,75 @@ it("registers configurable controller execution settings with safe defaults", as
   });
 });
 
+it("fails closed when the active controller has an invalid persisted configuration", async () => {
+  const { bb, harness } = await loadPlugin();
+  await harness.behavior.setSettings({
+    botToken: "123:test-token",
+    controllerModel: "claude-opus-5[1m]",
+    controllerReasoningLevel: "max",
+    controllerServiceTier: "fast",
+    controllerPermissionMode: "full",
+  });
+  const store = openStore(bb.storage);
+  const now = Date.now();
+  const pairingSecret = "invalid-config-pair";
+  store.createPairingCode(hashSecret(pairingSecret), now, now + 60_000);
+  expect(store.pairOwnerWithCode(hashSecret(pairingSecret), "7", "7", now)).toEqual({ ok: true });
+  const turn = store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 12_002,
+    inputText: "check configuration",
+    now,
+  });
+  const lease = store.acquireExecutorLease("invalid-config-test", now, 30_000);
+  if (!lease.acquired) throw new Error("missing controller test lease");
+  const fence = { ownerId: "invalid-config-test", generation: lease.generation, now };
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  const controller = store.getControllerForOwner("7", "7");
+  if (!controller) throw new Error("missing controller record");
+  expect(store.reserveControllerSpawn({
+    ...fence,
+    controllerKey: controller.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+  })).toBe(true);
+  expect(store.markControllerSpawned({
+    ...fence,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_invalid_config",
+    spawnToken: turn.id,
+  })).toBe(true);
+  const context = {
+    thread: {
+      id: "thr_invalid_config",
+      title: controllerSpawnTitle(controller.controllerKey, turn.id, "proj_personal", "host_personal", "claude-code"),
+      parentThreadId: null,
+      sourceThreadId: null,
+    },
+    project: { id: "proj_personal", kind: "personal" as const, name: "Personal", gitRemoteUrl: null },
+    environment: { id: "env_personal", name: null, path: "/personal", workspaceProvisionType: "personal" as const, branchName: null },
+    host: { id: "host_personal", name: "Personal host" },
+    provider: { id: "claude-code", model: "claude-opus-5[1m]" },
+    origin: { kind: null, pluginId: bb.pluginId },
+  };
+  const valid = await harness.behavior.resolveAgentConfiguration(context);
+  expect(valid.tools.map((tool) => tool.name)).toEqual(CONTROLLER_TOOL_NAMES);
+  expect(valid.skills).toEqual([]);
+  expect(valid.instructions).toContain(CONTROLLER_INSTRUCTION_SENTINEL);
+
+  await harness.behavior.setSettings({ botToken: null });
+  expect(harness.needsConfigurationMessages).toContain(
+    "Set the Telegram bot token in Extensions → Plugins → Telegram Agent.",
+  );
+  const invalid = await harness.behavior.resolveAgentConfiguration(context);
+  expect(invalid).toEqual({ tools: [], skills: [], instructions: null });
+});
+
 it("retains executable controller operating guidance alongside the trust boundaries", () => {
   const guidance = CONTROLLER_INSTRUCTIONS.toLowerCase();
   for (const behavior of [
@@ -359,6 +428,13 @@ it("wires submitted controller turns through the leased job executor", async () 
   const lease = store.acquireExecutorLease("setup", Date.now(), 30_000);
   if (!lease.acquired) throw new Error("missing setup lease");
   expect(store.claimNextControllerTurn({ ownerId: "setup", generation: lease.generation, now: Date.now() })?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: Date.now(),
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: "setup",
@@ -367,6 +443,7 @@ it("wires submitted controller turns through the leased job executor", async () 
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: "setup", generation: lease.generation, now: Date.now() })).toBe(true);
   const accepted = store.proposeControllerFinalization({
@@ -439,12 +516,20 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
   if (!lease.acquired) throw new Error("missing setup lease");
   const fence = { ownerId: "presence-setup", generation: lease.generation, now };
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: turn.id,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_presence_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
   expect(store.releaseExecutorLease(fence.ownerId, fence.generation, now)).toBe(true);

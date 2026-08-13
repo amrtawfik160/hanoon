@@ -223,12 +223,20 @@ it("claims exactly one FIFO turn while a controller turn is dispatching or submi
 
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ id: first.id, ordinal: 1, state: "dispatching" });
   expect(store.claimNextControllerTurn(fence)).toBeNull();
+  expect(store.reserveControllerSpawn({
+    controllerKey: first.controllerKey,
+    turnId: first.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: first.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: first.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: first.id, ...fence })).toBe(true);
   expect(store.claimNextControllerTurn(fence)).toBeNull();
@@ -266,6 +274,24 @@ it("reserves and consumes one exact pending controller project/host scope", () =
     ...value.fence,
   };
 
+  if (false) {
+    // @ts-expect-error strict controller mapping requires the spawn token
+    value.store.markControllerSpawned({
+      ...value.fence,
+      turnId: value.turn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      threadId: "thr_tokenless",
+    });
+  }
+  expect(value.store.markControllerSpawned({
+    ...value.fence,
+    turnId: value.turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_unreserved",
+    spawnToken: value.turn.id,
+  })).toBe(false);
   expect(value.store.reserveControllerSpawn(scope)).toBe(true);
   expect(value.store.reserveControllerSpawn(scope)).toBe(true);
   expect(value.store.reserveControllerSpawn({ ...scope, projectId: "proj_other" })).toBe(false);
@@ -421,12 +447,20 @@ it.each([
     ).run(value.controller.controllerKey);
   }],
   ["mapped controller", (value: ReturnType<typeof pendingSpawnFixture>) => {
+    expect(value.store.reserveControllerSpawn({
+      ...value.fence,
+      controllerKey: value.controller.controllerKey,
+      turnId: value.turn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+    })).toBe(true);
     expect(value.store.markControllerSpawned({
       ...value.fence,
       turnId: value.turn.id,
       projectId: "proj_personal",
       hostId: "host_personal",
       threadId: "thr_already_mapped",
+      spawnToken: value.turn.id,
     })).toBe(true);
   }],
 ] as const)("fails closed for a %s pending-spawn adversary", (_label, mutate) => {
@@ -447,6 +481,7 @@ it("fences controller mapping to the exact pending turn token and one unmapped c
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_wrong_token",
+    spawnToken: value.turn.id,
   })).toBe(false);
   expect(value.store.getControllerForOwner("7", "7")).toMatchObject({
     state: "pending_spawn",
@@ -486,6 +521,7 @@ it("fences controller mapping to the exact pending turn token and one unmapped c
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_second_mapping",
+    spawnToken: value.turn.id,
   })).toBe(false);
   expect(value.store.getControllerForOwner("7", "7")).toMatchObject({
     state: "active",
@@ -519,6 +555,13 @@ it("fences controller mutations against a stale executor generation", () => {
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
 
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -528,6 +571,7 @@ it("fences controller mutations against a stale executor generation", () => {
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_stale",
+    spawnToken: turn.id,
   })).toBe(false);
   expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
 });
@@ -562,12 +606,20 @@ it("requeues one unaccepted controller turn in a fresh generation without losing
   store.enqueueControllerTurn(turnInput(372, "second"));
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(first.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: first.controllerKey,
+    turnId: first.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: first.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_failed_init",
+    spawnToken: first.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: first.id, dispatchAfterSeq: 21, ...fence })).toBe(true);
 
@@ -591,12 +643,20 @@ it("keeps one durable Telegram message id from controller placeholder through li
   const turn = store.enqueueControllerTurn(turnInput(381, "stream this"));
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_stream",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, dispatchAfterSeq: 7, ...fence })).toBe(true);
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
@@ -638,12 +698,20 @@ it("refreshes an unchanged ephemeral controller draft before Telegram expires it
   const turn = store.enqueueControllerTurn(turnInput(391, "think for a while"));
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_slow",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
   const leased = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
@@ -701,12 +769,20 @@ it("fails and retires a submitted controller turn in one fenced operation", () =
   const turn = store.enqueueControllerTurn(turnInput(402));
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_atomic_failure",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
 
@@ -728,12 +804,20 @@ it("sends a controller answer as Telegram HTML so its formatting renders", () =>
   const turn = store.enqueueControllerTurn(turnInput(701));
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_formatting",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
 
@@ -784,12 +868,20 @@ it("does not expose a controller mapping after its paired owner is revoked", () 
   const turn = store.enqueueControllerTurn(turnInput(501));
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_owner",
+    spawnToken: turn.id,
   })).toBe(true);
 
   expect(store.getControllerByThreadId("thr_owner")?.controllerKey).toBe("owner-7-controller");
@@ -804,12 +896,20 @@ it("starts a fresh controller mapping after the same identity is revoked and pai
   const turn = store.enqueueControllerTurn(turnInput(551));
   const fence = acquire(store);
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ...fence,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_old_context",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.revokeOwner(2_001)).toBe(true);
   store.createPairingCode(hashSecret("pair-again"), 2_002, 10_000);

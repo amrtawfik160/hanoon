@@ -167,6 +167,13 @@ function fixture(options: { active?: boolean } = {}) {
   if (!lease.acquired) throw new Error("missing executor lease");
   const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
   if (!turn) throw new Error("missing controller turn");
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: 10_000,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: "executor",
@@ -175,6 +182,7 @@ function fixture(options: { active?: boolean } = {}) {
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,

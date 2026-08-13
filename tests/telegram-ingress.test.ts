@@ -300,6 +300,13 @@ function seedControllerInteraction(
   if (!lease.acquired) throw new Error("missing executor lease");
   const fence = { ownerId: "ingress-executor", generation: lease.generation };
   expect(fixture.store.claimNextControllerTurn({ ...fence, now: 9_000 })?.id).toBe(turn.id);
+  expect(fixture.store.reserveControllerSpawn({
+    controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: 9_000,
+  })).toBe(true);
   expect(fixture.store.markControllerSpawned({
     ...fence,
     now: 9_000,
@@ -307,6 +314,7 @@ function seedControllerInteraction(
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_ingress_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(fixture.store.markControllerTurnSubmitted({ ...fence, now: 9_000, turnId: turn.id })).toBe(true);
   const generation = fixture.store.listControllerGenerations(controllerKey, 1)[0];

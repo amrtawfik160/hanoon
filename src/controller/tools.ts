@@ -74,8 +74,8 @@ type ToolDependencies = {
   health(now: number): unknown;
   notify(): void;
   now(): number;
-  /** Current persisted controller provider; absent only for legacy unit fixtures. */
-  controllerProviderId?: () => string;
+  /** Current persisted controller provider; undefined means configuration is invalid. */
+  controllerProviderId?: () => string | undefined;
 };
 
 type EvidenceIndexDescriptor = Readonly<{

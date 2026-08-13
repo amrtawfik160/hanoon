@@ -51,12 +51,20 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
     now: 2_000,
   };
   expect(store.claimNextControllerTurn(fence)?.id).toBe(queued.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: queued.controllerKey,
+    turnId: queued.id,
+    projectId: "proj_1",
+    hostId: "host_1",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: queued.id,
     projectId: "proj_1",
     hostId: "host_1",
     threadId: `thr_controller_trust_${fixtureNumber}`,
+    spawnToken: queued.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, turnId: queued.id })).toBe(true);
 

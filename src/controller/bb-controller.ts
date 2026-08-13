@@ -105,19 +105,7 @@ type ControllerAdapterMethods = {
   findSpawnCandidate(controllerKey: string, pendingSpawnToken: string, signal: AbortSignal): Promise<ControllerLocation | null>;
 };
 
-type LegacyControllerLocation = Omit<ControllerLocation, "spawnToken"> & { spawnToken?: string };
-export type ControllerSpawnResult = ControllerLocation | LegacyControllerLocation;
-type LegacyControllerAdapterMethods = Omit<ControllerAdapterMethods, "spawn" | "findSpawnCandidate"> & {
-  spawn(
-    turn: ControllerTurnRecord,
-    controller: ControllerThreadRecord,
-    signal: AbortSignal,
-  ): Promise<ControllerSpawnResult>;
-  findSpawnCandidate(controllerKey: string, pendingSpawnToken: string, signal: AbortSignal): Promise<ControllerSpawnResult | null>;
-};
-
-/** Allows older fixture adapters to carry fields removed from the live contract. */
-export type ControllerAdapter = ControllerAdapterMethods | (LegacyControllerAdapterMethods & Record<string, unknown>);
+export type ControllerAdapter = ControllerAdapterMethods;
 
 export const CONTROLLER_EVENT_PAGE_LIMIT = 100;
 export const MAX_CONTROLLER_EVENT_PAGES = 50;

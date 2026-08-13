@@ -45,7 +45,24 @@ function completedTurn(
   if (!lease.acquired) throw new Error("missing lease");
   const fence = { ownerId: `executor-${updateId}`, generation: lease.generation, now };
   store.claimNextControllerTurn(fence);
-  store.markControllerSpawned({ ...fence, turnId: turn.id, projectId: "p", hostId: "h", threadId: "thr_c" });
+  const controller = store.getControllerForOwner("7", "7");
+  if (!controller?.threadId) {
+    if (!store.reserveControllerSpawn({
+      controllerKey: CONTROLLER_KEY,
+      turnId: turn.id,
+      projectId: "p",
+      hostId: "h",
+      now,
+    })) throw new Error("controller spawn reservation failed");
+    expect(store.markControllerSpawned({
+      ...fence,
+      turnId: turn.id,
+      projectId: "p",
+      hostId: "h",
+      threadId: "thr_c",
+      spawnToken: turn.id,
+    })).toBe(true);
+  }
   store.markControllerTurnSubmitted({ ...fence, turnId: turn.id });
   store.completeControllerTurn({ ...fence, turnId: turn.id, responseText: "an answer" });
   // Released so a later turn in the same test can take the singleton lease.

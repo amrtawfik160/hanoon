@@ -10,6 +10,18 @@ import {
 } from "../src/controller/bb-controller";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
 import { LunaControllerService } from "../src/controller/service";
+
+const testEvidenceProjector = {
+  reconcile: vi.fn(async (...args: unknown[]) => ({
+    outcome: "reconciled" as const,
+    reconciliationIncomplete: null,
+    fromSeq: 0,
+    throughSeq: Number(args[1] && typeof args[1] === "object" && "evidenceEventSeq" in args[1]
+      ? (args[1] as { evidenceEventSeq: number }).evidenceEventSeq
+      : 0),
+    targetSeq: typeof args[4] === "number" ? args[4] : 0,
+  })),
+};
 import {
   evaluateSupervisor,
   SUPERVISOR_HARD_TOKENS,
@@ -159,6 +171,13 @@ function submittedTurn(
     now: 2_000,
   });
   store.claimNextControllerTurn({ ...fence, now: 2_000 });
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: 2_000,
+  })).toBe(true);
   store.markControllerSpawned({
     ...fence,
     now: 2_000,
@@ -166,6 +185,7 @@ function submittedTurn(
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   });
   store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id });
   return turn;
@@ -286,11 +306,10 @@ type Observation = Awaited<ReturnType<ControllerAdapter["events"]>>;
 
 function serviceAdapter(observation: () => Observation, status: () => ControllerStatus): ControllerAdapter {
   return {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => status()),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => observation()),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -322,7 +341,7 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
     () => observation({ latestSeq: (seq += 1), toolCalls }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -363,7 +382,7 @@ it("leaves a turn parked on an owner question alone however much it has spent", 
     () => observation({ latestSeq: 9, toolCalls: SUPERVISOR_HARD_TOOL_CALLS }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_002 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -380,7 +399,7 @@ it("keeps the turn running when a budget nudge cannot be delivered", async () =>
     () => "active",
   );
   adapter.steer = vi.fn(async () => { throw new Error("steer channel is down"); });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -402,7 +421,7 @@ it("budgets this turn's tokens, not the whole thread's history", async () => {
     () => observation({ latestSeq: (seq += 1), totalTokens: lifetime }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -420,7 +439,7 @@ it("budgets this turn's tokens, not the whole thread's history", async () => {
     () => observation({ latestSeq: (seq += 1), totalTokens: spent }),
     () => "active",
   );
-  const second = new LunaControllerService({ store, adapter: busy, clock: { now: () => 2_002 } });
+  const second = new LunaControllerService({ store, adapter: busy, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_002 } });
   await expect(second.reconcile(runFence, runFence.signal)).resolves.toBe(true);
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({

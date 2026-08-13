@@ -71,9 +71,13 @@ export function loadControllerScenarioCorpus(): ReturnType<typeof parseControlle
 function scriptedAdapter(
   observeToolCall: () => Promise<boolean>,
   finalizeTurn: () => Promise<void>,
+  reserveSpawn: (turnId: string) => boolean,
 ): ControllerAdapter {
   return {
-    spawn: async () => ({ threadId: "thr_fixed_controller", projectId: "proj_fixed", hostId: "host_fixed" }),
+    spawn: async (turn) => {
+      if (!reserveSpawn(turn.id)) throw new Error("fixed scenario spawn reservation failed");
+      return { threadId: "thr_fixed_controller", projectId: "proj_fixed", hostId: "host_fixed", spawnToken: turn.id };
+    },
     send: async () => undefined,
     steer: async () => undefined,
     answerQuestion: async () => undefined,
@@ -221,7 +225,17 @@ async function runScenario(
     if (accepted.outcome !== "accepted") throw new Error("fixed scenario finalization was not accepted");
     finalizationAccepted = true;
   };
-  const adapter = scriptedAdapter(observeToolCall, finalizeTurn);
+  const adapter = scriptedAdapter(
+    observeToolCall,
+    finalizeTurn,
+    (turnId) => store.reserveControllerSpawn({
+      controllerKey: CONTROLLER_KEY,
+      turnId,
+      projectId: "proj_fixed",
+      hostId: "host_fixed",
+      now: FIXTURE_NOW,
+    }),
+  );
   const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => FIXTURE_NOW } });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY,

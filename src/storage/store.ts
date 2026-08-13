@@ -1763,7 +1763,7 @@ export interface TelegramAgentStore {
     projectId: string;
     hostId: string;
     threadId: string;
-    spawnToken?: string;
+    spawnToken: string;
     leaseMs?: number;
   }): boolean;
   markControllerTurnSubmitted(input: ControllerLeaseFence & {
@@ -3607,7 +3607,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     projectId: string;
     hostId: string;
     threadId: string;
-    spawnToken?: string;
+    spawnToken: string;
     leaseMs?: number;
   }): boolean {
     this.assertControllerMutation(input);
@@ -3629,18 +3629,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         !turn || turn.state !== "dispatching" ||
         turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation
       ) return false;
-      const strictSpawn = input.spawnToken !== undefined;
-      if (strictSpawn && input.spawnToken !== input.turnId) return false;
-      const scopePredicate = strictSpawn
-        ? "project_id = ? AND host_id = ?"
-        : "project_id IS NULL AND host_id IS NULL";
-      const scopeParameters = strictSpawn ? [input.projectId, input.hostId] : [];
+      if (input.spawnToken !== input.turnId) return false;
       const spawned = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = ?, host_id = ?, bb_thread_id = ?, state = 'active',
                 pending_spawn_token = NULL, last_error = NULL, updated_at = ?
           WHERE controller_key = ? AND state = 'pending_spawn' AND bb_thread_id IS NULL
-            AND pending_spawn_token = ? AND ${scopePredicate}`,
+            AND pending_spawn_token = ? AND project_id = ? AND host_id = ?`,
       ).run(
         input.projectId,
         input.hostId,
@@ -3648,7 +3643,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.now,
         turn.controller_key,
         input.turnId,
-        ...scopeParameters,
+        input.projectId,
+        input.hostId,
       ).changes === 1;
       if (spawned) {
         this.db.prepare(

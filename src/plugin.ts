@@ -178,9 +178,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     ),
     notify: () => executorNudge.notify(),
     now: clock,
-    controllerProviderId: () => controllerProviderFor(
-      config.ok ? controllerExecutionProfile(config.value).model : DEFAULT_CONTROLLER_EXECUTION_PROFILE.model,
-    ),
+    controllerProviderId: () => config.ok
+      ? controllerProviderFor(controllerExecutionProfile(config.value).model)
+      : undefined,
   });
 
   const terminal = new TerminalCommandRunner(bb.sdk);

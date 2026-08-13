@@ -501,7 +501,6 @@ it("passes the current pending token to adoption so a stale title yields a fresh
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -525,6 +524,26 @@ function serviceFixture() {
   if (!lease.acquired) throw new Error("missing lease");
   const fence = { ownerId: "executor", generation: lease.generation, signal: AbortSignal.timeout(2_000) };
   return { db: bb.storage.database(), store, fence, reopen: () => openStore(bb.storage, bb.storage.kv, () => 2_000) };
+}
+
+function reserveControllerSpawnForTest(
+  store: ReturnType<typeof serviceFixture>["store"],
+  turnId: string,
+  now = 2_000,
+  projectId = "proj_personal",
+  hostId = "host_personal",
+): void {
+  const turn = store.getControllerTurn(turnId);
+  if (!turn) throw new Error("missing controller turn for spawn reservation");
+  if (!store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId,
+    projectId,
+    hostId,
+    now,
+  })) {
+    throw new Error("controller spawn reservation failed");
+  }
 }
 
 function recordServiceQuestion(
@@ -628,6 +647,7 @@ it("ignores raw provider output and completes only from the accepted finalizatio
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -636,6 +656,7 @@ it("ignores raw provider output and completes only from the accepted finalizatio
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_accepted_only",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -646,11 +667,10 @@ it("ignores raw provider output and completes only from the accepted finalizatio
   const accepted = acceptControllerFinalization(store, turn.id);
   const rawOutput = vi.fn(async () => "RAW PROVIDER OUTPUT MUST NOT SHIP");
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    output: rawOutput,
     events: vi.fn(async () => ({
       latestSeq: 1,
       inputAccepted: true,
@@ -691,18 +711,18 @@ it("keeps an accepted finalization unconsumed while the provider is active", asy
     now: 2_000,
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
-    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_active_accepted",
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_active_accepted", spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
   const accepted = acceptControllerFinalization(store, turn.id);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false, completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -727,9 +747,10 @@ it("does not continue from a stale provider cursor", async () => {
     now: 2_000,
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
-    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_stale_cursor",
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_stale_cursor", spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
   expect(store.updateControllerStream({
@@ -737,7 +758,7 @@ it("does not continue from a stale provider cursor", async () => {
   })).toBe(true);
   const highWater = 4;
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => highWater),
@@ -761,11 +782,19 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
   store.enqueueControllerTurn({ ...turnRecord({ updateId: 12, inputText: "second" }), telegramUserId: "7", telegramChatId: "7", now: 2_001 });
   let status: "active" | "idle" = "active";
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => {
+      expect(store.reserveControllerSpawn({
+        controllerKey: "owner-7-controller",
+        turnId: spawnTurn.id,
+        projectId: "proj_personal",
+        hostId: "host_personal",
+        now: 2_000,
+      })).toBe(true);
+      return { threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id };
+    }),
     send: vi.fn(async () => undefined),
     status: async () => status,
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "First answer."),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -802,6 +831,7 @@ it("does not steer a queued owner message after the executor lease is lost", asy
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id);
   expect(store.markControllerSpawned({
     ...fence,
     now: 2_000,
@@ -809,11 +839,12 @@ it("does not steer a queued owner message after the executor lease is lost", asy
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_lease_fence",
+    spawnToken: running.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: running.id })).toBe(true);
 
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => {
       expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 2_003)).toBe(true);
@@ -853,6 +884,7 @@ it("fail-retires a continuation when the post-claim send is aborted", async () =
     now: 2_000,
   });
   expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     ...fence,
     now: 2_000,
@@ -860,11 +892,12 @@ it("fail-retires a continuation when the post-claim send is aborted", async () =
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_continuation_abort",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
   const aborted = new AbortController();
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => {
       aborted.abort();
       throw new Error("send outcome is ambiguous");
@@ -908,6 +941,7 @@ it("fail-retires when the lease is lost immediately after a continuation claim",
     now: 2_000,
   });
   expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     ...fence,
     now: 2_000,
@@ -915,6 +949,7 @@ it("fail-retires when the lease is lost immediately after a continuation claim",
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_continuation_refence",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
   const aborted = new AbortController();
@@ -929,7 +964,7 @@ it("fail-retires when the lease is lost immediately after a continuation claim",
   `);
   const send = vi.fn(async () => undefined);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send,
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
@@ -968,6 +1003,7 @@ it("keeps a needs-owner finalization parked and answerable across restart", asyn
     now: 2_000,
   });
   expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     ...fence,
     now: 2_000,
@@ -975,13 +1011,14 @@ it("keeps a needs-owner finalization parked and answerable across restart", asyn
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_needs_owner_restart",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
   expect(recordServiceQuestion(store, fence, turn.id, "interaction_needs_owner_restart")).toBe(true);
   const accepted = acceptNeedsOwnerFinalization(store, turn.id);
   const restarted = fixture.reopen();
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
@@ -1048,12 +1085,14 @@ it("keeps a queued image durable until the active turn finishes", async () => {
   });
   const leaseFence = { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 };
   expect(store.claimNextControllerTurn(leaseFence)?.id).toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id, leaseFence.now);
   expect(store.markControllerSpawned({
     ...leaseFence,
     turnId: running.id,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: running.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...leaseFence, turnId: running.id })).toBe(true);
   const image = {
@@ -1070,11 +1109,10 @@ it("keeps a queued image durable until the active turn finishes", async () => {
   });
   let status: "active" | "idle" = "active";
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => status),
     latestSeq: vi.fn(async () => 1),
-    output: vi.fn(async () => "First answer."),
     events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1118,7 +1156,6 @@ it("requeues a transient image preparation failure without adopting a late spawn
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1157,13 +1194,13 @@ it("requeues an aborted image preparation without consuming a retry", async () =
     threadId: "thr_unrelated",
     projectId: "proj_personal",
     hostId: "host_personal",
+    spawnToken: turn.id,
   }));
   const adapter: ControllerAdapter = {
     spawn: vi.fn(async () => { throw new ControllerImagePreparationError(true); }),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1202,6 +1239,7 @@ it("requeues a turn while the controller thread is still busy instead of failing
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1210,6 +1248,7 @@ it("requeues a turn while the controller thread is still busy instead of failing
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_busy",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: turn.id,
@@ -1226,11 +1265,10 @@ it("requeues a turn while the controller thread is still busy instead of failing
   });
   let status: "active" | "idle" = "active";
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => status),
     latestSeq: vi.fn(async () => 4),
-        output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 4, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1259,6 +1297,7 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1267,6 +1306,7 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_wedged",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: turn.id,
@@ -1282,11 +1322,10 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     now: 2_001,
   });
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
-        output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1315,6 +1354,7 @@ it("delivers a completed answer even when the controller thread ends in error", 
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1323,6 +1363,7 @@ it("delivers a completed answer even when the controller thread ends in error", 
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_answered_then_errored",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1332,11 +1373,10 @@ it("delivers a completed answer even when the controller thread ends in error", 
   })).toBe(true);
   const accepted = acceptControllerFinalization(store, turn.id, "Here is the answer.", 12);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "error" as const),
     latestSeq: vi.fn(async () => 12),
-        output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({
       latestSeq: 12,
       inputAccepted: true,
@@ -1365,11 +1405,10 @@ it("delivers a completed answer even when the controller thread ends in error", 
 it("reports a streaming turn only while its answer is still arriving", async () => {
   const { store, fence } = serviceFixture();
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1388,12 +1427,14 @@ it("reports a streaming turn only while its answer is still arriving", async () 
 
   const claim = { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 };
   expect(store.claimNextControllerTurn(claim)?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id, claim.now);
   expect(store.markControllerSpawned({
     ...claim,
     turnId: turn.id,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...claim, turnId: turn.id })).toBe(true);
   expect(service.isStreaming()).toBe(true);
@@ -1406,18 +1447,18 @@ it("fails an uncertain send closed and never submits it twice", async () => {
   const { store, fence } = serviceFixture();
   store.enqueueControllerTurn({ ...turnRecord({ updateId: 21, inputText: "send once" }), telegramUserId: "7", telegramChatId: "7", now: 2_000 });
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => { throw new Error("uncertain send"); }),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: "controller-turn-21" })),
   };
   const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).not.toBeNull();
+  reserveControllerSpawnForTest(store, "controller-turn-21");
   expect(store.markControllerSpawned({
     turnId: "controller-turn-21",
     ownerId: fence.ownerId,
@@ -1426,6 +1467,7 @@ it("fails an uncertain send closed and never submits it twice", async () => {
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: "controller-turn-21",
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: "controller-turn-21",
@@ -1451,6 +1493,7 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
     now: 2_000,
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1459,6 +1502,7 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1467,11 +1511,10 @@ it("keeps an idle submitted turn durable when BB output retrieval fails transien
     now: 2_000,
   })).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => { throw new Error("raw output must not be read"); }),
     events: vi.fn(async () => { throw new Error("temporary BB event failure"); }),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1498,6 +1541,7 @@ it("projects active Luna assistant deltas into the durable controller reply", as
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1506,6 +1550,7 @@ it("projects active Luna assistant deltas into the durable controller reply", as
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_streaming",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1515,11 +1560,10 @@ it("projects active Luna assistant deltas into the durable controller reply", as
     now: 2_000,
   })).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({
       latestSeq: 10,
       inputAccepted: true,
@@ -1559,6 +1603,7 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1567,6 +1612,7 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_thinking",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1577,11 +1623,10 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
   const [draft] = store.leaseOutbox(fence.ownerId, fence.generation, 2_000, 1, 30_000);
   expect(store.completeOutbox(draft!.logicalKey, fence.ownerId, fence.generation, null, 2_000)).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({
       latestSeq: 0,
       inputAccepted: true,
@@ -1620,6 +1665,7 @@ it("retires an errored controller so a later queued message can start a fresh ge
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(failed.id);
+  reserveControllerSpawnForTest(store, failed.id);
   expect(store.markControllerSpawned({
     turnId: failed.id,
     ownerId: fence.ownerId,
@@ -1628,6 +1674,7 @@ it("retires an errored controller so a later queued message can start a fresh ge
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_poisoned",
+    spawnToken: failed.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: failed.id,
@@ -1635,17 +1682,26 @@ it("retires an errored controller so a later queued message can start a fresh ge
     generation: fence.generation,
     now: 2_000,
   })).toBe(true);
-  const spawn = vi.fn(async () => ({
-    threadId: "thr_fresh",
-    projectId: "proj_personal",
-    hostId: "host_personal",
-  }));
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_000,
+    })).toBe(true);
+    return {
+      threadId: "thr_fresh",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: spawnTurn.id,
+    };
+  });
   const adapter: ControllerAdapter = {
     spawn,
     send: vi.fn(async () => undefined),
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1676,6 +1732,7 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(previous.id);
+  reserveControllerSpawnForTest(store, previous.id);
   expect(store.markControllerSpawned({
     turnId: previous.id,
     ownerId: fence.ownerId,
@@ -1684,6 +1741,7 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_poisoned_idle",
+    spawnToken: previous.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: previous.id,
@@ -1718,7 +1776,6 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     send: vi.fn(async () => undefined),
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned_idle" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1746,6 +1803,7 @@ it("retires an errored controller generation even when no turn remains submitted
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(previous.id);
+  reserveControllerSpawnForTest(store, previous.id);
   expect(store.markControllerSpawned({
     turnId: previous.id,
     ownerId: fence.ownerId,
@@ -1754,6 +1812,7 @@ it("retires an errored controller generation even when no turn remains submitted
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_initialize_timeout",
+    spawnToken: previous.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: previous.id,
@@ -1763,11 +1822,10 @@ it("retires an errored controller generation even when no turn remains submitted
     error: "Controller send outcome is uncertain",
   })).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "error" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -1793,6 +1851,7 @@ it("retries one controller generation when BB proves the input was never accepte
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1801,6 +1860,7 @@ it("retries one controller generation when BB proves the input was never accepte
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_never_accepted",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1809,17 +1869,26 @@ it("retries one controller generation when BB proves the input was never accepte
     dispatchAfterSeq: 9,
     now: 2_000,
   })).toBe(true);
-  const spawn = vi.fn(async () => ({
-    threadId: "thr_retry",
-    projectId: "proj_personal",
-    hostId: "host_personal",
-  }));
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_000,
+    })).toBe(true);
+    return {
+      threadId: "thr_retry",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: spawnTurn.id,
+    };
+  });
   const adapter: ControllerAdapter = {
     spawn,
     send: vi.fn(async () => undefined),
     status: vi.fn(async (threadId: string) => threadId === "thr_never_accepted" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => ({
       latestSeq: 11,
       inputAccepted: false,

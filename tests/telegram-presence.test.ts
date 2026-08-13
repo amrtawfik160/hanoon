@@ -61,12 +61,20 @@ describe("Telegram presence target resolution", () => {
       chatId: "70",
     });
 
+    expect(queued.store.reserveControllerSpawn({
+      controllerKey: queued.turn.controllerKey,
+      turnId: queued.turn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: queued.fence.now,
+    })).toBe(true);
     expect(queued.store.markControllerSpawned({
       ...queued.fence,
       turnId: queued.turn.id,
       projectId: "proj_personal",
       hostId: "host_personal",
       threadId: "thr_controller",
+      spawnToken: queued.turn.id,
     })).toBe(true);
     expect(queued.store.markControllerTurnSubmitted({ ...queued.fence, turnId: queued.turn.id })).toBe(true);
     expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toEqual({

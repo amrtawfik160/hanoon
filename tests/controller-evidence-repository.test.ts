@@ -469,6 +469,13 @@ it("scopes evidence reads to the requested turn", () => {
     now: 2_001,
   });
   expect(store.claimNextControllerTurn({ ...fence, now: 2_001 })?.id).toBe(other.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: other.controllerKey,
+    turnId: other.id,
+    projectId: "proj_2",
+    hostId: "host_1",
+    now: 2_001,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     ...fence,
     now: 2_001,
@@ -476,6 +483,7 @@ it("scopes evidence reads to the requested turn", () => {
     projectId: "proj_2",
     hostId: "host_1",
     threadId: "thr_other_controller",
+    spawnToken: other.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, now: 2_001, turnId: other.id })).toBe(true);
 

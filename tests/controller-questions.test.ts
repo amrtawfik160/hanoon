@@ -17,6 +17,18 @@ const QUESTION_ID = "toolu_abc:question-1";
 const OPTION_A = "toolu_abc:question-1:option-1";
 const OPTION_B = "toolu_abc:question-1:option-2";
 
+const testEvidenceProjector = {
+  reconcile: vi.fn(async (...args: unknown[]) => ({
+    outcome: "reconciled" as const,
+    reconciliationIncomplete: null,
+    fromSeq: 0,
+    throughSeq: Number(args[1] && typeof args[1] === "object" && "evidenceEventSeq" in args[1]
+      ? (args[1] as { evidenceEventSeq: number }).evidenceEventSeq
+      : 0),
+    targetSeq: typeof args[4] === "number" ? args[4] : 0,
+  })),
+};
+
 function questionPayload() {
   return {
     kind: "user_question",
@@ -320,6 +332,13 @@ function submittedTurn(store: ReturnType<typeof storeFixture>["store"], fence: {
     now: 2_000,
   });
   store.claimNextControllerTurn({ ...fence, now: 2_000 });
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: 2_000,
+  })).toBe(true);
   store.markControllerSpawned({
     ...fence,
     now: 2_000,
@@ -327,6 +346,7 @@ function submittedTurn(store: ReturnType<typeof storeFixture>["store"], fence: {
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   });
   store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id });
   return turn;
@@ -478,7 +498,7 @@ it("keeps the oldest pending interaction visible and promotes the next after del
 
 function serviceAdapter(overrides: Partial<ControllerAdapter> = {}): ControllerAdapter {
   return {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
@@ -490,7 +510,6 @@ function serviceAdapter(overrides: Partial<ControllerAdapter> = {}): ControllerA
     })),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "done"),
     events: vi.fn(async () => ({
       latestSeq: 0,
       inputAccepted: false,
@@ -520,7 +539,7 @@ it("parks the turn and asks in Telegram when the thread blocks on a question", a
       totalTokens: 0,
     })),
   });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 3_000 } });
   const signal = AbortSignal.timeout(2_000);
 
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
@@ -551,7 +570,7 @@ it.each([
     })),
     getInteraction: vi.fn(async () => ({ ...snapshot, payload: questionPayload() })),
   });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 3_000 } });
   const signal = AbortSignal.timeout(2_000);
 
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
@@ -591,7 +610,7 @@ it("rejects an exact interaction read after the controller generation changes", 
     })),
     getInteraction,
   });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 3_000 } });
   const signal = AbortSignal.timeout(2_000);
 
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
@@ -623,7 +642,7 @@ it.each(["resolved", "interrupted"] as const)("settles a lifecycle reference whe
       payload: null,
     })),
   });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 3_000 } });
   const signal = AbortSignal.timeout(2_000);
 
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
@@ -645,7 +664,7 @@ it("delivers the owner's answer back to the blocked BB thread", async () => {
     now: 4_000,
   }).ok).toBe(true);
   const adapter = serviceAdapter();
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 4_100 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 4_100 } });
   const signal = AbortSignal.timeout(2_000);
 
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
@@ -657,7 +676,7 @@ it("delivers the owner's answer back to the blocked BB thread", async () => {
     signal,
   );
   // Delivered once: a second pass must not answer the same interaction again.
-  const second = new LunaControllerService({ store, adapter, clock: { now: () => 4_200 } });
+  const second = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 4_200 } });
   await second.reconcile({ ...fence, signal }, signal);
   expect(adapter.answerQuestion).toHaveBeenCalledTimes(1);
 });
@@ -668,6 +687,7 @@ it("gives up on a turn that stopped producing events and unblocks the queue", as
   const service = new LunaControllerService({
     store,
     adapter: serviceAdapter(),
+    evidenceProjector: testEvidenceProjector,
     clock: { now: () => 2_000 + CONTROLLER_STALL_MS + 1 },
   });
   const signal = AbortSignal.timeout(2_000);
@@ -685,6 +705,7 @@ it("waits indefinitely while the owner still owes the thread an answer", async (
   const service = new LunaControllerService({
     store,
     adapter: serviceAdapter(),
+    evidenceProjector: testEvidenceProjector,
     clock: { now: () => 2_000 + CONTROLLER_STALL_MS + 1 },
   });
   const signal = AbortSignal.timeout(2_000);
@@ -706,7 +727,7 @@ it("hands a message sent mid-answer to the thread already writing it", async () 
     now: 2_100,
   });
   const adapter = serviceAdapter();
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_200 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_200 } });
   const signal = AbortSignal.timeout(2_000);
 
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
@@ -732,7 +753,7 @@ it("leaves a mid-answer message queued when the thread will not take it", async 
   const adapter = serviceAdapter({
     steer: vi.fn(async () => { throw new Error("BB refused the steer"); }),
   });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_200 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_200 } });
   const signal = AbortSignal.timeout(2_000);
 
   await service.reconcile({ ...fence, signal }, signal);
@@ -774,7 +795,7 @@ it("does not deliver an answer whose turn died before BB heard it", async () => 
   });
   store.failControllerTurn({ ...fence, now: 4_000, turnId: turn.id, error: "Controller provider turn failed" });
   const adapter = serviceAdapter();
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 4_100 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 4_100 } });
   const signal = AbortSignal.timeout(2_000);
 
   await service.reconcile({ ...fence, signal }, signal);
@@ -795,7 +816,7 @@ it("stops re-steering a message the thread keeps refusing", async () => {
   });
   const steer = vi.fn(async () => { throw new Error("BB refused the steer"); });
   const adapter = serviceAdapter({ steer });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_200 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_200 } });
   const signal = AbortSignal.timeout(2_000);
 
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -814,6 +835,7 @@ it("retires the wedged thread when a turn stalls, so the next message is not stu
   const service = new LunaControllerService({
     store,
     adapter: serviceAdapter(),
+    evidenceProjector: testEvidenceProjector,
     clock: { now: () => 2_000 + CONTROLLER_STALL_MS + 1 },
   });
   const signal = AbortSignal.timeout(2_000);

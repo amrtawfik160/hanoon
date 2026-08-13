@@ -379,12 +379,20 @@ function addSubmittedControllerTurn(store: TelegramAgentStore): string {
   if (!lease.acquired) throw new Error("missing presence setup lease");
   const fence = { ownerId: "presence-setup", generation: lease.generation, now: 1_000 };
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: turn.id,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_presence",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
   expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 1_000)).toBe(true);
