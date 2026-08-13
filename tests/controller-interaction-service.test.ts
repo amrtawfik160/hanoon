@@ -45,6 +45,40 @@ class DeliveryFenceRejectRepository extends ControllerInteractionRepository {
   }
 }
 
+class FreshFenceRepository extends ControllerInteractionRepository {
+  public readonly fenceTimes: number[] = [];
+  public markedFence: { now: number } | null = null;
+
+  public override isControllerInteractionDeliveryFenceCurrent(
+    input: Parameters<ControllerInteractionRepository["isControllerInteractionDeliveryFenceCurrent"]>[0],
+  ): boolean {
+    this.fenceTimes.push(input.now);
+    return super.isControllerInteractionDeliveryFenceCurrent(input);
+  }
+
+  public override markDelivered(
+    input: Parameters<ControllerInteractionRepository["markDelivered"]>[0],
+  ): boolean {
+    this.markedFence = input;
+    return super.markDelivered(input);
+  }
+}
+
+class ServiceBoundaryRepository extends ControllerInteractionRepository {
+  public constructor(
+    database: Database.Database,
+    private readonly beforeFence: () => void,
+  ) {
+    super(database);
+  }
+
+  public override getAnswered(controllerKey: string) {
+    const answered = super.getAnswered(controllerKey);
+    this.beforeFence();
+    return answered;
+  }
+}
+
 class TransitionFenceLossRepository extends ControllerInteractionRepository {
   public constructor(
     private readonly database: Database.Database,
@@ -140,6 +174,13 @@ function setup() {
       db.close();
     },
   };
+}
+
+function openIndependentDatabase(dbPath: string): Database.Database {
+  const database = new Database(dbPath);
+  database.pragma("busy_timeout = 5000");
+  database.pragma("foreign_keys = ON");
+  return database;
 }
 
 function remote(fixture: ReturnType<typeof setup>, status: string, overrides: Partial<ControllerInteractionRemote> = {}): ControllerInteractionRemote {
@@ -402,3 +443,172 @@ it("does not resolve twice after a crash between BB resolution and local deliver
   expect(fixture.repository.getAnswered(fixture.controllerKey)).toBeNull();
   fixture.close();
 });
+
+it("uses one fresh final boundary timestamp for the predicate and durable delivery", async () => {
+  const fixture = setup();
+  const deliveryNow = 2_345;
+  const repository = new FreshFenceRepository(fixture.db);
+  const get = vi.fn(async () => remote(fixture, "resolved"));
+  const resolve = vi.fn(async () => remote(fixture, "resolved"));
+  const service = new ControllerInteractionService({
+    store: repository,
+    clock: { now: () => deliveryNow },
+    interactions: { get, resolve },
+  });
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(true);
+
+  expect(fixture.db.prepare(
+    "SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?",
+  ).get(fixture.interaction.interactionId)).toEqual({ state: "delivered", delivered_at: deliveryNow });
+  expect(repository.markedFence?.now).toBe(deliveryNow);
+  expect(repository.fenceTimes).toEqual([deliveryNow, deliveryNow, deliveryNow]);
+  fixture.close();
+});
+
+it("fails closed when the lease expires at the fresh final delivery boundary", async () => {
+  const fixture = setup();
+  const secondary = openIndependentDatabase(fixture.dbPath);
+  let now = 2_100;
+  const get = vi.fn(async () => {
+    secondary.prepare("UPDATE executor_lease SET lease_expires_at = ? WHERE singleton = 1").run(2_200);
+    now = 2_200;
+    return remote(fixture, "resolved");
+  });
+  const resolve = vi.fn(async () => remote(fixture, "resolved"));
+  const service = new ControllerInteractionService({
+    store: fixture.repository,
+    clock: { now: () => now },
+    interactions: { get, resolve },
+  });
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
+
+  expect(get).toHaveBeenCalledTimes(1);
+  expect(resolve).not.toHaveBeenCalled();
+  expect(fixture.db.prepare(
+    "SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?",
+  ).get(fixture.interaction.interactionId)).toEqual({ state: "answered", delivered_at: null });
+  secondary.close();
+  fixture.close();
+});
+
+type DeliveryStage = "before-get" | "before-resolve" | "before-mark";
+
+const DELIVERY_STAGE_INVALIDATIONS = [
+  { name: "abort", apply: () => undefined },
+  {
+    name: "global takeover",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE executor_lease SET owner_id = 'successor', generation = 2 WHERE singleton = 1",
+    ).run(),
+  },
+  {
+    name: "global expiry",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE executor_lease SET lease_expires_at = 2_100 WHERE singleton = 1",
+    ).run(),
+  },
+  {
+    name: "submitted-turn lease change",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = 'turn_service_1'",
+    ).run(),
+  },
+  {
+    name: "submitted-turn state change",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE controller_turns SET state = 'completed' WHERE id = 'turn_service_1'",
+    ).run(),
+  },
+  {
+    name: "active controller state change",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE controller_threads SET state = 'failed' WHERE controller_key = 'owner-7-controller'",
+    ).run(),
+  },
+  {
+    name: "active controller thread change",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE controller_threads SET bb_thread_id = 'thr_other' WHERE controller_key = 'owner-7-controller'",
+    ).run(),
+  },
+  {
+    name: "generation end",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE controller_generations SET ended_at = 2_100, end_reason = 'takeover' WHERE id = 'gen_service_1'",
+    ).run(),
+  },
+  {
+    name: "generation replacement",
+    apply: (database: Database.Database) => {
+      database.prepare(
+        "UPDATE controller_generations SET ended_at = 2_100, end_reason = 'replacement' WHERE id = 'gen_service_1'",
+      ).run();
+      database.prepare(
+        "INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen_service_2', 'owner-7-controller', 'thr_service_1', 2_101, NULL, NULL)",
+      ).run();
+    },
+  },
+  {
+    name: "ambiguous open generation",
+    apply: (database: Database.Database) => database.prepare(
+      "INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen_service_2', 'owner-7-controller', 'thr_service_1', 2_101, NULL, NULL)",
+    ).run(),
+  },
+  {
+    name: "answered-row identity change",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE controller_interactions SET bb_thread_id = 'thr_other' WHERE interaction_id = 'service_approval'",
+    ).run(),
+  },
+  {
+    name: "answered-row state change",
+    apply: (database: Database.Database) => database.prepare(
+      "UPDATE controller_interactions SET state = 'pending', answered_at = NULL WHERE interaction_id = 'service_approval'",
+    ).run(),
+  },
+] as const;
+
+it.each(["before-get", "before-resolve", "before-mark"] as const)(
+  "blocks stale or aborted delivery at the %s boundary across the full SQLite fence matrix",
+  async (stage: DeliveryStage) => {
+    for (const invalidation of DELIVERY_STAGE_INVALIDATIONS) {
+      const fixture = setup();
+      const secondary = openIndependentDatabase(fixture.dbPath);
+      const controller = new AbortController();
+      let crossed = false;
+      const crossBoundary = () => {
+        if (crossed) throw new Error("delivery boundary crossed twice");
+        crossed = true;
+        secondary.prepare("SELECT 1").get();
+        if (invalidation.name === "abort") controller.abort();
+        else invalidation.apply(secondary);
+      };
+      const repository = stage === "before-get"
+        ? new ServiceBoundaryRepository(fixture.db, crossBoundary)
+        : fixture.repository;
+      const get = vi.fn(async () => {
+        if (stage !== "before-get") crossBoundary();
+        return remote(fixture, stage === "before-mark" ? "resolved" : "pending");
+      });
+      const resolve = vi.fn(async () => remote(fixture, "resolved"));
+      const service = new ControllerInteractionService({
+        store: repository,
+        clock: { now: () => 2_100 },
+        interactions: { get, resolve },
+      });
+
+      await expect(service.deliverAnswered(fixture.controllerKey, FENCE, controller.signal)).resolves.toBe(false);
+
+      expect(crossed).toBe(true);
+      expect(get).toHaveBeenCalledTimes(stage === "before-get" ? 0 : 1);
+      expect(resolve).not.toHaveBeenCalled();
+      expect(fixture.db.prepare(
+        "SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?",
+      ).get(fixture.interaction.interactionId)).toMatchObject({ delivered_at: null });
+      secondary.close();
+      fixture.close();
+    }
+  },
+);

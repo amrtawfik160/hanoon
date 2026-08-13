@@ -55,7 +55,7 @@ function lifecycleEvent(seq: number, status: string) {
 function adapterFixture(options: { events?: unknown[] } = {}) {
   const resolve = vi.fn(async () => ({ id: INTERACTION_ID, status: "resolving" }));
   const send = vi.fn(async () => ({ ok: true }));
-  const eventsList = vi.fn(async (_input?: { afterSeq?: string }) => options.events ?? []);
+  const eventsList = vi.fn(async (_input?: { afterSeq?: string; limit?: string }) => options.events ?? []);
   const sdk = {
     projects: { list: vi.fn(async () => []) },
     hosts: { list: vi.fn(async () => []) },
@@ -147,34 +147,54 @@ it("does not advance the lifecycle cursor past the omitted 257th reference", asy
     };
   });
   const events = [
-    ...references.slice(0, 256),
-    { id: "accepted", threadId: "thr_controller", seq: 257, createdAt: 257, scope: { kind: "turn" }, type: "turn/input/accepted", data: {} },
-    references[256]!,
+    ...references,
+    { id: "accepted", threadId: "thr_controller", seq: 258, createdAt: 258, scope: { kind: "turn" }, type: "turn/input/accepted", data: {} },
     { id: "tool", threadId: "thr_controller", seq: 259, createdAt: 259, scope: { kind: "turn" }, type: "item/started", data: { item: { type: "commandExecution" } } },
     { id: "tokens", threadId: "thr_controller", seq: 260, createdAt: 260, scope: { kind: "turn" }, type: "thread/tokenUsage/updated", data: { tokenUsage: { total: { totalTokens: 42 } } } },
     { id: "error", threadId: "thr_controller", seq: 261, createdAt: 261, scope: { kind: "turn" }, type: "system/error", data: {} },
   ];
-  const { adapter, eventsList } = adapterFixture({ events });
-  eventsList.mockImplementation(async (input?: { afterSeq?: string }) =>
-    input?.afterSeq === "0" ? events : events.slice(257),
-  );
+  const { adapter, eventsList } = adapterFixture();
+  const pageRequests: Array<{ afterSeq: string; limit: string }> = [];
+  eventsList.mockImplementation(async (input = {}) => {
+    const afterSeq = Number(input.afterSeq ?? "0");
+    const limit = Number(input.limit ?? "100");
+    pageRequests.push({ afterSeq: String(afterSeq), limit: String(limit) });
+    return events.filter((event) => event.seq > afterSeq).slice(0, limit);
+  });
 
   const first = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
   expect(first.interactionReferences).toHaveLength(256);
-  expect(first.latestSeq).toBe(257);
-  expect(first.inputAccepted).toBe(true);
+  expect(first.interactionReferences).not.toContainEqual({
+    interactionId: "interaction-257",
+    kind: "user_question",
+    status: "pending",
+  });
+  expect(first.latestSeq).toBe(256);
+  expect(first.inputAccepted).toBe(false);
   expect(first.toolActivityObserved).toBe(false);
   expect(first.totalTokens).toBe(0);
   expect(first.error).toBeNull();
+  expect(pageRequests).toEqual([
+    { afterSeq: "0", limit: "100" },
+    { afterSeq: "100", limit: "100" },
+    { afterSeq: "200", limit: "100" },
+  ]);
 
   const second = await adapter.events("thr_controller", first.latestSeq, AbortSignal.timeout(1_000));
   expect(second.interactionReferences).toEqual([
     { interactionId: "interaction-257", kind: "user_question", status: "pending" },
   ]);
   expect(second.latestSeq).toBe(261);
+  expect(second.inputAccepted).toBe(true);
   expect(second.toolActivityObserved).toBe(true);
   expect(second.totalTokens).toBe(42);
   expect(second.error).toBe("Controller provider turn failed");
+  expect(pageRequests).toEqual([
+    { afterSeq: "0", limit: "100" },
+    { afterSeq: "100", limit: "100" },
+    { afterSeq: "200", limit: "100" },
+    { afterSeq: "256", limit: "100" },
+  ]);
 });
 
 it("retains a lifecycle reference even when its inline payload is not answerable", async () => {

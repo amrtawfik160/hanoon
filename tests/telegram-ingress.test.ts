@@ -1,7 +1,11 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
 import { expect, it, vi } from "vitest";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { hashSecret } from "../src/crypto";
 import type { ProjectPolicy } from "../src/domain/models";
 import { TelegramIngress } from "../src/telegram/ingress";
@@ -13,7 +17,9 @@ import type {
 } from "../src/telegram/types";
 import { encodeCallbackData, persistableJobStatusPayload, renderProjectPicker } from "../src/telegram/view";
 import { controllerInteractionToken, questionOptionToken, type ControllerInteraction } from "../src/controller/questions";
+import { ControllerInteractionService } from "../src/controller/interaction-service";
 import { VersionConflictError, openStore, type TelegramAgentStore } from "../src/storage/store";
+import type { ControllerInteractionStore } from "../src/storage/controller-interaction-repository";
 import { admitConfirmedJob, policyFixture } from "./helpers";
 
 type SentMessage = {
@@ -277,7 +283,7 @@ function statusPayload(fixture: ReturnType<typeof ingressFixture>): SendMessageP
 function seedControllerInteraction(
   fixture: ReturnType<typeof ingressFixture>,
   interaction: ControllerInteraction,
-): { controllerKey: string; token: string; interactionId: string } {
+): { controllerKey: string; token: string; interactionId: string; turnId: string; threadId: string; fence: { ownerId: string; generation: number } } {
   const controllerKey = createHash("sha256")
     .update("telegram-controller:7:70", "utf8")
     .digest("base64url")
@@ -318,7 +324,160 @@ function seedControllerInteraction(
   const token = interaction.kind === "approval"
     ? controllerInteractionToken(interaction.interactionId, interaction.decisions[0] ?? "deny")
     : questionOptionToken(interaction.interactionId, interaction.questions[0]!.id, interaction.questions[0]!.options[0]!.value);
-  return { controllerKey, token, interactionId: interaction.interactionId };
+  return {
+    controllerKey,
+    token,
+    interactionId: interaction.interactionId,
+    turnId: turn.id,
+    threadId: "thr_ingress_controller",
+    fence,
+  };
+}
+
+type CallbackRaceWorker = Readonly<{
+  child: ChildProcess;
+  result: Promise<{ callbackId: string; outcome: string | null; nudged: boolean }>;
+}>;
+
+function callbackRaceWorkerSource(): string {
+  return String.raw`
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { TelegramIngress } from "TELEGRAM_INGRESS_MODULE";
+import { openStore } from "STORE_MODULE";
+
+const [dbPath, barrierDir, label, callbackId, token] = process.argv.slice(2);
+if (!dbPath || !barrierDir || !label || !callbackId || !token) throw new Error("callback race arguments are incomplete");
+const db = new Database(dbPath);
+db.pragma("busy_timeout = 5000");
+db.pragma("foreign_keys = ON");
+const values = new Map();
+const kv = {
+  get: async (key) => values.get(key),
+  set: async (key, value) => { values.set(key, value); },
+  delete: async (key) => { values.delete(key); },
+  list: async (prefix = "") => [...values.keys()].filter((key) => key.startsWith(prefix)),
+};
+const storage = {
+  database: () => db,
+  kv,
+  migrate: () => undefined,
+};
+const store = openStore(storage, kv, () => 9_002);
+const telegram = {
+  sendMessage: async () => ({ message_id: 1 }),
+  editMessage: async () => undefined,
+  answerCallback: async () => undefined,
+};
+const ingress = new TelegramIngress({
+  store,
+  telegram,
+  onWorkAvailable: () => writeFileSync(join(barrierDir, "nudge-" + label), "nudge"),
+});
+writeFileSync(join(barrierDir, "ready-" + label), "ready");
+while (!existsSync(join(barrierDir, "go"))) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+}
+await ingress.handleClaimed({
+  update_id: label === "one" ? 90_020 : 90_021,
+  callback_query: {
+    id: callbackId,
+    from: { id: 7, is_bot: false },
+    message: { message_id: 100, chat: { id: 70, type: "private" } },
+    data: "i:" + token,
+  },
+}, 9_002);
+process.stdout.write(JSON.stringify({
+  callbackId,
+  outcome: store.getCallback(callbackId)?.outcome ?? null,
+  nudged: existsSync(join(barrierDir, "nudge-" + label)),
+}) + "\n");
+db.close();
+`;
+}
+
+function waitForCallbackRaceFile(path: string, timeoutMs = 5_000): Promise<void> {
+  return new Promise((resolveWait, rejectWait) => {
+    const startedAt = Date.now();
+    const poll = () => {
+      if (existsSync(path)) return resolveWait();
+      if (Date.now() - startedAt >= timeoutMs) return rejectWait(new Error(`callback race barrier timed out: ${path}`));
+      setTimeout(poll, 5);
+    };
+    poll();
+  });
+}
+
+function startCallbackRaceWorker(
+  scriptPath: string,
+  fixture: ReturnType<typeof ingressFixture>,
+  barrierDir: string,
+  label: "one" | "two",
+  callbackId: string,
+  token: string,
+): CallbackRaceWorker {
+  const child = spawn(resolve("node_modules/.bin/vite-node"), [
+    "--script",
+    scriptPath,
+    fixture.db.name,
+    barrierDir,
+    label,
+    callbackId,
+    token,
+  ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const result = new Promise<{ callbackId: string; outcome: string | null; nudged: boolean }>((resolveResult, rejectResult) => {
+    child.once("error", rejectResult);
+    child.once("close", (code) => {
+      if (code !== 0) {
+        rejectResult(new Error(`callback race worker exited ${code}: ${stderr || stdout}`));
+        return;
+      }
+      const line = stdout.trim().split("\n").at(-1);
+      if (!line) {
+        rejectResult(new Error(`callback race worker returned no result: ${stderr}`));
+        return;
+      }
+      try {
+        resolveResult(JSON.parse(line) as { callbackId: string; outcome: string | null; nudged: boolean });
+      } catch (error) {
+        rejectResult(new Error(`callback race worker returned invalid JSON: ${stdout}`, { cause: error }));
+      }
+    });
+  });
+  return { child, result };
+}
+
+async function runCallbackRace(
+  fixture: ReturnType<typeof ingressFixture>,
+  token: string,
+): Promise<Array<{ callbackId: string; outcome: string | null; nudged: boolean }>> {
+  const barrierDir = mkdtempSync(join(tmpdir(), "telegram-controller-callback-race-"));
+  const scriptPath = join(barrierDir, "worker.ts");
+  writeFileSync(scriptPath, callbackRaceWorkerSource()
+    .replace("TELEGRAM_INGRESS_MODULE", resolve("src/telegram/ingress.ts"))
+    .replace("STORE_MODULE", resolve("src/storage/store.ts")));
+  const workers = [
+    startCallbackRaceWorker(scriptPath, fixture, barrierDir, "one", "callback-race-one", token),
+    startCallbackRaceWorker(scriptPath, fixture, barrierDir, "two", "callback-race-two", token),
+  ];
+  try {
+    await Promise.all([
+      waitForCallbackRaceFile(join(barrierDir, "ready-one")),
+      waitForCallbackRaceFile(join(barrierDir, "ready-two")),
+    ]);
+    writeFileSync(join(barrierDir, "go"), "go");
+    return await Promise.all(workers.map((worker) => worker.result));
+  } finally {
+    for (const worker of workers) {
+      if (worker.child.exitCode === null) worker.child.kill("SIGKILL");
+    }
+    rmSync(barrierDir, { recursive: true, force: true });
+  }
 }
 
 it("reveals no project information to an unauthorized chat", async () => {
@@ -397,61 +556,68 @@ it("authenticates and atomically records a generic controller callback before nu
   expect(fixture.store.listControllerTurns(seeded.controllerKey, 10)).toHaveLength(1);
 });
 
-it("records distinct callback replays across two real store connections without a second nudge", async () => {
-  let nudges = 0;
-  const fixture = ingressFixture({
-    owner: { userId: "7", chatId: "70" },
-    onWorkAvailable: () => { nudges += 1; },
-  });
+it("races real ingress wrappers and resolves the durable winner exactly once", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const seeded = seedControllerInteraction(fixture, {
     kind: "approval",
-    interactionId: "ingress_two_connection_replay",
+    interactionId: "ingress_wrapper_race",
     summary: "wants to run a bounded command",
     decisions: ["allow_once", "deny"],
   });
-  const secondaryDb = new Database(fixture.db.name);
-  secondaryDb.pragma("busy_timeout = 5000");
-  secondaryDb.pragma("foreign_keys = ON");
-  const secondaryStorage = {
-    database: () => secondaryDb,
-    kv: memoryKv(),
-    migrate: () => undefined,
-  } as unknown as Parameters<typeof openStore>[0];
-  const secondaryStore = openStore(secondaryStorage, memoryKv(), () => 9_002);
-  const secondaryIngress = new TelegramIngress({
-    store: secondaryStore,
-    telegram: new FakeTelegram(),
-    onWorkAvailable: () => { nudges += 1; },
-  });
+  const workerResults = await runCallbackRace(fixture, seeded.token);
 
-  try {
-    await fixture.ingress.handleClaimed(callbackUpdate(
-      90_020,
-      "controller-replay-one",
-      7,
-      70,
-      encodeCallbackData({ type: "controller_interaction", token: seeded.token }),
-    ), 9_001);
-    await secondaryIngress.handleClaimed(callbackUpdate(
-      90_021,
-      "controller-replay-two",
-      7,
-      70,
-      encodeCallbackData({ type: "controller_interaction", token: seeded.token }),
-    ), 9_002);
-
-    expect(fixture.store.getCallback("controller-replay-one")).toMatchObject({ outcome: "accepted" });
-    expect(fixture.store.getCallback("controller-replay-two")).toMatchObject({ outcome: "stale" });
-    expect(fixture.store.getOutbox("callback:controller-replay-one")?.payload.text).toBe("Got it.");
-    expect(fixture.store.getOutbox("callback:controller-replay-two")?.payload.text)
-      .toBe("That interaction is no longer open.");
-    expect(fixture.db.prepare(
-      "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
-    ).get(seeded.interactionId)).toMatchObject({ state: "answered" });
-    expect(nudges).toBe(1);
-  } finally {
-    secondaryDb.close();
+  expect(workerResults.map((result) => result.outcome).sort()).toEqual(["accepted", "stale"]);
+  expect(workerResults.filter((result) => result.nudged)).toHaveLength(1);
+  for (const result of workerResults) {
+    expect(fixture.store.getCallback(result.callbackId)).toMatchObject({ outcome: result.outcome });
+    expect(fixture.store.getOutbox(`callback:${result.callbackId}`)?.payload.text).toBe(
+      result.outcome === "accepted" ? "Got it." : "That interaction is no longer open.",
+    );
   }
+  expect(fixture.db.prepare(
+    "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get(seeded.interactionId)).toMatchObject({ state: "answered" });
+
+  let remoteStatus: "pending" | "resolved" = "pending";
+  const get = vi.fn(async (threadId: string, interactionId: string) => ({
+    id: interactionId,
+    threadId,
+    status: remoteStatus,
+  }));
+  const resolve = vi.fn(async (input: {
+    threadId: string;
+    interactionId: string;
+    resolution: Record<string, unknown>;
+  }) => {
+    remoteStatus = "resolved";
+    return { id: input.interactionId, threadId: input.threadId, status: remoteStatus };
+  });
+  const interactionStore: ControllerInteractionStore = {
+    isControllerInteractionDeliveryFenceCurrent: (input) => fixture.store.isControllerInteractionDeliveryFenceCurrent(input),
+    record: (input) => fixture.store.recordControllerInteraction(input),
+    markResolved: (input) => fixture.store.markControllerInteractionResolved(input),
+    answerByToken: (input) => fixture.store.answerControllerInteractionByToken(input),
+    answerWithText: (input) => fixture.store.answerControllerInteractionWithText(input),
+    getPending: (controllerKey) => fixture.store.getPendingControllerInteraction(controllerKey),
+    getAnswered: (controllerKey) => fixture.store.getAnsweredControllerInteraction(controllerKey),
+    markDelivered: (input) => fixture.store.markControllerInteractionDelivered(input),
+  };
+  const interactionService = new ControllerInteractionService({
+    store: interactionStore,
+    clock: { now: () => 9_100 },
+    interactions: { get, resolve },
+  });
+  const serviceFence = { ...seeded.fence, now: 9_100 };
+
+  await expect(interactionService.deliverAnswered(seeded.controllerKey, serviceFence, AbortSignal.timeout(2_000)))
+    .resolves.toBe(true);
+  await expect(interactionService.deliverAnswered(seeded.controllerKey, serviceFence, AbortSignal.timeout(2_000)))
+    .resolves.toBe(false);
+
+  expect(resolve).toHaveBeenCalledTimes(1);
+  expect(get).toHaveBeenCalledTimes(1);
+  expect(fixture.store.getAnsweredControllerInteraction(seeded.controllerKey)).toBeNull();
+  expect(fixture.store.listControllerTurns(seeded.controllerKey, 10)).toHaveLength(1);
 });
 
 it("does not let wrong-identity controller callbacks consume the parked interaction", async () => {

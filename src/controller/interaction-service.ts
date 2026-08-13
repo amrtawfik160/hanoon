@@ -58,7 +58,7 @@ export class ControllerInteractionService {
   ): Promise<boolean> {
     if (this.isAborted(signal)) return false;
     const answered = this.store.getAnswered(controllerKey);
-    if (!answered || this.isAborted(signal) || !this.fenceIsCurrent(answered, fence, signal)) return false;
+    if (!answered || !this.freshFenceIfCurrent(answered, fence, signal)) return false;
 
     const observed = await this.authoritativeGet(answered, signal);
     if (!observed || this.isAborted(signal)) return false;
@@ -67,7 +67,7 @@ export class ControllerInteractionService {
       return this.markDelivered(answered, fence, signal);
     }
     if (observed.status !== "pending") return false;
-    if (!this.fenceIsCurrent(answered, fence, signal)) return false;
+    if (!this.freshFenceIfCurrent(answered, fence, signal)) return false;
 
     let resolved: ControllerInteractionRemote | null;
     try {
@@ -103,33 +103,30 @@ export class ControllerInteractionService {
     fence: ControllerLeaseFence,
     signal?: AbortSignal,
   ): boolean {
-    if (this.isAborted(signal) || !this.fenceIsCurrent(answered, fence, signal)) return false;
-    return this.store.markDelivered({
-      ...fence,
-      interactionId: answered.interactionId,
-      turnId: answered.turnId,
-      bbThreadId: answered.bbThreadId,
-    });
+    const deliveryFence = this.freshFenceIfCurrent(answered, fence, signal);
+    return deliveryFence !== null && this.store.markDelivered(deliveryFence);
   }
 
-  private fenceIsCurrent(
+  private freshFenceIfCurrent(
     answered: ControllerInteractionDelivery,
     fence: ControllerLeaseFence,
     signal?: AbortSignal,
-  ): boolean {
-    if (this.isAborted(signal)) return false;
+  ): ControllerInteractionDeliveryFence | null {
+    if (this.isAborted(signal)) return null;
     try {
-      return this.store.isControllerInteractionDeliveryFenceCurrent({
-        ...fence,
+      const deliveryFence: ControllerInteractionDeliveryFence = {
+        ownerId: fence.ownerId,
+        generation: fence.generation,
         now: this.clock.now(),
         interactionId: answered.interactionId,
         turnId: answered.turnId,
         controllerKey: answered.controllerKey,
         bbThreadId: answered.bbThreadId,
         controllerGenerationId: answered.controllerGenerationId,
-      });
+      };
+      return this.store.isControllerInteractionDeliveryFenceCurrent(deliveryFence) ? deliveryFence : null;
     } catch {
-      return false;
+      return null;
     }
   }
 
