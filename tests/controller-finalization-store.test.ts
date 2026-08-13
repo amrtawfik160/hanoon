@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
 import { expect, it } from "vitest";
@@ -42,12 +43,14 @@ function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
 }
 
 function raceWorkerSource(): string {
+  const evidenceRepositoryModule = JSON.stringify(resolve("src/storage/controller-evidence-repository.ts"));
+  const storeModule = JSON.stringify(resolve("src/storage/store.ts"));
   return String.raw`
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { ControllerEvidenceRepository } from "../src/storage/controller-evidence-repository";
-import { openStore } from "../src/storage/store";
+import { ControllerEvidenceRepository } from ${evidenceRepositoryModule};
+import { openStore } from ${storeModule};
 
 const [dbPath, barrierDir, label, operation] = process.argv.slice(2);
 if (!dbPath || !barrierDir || !label || !operation) throw new Error("race worker arguments are incomplete");
@@ -1064,7 +1067,7 @@ it("accepts only live controller-owned non-system obligation refs", () => {
 });
 
 it("persists one accepted row when two SQLite processes race", async () => {
-  const directory = mkdtempSync(resolve(".task8-race-proposal-"));
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task8-race-proposal-"));
   const barrierDir = resolve(directory, "barriers");
   const scriptPath = resolve(directory, "race-worker.ts");
   let db: Database.Database | undefined;
@@ -1120,7 +1123,7 @@ it("persists one accepted row when two SQLite processes race", async () => {
 });
 
 it("persists one digest, outbox row, and consumption when completion races", async () => {
-  const directory = mkdtempSync(resolve(".task8-race-completion-"));
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task8-race-completion-"));
   const barrierDir = resolve(directory, "barriers");
   const scriptPath = resolve(directory, "race-worker.ts");
   let db: Database.Database | undefined;
@@ -1177,7 +1180,7 @@ it("persists one digest, outbox row, and consumption when completion races", asy
 });
 
 it("claims one continuation and sends one recovery prompt across SQLite workers", async () => {
-  const directory = mkdtempSync(resolve(".task9-race-continuation-"));
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task9-race-continuation-"));
   const barrierDir = resolve(directory, "barriers");
   const scriptPath = resolve(directory, "race-worker.ts");
   let db: Database.Database | undefined;
@@ -1224,7 +1227,7 @@ it("claims one continuation and sends one recovery prompt across SQLite workers"
 });
 
 it("retains a continuation claim after a worker crashes before send", async () => {
-  const directory = mkdtempSync(resolve(".task9-crash-continuation-"));
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task9-crash-continuation-"));
   const barrierDir = resolve(directory, "barriers");
   const scriptPath = resolve(directory, "race-worker.ts");
   let db: Database.Database | undefined;

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
@@ -142,18 +142,12 @@ it("requires an absolute output path even when a relative path resolves outside 
 });
 
 it("rejects an in-repository output whose first segment begins with two dots", async () => {
-  const directory = join(process.cwd(), "..reports");
-  mkdirSync(directory, { recursive: true });
-  try {
-    await expect(execFileAsync(process.execPath, [
-      "scripts/eval-controller-outcomes.mjs",
-      "--checkpoint", "baseline",
-      "--trials", "1",
-      "--output", join(directory, "out.json"),
-    ])).rejects.toMatchObject({ code: 1 });
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
+  await expect(execFileAsync(process.execPath, [
+    "scripts/eval-controller-outcomes.mjs",
+    "--checkpoint", "baseline",
+    "--trials", "1",
+    "--output", join(process.cwd(), "..reports", "out.json"),
+  ])).rejects.toMatchObject({ code: 1 });
 });
 
 it("runs the cumulative kernel checkpoint with its fixed safety cases", async () => {
