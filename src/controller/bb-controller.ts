@@ -11,11 +11,7 @@ import {
   controllerProviderFor,
   type ControllerExecutionProfile,
 } from "./execution-profile";
-import {
-  parsePendingQuestion,
-  type ControllerPendingQuestion,
-  type ControllerQuestionAnswers,
-} from "./questions";
+import { isSafeControllerInteractionId } from "./questions";
 
 export type ControllerLocation = { threadId: string; projectId: string; hostId: string };
 export type ControllerStatus =
@@ -27,6 +23,41 @@ export type ControllerStatus =
   | "missing"
   /** The live thread runs a different provider than the configured model needs. */
   | "incompatible";
+/**
+ * All an event stream may say about an interaction. The inline payload is never
+ * authority: the exact interaction is fetched before anything is persisted or
+ * shown, so a replayed or forged event cannot invent a question.
+ */
+export type ControllerInteractionReference = Readonly<{
+  interactionId: string;
+  kind: "user_question" | "approval" | "unsupported";
+  status: "pending" | "resolved" | "interrupted";
+}>;
+
+/** How many distinct interactions one event window may report. */
+export const MAX_CONTROLLER_INTERACTION_REFERENCES = 8;
+
+/**
+ * Trims an oversized window to the references that matter most. Settlements
+ * come first: dropping one leaves a durable row parked on an interaction BB has
+ * already closed, and a parked row suppresses every other kind of progress.
+ * Among the rest the newest win, because the block BB is actually waiting on is
+ * the last thing the stream said.
+ */
+function boundedReferences(
+  all: readonly ControllerInteractionReference[],
+): readonly ControllerInteractionReference[] {
+  if (all.length <= MAX_CONTROLLER_INTERACTION_REFERENCES) return all;
+  const settled = all.filter((reference) => reference.status !== "pending")
+    .slice(-MAX_CONTROLLER_INTERACTION_REFERENCES);
+  const pendingBudget = MAX_CONTROLLER_INTERACTION_REFERENCES - settled.length;
+  const pending = pendingBudget === 0
+    ? []
+    : all.filter((reference) => reference.status === "pending").slice(-pendingBudget);
+  const kept = new Set([...settled, ...pending]);
+  return all.filter((reference) => kept.has(reference));
+}
+
 export type ControllerEventObservation = {
   latestSeq: number;
   inputAccepted: boolean;
@@ -36,8 +67,8 @@ export type ControllerEventObservation = {
   toolActivityObserved: boolean;
   completed: boolean;
   error: string | null;
-  /** Set while the thread is blocked on a question only the owner can answer. */
-  pendingQuestion: ControllerPendingQuestion | null;
+  /** Bounded lifecycle references for anything the thread is blocked on. */
+  interactions: readonly ControllerInteractionReference[];
   /** Tool-shaped item starts in this window; the caller accumulates them. */
   toolCalls: number;
   /** Non-zero command exits in this window; the caller accumulates them. */
@@ -62,12 +93,6 @@ export type ControllerAdapter = {
   steer(
     threadId: string,
     text: string,
-    signal: AbortSignal,
-  ): Promise<void>;
-  answerQuestion(
-    threadId: string,
-    interactionId: string,
-    answers: ControllerQuestionAnswers,
     signal: AbortSignal,
   ): Promise<void>;
   status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
@@ -99,6 +124,34 @@ export class ControllerImagePreparationError extends Error {
     super("Controller image could not be prepared");
     this.name = "ControllerImagePreparationError";
   }
+}
+
+/**
+ * Reads a lifecycle row into the bounded reference the plugin may act on. A
+ * status the plugin cannot settle (`resolving`) is deliberately not a reference:
+ * the durable row stays exactly as it is until BB reaches a final state.
+ */
+function interactionReference(
+  eventType: "system/userQuestion/lifecycle" | "system/permissionGrant/lifecycle",
+  data: unknown,
+): ControllerInteractionReference | null {
+  if (typeof data !== "object" || data === null) return null;
+  const candidate = data as { interactionId?: unknown; status?: unknown; subject?: unknown };
+  if (!isSafeControllerInteractionId(candidate.interactionId)) return null;
+  const status = candidate.status;
+  if (status !== "pending" && status !== "resolved" && status !== "interrupted") return null;
+  if (eventType === "system/userQuestion/lifecycle") {
+    return { interactionId: candidate.interactionId, kind: "user_question", status };
+  }
+  const subject = candidate.subject;
+  const subjectKind = typeof subject === "object" && subject !== null
+    ? (subject as { kind?: unknown }).kind
+    : null;
+  return {
+    interactionId: candidate.interactionId,
+    kind: subjectKind === "permission_grant" ? "approval" : "unsupported",
+    status,
+  };
 }
 
 function controllerTitle(controllerKey: string): string {
@@ -195,19 +248,6 @@ export class BbControllerAdapter implements ControllerAdapter {
     });
   }
 
-  public async answerQuestion(
-    threadId: string,
-    interactionId: string,
-    answers: ControllerQuestionAnswers,
-    signal: AbortSignal,
-  ): Promise<void> {
-    await this.dependencies.sdk.threads.interactions.resolve({
-      threadId,
-      interactionId,
-      resolution: { kind: "user_answer", answers },
-    });
-  }
-
   public async status(threadId: string, signal: AbortSignal): Promise<ControllerStatus> {
     const thread = await this.dependencies.sdk.threads.get({ threadId, signal });
     if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
@@ -241,7 +281,7 @@ export class BbControllerAdapter implements ControllerAdapter {
     let toolActivityObserved = false;
     let completed = false;
     let error: string | null = null;
-    let pendingQuestion: ControllerPendingQuestion | null = null;
+    const interactions = new Map<string, ControllerInteractionReference>();
     let toolCalls = 0;
     let commandFailures = 0;
     let totalTokens = 0;
@@ -272,13 +312,14 @@ export class BbControllerAdapter implements ControllerAdapter {
         if (row.type === "system/error" || row.type === "provider/error") {
           error = "Controller provider turn failed";
         }
-        // The same interaction reports every step of its life on this stream, so
-        // the last word about it wins: a later "resolved" retires the question.
-        if (row.type === "system/userQuestion/lifecycle") {
-          const data = row.data as { interactionId?: unknown; status?: unknown; payload?: unknown };
-          pendingQuestion = data.status === "pending"
-            ? parsePendingQuestion(data.interactionId, data.payload)
-            : null;
+        // The same interaction reports every step of its life on this stream,
+        // so the last word about it wins: a later "resolved" retires it.
+        if (row.type === "system/userQuestion/lifecycle" || row.type === "system/permissionGrant/lifecycle") {
+          const reference = interactionReference(row.type, row.data);
+          if (reference) {
+            interactions.delete(reference.interactionId);
+            interactions.set(reference.interactionId, reference);
+          }
         }
       }
       if (rows.length < CONTROLLER_EVENT_PAGE_LIMIT) break;
@@ -290,7 +331,7 @@ export class BbControllerAdapter implements ControllerAdapter {
       toolActivityObserved,
       completed,
       error,
-      pendingQuestion,
+      interactions: boundedReferences([...interactions.values()]),
       toolCalls,
       commandFailures,
       totalTokens,

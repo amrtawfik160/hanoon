@@ -3,23 +3,33 @@ import type { EffectFence } from "../services/effect-runner";
 import {
   ControllerImagePreparationError,
   type ControllerAdapter,
+  type ControllerInteractionReference,
   type ControllerLocation,
   type ControllerStatus,
 } from "./bb-controller";
+import type { ControllerInteraction } from "./questions";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { projectControllerStream } from "./stream";
 import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
+import type { ControllerInteractionService } from "./interaction-service";
 import {
   ControllerEvidenceProjectorError,
   type ControllerEvidenceReconciler,
   type ControllerEvidenceReconciliation,
 } from "./evidence-projector";
 
+/** The BB half of the hidden-controller interaction bridge. */
+export type ControllerInteractionReconciler = Pick<
+  ControllerInteractionService,
+  "deliverAnswered" | "fetchPending"
+>;
+
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
   adapter: ControllerAdapter;
   evidenceProjector: ControllerEvidenceReconciler;
+  interactionService: ControllerInteractionReconciler;
   clock: { now(): number };
 };
 
@@ -41,6 +51,8 @@ type BoundaryFailureContext = Readonly<{
   fence: EffectFence;
   signal: AbortSignal;
   failureSummary: string;
+  /** The status already read on this pass, when the caller has one. */
+  observedStatus?: ControllerStatus;
 }>;
 
 const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
@@ -222,7 +234,27 @@ export class LunaControllerService {
     let liveController = this.dependencies.store.getControllerByThreadId(controller.threadId);
     if (!this.validAdoptedTurn(turn, liveController, fence, controller)) return false;
 
-    // 2. Run the native-evidence projector on every pass through a fixed
+    // 2. Deliver one already-durable owner answer. This is the sole operation
+    //    allowed before evidence: until BB hears a decision the owner already
+    //    made, the thread cannot produce any evidence at all, so a pass that
+    //    finds one does nothing else whether or not the delivery lands.
+    const ownerAnswer = this.dependencies.store.getAnsweredControllerInteraction(liveController!.controllerKey);
+    if (ownerAnswer) {
+      // Only one turn of a controller is ever submitted, so an answer parked on
+      // a different one is a broken invariant rather than ordinary lag.
+      if (ownerAnswer.turnId !== turn!.id) {
+        return this.failAndRetire(
+          liveController!,
+          turn!,
+          fence,
+          "Controller owner answer did not match the adopted turn",
+        ) === "retired";
+      }
+      if (await this.deliverOwnerAnswer(liveController!, fence, signal)) return true;
+      return await this.retireParkedOnLostThread(liveController!, turn!, fence, signal);
+    }
+
+    // 3. Run the native-evidence projector on every pass through a fixed
     //    high-water, before any legacy question/status/events/phase/draft/
     //    steer/supervisor/stall work, then re-read afterward.
     let reconciliation: ControllerEvidenceReconciliation | null = null;
@@ -253,7 +285,7 @@ export class LunaControllerService {
     liveController = this.dependencies.store.getControllerByThreadId(controller.threadId);
     if (!this.validAdoptedTurn(turn, liveController, fence, controller)) return false;
 
-    // 3. Deterministic, non-recoverable reconciliation outcomes fail-and-retire.
+    // 4. Deterministic, non-recoverable reconciliation outcomes fail-and-retire.
     if (reconciliation !== null) {
       if (reconciliation.outcome === "stale") return false; // no terminal write
       if (reconciliation.outcome === "limit_exceeded" || reconciliation.reconciliationIncomplete !== null) {
@@ -275,40 +307,7 @@ export class LunaControllerService {
       return this.failAndRetire(liveController!, turn!, fence, "Controller evidence limit exceeded") === "retired";
     }
 
-    // ===== Legacy pre-terminal work, all on the post-adoption turn =====
-    // An answer the owner already gave outranks anything else: until BB hears
-    // it, the thread cannot make progress and every other check is noise. It is
-    // delivered only under the adopted fence.
-    const ownerAnswer = this.dependencies.store.getAnsweredControllerQuestion(liveController!.controllerKey);
-    if (ownerAnswer) {
-      if (ownerAnswer.turnId !== turn!.id || ownerAnswer.controllerKey !== turn!.controllerKey) {
-        return this.failAndRetire(
-          liveController!,
-          turn!,
-          fence,
-          "Controller owner answer did not match the adopted turn",
-        ) === "retired";
-      }
-      try {
-        await this.dependencies.adapter.answerQuestion(
-          liveController!.threadId!,
-          ownerAnswer.interactionId,
-          ownerAnswer.answers,
-          signal,
-        );
-      } catch {
-        return false;
-      }
-      turn = this.dependencies.store.getControllerTurn(turn!.id);
-      liveController = this.dependencies.store.getControllerByThreadId(controller.threadId);
-      if (!this.validAdoptedTurn(turn, liveController, fence, controller)) return false;
-      if (!this.dependencies.store.markControllerQuestionDelivered({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        interactionId: ownerAnswer.interactionId,
-      })) return false;
-      return true;
-    }
-
+    // ===== Pre-terminal work, all on the post-adoption turn =====
     let status: ControllerStatus;
     try {
       status = await this.dependencies.adapter.status(controller.threadId, signal);
@@ -335,6 +334,20 @@ export class LunaControllerService {
         fence,
         signal,
         failureSummary: "Controller event boundary remained unavailable",
+        observedStatus: status,
+      });
+    }
+    // 5. Persist every observed lifecycle reference before the event cursor
+    //    advances past it, so a failed BB read costs a retry rather than the
+    //    owner's only view of what the thread is blocked on.
+    if (!await this.observeInteractions(liveController!, turn!, observation.interactions, fence, signal)) {
+      return this.retirePersistentBoundary({
+        controller: liveController!,
+        turn: turn!,
+        fence,
+        signal,
+        failureSummary: "Controller interaction boundary remained unavailable",
+        observedStatus: status,
       });
     }
     const projected = projectControllerStream(observation, {
@@ -354,32 +367,24 @@ export class LunaControllerService {
       commandFailures: observation.commandFailures,
       totalTokens: observation.totalTokens,
     });
-    if (observation?.pendingQuestion) {
-      this.dependencies.store.recordControllerQuestion({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId: turn!.id,
-        interactionId: observation.pendingQuestion.interactionId,
-        questions: observation.pendingQuestion.questions,
-      });
+    // 6. A turn waiting on a person does nothing else at all: no draft refresh,
+    //    steering, budget, stall, continuation, completion, or silence. Its own
+    //    answer is what unblocks it, and that arrives through step 2.
+    if (this.parkedOnInteraction(turn!)) {
+      await this.retireParkedOnLostThread(liveController!, turn!, fence, signal, status);
+      return true;
     }
     const refreshedAt = this.dependencies.clock.now();
-    // A turn parked on a question is waiting on a person. Redrawing its draft
-    // would only replace the question with stale half-written output.
-    const parked = this.hasExactLegacyQuestion(turn!);
-    if (!parked) {
-      this.dependencies.store.refreshControllerDraft({
-        ...fenceAt(fence, refreshedAt),
-        turnId: turn!.id,
-        sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
-      });
-    }
+    this.dependencies.store.refreshControllerDraft({
+      ...fenceAt(fence, refreshedAt),
+      turnId: turn!.id,
+      sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
+    });
     if (status === "active" || status === "starting" || status === "stopping") {
       // Active/starting/stopping do only phase/evidence work; no finalization
       // consumption happens here (B2b owns terminal handling). Anything the
       // owner says while an answer is being written belongs to that answer.
-      const waiting = !parked
-        ? this.dependencies.store.getQueuedControllerTurn(liveController!.controllerKey)
-        : null;
+      const waiting = this.dependencies.store.getQueuedControllerTurn(liveController!.controllerKey);
       if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
         try {
           await this.dependencies.adapter.steer(liveController!.threadId!, waiting.inputText, signal);
@@ -399,12 +404,11 @@ export class LunaControllerService {
         return true;
       }
       // The owner's own words outrank a budget nudge, so this runs only once
-      // nothing of theirs is waiting. A turn parked on a question is waiting on
-      // a person, and no budget should fire against their thinking time.
-      if (!parked && await this.superviseBudget(turn!.id, liveController!, fence, signal)) {
+      // nothing of theirs is waiting.
+      if (await this.superviseBudget(turn!.id, liveController!, fence, signal)) {
         return true;
       }
-      if (!parked && refreshedAt - turn!.updatedAt >= CONTROLLER_STALL_MS) {
+      if (refreshedAt - turn!.updatedAt >= CONTROLLER_STALL_MS) {
         return this.failAndRetire(
           liveController!,
           turn!,
@@ -438,7 +442,7 @@ export class LunaControllerService {
   }
 
   private async settleTerminal(context: TerminalContext): Promise<boolean> {
-    if (this.hasExactLegacyQuestion(context.turn)) return true;
+    if (this.parkedOnInteraction(context.turn)) return true;
     if (context.status === "missing" || context.status === "incompatible") {
       return this.failAndRetire(
         context.controller,
@@ -609,8 +613,147 @@ export class LunaControllerService {
     return claim;
   }
 
-  private hasExactLegacyQuestion(turn: ControllerTurnRecord): boolean {
-    return this.dependencies.store.hasControllerQuestionForTurn(turn.id, turn.controllerKey);
+  /**
+   * Hands BB the one decision the owner already made. A BB failure here is not
+   * terminal: the answer stays durable and the next pass tries again, because
+   * losing it would leave the thread waiting on an owner who has already
+   * replied.
+   */
+  private async deliverOwnerAnswer(
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    try {
+      return await this.dependencies.interactionService.deliverAnswered({
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: this.dependencies.clock.now(),
+        controllerKey: controller.controllerKey,
+        signal,
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A thread BB has lost can never settle what is parked on it, so the owner is
+   * told once instead of holding dead buttons forever. Only a proven missing or
+   * incompatible thread retires a parked turn; elapsed time never does, because
+   * a parked turn's idle time is the owner's thinking time.
+   */
+  private async retireParkedOnLostThread(
+    controller: ControllerThreadRecord,
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+    observed?: ControllerStatus,
+  ): Promise<boolean> {
+    let status = observed;
+    if (status === undefined) {
+      try {
+        status = await this.dependencies.adapter.status(controller.threadId!, signal);
+      } catch {
+        return false;
+      }
+    }
+    return this.retireLostThread(controller, turn, fence, status);
+  }
+
+  private retireLostThread(
+    controller: ControllerThreadRecord,
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    status: ControllerStatus | undefined,
+  ): boolean {
+    if (status !== "missing" && status !== "incompatible") return false;
+    return this.failAndRetire(
+      controller,
+      turn,
+      fence,
+      status === "missing"
+        ? "Controller conversation became unavailable"
+        : "Controller provider became incompatible",
+    ) === "retired";
+  }
+
+  /**
+   * Turns lifecycle references into durable rows. The inline event is only a
+   * hint: each pending reference is fenced, fetched from BB, and projected
+   * before anything is stored or shown. Returns false when the boundary could
+   * not be read, so the caller leaves the event cursor where it was.
+   */
+  private async observeInteractions(
+    controller: ControllerThreadRecord,
+    turn: ControllerTurnRecord,
+    references: readonly ControllerInteractionReference[],
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (references.length === 0) return true;
+    const generation = this.dependencies.store.getOpenControllerGeneration(
+      controller.controllerKey,
+      controller.threadId!,
+    );
+    if (!generation) return false;
+    for (const reference of references) {
+      if (reference.status !== "pending") {
+        const settled = this.dependencies.store.markControllerInteractionResolved({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          interactionId: reference.interactionId,
+          turnId: turn.id,
+          bbThreadId: controller.threadId!,
+        });
+        // Refusing to settle a row this turn is parked on would consume BB's
+        // only word that the block is over. A reference for something never
+        // recorded is ordinary and settles nothing. The parked id is re-read
+        // because settling an earlier reference in this window promotes it.
+        if (!settled && this.awaitingInteractionId(turn) === reference.interactionId) return false;
+        continue;
+      }
+      const source = {
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+        controllerKey: controller.controllerKey,
+        bbThreadId: controller.threadId!,
+        controllerGenerationId: generation.id,
+      };
+      if (!this.dependencies.store.controllerInteractionSourceCanRecord(source)) return false;
+      let interaction: ControllerInteraction | null;
+      try {
+        interaction = await this.dependencies.interactionService.fetchPending({
+          bbThreadId: controller.threadId!,
+          interactionId: reference.interactionId,
+          signal,
+        });
+      } catch {
+        return false;
+      }
+      if (!interaction) continue;
+      // A refused record means the fence moved or the row disagrees with what
+      // BB just returned. Advancing the cursor past it would lose the owner's
+      // only view of the block, so the pass fails instead.
+      if (!this.dependencies.store.recordControllerInteraction({
+        ...source,
+        now: this.dependencies.clock.now(),
+        interaction,
+      })) return false;
+    }
+    return true;
+  }
+
+  /** The interaction the turn is parked on right now, not when the pass began. */
+  private awaitingInteractionId(turn: ControllerTurnRecord): string | null {
+    return this.dependencies.store.getControllerTurn(turn.id)?.awaitingInteractionId ?? null;
+  }
+
+  /**
+   * True while the exact submitted turn still has an interaction the owner has
+   * not settled, or one they settled that BB has not been told about yet.
+   */
+  private parkedOnInteraction(turn: ControllerTurnRecord): boolean {
+    return this.dependencies.store.hasActiveControllerInteraction(turn.id, turn.controllerKey);
   }
 
   private async terminalHighWaterMatches(context: TerminalContext): Promise<TerminalHighWaterOutcome> {
@@ -680,7 +823,7 @@ export class LunaControllerService {
     const turn = this.dependencies.store.getControllerTurn(context.turn.id);
     const controller = this.dependencies.store.getControllerByThreadId(context.controller.threadId!);
     if (!this.validAdoptedTurn(turn, controller, context.fence, context.controller)) return false;
-    if (this.hasExactLegacyQuestion(turn!)) return true;
+    if (this.parkedOnInteraction(turn!)) return true;
     let accepted: ReturnType<TelegramAgentStore["getAcceptedControllerFinalization"]>;
     try {
       accepted = this.dependencies.store.getAcceptedControllerFinalization(turn!.id);
@@ -698,6 +841,14 @@ export class LunaControllerService {
 
   private retirePersistentBoundary(context: BoundaryFailureContext): boolean {
     if (context.signal.aborted) return false;
+    // A turn waiting on a person produces no events, so its idle time is the
+    // owner's thinking time rather than evidence of a wedged thread. Measuring
+    // a boundary failure against it would fail a turn the owner is still
+    // answering, and take their live Telegram buttons down with it. Only a
+    // thread BB has provably lost ends a parked turn.
+    if (this.parkedOnInteraction(context.turn)) {
+      return this.retireLostThread(context.controller, context.turn, context.fence, context.observedStatus);
+    }
     if (this.dependencies.clock.now() - context.turn.updatedAt < CONTROLLER_STALL_MS) return false;
     return this.failAndRetire(
       context.controller,

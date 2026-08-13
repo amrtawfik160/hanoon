@@ -397,3 +397,36 @@ it("closes and reopens file-backed SQLite after a post-resolve crash without res
     rmSync(seeded.directory, { recursive: true, force: true });
   }
 });
+
+function fetchService(get: ReturnType<typeof vi.fn>) {
+  return new ControllerInteractionService({
+    store: {} as never,
+    interactions: { get, resolve: vi.fn() } as never,
+    clock: () => 5,
+  });
+}
+
+it("projects a pending interaction only when BB returns the exact observed identity", async () => {
+  const payload = { kind: "approval", subject: { kind: "command", command: "npm test" }, availableDecisions: ["allow_once", "deny"] };
+  const service = fetchService(vi.fn(async () => ({ id: "pint_1", threadId: "thread-1", status: "pending", payload })));
+
+  await expect(service.fetchPending({ bbThreadId: "thread-1", interactionId: "pint_1" })).resolves.toEqual({
+    kind: "approval",
+    interactionId: "pint_1",
+    summary: "wants to run:\n\n`npm test`",
+    decisions: ["allow_once", "deny"],
+  });
+});
+
+it.each([
+  ["a different interaction id", { id: "pint_other", threadId: "thread-1", status: "pending" }],
+  ["a different thread", { id: "pint_1", threadId: "thread-other", status: "pending" }],
+  ["a resolved status", { id: "pint_1", threadId: "thread-1", status: "resolved" }],
+  ["a resolving status", { id: "pint_1", threadId: "thread-1", status: "resolving" }],
+  ["an interrupted status", { id: "pint_1", threadId: "thread-1", status: "interrupted" }],
+])("refuses to project an interaction BB returned with %s", async (_scenario, returned) => {
+  const payload = { kind: "approval", subject: { kind: "command", command: "npm test" }, availableDecisions: ["deny"] };
+  const service = fetchService(vi.fn(async () => ({ ...returned, payload })));
+
+  await expect(service.fetchPending({ bbThreadId: "thread-1", interactionId: "pint_1" })).resolves.toBeNull();
+});

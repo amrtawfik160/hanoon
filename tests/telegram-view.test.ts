@@ -74,6 +74,20 @@ describe("Telegram callback grammar", () => {
     expect(() => parseCallbackData("x:unknown")).toThrow();
   });
 
+  it("encodes controller interactions as i: and keeps legacy q: parse-only", () => {
+    const token = mergeNonce;
+    const encoded = encodeCallbackData({ type: "controller_interaction", token });
+
+    expect(encoded).toBe(`i:${token}`);
+    expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(64);
+    expect(parseCallbackData(encoded)).toEqual({ type: "controller_interaction", token });
+    // Migrated in-flight messages stay answerable for one release, but nothing
+    // may emit a new q: value.
+    expect(parseCallbackData(`q:${token}`)).toEqual({ type: "question", token });
+    expect(() => encodeCallbackData({ type: "question", token })).toThrow();
+    expect(() => parseCallbackData(`i:${"a".repeat(33)}`)).toThrow();
+  });
+
   it("keeps merge callbacks bound to only the approval nonce", () => {
     expect(encodeCallbackData({ type: "merge", nonce: mergeNonce })).toBe(`m:${mergeNonce}`);
     expect(encodeCallbackData({ type: "merge", nonce: mergeNonce })).not.toContain(telegramJobId);

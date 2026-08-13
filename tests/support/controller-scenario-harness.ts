@@ -73,7 +73,6 @@ function scriptedAdapter(observedToolCalls: () => number): ControllerAdapter {
     spawn: async () => ({ threadId: "thr_fixed_controller", projectId: "proj_fixed", hostId: "host_fixed" }),
     send: async () => undefined,
     steer: async () => undefined,
-    answerQuestion: async () => undefined,
     status: async () => "idle",
     latestSeq: async () => 0,
     events: async () => ({
@@ -83,7 +82,7 @@ function scriptedAdapter(observedToolCalls: () => number): ControllerAdapter {
         toolActivityObserved: observedToolCalls() > 0,
         completed: true,
         error: null,
-        pendingQuestion: null,
+        interactions: [],
         toolCalls: observedToolCalls(),
         commandFailures: 0,
         totalTokens: 0,
@@ -183,7 +182,16 @@ async function runScenario(
     return true;
   };
   const adapter = scriptedAdapter(() => observedToolCalls);
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => FIXTURE_NOW } });
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    interactionService: {
+      deliverAnswered: async () => false,
+      fetchPending: async () => null,
+    },
+    clock: { now: () => FIXTURE_NOW },
+  });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY,
     telegramUserId: OWNER_ID,

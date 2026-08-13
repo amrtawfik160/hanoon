@@ -10,7 +10,7 @@ const EMPTY: ControllerEventObservation = {
   toolActivityObserved: false,
   completed: false,
   error: null,
-  pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+  interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
 };
 
 describe("controller stream projection", () => {

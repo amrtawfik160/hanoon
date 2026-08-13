@@ -175,6 +175,9 @@ export function renderQuestion(
   };
 }
 
+/** The callback prefix every hidden-controller interaction button carries. */
+export const CONTROLLER_INTERACTION_CALLBACK_PREFIX = "i";
+
 /** What a worker thread is blocked on: a question, or a permission request. */
 export type ThreadApprovalDecision = "allow_once" | "allow_for_session" | "deny";
 export type ThreadInteraction =
@@ -284,7 +287,11 @@ export function parseControllerInteraction(interactionId: unknown, payload: unkn
           options !== undefined && (!Array.isArray(options) || options.length > MAX_OPTIONS || options.some((option) => parseOption(option) === null));
       })) return { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
     const pending = parsePendingQuestion(interactionId, payload);
-    return pending && new Set(pending.questions.map((question) => question.id)).size === pending.questions.length
+    // A question with no option and no free text cannot be answered from a
+    // phone. Saying so is the honest projection; keeping it as a question would
+    // park the turn on a message the owner can never settle.
+    return pending && new Set(pending.questions.map((question) => question.id)).size === pending.questions.length &&
+      pending.questions.every((question) => question.allowFreeText || question.options.length > 0)
       ? { kind: "user_question", interactionId, questions: pending.questions }
       : { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
   }
@@ -306,6 +313,57 @@ export function parseControllerInteraction(interactionId: unknown, payload: unkn
     ? candidate.kind
     : null;
   return { kind: "unsupported", interactionId, metadata: { sourceKind } };
+}
+
+/**
+ * The hidden controller offers a one-off decision only. A session-wide grant
+ * would outlive the turn the owner actually looked at, so it is not rendered
+ * here even when BB offers it.
+ */
+const CONTROLLER_APPROVAL_LABELS: Record<Extract<ThreadApprovalDecision, "allow_once" | "deny">, string> = {
+  allow_once: "Allow once",
+  deny: "Deny",
+};
+
+const UNSUPPORTED_CONTROLLER_INTERACTION_TEXT =
+  "Hanoon is waiting on something I can't answer from here. It needs you in BB.";
+
+export type RenderedControllerInteraction = {
+  /** Which question of a sequence this message asks; 0 for a single message. */
+  step: number;
+  text: string;
+  reply_markup?: RenderedQuestion["reply_markup"];
+};
+
+/**
+ * The one Telegram message a durable controller interaction is currently
+ * waiting on, or null once a question sequence has been answered through.
+ */
+export function renderControllerInteraction(
+  interaction: ControllerInteraction,
+  answers: ControllerQuestionAnswers = {},
+): RenderedControllerInteraction | null {
+  if (interaction.kind === "user_question") {
+    const next = nextUnansweredQuestion(interaction.questions, answers);
+    if (!next) return null;
+    return {
+      step: next.index,
+      ...renderQuestion(interaction.interactionId, next.question, CONTROLLER_INTERACTION_CALLBACK_PREFIX),
+    };
+  }
+  if (interaction.kind === "approval") {
+    return {
+      step: 0,
+      text: boundedTelegramText(`Hanoon ${interaction.summary}`),
+      reply_markup: {
+        inline_keyboard: interaction.decisions.map((decision) => [{
+          text: CONTROLLER_APPROVAL_LABELS[decision],
+          callback_data: `${CONTROLLER_INTERACTION_CALLBACK_PREFIX}:${threadDecisionToken(interaction.interactionId, decision)}`,
+        }]),
+      },
+    };
+  }
+  return { step: 0, text: UNSUPPORTED_CONTROLLER_INTERACTION_TEXT };
 }
 
 /**

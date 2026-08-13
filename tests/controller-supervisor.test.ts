@@ -9,7 +9,10 @@ import {
   type ControllerStatus,
 } from "../src/controller/bb-controller";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
-import { LunaControllerService } from "../src/controller/service";
+import {
+  LunaControllerService,
+  type ControllerInteractionReconciler,
+} from "../src/controller/service";
 import type { ControllerEvidenceReconciler } from "../src/controller/evidence-projector";
 import {
   evaluateSupervisor,
@@ -21,6 +24,10 @@ import {
   SUPERVISOR_SOFT_TOOL_CALLS,
   type SupervisorSignals,
 } from "../src/controller/supervisor";
+
+function stubInteractionService(): ControllerInteractionReconciler {
+  return { deliverAnswered: vi.fn(async () => false), fetchPending: vi.fn(async () => null) };
+}
 
 const evidenceProjector: ControllerEvidenceReconciler = {
   reconcile: vi.fn(async (_controller, turn) => ({
@@ -274,7 +281,6 @@ function serviceAdapter(observation: () => Observation, status: () => Controller
     latestSeq: vi.fn(async () => 0),
     events: vi.fn(async () => observation()),
     steer: vi.fn(async () => undefined),
-    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
 }
@@ -287,7 +293,7 @@ function observation(overrides: Partial<Observation> = {}): Observation {
     toolActivityObserved: false,
     completed: false,
     error: null,
-    pendingQuestion: null,
+    interactions: [],
     toolCalls: 0,
     commandFailures: 0,
     totalTokens: 0,
@@ -304,7 +310,8 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
     () => observation({ latestSeq: (seq += 1), toolCalls }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -340,25 +347,34 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
 it("leaves a turn parked on an owner question alone however much it has spent", async () => {
   const { store, fence } = storeFixture("parked");
   const turn = submittedTurn(store, fence);
-  expect(store.recordControllerQuestion({
+  const generation = store.getOpenControllerGeneration("owner-7-controller", "thr_controller");
+  if (!generation) throw new Error("missing open controller generation");
+  expect(store.recordControllerInteraction({
     ...fence,
     now: 2_001,
     turnId: turn.id,
-    interactionId: "int_1",
-    questions: [{
-      id: "q1",
-      prompt: "Which project?",
-      shortLabel: "Project",
-      multiSelect: false,
-      allowFreeText: false,
-      options: [{ value: "cyndra", label: "cyndra", description: "the invoice service" }],
-    }],
+    controllerKey: "owner-7-controller",
+    bbThreadId: "thr_controller",
+    controllerGenerationId: generation.id,
+    interaction: {
+      kind: "user_question",
+      interactionId: "int_1",
+      questions: [{
+        id: "q1",
+        prompt: "Which project?",
+        shortLabel: "Project",
+        multiSelect: false,
+        allowFreeText: false,
+        options: [{ value: "cyndra", label: "cyndra", description: "the invoice service" }],
+      }],
+    },
   })).toBe(true);
   const adapter = serviceAdapter(
     () => observation({ latestSeq: 9, toolCalls: SUPERVISOR_HARD_TOOL_CALLS }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -375,7 +391,8 @@ it("keeps the turn running when a budget nudge cannot be delivered", async () =>
     () => "active",
   );
   adapter.steer = vi.fn(async () => { throw new Error("steer channel is down"); });
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -397,7 +414,8 @@ it("budgets this turn's tokens, not the whole thread's history", async () => {
     () => observation({ latestSeq: (seq += 1), totalTokens: lifetime }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -415,7 +433,8 @@ it("budgets this turn's tokens, not the whole thread's history", async () => {
     () => observation({ latestSeq: (seq += 1), totalTokens: spent }),
     () => "active",
   );
-  const second = new LunaControllerService({ store, adapter: busy, evidenceProjector, clock: { now: () => 2_002 } });
+  const second = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter: busy, evidenceProjector, clock: { now: () => 2_002 } });
   await expect(second.reconcile(runFence, runFence.signal)).resolves.toBe(true);
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({

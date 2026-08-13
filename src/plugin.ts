@@ -46,6 +46,8 @@ import {
   EXTRACTION_MODELS,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
+import { ControllerInteractionService } from "./controller/interaction-service";
+import { ControllerInteractionRepository } from "./storage/controller-interaction-repository";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
@@ -472,6 +474,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const controller = new LunaControllerService({
     store,
     evidenceProjector,
+    interactionService: new ControllerInteractionService({
+      store: new ControllerInteractionRepository(bb.storage.database()),
+      interactions: bb.sdk.threads.interactions,
+      clock,
+    }),
     adapter: new BbControllerAdapter({
       sdk: bb.sdk,
       pluginId: bb.pluginId,

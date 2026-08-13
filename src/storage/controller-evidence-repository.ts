@@ -589,11 +589,13 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     input: ControllerFinalizationProposalInput,
     turn: FinalizationTurnRow,
   ): boolean {
-    const question = this.db.prepare(
-      `SELECT 1 FROM controller_questions
-        WHERE turn_id = ? AND controller_key = ? AND state = 'pending' LIMIT 1`,
+    // Generic interactions are the only active owner-question path. A delivered
+    // row is no longer a boundary: BB has already heard that answer.
+    const interaction = this.db.prepare(
+      `SELECT 1 FROM controller_interactions
+        WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered') LIMIT 1`,
     ).get(input.turnId, input.controllerKey);
-    if (question) return true;
+    if (interaction) return true;
     const operation = this.db.prepare(
       `SELECT 1 FROM thread_operations
         WHERE owner_user_id = ? AND owner_chat_id = ?

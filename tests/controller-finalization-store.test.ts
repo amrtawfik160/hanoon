@@ -788,28 +788,61 @@ it.each([
   expect(() => fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toThrow(/finalization/i);
 });
 
-it("accepts needs-owner only for the exact pending controller question", () => {
-  const fixture = submittedControllerFixture();
-  const candidate = needsOwnerFinalization();
-  expect(fixture.store.proposeControllerFinalization({
-    ...fixture.fence,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-    candidate,
-  })).toMatchObject({ outcome: "rejected", revision: 1, code: "owner_boundary_missing" });
-  fixture.db.prepare(
-    `INSERT INTO controller_questions (
-       interaction_id, turn_id, controller_key, questions_json, state,
-       answers_json, asked_at, answered_at
-     ) VALUES ('interaction_exact', ?, ?, '[]', 'pending', NULL, ?, NULL)`,
-  ).run(fixture.turn.id, fixture.turn.controllerKey, fixture.fence.now);
-  expect(fixture.store.proposeControllerFinalization({
-    ...fixture.fence,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-    candidate,
-  })).toMatchObject({ outcome: "accepted", finalization: { revision: 2 } });
-});
+it.each(["pending", "answered"] as const)(
+  "accepts needs-owner only for an exact %s controller interaction",
+  (state) => {
+    const fixture = submittedControllerFixture();
+    const candidate = needsOwnerFinalization();
+    // A delivered row is history: BB already heard that answer, so it is no
+    // longer a boundary the owner is standing on.
+    fixture.db.prepare(
+      `INSERT INTO controller_interactions (
+         interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
+         kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
+       ) VALUES ('interaction_delivered', ?, ?, NULL, NULL, 'unsupported', ?, 'delivered', NULL, ?, NULL, ?)`,
+    ).run(
+      fixture.turn.id,
+      fixture.turn.controllerKey,
+      JSON.stringify({ kind: "unsupported", interactionId: "interaction_delivered", metadata: { sourceKind: null } }),
+      fixture.fence.now,
+      fixture.fence.now,
+    );
+    expect(fixture.store.proposeControllerFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      candidate,
+    })).toMatchObject({ outcome: "rejected", revision: 1, code: "owner_boundary_missing" });
+
+    const threadId = fixture.db.prepare(
+      "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+    ).pluck().get(fixture.turn.controllerKey) as string;
+    const generationId = fixture.db.prepare(
+      "SELECT id FROM controller_generations WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL",
+    ).pluck().get(fixture.turn.controllerKey, threadId) as string;
+    fixture.db.prepare(
+      `INSERT INTO controller_interactions (
+         interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
+         kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
+       ) VALUES ('interaction_exact', ?, ?, ?, ?, 'unsupported', ?, ?, NULL, ?, ?, NULL)`,
+    ).run(
+      fixture.turn.id,
+      fixture.turn.controllerKey,
+      threadId,
+      generationId,
+      JSON.stringify({ kind: "unsupported", interactionId: "interaction_exact", metadata: { sourceKind: null } }),
+      state,
+      fixture.fence.now,
+      state === "answered" ? fixture.fence.now : null,
+    );
+    expect(fixture.store.proposeControllerFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      candidate,
+    })).toMatchObject({ outcome: "accepted", finalization: { revision: 2 } });
+  },
+);
 
 it("accepts needs-owner for an unexpired one-use confirmation bound to the paired owner", () => {
   const fixture = submittedControllerFixture();
