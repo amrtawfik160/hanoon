@@ -164,7 +164,7 @@ const INSTALL_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tool
 const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?|deployments?|resources?)";
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
-const SUCCESS_ADVERB = "(?:already|just|now|still|[a-z]+ly)";
+const SUCCESS_ADVERB = "(?:already|just|now|still|successfully|formally|fully|permanently|finally|definitely|actually|eventually|barely)";
 const SUCCESS_ADVERB_LINK = `\\s+${SUCCESS_ADVERB}`;
 const BOUNDED_SUCCESS_ADVERBS = `(?:${SUCCESS_ADVERB_LINK}){0,2}`;
 // Distribute at most two qualifiers across either side of "been" without
