@@ -165,6 +165,9 @@ const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|too
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
+// Bounded to a couple of qualifiers, so "the unit tests" and "the tests you
+// allowed" both read as the test suite while a long unrelated clause does not.
+const TEST_OBJECT = "(?:the\\s+)?(?:[a-z]+\\s+){0,2}tests?\\b";
 const NON_SUCCESS_CLAUSE = [
   /\?\s*$/,
   /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
@@ -194,6 +197,19 @@ const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
   },
   {
     pattern: /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
+    kinds: ["execution_result"],
+  },
+  // Saying the tests were *run* is as strong as saying they passed, and the
+  // subject is routinely dropped in chat prose — "Ran the tests you allowed"
+  // is the same claim as "I ran the tests". Clause-initial anchoring is what
+  // keeps this narrow: it reads a clause that leads with the verb, not every
+  // later mention of running something.
+  {
+    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:ran|run)\\s+${TEST_OBJECT}`, "i"),
+    kinds: ["execution_result"],
+  },
+  {
+    pattern: new RegExp(`^(?:ran|run)\\s+${TEST_OBJECT}`, "i"),
     kinds: ["execution_result"],
   },
   {

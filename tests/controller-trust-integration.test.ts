@@ -476,11 +476,30 @@ it("bridges one permission interaction to Telegram and back across a restart", a
   expect(Array.isArray(projects.projects)).toBe(true);
   const index = JSON.parse(await callTool(fixture, "telegram_agent_turn_evidence", {}) as string);
   const evidence = index.evidence[0];
-  const accepted = JSON.parse(await callTool(fixture, "telegram_agent_respond", {
+  // Approving one command is not evidence that the tests ran, and reading the
+  // project is not evidence either. The claim is refused through the registered
+  // tool rather than being delivered as the owner's answer.
+  const refused = JSON.parse(await callTool(fixture, "telegram_agent_respond", {
     disposition: "answered",
     segments: [{
       type: "claim",
       text: "Ran the tests you allowed; one project is in scope.",
+      kind: "observed_state",
+      outcome: "observed",
+      subjectRef: evidence.subjectRefs[0],
+      evidenceRefs: [evidence.ref],
+    }],
+    obligationRefs: [],
+  }) as string);
+  expect(refused).toMatchObject({ outcome: "rejected", code: "proof_incompatible" });
+  expect(restartedStore.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+
+  const accepted = JSON.parse(await callTool(fixture, "telegram_agent_respond", {
+    disposition: "answered",
+    segments: [{
+      type: "claim",
+      // Exactly what the project reading supports, and nothing about the tests.
+      text: "One project is in scope.",
       kind: "observed_state",
       outcome: "observed",
       subjectRef: evidence.subjectRefs[0],
@@ -496,9 +515,9 @@ it("bridges one permission interaction to Telegram and back across a restart", a
 
   expect(restartedStore.getControllerTurn(fixture.turn.id)).toMatchObject({
     state: "completed",
-    responseText: "Ran the tests you allowed; one project is in scope.",
+    responseText: "One project is in scope.",
   });
-  const answer = "Ran the tests you allowed; one project is in scope.";
+  const answer = "One project is in scope.";
   expect(restartedStore.getOutbox(`controller:${fixture.turn.id}:reply`)?.payload.text).toBe(answer);
   expect(await deliverOutbox(restartedStore, fixture.fence, telegram, 2_300)).toBeGreaterThan(0);
 

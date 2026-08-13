@@ -653,6 +653,57 @@ describe("claim outcome compatibility", () => {
     )).toMatchObject({ outcome: "accepted" });
   });
 
+  it.each([
+    ["the exact permission-path sentence", "Ran the tests you allowed; one project is in scope."],
+    ["a bare subject-elided assertion", "Ran the tests."],
+    ["a subject-elided assertion with no trailing stop", "Ran the tests"],
+    ["a subject-led past tense", "I ran the tests."],
+    ["a subject-led present perfect", "We have run the unit tests."],
+    ["an assertion trailing another clause", "The build is green and I ran the tests."],
+    ["an assertion leading another clause", "Ran the tests, then read the project."],
+  ] as const)("refuses %s asserted under observed_state", (_scenario, text) => {
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it("accepts a subject-elided test run filed as an execution result", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: "Ran the tests you allowed.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["a question", "Ran the tests?"],
+    ["a negation", "I did not run the tests."],
+    ["a future intention", "I will run the tests."],
+    ["a hedge", "I may have run the tests."],
+  ] as const)("leaves %s about a test run outside the screen", (_scenario, text) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("leaves an unrelated use of the word run alone", () => {
+    // "run" is an ordinary verb; only a claim to have run tests is high impact.
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "observed_state",
+        outcome: "observed",
+        text: "The job is still running the build.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
   it("screens a clause joined by a conjunction, not only a new sentence", () => {
     expectRejection(
       claimFinalization({
