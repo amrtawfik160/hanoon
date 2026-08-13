@@ -4,22 +4,18 @@ import { expect, it } from "vitest";
 import {
   ANSWER_CLAUSES,
   ANSWER_CLAUSE_IDS,
+  ANSWER_JUDGE_PROFILE,
+  ANSWER_RUBRIC_VERSION,
+  type AnswerClauseId,
   buildAnswerJudgeSpawnArgs,
-  buildJudgePrompt,
-  parseAnswerVerdict,
+  buildClauseAssessment,
+  buildClauseJudgePrompt,
+  detectExplicitClauseViolation,
+  parseClauseVerdict,
+  sanitizeInfrastructureDetail,
 } from "../src/eval/answer-contract";
 
 const repositoryRoot = join(import.meta.dirname, "..");
-
-function verdictJson(overrides: Record<string, boolean> = {}): string {
-  return JSON.stringify({
-    clauses: ANSWER_CLAUSES.map((clause) => ({
-      id: clause.id,
-      holds: overrides[clause.id] ?? true,
-      why: "because",
-    })),
-  });
-}
 
 it("keeps every clause id unique and stable", () => {
   expect(new Set(ANSWER_CLAUSE_IDS).size).toBe(ANSWER_CLAUSES.length);
@@ -27,61 +23,171 @@ it("keeps every clause id unique and stable", () => {
   expect(ANSWER_CLAUSE_IDS).toContain("not-process-only");
 });
 
-it("puts the owner message, the answer, and every clause into the judge prompt", () => {
-  const prompt = buildJudgePrompt({ ownerMessage: "is it done?", answer: "Yes, merged at 14:02." });
-
-  expect(prompt).toContain("is it done?");
-  expect(prompt).toContain("Yes, merged at 14:02.");
-  for (const clause of ANSWER_CLAUSES) expect(prompt).toContain(clause.id);
-  // The judge cannot see the systems described, so it must be told not to grade truth.
-  expect(prompt).toContain("never grade whether it is factually correct");
+it("pins the answer judge identity and rubric version", () => {
+  // Catches silently inheriting project defaults or accepting a different judge profile.
+  expect(ANSWER_RUBRIC_VERSION).toBe("answer-contract-hybrid-v1");
+  expect(ANSWER_JUDGE_PROFILE).toEqual({
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    reasoningLevel: "max",
+    serviceTier: "fast",
+    permissionMode: "auto",
+    visibility: "hidden",
+  });
 });
 
-it.each([
-  ["with optional model", "model-x", ["thread", "spawn", "--project", "proj_1", "--title", "answer-eval status-good", "--prompt", "judge prompt", "--json", "--model", "model-x"]],
-  ["without optional model", undefined, ["thread", "spawn", "--project", "proj_1", "--title", "answer-eval status-good", "--prompt", "judge prompt", "--json"]],
-] as const)("builds the current BB prompt spawn args %s", (_label, model, expected) => {
+it("records deterministic and model clause provenance with the pinned identity", () => {
+  // Catches losing source, thread, rubric, or judge identity when results are serialized.
+  expect(buildClauseAssessment({
+    clauseId: "no-dead-end-referral",
+    holds: false,
+    source: "deterministic",
+    reason: "Explicitly transfers a routine BB action to the owner.",
+    judgeThreadId: null,
+  })).toEqual({
+    id: "no-dead-end-referral",
+    holds: false,
+    source: "deterministic",
+    reason: "Explicitly transfers a routine BB action to the owner.",
+    judgeThreadId: null,
+    rubricVersion: "answer-contract-hybrid-v1",
+    judgeProfile: {
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      reasoningLevel: "max",
+      serviceTier: "fast",
+      permissionMode: "auto",
+      visibility: "hidden",
+    },
+  });
+  expect(buildClauseAssessment({
+    clauseId: "outcome-first",
+    holds: true,
+    source: "model",
+    reason: "The result leads the reply.",
+    judgeThreadId: "thr_clause_1",
+  }).judgeThreadId).toBe("thr_clause_1");
+});
+
+it("builds the exact pinned hidden BB spawn tuple", () => {
+  // Catches a missing pin, an obsolete flag, or a provider/model override at the CLI boundary.
   expect(buildAnswerJudgeSpawnArgs({
     project: "proj_1",
     title: "answer-eval status-good",
     prompt: "judge prompt",
-    ...(model ? { model } : {}),
-  })).toEqual(expected);
+  })).toEqual([
+    "thread", "spawn",
+    "--project", "proj_1",
+    "--provider", "codex",
+    "--model", "gpt-5.6-sol",
+    "--reasoning-level", "max",
+    "--service-tier", "fast",
+    "--permission-mode", "auto",
+    "--visibility", "hidden",
+    "--title", "answer-eval status-good",
+    "--prompt", "judge prompt",
+    "--json",
+  ]);
 });
 
-it("reads a verdict where every clause holds", () => {
-  expect(parseAnswerVerdict(verdictJson())).toMatchObject({ passed: true });
+it("builds one isolated clause prompt with operational definition and distinct anchors", () => {
+  // Catches reverting to a monolithic prompt or using the golden corpus as calibration examples.
+  const prompt = buildClauseJudgePrompt({
+    clauseId: "no-dead-end-referral",
+    ownerMessage: "What is blocking the release?",
+    answer: "The worker is blocked on a migration assertion.",
+  });
+
+  expect(prompt).toContain(`Rubric version ${ANSWER_RUBRIC_VERSION}`);
+  expect(prompt).toContain('clause id "no-dead-end-referral"');
+  expect(prompt).toContain("Operational definition:");
+  expect(prompt).toContain("Positive anchor (holds):");
+  expect(prompt).toContain("Negative anchor (fails):");
+  expect(prompt).toContain("Have the worker inspect its diagnostic view before retrying.");
+  expect(prompt).toContain("Please open the workspace panel and click Stop yourself.");
+  expect(prompt).not.toContain("same assertion since 14:20");
+  expect(prompt).not.toContain("You'll need to open the BB app");
 });
 
-it("fails the answer when any single clause does not hold", () => {
-  const verdict = parseAnswerVerdict(verdictJson({ "no-tool-narration": false }));
+it("keeps no-invented-progress closed to completion metrics rather than ordinary facts", () => {
+  // Catches broadening completion progress into an unverified-fact or timestamp rule.
+  const prompt = buildClauseJudgePrompt({
+    clauseId: "no-invented-progress",
+    ownerMessage: "What is the current state?",
+    answer: "The check has failed repeatedly since breakfast after three attempts.",
+  });
 
-  expect(verdict?.passed).toBe(false);
-  expect(verdict?.clauses.find((clause) => clause.id === "no-tool-narration")?.holds).toBe(false);
+  expect(prompt).toContain("unsupported completion percentages and forecasts of time-to-completion");
+  expect(prompt).toContain("Observed timestamps, elapsed durations, retry counts, attempt counts, event counts, error text, and ordinary status facts are outside this clause");
+  expect(prompt).toContain("The check has failed repeatedly since breakfast after three attempts.");
+  expect(prompt).toContain("The batch is 72% complete and is forecast to finish in 11 minutes.");
 });
 
-it("reads a verdict out of a fence or a preamble", () => {
-  expect(parseAnswerVerdict("Sure:\n```json\n" + verdictJson() + "\n```")).toMatchObject({ passed: true });
+it("keeps no-dead-end-referral closed to explicit owner BB operation delegation", () => {
+  // Catches treating a worker recommendation as an owner dead-end transfer.
+  const prompt = buildClauseJudgePrompt({
+    clauseId: "no-dead-end-referral",
+    ownerMessage: "What should happen next?",
+    answer: "The worker should inspect its own diagnostic view before retrying.",
+  });
+
+  expect(prompt).toContain("explicitly delegating a routine BB app/UI/tool operation to the owner");
+  expect(prompt).toContain("open/click/navigate/stop/restart/run themselves");
+  expect(prompt).toContain("It holds when the reply recommends what the worker should do");
+  expect(prompt).toContain("The worker should inspect its own diagnostic view before retrying.");
+  expect(prompt).toContain("Please open the workspace panel and click Stop yourself.");
+});
+
+it("uses explicit deterministic violations without auto-passing nuanced clauses", () => {
+  // Catches a deterministic shortcut that incorrectly passes a clause without model judgment.
+  expect(detectExplicitClauseViolation(
+    "no-dead-end-referral",
+    "You'll need to open the BB app and stop that thread yourself.",
+  )).toContain("owner");
+  expect(detectExplicitClauseViolation(
+    "no-dead-end-referral",
+    "The worker should stop retrying and inspect its failed check.",
+  )).toBeNull();
+  expect(detectExplicitClauseViolation(
+    "no-tool-narration",
+    "I called telegram_agent_read_thread and BB does not expose an ETA.",
+  )).toContain("tool");
+  expect(detectExplicitClauseViolation(
+    "no-tool-narration",
+    "The worker is blocked on the same migration assertion.",
+  )).toBeNull();
+});
+
+it("parses exactly one matching clause verdict", () => {
+  // Catches accepting a full multi-clause answer, the wrong clause, or extra wrapper text.
+  expect(parseClauseVerdict(
+    '{"id":"no-dead-end-referral","holds":true,"why":"It keeps the action with the worker."}',
+    "no-dead-end-referral",
+  )).toEqual({
+    id: "no-dead-end-referral",
+    holds: true,
+    why: "It keeps the action with the worker.",
+  });
 });
 
 it.each([
-  ["prose", "All the rules look fine to me."],
-  ["broken JSON", '{"clauses":[{"id":"outcome-first",]}'],
-  ["a missing clause", JSON.stringify({ clauses: [{ id: "outcome-first", holds: true }] })],
-  ["an unknown clause only", JSON.stringify({ clauses: [{ id: "invented", holds: true }] })],
-])("refuses to grade %s rather than passing it silently", (_label, output) => {
-  expect(parseAnswerVerdict(output)).toBeNull();
+  ["multiple clauses", '{"clauses":[]}', "no-tool-narration"],
+  ["wrong id", '{"id":"outcome-first","holds":true,"why":"ok"}', "no-tool-narration"],
+  ["fenced output", '```json\n{"id":"no-tool-narration","holds":true,"why":"ok"}\n```', "no-tool-narration"],
+  ["preamble", 'Result: {"id":"no-tool-narration","holds":true,"why":"ok"}', "no-tool-narration"],
+  ["extra field", '{"id":"no-tool-narration","holds":true,"why":"ok","source":"model"}', "no-tool-narration"],
+  ["missing reason", '{"id":"no-tool-narration","holds":true}', "no-tool-narration"],
+])("fails closed for %s clause output", (_label, output, clauseId) => {
+  // Catches treating malformed or ambiguous judge output as a pass.
+  expect(parseClauseVerdict(output, clauseId as AnswerClauseId)).toBeNull();
 });
 
-it("ignores a duplicated clause instead of letting it overwrite the first", () => {
-  const doubled = JSON.stringify({
-    clauses: [
-      ...ANSWER_CLAUSES.map((clause) => ({ id: clause.id, holds: true, why: "" })),
-      { id: "outcome-first", holds: false, why: "second opinion" },
-    ],
-  });
-
-  expect(parseAnswerVerdict(doubled)).toMatchObject({ passed: true });
+it("sanitizes captured infrastructure detail without exposing prompt or answer text", () => {
+  // Catches an infrastructure failure path that leaks sensitive calibration inputs.
+  expect(sanitizeInfrastructureDetail(
+    "bb failed: owner=owner-secret answer=answer-secret prompt=prompt-secret",
+    ["owner-secret", "answer-secret", "prompt-secret"],
+  )).toBe("bb failed: owner=[redacted] answer=[redacted] prompt=[redacted]");
 });
 
 it("ships golden cases covering both a passing and a failing shape of every kind", () => {

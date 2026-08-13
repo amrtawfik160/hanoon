@@ -1,18 +1,28 @@
-/**
- * The controller's instructions make specific, checkable promises about what an
- * answer looks like. Nothing in the deterministic suite tests them, so the
- * 39-line instruction string cannot be changed with any confidence — every
- * edit is a guess. These clauses restate those promises as a rubric a judge can
- * apply to one answer, so a prompt change can be measured rather than hoped at.
- *
- * Each clause is deliberately about the *answer*, never about whether the agent
- * was factually right: correctness depends on a world this harness does not
- * have, and a rubric that quietly grades it would be measuring noise.
- */
+import { ANSWER_CLAUSE_ANCHORS } from "./answer-anchors.js";
+
+export type AnswerClauseId =
+  | "outcome-first"
+  | "no-tool-narration"
+  | "no-invented-progress"
+  | "bounded-uncertainty"
+  | "no-dead-end-referral"
+  | "not-process-only";
+
 export type AnswerClause = Readonly<{
-  id: string;
+  id: AnswerClauseId;
   question: string;
 }>;
+
+export const ANSWER_RUBRIC_VERSION = "answer-contract-hybrid-v1" as const;
+
+export const ANSWER_JUDGE_PROFILE = Object.freeze({
+  provider: "codex",
+  model: "gpt-5.6-sol",
+  reasoningLevel: "max",
+  serviceTier: "fast",
+  permissionMode: "auto",
+  visibility: "hidden",
+} as const);
 
 export const ANSWER_CLAUSES: readonly AnswerClause[] = Object.freeze([
   Object.freeze({
@@ -25,7 +35,7 @@ export const ANSWER_CLAUSES: readonly AnswerClause[] = Object.freeze([
   }),
   Object.freeze({
     id: "no-invented-progress",
-    question: "Does the answer avoid inventing a completion percentage or an ETA that no tool could have reported?",
+    question: "Does the answer avoid unsupported completion percentages and forecasts of time-to-completion? Observed timestamps, elapsed durations, retry counts, attempt counts, event counts, error text, and ordinary status facts are outside this clause and must not be failed merely because they cannot be verified.",
   }),
   Object.freeze({
     id: "bounded-uncertainty",
@@ -33,7 +43,7 @@ export const ANSWER_CLAUSES: readonly AnswerClause[] = Object.freeze([
   }),
   Object.freeze({
     id: "no-dead-end-referral",
-    question: "Does the answer avoid telling the owner to go and do something in the BB app themselves?",
+    question: "Does the answer avoid explicitly delegating a routine BB app/UI/tool operation to the owner (open/click/navigate/stop/restart/run it themselves)? It holds when the reply says the worker should take an action, recommends a next step, or suggests telling the worker what to do.",
   }),
   Object.freeze({
     id: "not-process-only",
@@ -41,7 +51,7 @@ export const ANSWER_CLAUSES: readonly AnswerClause[] = Object.freeze([
   }),
 ]);
 
-export const ANSWER_CLAUSE_IDS: readonly string[] = Object.freeze(
+export const ANSWER_CLAUSE_IDS: readonly AnswerClauseId[] = Object.freeze(
   ANSWER_CLAUSES.map((clause) => clause.id),
 );
 
@@ -49,29 +59,81 @@ export type AnswerJudgeSpawnInput = Readonly<{
   project: string;
   title: string;
   prompt: string;
-  model?: string;
 }>;
 
 export function buildAnswerJudgeSpawnArgs(input: AnswerJudgeSpawnInput): string[] {
-  const spawnArgs = [
+  return [
     "thread", "spawn",
     "--project", input.project,
+    "--provider", ANSWER_JUDGE_PROFILE.provider,
+    "--model", ANSWER_JUDGE_PROFILE.model,
+    "--reasoning-level", ANSWER_JUDGE_PROFILE.reasoningLevel,
+    "--service-tier", ANSWER_JUDGE_PROFILE.serviceTier,
+    "--permission-mode", ANSWER_JUDGE_PROFILE.permissionMode,
+    "--visibility", ANSWER_JUDGE_PROFILE.visibility,
     "--title", input.title,
     "--prompt", input.prompt,
     "--json",
   ];
-  if (input.model) spawnArgs.push("--model", input.model);
-  return spawnArgs;
 }
 
-export type ClauseVerdict = Readonly<{ id: string; holds: boolean; why: string }>;
-export type AnswerVerdict = Readonly<{ clauses: readonly ClauseVerdict[]; passed: boolean }>;
+export type ClauseVerdict = Readonly<{
+  id: AnswerClauseId;
+  holds: boolean;
+  why: string;
+}>;
 
-export function buildJudgePrompt(input: { ownerMessage: string; answer: string }): string {
-  const clauses = ANSWER_CLAUSES
-    .map((clause, index) => `${index + 1}. id "${clause.id}": ${clause.question}`)
-    .join("\n");
-  return `You are grading one reply that an assistant sent to its owner over Telegram. Grade only the reply's form against the rules below. You cannot see the systems it describes, so never grade whether it is factually correct, and never reward or punish it for the news being good or bad.
+export type ClauseAssessment = Readonly<{
+  id: AnswerClauseId;
+  holds: boolean;
+  source: "deterministic" | "model";
+  reason: string;
+  judgeThreadId: string | null;
+  rubricVersion: typeof ANSWER_RUBRIC_VERSION;
+  judgeProfile: typeof ANSWER_JUDGE_PROFILE;
+}>;
+
+export function buildClauseAssessment(input: {
+  clauseId: AnswerClauseId;
+  holds: boolean;
+  source: "deterministic" | "model";
+  reason: string;
+  judgeThreadId: string | null;
+}): ClauseAssessment {
+  return {
+    id: input.clauseId,
+    holds: input.holds,
+    source: input.source,
+    reason: input.reason,
+    judgeThreadId: input.judgeThreadId,
+    rubricVersion: ANSWER_RUBRIC_VERSION,
+    judgeProfile: ANSWER_JUDGE_PROFILE,
+  };
+}
+
+export function buildClauseJudgePrompt(input: {
+  clauseId: AnswerClauseId;
+  ownerMessage: string;
+  answer: string;
+}): string {
+  const clause = ANSWER_CLAUSES.find((candidate) => candidate.id === input.clauseId);
+  const anchors = ANSWER_CLAUSE_ANCHORS[input.clauseId];
+  if (!clause || !anchors) throw new Error(`missing answer rubric clause ${input.clauseId}`);
+
+  return `You are grading one assistant reply over Telegram. Rubric version ${ANSWER_RUBRIC_VERSION}. Judge only clause id "${clause.id}". You cannot see the systems described, so never grade factual correctness or whether the news is good or bad.
+
+Operational definition:
+${anchors.definition}
+
+Positive anchor (holds):
+"""
+${anchors.positive}
+"""
+
+Negative anchor (fails):
+"""
+${anchors.negative}
+"""
 
 Owner asked:
 """
@@ -83,44 +145,78 @@ Assistant replied:
 ${input.answer}
 """
 
-For each rule, answer whether it holds:
-${clauses}
+Compare the reply only with this clause and its operational definition. Do not infer a failure from any other answer-quality rule. The anchors are illustrative examples, not facts about the reply.
 
-Reply with strict JSON and nothing else — no prose, no Markdown fence:
+Reply with exactly one strict JSON object and nothing else — no prose, no Markdown fence:
 
-{"clauses":[{"id":"outcome-first","holds":true,"why":"one short reason"}]}
+{"id":"${clause.id}","holds":true,"why":"one short reason"}
 
-Include every rule id exactly once. "holds" is true when the reply satisfies the rule.`;
+"holds" is true when the reply satisfies this one clause.`;
 }
 
-/**
- * The judge is a model, so its output is untrusted: a fence or preamble is
- * tolerated, but a missing or duplicated clause is a failed grading rather than
- * a silent pass — a rubric that scores an unparseable answer as fine is worse
- * than no rubric.
- */
-export function parseAnswerVerdict(output: string): AnswerVerdict | null {
-  const fenced = output.replace(/```(?:json)?/gi, " ");
-  const start = fenced.indexOf("{");
-  const end = fenced.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
+export function detectExplicitClauseViolation(
+  clauseId: AnswerClauseId,
+  answer: string,
+): string | null {
+  const normalized = answer.replace(/\s+/g, " ").trim();
+  switch (clauseId) {
+    case "no-dead-end-referral":
+      if (
+        /\b(?:you(?:'ll| will| need to| have to| should| must)|please)\b[^.!?]{0,220}\b(?:open|use|go to|navigate|click|stop|restart|run|perform)\b[^.!?]{0,220}\b(?:bb app|thread panel|yourself|manually|on your own)\b/i.test(normalized)
+      ) return "Explicitly transfers a routine BB action to the owner.";
+      return null;
+    case "no-tool-narration":
+      if (
+        /\b(?:called|used|invoked)\s+[a-z0-9_.-]+/i.test(normalized)
+        || /\b(?:tool|tools|bb internals|based on (?:the )?(?:available )?data|(?:bb|platform|system) (?:doesn't|does not) expose|can(?:not|'t) determine)\b/i.test(normalized)
+      ) return "Explicitly narrates tools, mechanisms, or unavailable capabilities.";
+      return null;
+    case "no-invented-progress":
+      if (
+        /\b\d+(?:\.\d+)?\s*%/i.test(normalized)
+        || /\bETA\b/i.test(normalized)
+        || /\b(?:should|expected to|will) finish\b/i.test(normalized)
+        || /\b(?:in|within)\s+\d+\s+(?:seconds?|minutes?|hours?|days?)\b/i.test(normalized)
+      ) return "Explicitly invents progress or a completion time.";
+      return null;
+    case "not-process-only":
+      if (/^\s*(?:let me|i(?:'ll| will)|give me)\b[^.!?]{0,180}\b(?:look|check|investigate|review|find out|get back|report back)\b/i.test(normalized)) {
+        return "Only promises future investigation instead of giving an answer.";
+      }
+      return null;
+    case "outcome-first":
+    case "bounded-uncertainty":
+      return null;
+  }
+}
+
+export function parseClauseVerdict(
+  output: string,
+  expectedClauseId: AnswerClauseId,
+): ClauseVerdict | null {
+  const trimmed = output.trim();
+  if (!trimmed) return null;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fenced.slice(start, end + 1));
+    parsed = JSON.parse(trimmed);
   } catch {
     return null;
   }
-  const entries = (parsed as { clauses?: unknown })?.clauses;
-  if (!Array.isArray(entries)) return null;
-  const byId = new Map<string, ClauseVerdict>();
-  for (const entry of entries) {
-    if (typeof entry !== "object" || entry === null) continue;
-    const { id, holds, why } = entry as Record<string, unknown>;
-    if (typeof id !== "string" || typeof holds !== "boolean") continue;
-    if (!ANSWER_CLAUSE_IDS.includes(id) || byId.has(id)) continue;
-    byId.set(id, { id, holds, why: typeof why === "string" ? why.slice(0, 300) : "" });
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const keys = Object.keys(parsed).sort();
+  if (keys.join(",") !== "holds,id,why") return null;
+  const { id, holds, why } = parsed as Record<string, unknown>;
+  if (id !== expectedClauseId || typeof holds !== "boolean" || typeof why !== "string" || !why.trim()) return null;
+  return { id: expectedClauseId, holds, why: why.slice(0, 300) };
+}
+
+export function sanitizeInfrastructureDetail(
+  detail: string,
+  sensitiveValues: readonly string[] = [],
+): string {
+  let sanitized = detail;
+  for (const sensitiveValue of sensitiveValues) {
+    if (sensitiveValue) sanitized = sanitized.replaceAll(sensitiveValue, "[redacted]");
   }
-  if (byId.size !== ANSWER_CLAUSES.length) return null;
-  const clauses = ANSWER_CLAUSES.map((clause) => byId.get(clause.id) as ClauseVerdict);
-  return { clauses, passed: clauses.every((clause) => clause.holds) };
+  return sanitized.replace(/\s+/g, " ").slice(0, 400);
 }
