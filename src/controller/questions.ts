@@ -37,18 +37,26 @@ const MAX_INTERACTION_ID = 200;
 const MAX_QUESTION_ID = 120;
 const MAX_OPTION_VALUE = 120;
 
-function boundedString(value: unknown, limit: number): string | null {
-  if (typeof value !== "string") return null;
-  const text = value.trim();
+function boundedString(rawText: unknown, limit: number, byteLimit = limit * 4): string | null {
+  if (typeof rawText !== "string") return null;
+  const text = rawText.trim();
   if (text.length === 0) return null;
-  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+  const characters = [...text];
+  if (characters.length <= limit && Buffer.byteLength(text, "utf8") <= byteLimit) return text;
+  const kept: string[] = [];
+  for (const character of characters) {
+    if (kept.length >= limit - 1 || Buffer.byteLength(`${kept.join("")}${character}…`, "utf8") > byteLimit) break;
+    kept.push(character);
+  }
+  return kept.length > 0 ? `${kept.join("")}…` : null;
 }
 
 function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const value = typeof candidate.value === "string" && candidate.value.length > 0 && candidate.value.length <= MAX_OPTION_VALUE ? candidate.value : null;
-  const label = boundedString(candidate.label, MAX_LABEL);
+  const value = typeof candidate.value === "string" && [...candidate.value].length > 0 &&
+    [...candidate.value].length <= MAX_OPTION_VALUE && Buffer.byteLength(candidate.value, "utf8") <= MAX_OPTION_VALUE * 4 ? candidate.value : null;
+  const label = boundedString(candidate.label, MAX_LABEL, 64);
   if (!value || !label) return null;
   return { value, label, description: boundedString(candidate.description, MAX_DESCRIPTION) };
 }
@@ -65,7 +73,7 @@ function parseQuestion(raw: unknown): ControllerQuestion | null {
   return {
     id,
     prompt,
-    shortLabel: boundedString(candidate.shortLabel, MAX_LABEL),
+    shortLabel: boundedString(candidate.shortLabel, MAX_LABEL, 64),
     multiSelect: candidate.multiSelect === true,
     allowFreeText: candidate.allowFreeText !== false,
     options,
@@ -171,13 +179,13 @@ function approvalSummary(subject: Record<string, unknown>): string | null {
   return null;
 }
 
-function containsApprovalSecret(value: string): boolean {
+function containsApprovalSecret(commandText: string): boolean {
   try {
-    assertNoRawMergeCallback(value, "command");
+    assertNoRawMergeCallback(commandText, "command");
   } catch {
     return true;
   }
-  let decoded = value;
+  let decoded = commandText;
   for (let depth = 0; depth < 4; depth += 1) {
     if (!decoded.includes("%")) break;
     try {
@@ -197,10 +205,20 @@ function containsApprovalSecret(value: string): boolean {
     /(?:env|environment)\b/i.test(decoded);
 }
 
-function safeApprovalPath(value: unknown): string | null {
-  if (typeof value !== "string" || value.length === 0 || value.length > 240 || value.startsWith("/") ||
-    value.includes("\\") || value.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
-  const basename = value.split("/").at(-1)!;
+export function isSafeControllerApprovalSummary(summary: unknown): summary is string {
+  if (typeof summary !== "string" || Buffer.byteLength(summary, "utf8") > 4_000) return false;
+  if (summary === "wants to run:\n\n`a redacted command`" || summary === "wants to write a protected path") return true;
+  const command = /^wants to run:\n\n`([^`]*)`$/.exec(summary)?.[1];
+  if (command !== undefined) return command.length > 0 && [...command].length <= MAX_PROMPT && !containsApprovalSecret(command);
+  const basename = /^wants to write ([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/.exec(summary)?.[1];
+  return basename !== undefined;
+}
+
+function safeApprovalPath(rawPath: unknown): string | null {
+  if (typeof rawPath !== "string" || rawPath.length === 0 || rawPath.length > 240 || rawPath.startsWith("/") ||
+    /^[A-Za-z]:/.test(rawPath) || rawPath === "~" || rawPath.startsWith("~/") || rawPath.includes("\\") ||
+    rawPath.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
+  const basename = rawPath.split("/").at(-1)!;
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(basename) ? basename : null;
 }
 
@@ -208,7 +226,7 @@ function controllerApprovalSummary(subject: unknown): string | null {
   if (typeof subject !== "object" || subject === null) return null;
   const candidate = subject as Record<string, unknown>;
   if (candidate.kind === "command" && typeof candidate.command === "string") {
-    return containsApprovalSecret(candidate.command) || candidate.command.length === 0 || candidate.command.length > MAX_PROMPT
+    return containsApprovalSecret(candidate.command) || candidate.command.includes("`") || candidate.command.length === 0 || candidate.command.length > MAX_PROMPT
       ? "wants to run:\n\n`a redacted command`"
       : `wants to run:\n\n\`${candidate.command}\``;
   }
@@ -227,14 +245,26 @@ export function parseControllerInteraction(interactionId: unknown, payload: unkn
     typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind === "user_question") {
+    if (!Array.isArray(candidate.questions) || candidate.questions.length === 0 || candidate.questions.length > MAX_QUESTIONS ||
+      candidate.questions.some((rawQuestion) => {
+        if (typeof rawQuestion !== "object" || rawQuestion === null) return true;
+        const rawCandidate = rawQuestion as Record<string, unknown>;
+        const options = rawCandidate.options;
+        return typeof rawCandidate.multiSelect !== "boolean" || typeof rawCandidate.allowFreeText !== "boolean" ||
+          options !== undefined && (!Array.isArray(options) || options.length > MAX_OPTIONS || options.some((option) => parseOption(option) === null));
+      })) return { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
     const pending = parsePendingQuestion(interactionId, payload);
-    return pending
+    return pending && new Set(pending.questions.map((question) => question.id)).size === pending.questions.length
       ? { kind: "user_question", interactionId, questions: pending.questions }
       : { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
   }
   if (candidate.kind === "approval") {
     const summary = controllerApprovalSummary(candidate.subject);
     const availableDecisions = Array.isArray(candidate.availableDecisions) ? candidate.availableDecisions : null;
+    if (availableDecisions === null || availableDecisions.some((decision) =>
+      decision !== "allow_once" && decision !== "allow_for_session" && decision !== "deny")) {
+      return { kind: "unsupported", interactionId, metadata: { sourceKind: "approval" } };
+    }
     const decisions = availableDecisions !== null
       ? (["allow_once", "deny"] as const).filter((decision) => availableDecisions.includes(decision))
       : [];
