@@ -1316,3 +1316,49 @@ describe("fixed corrections", () => {
     expect(new Set(corrections).size).toBe(FINALIZATION_REJECTION_CODES.length);
   });
 });
+
+describe("tag agreement across subjects and auxiliaries", () => {
+  const AUXILIARIES = ["is", "are", "was", "were", "has", "have", "had", "did"] as const;
+  const PRONOUNS = ["i", "we", "it", "they"] as const;
+  const PRONOUN_TEXT: Record<(typeof PRONOUNS)[number], string> = {
+    i: "I", we: "we", it: "it", they: "they",
+  };
+
+  // Written out rather than derived from the implementation, so the table is an
+  // independent statement of which pair confirms which assertion.
+  const CASES: [string, string[]][] = [
+    ["I implemented the fix", ["did i"]],
+    ["We shipped the change", ["did we"]],
+    ["Ran the tests", ["did i"]],
+    ["The tests passed", ["did they", "have they"]],
+    ["The deployment is live", ["is it"]],
+    ["The credentials are rotated", ["are they"]],
+    ["The fix has been implemented", ["has it"]],
+    ["The credentials have been rotated", ["have they"]],
+    ["The fix had been implemented", ["had it"]],
+  ];
+
+  it.each(CASES)("accepts only the agreeing pair for %s", (assertion, allowed) => {
+    const context = contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
+    for (const auxiliary of AUXILIARIES) {
+      for (const pronoun of PRONOUNS) {
+        const tag = `${auxiliary}n't ${PRONOUN_TEXT[pronoun]}?`;
+        const text = `${assertion}, ${tag}`;
+        const expected = allowed.includes(`${auxiliary} ${pronoun}`) ? "accepted" : "rejected";
+        expect([text, validateControllerFinalization(
+          claimFinalization({ kind: "observed_state", outcome: "observed", text }), context,
+        ).outcome]).toEqual([text, expected]);
+      }
+    }
+  });
+
+  it("never lets a plural subject take a singular perfect auxiliary", () => {
+    for (const assertion of ["The tests passed", "The credentials have been rotated"]) {
+      expectRejection(
+        textFinalization(`${assertion}, hasn't they?`),
+        emptyFinalizationContext(),
+        "high_impact_text_unclaimed",
+      );
+    }
+  });
+});

@@ -527,3 +527,45 @@ it.each([
     questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
   })).toMatchObject({ kind: "user_question" });
 });
+
+it.each([
+  ["an encoded ANSI-C construct", "Run curl %24%27-Uproxyuser:hunter2%27 now?"],
+  ["a repeatedly encoded ANSI-C construct", "Run curl %2524%2527-Uproxyuser:hunter2%2527 now?"],
+  ["an encoded localized double quote", "Run curl %24%22-Uproxyuser:hunter2%22 now?"],
+  ["a partially encoded construct", "Run curl $%27-Uproxyuser:hunter2%27 now?"],
+] as const)("downgrades a question prompt carrying %s", (_scenario, prompt) => {
+  // The construct is only visible while its quoting is intact, so each decoded
+  // reading is checked before anything is dequoted.
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "user_question",
+    questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
+  })).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "user_question" },
+  });
+});
+
+it.each([
+  ["an encoded ANSI-C construct", "curl %24%27-Uproxyuser:hunter2%27 https://example.com"],
+  ["a repeatedly encoded ANSI-C construct", "curl %2524%2527-Uproxyuser:hunter2%2527 https://example.com"],
+] as const)("makes an approval carrying %s unsupported", (_scenario, command) => {
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "approval",
+    subject: { kind: "command", command },
+    availableDecisions: ["allow_once", "deny"],
+  })).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "approval" },
+  });
+});
+
+it("treats a remaining escape at the decode cap as unread even beside a stray percent", () => {
+  // A stray percent elsewhere must not vouch for the layer that went unread.
+  // The pre-existing callback guard also refuses a bare percent, so this pins
+  // the exhaustion signal rather than relying on that guard alone.
+  const prompt = "Run curl %25252527-Uproxyuser:hunter2%25252527 at 50% load now?";
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "user_question",
+    questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
+  })).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "user_question" },
+  });
+});

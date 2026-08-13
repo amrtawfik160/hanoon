@@ -204,31 +204,47 @@ const NEGATIVE_TAG = new RegExp(
  * still about someone else entirely, so the subject and tense of the assertion
  * decide which tag can confirm it.
  */
-type TagProfile = Readonly<{ pronouns: readonly string[]; auxiliaries: readonly string[] }>;
+type TagSubject = "i" | "we" | "it" | "they";
 
-/** Perfect and simple past both admit "did" and "have": "passed, haven't they?" */
-const PAST_AUXILIARIES = ["did", "have", "has"] as const;
+/**
+ * The auxiliary that agrees with each subject, per tense. Pairing them is the
+ * point: holding a set of auxiliaries and a set of pronouns separately would
+ * admit any combination of the two, so "The tests passed, hasn't they?" would
+ * pass on parts that are each individually plausible.
+ */
+const PAST_PERFECT: Record<TagSubject, readonly string[]> = { i: ["had"], we: ["had"], it: ["had"], they: ["had"] };
+const PERFECT: Record<TagSubject, readonly string[]> = { i: ["have"], we: ["have"], it: ["has"], they: ["have"] };
+// "aren't I?" is the idiomatic first-person present tag; "amn't" is not used.
+const PRESENT_BE: Record<TagSubject, readonly string[]> = { i: ["am", "are"], we: ["are"], it: ["is"], they: ["are"] };
+const PAST_BE: Record<TagSubject, readonly string[]> = { i: ["was"], we: ["were"], it: ["was"], they: ["were"] };
+/**
+ * A simple past takes "did". A plural subject additionally takes "have", which
+ * is what makes "The tests passed, haven't they?" read naturally — but never
+ * "has", which agrees with no plural subject in any tense.
+ */
+const SIMPLE_PAST: Record<TagSubject, readonly string[]> = {
+  i: ["did"], we: ["did"], it: ["did"], they: ["did", "have"],
+};
 
 /** Assertions whose subject was dropped: "Ran the tests" means "I ran them". */
 const ELIDED_SPEAKER = /^\s*(?:ran|run)\b/;
 
-function tagProfile(assertion: string): TagProfile {
-  const text = assertion.toLowerCase();
-  const speaker = /^\s*(i|we)\b/.exec(text)?.[1] ?? (ELIDED_SPEAKER.test(text) ? "i" : undefined);
-  const auxiliaries = /\b(?:has|have|had)\b/.test(text)
-    ? PAST_AUXILIARIES
-    : /\b(?:is|are)\b/.test(text)
-      ? (["is", "are"] as const)
-      : /\b(?:was|were)\b/.test(text)
-        ? (["was", "were"] as const)
-        : PAST_AUXILIARIES;
-  // An elided subject is the speaker either way, so both first persons agree.
-  if (speaker) return { pronouns: speaker === "i" ? ["i", "we"] : ["we"], auxiliaries };
+function tagSubject(text: string): TagSubject {
+  const speaker = /^\s*(i|we)\b/.exec(text)?.[1];
+  if (speaker === "i" || ELIDED_SPEAKER.test(text)) return "i";
+  if (speaker === "we") return "we";
   // A nominal subject is referred to by "it" or "they" depending on its number,
   // which the head noun's own plural carries.
   const head = /^\s*(?:the\s+)?([a-z]+)/.exec(text)?.[1] ?? "";
-  const plural = head.endsWith("s") && !head.endsWith("ss");
-  return { pronouns: [plural ? "they" : "it"], auxiliaries };
+  return head.endsWith("s") && !head.endsWith("ss") ? "they" : "it";
+}
+
+function tagAuxiliaries(text: string): Record<TagSubject, readonly string[]> {
+  if (/\bhad\b/.test(text)) return PAST_PERFECT;
+  if (/\b(?:has|have)\b/.test(text)) return PERFECT;
+  if (/\b(?:is|are)\b/.test(text)) return PRESENT_BE;
+  if (/\b(?:was|were)\b/.test(text)) return PAST_BE;
+  return SIMPLE_PAST;
 }
 
 /** True when this tag is asking about this assertion rather than something else. */
@@ -238,8 +254,11 @@ function tagConfirms(assertion: string, tag: string): boolean {
   if (!match) return false;
   const auxiliary = (match[1] ?? match[3] ?? "").toLowerCase();
   const pronoun = (match[2] ?? match[4] ?? "").toLowerCase();
-  const profile = tagProfile(assertion);
-  return profile.auxiliaries.includes(auxiliary) && profile.pronouns.includes(pronoun);
+  const text = assertion.toLowerCase();
+  const subject = tagSubject(text);
+  // The tag has to name this assertion's subject *and* carry the auxiliary that
+  // agrees with it, as one pair rather than as two independent choices.
+  return pronoun === subject && tagAuxiliaries(text)[subject].includes(auxiliary);
 }
 
 /** Curly apostrophes are the same contraction; the grammar reads one spelling. */

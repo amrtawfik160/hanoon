@@ -108,14 +108,13 @@ function decodedViews(text: string): { views: string[]; exhausted: boolean } {
   return { views, exhausted: decodesFurther(current) };
 }
 
-/** True when another well-formed percent-escape is still waiting to be read. */
+/**
+ * True when another well-formed percent-escape is still waiting to be read.
+ * Its mere presence is enough: requiring the whole string to decode would let a
+ * stray percent elsewhere in the text vouch for the escape that was not read.
+ */
 function decodesFurther(text: string): boolean {
-  if (!/%[0-9A-Fa-f]{2}/.test(text)) return false;
-  try {
-    return decodeURIComponent(text) !== text;
-  } catch {
-    return false;
-  }
+  return /%[0-9A-Fa-f]{2}/.test(text);
 }
 
 /**
@@ -137,25 +136,34 @@ const SHELL_ESCAPE_CONSTRUCT = /\$['"]/;
  * into a quoted flag that has to be dequoted afterwards to be seen at all.
  * Every decoded view is therefore screened dequoted as well.
  */
-function credentialViews(text: string): { views: string[]; exhausted: boolean } {
+function credentialViews(text: string): {
+  views: string[];
+  exhausted: boolean;
+  shellEscaped: boolean;
+} {
   const views = new Set<string>();
   let exhausted = false;
+  // A shell-escape construct is only visible before its quotes are removed, and
+  // an encoded one only after decoding, so every reading is checked at the point
+  // it still has its quoting: `%24%27-Uproxy:pw%27` decodes into `$'…'` and must
+  // be caught there rather than after dequoting flattens it.
+  let shellEscaped = SHELL_ESCAPE_CONSTRUCT.test(text);
   for (const base of [text, unquoted(text)]) {
     views.add(base);
     const decoded = decodedViews(base);
     exhausted = exhausted || decoded.exhausted;
     for (const view of decoded.views) {
+      shellEscaped = shellEscaped || SHELL_ESCAPE_CONSTRUCT.test(view);
       views.add(view);
       views.add(unquoted(view));
     }
   }
-  return { views: [...views], exhausted };
+  return { views: [...views], exhausted, shellEscaped };
 }
 
 export function isUnsafeProviderText(text: string): boolean {
-  if (SHELL_ESCAPE_CONSTRUCT.test(text)) return true;
-  const { views, exhausted } = credentialViews(text);
-  if (exhausted) return true;
+  const { views, exhausted, shellEscaped } = credentialViews(text);
+  if (shellEscaped || exhausted) return true;
   return views.some((view) => (
     containsCredentialLikeText(view) || hasUnsafeCallbackMaterial(view) ||
     CLI_CREDENTIAL_FLAG.some((pattern) => pattern.test(view)) ||
