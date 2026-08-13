@@ -17,7 +17,7 @@ From a shell:
 ```bash
 bb plugin list --json
 bb telegram-agent doctor
-bb telegram-agent doctor <project-id>
+bb telegram-agent doctor proj_7f3d2a91
 bb plugin logs telegram-agent -n 50
 ```
 
@@ -27,7 +27,7 @@ Use `--json` on Telegram Agent commands when another tool must consume the resul
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally under the manifest roots `skills/workflow-kit` and `skills/guards`; operators do not install another skill plugin. The catalog has 17 local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+Skills are committed locally under the three manifest roots `skills/workflow-kit`, `skills/guards`, and `skills/delivery`; operators do not install another skill plugin. The catalog has 18 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
 
 Run the deterministic integrity gate from the repository root:
 

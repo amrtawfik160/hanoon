@@ -94,17 +94,30 @@ The conversation's own budgets are deliberately not settings. A turn is bounded 
 
 How the agent should behave — terser answers, always leading with the pull-request link — is not a setting. Tell it in the chat and it records a single standing instruction that is applied to every later turn, replaced whenever you restate it, and cleared when you tell it to stop. It is layered after the fixed instructions, so it can change tone and habits but never a safety boundary.
 
-### Why the default is `full`
+### The permission mode, and what it does not do
 
-The owner works from Telegram and is not watching the BB app, so an approval prompt rendered there stalls the agent with nobody to answer it. `full` lets it use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without that dead end.
+`full` is the current default because the owner works from Telegram and is not watching the BB app: before the interaction bridge existed, an approval prompt rendered there stalled the agent with nobody to answer it. That is a **compatibility default carried forward, and current residual risk** — not a safe target architecture. It is not mechanically enforced isolation, and the agent's standing instructions are guidance, not enforcement.
 
 The limits that remain are the ones the owner can actually see and answer:
 
 - merging a pull request and promoting to production run through the job pipeline and need a one-use Telegram approval;
-- destructive or irreversible actions outside a worktree are asked about in the chat first;
-- credential-shaped text is refused before it can be stored as a memory.
+- installing or connecting an integration, changing a credential, spending money, a destructive external action, or an irreversible external write are asked about in the chat first;
+- credential-shaped text is refused before it can be stored as a memory;
+- a permission prompt BB does raise for the hidden controller is bridged into Telegram as *Allow once* / *Deny*, so choosing `auto` or `accept-edits` no longer means waiting on a dead end.
 
-Set `auto` or `accept-edits` if you would rather approve execution in the BB app, and expect the agent to stop and wait when it hits one.
+Set `auto` or `accept-edits` if you would rather approve execution as it happens. A value you have saved is preserved exactly and is never rewritten.
+
+#### Why the default has not changed to `auto`
+
+Changing the fresh, unset default to `auto` is **disabled**, not merely unfinished. It stays disabled until a versioned runtime BB attestation proves all three of:
+
+1. an atomic activity snapshot, or a shared-revision equivalent covering every status, activity, and interaction field used for negative or idle inference;
+2. an atomic expected-head-and-candidate-tree conditional commit with a deterministic request key;
+3. mechanical denial of worker and controller native commit, ref mutation, push, GitHub write, merge, deploy, and equivalent network effects, while authorized edit and test work still runs.
+
+The vendored BB thread, timeline, and interaction calls share no atomic activity revision, and the commit API is unconditional, so neither the idle-truth protocol nor the conditional-commit protocol can be implemented safely on this runtime. Instruction text, a mocked adapter, and a Telegram approval button are none of them proof of that boundary.
+
+`executor_v2` managed-job publication is disabled behind the same gate. The current `legacy_v1` behaviour — the worker performing its own commit, push, and pull-request creation inside its managed worktree — remains what actually runs.
 
 Planner, critic, and documentation stages pin their own execution tuple and are unaffected by this setting; implementation and review workers use the enabled project's immutable policy snapshot.
 
@@ -115,9 +128,9 @@ Only standard BB Git projects with a canonical GitHub remote and an available so
 Prepare a JSON policy, then use one of three mutually exclusive input modes:
 
 ```bash
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json --host <host-id>
-bb telegram-agent project enable <project-id> --policy-json '<policy-json>'
+bb telegram-agent project enable proj_7f3d2a91 --policy-file /absolute/path/to/policy.json
+bb telegram-agent project enable proj_7f3d2a91 --policy-file /absolute/path/to/policy.json --host host_2b91c4
+bb telegram-agent project enable proj_7f3d2a91 --policy-json "$POLICY_JSON"
 ```
 
 The `--host` flag is valid only with an absolute `--policy-file` path and selects the BB host that owns that file. A command invoked from a BB thread can otherwise resolve the invoking environment's host.
@@ -125,7 +138,7 @@ The `--host` flag is valid only with an absolute `--policy-file` path and select
 Individual flags are also supported. At minimum they require `--alias`, `--base`, and `--merge-method`:
 
 ```bash
-bb telegram-agent project enable <project-id> \
+bb telegram-agent project enable proj_7f3d2a91 \
   --alias example \
   --base main \
   --merge-method squash \
@@ -216,6 +229,8 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `production.targetKey` | Optional shared isolation key: 1–64 lowercase letters, numbers, `.`, `_`, or `-`, starting alphanumeric. When absent, the project id is used. |
 | `production.deployCommands` | One to 20 commands when production is configured. |
 | `production.canaryCommands` | One to 20 commands when production is configured. |
+| `production.healthCommands` | Optional one to five cheap, read-only commands run on a timer after production is reached, so a crash loop is noticed rather than waited out. |
+| `production.healthIntervalMs` | Optional interval for those health commands, from 60,000 ms to 86,400,000 ms. |
 | `production.rollbackCommand` | Optional operator guidance. It is recorded but never executed automatically. |
 | `production.convexDeployRequired` | When true, a deploy command must invoke `convex deploy` through the supported CLI form. |
 | `requiredChecks` | Up to 50 non-empty GitHub check names. |
@@ -232,7 +247,7 @@ Deploy and canary must both be present before the plugin can issue merge approva
 
 ```bash
 bb telegram-agent doctor
-bb telegram-agent doctor <project-id>
+bb telegram-agent doctor proj_7f3d2a91
 bb telegram-agent project list
 ```
 

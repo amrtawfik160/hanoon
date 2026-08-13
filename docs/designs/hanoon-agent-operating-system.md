@@ -109,7 +109,7 @@ Hanoon is designed to exceed a process-centric harness where its existing archit
 
 ### Slice 1: controller trust contract
 
-Ship one controller instruction path, an enforceable descriptor for every Hanoon controller capability, blocking pre-execution policy, evidence-bearing controller tools, structured finalization, a completion gate, hidden-controller interaction bridging, `auto` as the default permission mode, and a minimum outcome-evaluation baseline. This is the prerequisite for every broader autonomy feature.
+Ship one controller instruction path, an enforceable descriptor for every Hanoon controller capability, blocking pre-execution policy, evidence-bearing controller tools, structured finalization, a completion gate, hidden-controller interaction bridging, ~~`auto` as the default permission mode~~ (**superseded — disabled** behind the runtime-attestation gate; the default remains `full`), and a minimum outcome-evaluation baseline. This is the prerequisite for every broader autonomy feature.
 
 ### Slice 2: proven autonomy
 
@@ -202,7 +202,7 @@ Slice 1 is one release contract but lands through three independently green chec
 
 1. **Baseline.** Add the versioned outcome-scenario/report contract, verify all current-source claims, record the compatible current-controller baseline, and change no owner-facing production behavior.
 2. **Kernel.** Add the complete capability manifest, blocking wrapper, evidence projection, finalization validator, and deterministic fake-host coverage. Exercise the new path only in tests and a disposable acceptance profile while the production default remains unchanged.
-3. **Cutover.** Add the Telegram interaction bridge, change fresh defaults from `full` to `auto`, make accepted finalization the sole owner-visible answer path, rerun the fixed-harness comparison, and remove the temporary compatibility path after acceptance.
+3. **Cutover.** Add the Telegram interaction bridge, make accepted finalization the sole owner-visible answer path, rerun the fixed-harness comparison, and remove the temporary compatibility path after acceptance. **Superseded:** the fresh-default change from `full` to `auto` was deliberately not made. It is gated on the runtime attestations in [Configuration](../configuration.md#why-the-default-has-not-changed-to-auto) and remains disabled.
 
 These checkpoints are review and rollback boundaries, not permanent operating modes. No long-lived dual delivery path or dual authority survives the Slice 1 release.
 
@@ -220,7 +220,7 @@ The controller instructions also change in three ways:
 
 - the final action for every owner turn is `telegram_agent_respond`;
 - installations, credential changes, spending, destructive external actions, and irreversible external writes require an explicit owner decision;
-- the controller no longer claims it can silently install or configure integrations.
+- the controller no longer promises to install or configure an integration on its own.
 
 ### Core capability policy
 
@@ -385,7 +385,9 @@ An owner tap is persisted before BB resolution. Delivery to BB is retried until 
 
 ### Permission default and residual boundary
 
-The default controller execution profile constant and plugin setting descriptor change from `full` to `auto`. Fresh configuration parsing therefore resolves to `auto`; any already persisted explicit permission value remains unchanged.
+> **Superseded — disabled, not implemented.** This clause is gated on versioned runtime BB attestations for an atomic activity snapshot, an atomic conditional commit, and mechanical denial of worker and controller native commit, ref mutation, push, GitHub write, merge, deploy, and equivalent network effects. None exist on this runtime, so the default was not changed.
+
+The default controller execution profile constant and plugin setting descriptor would change from `full` to `auto`, so that fresh configuration parsing resolves to `auto` while any already persisted explicit permission value remains unchanged. What actually ships: both still resolve to `full`, described as a compatibility default and residual risk.
 
 BB's own permission engine remains authoritative. Hanoon does not infer that a command is safe by parsing shell text, and it never approves an interaction on the owner's behalf. The bridge only moves BB's exact decision to Telegram.
 
@@ -469,7 +471,7 @@ Implementation follows test-driven development. Required tests include:
 
 - The initial owner input plus resolved configuration contains exactly one controller instruction sentinel.
 - The working-style overlay appears once and remains after the fixed boundary instructions.
-- Fresh/default profiles resolve `permissionMode: "auto"`; an explicit existing setting remains unchanged.
+- **Superseded (disabled):** fresh/default profiles would resolve `permissionMode: "auto"` with an explicit existing setting unchanged. They still resolve to `full` until the runtime-attestation gate passes.
 
 #### Capability policy
 
@@ -558,7 +560,7 @@ Live evidence is reported separately from deterministic tests. An incomplete sce
 ### Slice 1 acceptance criteria
 
 - Controller standing instructions appear exactly once.
-- New default controller sessions run in `auto` permission mode.
+- **Superseded (disabled):** new default controller sessions would run in `auto` permission mode. They run in `full` until the runtime-attestation gate passes.
 - Every delivered controller answer came from an accepted structured finalization.
 - Every delivered accepted finalization remained the last evidence-producing action for its turn.
 - Raw provider prose never reaches Telegram before finalization acceptance.
