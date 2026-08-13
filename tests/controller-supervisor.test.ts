@@ -195,7 +195,7 @@ function recordOwnerQuestion(
   store: ReturnType<typeof storeFixture>["store"],
   fence: { ownerId: string; generation: number },
   turn: ReturnType<typeof submittedTurn>,
-): boolean {
+): string {
   const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
   if (!generation) throw new Error("missing controller generation");
   return store.recordControllerInteraction({
@@ -377,7 +377,7 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
 it("leaves a turn parked on an owner question alone however much it has spent", async () => {
   const { store, fence } = storeFixture("parked");
   const turn = submittedTurn(store, fence);
-  expect(recordOwnerQuestion(store, fence, turn)).toBe(true);
+  expect(recordOwnerQuestion(store, fence, turn)).toBe("recorded");
   const adapter = serviceAdapter(
     () => observation({ latestSeq: 9, toolCalls: SUPERVISOR_HARD_TOOL_CALLS }),
     () => "active",

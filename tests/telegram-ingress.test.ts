@@ -327,7 +327,7 @@ function seedControllerInteraction(
     bbThreadId: "thr_ingress_controller",
     controllerGenerationId: generation.id,
     interaction,
-  })).toBe(true);
+  })).toBe("recorded");
   if (interaction.kind === "unsupported") throw new Error("unsupported interactions have no callback token");
   const token = interaction.kind === "approval"
     ? controllerInteractionToken(interaction.interactionId, interaction.decisions[0] ?? "deny")

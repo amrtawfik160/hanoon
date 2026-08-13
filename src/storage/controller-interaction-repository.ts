@@ -26,6 +26,8 @@ export type ControllerInteractionAnswer =
   }
   | { ok: false; reason: "stale" };
 
+export type ControllerInteractionRecordOutcome = "recorded" | "replay" | "stale" | "conflict";
+
 export type ControllerInteractionRecord = Readonly<{
   interactionId: string;
   turnId: string;
@@ -58,7 +60,7 @@ export interface ControllerInteractionStore {
     bbThreadId: string;
     controllerGenerationId: string;
     interaction: ControllerInteraction;
-  }): boolean;
+  }): ControllerInteractionRecordOutcome;
   markResolved(input: ControllerLeaseFence & {
     interactionId: string;
     turnId: string;
@@ -368,7 +370,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     bbThreadId: string;
     controllerGenerationId: string;
     interaction: ControllerInteraction;
-  }): boolean {
+  }): ControllerInteractionRecordOutcome {
     assertFence(input);
     assertIdentifier(input.turnId, "turnId");
     assertControllerKey(input.controllerKey);
@@ -376,18 +378,32 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     assertIdentifier(input.controllerGenerationId, "controllerGenerationId");
     assertIdentifier(input.interaction.interactionId, "interactionId");
     const interaction = this.validateInteraction(input.interaction);
-    return this.db.transaction((): boolean => {
+    return this.db.transaction((): ControllerInteractionRecordOutcome => {
       const turn = this.fencedTurn(input, {
         turnId: input.turnId,
         controllerKey: input.controllerKey,
         bbThreadId: input.bbThreadId,
         generationId: input.controllerGenerationId,
       });
-      if (!turn) return false;
+      if (!turn) return "stale";
       const existing = this.db.prepare(
-        "SELECT interaction_id FROM controller_interactions WHERE interaction_id = ?",
-      ).get(interaction.interactionId);
-      if (existing) return false;
+        "SELECT * FROM controller_interactions WHERE interaction_id = ?",
+      ).get(interaction.interactionId) as InteractionRow | undefined;
+      if (existing) {
+        const existingInteraction = parsePersistedInteraction(
+          existing.interaction_id,
+          existing.kind,
+          existing.payload_json,
+        );
+        const sameSource = existing.turn_id === input.turnId &&
+          existing.controller_key === input.controllerKey &&
+          existing.bb_thread_id === input.bbThreadId &&
+          existing.controller_generation_id === input.controllerGenerationId;
+        return sameSource && existingInteraction !== null &&
+          JSON.stringify(existingInteraction) === JSON.stringify(interaction)
+          ? "replay"
+          : "conflict";
+      }
       this.db.prepare(
         `INSERT INTO controller_interactions (
            interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
@@ -404,7 +420,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         input.now,
       );
       this.refreshAwaitingPointer(input.turnId, input.now);
-      return true;
+      return "recorded";
     }).immediate();
   }
 

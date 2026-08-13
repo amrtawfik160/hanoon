@@ -787,7 +787,7 @@ it.each([
 
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("boundary_owner_text");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   expect(fixture.repository.answerWithText({
     controllerKey: fixture.controllerKey,
     userId: "7",
@@ -974,7 +974,7 @@ it("stores unsafe questions only as an unsupported projection", () => {
       options: [{ value: "first", label: "First", description: null }],
     }],
   };
-  expect(fixture.repository.record(recordInput(fixture, unsafe))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, unsafe))).toBe("recorded");
   expect(fixture.repository.getPending(fixture.controllerKey)).toMatchObject({
     interaction: { kind: "unsupported", interactionId: unsafe.interactionId },
   });
@@ -986,7 +986,7 @@ it("stores unsafe questions only as an unsupported projection", () => {
 it("does not write unsafe owner text but keeps ordinary bounded text supported", () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("unsafe_owner_text");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
 
   expect(fixture.repository.answerWithText({
     controllerKey: fixture.controllerKey,
@@ -1015,7 +1015,7 @@ it.each([
 ] as const)("does not persist unsafe owner free text: %s", (text) => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction(`unsafe_owner_${text.slice(0, 8)}`);
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
 
   expect(fixture.repository.answerWithText({
     controllerKey: fixture.controllerKey,
@@ -1035,7 +1035,7 @@ it.each([
 ] as const)("fails closed on %s when reading persisted answers", (_name, kind, answerJson) => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction(`corrupt_${kind}`, kind === "approval" ? "approval" : "user_question");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   fixture.db.prepare(
     "UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = ? WHERE interaction_id = ?",
   ).run(answerJson, 2_100, interaction.interactionId);
@@ -1066,7 +1066,7 @@ it("uses own answer fields and requires a complete map for answered questions", 
       { ...base.questions[0]!, id: "question_2", prompt: "Which second option should I use?" },
     ],
   };
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
 
   const partial = { kind: "user_answer", answers: { question_1: { selected: ["first"] } } };
   expect(parseControllerInteractionResolution(interaction, partial, "pending")).not.toBeNull();
@@ -1103,9 +1103,9 @@ it("records one identity and keeps an older interaction as the pointer", () => {
   const first = controllerInteraction("interaction_first");
   const second = controllerInteraction("interaction_second", "approval");
 
-  expect(fixture.repository.record(recordInput(fixture, first, 2_000))).toBe(true);
-  expect(fixture.repository.record(recordInput(fixture, second, 2_001))).toBe(true);
-  expect(fixture.repository.record(recordInput(fixture, first, 2_002))).toBe(false);
+  expect(fixture.repository.record(recordInput(fixture, first, 2_000))).toBe("recorded");
+  expect(fixture.repository.record(recordInput(fixture, second, 2_001))).toBe("recorded");
+  expect(fixture.repository.record(recordInput(fixture, first, 2_002))).toBe("replay");
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 2 });
   expect(fixture.db.prepare("SELECT awaiting_interaction_id FROM controller_turns WHERE id = ?").get(fixture.turnId))
     .toEqual({ awaiting_interaction_id: "interaction_first" });
@@ -1116,12 +1116,43 @@ it("records one identity and keeps an older interaction as the pointer", () => {
 it("rejects a reused interaction id with a different source identity", () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("interaction_reused");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   expect(fixture.repository.record({
     ...recordInput(fixture, interaction),
     bbThreadId: "thr_other",
     controllerGenerationId: "gen_other",
-  })).toBe(false);
+  })).toBe("stale");
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 1 });
+  closeCurrentFixture(fixture);
+});
+
+it("distinguishes exact replay, stale fencing, and a conflicting source identity", () => {
+  const fixture = currentInteractionFixture();
+  const interaction = controllerInteraction("interaction_identity_outcomes");
+
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
+  expect(fixture.repository.record(recordInput(fixture, interaction, CURRENT_NOW + 1))).toBe("replay");
+  expect(fixture.repository.record({
+    ...recordInput(fixture, controllerInteraction("interaction_stale_identity")),
+    generation: CURRENT_GENERATION + 1,
+  })).toBe("stale");
+
+  fixture.db.prepare(
+    "UPDATE controller_generations SET ended_at = ?, end_reason = ? WHERE id = ?",
+  ).run(CURRENT_NOW + 2, "takeover", fixture.generationId);
+  fixture.db.prepare(
+    `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+     VALUES (?, ?, ?, ?, NULL, NULL)`,
+  ).run("gen_controller_2", fixture.controllerKey, "thr_controller_2", CURRENT_NOW + 2);
+  fixture.db.prepare(
+    "UPDATE controller_threads SET bb_thread_id = ? WHERE controller_key = ?",
+  ).run("thr_controller_2", fixture.controllerKey);
+
+  expect(fixture.repository.record({
+    ...recordInput(fixture, interaction, CURRENT_NOW + 3),
+    bbThreadId: "thr_controller_2",
+    controllerGenerationId: "gen_controller_2",
+  })).toBe("conflict");
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 1 });
   closeCurrentFixture(fixture);
 });
@@ -1136,7 +1167,7 @@ it.each([
   expect(fixture.repository.record({
     ...recordInput(fixture, controllerInteraction("interaction_stale")),
     ...override,
-  })).toBe(false);
+  })).toBe("stale");
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 0 });
   closeCurrentFixture(fixture);
 });
@@ -1147,7 +1178,7 @@ it("requires the submitted turn to adopt the executor lease before recording", (
     "UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = ?",
   ).run(fixture.turnId);
 
-  expect(fixture.repository.record(recordInput(fixture, controllerInteraction("turn_lease_record")))).toBe(false);
+  expect(fixture.repository.record(recordInput(fixture, controllerInteraction("turn_lease_record")))).toBe("stale");
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 0 });
   closeCurrentFixture(fixture);
 });
@@ -1155,7 +1186,7 @@ it("requires the submitted turn to adopt the executor lease before recording", (
 it("requires the submitted turn to retain the executor lease before resolving", () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("turn_lease_resolve");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   fixture.db.prepare(
     "UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = ?",
   ).run(fixture.turnId);
@@ -1175,7 +1206,7 @@ it("requires the submitted turn to retain the executor lease before resolving", 
 it("requires the submitted turn to retain the executor lease before delivery", () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("turn_lease_deliver", "approval");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   expect(fixture.repository.answerByToken({
     token: controllerInteractionToken(interaction.interactionId, "deny"),
     userId: "7",
@@ -1325,7 +1356,7 @@ it("rejects wrong or revoked owner identities", () => {
 it("fails closed when an interaction is cross-bound to a different controller", () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("cross_bound_owner");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   const otherControllerKey = "owner-7-controller-other";
   const otherThreadId = "thr_controller_other";
   const otherGenerationId = "gen_controller_other";
@@ -1464,7 +1495,7 @@ it("requires the complete current identity and lease fence before delivery", () 
   for (const testCase of cases) {
     const fixture = currentInteractionFixture();
     const interaction = controllerInteraction("interaction_delivery_fence", "approval");
-    expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+    expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
     expect(fixture.repository.answerByToken({
       token: controllerInteractionToken(interaction.interactionId, "deny"),
       userId: "7",
@@ -1492,8 +1523,8 @@ it("answers only the interaction exposed by the submitted turn pointer", () => {
   const fixture = currentInteractionFixture();
   const first = controllerInteraction("interaction_exposed_first");
   const second = controllerInteraction("interaction_exposed_second");
-  expect(fixture.repository.record(recordInput(fixture, first, 2_000))).toBe(true);
-  expect(fixture.repository.record(recordInput(fixture, second, 2_001))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, first, 2_000))).toBe("recorded");
+  expect(fixture.repository.record(recordInput(fixture, second, 2_001))).toBe("recorded");
 
   expect(fixture.repository.answerByToken({
     token: questionOptionToken(second.interactionId, "question_1", "first"),
@@ -1534,8 +1565,8 @@ it("does not let text skip an exposed approval to answer a later question", () =
   const fixture = currentInteractionFixture();
   const approval = controllerInteraction("interaction_exposed_approval", "approval");
   const question = controllerInteraction("interaction_hidden_question");
-  expect(fixture.repository.record(recordInput(fixture, approval, 2_000))).toBe(true);
-  expect(fixture.repository.record(recordInput(fixture, question, 2_001))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, approval, 2_000))).toBe("recorded");
+  expect(fixture.repository.record(recordInput(fixture, question, 2_001))).toBe("recorded");
 
   expect(fixture.repository.answerWithText({
     controllerKey: fixture.controllerKey,
@@ -1585,7 +1616,7 @@ it("allows exactly one winner for a two-connection button versus text race", () 
 it("allows exactly one winner for a barrier-backed independent-worker button race", async () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("interaction_worker_button_race", "approval");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   const results = await runInteractionRace(fixture, interaction, [
     { label: "allow", action: "button", token: controllerInteractionToken(interaction.interactionId, "allow_once") },
     { label: "deny", action: "button", token: controllerInteractionToken(interaction.interactionId, "deny") },
@@ -1599,7 +1630,7 @@ it("allows exactly one winner for a barrier-backed independent-worker button rac
 it("allows exactly one winner for a barrier-backed independent-worker button versus text race", async () => {
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("interaction_worker_text_race");
-  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, interaction))).toBe("recorded");
   const results = await runInteractionRace(fixture, interaction, [
     { label: "button", action: "button", token: questionOptionToken(interaction.interactionId, "question_1", "first") },
     { label: "text", action: "text" },

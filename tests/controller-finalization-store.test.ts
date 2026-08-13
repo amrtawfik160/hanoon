@@ -894,7 +894,7 @@ it("accepts needs-owner only for the exact pending or answered generic interacti
     bbThreadId: controller.bb_thread_id,
     controllerGenerationId: generation.id,
     interaction: { kind: "unsupported", interactionId: "interaction_exact" },
-  })).toBe(true);
+  })).toBe("recorded");
   expect(fixture.store.proposeControllerFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
@@ -917,7 +917,7 @@ it("does not complete an accepted needs-owner turn while its exact interaction i
     bbThreadId: controller.bb_thread_id,
     controllerGenerationId: generation.id,
     interaction: { kind: "unsupported", interactionId: "interaction_pending_completion_guard" },
-  })).toBe(true);
+  })).toBe("recorded");
   const accepted = fixture.store.proposeControllerFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,

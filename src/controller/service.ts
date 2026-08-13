@@ -245,22 +245,6 @@ export class LunaControllerService {
         interactionReferences: rawObservation.interactionReferences ?? [],
       };
       if (!Number.isSafeInteger(observation.latestSeq)) return true;
-      const projected = projectControllerStream(observation, {
-        cursor: turn.bbEventSeq,
-        text: turn.streamText,
-        phase: turn.streamPhase,
-      });
-      if (projected.cursor > turn.bbEventSeq) {
-        this.dependencies.store.updateControllerStream({
-          ...fenceAt(fence, this.dependencies.clock.now()),
-          turnId: turn.id,
-          cursor: projected.cursor,
-          phase: projected.phase,
-          toolCalls: observation.toolCalls,
-          commandFailures: observation.commandFailures,
-          totalTokens: observation.totalTokens,
-        });
-      }
     } catch {
       observation = null;
     }
@@ -269,6 +253,22 @@ export class LunaControllerService {
       observation.interactionReferences ?? [],
       { turn, controller, fence, signal },
     )) return true;
+    const projected = projectControllerStream(observation, {
+      cursor: turn.bbEventSeq,
+      text: turn.streamText,
+      phase: turn.streamPhase,
+    });
+    if (projected.cursor > turn.bbEventSeq) {
+      this.dependencies.store.updateControllerStream({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+        cursor: projected.cursor,
+        phase: projected.phase,
+        toolCalls: observation.toolCalls,
+        commandFailures: observation.commandFailures,
+        totalTokens: observation.totalTokens,
+      });
+    }
     const refreshedAt = this.dependencies.clock.now();
     turn = this.dependencies.store.getControllerTurn(turn.id);
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
@@ -550,7 +550,7 @@ export class LunaControllerService {
     if (snapshot.status !== "pending") return false;
     const interaction = parseControllerInteraction(snapshot.id, snapshot.payload);
     if (!interaction || (interaction.kind !== reference.kind && interaction.kind !== "unsupported")) return false;
-    const recorded = this.dependencies.store.recordControllerInteraction({
+    const recordOutcome = this.dependencies.store.recordControllerInteraction({
       ...fenceAt(context.fence, this.dependencies.clock.now()),
       turnId: context.turn.id,
       controllerKey: context.controller.controllerKey,
@@ -558,11 +558,7 @@ export class LunaControllerService {
       controllerGenerationId: generationAfter.id,
       interaction,
     });
-    return recorded || this.dependencies.store.isExecutorLeaseCurrent(
-      context.fence.ownerId,
-      context.fence.generation,
-      this.dependencies.clock.now(),
-    );
+    return recordOutcome === "recorded" || recordOutcome === "replay";
   }
 
   private async readInteraction(
@@ -780,23 +776,45 @@ export class LunaControllerService {
       this.fail(turn, fence, "Controller spawn token is unavailable");
       return null;
     }
-    // Image turns never adopt by title before attempting their own spawn. A
-    // title match cannot prove that the image was attached, and adopting it
-    // would silently drop the image. Recovery after an uncertain actual spawn
-    // remains available in the catch block below.
-    if (!turn.image) {
-      try {
-        candidate = await this.dependencies.adapter.findSpawnCandidate(
-          controller.controllerKey,
-          pendingSpawnToken,
-          signal,
-        );
-      } catch {
-        this.fail(turn, fence, "Controller spawn candidates are ambiguous");
+    if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+      if (signal.aborted) {
+        this.dependencies.store.requeueControllerTurn({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          turnId: turn.id,
+        });
+      }
+      return null;
+    }
+    // The adapter only returns a candidate after matching the complete
+    // tokenized identity: controller, pending turn, project, host, provider,
+    // plugin origin, and hidden/non-terminal state. That identity is also the
+    // evidence that an image-bearing spawn was this turn: the image is
+    // prepared before BB creates the titled thread. Reserve the same
+    // project/host before mapping it so adoption and a fresh spawn share the
+    // same durable fence.
+    try {
+      candidate = await this.dependencies.adapter.findSpawnCandidate(
+        controller.controllerKey,
+        pendingSpawnToken,
+        signal,
+      );
+    } catch {
+      this.fail(turn, fence, "Controller spawn candidates are ambiguous");
+      return null;
+    }
+    if (candidate) {
+      if (!this.dependencies.store.reserveControllerSpawn({
+        controllerKey: controller.controllerKey,
+        turnId: turn.id,
+        projectId: candidate.projectId,
+        hostId: candidate.hostId,
+        now: this.dependencies.clock.now(),
+      })) {
+        this.fail(turn, fence, "Controller spawn reservation is unavailable or stale");
         return null;
       }
+      return candidate;
     }
-    if (candidate) return candidate;
     // A replacement thread opens with the conversation so far, so retiring a
     // failed thread costs the owner a pause rather than the whole conversation.
     const seeded = { ...turn, inputText: this.composeInput(turn, { includeDigest: true }) };

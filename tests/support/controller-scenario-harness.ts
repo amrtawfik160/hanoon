@@ -1347,7 +1347,7 @@ async function runExtendedScenario(
         decisions: ["allow_once", "deny"],
       },
     });
-    if (!recordedApproval) throw new Error("fixed stale scenario approval could not be recorded");
+    if (recordedApproval !== "recorded") throw new Error("fixed stale scenario approval could not be recorded");
     const answeredApproval = store.answerControllerInteractionByToken({
       token: controllerInteractionToken(staleApprovalId, "allow_once"),
       userId: OWNER_ID,

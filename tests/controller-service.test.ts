@@ -515,6 +515,66 @@ it("passes the current pending token to adoption so a stale title yields a fresh
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: "thr_fresh_token", state: "active" });
 });
 
+it("adopts an exact image spawn candidate before preparing the image again", async () => {
+  const { store, fence } = serviceFixture();
+  const image = {
+    fileId: "telegram-image-before-map",
+    fileName: "telegram-screenshot.png",
+    mimeType: "image/png" as const,
+    sizeBytes: 12,
+  };
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 78, inputText: "Read this screenshot", image }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const findSpawnCandidate = vi.fn(async (controllerKey: string, pendingSpawnToken: string) => {
+    expect(controllerKey).toBe("owner-7-controller");
+    expect(pendingSpawnToken).toBe(turn.id);
+    return {
+      threadId: "thr_image_recovered",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: turn.id,
+    };
+  });
+  const spawn = vi.fn(async () => {
+    throw new Error("image spawn should not be repeated after adoption");
+  });
+  const adapter: ControllerAdapter = {
+    spawn,
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: false,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate,
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(findSpawnCandidate).toHaveBeenCalledTimes(1);
+  expect(spawn).not.toHaveBeenCalled();
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    threadId: "thr_image_recovered",
+    state: "active",
+  });
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", image });
+});
+
 let serviceFixtureNumber = 0;
 function serviceFixture() {
   const { bb } = createFakePluginHost({ pluginId: `telegram-controller-service-${serviceFixtureNumber++}` });
@@ -552,7 +612,7 @@ function recordServiceQuestion(
   fence: { ownerId: string; generation: number; now?: number },
   turnId: string,
   interactionId: string,
-): boolean {
+): string {
   const turn = store.getControllerTurn(turnId);
   if (!turn) throw new Error("missing service turn");
   const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
@@ -1214,7 +1274,7 @@ it("keeps a needs-owner finalization parked and answerable across restart", asyn
     spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
-  expect(recordServiceQuestion(store, fence, turn.id, "interaction_needs_owner_restart")).toBe(true);
+  expect(recordServiceQuestion(store, fence, turn.id, "interaction_needs_owner_restart")).toBe("recorded");
   const accepted = acceptNeedsOwnerFinalization(store, turn.id);
   const restarted = fixture.reopen();
   const adapter: ControllerAdapter = {
@@ -1338,7 +1398,7 @@ it("keeps a queued image durable until the active turn finishes", async () => {
   expect(adapter.send).toHaveBeenCalledWith("thr_controller", "Use this screenshot instead", fence.signal, image);
 });
 
-it("requeues a transient image preparation failure without adopting a late spawn candidate", async () => {
+it("requeues a transient image preparation failure when no exact candidate exists", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({
@@ -1355,9 +1415,7 @@ it("requeues a transient image preparation failure without adopting a late spawn
     telegramChatId: "7",
     now: 2_000,
   });
-  const findSpawnCandidate = vi.fn()
-    .mockResolvedValueOnce(null)
-    .mockResolvedValueOnce({ threadId: "thr_unrelated", projectId: "proj_personal", hostId: "host_personal" });
+  const findSpawnCandidate = vi.fn(async () => null);
   const adapter: ControllerAdapter = {
     spawn: vi.fn(async () => { throw new ControllerImagePreparationError(true); }),
     send: vi.fn(async () => undefined),
@@ -1373,7 +1431,7 @@ it("requeues a transient image preparation failure without adopting a late spawn
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
-  expect(findSpawnCandidate).not.toHaveBeenCalled();
+  expect(findSpawnCandidate).toHaveBeenCalledTimes(2);
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", retryCount: 2 });
   expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
 });

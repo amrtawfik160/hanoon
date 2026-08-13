@@ -357,7 +357,7 @@ function recordQuestion(
   fence: { ownerId: string; generation: number },
   turn: ReturnType<typeof submittedTurn>,
   now = 3_000,
-): boolean {
+): string {
   const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
   if (!generation) throw new Error("missing controller generation");
   return store.recordControllerInteraction({
@@ -379,7 +379,7 @@ it("parks a submitted turn on its question and asks the owner in Telegram", () =
   const { store, fence } = storeFixture("park");
   const turn = submittedTurn(store, fence);
 
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
 
   const parked = store.getControllerTurn(turn.id);
   expect(parked?.awaitingInteractionId).toBe(INTERACTION_ID);
@@ -398,7 +398,7 @@ it("parks a submitted turn on its question and asks the owner in Telegram", () =
 it("resolves a parked question from a tapped option and releases the turn", () => {
   const { store, fence } = storeFixture("tap");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
 
   const answered = store.answerControllerInteractionByToken({
     token: questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A),
@@ -420,7 +420,7 @@ it("resolves a parked question from a tapped option and releases the turn", () =
 it("resolves a parked question from a plain Telegram reply", () => {
   const { store, fence } = storeFixture("text");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
 
   const answered = store.answerControllerInteractionWithText({
     controllerKey: "owner-7-controller",
@@ -443,7 +443,7 @@ it("resolves a parked question from a plain Telegram reply", () => {
 it("refuses a stale option token once the question is answered", () => {
   const { store, fence } = storeFixture("stale");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
   const token = questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A);
   expect(store.answerControllerInteractionByToken({ token, userId: "7", chatId: "7", now: 4_000 }).ok).toBe(true);
 
@@ -454,7 +454,7 @@ it("refuses a stale option token once the question is answered", () => {
 it("keeps the oldest pending interaction visible and promotes the next after delivery", () => {
   const { store, fence } = storeFixture("interaction-order");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
   const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
   if (!generation) throw new Error("missing controller generation");
   expect(store.recordControllerInteraction({
@@ -476,7 +476,7 @@ it("keeps the oldest pending interaction visible and promotes the next after del
         options: [{ value: "second", label: "Second", description: null }],
       }],
     },
-  })).toBe(true);
+  })).toBe("recorded");
   expect(store.getOutbox("controller-interaction:second-controller-interaction:0")).toBeNull();
 
   expect(store.answerControllerInteractionByToken({
@@ -547,6 +547,118 @@ it("parks the turn and asks in Telegram when the thread blocks on a question", a
   expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBe(INTERACTION_ID);
   expect(store.getOutbox(`controller-interaction:${INTERACTION_ID}:0`)?.payload.text)
     .toContain("How should I run the fix threads?");
+});
+
+it("replays a lifecycle reference after a failed authoritative read", async () => {
+  const { store, fence } = storeFixture("service-interaction-read-retry");
+  const turn = submittedTurn(store, fence);
+  const getInteraction = vi.fn()
+    .mockRejectedValueOnce(new Error("temporary interaction read failure"))
+    .mockResolvedValue({
+      id: INTERACTION_ID,
+      threadId: "thr_controller",
+      status: "pending",
+      payload: questionPayload(),
+    });
+  const events = vi.fn(async () => ({
+    latestSeq: 5,
+    inputAccepted: true,
+    assistantOutputObserved: false,
+    toolActivityObserved: false,
+    completed: false,
+    error: null,
+    interactionReferences: [{
+      interactionId: INTERACTION_ID,
+      kind: "user_question" as const,
+      status: "pending" as const,
+    }],
+    toolCalls: 0,
+    commandFailures: 0,
+    totalTokens: 0,
+  }));
+  const adapter = serviceAdapter({
+    latestSeq: vi.fn(async () => 5),
+    events,
+    getInteraction,
+  });
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector: testEvidenceProjector,
+    clock: { now: () => 3_000 },
+  });
+  const signal = AbortSignal.timeout(10_000);
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  expect(getInteraction).toHaveBeenCalledTimes(1);
+  expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(0);
+  expect(store.getPendingControllerInteraction(turn.controllerKey)).toBeNull();
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  expect(events).toHaveBeenNthCalledWith(2, "thr_controller", 0, signal);
+  expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(5);
+  expect(store.getPendingControllerInteraction(turn.controllerKey)).toMatchObject({
+    interactionId: INTERACTION_ID,
+  });
+});
+
+it("fails closed when a lifecycle ID belongs to another controller generation", async () => {
+  const { db, store, fence } = storeFixture("service-interaction-conflict");
+  const turn = submittedTurn(store, fence);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
+  const previousGeneration = store.listControllerGenerations(turn.controllerKey, 1)[0];
+  if (!previousGeneration) throw new Error("missing previous controller generation");
+  db.prepare(
+    "UPDATE controller_generations SET ended_at = ?, end_reason = ? WHERE id = ?",
+  ).run(3_001, "takeover", previousGeneration.id);
+  db.prepare(
+    `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+     VALUES (?, ?, ?, ?, NULL, NULL)`,
+  ).run("gen_controller_replacement", turn.controllerKey, "thr_controller_replacement", 3_001);
+  db.prepare(
+    "UPDATE controller_threads SET bb_thread_id = ? WHERE controller_key = ?",
+  ).run("thr_controller_replacement", turn.controllerKey);
+
+  const getInteraction = vi.fn(async (threadId: string, interactionId: string) => ({
+    id: interactionId,
+    threadId,
+    status: "pending",
+    payload: questionPayload(),
+  }));
+  const adapter = serviceAdapter({
+    latestSeq: vi.fn(async () => 5),
+    events: vi.fn(async () => ({
+      latestSeq: 5,
+      inputAccepted: true,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      interactionReferences: [{
+        interactionId: INTERACTION_ID,
+        kind: "user_question" as const,
+        status: "pending" as const,
+      }],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    getInteraction,
+  });
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector: testEvidenceProjector,
+    clock: { now: () => 3_100 },
+  });
+  const signal = AbortSignal.timeout(10_000);
+
+  await service.reconcile({ ...fence, signal }, signal);
+
+  expect(getInteraction).toHaveBeenCalledWith("thr_controller_replacement", INTERACTION_ID, signal);
+  expect(store.getControllerTurn(turn.id)?.bbEventSeq).toBe(0);
 });
 
 it.each([
@@ -622,7 +734,7 @@ it("rejects an exact interaction read after the controller generation changes", 
 it.each(["resolved", "interrupted"] as const)("does not settle a lifecycle reference without a durable exact answer when BB is %s", async (status) => {
   const { store, fence } = storeFixture("service-resolved-interaction");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
   const adapter = serviceAdapter({
     events: vi.fn(async () => ({
       latestSeq: 5,
@@ -656,7 +768,7 @@ it.each(["resolved", "interrupted"] as const)("does not settle a lifecycle refer
 it("delivers the owner's answer back to the blocked BB thread", async () => {
   const { store, fence } = storeFixture("service-answer");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
   expect(store.answerControllerInteractionByToken({
     token: questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A),
     userId: "7",
@@ -712,7 +824,7 @@ it("gives up on a turn that stopped producing events and unblocks the queue", as
 it("waits indefinitely while the owner still owes the thread an answer", async () => {
   const { store, fence } = storeFixture("service-no-stall");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn, 2_500)).toBe(true);
+  expect(recordQuestion(store, fence, turn, 2_500)).toBe("recorded");
   const service = new LunaControllerService({
     store,
     adapter: serviceAdapter(),
@@ -775,7 +887,7 @@ it("leaves a mid-answer message queued when the thread will not take it", async 
 it("retires a parked question when its turn dies, so later messages are not swallowed", () => {
   const { store, fence } = storeFixture("orphan");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
 
   expect(store.failControllerTurn({
     ...fence,
@@ -797,7 +909,7 @@ it("retires a parked question when its turn dies, so later messages are not swal
 it("does not deliver an answer whose turn died before BB heard it", async () => {
   const { store, fence } = storeFixture("orphan-answer");
   const turn = submittedTurn(store, fence);
-  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe("recorded");
   store.answerControllerInteractionByToken({
     token: questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A),
     userId: "7",

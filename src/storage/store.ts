@@ -102,6 +102,7 @@ import {
   ControllerInteractionRepository,
   type ControllerInteraction,
   type ControllerInteractionAnswer,
+  type ControllerInteractionRecordOutcome,
   type ControllerInteractionDeliveryFence,
   type ControllerInteractionDelivery,
   type ControllerInteractionRecord,
@@ -1798,7 +1799,7 @@ export interface TelegramAgentStore {
     bbThreadId: string;
     controllerGenerationId: string;
     interaction: ControllerInteraction;
-  }): boolean;
+  }): ControllerInteractionRecordOutcome;
   markControllerInteractionResolved(input: ControllerLeaseFence & {
     interactionId: string;
     turnId: string;
@@ -3847,14 +3848,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     bbThreadId: string;
     controllerGenerationId: string;
     interaction: ControllerInteraction;
-  }): boolean {
-    return this.db.transaction((): boolean => {
-      if (!this.controllerInteractionRepository.record(input)) return false;
+  }): ControllerInteractionRecordOutcome {
+    return this.db.transaction((): ControllerInteractionRecordOutcome => {
+      const outcome = this.controllerInteractionRepository.record(input);
+      if (outcome !== "recorded") return outcome;
       const pending = this.controllerInteractionRepository.getPending(input.controllerKey);
       if (pending?.interactionId === input.interaction.interactionId) {
         this.persistControllerInteractionPrompt(pending, input.now);
       }
-      return true;
+      return outcome;
     }).immediate();
   }
 
