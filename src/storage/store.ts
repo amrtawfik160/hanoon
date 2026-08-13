@@ -55,11 +55,9 @@ import {
   parseControllerInteraction,
   parseControllerInteractionResolution,
   questionOptionToken,
-  renderQuestion,
+  renderControllerInteraction,
   renderThreadInteraction,
   threadDecisionToken,
-  type ControllerQuestion,
-  type ControllerQuestionAnswers,
   type ThreadInteraction,
 } from "../controller/questions";
 import {
@@ -781,24 +779,6 @@ type ControllerTurnRow = {
   created_at: number;
   updated_at: number;
 };
-type ControllerQuestionRow = {
-  interaction_id: string;
-  turn_id: string;
-  controller_key: string;
-  questions_json: string;
-  state: "pending" | "answered";
-  answers_json: string;
-  asked_at: number;
-  answered_at: number | null;
-};
-export type ControllerQuestionRecord = {
-  interactionId: string;
-  turnId: string;
-  controllerKey: string;
-  questions: ControllerQuestion[];
-  answers: ControllerQuestionAnswers;
-  askedAt: number;
-};
 type ObservedThreadRow = {
   thread_id: string;
   title: string;
@@ -828,16 +808,10 @@ export type ThreadInteractionDelivery = {
   title: string;
   resolution: Record<string, unknown>;
 };
-export type ControllerQuestionAnswer =
-  | {
-    ok: true;
-    /** False while the same interaction still has questions the owner has not settled. */
-    complete: boolean;
-    turnId: string;
-    interactionId: string;
-    answers: ControllerQuestionAnswers;
-  }
-  | { ok: false; reason: "stale" };
+export type ControllerInteractionCallbackResult = Readonly<{
+  answer: ControllerInteractionAnswer;
+  recorded: boolean;
+}>;
 type ThreadOperationRow = {
   id: string;
   nonce_hash: string;
@@ -1803,11 +1777,6 @@ export interface TelegramAgentStore {
     turnId: string;
     sentBefore: number;
   }): boolean;
-  recordControllerQuestion(input: ControllerLeaseFence & {
-    turnId: string;
-    interactionId: string;
-    questions: readonly ControllerQuestion[];
-  }): boolean;
   recordControllerInteraction(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -1833,6 +1802,13 @@ export interface TelegramAgentStore {
     text: string;
     now: number;
   }): ControllerInteractionAnswer;
+  answerControllerInteractionByTokenAndRecordCallback(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    callbackId: string;
+    now: number;
+  }): ControllerInteractionCallbackResult;
   getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null;
   getAnsweredControllerInteraction(controllerKey: string): ControllerInteractionDelivery | null;
   markControllerInteractionDelivered(input: ControllerLeaseFence & {
@@ -1840,17 +1816,6 @@ export interface TelegramAgentStore {
     turnId: string;
     bbThreadId: string;
   }): boolean;
-  answerControllerQuestion(input: {
-    token: string;
-    userId: string;
-    chatId: string;
-    now: number;
-  }): ControllerQuestionAnswer;
-  answerControllerQuestionWithText(input: {
-    controllerKey: string;
-    text: string;
-    now: number;
-  }): ControllerQuestionAnswer;
   observeThread(input: {
     threadId: string;
     title: string;
@@ -1875,9 +1840,6 @@ export interface TelegramAgentStore {
   getAnsweredThreadInteraction(): ThreadInteractionDelivery | null;
   markThreadInteractionDelivered(interactionId: string, now: number): boolean;
   discardThreadInteractions(threadId: string, keep: readonly string[]): number;
-  getPendingControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null;
-  getAnsweredControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null;
-  markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string; turnId?: string }): boolean;
   canMutateControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -3355,7 +3317,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         return "stale" as const;
       }
       if (accepted.candidate.disposition === "needs_owner" && this.db.prepare(
-        `SELECT 1 FROM controller_questions
+        `SELECT 1 FROM controller_interactions
           WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered')
           LIMIT 1`,
       ).get(input.turnId, input.controllerKey)) {
@@ -3755,7 +3717,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     controllerGenerationId: string;
     interaction: ControllerInteraction;
   }): boolean {
-    return this.controllerInteractionRepository.record(input);
+    return this.db.transaction((): boolean => {
+      if (!this.controllerInteractionRepository.record(input)) return false;
+      const pending = this.controllerInteractionRepository.getPending(input.controllerKey);
+      if (pending?.interactionId === input.interaction.interactionId) {
+        this.persistControllerInteractionPrompt(pending, input.now);
+      }
+      return true;
+    }).immediate();
   }
 
   public markControllerInteractionResolved(input: ControllerLeaseFence & {
@@ -3763,7 +3732,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     turnId: string;
     bbThreadId: string;
   }): boolean {
-    return this.controllerInteractionRepository.markResolved(input);
+    return this.db.transaction((): boolean => {
+      const controllerKey = this.controllerInteractionControllerKey(input.interactionId);
+      const resolved = this.controllerInteractionRepository.markResolved(input);
+      if (resolved && controllerKey) this.persistNextControllerInteractionPrompt(controllerKey, input.now);
+      return resolved;
+    }).immediate();
   }
 
   public answerControllerInteractionByToken(input: {
@@ -3772,7 +3746,39 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     chatId: string;
     now: number;
   }): ControllerInteractionAnswer {
-    return this.controllerInteractionRepository.answerByToken(input);
+    return this.db.transaction((): ControllerInteractionAnswer => {
+      const answer = this.controllerInteractionRepository.answerByToken(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      return answer;
+    }).immediate();
+  }
+
+  public answerControllerInteractionByTokenAndRecordCallback(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    callbackId: string;
+    now: number;
+  }): ControllerInteractionCallbackResult {
+    return this.db.transaction((): ControllerInteractionCallbackResult => {
+      const answer = this.controllerInteractionRepository.answerByToken(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      const recorded = this.recordCallback(
+        input.callbackId,
+        null,
+        "controller_interaction",
+        answer.ok ? "accepted" : answer.reason,
+        input.now,
+      );
+      if (recorded) {
+        persistControllerOutbox(this.db, {
+          logicalKey: `callback:${input.callbackId}`,
+          chatId: input.chatId,
+          payload: { text: answer.ok ? "Got it." : "That interaction is no longer open." },
+        }, input.now);
+      }
+      return { answer, recorded };
+    }).immediate();
   }
 
   public answerControllerInteractionWithText(input: {
@@ -3782,7 +3788,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     text: string;
     now: number;
   }): ControllerInteractionAnswer {
-    return this.controllerInteractionRepository.answerWithText(input);
+    return this.db.transaction((): ControllerInteractionAnswer => {
+      const answer = this.controllerInteractionRepository.answerWithText(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      return answer;
+    }).immediate();
   }
 
   public getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null {
@@ -3798,177 +3808,58 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     turnId: string;
     bbThreadId: string;
   }): boolean {
-    return this.controllerInteractionRepository.markDelivered(input);
-  }
-
-  /**
-   * Parks a submitted turn on a question only the owner can settle and asks it
-   * in Telegram. The turn stays submitted because the BB turn really is still
-   * open — it is waiting on a person, not on the model.
-   */
-  public recordControllerQuestion(input: ControllerLeaseFence & {
-    turnId: string;
-    interactionId: string;
-    questions: readonly ControllerQuestion[];
-  }): boolean {
-    this.assertControllerMutation(input);
-    assertControllerIdentifier(input.interactionId, "interactionId");
-    if (input.questions.length === 0) throw new TypeError("a controller question must have questions");
     return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const row = this.db.prepare(
-        `SELECT turn.*, controller.telegram_chat_id FROM controller_turns AS turn
-           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
-          WHERE turn.id = ? AND turn.state = 'submitted'`,
-      ).get(input.turnId) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
-      if (!row) return false;
-      // Seeing the same question again on a later poll must not re-ask it.
-      const known = this.db.prepare("SELECT 1 FROM controller_questions WHERE interaction_id = ?")
-        .get(input.interactionId);
-      if (known) return false;
-      this.db.prepare(
-        `INSERT INTO controller_questions
-           (interaction_id, turn_id, controller_key, questions_json, state, answers_json, asked_at, answered_at)
-         VALUES (?, ?, ?, ?, 'pending', '{}', ?, NULL)`,
-      ).run(
-        input.interactionId,
-        row.id,
-        row.controller_key,
-        JSON.stringify(input.questions),
-        input.now,
-      );
-      this.db.prepare(
-        `UPDATE controller_turns SET awaiting_interaction_id = ?, updated_at = ?
-          WHERE id = ? AND state = 'submitted'`,
-      ).run(input.interactionId, input.now, input.turnId);
-      this.askControllerQuestion(input.interactionId, row.telegram_chat_id, input.questions, {}, input.now);
-      return true;
+      const controllerKey = this.controllerInteractionControllerKey(input.interactionId);
+      const delivered = this.controllerInteractionRepository.markDelivered(input);
+      if (delivered && controllerKey) this.persistNextControllerInteractionPrompt(controllerKey, input.now);
+      return delivered;
     }).immediate();
   }
 
-  private askControllerQuestion(
-    interactionId: string,
-    chatId: string,
-    questions: readonly ControllerQuestion[],
-    answers: ControllerQuestionAnswers,
+  private persistControllerInteractionFollowUp(
+    answer: ControllerInteractionAnswer,
     now: number,
   ): void {
-    const next = nextUnansweredQuestion(questions, answers);
-    if (!next) return;
-    const rendered = renderQuestion(interactionId, next.question);
+    if (!answer.ok || answer.complete) return;
+    const pending = this.controllerInteractionRepository.getPending(answer.controllerKey);
+    if (!pending || pending.interactionId !== answer.interactionId) return;
+    this.persistControllerInteractionPrompt(pending, now);
+  }
+
+  private persistControllerInteractionPrompt(
+    pending: ControllerInteractionRecord,
+    now: number,
+  ): void {
+    const rendered = renderControllerInteraction(pending.interaction, pending.answers);
+    const next = pending.interaction.kind === "user_question"
+      ? nextUnansweredQuestion(pending.interaction.questions, pending.answers)
+      : null;
+    const index = next?.index ?? 0;
+    const controller = this.db.prepare(
+      "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
+    ).get(pending.controllerKey) as { telegram_chat_id: string } | undefined;
+    if (!controller) throw new Error("controller interaction owner is unavailable");
     persistControllerOutbox(this.db, {
-      logicalKey: `controller-question:${interactionId}:${next.index}`,
-      chatId,
+      logicalKey: `controller-interaction:${pending.interactionId}:${index}`,
+      chatId: controller.telegram_chat_id,
       payload: {
         ...formattedMessage(rendered.text),
-        reply_markup: rendered.reply_markup,
+        ...( "reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
         disable_web_page_preview: true,
       },
     }, now);
   }
 
-  private settleControllerQuestion(
-    row: ControllerQuestionRow,
-    questionId: string,
-    answer: { selected: string[]; freeText?: string },
-    now: number,
-  ): ControllerQuestionAnswer {
-    const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
-    const answers = { ...JSON.parse(row.answers_json) as ControllerQuestionAnswers, [questionId]: answer };
-    const complete = nextUnansweredQuestion(questions, answers) === null;
-    const updated = this.db.prepare(
-      `UPDATE controller_questions
-          SET answers_json = ?, state = ?, answered_at = ?
-        WHERE interaction_id = ? AND state = 'pending'`,
-    ).run(
-      JSON.stringify(answers),
-      complete ? "answered" : "pending",
-      complete ? now : null,
-      row.interaction_id,
-    );
-    if (updated.changes !== 1) return { ok: false, reason: "stale" };
-    if (complete) {
-      this.db.prepare(
-        `UPDATE controller_turns SET awaiting_interaction_id = NULL, updated_at = ?
-          WHERE id = ? AND awaiting_interaction_id = ?`,
-      ).run(now, row.turn_id, row.interaction_id);
-    } else {
-      const chatId = this.db.prepare(
-        "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
-      ).get(row.controller_key) as { telegram_chat_id: string } | undefined;
-      if (chatId) this.askControllerQuestion(row.interaction_id, chatId.telegram_chat_id, questions, answers, now);
-    }
-    return {
-      ok: true,
-      complete,
-      turnId: row.turn_id,
-      interactionId: row.interaction_id,
-      answers,
-    };
+  private persistNextControllerInteractionPrompt(controllerKey: string, now: number): void {
+    const pending = this.controllerInteractionRepository.getPending(controllerKey);
+    if (pending) this.persistControllerInteractionPrompt(pending, now);
   }
 
-  /** Answers whichever question a tapped button stands for. */
-  public answerControllerQuestion(input: {
-    token: string;
-    userId: string;
-    chatId: string;
-    now: number;
-  }): ControllerQuestionAnswer {
-    assertCanonicalPositiveDecimal(input.userId, "userId");
-    assertCanonicalPositiveDecimal(input.chatId, "chatId");
-    assertNonNegativeInteger(input.now, "now");
-    return this.db.transaction((): ControllerQuestionAnswer => {
-      const row = this.db.prepare(
-        `SELECT question.* FROM controller_questions AS question
-           JOIN controller_threads AS controller ON controller.controller_key = question.controller_key
-           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
-            AND owners.telegram_user_id = controller.telegram_user_id
-            AND owners.telegram_chat_id = controller.telegram_chat_id
-           JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
-          WHERE question.state = 'pending'
-            AND controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
-          ORDER BY question.asked_at DESC LIMIT 1`,
-      ).get(input.userId, input.chatId) as ControllerQuestionRow | undefined;
-      if (!row) return { ok: false, reason: "stale" };
-      const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
-      const answers = JSON.parse(row.answers_json) as ControllerQuestionAnswers;
-      for (const question of questions) {
-        if (question.id in answers) continue;
-        for (const option of question.options) {
-          if (questionOptionToken(row.interaction_id, question.id, option.value) !== input.token) continue;
-          return this.settleControllerQuestion(row, question.id, { selected: [option.value] }, input.now);
-        }
-      }
-      return { ok: false, reason: "stale" };
-    }).immediate();
-  }
-
-  /**
-   * A plain reply answers the open question. The owner is having a conversation,
-   * not filling in a form, so "in review i mean not in progress" is an answer.
-   */
-  public answerControllerQuestionWithText(input: {
-    controllerKey: string;
-    text: string;
-    now: number;
-  }): ControllerQuestionAnswer {
-    assertControllerKey(input.controllerKey);
-    assertControllerText(input.text, "controller question answer");
-    assertNonNegativeInteger(input.now, "now");
-    return this.db.transaction((): ControllerQuestionAnswer => {
-      const row = this.db.prepare(
-        `SELECT question.* FROM controller_questions AS question
-           JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
-          WHERE question.controller_key = ? AND question.state = 'pending'
-          ORDER BY question.asked_at DESC LIMIT 1`,
-      ).get(input.controllerKey) as ControllerQuestionRow | undefined;
-      if (!row) return { ok: false, reason: "stale" };
-      const questions = JSON.parse(row.questions_json) as ControllerQuestion[];
-      const answers = JSON.parse(row.answers_json) as ControllerQuestionAnswers;
-      const next = nextUnansweredQuestion(questions, answers);
-      if (!next) return { ok: false, reason: "stale" };
-      return this.settleControllerQuestion(row, next.question.id, { selected: [], freeText: input.text }, input.now);
-    }).immediate();
+  private controllerInteractionControllerKey(interactionId: string): string | null {
+    const row = this.db.prepare(
+      "SELECT controller_key FROM controller_interactions WHERE interaction_id = ?",
+    ).get(interactionId) as { controller_key: string } | undefined;
+    return row?.controller_key ?? null;
   }
 
   /**
@@ -4197,33 +4088,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.prepare(sql).run(threadId, ...keep).changes;
   }
 
-  /** An answer the owner has given that BB has not been told about yet. */
-  public getAnsweredControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null {
-    return this.readControllerQuestion(controllerKey, "answered", turnId);
-  }
-
-  public getPendingControllerQuestion(controllerKey: string, turnId?: string): ControllerQuestionRecord | null {
-    return this.readControllerQuestion(controllerKey, "pending", turnId);
-  }
-
-  // Delivery is recorded separately from the answer so a crash between the two
-  // re-sends the answer rather than losing it.
-  public markControllerQuestionDelivered(input: ControllerLeaseFence & { interactionId: string; turnId?: string }): boolean {
-    assertControllerIdentifier(input.interactionId, "interactionId");
-    this.assertLeaseIdentity("controller-question", input.ownerId, input.generation, input.now);
-    return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const delivered = input.turnId === undefined
-        ? this.db.prepare(
-          "UPDATE controller_questions SET state = 'delivered' WHERE interaction_id = ? AND state = 'answered'",
-        ).run(input.interactionId)
-        : this.db.prepare(
-          "UPDATE controller_questions SET state = 'delivered' WHERE interaction_id = ? AND turn_id = ? AND state = 'answered'",
-        ).run(input.interactionId, input.turnId);
-      return delivered.changes === 1;
-    }).immediate();
-  }
-
   public canMutateControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -4254,32 +4118,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return row !== undefined;
   }
 
-  // A question outlives its turn only on paper. Once that turn is gone the
-  // answer has nowhere to land, and reading the owner's next message as an
-  // answer to it would swallow the message outright.
-  private readControllerQuestion(
-    controllerKey: string,
-    state: ControllerQuestionRow["state"],
-    turnId?: string,
-  ): ControllerQuestionRecord | null {
-    assertControllerKey(controllerKey);
-    const row = this.db.prepare(
-      `SELECT question.* FROM controller_questions AS question
-         JOIN controller_turns AS turn ON turn.id = question.turn_id AND turn.state = 'submitted'
-        WHERE question.controller_key = ? AND question.state = ?
-          AND (? IS NULL OR question.turn_id = ?)
-        ORDER BY question.asked_at DESC LIMIT 1`,
-    ).get(controllerKey, state, turnId ?? null, turnId ?? null) as ControllerQuestionRow | undefined;
-    if (!row) return null;
-    return {
-      interactionId: row.interaction_id,
-      turnId: row.turn_id,
-      controllerKey: row.controller_key,
-      questions: JSON.parse(row.questions_json) as ControllerQuestion[],
-      answers: JSON.parse(row.answers_json) as ControllerQuestionAnswers,
-      askedAt: row.asked_at,
-    };
-  }
 
   public refreshControllerDraft(input: ControllerLeaseFence & {
     turnId: string;

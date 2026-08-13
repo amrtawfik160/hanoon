@@ -12,8 +12,6 @@ import {
   type ControllerExecutionProfile,
 } from "./execution-profile";
 import {
-  parsePendingQuestion,
-  type ControllerPendingQuestion,
   type ControllerQuestionAnswers,
 } from "./questions";
 
@@ -27,6 +25,17 @@ export type ControllerStatus =
   | "missing"
   /** The live thread runs a different provider than the configured model needs. */
   | "incompatible";
+export type ControllerInteractionReference = Readonly<{
+  interactionId: string;
+  kind: "user_question" | "approval" | "unsupported";
+  status: "pending" | "resolved" | "interrupted";
+}>;
+export type ControllerInteractionSnapshot = Readonly<{
+  id: string;
+  threadId: string;
+  status: string;
+  payload: unknown;
+}>;
 export type ControllerEventObservation = {
   latestSeq: number;
   inputAccepted: boolean;
@@ -34,8 +43,10 @@ export type ControllerEventObservation = {
   toolActivityObserved: boolean;
   completed: boolean;
   error: string | null;
-  /** Set while the thread is blocked on a question only the owner can answer. */
-  pendingQuestion: ControllerPendingQuestion | null;
+  /** Bounded lifecycle references; BB interaction payloads are never event authority. */
+  interactionReferences?: readonly ControllerInteractionReference[];
+  /** Legacy fixture-only field; live adapters never populate it or parse it. */
+  pendingQuestion?: unknown;
   /** Tool-shaped item starts in this window; the caller accumulates them. */
   toolCalls: number;
   /** Non-zero command exits in this window; the caller accumulates them. */
@@ -44,7 +55,9 @@ export type ControllerEventObservation = {
   totalTokens: number;
 };
 
-type LegacyControllerEventObservation = Omit<ControllerEventObservation, "assistantOutputObserved" | "toolActivityObserved"> & Record<string, unknown>;
+type LegacyControllerEventObservation = Omit<ControllerEventObservation, "assistantOutputObserved" | "toolActivityObserved" | "interactionReferences"> & {
+  interactionReferences?: readonly ControllerInteractionReference[];
+} & Record<string, unknown>;
 
 export type ControllerEventResult = ControllerEventObservation | LegacyControllerEventObservation;
 
@@ -72,6 +85,17 @@ type ControllerAdapterMethods = {
     answers: ControllerQuestionAnswers,
     signal: AbortSignal,
   ): Promise<void>;
+  getInteraction?(
+    threadId: string,
+    interactionId: string,
+    signal: AbortSignal,
+  ): Promise<ControllerInteractionSnapshot>;
+  resolveInteraction?(
+    threadId: string,
+    interactionId: string,
+    resolution: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<void>;
   status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
   latestSeq(threadId: string, signal: AbortSignal): Promise<number>;
   events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventResult>;
@@ -83,6 +107,7 @@ export type ControllerAdapter = ControllerAdapterMethods | (ControllerAdapterMet
 
 export const CONTROLLER_EVENT_PAGE_LIMIT = 100;
 export const MAX_CONTROLLER_EVENT_PAGES = 50;
+const MAX_CONTROLLER_INTERACTION_REFERENCES = 256;
 
 // Reasoning, plain messages, and plan updates are the model thinking out loud.
 // Everything here reaches outside the model, which is what a budget should bound.
@@ -204,10 +229,34 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     answers: ControllerQuestionAnswers,
     signal: AbortSignal,
   ): Promise<void> {
+    await this.resolveInteraction(threadId, interactionId, { kind: "user_answer", answers }, signal);
+  }
+
+  public async getInteraction(
+    threadId: string,
+    interactionId: string,
+    signal: AbortSignal,
+  ): Promise<ControllerInteractionSnapshot> {
+    const interaction = await this.dependencies.sdk.threads.interactions.get({ threadId, interactionId, signal });
+    return {
+      id: interaction.id,
+      threadId: interaction.threadId,
+      status: interaction.status,
+      payload: "payload" in interaction ? interaction.payload : null,
+    };
+  }
+
+  public async resolveInteraction(
+    threadId: string,
+    interactionId: string,
+    resolution: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
     await this.dependencies.sdk.threads.interactions.resolve({
       threadId,
       interactionId,
-      resolution: { kind: "user_answer", answers },
+      resolution: resolution as never,
     });
   }
 
@@ -244,7 +293,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     let toolActivityObserved = false;
     let completed = false;
     let error: string | null = null;
-    let pendingQuestion: ControllerPendingQuestion | null = null;
+    const interactionReferences = new Map<string, { reference: ControllerInteractionReference; seq: number }>();
     let toolCalls = 0;
     let commandFailures = 0;
     let totalTokens = 0;
@@ -275,13 +324,18 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
         if (row.type === "system/error" || row.type === "provider/error") {
           error = "Controller provider turn failed";
         }
-        // The same interaction reports every step of its life on this stream, so
-        // the last word about it wins: a later "resolved" retires the question.
-        if (row.type === "system/userQuestion/lifecycle") {
-          const data = row.data as { interactionId?: unknown; status?: unknown; payload?: unknown };
-          pendingQuestion = data.status === "pending"
-            ? parsePendingQuestion(data.interactionId, data.payload)
-            : null;
+        if (row.type === "system/userQuestion/lifecycle" || row.type === "system/permissionGrant/lifecycle") {
+          const lifecyclePayload = row.data as { interactionId?: unknown; status?: unknown };
+          const interactionId = lifecyclePayload.interactionId;
+          const status = lifecyclePayload.status;
+          if (typeof interactionId !== "string" || interactionId.length === 0 || interactionId.length > 256) continue;
+          if (status !== "pending" && status !== "resolved" && status !== "interrupted") continue;
+          const kind = row.type === "system/userQuestion/lifecycle" ? "user_question" : "approval";
+          const key = `${kind}:${interactionId}`;
+          const previous = interactionReferences.get(key);
+          if (previous && previous.seq > row.seq) continue;
+          if (!previous && interactionReferences.size >= MAX_CONTROLLER_INTERACTION_REFERENCES) continue;
+          interactionReferences.set(key, { reference: { interactionId, kind, status }, seq: row.seq });
         }
       }
       if (rows.length < CONTROLLER_EVENT_PAGE_LIMIT) break;
@@ -293,7 +347,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       toolActivityObserved,
       completed,
       error,
-      pendingQuestion,
+      interactionReferences: [...interactionReferences.values()].map(({ reference }) => reference),
       toolCalls,
       commandFailures,
       totalTokens,

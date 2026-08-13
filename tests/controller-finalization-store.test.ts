@@ -844,7 +844,7 @@ it.each([
   expect(() => fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toThrow(/finalization/i);
 });
 
-it("accepts needs-owner only for the exact pending or answered controller question", () => {
+it("accepts needs-owner only for the exact pending or answered generic interaction", () => {
   const fixture = submittedControllerFixture();
   const candidate = needsOwnerFinalization();
   expect(fixture.store.proposeControllerFinalization({
@@ -860,25 +860,32 @@ it("accepts needs-owner only for the exact pending or answered controller questi
      ) VALUES ('turn_question_other', 987655, ?, 2, 'Other turn', 'completed',
        'executor', 1, ?, ?, ?)`,
   ).run(fixture.turn.controllerKey, fixture.fence.now, fixture.fence.now, fixture.fence.now);
+  const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+  const controller = fixture.db.prepare(
+    "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  if (!generation) throw new Error("missing controller generation");
   fixture.db.prepare(
-    `INSERT INTO controller_questions (
-       interaction_id, turn_id, controller_key, questions_json, state,
-       answers_json, asked_at, answered_at
-     ) VALUES ('interaction_other', 'turn_question_other', ?, '[]', 'answered',
-       '{"q":{"selected":[]}}', ?, ?)`,
-  ).run(fixture.turn.controllerKey, fixture.fence.now, fixture.fence.now);
+    `INSERT INTO controller_interactions (
+       interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
+       kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
+     ) VALUES ('interaction_other', 'turn_question_other', ?, ?, ?, 'unsupported',
+       '{"kind":"unsupported","interactionId":"interaction_other"}', 'answered', '{}', ?, ?, NULL)`,
+  ).run(fixture.turn.controllerKey, controller.bb_thread_id, generation.id, fixture.fence.now, fixture.fence.now);
   expect(fixture.store.proposeControllerFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
     candidate,
   })).toMatchObject({ outcome: "rejected", revision: 2, code: "owner_boundary_missing" });
-  fixture.db.prepare(
-    `INSERT INTO controller_questions (
-       interaction_id, turn_id, controller_key, questions_json, state,
-       answers_json, asked_at, answered_at
-     ) VALUES ('interaction_exact', ?, ?, '[]', 'answered', '{"q":{"selected":[]}}', ?, ?)`,
-  ).run(fixture.turn.id, fixture.turn.controllerKey, fixture.fence.now, fixture.fence.now);
+  expect(fixture.store.recordControllerInteraction({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbThreadId: controller.bb_thread_id,
+    controllerGenerationId: generation.id,
+    interaction: { kind: "unsupported", interactionId: "interaction_exact" },
+  })).toBe(true);
   expect(fixture.store.proposeControllerFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
@@ -887,20 +894,20 @@ it("accepts needs-owner only for the exact pending or answered controller questi
   })).toMatchObject({ outcome: "accepted", finalization: { revision: 3 } });
 });
 
-it("does not complete an accepted needs-owner turn while its exact question is pending", () => {
+it("does not complete an accepted needs-owner turn while its exact interaction is pending", () => {
   const fixture = submittedControllerFixture();
-  expect(fixture.store.recordControllerQuestion({
+  const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+  const controller = fixture.db.prepare(
+    "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  if (!generation) throw new Error("missing controller generation");
+  expect(fixture.store.recordControllerInteraction({
     ...fixture.fence,
     turnId: fixture.turn.id,
-    interactionId: "interaction_pending_completion_guard",
-    questions: [{
-      id: "question-pending-completion-guard",
-      prompt: "Should I continue?",
-      shortLabel: "Continue",
-      multiSelect: false,
-      allowFreeText: true,
-      options: [{ value: "yes", label: "Yes", description: "Continue" }],
-    }],
+    controllerKey: fixture.turn.controllerKey,
+    bbThreadId: controller.bb_thread_id,
+    controllerGenerationId: generation.id,
+    interaction: { kind: "unsupported", interactionId: "interaction_pending_completion_guard" },
   })).toBe(true);
   const accepted = fixture.store.proposeControllerFinalization({
     ...fixture.fence,

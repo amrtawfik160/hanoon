@@ -2,10 +2,14 @@ import type { TelegramAgentStore } from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
 import {
   ControllerImagePreparationError,
+  type ControllerInteractionReference,
+  type ControllerInteractionSnapshot,
   type ControllerAdapter,
   type ControllerLocation,
   type ControllerStatus,
 } from "./bb-controller";
+import { ControllerInteractionService } from "./interaction-service";
+import { parseControllerInteraction } from "./questions";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { normalizeControllerEventObservation, projectControllerStream } from "./stream";
 import type { ControllerEventObservation } from "./bb-controller";
@@ -20,9 +24,17 @@ import {
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
   adapter: ControllerAdapter;
+  interactionService?: ControllerInteractionService;
   evidenceProjector?: ControllerEvidenceReconciler;
   clock: { now(): number };
 };
+
+type InteractionReconciliationContext = Readonly<{
+  turn: ControllerTurnRecord;
+  controller: ControllerThreadRecord;
+  fence: EffectFence;
+  signal: AbortSignal;
+}>;
 
 const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
 // How long a queued message may wait for a busy controller thread before the
@@ -222,6 +234,8 @@ export class LunaControllerService {
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
 
+    if (await this.deliverAnsweredInteraction(turn, controller, fence, signal)) return true;
+
     const evidenceOutcome = await this.reconcileEvidence(controller, turn, fence, signal);
     if (evidenceOutcome === "retry") return this.handleEvidenceRetry(turn, controller, fence, signal);
     if (evidenceOutcome === "stale") return true;
@@ -233,10 +247,6 @@ export class LunaControllerService {
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
 
-    const ownerAnswer = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey, turn.id);
-    if (ownerAnswer) return this.deliverOwnerAnswer(ownerAnswer, controller, fence, signal);
-    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey, turn.id)) return true;
-
     let status: ControllerStatus;
     try {
       status = await this.dependencies.adapter.status(controller.threadId, signal);
@@ -245,11 +255,15 @@ export class LunaControllerService {
     }
     let observation: ControllerEventObservation | null = null;
     try {
-      observation = normalizeControllerEventObservation(await this.dependencies.adapter.events(
+      const rawObservation = await this.dependencies.adapter.events(
         controller.threadId,
         turn.bbEventSeq,
         signal,
-      ));
+      );
+      observation = {
+        ...normalizeControllerEventObservation(rawObservation),
+        interactionReferences: rawObservation.interactionReferences ?? [],
+      };
       if (!Number.isSafeInteger(observation.latestSeq) || observation.latestSeq < turn.bbEventSeq) return true;
       const projected = projectControllerStream(observation, {
         cursor: turn.bbEventSeq,
@@ -271,27 +285,20 @@ export class LunaControllerService {
       observation = null;
     }
     if (observation === null) return false;
-    if (observation?.pendingQuestion) {
-      this.dependencies.store.recordControllerQuestion({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId: turn.id,
-        interactionId: observation.pendingQuestion.interactionId,
-        questions: observation.pendingQuestion.questions,
-      });
-    }
+    if (!await this.reconcileInteractionReferences(
+      observation.interactionReferences ?? [],
+      { turn, controller, fence, signal },
+    )) return true;
     const refreshedAt = this.dependencies.clock.now();
     turn = this.dependencies.store.getControllerTurn(turn.id);
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
-    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey, turn.id)) return true;
+    if (await this.deliverAnsweredInteraction(turn, controller, fence, signal)) return true;
+    if (this.hasPendingInteraction(controller.controllerKey, turn.id)) return true;
 
     const accepted = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
     const parked = turn.awaitingInteractionId;
     if (parked !== null) return true;
-    const answeredAfterObservation = this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey, turn.id);
-    if (answeredAfterObservation) {
-      return this.deliverOwnerAnswer(answeredAfterObservation, controller, fence, signal);
-    }
     if (status === "active" || status === "starting" || status === "stopping") {
       if (accepted) return true;
       this.dependencies.store.refreshControllerDraft({
@@ -413,8 +420,8 @@ export class LunaControllerService {
     fence: EffectFence,
     signal: AbortSignal,
   ): Promise<boolean> {
-    if (this.dependencies.store.getPendingControllerQuestion(controller.controllerKey, turn.id) ||
-        this.dependencies.store.getAnsweredControllerQuestion(controller.controllerKey, turn.id)) return true;
+    if (this.hasPendingInteraction(controller.controllerKey, turn.id) ||
+        this.dependencies.store.getAnsweredControllerInteraction(controller.controllerKey)?.turnId === turn.id) return true;
     let status: ControllerStatus;
     try {
       status = await this.dependencies.adapter.status(controller.threadId!, signal);
@@ -446,30 +453,162 @@ export class LunaControllerService {
   }
 
   private async deliverOwnerAnswer(
-    ownerAnswer: NonNullable<ReturnType<TelegramAgentStore["getAnsweredControllerQuestion"]>>,
+    ownerAnswer: NonNullable<ReturnType<TelegramAgentStore["getAnsweredControllerInteraction"]>>,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!controller.threadId) return;
+    const turn = this.dependencies.store.getControllerTurn(ownerAnswer.turnId);
+    if (!turn || turn.state !== "submitted" ||
+        !this.providerMutationAllowed(turn, controller, fence, signal)) return;
+    try {
+      if (this.dependencies.adapter.resolveInteraction) {
+        await this.dependencies.adapter.resolveInteraction(
+          controller.threadId,
+          ownerAnswer.interactionId,
+          ownerAnswer.resolution,
+          signal,
+        );
+      } else if (ownerAnswer.interaction.kind === "user_question") {
+        await this.dependencies.adapter.answerQuestion(
+          controller.threadId,
+          ownerAnswer.interactionId,
+          ownerAnswer.answers,
+          signal,
+        );
+      } else {
+        return;
+      }
+    } catch {
+      // Provider failures are ambiguous; retaining the durable answer lets the
+      // executor retry after an authoritative read on the next pass.
+      return;
+    }
+    this.dependencies.store.markControllerInteractionDelivered({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      interactionId: ownerAnswer.interactionId,
+      turnId: ownerAnswer.turnId,
+      bbThreadId: ownerAnswer.bbThreadId,
+    });
+  }
+
+  private hasPendingInteraction(controllerKey: string, turnId: string): boolean {
+    return this.dependencies.store.getPendingControllerInteraction(controllerKey)?.turnId === turnId;
+  }
+
+  private async deliverAnsweredInteraction(
+    turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
     fence: EffectFence,
     signal: AbortSignal,
   ): Promise<boolean> {
-    if (!controller.threadId) return true;
-    const turn = this.dependencies.store.getControllerTurn(ownerAnswer.turnId);
-    if (!turn || turn.state !== "submitted" ||
-        !this.providerMutationAllowed(turn, controller, fence, signal)) return true;
-    try {
-      await this.dependencies.adapter.answerQuestion(
-        controller.threadId,
-        ownerAnswer.interactionId,
-        ownerAnswer.answers,
+    const answered = this.dependencies.store.getAnsweredControllerInteraction(controller.controllerKey);
+    if (!answered || answered.turnId !== turn.id) return false;
+    if (this.dependencies.interactionService) {
+      await this.dependencies.interactionService.deliverAnswered(
+        controller.controllerKey,
+        fenceAt(fence, this.dependencies.clock.now()),
         signal,
       );
-    } catch {
-      return false;
+      return true;
     }
-    return this.dependencies.store.markControllerQuestionDelivered({
-      ...fenceAt(fence, this.dependencies.clock.now()),
-      interactionId: ownerAnswer.interactionId,
-      turnId: ownerAnswer.turnId,
+    await this.deliverOwnerAnswer(answered, controller, fence, signal);
+    return true;
+  }
+
+  private async reconcileInteractionReferences(
+    references: readonly ControllerInteractionReference[],
+    context: InteractionReconciliationContext,
+  ): Promise<boolean> {
+    for (const reference of references) {
+      if (!await this.reconcileInteractionReference(reference, context)) return false;
+    }
+    return true;
+  }
+
+  private async reconcileInteractionReference(
+    reference: ControllerInteractionReference,
+    context: InteractionReconciliationContext,
+  ): Promise<boolean> {
+    const generationBefore = this.currentControllerGeneration(
+      context.controller.controllerKey,
+      context.controller.threadId!,
+    );
+    if (!generationBefore) return false;
+    if (reference.status === "resolved" || reference.status === "interrupted") {
+      return this.settleInteractionReference(reference, context);
+    }
+    const snapshot = await this.readInteraction(reference, context);
+    if (!snapshot) return false;
+    const generationAfter = this.currentControllerGeneration(
+      context.controller.controllerKey,
+      context.controller.threadId!,
+    );
+    if (!generationAfter || generationAfter.id !== generationBefore.id ||
+        snapshot.id !== reference.interactionId || snapshot.threadId !== context.controller.threadId) return false;
+    if (snapshot.status === "resolved" || snapshot.status === "interrupted") {
+      return this.settleInteractionReference(reference, context);
+    }
+    if (snapshot.status !== "pending") return false;
+    const interaction = parseControllerInteraction(snapshot.id, snapshot.payload);
+    if (!interaction || (interaction.kind !== reference.kind && interaction.kind !== "unsupported")) return false;
+    const recorded = this.dependencies.store.recordControllerInteraction({
+      ...fenceAt(context.fence, this.dependencies.clock.now()),
+      turnId: context.turn.id,
+      controllerKey: context.controller.controllerKey,
+      bbThreadId: context.controller.threadId!,
+      controllerGenerationId: generationAfter.id,
+      interaction,
     });
+    return recorded || this.dependencies.store.isExecutorLeaseCurrent(
+      context.fence.ownerId,
+      context.fence.generation,
+      this.dependencies.clock.now(),
+    );
+  }
+
+  private async readInteraction(
+    reference: ControllerInteractionReference,
+    context: InteractionReconciliationContext,
+  ): Promise<ControllerInteractionSnapshot | null> {
+    const getInteraction = this.dependencies.adapter.getInteraction;
+    if (!getInteraction || !context.controller.threadId) return null;
+    try {
+      return await getInteraction.call(
+        this.dependencies.adapter,
+        context.controller.threadId,
+        reference.interactionId,
+        context.signal,
+      );
+    } catch {
+      // A failed external read cannot prove the interaction disappeared or resolved.
+      return null;
+    }
+  }
+
+  private settleInteractionReference(
+    reference: ControllerInteractionReference,
+    context: InteractionReconciliationContext,
+  ): boolean {
+    const settled = this.dependencies.store.markControllerInteractionResolved({
+      ...fenceAt(context.fence, this.dependencies.clock.now()),
+      interactionId: reference.interactionId,
+      turnId: context.turn.id,
+      bbThreadId: context.controller.threadId!,
+    });
+    return settled || this.dependencies.store.isExecutorLeaseCurrent(
+      context.fence.ownerId,
+      context.fence.generation,
+      this.dependencies.clock.now(),
+    );
+  }
+
+  private currentControllerGeneration(controllerKey: string, threadId: string): { id: string; threadId: string } | null {
+    const generations = this.dependencies.store.listControllerGenerations(controllerKey, 100);
+    const open = generations.filter((generation) => generation.endedAt === null);
+    if (open.length !== 1 || open[0]?.threadId !== threadId) return null;
+    return { id: open[0].id, threadId: open[0].threadId };
   }
 
   private async completeAccepted(

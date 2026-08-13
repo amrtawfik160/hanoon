@@ -532,6 +532,49 @@ export function renderQuestion(
   };
 }
 
+export type RenderedControllerInteraction = RenderedQuestion | { text: string };
+
+const CONTROLLER_APPROVAL_LABELS: Record<ControllerApprovalDecision, string> = {
+  allow_once: "Allow once",
+  deny: "Deny",
+};
+
+function renderControllerQuestion(
+  interaction: Extract<ControllerInteraction, { kind: "user_question" }>,
+  answers: ControllerQuestionAnswers,
+): RenderedQuestion {
+  const next = nextUnansweredQuestion(interaction.questions, answers);
+  if (!next) throw new TypeError("controller interaction has no unanswered question");
+  const rendered = renderQuestion(interaction.interactionId, next.question, "i");
+  return { ...rendered, text: `The controller needs your answer.\n\n${rendered.text}` };
+}
+
+function renderControllerApproval(
+  interaction: Extract<ControllerInteraction, { kind: "approval" }>,
+): RenderedQuestion {
+  return {
+    text: `The controller ${interaction.summary}`,
+    reply_markup: {
+      inline_keyboard: interaction.decisions.map((decision) => [{
+        text: CONTROLLER_APPROVAL_LABELS[decision],
+        callback_data: `i:${controllerInteractionToken(interaction.interactionId, decision)}`,
+      }]),
+    },
+  };
+}
+
+export function renderControllerInteraction(
+  interaction: ControllerInteraction,
+  answers: ControllerQuestionAnswers = {},
+): RenderedControllerInteraction {
+  if (interaction.kind === "unsupported") {
+    return { text: "The controller is waiting on an interaction this Telegram bridge cannot answer." };
+  }
+  return interaction.kind === "user_question"
+    ? renderControllerQuestion(interaction, answers)
+    : renderControllerApproval(interaction);
+}
+
 /** What a worker thread is blocked on: a question, or a permission request. */
 export type ThreadApprovalDecision = "allow_once" | "allow_for_session" | "deny";
 export type ThreadInteraction =

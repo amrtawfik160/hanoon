@@ -31,6 +31,8 @@ export type CallbackAction =
   | { type: "operation"; nonce: string }
   /** One option of a question the controller thread is blocked on. */
   | { type: "question"; token: string }
+  /** One choice from a generic controller interaction. */
+  | { type: "controller_interaction"; token: string }
   /** One choice offered for a watched thread that is waiting on the owner. */
   | { type: "thread_interaction"; token: string };
 
@@ -336,6 +338,10 @@ export function encodeCallbackData(action: CallbackAction): string {
       if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
       encoded = `q:${action.token}`;
       break;
+    case "controller_interaction":
+      if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
+      encoded = `i:${action.token}`;
+      break;
     case "thread_interaction":
       if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
       encoded = `w:${action.token}`;
@@ -368,6 +374,8 @@ export function parseCallbackData(data: string): CallbackAction {
   if (match) return { type: "operation", nonce: match[1] };
   match = /^q:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "question", token: match[1] };
+  match = /^i:([A-Za-z0-9_-]{32})$/.exec(data);
+  if (match) return { type: "controller_interaction", token: match[1] };
   match = /^w:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "thread_interaction", token: match[1] };
   throw new TypeError("Telegram callback data is invalid");

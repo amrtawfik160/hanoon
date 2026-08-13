@@ -12,6 +12,7 @@ import type {
   TelegramUpdate,
 } from "../src/telegram/types";
 import { encodeCallbackData, persistableJobStatusPayload, renderProjectPicker } from "../src/telegram/view";
+import { controllerInteractionToken, questionOptionToken, type ControllerInteraction } from "../src/controller/questions";
 import { VersionConflictError, openStore, type TelegramAgentStore } from "../src/storage/store";
 import { admitConfirmedJob, policyFixture } from "./helpers";
 
@@ -273,6 +274,53 @@ function statusPayload(fixture: ReturnType<typeof ingressFixture>): SendMessageP
   return fixture.telegram.deliveries.at(-1) ?? { text: "" };
 }
 
+function seedControllerInteraction(
+  fixture: ReturnType<typeof ingressFixture>,
+  interaction: ControllerInteraction,
+): { controllerKey: string; token: string } {
+  const controllerKey = createHash("sha256")
+    .update("telegram-controller:7:70", "utf8")
+    .digest("base64url")
+    .slice(0, 32);
+  const turn = fixture.store.enqueueControllerTurn({
+    controllerKey,
+    telegramUserId: "7",
+    telegramChatId: "70",
+    updateId: 90_001,
+    inputText: "controller interaction fixture",
+    now: 9_000,
+  });
+  const lease = fixture.store.acquireExecutorLease("ingress-executor", 9_000, 60_000);
+  if (!lease.acquired) throw new Error("missing executor lease");
+  const fence = { ownerId: "ingress-executor", generation: lease.generation };
+  expect(fixture.store.claimNextControllerTurn({ ...fence, now: 9_000 })?.id).toBe(turn.id);
+  expect(fixture.store.markControllerSpawned({
+    ...fence,
+    now: 9_000,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_ingress_controller",
+  })).toBe(true);
+  expect(fixture.store.markControllerTurnSubmitted({ ...fence, now: 9_000, turnId: turn.id })).toBe(true);
+  const generation = fixture.store.listControllerGenerations(controllerKey, 1)[0];
+  if (!generation) throw new Error("missing controller generation");
+  expect(fixture.store.recordControllerInteraction({
+    ...fence,
+    now: 9_001,
+    turnId: turn.id,
+    controllerKey,
+    bbThreadId: "thr_ingress_controller",
+    controllerGenerationId: generation.id,
+    interaction,
+  })).toBe(true);
+  if (interaction.kind === "unsupported") throw new Error("unsupported interactions have no callback token");
+  const token = interaction.kind === "approval"
+    ? controllerInteractionToken(interaction.interactionId, interaction.decisions[0] ?? "deny")
+    : questionOptionToken(interaction.interactionId, interaction.questions[0]!.id, interaction.questions[0]!.options[0]!.value);
+  return { controllerKey, token };
+}
+
 it("reveals no project information to an unauthorized chat", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
 
@@ -295,6 +343,113 @@ it("queues authorized standalone text for Luna without creating a software job",
     state: "queued",
     inputText: "What projects can you work on?",
   }]);
+});
+
+it("authenticates and atomically records a generic controller callback before nudging", async () => {
+  let durableBeforeNudge = false;
+  let nudges = 0;
+  let fixture: ReturnType<typeof ingressFixture>;
+  fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => {
+      nudges += 1;
+      const row = fixture.db.prepare(
+        "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+      ).get("ingress_question") as { state: string; answer_json: string | null } | undefined;
+      durableBeforeNudge = row?.state === "answered" && row.answer_json !== null &&
+        fixture.store.getCallback("controller-callback")?.outcome === "accepted" &&
+        fixture.store.getOutbox("callback:controller-callback")?.payload.text === "Got it.";
+    },
+  });
+  const seeded = seedControllerInteraction(fixture, {
+    kind: "user_question",
+    interactionId: "ingress_question",
+    questions: [{
+      id: "route",
+      prompt: "Which route?",
+      shortLabel: "Route",
+      multiSelect: false,
+      allowFreeText: true,
+      options: [{ value: "first", label: "First", description: "Use the first route." }],
+    }],
+  });
+
+  const callback = callbackUpdate(
+    90_002,
+    "controller-callback",
+    7,
+    70,
+    encodeCallbackData({ type: "controller_interaction", token: seeded.token }),
+  );
+  await fixture.ingress.handleClaimed(callback, 9_002);
+  await fixture.ingress.handleClaimed(callback, 9_003);
+
+  expect(fixture.db.prepare(
+    "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get("ingress_question")).toMatchObject({ state: "answered" });
+  expect(fixture.store.getCallback("controller-callback")).toMatchObject({
+    action: "controller_interaction",
+    outcome: "accepted",
+  });
+  expect(fixture.store.getOutbox("callback:controller-callback")?.payload.text).toBe("Got it.");
+  expect(durableBeforeNudge).toBe(true);
+  expect(nudges).toBe(1);
+  expect(fixture.store.listControllerTurns(seeded.controllerKey, 10)).toHaveLength(1);
+});
+
+it("does not let wrong-identity controller callbacks consume the parked interaction", async () => {
+  let nudges = 0;
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => { nudges += 1; },
+  });
+  const seeded = seedControllerInteraction(fixture, {
+    kind: "approval",
+    interactionId: "ingress_approval",
+    summary: "wants to run a bounded command",
+    decisions: ["allow_once", "deny"],
+  });
+  await fixture.ingress.handleClaimed(callbackUpdate(
+    90_004,
+    "wrong-controller-callback",
+    8,
+    70,
+    encodeCallbackData({ type: "controller_interaction", token: seeded.token }),
+  ), 9_004);
+
+  expect(fixture.store.getPendingControllerInteraction(seeded.controllerKey)?.interactionId)
+    .toBe("ingress_approval");
+  expect(fixture.store.getCallback("wrong-controller-callback")).toBeNull();
+  expect(nudges).toBe(0);
+});
+
+it("routes plain text to the oldest pending controller question instead of queueing a new turn", async () => {
+  let nudges = 0;
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => { nudges += 1; },
+  });
+  const seeded = seedControllerInteraction(fixture, {
+    kind: "user_question",
+    interactionId: "ingress_text_question",
+    questions: [{
+      id: "route",
+      prompt: "Which route?",
+      shortLabel: "Route",
+      multiSelect: false,
+      allowFreeText: true,
+      options: [{ value: "first", label: "First", description: null }],
+    }],
+  });
+
+  await fixture.ingress.handleClaimed(messageUpdate(90_005, 7, 70, "Use the fallback route."), 9_005);
+
+  expect(fixture.store.getAnsweredControllerInteraction(seeded.controllerKey)).toMatchObject({
+    interactionId: "ingress_text_question",
+    resolution: { kind: "user_answer" },
+  });
+  expect(fixture.store.listControllerTurns(seeded.controllerKey, 10)).toHaveLength(1);
+  expect(nudges).toBe(1);
 });
 
 it("durably queues the largest Telegram photo with its caption for Luna", async () => {

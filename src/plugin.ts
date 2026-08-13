@@ -46,6 +46,7 @@ import {
   EXTRACTION_MODELS,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
+import { ControllerInteractionService } from "./controller/interaction-service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
@@ -469,28 +470,54 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     onWorkAvailable: () => executorNudge.notify(),
     health,
   });
+  const controllerAdapter = new BbControllerAdapter({
+    sdk: bb.sdk,
+    pluginId: bb.pluginId,
+    executionProfile: () => {
+      if (!config.ok) throw new Error(config.message);
+      return controllerExecutionProfile(config.value);
+    },
+    downloadImage: async (fileId, maxBytes, signal) => {
+      if (!config.ok) throw new Error(config.message);
+      try {
+        return await telegramForToken(config.value.botToken).downloadFile(fileId, maxBytes, signal);
+      } catch (error) {
+        if (error instanceof TelegramFileTooLargeError) {
+          throw new ControllerImagePreparationError(false);
+        }
+        throw error;
+      }
+    },
+  });
+  const controllerInteractionService = new ControllerInteractionService({
+    store: {
+      isExecutorLeaseCurrent: (ownerId, generation, now) => store.isExecutorLeaseCurrent(ownerId, generation, now),
+      record: (input) => store.recordControllerInteraction(input),
+      markResolved: (input) => store.markControllerInteractionResolved(input),
+      answerByToken: (input) => store.answerControllerInteractionByToken(input),
+      answerWithText: (input) => store.answerControllerInteractionWithText(input),
+      getPending: (controllerKey) => store.getPendingControllerInteraction(controllerKey),
+      getAnswered: (controllerKey) => store.getAnsweredControllerInteraction(controllerKey),
+      markDelivered: (input) => store.markControllerInteractionDelivered(input),
+    },
+    interactions: {
+      get: async (threadId, interactionId, signal) => controllerAdapter.getInteraction(
+        threadId,
+        interactionId,
+        signal ?? AbortSignal.timeout(30_000),
+      ),
+      resolve: async (input, signal) => {
+        const effectiveSignal = signal ?? AbortSignal.timeout(30_000);
+        await controllerAdapter.resolveInteraction(input.threadId, input.interactionId, input.resolution, effectiveSignal);
+        return controllerAdapter.getInteraction(input.threadId, input.interactionId, effectiveSignal);
+      },
+    },
+  });
   const controller = new LunaControllerService({
     store,
     evidenceProjector,
-    adapter: new BbControllerAdapter({
-      sdk: bb.sdk,
-      pluginId: bb.pluginId,
-      executionProfile: () => {
-        if (!config.ok) throw new Error(config.message);
-        return controllerExecutionProfile(config.value);
-      },
-      downloadImage: async (fileId, maxBytes, signal) => {
-        if (!config.ok) throw new Error(config.message);
-        try {
-          return await telegramForToken(config.value.botToken).downloadFile(fileId, maxBytes, signal);
-        } catch (error) {
-          if (error instanceof TelegramFileTooLargeError) {
-            throw new ControllerImagePreparationError(false);
-          }
-          throw error;
-        }
-      },
-    }),
+    adapter: controllerAdapter,
+    interactionService: controllerInteractionService,
     clock: { now: clock },
   });
   const monitors = new MonitorService({

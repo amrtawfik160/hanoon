@@ -465,7 +465,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     turn: FinalizationTurnRow,
   ): boolean {
     const question = this.db.prepare(
-      `SELECT 1 FROM controller_questions
+      `SELECT 1 FROM controller_interactions
         WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered') LIMIT 1`,
     ).get(input.turnId, input.controllerKey);
     if (question) return true;

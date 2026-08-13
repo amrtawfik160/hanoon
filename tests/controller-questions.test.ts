@@ -6,7 +6,10 @@ import { openStore } from "../src/storage/store";
 import { BbControllerAdapter, type ControllerAdapter } from "../src/controller/bb-controller";
 import { CONTROLLER_STALL_MS, LunaControllerService } from "../src/controller/service";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
-import { questionOptionToken } from "../src/controller/questions";
+import {
+  questionOptionToken,
+  renderControllerInteraction,
+} from "../src/controller/questions";
 
 const INTERACTION_ID = "pint_4k97457aun";
 const QUESTION_ID = "toolu_abc:question-1";
@@ -80,25 +83,14 @@ function adapterFixture(options: { events?: unknown[] } = {}) {
   return { adapter, resolve, send, eventsList };
 }
 
-it("surfaces a pending user question from the controller event stream", async () => {
+it("surfaces a pending user-question reference from the controller event stream", async () => {
   const { adapter } = adapterFixture({ events: [lifecycleEvent(5, "pending")] });
 
   const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
 
-  expect(observation.pendingQuestion).toEqual({
-    interactionId: INTERACTION_ID,
-    questions: [{
-      id: QUESTION_ID,
-      prompt: "36 open issues in Cyndra. How should I run the fix threads?",
-      shortLabel: "Fix threads",
-      multiSelect: false,
-      allowFreeText: true,
-      options: [
-        { value: OPTION_A, label: "Cluster into ~8 threads", description: "Group issues by surface." },
-        { value: OPTION_B, label: "One thread per issue", description: "Maximum isolation." },
-      ],
-    }],
-  });
+  expect(observation.interactionReferences).toEqual([
+    { interactionId: INTERACTION_ID, kind: "user_question", status: "pending" },
+  ]);
 });
 
 it("clears the pending question once the interaction stops being pending", async () => {
@@ -108,17 +100,56 @@ it("clears the pending question once the interaction stops being pending", async
 
   const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
 
-  expect(observation.pendingQuestion).toBeNull();
+  expect(observation.interactionReferences).toEqual([
+    { interactionId: INTERACTION_ID, kind: "user_question", status: "resolved" },
+  ]);
 });
 
-it("ignores a lifecycle event that carries no answerable question", async () => {
+it("uses lifecycle sequence rather than arrival order for duplicate references", async () => {
+  const resolved = lifecycleEvent(6, "resolved");
+  const pending = lifecycleEvent(5, "pending");
+  const { adapter } = adapterFixture({ events: [resolved, pending, pending, resolved] });
+
+  await expect(adapter.events("thr_controller", 0, AbortSignal.timeout(1_000))).resolves.toMatchObject({
+    interactionReferences: [{ interactionId: INTERACTION_ID, kind: "user_question", status: "resolved" }],
+  });
+});
+
+it("emits bounded references for both question and permission lifecycles without trusting inline payloads", async () => {
+  const permission = {
+    ...lifecycleEvent(6, "pending"),
+    type: "system/permissionGrant/lifecycle",
+    data: {
+      ...lifecycleEvent(6, "pending").data,
+      interactionId: "permission_4k97457aun",
+      payload: { kind: "approval", summary: "inline payload is not authority" },
+    },
+  };
+  const { adapter } = adapterFixture({
+    events: [lifecycleEvent(5, "pending"), permission, lifecycleEvent(7, "resolved")],
+  });
+
+  await expect(adapter.events("thr_controller", 0, AbortSignal.timeout(1_000))).resolves.toMatchObject({
+    interactionReferences: [
+      { interactionId: INTERACTION_ID, kind: "user_question", status: "resolved" },
+      { interactionId: "permission_4k97457aun", kind: "approval", status: "pending" },
+    ],
+  });
+});
+
+it("retains a lifecycle reference even when its inline payload is not answerable", async () => {
   const bare = lifecycleEvent(5, "pending");
   const { adapter } = adapterFixture({
     events: [{ ...bare, data: { ...bare.data, payload: { kind: "user_question", questions: [] } } }],
   });
 
   await expect(adapter.events("thr_controller", 0, AbortSignal.timeout(1_000)))
-    .resolves.toMatchObject({ pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 });
+    .resolves.toMatchObject({
+      interactionReferences: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    });
 });
 
 it("answers a pending question through the BB interaction resolution", async () => {
@@ -161,6 +192,29 @@ it("derives a stable, callback-sized token for each question option", () => {
   expect(token).toMatch(/^[A-Za-z0-9_-]{32}$/);
 });
 
+it("renders controller questions, approvals, and unsupported interactions with the controller callback namespace", () => {
+  const question = renderControllerInteraction({
+    kind: "user_question",
+    interactionId: INTERACTION_ID,
+    questions: questionPayload().questions,
+  });
+  expect("reply_markup" in question ? question.reply_markup.inline_keyboard[0]?.[0]?.callback_data : null)
+    .toBe(`i:${questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A)}`);
+
+  const approval = renderControllerInteraction({
+    kind: "approval",
+    interactionId: INTERACTION_ID,
+    summary: "wants to run a command",
+    decisions: ["allow_once", "deny"],
+  });
+  expect("reply_markup" in approval ? approval.reply_markup.inline_keyboard.flat().map((button) => button.text) : [])
+    .toEqual(["Allow once", "Deny"]);
+  expect(approval.text).not.toMatch(/session/i);
+
+  const unsupported = renderControllerInteraction({ kind: "unsupported", interactionId: INTERACTION_ID });
+  expect(unsupported).not.toHaveProperty("reply_markup");
+});
+
 function storeFixture(name: string) {
   const { bb } = createFakePluginHost({ pluginId: `telegram-questions-${name}` });
   const store = openStore(bb.storage, bb.storage.kv, () => 2_000);
@@ -169,7 +223,11 @@ function storeFixture(name: string) {
   // Long enough that the stall-watchdog clock in these tests stays inside it.
   const lease = store.acquireExecutorLease("executor", 2_000, 60 * 60_000);
   if (!lease.acquired) throw new Error("missing lease");
-  return { store, fence: { ownerId: "executor", generation: lease.generation } };
+  return {
+    db: bb.storage.database(),
+    store,
+    fence: { ownerId: "executor", generation: lease.generation },
+  };
 }
 
 function submittedTurn(store: ReturnType<typeof storeFixture>["store"], fence: { ownerId: string; generation: number }) {
@@ -194,28 +252,45 @@ function submittedTurn(store: ReturnType<typeof storeFixture>["store"], fence: {
   return turn;
 }
 
+function recordQuestion(
+  store: ReturnType<typeof storeFixture>["store"],
+  fence: { ownerId: string; generation: number },
+  turn: ReturnType<typeof submittedTurn>,
+  now = 3_000,
+): boolean {
+  const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
+  if (!generation) throw new Error("missing controller generation");
+  return store.recordControllerInteraction({
+    ...fence,
+    now,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbThreadId: "thr_controller",
+    controllerGenerationId: generation.id,
+    interaction: {
+      kind: "user_question",
+      interactionId: INTERACTION_ID,
+      questions: questionPayload().questions,
+    },
+  });
+}
+
 it("parks a submitted turn on its question and asks the owner in Telegram", () => {
   const { store, fence } = storeFixture("park");
   const turn = submittedTurn(store, fence);
 
-  expect(store.recordControllerQuestion({
-    ...fence,
-    now: 3_000,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  })).toBe(true);
+  expect(recordQuestion(store, fence, turn)).toBe(true);
 
   const parked = store.getControllerTurn(turn.id);
   expect(parked?.awaitingInteractionId).toBe(INTERACTION_ID);
   expect(parked?.state).toBe("submitted");
 
-  const asked = store.getOutbox(`controller-question:${INTERACTION_ID}:0`);
+  const asked = store.getOutbox(`controller-interaction:${INTERACTION_ID}:0`);
   expect(asked?.payload.text).toContain("How should I run the fix threads?");
   expect(asked?.payload.reply_markup).toEqual({
     inline_keyboard: [
-      [{ text: "Cluster into ~8 threads", callback_data: `q:${questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A)}` }],
-      [{ text: "One thread per issue", callback_data: `q:${questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_B)}` }],
+      [{ text: "Cluster into ~8 threads", callback_data: `i:${questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A)}` }],
+      [{ text: "One thread per issue", callback_data: `i:${questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_B)}` }],
     ],
   });
 });
@@ -223,73 +298,102 @@ it("parks a submitted turn on its question and asks the owner in Telegram", () =
 it("resolves a parked question from a tapped option and releases the turn", () => {
   const { store, fence } = storeFixture("tap");
   const turn = submittedTurn(store, fence);
-  store.recordControllerQuestion({
-    ...fence,
-    now: 3_000,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  });
+  expect(recordQuestion(store, fence, turn)).toBe(true);
 
-  const answered = store.answerControllerQuestion({
+  const answered = store.answerControllerInteractionByToken({
     token: questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A),
     userId: "7",
     chatId: "7",
     now: 4_000,
   });
 
-  expect(answered).toEqual({
+  expect(answered).toMatchObject({
     ok: true,
     complete: true,
     turnId: turn.id,
     interactionId: INTERACTION_ID,
-    answers: { [QUESTION_ID]: { selected: [OPTION_A] } },
+    resolution: { kind: "user_answer", answers: { [QUESTION_ID]: { selected: [OPTION_A] } } },
   });
-  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBeNull();
+  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBe(INTERACTION_ID);
 });
 
 it("resolves a parked question from a plain Telegram reply", () => {
   const { store, fence } = storeFixture("text");
   const turn = submittedTurn(store, fence);
-  store.recordControllerQuestion({
-    ...fence,
-    now: 3_000,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  });
+  expect(recordQuestion(store, fence, turn)).toBe(true);
 
-  const answered = store.answerControllerQuestionWithText({
+  const answered = store.answerControllerInteractionWithText({
     controllerKey: "owner-7-controller",
+    userId: "7",
+    chatId: "7",
     text: "in review i mean not in progress",
     now: 4_000,
   });
 
-  expect(answered).toEqual({
+  expect(answered).toMatchObject({
     ok: true,
     complete: true,
     turnId: turn.id,
     interactionId: INTERACTION_ID,
-    answers: { [QUESTION_ID]: { selected: [], freeText: "in review i mean not in progress" } },
+    resolution: { kind: "user_answer", answers: { [QUESTION_ID]: { selected: [], freeText: "in review i mean not in progress" } } },
   });
-  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBeNull();
+  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBe(INTERACTION_ID);
 });
 
 it("refuses a stale option token once the question is answered", () => {
   const { store, fence } = storeFixture("stale");
   const turn = submittedTurn(store, fence);
-  store.recordControllerQuestion({
-    ...fence,
-    now: 3_000,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  });
+  expect(recordQuestion(store, fence, turn)).toBe(true);
   const token = questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A);
-  expect(store.answerControllerQuestion({ token, userId: "7", chatId: "7", now: 4_000 }).ok).toBe(true);
+  expect(store.answerControllerInteractionByToken({ token, userId: "7", chatId: "7", now: 4_000 }).ok).toBe(true);
 
-  expect(store.answerControllerQuestion({ token, userId: "7", chatId: "7", now: 4_001 }))
+  expect(store.answerControllerInteractionByToken({ token, userId: "7", chatId: "7", now: 4_001 }))
     .toEqual({ ok: false, reason: "stale" });
+});
+
+it("keeps the oldest pending interaction visible and promotes the next after delivery", () => {
+  const { store, fence } = storeFixture("interaction-order");
+  const turn = submittedTurn(store, fence);
+  expect(recordQuestion(store, fence, turn)).toBe(true);
+  const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
+  if (!generation) throw new Error("missing controller generation");
+  expect(store.recordControllerInteraction({
+    ...fence,
+    now: 3_001,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbThreadId: generation.threadId,
+    controllerGenerationId: generation.id,
+    interaction: {
+      kind: "user_question",
+      interactionId: "second-controller-interaction",
+      questions: [{
+        id: "second-question",
+        prompt: "Which second route?",
+        shortLabel: "Route",
+        multiSelect: false,
+        allowFreeText: true,
+        options: [{ value: "second", label: "Second", description: null }],
+      }],
+    },
+  })).toBe(true);
+  expect(store.getOutbox("controller-interaction:second-controller-interaction:0")).toBeNull();
+
+  expect(store.answerControllerInteractionByToken({
+    token: questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A),
+    userId: "7",
+    chatId: "7",
+    now: 3_002,
+  }).ok).toBe(true);
+  expect(store.markControllerInteractionDelivered({
+    ...fence,
+    now: 3_003,
+    interactionId: INTERACTION_ID,
+    turnId: turn.id,
+    bbThreadId: generation.threadId,
+  })).toBe(true);
+  expect(store.getOutbox("controller-interaction:second-controller-interaction:0")?.payload.text)
+    .toContain("Which second route?");
 });
 
 function serviceAdapter(overrides: Partial<ControllerAdapter> = {}): ControllerAdapter {
@@ -298,6 +402,12 @@ function serviceAdapter(overrides: Partial<ControllerAdapter> = {}): ControllerA
     send: vi.fn(async () => undefined),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
+    getInteraction: vi.fn(async (threadId: string, interactionId: string) => ({
+      id: interactionId,
+      threadId,
+      status: "pending",
+      payload: questionPayload(),
+    })),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
     output: vi.fn(async () => "done"),
@@ -307,7 +417,7 @@ function serviceAdapter(overrides: Partial<ControllerAdapter> = {}): ControllerA
       assistantDelta: "",
       completed: false,
       error: null,
-      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     findSpawnCandidate: vi.fn(async () => null),
     ...overrides,
@@ -324,7 +434,7 @@ it("parks the turn and asks in Telegram when the thread blocks on a question", a
       assistantDelta: "Big job.",
       completed: false,
       error: null,
-      pendingQuestion: { interactionId: INTERACTION_ID, questions: questionPayload().questions },
+      interactionReferences: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
       toolCalls: 0,
       commandFailures: 0,
       totalTokens: 0,
@@ -336,21 +446,119 @@ it("parks the turn and asks in Telegram when the thread blocks on a question", a
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
 
   expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBe(INTERACTION_ID);
-  expect(store.getOutbox(`controller-question:${INTERACTION_ID}:0`)?.payload.text)
+  expect(store.getOutbox(`controller-interaction:${INTERACTION_ID}:0`)?.payload.text)
     .toContain("How should I run the fix threads?");
+});
+
+it.each([
+  ["wrong interaction id", { id: "other-interaction", threadId: "thr_controller", status: "pending" }],
+  ["wrong thread id", { id: INTERACTION_ID, threadId: "thr_other", status: "pending" }],
+  ["ambiguous status", { id: INTERACTION_ID, threadId: "thr_controller", status: "resolving" }],
+] as const)("rejects a lifecycle get with %s before projecting its payload", async (_caseName, snapshot) => {
+  const { store, fence } = storeFixture("service-get-boundary");
+  const turn = submittedTurn(store, fence);
+  const adapter = serviceAdapter({
+    events: vi.fn(async () => ({
+      latestSeq: 5,
+      inputAccepted: true,
+      assistantDelta: "Inline payload is not authority.",
+      completed: false,
+      error: null,
+      interactionReferences: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    getInteraction: vi.fn(async () => ({ ...snapshot, payload: questionPayload() })),
+  });
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });
+  const signal = AbortSignal.timeout(2_000);
+
+  await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
+
+  expect(adapter.getInteraction).toHaveBeenCalledTimes(1);
+  expect(store.getPendingControllerInteraction(turn.controllerKey)).toBeNull();
+  expect(store.getOutbox(`controller-interaction:${INTERACTION_ID}:0`)).toBeNull();
+});
+
+it("rejects an exact interaction read after the controller generation changes", async () => {
+  const { db, store, fence } = storeFixture("service-generation-boundary");
+  const turn = submittedTurn(store, fence);
+  const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
+  if (!generation) throw new Error("missing controller generation");
+  const getInteraction = vi.fn(async () => {
+    db.prepare(
+      "UPDATE controller_generations SET ended_at = ?, end_reason = ? WHERE id = ?",
+    ).run(3_001, "takeover", generation.id);
+    return {
+      id: INTERACTION_ID,
+      threadId: "thr_controller",
+      status: "pending",
+      payload: questionPayload(),
+    };
+  });
+  const adapter = serviceAdapter({
+    events: vi.fn(async () => ({
+      latestSeq: 5,
+      inputAccepted: true,
+      assistantDelta: "Generation changed.",
+      completed: false,
+      error: null,
+      interactionReferences: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    getInteraction,
+  });
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });
+  const signal = AbortSignal.timeout(2_000);
+
+  await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
+
+  expect(getInteraction).toHaveBeenCalledTimes(1);
+  expect(store.getPendingControllerInteraction(turn.controllerKey)).toBeNull();
+});
+
+it.each(["resolved", "interrupted"] as const)("settles a lifecycle reference when the exact interaction is already %s", async (status) => {
+  const { store, fence } = storeFixture("service-resolved-interaction");
+  const turn = submittedTurn(store, fence);
+  expect(recordQuestion(store, fence, turn)).toBe(true);
+  const adapter = serviceAdapter({
+    events: vi.fn(async () => ({
+      latestSeq: 5,
+      inputAccepted: true,
+      assistantDelta: "Done.",
+      completed: false,
+      error: null,
+      interactionReferences: [{ interactionId: INTERACTION_ID, kind: "user_question" as const, status: "pending" as const }],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    getInteraction: vi.fn(async (threadId: string, interactionId: string) => ({
+      id: interactionId,
+      threadId,
+      status,
+      payload: null,
+    })),
+  });
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 3_000 } });
+  const signal = AbortSignal.timeout(2_000);
+
+  await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
+
+  expect(adapter.getInteraction).toHaveBeenCalledWith("thr_controller", INTERACTION_ID, signal);
+  expect(adapter.answerQuestion).not.toHaveBeenCalled();
+  expect(store.getPendingControllerInteraction(turn.controllerKey)).toBeNull();
+  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBeNull();
 });
 
 it("delivers the owner's answer back to the blocked BB thread", async () => {
   const { store, fence } = storeFixture("service-answer");
   const turn = submittedTurn(store, fence);
-  store.recordControllerQuestion({
-    ...fence,
-    now: 3_000,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  });
-  expect(store.answerControllerQuestion({
+  expect(recordQuestion(store, fence, turn)).toBe(true);
+  expect(store.answerControllerInteractionByToken({
     token: questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A),
     userId: "7",
     chatId: "7",
@@ -393,13 +601,7 @@ it("gives up on a turn that stopped producing events and unblocks the queue", as
 it("waits indefinitely while the owner still owes the thread an answer", async () => {
   const { store, fence } = storeFixture("service-no-stall");
   const turn = submittedTurn(store, fence);
-  store.recordControllerQuestion({
-    ...fence,
-    now: 2_500,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  });
+  expect(recordQuestion(store, fence, turn, 2_500)).toBe(true);
   const service = new LunaControllerService({
     store,
     adapter: serviceAdapter(),
@@ -461,13 +663,7 @@ it("leaves a mid-answer message queued when the thread will not take it", async 
 it("retires a parked question when its turn dies, so later messages are not swallowed", () => {
   const { store, fence } = storeFixture("orphan");
   const turn = submittedTurn(store, fence);
-  store.recordControllerQuestion({
-    ...fence,
-    now: 3_000,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  });
+  expect(recordQuestion(store, fence, turn)).toBe(true);
 
   expect(store.failControllerTurn({
     ...fence,
@@ -476,9 +672,11 @@ it("retires a parked question when its turn dies, so later messages are not swal
     error: "Controller provider turn failed",
   })).toBe(true);
 
-  expect(store.getPendingControllerQuestion("owner-7-controller")).toBeNull();
-  expect(store.answerControllerQuestionWithText({
+  expect(store.getPendingControllerInteraction("owner-7-controller")).toBeNull();
+  expect(store.answerControllerInteractionWithText({
     controllerKey: "owner-7-controller",
+    userId: "7",
+    chatId: "7",
     text: "cluster them",
     now: 4_100,
   })).toEqual({ ok: false, reason: "stale" });
@@ -487,14 +685,8 @@ it("retires a parked question when its turn dies, so later messages are not swal
 it("does not deliver an answer whose turn died before BB heard it", async () => {
   const { store, fence } = storeFixture("orphan-answer");
   const turn = submittedTurn(store, fence);
-  store.recordControllerQuestion({
-    ...fence,
-    now: 3_000,
-    turnId: turn.id,
-    interactionId: INTERACTION_ID,
-    questions: questionPayload().questions,
-  });
-  store.answerControllerQuestion({
+  expect(recordQuestion(store, fence, turn)).toBe(true);
+  store.answerControllerInteractionByToken({
     token: questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A),
     userId: "7",
     chatId: "7",

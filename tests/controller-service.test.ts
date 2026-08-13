@@ -286,7 +286,7 @@ it("reduces BB controller events after the durable sequence without exposing rea
     toolActivityObserved: false,
     completed: true,
     error: null,
-    pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+    interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
   });
   expect(eventsList).toHaveBeenCalledWith({
     threadId: "thr_controller",
@@ -455,6 +455,39 @@ function serviceFixture() {
   if (!lease.acquired) throw new Error("missing lease");
   const fence = { ownerId: "executor", generation: lease.generation, signal: AbortSignal.timeout(2_000) };
   return { db: bb.storage.database(), store, fence, reopen: () => openStore(bb.storage, bb.storage.kv, () => 2_000) };
+}
+
+function recordServiceQuestion(
+  store: ReturnType<typeof serviceFixture>["store"],
+  fence: { ownerId: string; generation: number; now?: number },
+  turnId: string,
+  interactionId: string,
+): boolean {
+  const turn = store.getControllerTurn(turnId);
+  if (!turn) throw new Error("missing service turn");
+  const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
+  if (!generation) throw new Error("missing service generation");
+  return store.recordControllerInteraction({
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: fence.now ?? 2_000,
+    turnId,
+    controllerKey: turn.controllerKey,
+    bbThreadId: generation.threadId,
+    controllerGenerationId: generation.id,
+    interaction: {
+      kind: "user_question",
+      interactionId,
+      questions: [{
+        id: "question-needs-owner-restart",
+        prompt: "Should I continue?",
+        shortLabel: "Continue",
+        multiSelect: false,
+        allowFreeText: true,
+        options: [{ value: "yes", label: "Yes", description: "Continue" }],
+      }],
+    },
+  });
 }
 
 function acceptControllerFinalization(
@@ -874,20 +907,7 @@ it("keeps a needs-owner finalization parked and answerable across restart", asyn
     threadId: "thr_needs_owner_restart",
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
-  expect(store.recordControllerQuestion({
-    ...fence,
-    now: 2_000,
-    turnId: turn.id,
-    interactionId: "interaction_needs_owner_restart",
-    questions: [{
-      id: "question-needs-owner-restart",
-      prompt: "Should I continue?",
-      shortLabel: "Continue",
-      multiSelect: false,
-      allowFreeText: true,
-      options: [{ value: "yes", label: "Yes", description: "Continue" }],
-    }],
-  })).toBe(true);
+  expect(recordServiceQuestion(store, fence, turn.id, "interaction_needs_owner_restart")).toBe(true);
   const accepted = acceptNeedsOwnerFinalization(store, turn.id);
   const restarted = fixture.reopen();
   const adapter: ControllerAdapter = {
@@ -923,12 +943,14 @@ it("keeps a needs-owner finalization parked and answerable across restart", asyn
   expect(restarted.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
   expect(adapter.answerQuestion).not.toHaveBeenCalled();
 
-  expect(restarted.answerControllerQuestionWithText({
+  expect(restarted.answerControllerInteractionWithText({
     controllerKey: turn.controllerKey,
+    userId: "7",
+    chatId: "7",
     text: "Yes, continue.",
     now: 2_003,
   })).toMatchObject({ ok: true, complete: true, turnId: turn.id });
-  expect(restarted.getAnsweredControllerQuestion(turn.controllerKey, turn.id)).toMatchObject({
+  expect(restarted.getAnsweredControllerInteraction(turn.controllerKey)).toMatchObject({
     interactionId: "interaction_needs_owner_restart",
     turnId: turn.id,
   });
@@ -936,7 +958,7 @@ it("keeps a needs-owner finalization parked and answerable across restart", asyn
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.answerQuestion).toHaveBeenCalledTimes(1);
   expect(fixture.db.prepare(
-    "SELECT state FROM controller_questions WHERE interaction_id = ?",
+    "SELECT state FROM controller_interactions WHERE interaction_id = ?",
   ).get("interaction_needs_owner_restart")).toEqual({ state: "delivered" });
   expect(restarted.getControllerTurn(turn.id)?.state).toBe("submitted");
   expect(restarted.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();

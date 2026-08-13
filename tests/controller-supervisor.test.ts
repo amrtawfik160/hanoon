@@ -171,6 +171,35 @@ function submittedTurn(
   return turn;
 }
 
+function recordOwnerQuestion(
+  store: ReturnType<typeof storeFixture>["store"],
+  fence: { ownerId: string; generation: number },
+  turn: ReturnType<typeof submittedTurn>,
+): boolean {
+  const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
+  if (!generation) throw new Error("missing controller generation");
+  return store.recordControllerInteraction({
+    ...fence,
+    now: 2_001,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbThreadId: "thr_controller",
+    controllerGenerationId: generation.id,
+    interaction: {
+      kind: "user_question",
+      interactionId: "int_1",
+      questions: [{
+        id: "q1",
+        prompt: "Which project?",
+        shortLabel: "Project",
+        multiSelect: false,
+        allowFreeText: false,
+        options: [{ value: "cyndra", label: "cyndra", description: "the invoice service" }],
+      }],
+    },
+  });
+}
+
 it("starts a turn with no recorded usage", () => {
   const { store, fence } = storeFixture("initial");
   const turn = submittedTurn(store, fence);
@@ -329,20 +358,7 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
 it("leaves a turn parked on an owner question alone however much it has spent", async () => {
   const { store, fence } = storeFixture("parked");
   const turn = submittedTurn(store, fence);
-  expect(store.recordControllerQuestion({
-    ...fence,
-    now: 2_001,
-    turnId: turn.id,
-    interactionId: "int_1",
-    questions: [{
-      id: "q1",
-      prompt: "Which project?",
-      shortLabel: "Project",
-      multiSelect: false,
-      allowFreeText: false,
-      options: [{ value: "cyndra", label: "cyndra", description: "the invoice service" }],
-    }],
-  })).toBe(true);
+  expect(recordOwnerQuestion(store, fence, turn)).toBe(true);
   const adapter = serviceAdapter(
     () => observation({ latestSeq: 9, toolCalls: SUPERVISOR_HARD_TOOL_CALLS }),
     () => "active",
