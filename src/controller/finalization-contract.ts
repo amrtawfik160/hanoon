@@ -25,6 +25,7 @@ export const FINALIZATION_REJECTION_CODES = [
   "obligation_forbidden",
   "obligation_missing",
   "obligation_not_live",
+  "invocation_in_flight",
   "process_only",
   "high_impact_text_unclaimed",
 ] as const;
@@ -76,6 +77,7 @@ type ControllerClaim = Extract<ControllerFinalization["segments"][number], { typ
 
 export type ControllerFinalizationValidationContext = Readonly<{
   acceptedAlready: boolean;
+  invocationInFlight?: boolean;
   revisionCount: number;
   evidenceLimitExceeded: boolean;
   evidenceByRef: ReadonlyMap<EvidenceRef, Readonly<{
@@ -138,6 +140,7 @@ const CORRECTIONS: Record<FinalizationRejectionCode, string> = {
   obligation_forbidden: "Remove obligations from answered or needs_owner finalizations.",
   obligation_missing: "A deferred finalization requires a durable obligation.",
   obligation_not_live: "Reference only live obligations for a deferred finalization.",
+  invocation_in_flight: "Wait for the current mutating capability invocation to settle before finalizing.",
   process_only: "Replace process intent with a direct answer or durable deferred obligation.",
   high_impact_text_unclaimed: "Move high-impact success assertions into evidence-backed claim segments.",
 };
@@ -376,6 +379,7 @@ function contextRejectionCode(
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
   if (context.acceptedAlready) return "accepted_already";
+  if (context.invocationInFlight) return "invocation_in_flight";
   if (context.revisionCount >= 8) return "revision_limit";
   if (context.evidenceLimitExceeded) return "evidence_limit_exceeded";
   return null;

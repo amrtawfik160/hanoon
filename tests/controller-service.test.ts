@@ -805,6 +805,95 @@ it("keeps an accepted finalization unconsumed while the provider is active", asy
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toBe(accepted.renderedMessage);
 });
 
+it.each(["source_gap", "page_cap"] as const)(
+  "retries an accepted turn after a transient evidence %s",
+  async (reconciliationIncomplete) => {
+    const { store, fence } = serviceFixture();
+    const turn = store.enqueueControllerTurn({
+      ...turnRecord({ updateId: 670, inputText: "retry evidence safely" }),
+      telegramUserId: "7",
+      telegramChatId: "7",
+      now: 2_000,
+    });
+    expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+      .toBe(turn.id);
+    reserveControllerSpawnForTest(store, turn.id);
+    expect(store.markControllerSpawned({
+      turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+      projectId: "proj_personal", hostId: "host_personal", threadId: `thr_gap_${reconciliationIncomplete}`,
+      spawnToken: turn.id,
+    })).toBe(true);
+    expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+    const accepted = acceptControllerFinalization(store, turn.id);
+    const projector = {
+      reconcile: vi.fn(async () => ({
+        outcome: "reconciled" as const,
+        reconciliationIncomplete,
+        fromSeq: 0,
+        throughSeq: 0,
+        targetSeq: 0,
+      })),
+    };
+    const adapter: ControllerAdapter = {
+      spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+      send: vi.fn(async () => undefined),
+      status: vi.fn(async () => "active" as const),
+      latestSeq: vi.fn(async () => 0),
+      events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false, completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+      steer: vi.fn(async () => undefined),
+      answerQuestion: vi.fn(async () => undefined),
+      findSpawnCandidate: vi.fn(async () => null),
+    };
+    const service = new LunaControllerService({
+      store,
+      adapter,
+      evidenceProjector: projector,
+      clock: { now: () => 2_002 },
+    });
+
+    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
+    expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+    expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  },
+);
+
+it("does not steer or fail an active accepted turn at ordinary budgets", async () => {
+  const { store, fence, db } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 674, inputText: "keep accepted answer alive" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_accepted_budget", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  db.prepare(
+    "UPDATE controller_turns SET tool_calls = 120, total_tokens = 600000, command_failures = 5 WHERE id = ?",
+  ).run(turn.id);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false, completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+});
+
 it("does not let an accepted active turn bypass the stall boundary", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({

@@ -315,7 +315,7 @@ export class LunaControllerService {
       // The owner's own words outrank a budget nudge, so this runs only once
       // nothing of theirs is waiting. A turn parked on a question is waiting on
       // a person, and no budget should fire against their thinking time.
-      if (parked === null && await this.superviseBudget(turn.id, controller, fence, signal)) {
+      if (!accepted && parked === null && await this.superviseBudget(turn.id, controller, fence, signal)) {
         return true;
       }
       if (parked === null && refreshedAt - turn.updatedAt >= CONTROLLER_STALL_MS) {
@@ -381,9 +381,10 @@ export class LunaControllerService {
       );
       if (!reconciliation) return "fatal";
       if (reconciliation.outcome === "stale") return "stale";
-      if (reconciliation.outcome === "limit_exceeded" || reconciliation.reconciliationIncomplete !== null) {
+      if (reconciliation.outcome === "limit_exceeded") {
         return "fatal";
       }
+      if (reconciliation.reconciliationIncomplete !== null) return "retry";
       if (reconciliation.targetSeq !== highWater) return "stale";
       return "ready";
     } catch (error) {
@@ -728,7 +729,8 @@ export class LunaControllerService {
     signal: AbortSignal,
   ): Promise<boolean> {
     const turn = this.dependencies.store.getControllerTurn(turnId);
-    if (!turn || turn.state !== "submitted" || controller.threadId === null) return false;
+    if (!turn || turn.state !== "submitted" || controller.threadId === null ||
+        this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
     const decision = evaluateSupervisor({
       toolCalls: turn.toolCalls,
       // Spend for *this* turn: the reported figure counts the whole thread,
@@ -740,6 +742,7 @@ export class LunaControllerService {
     });
     if (decision.kind === "continue") return false;
     if (decision.kind === "steer") {
+      if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
       if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
       try {
         await this.dependencies.adapter.steer(controller.threadId, decision.text, signal);
@@ -748,12 +751,14 @@ export class LunaControllerService {
         // hard budget still stops the turn, and the next poll may deliver it.
         return false;
       }
+      if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
       return this.dependencies.store.recordControllerSupervisorSteer({
         ...fenceAt(fence, this.dependencies.clock.now()),
         turnId,
         reason: decision.reason,
       });
     }
+    if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
     this.failAndRetire(
       turn,
       controller,

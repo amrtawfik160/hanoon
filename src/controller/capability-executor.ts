@@ -18,7 +18,7 @@ import type {
   ControllerEvidenceRecord,
   ControllerEvidenceOutcome,
 } from "../storage/controller-evidence-repository";
-import type { TelegramAgentStore } from "../storage/store";
+import type { TelegramAgentStore, ToolReceiptClaim } from "../storage/store";
 
 const MAX_SAFE_SUBJECTS = 16;
 const SAFE_SUBJECT_REF = /^(?:project|job|thread|monitor|memory|delegation|controller):[^\s:]{1,248}$/;
@@ -110,7 +110,6 @@ export type ControllerCapabilityExecutionErrorCode =
   | "receipt_invalid"
   | "result_limit_exceeded"
   | "evidence_projection_invalid"
-  | "receipt_persistence_failed"
   | "evidence_write_failed"
   | "final_result_invalid";
 
@@ -361,15 +360,66 @@ function receiptKey(
   };
 }
 
+type InvocationReservation = Readonly<{
+  key: ReturnType<typeof receiptKey> | null;
+  claim: ToolReceiptClaim | null;
+}>;
+
+function reserveInvocation(
+  dependencies: ControllerCapabilityDependencies,
+  authorized: AuthorizedControllerCapability,
+  input: ExecuteControllerCapabilityInput,
+): InvocationReservation {
+  if (input.descriptor.effect_class === "read") return { key: null, claim: null };
+  const key = receiptKey(authorized, input.descriptor, input.params);
+  const fence = currentFence(dependencies, authorized);
+  const claim = dependencies.store.claimToolReceipt({
+    ...key,
+    controllerKey: authorized.controller.controllerKey,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: fence.now,
+  });
+  if (claim.outcome === "finalized") {
+    throw new ControllerCapabilityAuthorizationError("turn_finalized");
+  }
+  if (claim.outcome === "fence_lost") {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
+  }
+  return { key, claim };
+}
+
+function releaseFreshInvocation(
+  dependencies: ControllerCapabilityDependencies,
+  authorized: AuthorizedControllerCapability,
+  reservation: InvocationReservation,
+): void {
+  if (reservation.key === null || reservation.claim?.outcome !== "fresh") return;
+  let fence: AuthorizedControllerCapability["fence"];
+  try {
+    fence = currentFence(dependencies, authorized);
+  } catch (error) {
+    if (error instanceof ControllerCapabilityAuthorizationError) return;
+    throw error;
+  }
+  dependencies.store.failToolReceipt({
+    ...reservation.key,
+    controllerKey: authorized.controller.controllerKey,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    error: "authorization_failed",
+    now: fence.now,
+  });
+}
+
 async function domainResultForExecution(
   dependencies: ControllerCapabilityDependencies,
   authorized: AuthorizedControllerCapability,
   input: ExecuteControllerCapabilityInput,
   resolution: ControllerCapabilityScopeResolution,
+  reservation: InvocationReservation,
 ): Promise<{ domainResult: ControllerJsonObject; replay: boolean; interrupted: boolean; key: ReturnType<typeof receiptKey> | null }> {
-  const key = input.descriptor.receipt_kind === "tool_receipt"
-    ? receiptKey(authorized, input.descriptor, input.params)
-    : null;
+  const { key } = reservation;
   if (key === null) {
     const rawDomainValue = await input.run(resolution);
     try {
@@ -378,11 +428,8 @@ async function domainResultForExecution(
       throw new ControllerCapabilityExecutionError("domain_result_invalid");
     }
   }
-  const claim = dependencies.store.claimToolReceipt({
-    ...key,
-    controllerKey: authorized.controller.controllerKey,
-    now: currentFence(dependencies, authorized).now,
-  });
+  const claim = reservation.claim;
+  if (claim === null) throw new ControllerCapabilityExecutionError("receipt_invalid");
   if (claim.outcome === "completed") {
     return { domainResult: parseReceiptDomainObject(claim.result), replay: true, interrupted: false, key };
   }
@@ -394,7 +441,15 @@ async function domainResultForExecution(
     rawDomainValue = await input.run(resolution);
   } catch (error) {
     if (input.descriptor.effect_class === "durable_local_write") {
-      dependencies.store.failToolReceipt({ ...key, error: "domain_operation_failed", now: dependencies.now() });
+      const fence = currentFence(dependencies, authorized);
+      dependencies.store.failToolReceipt({
+        ...key,
+        controllerKey: authorized.controller.controllerKey,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        error: "domain_operation_failed",
+        now: fence.now,
+      });
     }
     throw error;
   }
@@ -419,23 +474,42 @@ export async function executeControllerCapability(
     policyReadable: true,
     scope: { kind: input.descriptor.project_scope === "controller_global" ? "controller_global" : "exact_entity", entityRefs: [], matches: true },
   });
+  const reservation = reserveInvocation(dependencies, preliminary, input);
+  // Reserve before any asynchronous scope read so finalization cannot win the gap before the mutation.
   let resolution: ControllerCapabilityScopeResolution;
   try {
     resolution = input.resolveScope
       ? await input.resolveScope(preliminary)
       : { scope: input.scope ?? { kind: "exact_entity", entityRefs: [], matches: false } };
   } catch (error) {
+    releaseFreshInvocation(dependencies, preliminary, reservation);
     if (error instanceof ControllerCapabilityAuthorizationError) throw error;
     throw new ControllerCapabilityAuthorizationError("policy_unreadable");
   }
-  const authorized = authorizeControllerCapability(dependencies, {
-    ...input,
-    policyReadable: resolution.policyReadable ?? input.policyReadable ?? true,
-    scope: resolution.scope,
-  });
-  if (preliminary.turn.id !== authorized.turn.id) throw new ControllerCapabilityAuthorizationError("turn_missing");
-  currentFence(dependencies, authorized);
-  const execution = await domainResultForExecution(dependencies, authorized, input, resolution);
+  let authorized: AuthorizedControllerCapability;
+  try {
+    authorized = authorizeControllerCapability(dependencies, {
+      ...input,
+      policyReadable: resolution.policyReadable ?? input.policyReadable ?? true,
+      scope: resolution.scope,
+    });
+    if (preliminary.turn.id !== authorized.turn.id) {
+      throw new ControllerCapabilityAuthorizationError("turn_missing");
+    }
+    currentFence(dependencies, authorized);
+  } catch (error) {
+    releaseFreshInvocation(dependencies, preliminary, reservation);
+    throw error;
+  }
+  let execution: Awaited<ReturnType<typeof domainResultForExecution>>;
+  try {
+    execution = await domainResultForExecution(dependencies, authorized, input, resolution, reservation);
+  } catch (error) {
+    if (error instanceof ControllerCapabilityAuthorizationError) {
+      releaseFreshInvocation(dependencies, authorized, reservation);
+    }
+    throw error;
+  }
   let projection: ControllerCapabilityEvidenceProjection;
   try {
     const rawProjection = execution.interrupted
@@ -452,21 +526,10 @@ export async function executeControllerCapability(
   } catch {
     throw new ControllerCapabilityExecutionError("result_limit_exceeded");
   }
-  if (execution.key !== null && !execution.replay && !execution.interrupted) {
-    try {
-      dependencies.store.completeToolReceipt({
-        ...execution.key,
-        result: canonicalString(execution.domainResult),
-        now: dependencies.now(),
-      });
-    } catch {
-      throw new ControllerCapabilityExecutionError("receipt_persistence_failed");
-    }
-  }
   const fence = currentFence(dependencies, authorized);
   let evidenceWrite: ReturnType<TelegramAgentStore["recordControllerEvidence"]>;
   try {
-    evidenceWrite = dependencies.store.recordControllerEvidence({
+    const evidenceInput = {
       ...fence,
       turnId: authorized.turn.id,
       controllerKey: authorized.controller.controllerKey,
@@ -478,7 +541,16 @@ export async function executeControllerCapability(
       resultSha256: sha256ControllerJson(execution.domainResult),
       proofKinds: projection.proofKinds,
       subjectRefs: projection.subjectRefs,
-    });
+    } as const;
+    evidenceWrite = execution.key !== null && !execution.replay
+      ? dependencies.store.settleToolReceiptAndRecordEvidence({
+          ...evidenceInput,
+          toolName: input.descriptor.capability_id,
+          result: canonicalString(execution.domainResult),
+          receiptState: execution.interrupted ? "failed" : "completed",
+          receiptError: execution.interrupted ? "outcome_unknown" : null,
+        })
+      : dependencies.store.recordControllerEvidence(evidenceInput);
   } catch {
     throw new ControllerCapabilityExecutionError("evidence_write_failed");
   }

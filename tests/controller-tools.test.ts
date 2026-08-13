@@ -1322,14 +1322,18 @@ it.each([
     now: 10_100,
     turnId: turn.id,
   })).toBe(true);
-  bb.storage.database().exec(`
-    CREATE TRIGGER race_job_resolution AFTER INSERT ON tool_receipts
-    WHEN NEW.tool_name = '${toolName}'
-    BEGIN
-      UPDATE jobs SET state = '${racedState}', version = version + 1
-      WHERE id = 'controller_job_b';
-    END;
-  `);
+  const listControlJobs = store.listControlJobs.bind(store);
+  let raced = false;
+  vi.spyOn(store, "listControlJobs").mockImplementation((kind, limit) => {
+    const candidates = listControlJobs(kind, limit);
+    if (!raced) {
+      raced = true;
+      bb.storage.database().prepare(
+        "UPDATE jobs SET state = ?, version = version + 1 WHERE id = ?",
+      ).run(racedState, "controller_job_b");
+    }
+    return candidates;
+  });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
@@ -1364,13 +1368,18 @@ it.each([
   activate();
   const before = store.getJob("controller_job_exact");
   if (!before) throw new Error("exact race job was not created");
-  bb.storage.database().exec(`
-    CREATE TRIGGER race_exact_job_version AFTER INSERT ON tool_receipts
-    WHEN NEW.tool_name = '${toolName}'
-    BEGIN
-      UPDATE jobs SET version = version + 1 WHERE id = 'controller_job_exact';
-    END;
-  `);
+  const getJob = store.getJob.bind(store);
+  let raced = false;
+  vi.spyOn(store, "getJob").mockImplementation((jobId) => {
+    const job = getJob(jobId);
+    if (!raced && jobId === before.id) {
+      raced = true;
+      bb.storage.database().prepare(
+        "UPDATE jobs SET version = version + 1 WHERE id = ?",
+      ).run(before.id);
+    }
+    return job;
+  });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,

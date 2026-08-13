@@ -109,6 +109,7 @@ describe("controller finalization public contract", () => {
       "obligation_forbidden",
       "obligation_missing",
       "obligation_not_live",
+      "invocation_in_flight",
       "process_only",
       "high_impact_text_unclaimed",
     ]);
@@ -930,6 +931,10 @@ describe("fixed corrections", () => {
         segments: [{ type: "text", text: "I'll follow up with the result." }],
         obligationRefs: ["obligation:1"],
       }, emptyFinalizationContext())],
+      ["invocation_in_flight", validateControllerFinalization(
+        textFinalization("The answer is complete."),
+        emptyFinalizationContext({ invocationInFlight: true }),
+      )],
       ["process_only", validateControllerFinalization(textFinalization("I'll investigate."), emptyFinalizationContext())],
       ["high_impact_text_unclaimed", validateControllerFinalization(
         textFinalization("The fix is implemented."),

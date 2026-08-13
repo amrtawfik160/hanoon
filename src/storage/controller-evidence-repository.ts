@@ -102,6 +102,13 @@ export type ControllerEvidenceInput = ControllerLeaseFence & Readonly<{
   subjectRefs: readonly string[];
 }>;
 
+export type ControllerToolReceiptSettlementInput = ControllerEvidenceInput & Readonly<{
+  toolName: string;
+  result: string;
+  receiptState: "completed" | "failed";
+  receiptError: string | null;
+}>;
+
 export type ControllerNativeEvidenceCandidate = Readonly<{
   sourceName: string;
   sourceItemId: string;
@@ -186,6 +193,7 @@ type EvidenceInsertFields = Readonly<{
 }>;
 
 const MAX_EVIDENCE_ROWS = 128;
+const MAX_RECEIPT_RESULT_BYTES = 8_000;
 const MAX_PROOF_KINDS = 8;
 const MAX_SUBJECT_REFS = 16;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
@@ -227,6 +235,50 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
         this.markLimitExceeded(validated);
         return { outcome: "limit_exceeded" };
       }
+      const id = this.insertDirectEvidence({
+        ...validated,
+        sourceKind: "hanoon_tool",
+        sourceItemId: null,
+      });
+      return { outcome: "recorded", evidence: this.requiredEvidence(validated.turnId, id) };
+    }).immediate();
+  }
+
+  public settleToolReceiptAndRecordEvidence(
+    input: ControllerToolReceiptSettlementInput,
+  ): ControllerEvidenceWrite {
+    const validated = validatedDirectInput(input);
+    assertBoundedString(input.toolName, "toolName");
+    if (input.receiptState !== "completed" && input.receiptState !== "failed") {
+      throw new TypeError("receiptState is invalid");
+    }
+    if (typeof input.result !== "string" ||
+        Buffer.byteLength(input.result, "utf8") > MAX_RECEIPT_RESULT_BYTES) {
+      throw new TypeError("tool receipt result must be at most 8000 UTF-8 bytes");
+    }
+    if (input.receiptError !== null) assertBoundedString(input.receiptError, "receiptError");
+    return this.db.transaction((): ControllerEvidenceWrite => {
+      if (!this.fencedTurn(validated)) return { outcome: "stale" };
+      if (this.evidenceCount(validated.turnId) >= MAX_EVIDENCE_ROWS) {
+        this.markLimitExceeded(validated);
+        return { outcome: "limit_exceeded" };
+      }
+      const settled = this.db.prepare(
+        `UPDATE tool_receipts
+            SET state = ?, result_text = ?, last_error = ?, updated_at = ?
+          WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?
+            AND controller_key = ? AND state = 'started'`,
+      ).run(
+        input.receiptState,
+        input.receiptState === "completed" ? input.result : null,
+        input.receiptError,
+        input.now,
+        input.turnId,
+        input.toolName,
+        input.argsSha256,
+        input.controllerKey,
+      );
+      if (settled.changes !== 1) return { outcome: "stale" };
       const id = this.insertDirectEvidence({
         ...validated,
         sourceKind: "hanoon_tool",
@@ -452,12 +504,19 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     const ownerBoundaryPresent = this.ownerBoundaryPresent(input, turn);
     return {
       acceptedAlready: false,
+      invocationInFlight: this.startedToolReceipt(input.turnId),
       revisionCount,
       evidenceLimitExceeded: turn.evidence_limit_exceeded_at !== null,
       evidenceByRef,
       ownerBoundaryPresent,
       liveObligationRefs: this.liveObligationRefs(input.controllerKey),
     };
+  }
+
+  private startedToolReceipt(turnId: string): boolean {
+    return this.db.prepare(
+      "SELECT 1 FROM tool_receipts WHERE turn_id = ? AND state = 'started' LIMIT 1",
+    ).get(turnId) !== undefined;
   }
 
   private ownerBoundaryPresent(

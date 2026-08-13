@@ -337,6 +337,29 @@ it("accepts one evidence-bound candidate and makes it immutable", () => {
   ).get(turn.id)).toEqual({ count: 1 });
 });
 
+it("rejects finalization while a mutating invocation remains started", () => {
+  const fixture = submittedControllerFixture();
+  const argsSha256 = "a".repeat(64);
+  expect(fixture.store.claimToolReceipt({
+    turnId: fixture.turn.id,
+    toolName: "telegram_agent_remember",
+    argsSha256,
+    controllerKey: fixture.turn.controllerKey,
+    now: fixture.fence.now,
+  })).toEqual({ outcome: "fresh" });
+
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: plainFinalization(),
+  })).toMatchObject({ outcome: "rejected", code: "invocation_in_flight" });
+  expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+  expect(fixture.store.listToolReceipts(fixture.turn.id)).toMatchObject([
+    { toolName: "telegram_agent_remember", state: "started" },
+  ]);
+});
+
 it("allows eight rejected revisions and inserts no ninth row", () => {
   const { store, turn, fence, db } = submittedControllerFixture();
   for (let revision = 1; revision <= 8; revision += 1) {

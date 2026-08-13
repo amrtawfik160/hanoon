@@ -92,6 +92,7 @@ import {
   type AcceptedControllerFinalization,
   type ControllerEvidenceInput,
   type ControllerEvidenceRecord,
+  type ControllerToolReceiptSettlementInput,
   type ControllerEvidenceWrite,
   type ControllerFinalizationProposalInput,
   type ControllerFinalizationProposalResult,
@@ -246,7 +247,16 @@ export type ToolReceiptKey = {
 export type ToolReceiptClaim =
   | { outcome: "fresh" }
   | { outcome: "completed"; result: string }
-  | { outcome: "interrupted" };
+  | { outcome: "interrupted" }
+  | { outcome: "finalized" }
+  | { outcome: "fence_lost" };
+
+export type ToolReceiptClaimInput = ToolReceiptKey & Readonly<{
+  controllerKey: string;
+  now: number;
+  ownerId?: string;
+  generation?: number;
+}>;
 
 export type ControllerGeneration = {
   id: string;
@@ -1728,6 +1738,9 @@ export interface TelegramAgentStore {
     input: ControllerLeaseFence & Readonly<{ turnId: string }>,
   ): boolean;
   recordControllerEvidence(input: ControllerEvidenceInput): ControllerEvidenceWrite;
+  settleToolReceiptAndRecordEvidence(
+    input: ControllerToolReceiptSettlementInput,
+  ): ControllerEvidenceWrite;
   recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite;
@@ -1884,9 +1897,15 @@ export interface TelegramAgentStore {
   }): boolean;
   listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[];
   getPendingControllerTurn(controllerKey: string): ControllerTurnRecord | null;
-  claimToolReceipt(input: ToolReceiptKey & { controllerKey: string; now: number }): ToolReceiptClaim;
+  claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim;
   completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void;
-  failToolReceipt(input: ToolReceiptKey & { error: string; now: number }): void;
+  failToolReceipt(input: ToolReceiptKey & Readonly<{
+    error: string;
+    now: number;
+    controllerKey?: string;
+    ownerId?: string;
+    generation?: number;
+  }>): void;
   listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[];
   listControllerGenerations(controllerKey: string, limit: number): ControllerGeneration[];
   createMonitor(input: {
@@ -3294,6 +3313,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.controllerEvidenceRepository.record(input);
   }
 
+  public settleToolReceiptAndRecordEvidence(
+    input: ControllerToolReceiptSettlementInput,
+  ): ControllerEvidenceWrite {
+    return this.controllerEvidenceRepository.settleToolReceiptAndRecordEvidence(input);
+  }
+
   public recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite {
@@ -4471,18 +4496,46 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   // Reserving before the call is what makes replay safe: a crash mid-tool leaves
   // a 'started' receipt, which is reported as uncertain rather than repeated.
-  public claimToolReceipt(input: ToolReceiptKey & { controllerKey: string; now: number }): ToolReceiptClaim {
+  public claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim {
     assertControllerKey(input.controllerKey);
     assertControllerIdentifier(input.turnId, "turnId");
     assertControllerIdentifier(input.toolName, "toolName");
     assertSha256Hex(input.argsSha256);
     assertNonNegativeInteger(input.now, "now");
+    const hasFence = input.ownerId !== undefined || input.generation !== undefined;
+    if (hasFence) {
+      if (input.ownerId === undefined || input.generation === undefined) {
+        throw new TypeError("tool receipt reservation fence is incomplete");
+      }
+      assertControllerIdentifier(input.ownerId, "ownerId");
+      assertNonNegativeInteger(input.generation, "generation");
+    }
 
     return this.db.transaction((): ToolReceiptClaim => {
+      const turn = this.db.prepare(
+        `SELECT controller_key, state, lease_owner, lease_generation, accepted_finalization_id
+           FROM controller_turns WHERE id = ?`,
+      ).get(input.turnId) as {
+        controller_key: string;
+        state: string;
+        lease_owner: string | null;
+        lease_generation: number | null;
+        accepted_finalization_id: number | null;
+      } | undefined;
+      if (turn && turn.accepted_finalization_id !== null) {
+        return { outcome: "finalized" };
+      }
+      if (hasFence && (
+        !turn || turn.controller_key !== input.controllerKey || turn.state !== "submitted" ||
+        turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation ||
+        !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)
+      )) return { outcome: "fence_lost" };
       const existing = this.db.prepare(
-        "SELECT state, result_text FROM tool_receipts WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?",
+        `SELECT state, result_text, controller_key FROM tool_receipts
+          WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?`,
       ).get(input.turnId, input.toolName, input.argsSha256) as
-        { state: string; result_text: string | null } | undefined;
+        { state: string; result_text: string | null; controller_key: string } | undefined;
+      if (existing && existing.controller_key !== input.controllerKey) return { outcome: "fence_lost" };
       if (existing?.state === "completed") {
         return { outcome: "completed", result: existing.result_text ?? "" };
       }
@@ -4518,12 +4571,37 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (completed.changes !== 1) throw new Error("exact started tool receipt was not completed");
   }
 
-  public failToolReceipt(input: ToolReceiptKey & { error: string; now: number }): void {
+  public failToolReceipt(input: ToolReceiptKey & Readonly<{
+    error: string;
+    now: number;
+    controllerKey?: string;
+    ownerId?: string;
+    generation?: number;
+  }>): void {
     assertNonNegativeInteger(input.now, "now");
+    const hasFence = input.ownerId !== undefined || input.generation !== undefined;
+    if (hasFence && (
+      input.ownerId === undefined || input.generation === undefined || input.controllerKey === undefined
+    )) {
+      throw new TypeError("tool receipt failure fence is incomplete");
+    }
+    if (hasFence) assertControllerKey(input.controllerKey!);
+    if (hasFence && !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)) return;
+    const fencePredicate = hasFence
+      ? ` AND EXISTS (
+           SELECT 1 FROM controller_turns
+            WHERE id = ? AND controller_key = ? AND state = 'submitted'
+              AND lease_owner = ? AND lease_generation = ? AND accepted_finalization_id IS NULL
+         )`
+      : "";
+    const parameters = hasFence
+      ? [input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256,
+          input.turnId, input.controllerKey, input.ownerId!, input.generation!]
+      : [input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256];
     this.db.prepare(
       `UPDATE tool_receipts SET state = 'failed', last_error = ?, updated_at = ?
-        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'`,
-    ).run(input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256);
+        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'${fencePredicate}`,
+    ).run(...parameters);
   }
 
   public listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[] {
