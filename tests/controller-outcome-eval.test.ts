@@ -319,6 +319,26 @@ it("never relabels an unlike pair as comparable, and fails the release gate inst
   expect(evaluation.exitCode).toBe(1);
 }, EVAL_TIMEOUT_MS);
 
+it("exits nonzero when trials disagree about the outer task-tool surface", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const named = { ...trial, harness: { ...trial.harness, hanoonCommit: "a".repeat(40) } };
+  expect(named.harness.outerTaskTools).toEqual([]);
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline", trials: 1, seed: 8122026, output: evaluationOutput(), replace: false,
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [named, {
+      ...named,
+      trial: 2,
+      harness: { ...named.harness, outerTaskTools: ["shell"] },
+    }],
+  });
+
+  expect(evaluation.identityGateFailed).toBe(true);
+  expect(evaluation.exitCode).toBe(1);
+}, EVAL_TIMEOUT_MS);
+
 it("refuses to release against a baseline whose metrics were never established", async () => {
   const runner = await runnerModule();
   const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });

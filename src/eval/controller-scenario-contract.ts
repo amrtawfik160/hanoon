@@ -21,6 +21,14 @@ export const controllerHarnessIdentitySchema = z.object({
   contextSha256: sha256Schema,
   advertisedTools: z.array(z.string().min(1).max(128)).max(64),
   parameterSchemaSha256: z.record(z.string().min(1).max(128), sha256Schema),
+  /**
+   * The tools the agent could reach *outside* the controller — the task
+   * surface, not Hanoon's own capabilities. Changing it changes the task, so
+   * unlike the controller manifest this is a fixed condition a comparison must
+   * hold constant rather than an intervention to be disclosed.
+   */
+  outerTaskTools: z.array(z.string().min(1).max(128)).max(64)
+    .refine(unique, "outer task tools must be unique"),
 }).strict();
 
 export const controllerTrialBudgetSchema = z.object({
@@ -174,17 +182,23 @@ function hasDuplicateTrialPairs(trials: readonly ControllerScenarioTrial[]): boo
 }
 
 /**
- * What a single trial amounts to. Every layer the scenario declared as required
- * counts: a trial whose trace or required answer failed did not do what the
- * scenario asked, whatever its outcome grader concluded, and neither did one
- * that only got there by running past its budget. Metrics that could not be
- * established leave the trial unproven rather than passed.
+ * What a single trial amounts to. The outcome layer is the verdict: its failure
+ * is a failed trial and nothing in trace or answer can average that away. A
+ * failed trace or answer is diagnostic — it says the run is worth looking at,
+ * not that the agent got the wrong result — so it never turns an outcome pass
+ * into a failure. Any incomplete layer leaves the trial unproven, and a
+ * `not_applicable` answer is neither failure nor incomplete.
+ *
+ * Budget is the one addition to those three layers: a run that only finished by
+ * going past its budget did not pass on the terms it was given. Any other
+ * terminal metric failure means the trial could not be established at all.
  */
 function trialClassification(trial: ControllerScenarioTrial): "passed" | "failed" | "incomplete" {
-  const grades = [trial.outcome, trial.trace, trial.answer];
-  if (grades.some((grade) => grade.status === "failed")) return "failed";
+  if (trial.outcome.status === "failed") return "failed";
   if (trial.metrics.terminalFailureClass === BUDGET_EXCEEDED) return "failed";
-  if (grades.some((grade) => grade.status === "incomplete")) return "incomplete";
+  if ([trial.outcome, trial.trace, trial.answer].some((grade) => grade.status === "incomplete")) {
+    return "incomplete";
+  }
   if (trial.metrics.terminalFailureClass !== null) return "incomplete";
   return "passed";
 }
@@ -323,6 +337,9 @@ function interventionOf(report: ControllerEvaluationReport): z.infer<typeof inte
  */
 function fixedConditions(trial: ControllerScenarioTrial): string {
   return JSON.stringify({
+    // The outer task surface belongs here, not to the intervention: it is what
+    // the agent could reach beyond Hanoon, and changing it changes the task.
+    outerTaskTools: [...trial.harness.outerTaskTools].sort(),
     provider: trial.harness.provider,
     model: trial.harness.model,
     reasoningLevel: trial.harness.reasoningLevel,
@@ -368,16 +385,25 @@ export function compareControllerEvaluations(input: {
     const conditions = new Set([...baselineTrials, ...currentTrials].map(fixedConditions));
     const conditionsMatch = conditions.size === 1;
     if (!conditionsMatch) reasons.push(`${scenarioId}: fixed conditions differ`);
+    // Named on its own so the report says *which* condition moved, rather than
+    // leaving the reader to diff two identity blocks.
+    const outerToolSurfaces = new Set(
+      [...baselineTrials, ...currentTrials].map((trial) => JSON.stringify([...trial.harness.outerTaskTools].sort())),
+    );
+    const outerToolsMatch = outerToolSurfaces.size === 1;
+    if (!outerToolsMatch) reasons.push(`${scenarioId}: outer task tools differ`);
     // A side whose metrics were never established did not score 0 on merit: it
-    // was never scored. Reading the other side's rate against it would present
-    // the gap as behaviour, so measurement availability is itself a condition
-    // the two sides must share.
+    // was never scored. Both sides must actually be measured — two unmeasured
+    // runs agree with each other and still support no comparison at all.
     const baselineMeasured = trialsAreMeasured(baselineTrials);
     const currentMeasured = trialsAreMeasured(currentTrials);
-    if (baselineMeasured !== currentMeasured) {
-      reasons.push(`${scenarioId}: ${baselineMeasured ? "current" : "baseline"} metrics unavailable`);
+    if (!baselineMeasured || !currentMeasured) {
+      const missing = !baselineMeasured && !currentMeasured
+        ? "baseline and current"
+        : baselineMeasured ? "current" : "baseline";
+      reasons.push(`${scenarioId}: ${missing} metrics unavailable`);
     }
-    const comparable = conditionsMatch && baselineMeasured === currentMeasured;
+    const comparable = conditionsMatch && outerToolsMatch && baselineMeasured && currentMeasured;
     const baselineRate = scenarioRate(baselineTrials);
     const currentRate = scenarioRate(currentTrials);
     scenarios.push({

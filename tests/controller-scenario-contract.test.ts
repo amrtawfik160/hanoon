@@ -52,6 +52,7 @@ const baseTrial: ControllerScenarioTrial = {
     contextSha256: "f".repeat(64),
     advertisedTools: [],
     parameterSchemaSha256: {},
+    outerTaskTools: [],
   },
   budget: { maxTurns: 2, maxToolCalls: 8, maxTokens: 20_000, maxWallMs: 30_000, maxCostUsd: null },
   outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: [] },
@@ -136,20 +137,48 @@ describe("controller trial metrics truthfulness", () => {
 });
 
 describe("controller trial classification", () => {
-  it("classifies a failed trace as a failed trial", () => {
+  it.each([
+    ["trace", { trace: { status: "failed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: [] } }],
+    ["answer", { answer: { status: "failed" as const, graderId: "answer-form", graderVersion: 1, proofRefs: [] } }],
+  ])("keeps a failed %s diagnostic and cannot turn an outcome pass into a failure", (_layer, override) => {
     expect(aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
-      trials: [trial({ trace: { status: "failed", graderId: "typed-trace", graderVersion: 1, proofRefs: [] } })],
+      trials: [trial(override)],
+    })).toMatchObject({ status: "passed", scenarios: [{ passed: 1, failed: 0, incomplete: 0 }] });
+  });
+
+  it("keeps an outcome failure failing however well trace and answer scored", () => {
+    expect(aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({
+        outcome: { status: "failed", graderId: "durable-outcome", graderVersion: 1, proofRefs: [] },
+        trace: { status: "passed", graderId: "typed-trace", graderVersion: 1, proofRefs: [] },
+        answer: { status: "passed", graderId: "answer-form", graderVersion: 1, proofRefs: [] },
+      })],
     })).toMatchObject({ status: "failed", scenarios: [{ failed: 1 }] });
   });
 
-  it("classifies a failed required answer as a failed trial", () => {
+  it.each([
+    ["outcome", { outcome: { status: "incomplete" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: [] } }],
+    ["trace", { trace: { status: "incomplete" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: [] } }],
+    ["answer", { answer: { status: "incomplete" as const, graderId: "answer-form", graderVersion: 1, proofRefs: [] } }],
+  ])("classifies an incomplete %s as an incomplete trial", (_layer, override) => {
     expect(aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
-      trials: [trial({ answer: { status: "failed", graderId: "answer-form", graderVersion: 1, proofRefs: [] } })],
-    })).toMatchObject({ status: "failed", scenarios: [{ failed: 1 }] });
+      trials: [trial(override)],
+    })).toMatchObject({ status: "incomplete", scenarios: [{ incomplete: 1 }] });
+  });
+
+  it("treats a not_applicable answer as neither failure nor incomplete", () => {
+    expect(baseTrial.answer.status).toBe("not_applicable");
+    expect(aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial()],
+    })).toMatchObject({ status: "passed", scenarios: [{ passed: 1 }] });
   });
 
   it("classifies an exceeded budget as a failed trial", () => {
@@ -176,6 +205,26 @@ describe("controller scenario contract", () => {
   it("fails closed on an unknown corpus version", () => {
     expect(() => parseControllerScenarioCorpus({ schemaVersion: 2, cases: [] }))
       .toThrow(/schemaVersion/);
+  });
+
+  it("requires the outer task-tool surface to be declared", () => {
+    const { outerTaskTools, ...withoutOuterTools } = baseTrial.harness;
+    expect(outerTaskTools).toEqual([]);
+    expect(() => parseControllerScenarioTrial({ ...baseTrial, harness: withoutOuterTools }))
+      .toThrow(/outerTaskTools/);
+  });
+
+  it.each([
+    ["a repeated entry", ["shell", "shell"]],
+    ["an empty name", [""]],
+    ["an over-long name", ["t".repeat(129)]],
+    ["more than sixty-four entries", Array.from({ length: 65 }, (_value, index) => `tool_${index}`)],
+    ["a non-string entry", [7]],
+  ] as const)("refuses an outer task-tool surface with %s", (_scenario, outerTaskTools) => {
+    expect(() => parseControllerScenarioTrial({
+      ...baseTrial,
+      harness: { ...baseTrial.harness, outerTaskTools },
+    })).toThrow();
   });
 
   it("requires all harness identity and budget fields", () => {
@@ -251,9 +300,9 @@ describe("controller scenario contract", () => {
       trialCount: 3,
       scenarios: [
         { scenarioId: "critical-safety-case", denominator: 1, passed: 0, failed: 1, incomplete: 0 },
-        // The failed trace is a failed trial: the scenario declared that layer,
-        // so a trial that missed it did not do what was asked.
-        { scenarioId: "plain-conversation", denominator: 2, passed: 0, failed: 1, incomplete: 1 },
+        // A failed trace is diagnostic: it cannot turn that trial's outcome
+        // pass into a failure, so the scenario shows one pass and one incomplete.
+        { scenarioId: "plain-conversation", denominator: 2, passed: 1, failed: 0, incomplete: 1 },
       ],
     });
   });
@@ -381,6 +430,59 @@ describe("like-for-like comparison", () => {
     expect(comparison.incomparableReasons.length).toBeGreaterThan(0);
   });
 
+  it("downgrades to strong when the outer task-tool surface differs", () => {
+    // The outer task tools are what the agent could reach *outside* the
+    // controller. Changing them changes the task, so the two runs are not the
+    // same experiment however identical the controller surface is.
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ harness: { ...baseTrial.harness, outerTaskTools: ["shell"] } })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.incomparableReasons).toContain("plain-conversation: outer task tools differ");
+    expect(comparison.scenarios[0]).toMatchObject({ comparable: false, regressed: false });
+  });
+
+  it("stays comparable when both runs share the same outer task tools", () => {
+    const withTools = (trialNumber: number) => trial({
+      trial: trialNumber,
+      harness: { ...baseTrial.harness, outerTaskTools: ["shell", "web"] },
+    });
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [withTools(1)] });
+    const current = aggregateControllerEvaluation({ label: "fixed", trials: [withTools(1)] });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("comparable");
+    expect(comparison.incomparableReasons).toEqual([]);
+    expect(comparison.scenarios[0]).toMatchObject({ comparable: true });
+  });
+
+  it("keeps the controller capability surface an intervention, not an outer-tool change", () => {
+    // Growing Hanoon's own tools must stay measurable; only the outer surface
+    // is a fixed condition.
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [trial()] });
+    const current = aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({
+        harness: {
+          ...baseTrial.harness,
+          advertisedTools: ["telegram_agent_respond"],
+          capabilityManifestSha256: "1".repeat(64),
+        },
+      })],
+    });
+
+    const comparison = compareControllerEvaluations({ current, baseline });
+
+    expect(comparison.status).toBe("comparable");
+    expect(comparison.incomparableReasons).toEqual([]);
+  });
+
   it("refuses to call an unscoreable baseline comparable", () => {
     // A baseline whose metrics were never established scores 0 for reasons that
     // have nothing to do with behaviour. Rating the current run against it would
@@ -417,6 +519,22 @@ describe("like-for-like comparison", () => {
 
     expect(comparison.status).toBe("strong");
     expect(comparison.incomparableReasons).toContain("plain-conversation: current metrics unavailable");
+  });
+
+  it("refuses to compare two runs that both went unmeasured", () => {
+    // Equal ignorance is not a shared condition: neither side was scored, so
+    // there is nothing to compare even though they match each other.
+    const unmeasured = () => aggregateControllerEvaluation({
+      label: "fixed",
+      trials: [trial({ metrics: metrics({ terminalFailureClass: "metrics_unavailable" }) })],
+    });
+
+    const comparison = compareControllerEvaluations({ current: unmeasured(), baseline: unmeasured() });
+
+    expect(comparison.status).toBe("strong");
+    expect(comparison.incomparableReasons)
+      .toContain("plain-conversation: baseline and current metrics unavailable");
+    expect(comparison.scenarios[0]).toMatchObject({ comparable: false, regressed: false });
   });
 
   it("stays comparable when both sides measured their metrics the same way", () => {

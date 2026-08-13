@@ -177,6 +177,10 @@ function harnessIdentity(input: {
     contextSha256: contextSha256(input),
     advertisedTools: input.toolSurface.advertisedTools,
     parameterSchemaSha256: input.toolSurface.parameterSchemaSha256,
+    // Empty as a measured fact, not as a placeholder: this harness drives the
+    // registered controller path directly, with no outer agent and therefore no
+    // task tools outside Hanoon's own capabilities for it to reach.
+    outerTaskTools: [],
   };
 }
 
