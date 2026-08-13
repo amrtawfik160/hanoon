@@ -22,12 +22,10 @@ function hasUnsafeCallbackMaterial(text: string): boolean {
  * keyword screen would see.
  */
 const CLI_CREDENTIAL_FLAG = [
-  // The value may be attached (`-ualice:hunter2`, `-phunter2`), separated, or
-  // joined with `=`. Attached is the form that reads least like a secret and is
-  // exactly why it has to be covered.
   // Attached (`-ualice:hunter2`), joined (`-u=alice`), or separated (`-u alice`).
-  // A separated value that is itself a flag is not a credential, so `-p -h db`
-  // stays readable while `-phunter2` does not.
+  // Attached is the form that reads least like a secret, which is exactly why it
+  // has to be covered. A separated value that is itself a flag is not a
+  // credential, so `-p -h db` stays readable while `-phunter2` does not.
   /(?:^|\s)-[up](?:=\S+|[^\s=-]\S*|\s+[^\s-]\S*)/,
   // The long form stays delimiter-bound. Without that, any option whose name
   // merely begins with one of these words — `--user-agent`, `--passthrough` —

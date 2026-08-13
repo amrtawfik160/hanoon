@@ -339,8 +339,12 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
   const logged: string[] = [];
   const consoleMethods = ["log", "info", "warn", "error", "debug", "trace"] as const;
   const originalConsole = consoleMethods.map((method) => [method, console[method]] as const);
-  const originalStdout = process.stdout.write.bind(process.stdout);
-  const originalStderr = process.stderr.write.bind(process.stderr);
+  // The exact method objects, not bound wrappers: restoring a wrapper would
+  // leave a different function on the global stream, which is a mutation this
+  // test has no business making. Nothing here calls them, so no binding is
+  // needed either.
+  const originalStdout = process.stdout.write;
+  const originalStderr = process.stderr.write;
   for (const method of consoleMethods) {
     console[method] = ((...parts: unknown[]) => { logged.push(parts.map(String).join(" ")); }) as typeof console.log;
   }
@@ -357,6 +361,11 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     process.stderr.write = originalStderr;
   }
   expect(reconciled).toBe(true);
+  // Restored by identity, not merely by behaviour: this test must leave the
+  // global streams and console exactly as it found them.
+  expect(process.stdout.write).toBe(originalStdout);
+  expect(process.stderr.write).toBe(originalStderr);
+  for (const [method, original] of originalConsole) expect(console[method]).toBe(original);
   // The observer is demonstrably live, so the absence checks below mean something.
   expect(logged.join("\n")).toContain(canary);
 
