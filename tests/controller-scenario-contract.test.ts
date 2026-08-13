@@ -57,12 +57,120 @@ const baseTrial: ControllerScenarioTrial = {
   outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: [] },
   trace: { status: "passed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: [] },
   answer: { status: "not_applicable" as const, graderId: "answer-form", graderVersion: 1, proofRefs: [] },
-  metrics: { wallMs: 1, tokens: 0, costUsd: null, terminalFailureClass: null },
+  metrics: {
+    wallMs: 12,
+    turns: 1,
+    toolCalls: 2,
+    tokens: 0,
+    tokenAccounting: "no_provider_fixed_harness" as const,
+    costUsd: null,
+    costAccounting: "no_cost_budget" as const,
+    terminalFailureClass: null,
+  },
 };
 
 function trial(overrides: Partial<ControllerScenarioTrial> = {}): ControllerScenarioTrial {
   return { ...baseTrial, ...overrides };
 }
+
+function metrics(overrides: Partial<ControllerScenarioTrial["metrics"]> = {}): ControllerScenarioTrial["metrics"] {
+  return { ...baseTrial.metrics, ...overrides };
+}
+
+describe("controller trial metrics truthfulness", () => {
+  it("requires every metric a budget bounds", () => {
+    const { turns, ...withoutTurns } = baseTrial.metrics;
+    expect(turns).toBe(1);
+    expect(() => parseControllerScenarioTrial({ ...baseTrial, metrics: withoutTurns })).toThrow(/turns/);
+    const { toolCalls, ...withoutToolCalls } = baseTrial.metrics;
+    expect(toolCalls).toBe(2);
+    expect(() => parseControllerScenarioTrial({ ...baseTrial, metrics: withoutToolCalls })).toThrow(/toolCalls/);
+  });
+
+  it("allows zero tokens only with explicit no-provider provenance", () => {
+    expect(() => parseControllerScenarioTrial({
+      ...baseTrial,
+      metrics: metrics({ tokens: 0, tokenAccounting: "provider_reported" }),
+    })).toThrow(/token/i);
+    expect(parseControllerScenarioTrial({
+      ...baseTrial,
+      metrics: metrics({ tokens: 4_000, tokenAccounting: "provider_reported" }),
+    }).metrics.tokens).toBe(4_000);
+  });
+
+  it("refuses a nonzero token count claimed under fixed-harness provenance", () => {
+    expect(() => parseControllerScenarioTrial({
+      ...baseTrial,
+      metrics: metrics({ tokens: 4_000, tokenAccounting: "no_provider_fixed_harness" }),
+    })).toThrow(/token/i);
+  });
+
+  it("allows a null cost only when the budget sets no cost ceiling", () => {
+    expect(() => parseControllerScenarioTrial({
+      ...baseTrial,
+      budget: { ...baseTrial.budget, maxCostUsd: 5 },
+      metrics: metrics({ costUsd: null, costAccounting: "no_cost_budget" }),
+    })).toThrow(/cost/i);
+    expect(parseControllerScenarioTrial({
+      ...baseTrial,
+      budget: { ...baseTrial.budget, maxCostUsd: 5 },
+      metrics: metrics({ costUsd: 0.25, costAccounting: "provider_reported" }),
+    }).metrics.costUsd).toBe(0.25);
+  });
+
+  it.each([
+    ["turns", { turns: 3 }],
+    ["tool calls", { toolCalls: 9 }],
+    ["wall time", { wallMs: 30_001 }],
+  ] as const)("refuses a trial that exceeded its %s without saying so", (_scenario, exceeded) => {
+    expect(() => parseControllerScenarioTrial({
+      ...baseTrial,
+      metrics: metrics({ ...exceeded, terminalFailureClass: null }),
+    })).toThrow(/budget/i);
+    expect(parseControllerScenarioTrial({
+      ...baseTrial,
+      outcome: { ...baseTrial.outcome, status: "failed" },
+      metrics: metrics({ ...exceeded, terminalFailureClass: "budget_exceeded" }),
+    }).metrics.terminalFailureClass).toBe("budget_exceeded");
+  });
+});
+
+describe("controller trial classification", () => {
+  it("classifies a failed trace as a failed trial", () => {
+    expect(aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({ trace: { status: "failed", graderId: "typed-trace", graderVersion: 1, proofRefs: [] } })],
+    })).toMatchObject({ status: "failed", scenarios: [{ failed: 1 }] });
+  });
+
+  it("classifies a failed required answer as a failed trial", () => {
+    expect(aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({ answer: { status: "failed", graderId: "answer-form", graderVersion: 1, proofRefs: [] } })],
+    })).toMatchObject({ status: "failed", scenarios: [{ failed: 1 }] });
+  });
+
+  it("classifies an exceeded budget as a failed trial", () => {
+    expect(aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({
+        outcome: { ...baseTrial.outcome, status: "failed" },
+        metrics: metrics({ turns: 3, terminalFailureClass: "budget_exceeded" }),
+      })],
+    })).toMatchObject({ status: "failed", scenarios: [{ failed: 1 }] });
+  });
+
+  it("classifies an unavailable required metric as incomplete rather than passed", () => {
+    expect(aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      trials: [trial({ metrics: metrics({ terminalFailureClass: "metrics_unavailable" }) })],
+    })).toMatchObject({ status: "incomplete", scenarios: [{ incomplete: 1 }] });
+  });
+});
 
 describe("controller scenario contract", () => {
   it("fails closed on an unknown corpus version", () => {
@@ -119,7 +227,7 @@ describe("controller scenario contract", () => {
     })).toThrow(/generatedAt/);
   });
 
-  it("reports hand-derived scenario summaries and keeps diagnostic failures non-authoritative", () => {
+  it("reports hand-derived scenario summaries counting every declared layer", () => {
     const report = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
@@ -143,7 +251,9 @@ describe("controller scenario contract", () => {
       trialCount: 3,
       scenarios: [
         { scenarioId: "critical-safety-case", denominator: 1, passed: 0, failed: 1, incomplete: 0 },
-        { scenarioId: "plain-conversation", denominator: 2, passed: 1, failed: 0, incomplete: 1 },
+        // The failed trace is a failed trial: the scenario declared that layer,
+        // so a trial that missed it did not do what was asked.
+        { scenarioId: "plain-conversation", denominator: 2, passed: 0, failed: 1, incomplete: 1 },
       ],
     });
   });

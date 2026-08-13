@@ -12,11 +12,13 @@ import { ControllerInteractionService } from "../../src/controller/interaction-s
 import { ControllerInteractionRepository } from "../../src/storage/controller-interaction-repository";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../../src/controller/execution-profile";
 import { threadDecisionToken } from "../../src/controller/questions";
+import { composeControllerInstructions } from "../../src/controller/instructions";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../../src/controller/tools";
 import { ControllerCapabilityAuthorizationError } from "../../src/controller/capability-executor";
 import { TelegramIngress } from "../../src/telegram/ingress";
 import type { SendMessagePayload, TelegramUpdate } from "../../src/telegram/types";
 import {
+  BUDGET_EXCEEDED,
   controllerCheckpointCases,
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
@@ -101,28 +103,79 @@ function parseJobStatusProjection(result: unknown): JobStatusProjection {
   return { id, state, serialized: result };
 }
 
-function harnessIdentity(
-  scenarioCase: ScenarioCase,
-  trial: number,
-  seed: number,
-  toolSurface: ReturnType<typeof registeredToolSurface>,
-): ControllerScenarioTrial["harness"] {
-  const fixture = `${scenarioCase.id}:${trial}:${seed}`;
+/**
+ * The digest of the project policies actually stored for this trial, in a
+ * canonical order so two runs over the same policies agree and a changed policy
+ * cannot pass for the same conditions.
+ */
+function durablePolicySha256(store: TelegramAgentStore): string {
+  const policies = store.listEnabledProjectPolicies()
+    .map((record) => record.policy)
+    .sort((left, right) => left.projectId.localeCompare(right.projectId));
+  return sha256(canonicalJson(policies));
+}
+
+/**
+ * Everything that varies the conditions of one trial. Its digest has to move
+ * when any of them move, or two different runs would claim to be the same run.
+ */
+function contextSha256(input: {
+  scenarioCase: ScenarioCase;
+  trial: number;
+  seed: number;
+  phase: Partial<ThreadPhase>;
+}): string {
+  return sha256(canonicalJson({
+    scenarioId: input.scenarioCase.id,
+    scenarioVersion: input.scenarioCase.scenarioVersion,
+    checkpoint: input.scenarioCase.checkpoint,
+    ownerMessage: input.scenarioCase.ownerMessage,
+    budget: input.scenarioCase.budget,
+    trial: input.trial,
+    seed: input.seed,
+    phase: {
+      status: input.phase.status ?? null,
+      maxSeq: input.phase.maxSeq ?? null,
+      events: (input.phase.events ?? []) as unknown,
+      interaction: (input.phase.interaction ?? null) as unknown,
+    },
+  }));
+}
+
+/**
+ * What this trial actually ran under. Every digest here is taken from the real
+ * artefact rather than from a literal standing in for it: a changed instruction
+ * block, overlay, policy, or execution profile moves the identity, which is the
+ * only thing that stops two unlike runs from being compared as like for like.
+ */
+function harnessIdentity(input: {
+  scenarioCase: ScenarioCase;
+  trial: number;
+  seed: number;
+  toolSurface: ReturnType<typeof registeredToolSurface>;
+  store: TelegramAgentStore;
+  phase: Partial<ThreadPhase>;
+}): ControllerScenarioTrial["harness"] {
+  const overlay = input.store.getControllerOverlay();
+  const execution = DEFAULT_CONTROLLER_EXECUTION_PROFILE;
   return {
     hanoonCommit: process.env.HANOON_EVAL_COMMIT ?? "0".repeat(40),
     dirty: process.env.HANOON_EVAL_DIRTY === "true",
+    // No provider runs in this corpus: the controller half is the plugin's own
+    // registered path against the fake BB host, and saying so is what keeps the
+    // report from reading as a provider measurement.
     provider: "fake-bb",
     model: "scripted-controller",
     reasoningLevel: "not_applicable",
     serviceTier: "not_applicable",
-    permissionMode: "auto",
-    instructionSha256: sha256("fixed-controller-scenario-instruction-v1"),
-    overlaySha256: sha256(""),
-    capabilityManifestSha256: toolSurface.capabilityManifestSha256,
-    policySha256: sha256("baseline-no-project-policy"),
-    contextSha256: sha256(fixture),
-    advertisedTools: toolSurface.advertisedTools,
-    parameterSchemaSha256: toolSurface.parameterSchemaSha256,
+    permissionMode: execution.permissionMode,
+    instructionSha256: sha256(composeControllerInstructions(overlay)),
+    overlaySha256: sha256(overlay ?? ""),
+    capabilityManifestSha256: input.toolSurface.capabilityManifestSha256,
+    policySha256: durablePolicySha256(input.store),
+    contextSha256: contextSha256(input),
+    advertisedTools: input.toolSurface.advertisedTools,
+    parameterSchemaSha256: input.toolSurface.parameterSchemaSha256,
   };
 }
 
@@ -256,11 +309,17 @@ function scenarioFixture(fixtureId: string, phaseOverrides: Partial<ThreadPhase>
     clock: { now: () => FIXTURE_NOW },
   });
 
-  const callTool = (name: string, args: Record<string, unknown>) =>
-    harness.behavior.callAgentTool(name, args, { threadId: THREAD_ID, projectId: PROJECT_ID });
+  // Counted here rather than inferred later: this is the only door a scenario
+  // has to a registered capability, so what passes through it is the trial's
+  // real tool-call count.
+  const toolCalls: string[] = [];
+  const callTool = (name: string, args: Record<string, unknown>) => {
+    toolCalls.push(name);
+    return harness.behavior.callAgentTool(name, args, { threadId: THREAD_ID, projectId: PROJECT_ID });
+  };
 
   return {
-    bb, harness, store, phase, fence, signal, adapter, toolSurface, resolved, sent, callTool,
+    bb, harness, store, phase, fence, signal, adapter, toolSurface, resolved, sent, callTool, toolCalls,
     service: makeService(store),
     makeService,
     reopen: () => openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW),
@@ -290,13 +349,32 @@ function submitTurn(fixture: Fixture, scenarioCase: ScenarioCase, updateId: numb
   return turn;
 }
 
-function propose(fixture: Fixture, turnId: string, candidate: unknown) {
-  return fixture.store.proposeControllerFinalization({
-    ...fixture.fence,
-    turnId,
-    controllerKey: CONTROLLER_KEY,
-    candidate: candidate as never,
-  });
+/**
+ * Finalizes exactly the way the controller has to: through the registered
+ * `telegram_agent_respond` capability. Going straight to the store would grade
+ * a path the provider cannot reach, and would skip the registration, fence, and
+ * evidence checks that stand between a candidate answer and an accepted one.
+ */
+async function propose(
+  fixture: Fixture,
+  turnId: string,
+  candidate: Record<string, unknown>,
+): Promise<{ outcome: string; code?: string; ref?: string }> {
+  const raw = await fixture.callTool("telegram_agent_respond", candidate);
+  if (typeof raw !== "string") throw new Error("the registered respond tool returned no bounded result");
+  const parsed = JSON.parse(raw) as { outcome?: unknown; code?: unknown; ref?: unknown };
+  if (typeof parsed.outcome !== "string") throw new Error("the registered respond tool returned no outcome");
+  // The tool addresses the turn the controller thread is on, so a scenario that
+  // finalized some other turn would be grading the wrong thing.
+  const accepted = fixture.store.getAcceptedControllerFinalization(turnId);
+  if (parsed.outcome === "accepted" && accepted === null) {
+    throw new Error("the registered respond tool accepted a finalization for another turn");
+  }
+  return {
+    outcome: parsed.outcome,
+    ...(typeof parsed.code === "string" ? { code: parsed.code } : {}),
+    ...(typeof parsed.ref === "string" ? { ref: parsed.ref } : {}),
+  };
 }
 
 function textFinalization(text: string) {
@@ -362,7 +440,7 @@ function satisfiedIds(observations: Readonly<Record<string, boolean>>): string[]
 async function runPlainConversation(fixture: Fixture, scenarioCase: ScenarioCase, fixtureId: string, updateId: number): Promise<Grades> {
   const turn = submitTurn(fixture, scenarioCase, updateId);
   const response = "Hello from Hanoon.";
-  const accepted = propose(fixture, turn.id, textFinalization(response));
+  const accepted = await propose(fixture, turn.id, textFinalization(response));
   if (accepted.outcome !== "accepted") throw new Error(`plain finalization was not accepted: ${accepted.outcome}`);
   await fixture.service.reconcile(fixture.fence, fixture.signal);
 
@@ -398,7 +476,7 @@ async function runJobStatus(fixture: Fixture, scenarioCase: ScenarioCase, fixtur
   const turn = submitTurn(fixture, scenarioCase, updateId);
   const status = parseJobStatusProjection(await fixture.callTool("telegram_agent_job_status", { jobId: queuedJob.id }));
   const response = `Job ${status.id} is currently ${status.state}.`;
-  const accepted = propose(fixture, turn.id, textFinalization(response));
+  const accepted = await propose(fixture, turn.id, textFinalization(response));
   if (accepted.outcome !== "accepted") throw new Error(`status finalization was not accepted: ${accepted.outcome}`);
   await fixture.service.reconcile(fixture.fence, fixture.signal);
 
@@ -548,7 +626,7 @@ async function runRejectedFinalization(
   expectedCode: string,
 ): Promise<Grades> {
   const turn = submitTurn(fixture, scenarioCase, updateId);
-  const rejected = propose(fixture, turn.id, textFinalization(candidateText));
+  const rejected = await propose(fixture, turn.id, textFinalization(candidateText));
   await fixture.service.reconcile(fixture.fence, fixture.signal);
 
   const current = fixture.store.getControllerTurn(turn.id);
@@ -617,8 +695,19 @@ async function runTelegramAllowOnce(
   fixture.phase.events = [permissionLifecycle(2, "pending"), permissionLifecycle(3, "resolved")];
   await service.reconcile(fixture.fence, fixture.signal);
 
+  // What "the provider carried on" has to mean: a registered capability the
+  // controller invokes *after* the block cleared, leaving its own durable
+  // evidence row. A completed turn proves only that the turn ended, which it
+  // would have done even if the approval had gone nowhere.
+  const evidenceBeforeAction = fixture.store.listControllerEvidence(turn.id, 128).length;
+  const postResolutionAction = await fixture.callTool("telegram_agent_list_projects", {});
+  const postResolutionEvidence = fixture.store.listControllerEvidence(turn.id, 128);
+  const providerContinued = typeof postResolutionAction === "string" &&
+    postResolutionEvidence.length === evidenceBeforeAction + 1 &&
+    postResolutionEvidence.at(-1)?.sourceName === "telegram_agent_list_projects";
+
   const response = "Ran it once, with your approval.";
-  const accepted = propose(fixture, turn.id, textFinalization(response));
+  const accepted = await propose(fixture, turn.id, textFinalization(response));
   if (accepted.outcome !== "accepted") throw new Error(`approval finalization was not accepted: ${accepted.outcome}`);
   fixture.phase.status = "idle";
   await service.reconcile(fixture.fence, fixture.signal);
@@ -636,7 +725,7 @@ async function runTelegramAllowOnce(
     satisfied: satisfiedIds({
       telegram_approval_rendered: offeredOnlyOnce,
       interaction_resolved_once: exactResolution,
-      provider_continued: completed?.state === "completed",
+      provider_continued: providerContinued,
       owner_tap_survived_restart: options.restart && exactResolution && tapPersistedBeforeResolution,
       permission_interaction_observed: asked !== null,
       owner_tap_persisted_before_resolution: tapPersistedBeforeResolution,
@@ -668,12 +757,12 @@ async function runDurableDeferredMonitor(fixture: Fixture, scenarioCase: Scenari
   const response = "I'll follow up when it finishes.";
   // The unbound promise is proposed first, so its rejection is the obligation
   // check rather than an already-accepted turn.
-  const unbound = propose(fixture, turn.id, {
+  const unbound = await propose(fixture, turn.id, {
     disposition: "deferred",
     segments: [{ type: "text", text: response }],
     obligationRefs: ["monitor:not-a-real-monitor"],
   });
-  const deferred = propose(fixture, turn.id, {
+  const deferred = await propose(fixture, turn.id, {
     disposition: "deferred",
     segments: [{ type: "text", text: response }],
     obligationRefs: armed ? [`monitor:${armed.id}`] : [],
@@ -764,9 +853,12 @@ async function runScenario(
   seed: number,
 ): Promise<ControllerScenarioTrial> {
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
-  const fixture = scenarioFixture(fixtureId, scenarioPhase(scenarioCase.id));
+  const phase = scenarioPhase(scenarioCase.id);
+  const fixture = scenarioFixture(fixtureId, phase);
   const updateId = (seed % 10_000) * 100 + trial * 10 + scenarioIndex(scenarioCase.id);
+  const startedAt = performance.now();
   const grades = await gradeScenario(fixture, scenarioCase, fixtureId, updateId);
+  const wallMs = Math.max(0, Math.round(performance.now() - startedAt));
   const answerApplies = scenarioCase.answerGrader === "required";
   const satisfied = new Set(grades.satisfied);
   // The corpus's declared sets are what grade a trial: an assertion added or
@@ -781,7 +873,9 @@ async function runScenario(
     scenarioId: scenarioCase.id,
     trial,
     seed,
-    harness: harnessIdentity(scenarioCase, trial, seed, fixture.toolSurface),
+    harness: harnessIdentity({
+      scenarioCase, trial, seed, phase, toolSurface: fixture.toolSurface, store: fixture.store,
+    }),
     budget: scenarioCase.budget,
     outcome: {
       status: outcomePassed ? "passed" : "failed",
@@ -808,8 +902,39 @@ async function runScenario(
       graderVersion: 1,
       proofRefs: [proof(`${fixtureId}:answer:${answerApplies ? grades.answerPassed : "not_applicable"}`)],
     },
-    metrics: { wallMs: 1, tokens: 0, costUsd: null, terminalFailureClass: null },
+    metrics: scenarioMetrics(fixture, scenarioCase, wallMs),
   });
+}
+
+/**
+ * What the trial actually cost, measured rather than asserted. Turns and tool
+ * calls come from the durable store and the registered call door; wall time is
+ * real elapsed time.
+ *
+ * Tokens are zero because no provider runs in this corpus at all — the
+ * controller half is scripted and the model is never called — and that is
+ * declared as its provenance rather than left to look like a measurement of a
+ * very cheap model. Cost is absent for the same reason, and only where the
+ * scenario's budget sets no cost ceiling to answer to.
+ */
+function scenarioMetrics(
+  fixture: Fixture,
+  scenarioCase: ScenarioCase,
+  wallMs: number,
+): ControllerScenarioTrial["metrics"] {
+  const measured = {
+    wallMs,
+    turns: fixture.store.listControllerTurns(CONTROLLER_KEY, 512).length,
+    toolCalls: fixture.toolCalls.length,
+    tokens: 0,
+    tokenAccounting: "no_provider_fixed_harness" as const,
+    costUsd: null,
+    costAccounting: "no_cost_budget" as const,
+  };
+  const budget = scenarioCase.budget;
+  const exceeded = measured.turns > budget.maxTurns || measured.toolCalls > budget.maxToolCalls ||
+    measured.tokens > budget.maxTokens || measured.wallMs > budget.maxWallMs;
+  return { ...measured, terminalFailureClass: exceeded ? BUDGET_EXCEEDED : null };
 }
 
 function scenarioIndex(scenarioId: string): number {

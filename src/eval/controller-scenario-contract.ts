@@ -63,12 +63,52 @@ export const controllerScenarioCorpusSchema = z.object({
   ),
 }).strict();
 
+/**
+ * Where a token count came from. Zero tokens is a real measurement only when
+ * there was no provider to spend any; claiming a provider reported zero is how
+ * an unmeasured run passes for a cheap one.
+ */
+export const TOKEN_ACCOUNTING = ["no_provider_fixed_harness", "provider_reported"] as const;
+/** Likewise for cost: absent is honest only when nothing bounded it. */
+export const COST_ACCOUNTING = ["no_cost_budget", "provider_reported"] as const;
+
+/** The one class naming a trial whose metrics could not be established. */
+export const METRICS_UNAVAILABLE = "metrics_unavailable";
+/** The one class naming a trial that ran past a budget field. */
+export const BUDGET_EXCEEDED = "budget_exceeded";
+
 const controllerMetricsSchema = z.object({
   wallMs: z.number().int().min(0).max(3_600_000),
+  turns: z.number().int().min(0).max(1_000),
+  toolCalls: z.number().int().min(0).max(4_096),
   tokens: z.number().int().min(0).max(2_000_000),
+  tokenAccounting: z.enum(TOKEN_ACCOUNTING),
   costUsd: z.number().min(0).max(1_000).nullable(),
+  costAccounting: z.enum(COST_ACCOUNTING),
   terminalFailureClass: z.string().min(1).max(120).nullable(),
-}).strict();
+}).strict().superRefine((measured, context) => {
+  if ((measured.tokens === 0) !== (measured.tokenAccounting === "no_provider_fixed_harness")) {
+    context.addIssue({
+      code: "custom",
+      message: "zero tokens requires no-provider fixed-harness accounting, and that accounting requires zero tokens",
+    });
+  }
+  if ((measured.costUsd === null) !== (measured.costAccounting === "no_cost_budget")) {
+    context.addIssue({ code: "custom", message: "an absent cost requires no-cost-budget accounting" });
+  }
+});
+
+/** True when any measured value ran past what its budget field allowed. */
+function exceedsBudget(
+  measured: z.infer<typeof controllerMetricsSchema>,
+  budget: z.infer<typeof controllerTrialBudgetSchema>,
+): boolean {
+  return measured.turns > budget.maxTurns ||
+    measured.toolCalls > budget.maxToolCalls ||
+    measured.tokens > budget.maxTokens ||
+    measured.wallMs > budget.maxWallMs ||
+    (measured.costUsd !== null && budget.maxCostUsd !== null && measured.costUsd > budget.maxCostUsd);
+}
 
 export const controllerScenarioTrialSchema = z.object({
   schemaVersion: z.literal(1),
@@ -82,7 +122,19 @@ export const controllerScenarioTrialSchema = z.object({
   trace: controllerLayerGradeSchema.extend({ status: scenarioLayerStatusSchema }),
   answer: controllerLayerGradeSchema,
   metrics: controllerMetricsSchema,
-}).strict();
+}).strict().superRefine((candidateTrial, context) => {
+  // A run that went over budget and says nothing about it is the one shape that
+  // would let an overrun be reported as an ordinary pass.
+  if (exceedsBudget(candidateTrial.metrics, candidateTrial.budget) &&
+    candidateTrial.metrics.terminalFailureClass !== BUDGET_EXCEEDED) {
+    context.addIssue({ code: "custom", message: "a trial past its budget must declare budget_exceeded" });
+  }
+  // Absent cost is only honest where nothing asked for one; a run under a cost
+  // ceiling has to say what it actually spent.
+  if ((candidateTrial.budget.maxCostUsd === null) !== (candidateTrial.metrics.costAccounting === "no_cost_budget")) {
+    context.addIssue({ code: "custom", message: "an absent cost requires a budget with no cost ceiling" });
+  }
+});
 
 const reportStatusSchema = z.enum(["passed", "failed", "incomplete"]);
 const iso8601TimestampPattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(?:Z|[+-](\d{2}):(\d{2}))$/;
@@ -121,15 +173,26 @@ function hasDuplicateTrialPairs(trials: readonly ControllerScenarioTrial[]): boo
   return !unique(trials.map(trialPairKey));
 }
 
-function derivedReportStatus(trials: readonly ControllerScenarioTrial[]): z.infer<typeof reportStatusSchema> {
-  if (trials.some((trial) => trial.outcome.status === "failed")) return "failed";
-  if (trials.some((trial) => [trial.outcome, trial.trace, trial.answer].some((grade) => grade.status === "incomplete"))) return "incomplete";
+/**
+ * What a single trial amounts to. Every layer the scenario declared as required
+ * counts: a trial whose trace or required answer failed did not do what the
+ * scenario asked, whatever its outcome grader concluded, and neither did one
+ * that only got there by running past its budget. Metrics that could not be
+ * established leave the trial unproven rather than passed.
+ */
+function trialClassification(trial: ControllerScenarioTrial): "passed" | "failed" | "incomplete" {
+  const grades = [trial.outcome, trial.trace, trial.answer];
+  if (grades.some((grade) => grade.status === "failed")) return "failed";
+  if (trial.metrics.terminalFailureClass === BUDGET_EXCEEDED) return "failed";
+  if (grades.some((grade) => grade.status === "incomplete")) return "incomplete";
+  if (trial.metrics.terminalFailureClass !== null) return "incomplete";
   return "passed";
 }
 
-function trialClassification(trial: ControllerScenarioTrial): "passed" | "failed" | "incomplete" {
-  if (trial.outcome.status === "failed") return "failed";
-  if ([trial.outcome, trial.trace, trial.answer].some((grade) => grade.status === "incomplete")) return "incomplete";
+function derivedReportStatus(trials: readonly ControllerScenarioTrial[]): z.infer<typeof reportStatusSchema> {
+  const classifications = trials.map(trialClassification);
+  if (classifications.includes("failed")) return "failed";
+  if (classifications.includes("incomplete")) return "incomplete";
   return "passed";
 }
 

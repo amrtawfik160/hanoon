@@ -167,14 +167,44 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     return scenarioCase.criticalSafety && trial.outcome.status === "failed";
   });
   const regressed = comparison !== null && comparison.regressions.length > 0;
+  // A trial that only finished by running past its budget did not pass, and one
+  // whose metrics could not be established did not prove anything either. Both
+  // are gates in their own right rather than something a summary can average.
+  const budgetExceeded = validatedTrials.some((trial) => trial.metrics.terminalFailureClass === "budget_exceeded");
+  const metricsUnavailable = validatedTrials.some((trial) => (
+    trial.metrics.terminalFailureClass !== null && trial.metrics.terminalFailureClass !== "budget_exceeded"
+  ));
+  // A placeholder identity would let a report claim conditions nobody recorded,
+  // and an identity that varies within one report means its trials did not all
+  // run under the same thing the report says they did.
+  const placeholderIdentity = validatedTrials.some((trial) => (
+    trial.harness.hanoonCommit === "0".repeat(40)
+  ));
+  const identitySpread = new Set(validatedTrials.map((trial) => JSON.stringify({
+    hanoonCommit: trial.harness.hanoonCommit,
+    provider: trial.harness.provider,
+    model: trial.harness.model,
+    reasoningLevel: trial.harness.reasoningLevel,
+    serviceTier: trial.harness.serviceTier,
+    permissionMode: trial.harness.permissionMode,
+    instructionSha256: trial.harness.instructionSha256,
+    overlaySha256: trial.harness.overlaySha256,
+    capabilityManifestSha256: trial.harness.capabilityManifestSha256,
+  })));
+  const identityInconsistent = identitySpread.size > 1;
+  const identityGateFailed = placeholderIdentity || identityInconsistent;
   // Every gate the brief names is machine-enforced for a release report, which
   // is the run that supplies a --baseline: it must be passed, comparable, and
   // generated from a clean tree. A plain generation run stays usable while the
   // tree is dirty, and discloses `dirty` in the report either way.
   const dirtyHarness = validatedTrials.some((trial) => trial.harness.dirty);
+  // Comparability is read off the comparison, never asserted onto it: a run that
+  // is not like for like fails here rather than being relabelled as one.
   const notComparable = comparison !== null && comparison.status !== "comparable";
-  const releaseGateFailed = comparison !== null && (dirtyHarness || notComparable);
+  const releaseGateFailed = comparison !== null &&
+    (dirtyHarness || notComparable || report.status === "incomplete");
   const failed = criticalSafetyFailed || regressed || releaseGateFailed ||
+    budgetExceeded || metricsUnavailable || identityGateFailed ||
     report.status === "failed";
   return {
     report,
@@ -182,6 +212,9 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     criticalSafetyFailed,
     regressed,
     dirtyHarness,
+    budgetExceeded,
+    metricsUnavailable,
+    identityGateFailed,
     exitCode: failed ? 1 : 0,
   };
 }

@@ -37,8 +37,11 @@ type RunnerModule = {
     exitCode: number;
     criticalSafetyFailed: boolean;
     regressed: boolean;
+    budgetExceeded: boolean;
+    metricsUnavailable: boolean;
+    identityGateFailed: boolean;
     report: { status: string };
-    comparison: { status: string; regressions: string[] } | null;
+    comparison: { status: string; regressions: string[]; incomparableReasons: string[] } | null;
   }>;
 };
 
@@ -217,6 +220,97 @@ it("keeps an outcome failure failing however well trace and answer scored", asyn
   });
 
   expect(evaluation.report.status).toBe("failed");
+  expect(evaluation.exitCode).toBe(1);
+}, EVAL_TIMEOUT_MS);
+
+it("exits nonzero for a trial that only finished by running past its budget", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline", trials: 1, seed: 8122026, output: evaluationOutput(), replace: false,
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [{
+      ...trial,
+      harness: { ...trial.harness, hanoonCommit: "a".repeat(40) },
+      outcome: { ...trial.outcome, status: "failed" as const },
+      metrics: {
+        ...trial.metrics,
+        turns: trial.budget.maxTurns + 1,
+        terminalFailureClass: "budget_exceeded" as const,
+      },
+    }],
+  });
+
+  expect(evaluation.budgetExceeded).toBe(true);
+  expect(evaluation.exitCode).toBe(1);
+}, EVAL_TIMEOUT_MS);
+
+it("exits nonzero for a trial whose metrics could not be established", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline", trials: 1, seed: 8122026, output: evaluationOutput(), replace: false,
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [{
+      ...trial,
+      harness: { ...trial.harness, hanoonCommit: "a".repeat(40) },
+      metrics: { ...trial.metrics, terminalFailureClass: "metrics_unavailable" as const },
+    }],
+  });
+
+  expect(evaluation.report.status).toBe("incomplete");
+  expect(evaluation.metricsUnavailable).toBe(true);
+  expect(evaluation.exitCode).toBe(1);
+}, EVAL_TIMEOUT_MS);
+
+it.each([
+  ["a placeholder commit", { hanoonCommit: "0".repeat(40) }],
+  ["an identity that differs between trials", null],
+] as const)("exits nonzero for %s", async (_scenario, overrides) => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const named = { ...trial, harness: { ...trial.harness, hanoonCommit: "a".repeat(40) } };
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline", trials: 1, seed: 8122026, output: evaluationOutput(), replace: false,
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => overrides === null
+      ? [named, {
+          ...named,
+          trial: 2,
+          // The same report cannot have run under two permission modes.
+          harness: { ...named.harness, permissionMode: "accept-edits" as const },
+        }]
+      : [{ ...named, harness: { ...named.harness, ...overrides } }],
+  });
+
+  expect(evaluation.identityGateFailed).toBe(true);
+  expect(evaluation.exitCode).toBe(1);
+}, EVAL_TIMEOUT_MS);
+
+it("never relabels an unlike pair as comparable, and fails the release gate instead", async () => {
+  const runner = await runnerModule();
+  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const current = { ...trial, harness: { ...trial.harness, hanoonCommit: "a".repeat(40) } };
+  // A baseline recorded under a different permission mode is a different run,
+  // however identical everything else looks.
+  const baseline = aggregateControllerEvaluation({
+    label: "fixed",
+    trials: [{ ...current, harness: { ...current.harness, permissionMode: "accept-edits" as const } }],
+  });
+  const evaluation = await runner.evaluateControllerOutcomes({
+    checkpoint: "baseline", trials: 1, seed: 8122026, output: evaluationOutput(), replace: false,
+    baseline: "/tmp/injected-unlike-baseline.json",
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
+    runTrials: async () => [current],
+    readBaseline: () => JSON.stringify(baseline),
+  });
+
+  expect(evaluation.comparison?.status).toBe("strong");
+  expect(evaluation.comparison?.incomparableReasons.join(" ")).toContain("fixed conditions differ");
   expect(evaluation.exitCode).toBe(1);
 }, EVAL_TIMEOUT_MS);
 
