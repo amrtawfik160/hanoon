@@ -13,6 +13,12 @@ import { TelegramClient } from "./telegram/client";
 import type { TelegramAgentStore } from "./storage/store";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { projectResourceWait } from "./storage/autonomy-repository";
+import {
+  RECIPE_PROMOTION_ORDER,
+  RecipePromotionIncompleteError,
+  type RecipePromotionService,
+} from "./capabilities/promotion";
+import { TASK_RECIPES, type TaskRecipe } from "./domain/recipes";
 
 type BbSdk = BbPluginApi["sdk"];
 
@@ -24,6 +30,16 @@ export type TelegramAgentCliDependencies = {
   getBotToken: () => string | undefined;
   createTelegramClient: (token: string) => Pick<TelegramClient, "getMe">;
   revokeAllApprovals: (now: number) => number;
+  capabilityPromotions: Pick<
+    RecipePromotionService,
+    "status" | "promote" | "rollback" | "routingStatus" | "listDecisions"
+  >;
+  capabilitySettings: () => Readonly<{
+    jobGraph: "adaptive" | "legacy";
+    controllerTools: "bundled" | "all-tools";
+    modelRouting: "adaptive" | "strong-only";
+  }>;
+  notify?: () => void;
 };
 
 type FlagSpec = {
@@ -87,10 +103,40 @@ const JOB_LIST_FLAGS: Record<string, FlagSpec> = {
 };
 const JOB_ID_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
 const DOCTOR_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+const CAPABILITY_STATUS_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+const CAPABILITY_INVENTORY_FLAGS: Record<string, FlagSpec> = {
+  json: JSON_FLAG,
+  host: { kind: "value" },
+  limit: { kind: "value" },
+};
+const CAPABILITY_RECEIPT_FLAGS: Record<string, FlagSpec> = {
+  json: JSON_FLAG,
+  limit: { kind: "value" },
+};
+const CAPABILITY_RECIPE_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
 
 const MAX_COLLECTION_SIZE = 100;
 const PAIRING_TTL_MS = 10 * 60 * 1_000;
 const MAX_ERROR_LENGTH = 240;
+const CLI_HELP = `Usage: bb telegram-agent <command> [options]
+
+Commands:
+  pair [--json]
+  unpair [--json]
+  project list [--json]
+  project enable <project-id> [options]
+  project disable <project-id> [--json]
+  job list [--limit <1-100>] [--json]
+  job show <job-id> [--json]
+  job retry <job-id> [--json]
+  job cancel <job-id> [--json]
+  capability status [recipe] [--json]
+  capability inventory [--host <scope>] [--limit <1-100>] [--json]
+  capability receipts <profile-id> [--limit <1-100>] [--json]
+  capability promote <recipe> [--json]
+  capability rollback <recipe> [--json]
+  doctor [project-id] [--json]
+`;
 const CREDENTIAL_TEXT = [
   /\bbearer\s+\S+/i,
   /\b(?:api[_-]?key|password|secret|token|credential)\s*[:=]\s*\S+/i,
@@ -260,6 +306,12 @@ function safeJob(store: TelegramAgentStore, job: Job, now: number): JsonRecord {
   return {
     id: job.id,
     state: job.state,
+    recipe: {
+      id: job.taskRecipe,
+      version: job.recipeVersion,
+      promotionCount: job.recipePromotionCount,
+      routingMode: job.routingMode,
+    },
     projectId: job.projectId,
     environmentId: job.environmentId,
     implementationThreadId: job.implementationThreadId,
@@ -638,9 +690,14 @@ function jobRetry(
   const jobId = onePositional(parsed, "job retry");
   const current = deps.store.getJob(jobId);
   if (!current) throw new CliOperationError("Job was not found");
-  const next = deps.store.applyJobEvent(jobId, current.version, { type: "RETRY" }, deps.now());
-  const output = safeJob(deps.store, next, deps.now());
-  return success(output, `Retried ${jobId} (${next.state})`, json);
+  const retryResult = deps.store.retryFailedJob(jobId, current.version, deps.now());
+  if (retryResult.outcome === "unavailable") throw new CliOperationError("Job is not retryable");
+  deps.notify?.();
+  const output = safeJob(deps.store, retryResult.job, deps.now());
+  const message = retryResult.outcome === "queued"
+    ? `Retry queued for ${jobId}`
+    : `Retried ${jobId} (${retryResult.job.state})`;
+  return success(output, message, json);
 }
 
 function jobCancel(
@@ -651,10 +708,13 @@ function jobCancel(
   const jobId = onePositional(parsed, "job cancel");
   const current = deps.store.getJob(jobId);
   if (!current) throw new CliOperationError("Job was not found");
+  const activeWorkers = deps.store.getCurrentWorkerLiveness(jobId);
   const next = deps.store.applyJobEvent(
     jobId,
     current.version,
-    { type: "CANCEL_REQUESTED", activeWorker: deps.store.getWorkerLiveness(jobId) },
+    activeWorkers === null
+      ? { type: "CANCEL_REQUESTED" }
+      : { type: "CANCEL_REQUESTED", activeWorker: activeWorkers[0] ?? null, activeWorkers },
     deps.now(),
   );
   const output = { ...safeJob(deps.store, next, deps.now()), cancelRequested: next.cancelRequestedAt !== null };
@@ -687,6 +747,23 @@ async function doctor(
   addCheck(checks, "token presence", Boolean(deps.getBotToken()), "configured", "missing");
   addCheck(checks, "owner pairing", deps.store.getOwner() !== null, "paired", "not paired");
   if (projectId === undefined) {
+    const policies = deps.store.listEnabledProjectPolicies();
+    addCheck(
+      checks,
+      "enabled projects",
+      policies.length > 0,
+      `${policies.length} enabled`,
+      "none enabled",
+    );
+    for (const { policy } of policies) {
+      addCheck(
+        checks,
+        `${policy.alias} production`,
+        policy.production !== undefined,
+        "configured",
+        "missing; merge approval is blocked",
+      );
+    }
     const output = success(
       { checks },
       checks.map((check) => `${check.name}: ${check.status} (${check.summary})`).join("\n"),
@@ -838,6 +915,204 @@ async function runProject(
   throw new CliInputError(`Unknown project subcommand ${subcommand}`);
 }
 
+function capabilityRecipe(value: string, label: string): TaskRecipe {
+  if (!(TASK_RECIPES as readonly string[]).includes(value)) {
+    throw new CliInputError(`${label} must be one of ${RECIPE_PROMOTION_ORDER.join(", ")}`);
+  }
+  return value as TaskRecipe;
+}
+
+function boundedCapabilityId(value: string, label: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value)) {
+    throw new CliInputError(`${label} is invalid`);
+  }
+  return value;
+}
+
+async function capabilityStatus(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): Promise<PluginCliResult> {
+  if (parsed.positionals.length > 1) throw new CliInputError("capability status accepts at most one recipe");
+  const recipes = parsed.positionals[0]
+    ? [capabilityRecipe(parsed.positionals[0], "recipe")]
+    : [...RECIPE_PROMOTION_ORDER];
+  const settings = deps.capabilitySettings();
+  const rows = await Promise.all(recipes.map(async (recipe) => {
+    const promotion = await deps.capabilityPromotions.status(recipe);
+    const routing = deps.capabilityPromotions.routingStatus(recipe, settings.jobGraph);
+    return {
+      recipe,
+      routingMode: routing.routingMode,
+      promotion: {
+        status: promotion.status,
+        ready: promotion.ready,
+        reasonCodes: promotion.reasonCodes.slice(0, 32),
+        evidenceDigest: promotion.evidenceDigest,
+        candidateSuccesses: promotion.candidateSuccesses,
+        baselineSuccesses: promotion.baselineSuccesses,
+      },
+      decision: routing.decision ? {
+        id: routing.decision.id,
+        action: routing.decision.action,
+        reasonCode: routing.decision.reasonCode,
+        evidenceDigest: routing.decision.evidenceDigest,
+        createdAt: routing.decision.createdAt,
+      } : null,
+    };
+  }));
+  return success(
+    { settings, recipes: rows },
+    rows.map((row) =>
+      `${row.recipe}: ${row.routingMode}; promotion ${row.promotion.status}` +
+      (row.decision ? ` (${row.decision.action})` : ""),
+    ).join("\n"),
+    json,
+  );
+}
+
+function capabilityInventory(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): PluginCliResult {
+  noPositionals(parsed);
+  const hostScope = boundedCapabilityId(parsed.values.get("host") ?? "primary", "--host");
+  const limit = readOptionalInteger(parsed, "limit", "--limit", 1, MAX_COLLECTION_SIZE) ?? 50;
+  const items = deps.store.listExternalCapabilityInventory(hostScope, limit).map((item) => ({
+    capabilityId: item.capabilityId,
+    capabilityKind: item.capabilityKind,
+    version: item.version,
+    digest: item.digest,
+    status: item.status,
+    discoveredAt: item.discoveredAt,
+  }));
+  const health = deps.store.getExternalCapabilityInventoryHealth(hostScope);
+  const projectedHealth = health ? {
+    status: health.status,
+    errorClass: health.errorClass,
+    refreshedAt: health.refreshedAt,
+  } : null;
+  return success(
+    { hostScope, health: projectedHealth, items },
+    [`${hostScope}: ${projectedHealth?.status ?? "not-refreshed"}`, ...items.map((item) =>
+      `${item.capabilityId} (${item.capabilityKind}, ${item.status})`)].join("\n"),
+    json,
+  );
+}
+
+function capabilityReceipts(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): PluginCliResult {
+  const profileId = boundedCapabilityId(onePositional(parsed, "capability receipts"), "profile-id");
+  const limit = readOptionalInteger(parsed, "limit", "--limit", 1, MAX_COLLECTION_SIZE) ?? 50;
+  const profile = deps.store.getCapabilityProfileById(profileId);
+  if (!profile) throw new CliOperationError("Capability profile was not found");
+  const receipts = deps.store.listCapabilityReceipts(profileId, limit).map((receipt) => ({
+    id: receipt.id,
+    profileRevision: receipt.profileRevision,
+    capabilityId: receipt.capabilityId,
+    capabilityKind: receipt.capabilityKind,
+    eventType: receipt.eventType,
+    reasonCode: receipt.reasonCode,
+    mandatory: receipt.mandatory,
+    outcome: receipt.outcome,
+    evidenceCount: receipt.evidenceRefs.length,
+    createdAt: receipt.createdAt,
+  }));
+  const projectedProfile = {
+    id: profile.id,
+    revision: profile.revision,
+    recipeId: profile.recipeId,
+    recipeVersion: profile.recipeVersion,
+    mode: profile.mode,
+    registryDigest: profile.registryDigest,
+    graphDigest: profile.graphDigest,
+    model: profile.model,
+    selectedCount: profile.assignments.length,
+  };
+  return success(
+    { profile: projectedProfile, receipts },
+    [
+      `${profile.id}: ${profile.recipeId}@${profile.recipeVersion} revision ${profile.revision}`,
+      `${profile.model.providerId}/${profile.model.modelId} ${profile.model.reasoning} ${profile.model.serviceTier}`,
+      ...receipts.map((receipt) =>
+        `${receipt.capabilityId}: ${receipt.outcome ?? receipt.eventType} (${receipt.evidenceCount} evidence refs)`),
+    ].join("\n"),
+    json,
+  );
+}
+
+async function capabilityPromote(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): Promise<PluginCliResult> {
+  const recipe = capabilityRecipe(onePositional(parsed, "capability promote"), "recipe");
+  try {
+    const decision = await deps.capabilityPromotions.promote(recipe);
+    deps.notify?.();
+    return success(decision, `${recipe} is active for new attempts`, json);
+  } catch (error) {
+    if (!(error instanceof RecipePromotionIncompleteError)) throw error;
+    const output = {
+      recipe,
+      status: error.assessment.status,
+      ready: false,
+      reasonCodes: error.assessment.reasonCodes.slice(0, 32),
+      evidenceDigest: error.assessment.evidenceDigest,
+    };
+    return json
+      ? { exitCode: 1, stdout: serialize(output), stderr: "" }
+      : {
+          exitCode: 1,
+          stdout: "",
+          stderr: `Promotion ${error.assessment.status}: ${error.assessment.reasonCodes.slice(0, 8).join(", ")}\n`,
+        };
+  }
+}
+
+function capabilityRollback(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): PluginCliResult {
+  const recipe = capabilityRecipe(onePositional(parsed, "capability rollback"), "recipe");
+  const decision = deps.capabilityPromotions.rollback(recipe);
+  deps.notify?.();
+  return success(decision, `${recipe} is shadow-only for new attempts`, json);
+}
+
+async function runCapability(
+  deps: TelegramAgentCliDependencies,
+  argv: readonly string[],
+): Promise<PluginCliResult> {
+  if (argv.length === 0) throw new CliInputError("capability requires a subcommand");
+  const subcommand = argv[0];
+  if (subcommand === "status") {
+    const parsed = parseFlags(argv.slice(1), CAPABILITY_STATUS_FLAGS);
+    return capabilityStatus(deps, parsed, parsed.flags.has("json"));
+  }
+  if (subcommand === "inventory") {
+    const parsed = parseFlags(argv.slice(1), CAPABILITY_INVENTORY_FLAGS);
+    return capabilityInventory(deps, parsed, parsed.flags.has("json"));
+  }
+  if (subcommand === "receipts") {
+    const parsed = parseFlags(argv.slice(1), CAPABILITY_RECEIPT_FLAGS);
+    return capabilityReceipts(deps, parsed, parsed.flags.has("json"));
+  }
+  if (subcommand === "promote" || subcommand === "rollback") {
+    const parsed = parseFlags(argv.slice(1), CAPABILITY_RECIPE_FLAGS);
+    return subcommand === "promote"
+      ? capabilityPromote(deps, parsed, parsed.flags.has("json"))
+      : capabilityRollback(deps, parsed, parsed.flags.has("json"));
+  }
+  throw new CliInputError(`Unknown capability subcommand ${subcommand}`);
+}
+
 async function runJob(
   deps: TelegramAgentCliDependencies,
   argv: readonly string[],
@@ -865,6 +1140,9 @@ export async function runTelegramAgentCli(
 ): Promise<PluginCliResult> {
   const json = jsonRequested(argv);
   try {
+    if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "help")) {
+      return { exitCode: 0, stdout: CLI_HELP, stderr: "" };
+    }
     if (argv.length === 0) throw new CliInputError("A telegram-agent command is required");
     const command = argv[0];
     if (command === "pair") {
@@ -879,6 +1157,7 @@ export async function runTelegramAgentCli(
     }
     if (command === "project") return await runProject(deps, argv.slice(1), context);
     if (command === "job") return await runJob(deps, argv.slice(1));
+    if (command === "capability") return await runCapability(deps, argv.slice(1));
     if (command === "doctor") {
       const parsed = parseFlags(argv.slice(1), DOCTOR_FLAGS);
       if (parsed.positionals.length > 1) throw new CliInputError("doctor accepts at most one project-id");

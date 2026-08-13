@@ -1,5 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { projectControllerStream } from "../src/controller/stream";
+import { controllerDraftPreview, projectControllerStream } from "../src/controller/stream";
+
+describe("controller draft preview", () => {
+  it("keeps provider-neutral progress visible when no tokens have arrived", () => {
+    expect(controllerDraftPreview({ streamText: "", streamPhase: "connecting" }))
+      .toBe("Connecting…");
+    expect(controllerDraftPreview({ streamText: "", streamPhase: "thinking" }))
+      .toBe("Thinking…");
+    expect(controllerDraftPreview({ streamText: "", streamPhase: "using_tools" }))
+      .toBe("Working…");
+    expect(controllerDraftPreview({
+      streamText: "",
+      streamPhase: "connecting",
+      fallbackText: "Connecting…",
+    })).toBe("Connecting…");
+    expect(controllerDraftPreview({ streamText: "Checking the webhook", streamPhase: "thinking" }))
+      .toBe("Checking the webhook");
+  });
+});
 
 describe("controller stream projection", () => {
   it("appends only new assistant output and advances from thinking to responding", () => {
@@ -41,6 +59,61 @@ describe("controller stream projection", () => {
       cursor: 13,
       text: "Hello world",
       phase: "responding",
+    });
+  });
+
+  it("streams a public thinking summary, then replaces it with the answer", () => {
+    const thinking = projectControllerStream({
+      latestSeq: 4,
+      inputAccepted: true,
+      assistantDelta: "",
+      thinkingDelta: "Checking the webhook",
+      completed: false,
+      error: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+    }, {
+      cursor: 1,
+      text: "",
+      phase: "connecting",
+    });
+    expect(thinking).toEqual({
+      cursor: 4,
+      text: "Checking the webhook",
+      phase: "thinking",
+    });
+
+    expect(projectControllerStream({
+      latestSeq: 7,
+      inputAccepted: true,
+      assistantDelta: "I'll fix the signer.",
+      thinkingDelta: "",
+      completed: false,
+      error: null,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+    }, thinking)).toEqual({
+      cursor: 7,
+      text: "I'll fix the signer.",
+      phase: "responding",
+    });
+  });
+
+  it("marks a tool-using turn without treating it as a finished answer", () => {
+    expect(projectControllerStream({
+      latestSeq: 5,
+      inputAccepted: true,
+      assistantDelta: "",
+      thinkingDelta: "",
+      completed: false,
+      error: null,
+      pendingQuestion: null, toolCalls: 1, commandFailures: 0, totalTokens: 0,
+    }, {
+      cursor: 4,
+      text: "Checking the webhook",
+      phase: "thinking",
+    })).toEqual({
+      cursor: 5,
+      text: "Checking the webhook",
+      phase: "using_tools",
     });
   });
 

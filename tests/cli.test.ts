@@ -6,12 +6,14 @@ import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import type { ProjectPolicy } from "../src/domain/models";
 import { activeWorkerFixture, admitConfirmedJob, policyFixture, productionPolicyFixture } from "./helpers";
+import { insertResolvedPromotionLedgerFixture } from "./promotion-evidence-fixture";
 
 let pluginNumber = 0;
 
 async function loadPlugin() {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-agent-task11-cli-${pluginNumber++}`,
+    sdk: { subscribe: () => () => undefined },
   });
   await plugin(bb);
   return { bb, harness, store: openStore(bb.storage) };
@@ -88,7 +90,176 @@ it("registers one telegram-agent CLI with complete operator command metadata", a
     expect.objectContaining({ name: "project" }),
     expect.objectContaining({ name: "job" }),
     expect.objectContaining({ name: "doctor" }),
+    expect.objectContaining({ name: "capability" }),
   ]));
+});
+
+it.each([["--help"], ["help"]])("prints actionable command help for %s", async (...argv) => {
+  const { harness } = await loadPlugin();
+
+  const result = await harness.behavior.runCli(argv);
+
+  expect(result.exitCode).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(result.stdout).toContain("job show <job-id>");
+  expect(result.stdout).toContain("project list");
+  expect(result.stdout).toContain("doctor [project-id]");
+  expect(result.stdout).toContain("capability status");
+});
+
+it("reports bounded capability rollout status without inventing live promotion evidence", async () => {
+  const { harness, store } = await loadPlugin();
+
+  const result = await harness.behavior.runCli(["capability", "status", "direct", "--json"]);
+
+  expect(result.exitCode).toBe(0);
+  expect(parseJson(result.stdout)).toMatchObject({
+    settings: {
+      jobGraph: "adaptive",
+      controllerTools: "bundled",
+      modelRouting: "adaptive",
+    },
+    recipes: [{
+      recipe: "direct",
+      routingMode: "shadow",
+      promotion: { status: "incomplete", ready: false },
+    }],
+  });
+  expect(store.listRecipeRolloutDecisions("direct", 10)).toEqual([]);
+  expect(result.stdout).not.toMatch(/requestText|prompt|filesystem|\/root\//u);
+});
+
+it("refuses capability promotion without durable live evidence and supports append-only rollback", async () => {
+  const { harness, store } = await loadPlugin();
+
+  const refused = await harness.behavior.runCli(["capability", "promote", "direct", "--json"]);
+  expect(refused.exitCode).toBe(1);
+  expect(parseJson(refused.stdout)).toMatchObject({
+    recipe: "direct",
+    status: "incomplete",
+    ready: false,
+  });
+  expect(store.listRecipeRolloutDecisions("direct", 10)).toEqual([]);
+
+  store.appendRecipeRolloutDecision({
+    recipe: "direct",
+    action: "promote",
+    reasonCode: "promotion_gates_passed",
+    evidenceDigest: "a".repeat(64),
+    now: 2_000,
+  });
+  const rolledBack = await harness.behavior.runCli(["capability", "rollback", "direct", "--json"]);
+  expect(rolledBack.exitCode).toBe(0);
+  expect(parseJson(rolledBack.stdout)).toMatchObject({ recipe: "direct", action: "rollback" });
+  expect(store.getLatestRecipeRolloutDecision("direct")?.action).toBe("rollback");
+});
+
+it("promotes through the production CLI only after the durable reader resolves authoritative records", async () => {
+  const { bb, harness, store } = await loadPlugin();
+  insertResolvedPromotionLedgerFixture({
+    db: bb.storage.database(),
+    store,
+    prefix: "cli-production-reader",
+  });
+
+  const promoted = await harness.behavior.runCli(["capability", "promote", "direct", "--json"]);
+
+  expect(promoted.exitCode).toBe(0);
+  expect(parseJson(promoted.stdout)).toMatchObject({
+    recipe: "direct",
+    action: "promote",
+    reasonCode: "promotion_gates_passed",
+    evidenceDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+  });
+  expect(store.getLatestRecipeRolloutDecision("direct")?.action).toBe("promote");
+});
+
+it("projects bounded inventory and receipt details without sources, subjects, or evidence payloads", async () => {
+  const { harness, store } = await loadPlugin();
+  store.replaceExternalCapabilityInventory({
+    hostScope: "primary",
+    now: 2_000,
+    items: [{
+      inventoryKey: "inventory:skill:bounded",
+      capabilityId: "external-bounded-skill",
+      capabilityKind: "skill",
+      source: "/root/private/provider/location",
+      version: "1.2.3",
+      digest: "b".repeat(64),
+      hostScope: "primary",
+      status: "inventory-only",
+      metadata: { credential: "token=should-not-print" },
+      discoveredAt: 2_000,
+    }],
+  });
+  const profile = store.createCapabilityProfile({
+    subjectKind: "worker_attempt",
+    subjectId: "attempt:private-subject",
+    threadId: "thr_private",
+    recipeId: "bounded",
+    recipeVersion: 1,
+    registryDigest: "c".repeat(64),
+    graphDigest: "d".repeat(64),
+    mode: "active",
+    model: {
+      pool: "standard",
+      providerId: "codex",
+      modelId: "gpt-5.6-terra",
+      reasoning: "high",
+      serviceTier: "fast",
+    },
+    assignments: [{
+      capabilityId: "test-driven-development",
+      capabilityKind: "skill",
+      descriptorDigest: "e".repeat(64),
+      mandatory: true,
+    }],
+    reasonCodes: ["private-reason"],
+    traits: ["private-trait"],
+    now: 2_000,
+  });
+  store.appendCapabilityTerminalOutcome({
+    profileId: profile.id,
+    capabilityId: "test-driven-development",
+    descriptorDigest: "e".repeat(64),
+    outcome: "passed",
+    evidenceRefs: ["/root/private/evidence.txt", "token=should-not-print"],
+    now: 2_001,
+  });
+
+  const inventory = await harness.behavior.runCli(["capability", "inventory", "--host", "primary", "--json"]);
+  expect(inventory.exitCode).toBe(0);
+  expect(parseJson(inventory.stdout)).toMatchObject({
+    hostScope: "primary",
+    items: [{ capabilityId: "external-bounded-skill", capabilityKind: "skill", version: "1.2.3" }],
+  });
+  expect(inventory.stdout).not.toMatch(/private|credential|should-not-print|source/u);
+
+  const receipts = await harness.behavior.runCli(["capability", "receipts", profile.id, "--json"]);
+  expect(receipts.exitCode).toBe(0);
+  expect(parseJson(receipts.stdout)).toMatchObject({
+    profile: {
+      id: profile.id,
+      revision: 1,
+      recipeId: "bounded",
+      model: {
+        pool: "standard",
+        providerId: "codex",
+        modelId: "gpt-5.6-terra",
+        reasoning: "high",
+        serviceTier: "fast",
+      },
+    },
+    receipts: expect.arrayContaining([
+      expect.objectContaining({
+        capabilityId: "test-driven-development",
+        eventType: "outcome",
+        outcome: "passed",
+        evidenceCount: 2,
+      }),
+    ]),
+  });
+  expect(receipts.stdout).not.toMatch(/private-subject|thr_private|private-reason|private-trait|evidence\.txt|should-not-print/u);
 });
 
 it("pairs through Telegram getMe and marks the one-use link sensitive and expiring", async () => {
@@ -560,6 +731,7 @@ it("projects bounded admission and resource facts without lease ownership detail
   expect(projection).toMatchObject({
     id: draft.id,
     projectId: "proj_1",
+    recipe: { id: "architectural", version: 1, promotionCount: 0, routingMode: "legacy" },
     admission: {
       state: "admitted",
       queueSequence: expect.any(Number),

@@ -52,10 +52,16 @@ const DELEGATION_SWEEP_MS = 15_000;
 // millisecond ties within one process.
 const MONITOR_UPDATE_ID_BASE = 2_000_000_000;
 const MONITOR_CLOCK_EPOCH_MS = 1_700_000_000_000;
+const CAPABILITY_NOTICE_POLICY =
+  "For capability routing, notify only for a denial, material escalation, substitute use, exhausted recovery, missing mandatory evidence, or an owner decision.";
 
 function firedPrompt(monitor: MonitorRecord, reason: string): string {
-  return `A monitor you set has fired.\n\nWhy: ${reason}\nWhat you said to do: ${monitor.instruction}\n\n` +
-    "Do it now, then tell the owner what happened in one or two sentences. They did not just ask you anything — this is you following up.";
+  const cleanup = monitor.kind === "schedule"
+    ? "\nThis schedule repeats. Cancel it now if its purpose is complete, obsolete, or polling live work; use a thread_idle monitor for live work instead.\n"
+    : "";
+  return `A monitor you set has fired.\n\nMonitor id: ${monitor.id}\nMonitor kind: ${monitor.kind}\n` +
+    `Why: ${reason}\nWhat you said to do: ${monitor.instruction}\n${cleanup}\n` +
+    `Do it now. ${CAPABILITY_NOTICE_POLICY} Message the owner only if something needs their decision or a job finished or failed. If nothing meaningful changed, stay silent.`;
 }
 
 /** Settled states report an outcome; a member still running at the join timeout says so. */
@@ -69,7 +75,7 @@ function memberLine(member: DelegationThreadRecord): string {
 
 function joinedPrompt(delegation: DelegationRecord): string {
   const head = `Work you delegated has finished.\n\nWhat you said to do: ${delegation.instruction}\n\nResults:\n`;
-  const tail = "\n\nDo it now, then tell the owner what happened in one or two sentences. They did not just ask you anything — this is you following up.";
+  const tail = `\n\nDo it now. ${CAPABILITY_NOTICE_POLICY} Then tell the owner what happened in one or two sentences. They did not just ask you anything — this is you following up.`;
   // Clip the results, never the instruction or the trailer. Trimming the whole
   // string from its end drops the directive first, leaving the agent a wall of
   // output with no idea what to do or that this is an unprompted follow-up.

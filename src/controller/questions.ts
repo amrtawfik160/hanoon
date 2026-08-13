@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { telegramSafeTitle } from "../telegram/markdown";
 
 /** One selectable answer to a question the controller thread asked. */
 export type ControllerQuestionOption = {
@@ -201,17 +202,18 @@ export function renderThreadInteraction(
   title: string,
   interaction: ThreadInteraction,
 ): RenderedQuestion | { text: string } {
+  const heading = telegramSafeTitle(title);
   if (interaction.kind === "unsupported") {
-    return { text: `*${title}* is waiting on something I can't answer from here. It needs you in BB.` };
+    return { text: `*${heading}* is waiting on something I can't answer from here. It needs you in BB.` };
   }
   if (interaction.kind === "user_question") {
     const first = interaction.questions[0];
     if (!first) throw new TypeError("a thread question must have a question");
     const rendered = renderQuestion(interaction.interactionId, first, "w");
-    return { ...rendered, text: `*${title}* needs your answer.\n\n${rendered.text}` };
+    return { ...rendered, text: `*${heading}* needs your answer.\n\n${rendered.text}` };
   }
   return {
-    text: `*${title}* ${interaction.summary}`,
+    text: `*${heading}* ${interaction.summary}`,
     reply_markup: {
       inline_keyboard: interaction.decisions.map((decision) => [{
         text: APPROVAL_LABELS[decision],

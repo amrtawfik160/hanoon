@@ -44,7 +44,9 @@ function prepareReviewJob(
     environmentId: string;
     implementationThreadId: string;
     reviewThreadId: string;
+    riskReviewThreadId: string;
     attemptId: string;
+    riskAttemptId: string;
     headSha: string;
   },
 ) {
@@ -90,6 +92,14 @@ function prepareReviewJob(
     headSha: input.headSha,
   });
   db.prepare(
+    "UPDATE attempts SET review_lens = 'quality', review_stage = 'review' WHERE id = ?",
+  ).run(input.attemptId);
+  db.prepare(
+    `INSERT INTO attempts (
+       id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha, created_at
+     ) VALUES (?, ?, 'review', 'risk', 'review', 1, ?, ?, ?)`,
+  ).run(input.riskAttemptId, input.id, input.riskReviewThreadId, input.headSha, 1_000);
+  db.prepare(
     `INSERT INTO job_admissions (
        job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
      ) VALUES (?, ?, ?, 'admitted', 'CONFIRMED', ?, ?)`,
@@ -100,11 +110,15 @@ function prepareReviewJob(
        lease_expires_at, acquired_at, renewed_at, released_at, release_reason
      ) VALUES (?, ?, 'project', 'held', 'fixture-executor', 1, 50_000, 1_000, 1_000, NULL, NULL)`,
   ).run(job.id, projectResourceKey(input.projectId));
+  expect(store.enqueueReconcileForThread(input.riskReviewThreadId, 1_002)).toBe(true);
   return store.getJob(input.id)!;
 }
 
 it("keeps simultaneous opposite review verdicts bound to their own jobs", async () => {
-  const { bb, harness } = createFakePluginHost({ pluginId: "review-concurrency-plugin" });
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "review-concurrency-plugin",
+    sdk: { subscribe: () => () => undefined },
+  });
   await plugin(bb);
   const store = openStore(bb.storage);
   const db = bb.storage.database();
@@ -116,8 +130,10 @@ it("keeps simultaneous opposite review verdicts bound to their own jobs", async 
     projectId: "proj_a",
     environmentId: "environment_a",
     implementationThreadId: "implementation_a",
-    reviewThreadId: "review_a",
+    reviewThreadId: "review_quality_a",
+    riskReviewThreadId: "review_risk_a",
     attemptId: "attempt_a",
+    riskAttemptId: "attempt_a_risk",
     headSha: headA,
   });
   const jobB = prepareReviewJob(store, db, {
@@ -126,8 +142,10 @@ it("keeps simultaneous opposite review verdicts bound to their own jobs", async 
     projectId: "proj_b",
     environmentId: "environment_b",
     implementationThreadId: "implementation_b",
-    reviewThreadId: "review_b",
+    reviewThreadId: "review_quality_b",
+    riskReviewThreadId: "review_risk_b",
     attemptId: "attempt_b",
+    riskAttemptId: "attempt_b_risk",
     headSha: headB,
   });
 
@@ -150,8 +168,10 @@ it("keeps simultaneous opposite review verdicts bound to their own jobs", async 
   harness.sdk.stub("threads.output", async ({ threadId }: { threadId: string }) => {
     outputCalls.push(threadId);
     return {
-      output: threadId === "review_a"
+      output: threadId.endsWith("_a")
         ? reviewOutput({ verdict: "pass", reviewedHeadSha: headA, summary: "A passed" })
+        : threadId === "review_risk_b"
+          ? reviewOutput({ verdict: "pass", reviewedHeadSha: headB, summary: "B risk passed" })
         : reviewOutput({
             verdict: "changes_requested",
             reviewedHeadSha: headB,
@@ -175,13 +195,19 @@ it("keeps simultaneous opposite review verdicts bound to their own jobs", async 
     environmentB.resolve({ available: true, clean: true, checkout: { headSha: headB } });
     environmentA.resolve({ available: true, clean: true, checkout: { headSha: headA } });
 
-    await vi.waitFor(() => expect(outputCalls).toHaveLength(2));
+    await vi.waitFor(() => expect(environmentCalls.length).toBeGreaterThanOrEqual(4));
+    await vi.waitFor(() => expect(outputCalls).toHaveLength(4));
     await vi.waitFor(() => expect(store.getJob(jobA.id)?.state).not.toBe("reviewing"));
     await vi.waitFor(() => expect(store.getJob(jobB.id)?.state).not.toBe("reviewing"));
-
-    expect(outputCalls).toEqual(expect.arrayContaining(["review_a", "review_b"]));
+    expect(outputCalls).toEqual(expect.arrayContaining([
+      "review_quality_a",
+      "review_risk_a",
+      "review_quality_b",
+      "review_risk_b",
+    ]));
     expect(store.getJob(jobA.id)?.state).toBe("documenting");
-    expect(store.getJob(jobB.id)?.state).toBe("remediating");
+    expect(store.getJob(jobB.id)).toMatchObject({ reviewCycle: 1 });
+    expect(store.getJob(jobB.id)?.state).not.toBe("documenting");
     expect(JSON.parse(store.getAttempt("attempt_a")!.resultJson!)).toMatchObject({
       outcome: "pass",
       reviewedHeadSha: headA,
@@ -190,6 +216,14 @@ it("keeps simultaneous opposite review verdicts bound to their own jobs", async 
       outcome: "changes_requested",
       reviewedHeadSha: headB,
       findings: [{ title: "B finding", details: "B only" }],
+    });
+    expect(JSON.parse(store.getAttempt("attempt_a_risk")!.resultJson!)).toMatchObject({
+      outcome: "pass",
+      reviewedHeadSha: headA,
+    });
+    expect(JSON.parse(store.getAttempt("attempt_b_risk")!.resultJson!)).toMatchObject({
+      outcome: "pass",
+      reviewedHeadSha: headB,
     });
   } finally {
     environmentA.resolve({ available: true, clean: true, checkout: { headSha: headA } });

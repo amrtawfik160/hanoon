@@ -13,7 +13,15 @@ import {
   type ResourceKind,
 } from "../autonomy/models";
 import { transition } from "../domain/state-machine";
-import type { Job, JobEvent, ProjectPolicy } from "../domain/models";
+import {
+  isResumablePermanentFailure,
+  isResumablePlanBlock,
+  isResumableReviewBlock,
+  isReviewedPrCompletionBlock,
+  type Job,
+  type JobEvent,
+  type ProjectPolicy,
+} from "../domain/models";
 import {
   JOB_SELECT,
   VersionConflictError,
@@ -127,6 +135,7 @@ const ADMISSION_STATES: ReadonlySet<AdmissionState> = new Set([
 const RESUME_EVENTS: ReadonlySet<AdmissionResumeEvent> = new Set([
   "CONFIRMED",
   "CONTINUE_REVIEW",
+  "RETRY",
 ]);
 const RESOURCE_KINDS: ReadonlySet<ResourceKind> = new Set([
   "project",
@@ -304,8 +313,14 @@ function assertJobIdentity(job: Job, input: AdmissionWriteInput): void {
 }
 
 function assertContinuationState(job: Job, resumeEvent: AdmissionResumeEvent): void {
-  if (resumeEvent === "CONTINUE_REVIEW" && (job.state !== "blocked" || job.blockedReason !== "review_limit")) {
-    throw new AutonomyAdmissionConflictError(job.id, "review continuation requires a review-limit block");
+  if (resumeEvent === "CONTINUE_REVIEW" && !isResumablePlanBlock(job) &&
+    !isResumableReviewBlock(job) && !isReviewedPrCompletionBlock(job)) {
+    throw new AutonomyAdmissionConflictError(job.id, "review continuation requires a review-limit, plan-limit, or reviewed-PR completion block");
+  }
+  if (resumeEvent === "RETRY" && !isResumablePermanentFailure(job) && (
+    job.state !== "failed" || job.resumeState === null || job.cancelRequestedAt !== null
+  )) {
+    throw new AutonomyAdmissionConflictError(job.id, "retry continuation requires a recoverable failed job");
   }
 }
 
@@ -422,8 +437,15 @@ function currentExecutorLease(
 
 function resumeEventForAdmission(job: Job, resumeEvent: AdmissionResumeEvent): JobEvent | null {
   if (resumeEvent === "CONFIRMED" && job.state === "awaiting_confirmation") return { type: "CONFIRMED" };
-  if (resumeEvent === "CONTINUE_REVIEW" && job.state === "blocked" && job.blockedReason === "review_limit") {
+  if (resumeEvent === "CONTINUE_REVIEW" && job.state === "blocked" &&
+    (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job))) {
     return { type: "CONTINUE_REVIEW" };
+  }
+  if (resumeEvent === "RETRY" && (
+    isResumablePermanentFailure(job) ||
+    (job.state === "failed" && job.resumeState !== null && job.cancelRequestedAt === null)
+  )) {
+    return { type: "RETRY" };
   }
   return null;
 }

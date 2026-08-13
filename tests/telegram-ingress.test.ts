@@ -367,6 +367,87 @@ it("queues a captionless image document with a default inspection prompt", async
   }]);
 });
 
+it("queues a captionless Telegram GIF animation for the controller", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+
+  await fixture.ingress.handleClaimed(messageUpdate(13, 7, 70, undefined, {
+    animation: {
+      file_id: "gif-file-id",
+      file_unique_id: "gif-unique-id",
+      width: 480,
+      height: 480,
+      duration: 2,
+      mime_type: "video/mp4",
+      file_size: 180_000,
+      thumbnail: {
+        file_id: "gif-thumb-id",
+        file_unique_id: "gif-thumb-unique",
+        width: 320,
+        height: 320,
+        file_size: 8_000,
+      },
+    },
+  }), 1_904);
+
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  expect(controller).not.toBeNull();
+  expect(fixture.store.listControllerTurns(controller!.controllerKey, 10)).toMatchObject([{
+    updateId: 13,
+    inputText: "Please inspect this clip.",
+    image: {
+      kind: "animation",
+      fileId: "gif-file-id",
+      fileName: "telegram-gif-unique-id.mp4",
+      mimeType: "video/mp4",
+      sizeBytes: 180_000,
+      durationSeconds: 2,
+      thumbnail: {
+        fileId: "gif-thumb-id",
+        fileName: "telegram-gif-thumb-unique.jpg",
+        sizeBytes: 8_000,
+      },
+    },
+  }]);
+});
+
+it("queues a video and its caption instead of dropping the update", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+
+  await fixture.ingress.handleClaimed(messageUpdate(14, 7, 70, undefined, {
+    caption: "The settings page I recorded",
+    video: {
+      file_id: "video-file-id",
+      file_unique_id: "video-unique-id",
+      width: 720,
+      height: 1280,
+      duration: 12,
+      mime_type: "video/mp4",
+      file_size: 1_200_000,
+      thumbnail: {
+        file_id: "video-thumb-id",
+        file_unique_id: "video-thumb-unique",
+        width: 180,
+        height: 320,
+        file_size: 9_000,
+      },
+    },
+  }), 1_905);
+
+  const controller = fixture.store.getControllerForOwner("7", "70");
+  expect(controller).not.toBeNull();
+  expect(fixture.store.listControllerTurns(controller!.controllerKey, 10)).toMatchObject([{
+    updateId: 14,
+    inputText: "The settings page I recorded",
+    image: {
+      kind: "video",
+      fileId: "video-file-id",
+      fileName: "telegram-video-unique-id.mp4",
+      mimeType: "video/mp4",
+      durationSeconds: 12,
+    },
+  }]);
+});
+
 it("rejects a known oversized image before queueing controller work", async () => {
   const onWorkAvailable = vi.fn();
   const fixture = ingressFixture({

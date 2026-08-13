@@ -70,6 +70,7 @@ it("uses optimistic versions and leaves one durable effect after a stale replay"
 it.each([
   { name: "CONFIRMED", event: { type: "CONFIRMED" as const } },
   { name: "CONTINUE_REVIEW", event: { type: "CONTINUE_REVIEW" as const } },
+  { name: "RETRY", event: { type: "RETRY" as const } },
 ])("rejects admission-only $name events at the public store boundary without mutation", ({ event }) => {
   const { db, store } = storeFixture();
   const draft = store.createJob({ id: `job_${event.type.toLowerCase()}`, sourceUpdateId: 101, requestText: "do it", now: 1_000 });
@@ -253,7 +254,7 @@ it("bounds and protects durable Telegram failure summaries", () => {
 });
 
 it("enqueues one reconcile effect for a known worker thread", () => {
-  const { store } = storeFixture();
+  const { db, store } = storeFixture();
   const job = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "do it", now: 1_000 });
   store.applyJobEvent(job.id, job.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
   const selected = store.getJob(job.id);
@@ -268,6 +269,44 @@ it("enqueues one reconcile effect for a known worker thread", () => {
   expect(store.enqueueReconcileForThread("unknown", 2_002)).toBe(false);
   expect(store.listEffectsForJob(job.id).filter((effect) => effect.kind === "reconcile_job")).toHaveLength(1);
   expect(store.listEffectsForJob(job.id).find((effect) => effect.kind === "reconcile_job")?.payload).toEqual({ threadId: "thr_i" });
+
+  db.prepare("UPDATE effects SET status = 'done' WHERE idempotency_key = ?").run("reconcile:job_1:thr_i");
+  expect(store.enqueueReconcileForThread("thr_i", 3_000)).toBe(true);
+  expect(store.getEffect(job.id, "reconcile:job_1:thr_i")).toMatchObject({
+    status: "pending",
+    attempts: 0,
+    nextAttemptAt: 3_000,
+  });
+  expect(store.listEffectsForJob(job.id).filter((effect) => effect.kind === "reconcile_job")).toHaveLength(1);
+});
+
+it("wakes for watched worker, monitor, and environment threads", () => {
+  const { store } = storeFixture();
+  const job = store.createJob({ id: "job_1", sourceUpdateId: 101, requestText: "do it", now: 1_000 });
+  store.applyJobEvent(job.id, job.version, { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, 1_100);
+  const selected = store.getJob(job.id);
+  if (!selected) throw new Error("selected job missing");
+  const planning = admitConfirmedJob(store, selected, 1_200);
+  const critiquing = store.applyJobEvent(job.id, planning.version, { type: "PLAN_READY", attemptId: "stage_plan" }, 1_250);
+  const creating = store.applyJobEvent(job.id, critiquing.version, { type: "CRITIQUE_PASSED", attemptId: "stage_critique" }, 1_275);
+  store.applyJobEvent(job.id, creating.version, { type: "IMPLEMENTATION_CREATED", threadId: "thr_i", environmentId: "env_1" }, 1_300);
+
+  expect(store.shouldWakeForThread("thr_i")).toBe(true);
+  expect(store.shouldWakeForThread("thr_other")).toBe(false);
+  expect(store.shouldWakeForEnvironment("env_1")).toBe(true);
+  expect(store.shouldWakeForEnvironment("env_other")).toBe(false);
+  expect(store.enqueueReconcileForEnvironment("env_1", 2_000)).toBe(true);
+  expect(store.getEffect(job.id, "reconcile:job_1:thr_i")?.status).toBe("pending");
+
+  store.createMonitor({
+    controllerKey: "owner-7-controller",
+    kind: "thread_idle",
+    threadId: "thr_watch",
+    instruction: "Tell me when it finishes.",
+    dueAt: null,
+    now: 2_100,
+  });
+  expect(store.shouldWakeForThread("thr_watch")).toBe(true);
 });
 
 it("requeues a released review-limit block without a global active-job rejection", () => {
@@ -299,6 +338,94 @@ it("requeues a released review-limit block without a global active-job rejection
   expect(store.requeueReviewAdmission(blocked.id, selected.version, 1_300)).toEqual(requeued);
   expect(store.getJob(blocked.id)?.state).toBe("blocked");
   expect(store.getJob(active.id)?.state).toBe("awaiting_project");
+});
+
+it("requeues a released plan-limit block the same way as a review-limit block", () => {
+  const { db, store } = storeFixture();
+  const blocked = store.createJob({ id: "job_plan_blocked", sourceUpdateId: 105, requestText: "plan blocked", now: 1_000 });
+  const selected = store.applyJobEvent(blocked.id, blocked.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  store.queueAdmission({
+    jobId: blocked.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_050,
+  });
+  db.prepare("UPDATE jobs SET state = 'blocked', blocked_reason = 'plan_limit', plan_cycle = 2 WHERE id = ?").run(blocked.id);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = 1_100, release_reason = 'plan_limit' WHERE job_id = ?").run(blocked.id);
+
+  expect(store.requeueReviewAdmission(blocked.id, selected.version, 1_200)).toMatchObject({
+    outcome: "queued",
+    admission: { state: "queued", resumeEvent: "CONTINUE_REVIEW" },
+  });
+});
+
+it("requeues a released failed job and resumes it only after capacity is reacquired", () => {
+  const { db, store } = storeFixture();
+  const draft = store.createJob({ id: "job_released_retry", sourceUpdateId: 103, requestText: "retry", now: 1_000 });
+  const selected = store.applyJobEvent(draft.id, draft.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  const planning = admitConfirmedJob(store, selected, 1_100);
+  const failed = store.applyJobEvent(planning.id, planning.version, { type: "FAILED", error: "validation unavailable" }, 1_200);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = ? WHERE job_id = ?")
+    .run(1_300, "job_released", failed.id);
+  db.prepare("UPDATE job_resource_claims SET state = 'released', lease_expires_at = 0, released_at = ?, release_reason = ? WHERE job_id = ?")
+    .run(1_300, "job_released", failed.id);
+  expect(store.listControlJobs("retry", 10).map((job) => job.id)).toContain(failed.id);
+  expect(store.countControlJobs("retry")).toBe(1);
+
+  const scheduled = store.retryFailedJob(failed.id, failed.version, 1_400);
+
+  expect(scheduled).toMatchObject({
+    outcome: "queued",
+    job: { state: "failed" },
+    admission: { state: "queued", resumeEvent: "RETRY" },
+  });
+  expect(store.retryFailedJob(failed.id, failed.version, 1_450)).toEqual(scheduled);
+  const lease = store.acquireExecutorLease("retry-admitter", 1_500, 30_000);
+  if (!lease.acquired) throw new Error("retry admission lease was not acquired");
+  const admitted = store.tryAdmit({
+    jobId: failed.id,
+    maxConcurrentJobs: 8,
+    ownerId: "retry-admitter",
+    generation: lease.generation,
+    now: 1_500,
+    leaseMs: 30_000,
+  });
+  expect(admitted).toMatchObject({
+    outcome: "admitted",
+    job: { state: "planning", resumeState: null, lastError: null },
+    admission: { state: "admitted", resumeEvent: "RETRY" },
+  });
+  expect(store.listEffectsForJob(failed.id).at(-1)).toMatchObject({ kind: "spawn_plan", status: "pending" });
+});
+
+it("does not queue a failed job that has no durable resume checkpoint", () => {
+  const { db, store } = storeFixture();
+  const draft = store.createJob({ id: "job_retry_without_resume", sourceUpdateId: 104, requestText: "retry", now: 1_000 });
+  const selected = store.applyJobEvent(draft.id, draft.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  const planning = admitConfirmedJob(store, selected, 1_100);
+  const failed = store.applyJobEvent(planning.id, planning.version, { type: "FAILED", error: "validation unavailable" }, 1_200);
+  db.prepare("UPDATE jobs SET resume_state = NULL WHERE id = ?").run(failed.id);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = ? WHERE job_id = ?")
+    .run(1_300, "job_released", failed.id);
+
+  expect(store.retryFailedJob(failed.id, failed.version, 1_400)).toEqual({ outcome: "unavailable" });
+  expect(store.getAdmission(failed.id)?.state).toBe("released");
 });
 
 it("rejects a queued CONFIRMED admission as a review continuation", () => {

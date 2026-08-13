@@ -10,7 +10,7 @@ export const MAX_CONCURRENT_JOBS = 8;
 
 export type MaxConcurrentJobs = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
 export type AdmissionState = "queued" | "admitted" | "draining" | "released";
-export type AdmissionResumeEvent = "CONFIRMED" | "CONTINUE_REVIEW";
+export type AdmissionResumeEvent = "CONFIRMED" | "CONTINUE_REVIEW" | "RETRY";
 export type ResourceKind = "project" | "repository_merge" | "production_target";
 
 export const RELEASE_CANDIDATE_JOB_STATES: readonly JobState[] = [

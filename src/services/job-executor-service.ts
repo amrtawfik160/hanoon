@@ -4,9 +4,15 @@ import type { StoredEffect } from "../domain/models";
 import { AutonomyScheduler } from "../autonomy/scheduler";
 import { MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "../autonomy/models";
 import { redactError } from "../errors";
+import { controllerDraftPreview } from "../controller/stream";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
 import { classifyTelegramError } from "../telegram/errors";
 import { JobLaneRunner, type JobLaneKind, type JobLaneSnapshotProvider } from "./job-lane-runner";
+import {
+  projectUnknownWorker,
+  projectWorkerLiveness,
+  type BbThreadObservation,
+} from "./worker-liveness";
 
 type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
@@ -26,7 +32,8 @@ export type JobExecutorDependencies = {
   telegram?: (token?: string) => JobExecutorTelegram;
   getTelegramClient?: (token?: string) => JobExecutorTelegram;
   telegramToken?: () => string | undefined;
-  reconcileJob?: (job: JobRecord, signal: AbortSignal, fence: EffectFence) => Promise<void>;
+  reconcileJob?: (job: JobRecord, signal: AbortSignal, fence: EffectFence, resourceId?: string) => Promise<void>;
+  getWorkerThread?: (threadId: string, signal: AbortSignal) => Promise<BbThreadObservation>;
   scheduler?: Pick<AutonomyScheduler, "run">;
   maxConcurrentJobs?: () => number | null;
   onWorkAvailable?: () => void;
@@ -76,6 +83,7 @@ const IDLE_POLL_MS = 60_000;
 // wait is also the draft's frame rate: a whole second of output lands in one
 // jump. While an answer is arriving the loop runs at roughly draft speed.
 const STREAM_POLL_MS = 250;
+export const WORKER_RECONCILE_INTERVAL_MS = 10_000;
 const PERMANENT_EFFECT_ERROR_NAMES = new Set([
   "TypeError",
   "SyntaxError",
@@ -134,6 +142,11 @@ function isTerminal(job: JobRecord): boolean {
   return ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state);
 }
 
+function hasReconcileableWorker(job: JobRecord): boolean {
+  return ["planning", "critiquing", "implementing", "remediating", "reviewing", "documenting", "final_reviewing"]
+    .includes(job.state);
+}
+
 function controllerTurnId(logicalKey: string): string | null {
   const match = /^controller:(controller-turn-[^:]+):reply$/.exec(logicalKey);
   return match?.[1] ?? null;
@@ -143,6 +156,29 @@ type ReleasePassResult = Readonly<{
   didWork: boolean;
   leaseLost: boolean;
 }>;
+
+type ReleasePassInput = Readonly<{
+  store: TelegramAgentStore;
+  ownerId: string;
+  generation: number;
+  clock: { now(): number };
+  busyJobIds: ReadonlySet<string>;
+  getWorkerThread: JobExecutorDependencies["getWorkerThread"];
+  signal: AbortSignal;
+}>;
+
+type ReleaseWorkerInput = Readonly<{
+  store: TelegramAgentStore;
+  job: JobRecord;
+  worker: NonNullable<ReturnType<TelegramAgentStore["getWorkerLiveness"]>>;
+  ownerId: string;
+  generation: number;
+  clock: { now(): number };
+  getWorkerThread: NonNullable<JobExecutorDependencies["getWorkerThread"]>;
+  signal: AbortSignal;
+}>;
+
+type ReleaseStep = "worked" | "skipped" | "aborted" | "lease_lost";
 
 type LaneOperationRecord = Readonly<{
   jobId: string;
@@ -281,29 +317,91 @@ export function settleEffectFailure(
   );
 }
 
-function finalizeReleaseCandidates(
-  store: TelegramAgentStore,
-  ownerId: string,
-  generation: number,
-  clock: { now(): number },
-  busyJobIds: ReadonlySet<string>,
-): ReleasePassResult {
-  let didWork = false;
-  const admissions = store.listReleaseCandidates(100);
-  for (const admission of admissions) {
-    if (busyJobIds.has(admission.jobId)) continue;
-    const fence = {
-      ownerId,
-      generation,
-      now: clock.now(),
-    };
-    assertNow(fence.now);
-    if (!store.beginDraining({ jobId: admission.jobId, ...fence })) {
-      return { didWork, leaseLost: true };
+function persistReleaseWorkerObservation(
+  input: ReleaseWorkerInput,
+  thread: BbThreadObservation | null,
+): ReleaseStep {
+  if (input.signal.aborted) return "aborted";
+  const observedAt = input.clock.now();
+  assertNow(observedAt);
+  try {
+    const fence = { ownerId: input.ownerId, generation: input.generation, now: observedAt };
+    if (thread) {
+      projectWorkerLiveness(
+        input.store, input.job, thread, observedAt,
+        input.worker.workerKind, input.worker.generation, fence,
+      );
+    } else {
+      projectUnknownWorker(
+        input.store, input.job, input.worker.resourceId, observedAt,
+        input.worker.workerKind, input.worker.generation, fence,
+      );
     }
-    const released = store.finalizeRelease({ jobId: admission.jobId, ...fence });
-    if (released === null) return { didWork, leaseLost: true };
-    didWork = true;
+  } catch (error) {
+    if (!input.store.isExecutorLeaseCurrent(input.ownerId, input.generation, observedAt)) return "lease_lost";
+    throw error;
+  }
+  return "worked";
+}
+
+async function refreshReleaseWorker(input: ReleaseWorkerInput): Promise<ReleaseStep> {
+  let thread: BbThreadObservation;
+  try {
+    thread = await input.getWorkerThread(input.worker.resourceId, input.signal);
+  } catch {
+    // BB lookup errors are opaque. Unknown is the fail-closed observation and
+    // advances observedAt so a transient outage cannot create a hot poll loop.
+    return persistReleaseWorkerObservation(input, null);
+  }
+  if (input.signal.aborted) return "aborted";
+  return persistReleaseWorkerObservation(
+    input,
+    thread.id === input.worker.resourceId ? thread : null,
+  );
+}
+
+async function finalizeReleaseCandidate(
+  input: ReleasePassInput,
+  admission: ReturnType<TelegramAgentStore["listReleaseCandidates"]>[number],
+): Promise<ReleaseStep> {
+  if (input.busyJobIds.has(admission.jobId)) return "skipped";
+  const now = input.clock.now();
+  assertNow(now);
+  if (!input.store.beginDraining({
+    jobId: admission.jobId,
+    ownerId: input.ownerId,
+    generation: input.generation,
+    now,
+  })) return "lease_lost";
+
+  const job = input.store.getJob(admission.jobId);
+  const worker = input.store.getWorkerLiveness(admission.jobId);
+  const refreshDue = job && worker && worker.resourceKind === "bb_thread" &&
+    !["idle", "failed"].includes(worker.state) && input.getWorkerThread &&
+    now - worker.observedAt >= WORKER_RECONCILE_INTERVAL_MS;
+  if (refreshDue) {
+    const refresh = await refreshReleaseWorker({ ...input, job, worker, getWorkerThread: input.getWorkerThread });
+    if (refresh === "aborted" || refresh === "lease_lost") return refresh;
+  }
+
+  const finalizedAt = input.clock.now();
+  assertNow(finalizedAt);
+  const released = input.store.finalizeRelease({
+    jobId: admission.jobId,
+    ownerId: input.ownerId,
+    generation: input.generation,
+    now: finalizedAt,
+  });
+  return released === null ? "lease_lost" : "worked";
+}
+
+async function finalizeReleaseCandidates(input: ReleasePassInput): Promise<ReleasePassResult> {
+  let didWork = false;
+  for (const admission of input.store.listReleaseCandidates(100)) {
+    const step = await finalizeReleaseCandidate(input, admission);
+    if (step === "lease_lost") return { didWork, leaseLost: true };
+    if (step === "aborted") return { didWork, leaseLost: false };
+    if (step === "worked") didWork = true;
   }
   return { didWork, leaseLost: false };
 }
@@ -356,6 +454,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
   const sleep = deps.sleep ?? defaultSleep;
   const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 251));
   let acquiredGeneration: number | null = null;
+  deps.presence?.reset();
 
   while (!signal.aborted) {
     const now = deps.clock.now();
@@ -370,7 +469,6 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       continue;
     }
     acquiredGeneration = lease.generation;
-    deps.presence?.reset();
     const workAbort = new AbortController();
     let leaseLost = false;
     let continueAcquiring = false;
@@ -394,6 +492,15 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
     deps.laneSnapshots?.attach(lanes);
     const laneOperations = new Map<string, LaneOperationRecord>();
     const adoptedJobIds = new Set<string>();
+    const nextWorkerReconcileAt = new Map<string, number>();
+    const hasCurrentAdoptedClaims = (jobId: string, now: number): boolean => {
+      const claims = deps.store.listCurrentHeldResourceClaims(jobId, 100);
+      return claims.length > 0 && claims.every((claim) =>
+        claim.ownerId === ownerId &&
+        claim.generation === lease.generation &&
+        claim.leaseExpiresAt > now,
+      );
+    };
     const onWorkAbort = (): void => {
       lanes.abortAll(abortReason(workAbort.signal));
       laneOperations.clear();
@@ -433,6 +540,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             if (completion.outcome === "fulfilled") {
               if (operation.effect === null) {
                 adoptedJobIds.add(operation.jobId);
+                nextWorkerReconcileAt.set(operation.jobId, now + WORKER_RECONCILE_INTERVAL_MS);
               } else if (!deps.store.completeEffect(operation.effect.idempotencyKey, ownerId, lease.generation, now)) {
                 loseLease();
               }
@@ -618,6 +726,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             kind: "pipeline",
             effect: null,
           });
+          if (started) nextWorkerReconcileAt.set(job.id, deps.clock.now() + WORKER_RECONCILE_INTERVAL_MS);
           return started;
         };
 
@@ -654,6 +763,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           if (lanes.hasJob(admission.jobId)) continue;
           const job = deps.store.getJob(admission.jobId);
           if (!job) continue;
+          const claimNow = deps.clock.now();
+          assertNow(claimNow);
+          if (adoptedJobIds.has(job.id) && !hasCurrentAdoptedClaims(job.id, claimNow)) {
+            adoptedJobIds.delete(job.id);
+          }
           if (!adoptedJobIds.has(job.id)) {
             if (deps.reconcileJob) {
               if (startReconciliationLane(job, true)) {
@@ -672,7 +786,16 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             now: deps.clock.now(),
             leaseMs,
           });
-          if (!effect) continue;
+          if (!effect) {
+            const dueAt = nextWorkerReconcileAt.get(job.id);
+            if (deps.reconcileJob && hasReconcileableWorker(job) && dueAt !== undefined && claimNow >= dueAt) {
+              if (startReconciliationLane(job, true)) {
+                pipelineState.cursorJobId = job.id;
+                didWork = true;
+              }
+            }
+            continue;
+          }
           if (!startEffectLane(effect, "pipeline")) {
             if (!workAbort.signal.aborted) loseLease();
             break;
@@ -704,13 +827,15 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           break;
         }
 
-        const releasePass = finalizeReleaseCandidates(
-          deps.store,
+        const releasePass = await finalizeReleaseCandidates({
+          store: deps.store,
           ownerId,
-          lease.generation,
-          deps.clock,
-          new Set(lanes.snapshot().busyJobIds),
-        );
+          generation: lease.generation,
+          clock: deps.clock,
+          busyJobIds: new Set(lanes.snapshot().busyJobIds),
+          getWorkerThread: deps.getWorkerThread,
+          signal: workAbort.signal,
+        });
         didWork = releasePass.didWork || didWork;
         if (releasePass.leaseLost) {
           continueAcquiring = true;
@@ -746,7 +871,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               await telegram.sendMessageDraft(
                 item.chatId,
                 stableChatDraftId(item.chatId),
-                controllerTurn.streamText,
+                controllerDraftPreview({
+                  streamText: controllerTurn.streamText,
+                  streamPhase: controllerTurn.streamPhase,
+                  fallbackText: payloadText(item),
+                }),
               );
             } else if (knownMessageId !== null) {
               await telegram.editMessage(item.chatId, knownMessageId, item.payload);
@@ -898,9 +1027,17 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         const ordinaryWaitMs = deps.controller?.isStreaming?.()
           ? STREAM_POLL_MS
           : didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+        const sweepNow = deps.clock.now();
+        const workerSweepWaitMs = [...nextWorkerReconcileAt.entries()].reduce((soonest, [jobId, dueAt]) => {
+          if (!adoptedJobIds.has(jobId) || lanes.hasJob(jobId)) return soonest;
+          const candidate = deps.store.getJob(jobId);
+          if (!candidate || !hasReconcileableWorker(candidate)) return soonest;
+          return Math.min(soonest, Math.max(1, dueAt - sweepNow));
+        }, Number.POSITIVE_INFINITY);
+        const ordinaryAndSweepWaitMs = Math.min(ordinaryWaitMs, workerSweepWaitMs);
         const waitMs = presenceWaitMs === null
-          ? ordinaryWaitMs
-          : Math.min(ordinaryWaitMs, Math.max(1, presenceWaitMs));
+          ? ordinaryAndSweepWaitMs
+          : Math.min(ordinaryAndSweepWaitMs, Math.max(1, presenceWaitMs));
         try {
           const busyLaneJobIds = lanes.snapshot().busyJobIds;
           const busyReleaseCandidate = !deps.waitForWork && busyLaneJobIds.some((jobId) =>
@@ -934,7 +1071,6 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       signal.removeEventListener("abort", onStop);
       workAbort.abort();
       await heartbeat;
-      deps.presence?.reset();
       deps.laneSnapshots?.detach(lanes);
       if (deps.releaseOnShutdown && !continueAcquiring && signal.aborted) {
         deps.store.releaseExecutorLease(ownerId, lease.generation, deps.clock.now());

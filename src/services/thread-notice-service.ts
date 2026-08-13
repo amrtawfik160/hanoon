@@ -1,3 +1,4 @@
+import { parseWorkerThreadTitle } from "../agent-skills/role-resolver";
 import { redactError } from "../errors";
 import { parseThreadInteraction } from "../controller/questions";
 import type { TelegramAgentStore } from "../storage/store";
@@ -58,6 +59,15 @@ export class ThreadNoticeService {
 
   public constructor(private readonly dependencies: ThreadNoticeServiceDependencies) {}
 
+  /**
+   * Drops the pacing guard for the next sweep. BB telling us its interactions
+   * changed is news the pacing was never meant to hold back: the owner is
+   * looking at a card that no longer means anything.
+   */
+  public requestSweep(): void {
+    this.sweptAt = null;
+  }
+
   public async processDue(): Promise<boolean> {
     const owner = this.dependencies.store.getOwner();
     if (!owner) return false;
@@ -77,6 +87,9 @@ export class ThreadNoticeService {
       // A sub-agent's thread is the parent's business, not the owner's; they
       // asked to hear about the work they started, not each step inside it.
       if (thread.parentThreadId !== null) continue;
+      // Pipeline workers already have a job status card. Announcing their
+      // internal titles as "finished" is noise the owner cannot act on.
+      if (parseWorkerThreadTitle(thread.title) !== null) continue;
       if (this.dependencies.store.observeThread({
         threadId: thread.id,
         title: thread.title,
@@ -99,8 +112,13 @@ export class ThreadNoticeService {
       return false;
     }
     const open = pending.filter((interaction) => interaction.status === "pending");
-    this.dependencies.store.discardThreadInteractions(thread.id, open.map((interaction) => interaction.id));
-    let asked = false;
+    // Retiring a card the owner already answered elsewhere is work of its own:
+    // an edit is now waiting to go out, and the loop should not settle for idle.
+    let asked = this.dependencies.store.discardThreadInteractions(
+      thread.id,
+      open.map((interaction) => interaction.id),
+      this.dependencies.clock.now(),
+    ) > 0;
     for (const candidate of open) {
       const interaction = parseThreadInteraction(candidate.id, candidate.payload);
       if (!interaction) continue;

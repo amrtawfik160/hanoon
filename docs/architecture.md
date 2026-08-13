@@ -6,11 +6,11 @@ Telegram Agent is a full-trust BB plugin that turns one paired private Telegram 
 
 The system has three layers:
 
-1. **Telegram I/O** polls updates, validates the paired private owner, records accepted input, and delivers drafts, status edits, callbacks, and final messages.
+1. **Telegram I/O** polls updates, validates the paired private owner, records accepted input, and delivers drafts, status edits, callbacks, and final messages. Photos, image files, GIFs, and short videos are accepted on the same owner turn. Stills attach as BB images. GIFs and videos are downloaded and sampled into an ordered set of stills the controller can see; if sampling is unavailable, Telegram's preview still is used instead.
 2. **Durable control** stores pairing, controller turns, jobs, immutable policy snapshots, effects, approvals, attempts, liveness, and the Telegram outbox in the plugin database.
-3. **BB execution** runs the hidden conversational controller and the visible planning, implementation, review, documentation, validation, merge, deployment, and canary work.
+3. **BB execution** runs the hidden conversational controller and hidden planning, implementation, review, documentation, validation, merge, deployment, and canary workers. The owner hears about that work through Telegram job cards, not BB sidebar threads.
 
-Ingress and BB lifecycle events do not start agent sessions. They record or enqueue work and nudge the executor. The single generation-fenced executor is the only component that dispatches controller turns, spawns pipeline threads, runs effects, or delivers Telegram output. Within that authority it can run a bounded number of independent project lanes concurrently.
+Ingress, BB lifecycle events, and BB realtime thread or environment changes do not start agent sessions. They record or enqueue work and nudge the executor. A completed reconcile for a worker thread can be re-armed when that thread or its environment changes again, so a job that stays active is observed again instead of going stale until the next scheduled poll. The single generation-fenced executor is the only component that dispatches controller turns, spawns pipeline threads, runs effects, or delivers Telegram output. Within that authority it can run a bounded number of independent project lanes concurrently.
 
 ## Ownership and data flow
 
@@ -18,10 +18,10 @@ Ingress and BB lifecycle events do not start agent sessions. They record or enqu
 flowchart LR
     Owner[Paired Telegram owner] -->|private messages and approvals| Ingress[Telegram ingress]
     Ingress -->|durable input only| State[(Plugin SQLite)]
-    Events[BB lifecycle events] -->|enqueue reconciliation| State
+    Events[BB lifecycle and realtime events] -->|enqueue reconciliation| State
     State -->|work notification| Executor[Single leased executor, bounded lanes]
     Executor -->|conversation| Controller[Hidden BB controller thread]
-    Executor -->|reviewed job effects| Pipeline[Visible BB pipeline threads]
+    Executor -->|reviewed job effects| Pipeline[Hidden BB pipeline threads]
     Pipeline -->|managed environment| Worktree[Git worktree]
     Controller -->|bounded reply state| State
     Pipeline -->|attempts, receipts, liveness| State
@@ -50,48 +50,83 @@ After an executor restart, the successor reconciles the exact job before adoptin
 
 ```mermaid
 flowchart LR
-    Intake --> Plan --> Critique --> Build --> Test --> Review --> Docs
-    Docs --> FinalTest[Final test] --> FinalReview[Final review]
+    Intake --> Plan --> Critique --> Build --> Test --> Review[Quality + risk review] --> Docs
+    Docs --> FinalTest[Final test] --> FinalReview[Quality + risk final review]
     FinalReview --> Approval[Owner approval] --> Merge --> Deploy --> Canary --> Complete
+    FinalReview -->|no production| Complete
+    Intake -->|small fix| SmallBuild[Build] --> SmallTest[Validation] --> SmallReview[Quality review] --> Complete
+    Intake -->|existing PR| Adopt[Verify repository, base, and head] --> Test
     Critique -->|one revision| Plan
     Test -->|failure| Patch
     Review -->|changes requested| Patch
     FinalTest -->|failure| Patch
     FinalReview -->|changes requested| Patch
     Patch --> Test
-    Critique -->|limit or invalid result| Blocked
+    Critique -->|limit| Blocked
     Patch -->|cycle limit| Blocked
 ```
 
-The planner writes a bounded plan artifact. The critic receives the work order and plan as immutable project attachments in a fresh BB thread. The implementation worker receives the accepted plan without inheriting the planner's provider conversation.
+The planner writes a bounded plan artifact. Its verification section must reproduce the policy's exact commands in a table that expects exit code `0`, or use the exact explicit-skip line when the policy has no commands. The critic receives the work order and plan as immutable project attachments in a fresh BB thread. The implementation worker receives the accepted plan without inheriting the planner's provider conversation.
 
-After implementation produces a pull request, deterministic validation runs before a fresh review thread is spawned in the same BB environment. A reviewer never forks or resumes the implementation conversation. A changes-requested verdict returns bounded findings to the implementation thread; a new pull-request head requires new validation and another fresh review.
+After implementation produces a pull request, deterministic validation runs before fresh review threads are spawned in the same BB environment. Full jobs require independent quality and risk verdicts; small fixes require only the quality verdict. The group cannot advance until every required lens has durable evidence for the exact head. A reviewer never forks or resumes the implementation conversation. A changes-requested verdict returns bounded findings to the implementation thread; a new pull-request head requires new validation and another fresh review group.
 
-Documentation, final validation, and final review happen before the owner receives a one-use merge approval. Merge, deploy, and canary each produce separate durable receipts. A successful merge followed by a failed deploy or canary is recorded as `production_failed`; the plugin does not claim completion or run rollback automatically.
+Documentation, final validation, and final review happen before the owner receives a one-use merge approval when production is configured. Documentation may be skipped only with a strict report and an observed clean, empty documentation diff. If production is not configured, a successful final review completes the job at the reviewed pull request. A small-fix job skips planning, critique, documentation, and final review, but still must pass deterministic validation and one independent quality review. An adopted pull request records planning and critique as honestly skipped after verifying its repository, base branch, URL, remote head, and deterministic local branch, then enters the normal full validation/review/finish path. Merge, deploy, and canary each produce separate durable receipts. A successful merge followed by a failed deploy or canary is recorded as `production_failed`; the plugin does not claim completion or run rollback automatically.
+
+## Adaptive capability control plane
+
+The capability control plane sits before provider work and reuses the delivery state machine rather than replacing its merge or production fences:
+
+```mermaid
+flowchart LR
+    Request --> Classifier[Traits + six recipes]
+    Classifier --> JobSnapshot[Recipe + legacy/shadow/active mode]
+    JobSnapshot --> Profile[Immutable least-capability profile]
+    Profile --> Route[Exact model tuple]
+    Route --> Provider[BB provider boundary]
+    Provider --> Outcomes[Append-only trials and capability outcomes]
+    Outcomes --> Gate[Native, validation, and guard gates]
+    Gate --> Transition[Authoritative job transition]
+```
+
+The pinned catalog validates every admitted skill, controller bundle, native adapter, model-pool marker, and recipe descriptor by digest and dependency graph. Profiles bind the catalog and graph digests, recipe/version, routing mode, exact model tuple, selected assignments, traits, and reason codes to one controller turn or worker attempt. A profile is written before its provider call. Selected mandatory capabilities receive exactly one terminal outcome before their stage may advance; native-adapter outcomes commit in the same SQLite transaction as the transition they authorize.
+
+The six recipes are `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, and `architectural`. Their graphs express direct diff guards, approved-design implementation, diagnosis plus regression, skill baseline proof, adopted-pull-request inspection, and plan/critique plus task and integrated review respectively. Later evidence can raise rigor at most twice, never downgrade it, and the persisted job snapshot survives retry and restart.
+
+Active model routing pins provider, model, reasoning, and service tier before spawn. One equivalent provider failure retries the same tuple; a second escalates only the next provider call from `fast` to `standard` to `strong`. It never switches within an attempt or downgrades after restart. A second equivalent failure at `strong` blocks. Permission remains a separate policy field.
+
+Review guards are selected from the canonical exact-head diff. Their strict envelopes bind profile revision, head SHA, diff digest, descriptor digests, and bounded findings. Mandatory outcomes are checked again at the executor transition. The same mandatory finding requests remediation twice and blocks on its third occurrence in the durable job/review lineage.
+
+External provider, model, plugin, and skill discovery is read-only and deadline-bound. A failed refresh preserves the previous snapshot with degraded health. Discovered entries stay `inventory-only`: discovery alone grants no execution authority, and admission requires a validated descriptor, explicit role/recipe/stage mapping, and at least five compatible shadow trials.
+
+Rollout is per recipe. `shadow` computes candidate profiles and routing evidence without controlling provider behavior or recording candidate success as production truth. `active` can control only after a durable promotion decision; rollback affects new jobs while retaining profiles, receipts, trials, and in-flight snapshots. The production promotion reader resolves the newest append-only manifest against integrity-bound deterministic and classifier artifacts, safety snapshots, an active post-merge job, distinct failure/recovery receipts, and terminal candidate/baseline model trials. Trial settlement timestamps must prove failure before recovery, both receipts before merge, merge before the live-run record, and that record before the manifest. A missing, corrupt, duplicate, cross-recipe, reversed, or mismatched reference makes the whole manifest incomplete; it never falls back to older proof.
+
+This release deliberately exposes no promotion-evidence append method, CLI input, controller tool, or plugin callback. A future trusted live collector must prove the acceptance job is disposable, derive artifact and safety records from authoritative harness output, and commit the bounded ledger transactionally. Until that collector exists, the seam remains explicitly incomplete: a fresh installation has no promotion evidence, `capability promote` fails closed, and adaptive recipes default to `shadow`.
 
 ## Agent skill runtime
 
-The BB manifest registers exactly three local skill roots, each vendored verbatim from one permissively licensed upstream and carrying that upstream's licence:
+The BB manifest registers five local skill roots. Four are vendored from reviewed permissively licensed upstreams. The fifth is first-party Hanoon guidance:
 
 | Root | Upstream | Licence | Contents |
 | --- | --- | --- | --- |
-| `skills/workflow-kit` | [obra/superpowers](https://github.com/obra/superpowers), pinned `6.2.0` | MIT | 14 workflow skills |
+| `skills/workflow-kit` | [obra/superpowers](https://github.com/obra/superpowers), pinned `6.3.0` | MIT | 14 workflow skills |
 | `skills/guards` | [amElnagdy/guard-skills](https://github.com/amElnagdy/guard-skills) | MIT | `clean-code-guard`, `test-guard`, `docs-guard` |
 | `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | Apache-2.0 | `pr-writer` |
+| `skills/discovery` | [mattpocock/skills](https://github.com/mattpocock/skills), pinned `1.2.3` at revision `84fdeffd12f2ee307994d1eb6feb48173b6e0502` | MIT | `grill-with-docs`, `grilling`, `domain-modeling` |
+| `skills/hanoon` | first-party | first-party | `human-friendly-coding-communication`, `proportional-development-workflow` |
 
-A root's licence is recorded per root rather than per bundle, because the three do not share one: folding Apache-2.0 material under an MIT notice would misstate its terms. All 18 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
+A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. All 23 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
 
 The existing single `bb.agents.configure` callback keeps the controller and worker boundaries separate. Its exact role-selection matrix is:
 
 | Verified role/context | Selected skill ids |
 | --- | --- |
-| controller | none; controller tools and `CONTROLLER_INSTRUCTIONS` only |
-| planner | none |
-| critic | none |
-| implementation | `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
-| review | `clean-code-guard`, `test-guard` |
-| documentation | `docs-guard`, `verification-before-completion` |
-| final-review | `clean-code-guard`, `test-guard`, `docs-guard` |
+| controller | `human-friendly-coding-communication`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`; controller tools and `CONTROLLER_INSTRUCTIONS` |
+| planner | `human-friendly-coding-communication` |
+| critic | `human-friendly-coding-communication` |
+| implementation | `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
+| review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard` |
+| documentation | `human-friendly-coding-communication`, `docs-guard`, `verification-before-completion` |
+| final-review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard` |
 | validation, merge, deploy, canary | none; these are deterministic stages, not skill-bearing worker roles |
 
 ### Fail-closed worker selection
@@ -106,19 +141,19 @@ The parser accepts job ids of 1–256 `[A-Za-z0-9_-]` characters and attempt ids
 
 It then checks durable ownership. Implementation, review, and final-review titles must use an `attempt:` id and an exact durable attempt of kind `implementation` or `review`; planner, critic, and documentation titles must use a `stage:` id and an exact durable stage role `PLAN`, `CRITIQUE`, or `DOCS`. The id after that prefix is looked up as the exact job effect idempotency key, and its effect must be respectively `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs`. The job must exist and belong to the current project. Its persisted environment id, when non-null, and persisted worker thread id, when non-null, must equal the current context. A null binding is allowed only for the first start; it is not a wildcard after persistence. Title, job, attempt, role, effect, project, environment, thread, origin, project-kind, or workspace mismatches all return no tools and no skills. There is no fallback to a newest job, parent thread, or title-only inference.
 
-The controller branch is independently exact: it requires the active durable controller, matching project and host, the plugin origin, an allowed controller provider, a personal project and personal workspace, and the stable controller title. It receives controller tools and zero development skills. A spoofed or unrecognized context cannot inherit either controller tools or a worker profile.
+The controller branch is independently exact: it requires the active durable controller, matching project and host, the plugin origin, an allowed controller provider, a personal project and personal workspace, and the stable controller title. It receives controller tools, the two first-party guidance skills, the three discovery skills, and `CONTROLLER_INSTRUCTIONS`. A spoofed or unrecognized context cannot inherit either controller tools or a worker profile.
 
 ### Bundle integrity and maintenance
 
-`npm run skills:verify` runs the synchronous verifier used by activation. It requires the manifest roots and `skills/skills.lock.json` schema version 1, bounds the lock to 1 MiB, the bundle to 64 skills and 512 locked files, rejects symlinks/non-regular or over-256 KiB files, and requires every discovered file to be locked exactly once with a SHA-256 digest. It also checks lexical safe paths, skill directory/frontmatter/lock-name agreement, nested local Markdown links that stay within their registered root and resolve to a regular file or a directory inside it, and the recorded provenance and licence of all three roots (pinned workflow-kit `6.2.0`, the MIT guard kit, and the Apache-2.0 delivery kit) against their committed LICENSE files. Success prints a bundle digest and skill count.
+`npm run skills:verify` runs the synchronous verifier used by activation. It requires the manifest roots and `skills/skills.lock.json` schema version 1, bounds the lock to 1 MiB, the bundle to 64 skills and 512 locked files, rejects symlinks/non-regular or over-256 KiB files, and requires every discovered file to be locked exactly once with a SHA-256 digest. It also checks lexical safe paths, skill directory/frontmatter/lock-name agreement, nested local Markdown links that stay within their registered root and resolve to a regular file or a directory inside it, and the recorded provenance and licence of all four vendored roots (including pinned workflow-kit `6.3.0` and discovery kit `1.2.3`) plus the first-party Hanoon root. Success prints a bundle digest and skill count.
 
 The package `build` script runs `npm run skills:verify` before `bb plugin build`; `server.ts` runs the same verification before `createPlugin` can register services, tools, schedules, or commands. Any malformed lock, missing root/skill/resource, unlocked or escaped path, frontmatter/provenance mismatch, symlink, size/count limit, or digest mismatch stops the build or activation. There is no runtime download, replacement, or repair path.
 
-Synchronization is a maintainer-only, network-free operation from an already-reviewed absolute checkout. The checkout must identify the `superpowers` package at version `6.2.0`, contain `LICENSE` and `skills/`, and carry the reviewed MIT license. The exact command is:
+Synchronization is a maintainer-only, network-free operation from an already-reviewed absolute checkout. The checkout must identify the `superpowers` package at version `6.3.0`, contain `LICENSE` and `skills/`, and carry the reviewed MIT license. The exact command is:
 
 ```bash
-WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.2.0
-npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.2.0
+WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.3.0
+npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
 ```
 
 It rewrites only the local `skills/workflow-kit` tree and `skills/skills.lock.json`; ordinary plugin startup never invokes it.
@@ -137,7 +172,7 @@ BB threads and Git worktrees solve different isolation problems:
 | Uncommitted files and artifacts | Shared when threads reuse an environment | Isolated from other worktrees |
 | Filesystem mutation | Runs through the thread's environment | The actual mutation boundary |
 
-The conversational controller runs in a hidden personal workspace and has no implementation checkout. Planning creates or reuses the job's managed worktree. Implementation, review, documentation, and validation threads that reuse that environment see the same files, even though their provider conversations remain separate.
+The conversational controller runs in a hidden personal workspace and has no implementation checkout. Planning creates or reuses the job's managed worktree. Implementation, review, documentation, and validation threads that reuse that environment see the same files, even though their provider conversations remain separate. Each implementation worktree also has a gitignored `PROGRESS.md` scratchpad. Workers read it on entry and update it at meaningful milestones so a replacement session can continue after context compaction or recovery without turning transient notes into a commit.
 
 ## Durable state
 
@@ -178,11 +213,11 @@ Restating a subject supersedes its predecessor instead of overwriting it, so cor
 
 ## Monitors
 
-A monitor is a durable obligation, not a reminder. It watches a BB thread for completion or failure, or fires on a cron schedule. Firing is claimed before it happens, so a crash mid-fire cannot double-book it; a one-shot watch retires and a schedule re-arms for its next occurrence. The agent receives its own instruction back as an ordinary turn, acts on it, and reports to the owner.
+A monitor is a durable obligation, not a reminder. It watches a BB thread for completion or failure, or fires on a cron schedule. Thread watches are event-driven: BB realtime and lifecycle events wake the executor instead of waiting for the next idle poll. Firing is claimed before it happens, so a crash mid-fire cannot double-book it; a one-shot watch retires and a schedule re-arms for its next occurrence. The agent receives its own instruction back as an ordinary turn, acts on it, and reports to the owner. Schedules are for clock time, not for polling whether a thread or job has moved.
 
 ## Thread notices
 
-The owner drives BB from Telegram, so anything that would wait for a click in the BB app is work that waits forever. A background sweep watches every **top-level** visible thread — a sub-agent's thread is reported to its parent, not to the owner — and delivers two things:
+The owner drives BB from Telegram, so anything that would wait for a click in the BB app is work that waits forever. A background sweep watches every **top-level** visible thread — a sub-agent's thread is reported to its parent, not to the owner, and a Hanoon pipeline worker is already covered by the job status card — and delivers two things:
 
 - **Finished and failed.** A thread's first observation is recorded silently, so enabling the sweep does not replay a backlog. After that, only a thread that was *working* can stop working: a move into `idle` or `error` is announced when it comes from `active`, `starting`, or `stopping`. A thread marked failed after it already finished has had its say, and repeating it as a failure would contradict what the owner just read. A thread being steered turn by turn is announced at most once every ten minutes, so it does not narrate every reply.
 - **Blocked.** A thread waiting on a BB interaction is rendered into Telegram with inline buttons: the options of a question, or *Allow once* / *Allow all session* / *Deny* for a command or file-change approval. The tap is carried back through BB's interaction resolution, and delivery is recorded separately from the answer so a crash between the two re-sends rather than loses it.
@@ -200,6 +235,10 @@ The conversational agent can ask the owner a question mid-answer. BB raises that
 Two timeouts bound the ways an answer can go missing, and their ordering matters. A submitted turn that produces no BB event for eight minutes is treated as wedged: the turn fails with a message to the owner **and the thread is retired**, so the next message opens a fresh session. That deadline sits below the ten-minute limit on how long a queued message waits for a busy thread, so recovery happens before the queue starts failing behind it. A turn parked on a question is exempt — waiting on a person is not a stall.
 
 A message the owner sends while an answer is still being written is steered into the running thread rather than queued behind it, so a correction lands while it can still correct something.
+
+A controller answer may promise a later check-in only when that same turn has a completed receipt for a durable thread watch or schedule. Otherwise the settlement gate replaces the promise with an explicit statement that the work is unfinished and no follow-up is armed.
+
+While Luna is connecting, thinking, or using tools, Telegram shows a live draft instead of a blank loading state: a short status line at first, then the public thinking summary as it arrives. The private reasoning chain stays off that draft. The finished reply still comes from the completed assistant output, not the thinking preview.
 
 ## Learning from finished jobs
 
@@ -286,6 +325,7 @@ Budgets are constants rather than settings, on the same reasoning as the stall d
 - Memory never stores credential-shaped text, and hidden threads stay unreachable from the thread tools.
 - Project worker settings come from the job's immutable project policy. Changing the controller model or reasoning level does not rewrite an active job.
 - Review verdicts are structured and bound to an exact full pull-request head SHA.
+- Plan verification, validation receipts, documentation disposition, and every required review lens are checked from durable structured evidence before their transition can advance.
 - Pull-request head evidence is resolved from `git ls-remote origin refs/pull/<number>/head`; cached API metadata is not the merge authority.
 - Merge requires current review and validation evidence plus an expiring, one-use owner approval. Concurrency and resource ownership never replace that approval, and GitHub repository rules still apply.
 - Deployment and canary commands are owner-authored policy inputs. They run only after the approved merge is confirmed and the worktree is detached at that merge commit.

@@ -1,12 +1,37 @@
 import { createHash } from "node:crypto";
-import { buildWorkerThreadTitle } from "../agent-skills/role-resolver";
-import type { Job, JobEffect, JobEvent, ReviewFinding, StoredEffect, WorkerLiveness } from "../domain/models";
+import { buildWorkerThreadTitle, type WorkerSkillRole } from "../agent-skills/role-resolver";
+import {
+  CAPABILITY_BY_ID,
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+} from "../capabilities/catalog";
+import {
+  capabilityProfileDigest,
+  selectCapabilityProfile,
+  type WorkerProfileStage,
+} from "../capabilities/profiles";
+import { changedPathsFromGitDiff } from "../capabilities/change-surface";
+import {
+  DEFAULT_MODEL_POOL_REGISTRY,
+  recordModelFailure,
+  selectModelRoute,
+  type ModelPool,
+  type ModelRoute,
+} from "../capabilities/models";
+import {
+  nativeAdapterEnvelopeWithOutcome,
+  prepareNativeAdapterTransition,
+  type NativeAdapterTransition,
+  type NativeAdapterTransitionEnvelope,
+} from "../capabilities/native-adapters";
+import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
 import { ApprovalService } from "./approval-service";
-import { buildWorkOrder } from "../bb/handoffs";
+import { buildWorkOrder, type CapabilityWorkOrderEnvelope } from "../bb/handoffs";
 import { buildPlanArtifact } from "../bb/pipeline-handoffs";
-import type { BbAttempt, EnvironmentSnapshot, PipelineThreadAttempt } from "../bb/runner";
+import { environmentDiffText, type BbAttempt, type EnvironmentSnapshot, type PipelineThreadAttempt } from "../bb/runner";
+import { publishImplementationPullRequest } from "../bb/pr-publish";
 import type { TerminalCommandRunner, TerminalObservation } from "../bb/terminal-command";
-import { ValidationError, type ValidationSnapshot } from "../bb/validation";
+import { environmentWorktreeIsClean, ValidationError, type ValidationSnapshot } from "../bb/validation";
 import { persistableJobStatusPayload, renderJobStatus } from "../telegram/view";
 import { projectResourceWait } from "../storage/autonomy-repository";
 import type {
@@ -17,6 +42,7 @@ import type {
   ExecutorFence,
   TelegramAgentStore,
 } from "../storage/store";
+import type { CapabilityProfile, ModelRouteTrial } from "../storage/capability-repository";
 import { isSafeControlEffect } from "../autonomy/models";
 import {
   projectTerminalLiveness,
@@ -67,6 +93,8 @@ type BbEffectAdapter = {
   sendRemediation?(job: Job, findings: ReviewFinding[], reasons?: string[]): Promise<void>;
   sendSteering?(threadId: string, text: string): Promise<void>;
   stopWorker?(worker: string | WorkerLiveness): Promise<void>;
+  retireWorker?(resourceId: string, allowMissing: boolean): Promise<void>;
+  prepareProgressScratchpad?(environmentId: string): Promise<void>;
   getThread?(threadId: string): Promise<BbThread>;
   getEnvironmentSnapshot?(environmentId: string, baseBranch: string): Promise<EnvironmentSnapshot>;
   getPullRequestSnapshot?(environmentId: string): Promise<unknown>;
@@ -103,6 +131,7 @@ export type EffectRunnerDependencies = {
   store: TelegramAgentStore;
   fence: EffectFence;
   now: () => number;
+  minimumModelPool?: () => ModelPool | undefined;
   bb?: BbEffectAdapter;
   terminal?: TerminalCommandRunner;
   mergeHandler?: {
@@ -113,12 +142,11 @@ export type EffectRunnerDependencies = {
     }): Promise<unknown>;
   };
   approvals?: ApprovalService;
-  reconcileJob?: (job: Job, signal: AbortSignal, fence: EffectFence) => Promise<void>;
-  resolvePrHead?: (job: Job, effect: StoredEffect, signal: AbortSignal) => Promise<{
-    event: "PR_HEAD_RESOLVED" | "PR_HEAD_RESOLUTION_FAILED";
-    headSha?: string;
-    reason?: string;
-  }>;
+  reconcileJob?: (job: Job, signal: AbortSignal, fence: EffectFence, resourceId?: string) => Promise<void>;
+  resolvePrHead?: (job: Job, effect: StoredEffect, signal: AbortSignal) => Promise<
+    | { event: "PR_HEAD_RESOLVED"; headSha: string; originRepository: string }
+    | { event: "PR_HEAD_RESOLUTION_FAILED"; reason?: string }
+  >;
   runValidation?: (job: Job, effect: StoredEffect, signal: AbortSignal) => Promise<ValidationSnapshot>;
   runProductionStage?: (
     job: Job,
@@ -150,6 +178,19 @@ function fullSha(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
 }
 
+function locatedPullRequest(snapshot: unknown): { number: number; url: string } | null {
+  const record = snapshot !== null && typeof snapshot === "object"
+    ? snapshot as { outcome?: string; pullRequest?: { number?: unknown; url?: unknown } }
+    : {};
+  const number = record.pullRequest?.number;
+  const url = record.pullRequest?.url;
+  if (record.outcome === "available" && typeof number === "number" && Number.isInteger(number) && number >= 1
+    && typeof url === "string" && url.length > 0) {
+    return { number, url };
+  }
+  return null;
+}
+
 function expectedStates(kind: JobEffect["kind"]): readonly string[] {
   switch (kind) {
     case "render_status": return [];
@@ -169,6 +210,7 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "merge_pr": return ["merging"];
     case "deploy_production": return ["deploying"];
     case "verify_production": return ["verifying_production"];
+    case "recover_worker": return ["recovering_worker"];
     case "stop_thread": return [];
     case "steer_implementation": return ["implementing", "remediating"];
     case "reconcile_job": return [];
@@ -197,6 +239,7 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
   "merge_pr",
   "deploy_production",
   "verify_production",
+  "recover_worker",
   "stop_thread",
   "steer_implementation",
   "reconcile_job",
@@ -235,6 +278,11 @@ export function threadResultEnvironment(result: { environmentId?: unknown }): st
   return result.environmentId;
 }
 
+function validateThreadResult(result: { id?: unknown; environmentId?: unknown }): void {
+  threadResultId(result);
+  threadResultEnvironment(result);
+}
+
 function listThreadsAdapter(bb: BbEffectAdapter): BbEffectAdapter["listThreads"] | undefined {
   if (bb.listThreads) return bb.listThreads.bind(bb);
   if (bb.threads?.list) return bb.threads.list.bind(bb.threads);
@@ -248,7 +296,16 @@ function stageInputSha(...shaValues: string[]): string {
   return hash.digest("hex");
 }
 
-function validationStageEvidence(result: ValidationSnapshot): Record<string, unknown> {
+function validationStageEvidence(result: ValidationSnapshot, policy: ProjectPolicy): Record<string, unknown> {
+  const policyCommandReceipts = result.policyCommandReceipts ?? policy.validationCommands.flatMap((configured) => {
+    const receipt = result.commandReceipts.find((candidate) => candidate.command === configured.command);
+    return receipt ? [{
+      name: configured.name,
+      commandSha256: createHash("sha256").update(configured.command, "utf8").digest("hex"),
+      outcome: receipt.outcome,
+      exitCode: receipt.exitCode,
+    }] : [];
+  });
   return {
     validationOutcome: result.validationOutcome,
     headSha: result.headSha,
@@ -260,17 +317,29 @@ function validationStageEvidence(result: ValidationSnapshot): Record<string, unk
       exitCode: receipt.exitCode,
       output: receipt.output.slice(0, 1_000),
     })),
+    policyCommandReceipts: policyCommandReceipts.slice(0, 20),
     requiredChecks: result.requiredChecks.slice(0, 50).map((check) => ({
       name: check.name.slice(0, 200),
       bucket: check.bucket.slice(0, 80),
       state: check.state.slice(0, 80),
       link: check.link?.slice(0, 500) ?? null,
     })),
+    githubPr: result.githubPr ? {
+      number: result.githubPr.number,
+      url: result.githubPr.url.slice(0, 500),
+      state: result.githubPr.state.slice(0, 40),
+      isDraft: result.githubPr.isDraft,
+      baseRefName: result.githubPr.baseRefName.slice(0, 255),
+      headRefName: result.githubPr.headRefName.slice(0, 255),
+    } : null,
     completedAt: result.completedAt,
   };
 }
 
-function pipelineAttemptForRunner(attempt: PipelineStageAttempt): PipelineThreadAttempt {
+function pipelineAttemptForRunner(
+  attempt: PipelineStageAttempt,
+  capabilityProfile?: CapabilityWorkOrderEnvelope,
+): PipelineThreadAttempt {
   if (attempt.role !== "PLAN" && attempt.role !== "CRITIQUE" && attempt.role !== "DOCS") {
     throw new PermanentEffectError("pipeline thread attempt role is not model-backed");
   }
@@ -281,7 +350,62 @@ function pipelineAttemptForRunner(attempt: PipelineStageAttempt): PipelineThread
     threadId: attempt.threadId,
     environmentId: attempt.environmentId,
     outputText: attempt.outputText,
+    capabilityProfile,
   };
+}
+
+function sortedUnique(values: readonly string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+const MODEL_POOL_RANK: Readonly<Record<ModelPool, number>> = { fast: 0, standard: 1, strong: 2 };
+
+function nextModelPool(pool: ModelPool): ModelPool | null {
+  if (pool === "fast") return "standard";
+  if (pool === "standard") return "strong";
+  return null;
+}
+
+function sameModelRoute(left: ModelRoute, right: ModelRoute): boolean {
+  return left.pool === right.pool && left.providerId === right.providerId && left.modelId === right.modelId &&
+    left.reasoning === right.reasoning && left.serviceTier === right.serviceTier;
+}
+
+function selectedWorkerTraits(
+  job: Job,
+  role: WorkerSkillRole,
+  stage: WorkerProfileStage,
+  extraTraits: readonly string[],
+): string[] {
+  const traits = new Set<string>(job.taskTraits.map((entry) => entry.id));
+  for (const trait of extraTraits) traits.add(trait);
+  if (["bounded", "bug", "architectural", "skill-authoring"].includes(job.taskRecipe)) {
+    traits.add("behavioral-change");
+  }
+  if (job.taskRecipe === "bug") traits.add("unexpected-behavior");
+  if (role === "planner" && stage === "planning") traits.add("approved-spec");
+  if (role === "critic" || role === "review" || role === "final-review" || role === "documentation") {
+    traits.add("strict-json");
+  }
+  if (role === "documentation") traits.add("docs-changed");
+  return sortedUnique([...traits]);
+}
+
+function reviewChangeSurfaceTraits(diff: string): string[] {
+  const traits = new Set<string>(["strict-json"]);
+  const paths = changedPathsFromGitDiff(diff);
+  for (const path of paths) {
+    const normalized = path.toLowerCase();
+    if (/(^|\/)(?:tests?|__tests__)(\/|$)|\.(?:test|spec)\.[^.]+$/u.test(normalized)) {
+      traits.add("tests-changed");
+    } else if (/(^|\/)(?:readme|changelog)(?:\.|$)|(^|\/)docs?\/|\.(?:md|mdx|rst)$/u.test(normalized)) {
+      traits.add("docs-changed");
+    } else {
+      traits.add("code-changed");
+    }
+  }
+  if (paths.length > 1 || diff.length > 2_000) traits.add("nontrivial-diff");
+  return sortedUnique([...traits]);
 }
 
 function productionReceiptCountIsValid(snapshot: ProductionStageSnapshot, configuredCommands: number): boolean {
@@ -314,16 +438,39 @@ export class EffectRunner {
     };
   }
 
-  private applyEvent(jobId: string, expectedVersion: number, event: JobEvent): Job {
+  private applyEvent(
+    jobId: string,
+    expectedVersion: number,
+    event: JobEvent,
+    nativeAdapter?: NativeAdapterTransitionEnvelope,
+  ): Job {
     this.assertFence();
     const updated = this.dependencies.store.applyExecutorJobEvent({
       jobId,
       expectedVersion,
       event,
+      ...(nativeAdapter ? { nativeAdapter } : {}),
       ...this.executorFence(),
     });
     if (!updated) throw new Error("executor lease was lost before job transition");
     return updated;
+  }
+
+  private prepareNativeAdapter(
+    effect: StoredEffect,
+    job: Job,
+    transition: NativeAdapterTransition,
+    reviewLaneCount?: number,
+  ): NativeAdapterTransitionEnvelope | undefined {
+    return prepareNativeAdapterTransition({
+      store: this.dependencies.store,
+      job,
+      transition,
+      effectIdempotencyKey: effect.idempotencyKey,
+      ...(reviewLaneCount === undefined ? {} : { reviewLaneCount }),
+      minimumModelPool: this.dependencies.minimumModelPool?.(),
+      now: this.now(),
+    });
   }
 
   private updateExecutorAttempt(
@@ -380,30 +527,396 @@ export class EffectRunner {
     return job;
   }
 
+  private modelRouteForWorkerProfile(
+    job: Job,
+    subjectId: string,
+    stage: WorkerProfileStage,
+    pipelineRole: boolean,
+    risk: "low" | "medium" | "high",
+    existing: CapabilityProfile | null,
+  ): ModelRoute {
+    const selection = {
+      executionClass: pipelineRole ? "pipeline" as const : "worker" as const,
+      recipe: job.taskRecipe,
+      stage,
+      risk,
+      observedComplexity: job.taskTraits.some((trait) => trait.id === "multi-session") ? "high" as const : undefined,
+    };
+    if (!existing) {
+      return selectModelRoute({
+        ...selection,
+        minimumPool: this.dependencies.minimumModelPool?.(),
+      }, DEFAULT_MODEL_POOL_REGISTRY);
+    }
+    const trials = this.dependencies.store.listModelRouteTrials("worker_attempt", subjectId, 256);
+    const latest = trials.at(-1);
+    if (latest?.outcome === "blocked") {
+      throw new PermanentEffectError("Model provider route is durably blocked after equivalent strong-pool failures");
+    }
+    if (latest?.outcome === "selected") {
+      if (!sameModelRoute(latest.route, existing.model)) {
+        throw new PermanentEffectError("Unsettled model trial does not match the immutable worker profile");
+      }
+      return existing.model;
+    }
+    const [previous, current] = trials.slice(-2);
+    const equivalentFailures = previous?.outcome === "failed" && current?.outcome === "failed" &&
+      previous.failureSignature !== null && previous.failureSignature === current.failureSignature &&
+      sameModelRoute(previous.route, current.route) && sameModelRoute(current.route, existing.model);
+    if (!equivalentFailures) return existing.model;
+    const nextPool = nextModelPool(existing.model.pool);
+    if (nextPool === null) {
+      throw new PermanentEffectError("Model provider route exhausted the strong pool");
+    }
+    return selectModelRoute({ ...selection, minimumPool: nextPool }, DEFAULT_MODEL_POOL_REGISTRY);
+  }
+
+  private settleProfileForModelRouteChange(
+    profile: CapabilityProfile,
+    trials: readonly ModelRouteTrial[],
+    reasonCode: "model_route_escalated" | "model_route_blocked",
+  ): void {
+    const evidenceRefs = trials.slice(-2).map((trial) => `model-trial:${trial.id}`);
+    if (evidenceRefs.length === 0) throw new PermanentEffectError("Model route change is missing durable failure evidence");
+    const missing = new Set(this.dependencies.store.listMissingMandatoryCapabilityOutcomes(profile.id));
+    for (const assignment of profile.assignments) {
+      if (!assignment.mandatory || !missing.has(assignment.capabilityId)) continue;
+      this.dependencies.store.appendCapabilityTerminalOutcome({
+        profileId: profile.id,
+        capabilityId: assignment.capabilityId,
+        descriptorDigest: assignment.descriptorDigest,
+        outcome: "blocked",
+        evidenceRefs,
+        reasonCode,
+        now: this.now(),
+      });
+    }
+  }
+
+  private beginModelRouteTrial(
+    profile: CapabilityWorkOrderEnvelope | undefined,
+    subjectId: string,
+    stage: WorkerProfileStage,
+    operation: string,
+  ): ModelRouteTrial | undefined {
+    if (profile?.mode !== "active") return undefined;
+    const model = profile.model;
+    if (!model) throw new PermanentEffectError("Active capability profile is missing its model route");
+    const trials = this.dependencies.store.listModelRouteTrials("worker_attempt", subjectId, 256);
+    const latest = trials.at(-1);
+    if (latest?.outcome === "selected") {
+      if (!sameModelRoute(latest.route, model)) {
+        throw new PermanentEffectError("Unsettled model trial does not match the provider invocation route");
+      }
+      return latest;
+    }
+    return this.dependencies.store.recordModelRouteSelection({
+      subjectKind: "worker_attempt",
+      subjectId,
+      attempt: (latest?.attempt ?? 0) + 1,
+      stage,
+      operation,
+      route: model,
+      now: this.now(),
+    });
+  }
+
+  private settleRecoveredModelRoute(subjectId: string, profile: CapabilityProfile | null): void {
+    if (profile?.mode !== "active") return;
+    const latest = this.dependencies.store.listModelRouteTrials("worker_attempt", subjectId, 256).at(-1);
+    if (latest?.outcome !== "selected") return;
+    if (!sameModelRoute(latest.route, profile.model)) {
+      throw new PermanentEffectError("Recovered worker route does not match its unsettled model trial");
+    }
+    this.dependencies.store.settleModelRouteTrial({
+      subjectKind: "worker_attempt",
+      subjectId,
+      attempt: latest.attempt,
+      outcome: "passed",
+      failureSignature: null,
+      now: this.now(),
+    });
+  }
+
+  private async invokeModelProvider<T>(input: Readonly<{
+    effect: StoredEffect;
+    profile: CapabilityWorkOrderEnvelope | undefined;
+    subjectId: string;
+    stage: WorkerProfileStage;
+    operation: string;
+    invoke: () => Promise<T>;
+    validate?: (result: T) => void;
+  }>): Promise<T> {
+    const trial = this.beginModelRouteTrial(input.profile, input.subjectId, input.stage, input.operation);
+    let result: T;
+    try {
+      result = await input.invoke();
+    } catch (error) {
+      this.assertFence();
+      if (!trial) throw error;
+      const priorFailureSignatures = this.dependencies.store
+        .listModelRouteTrials("worker_attempt", input.subjectId, 256)
+        .filter((candidate) => candidate.attempt !== trial.attempt && candidate.outcome === "failed")
+        .flatMap((candidate) => candidate.failureSignature === null ? [] : [candidate.failureSignature]);
+      const decision = recordModelFailure({
+        route: trial.route,
+        stage: input.stage,
+        operation: input.operation,
+        error,
+        priorFailureSignatures,
+      });
+      this.dependencies.store.settleModelRouteTrial({
+        subjectKind: "worker_attempt",
+        subjectId: input.subjectId,
+        attempt: trial.attempt,
+        outcome: decision.action === "block" ? "blocked" : "failed",
+        failureSignature: decision.signature,
+        now: this.now(),
+      });
+      if (decision.action === "block") {
+        const profile = this.dependencies.store.getCapabilityProfileById(input.profile!.profileId);
+        if (!profile) throw new PermanentEffectError("Blocked model route lost its immutable capability profile");
+        this.settleProfileForModelRouteChange(
+          profile,
+          this.dependencies.store.listModelRouteTrials("worker_attempt", input.subjectId, 256),
+          "model_route_blocked",
+        );
+        throw new PermanentEffectError("Model provider route exhausted the strong pool");
+      }
+      throw error;
+    }
+    this.renewOperationFence(input.effect);
+    input.validate?.(result);
+    if (trial) {
+      this.dependencies.store.settleModelRouteTrial({
+        subjectKind: "worker_attempt",
+        subjectId: input.subjectId,
+        attempt: trial.attempt,
+        outcome: "passed",
+        failureSignature: null,
+        now: this.now(),
+      });
+    }
+    return result;
+  }
+
+  private ensureWorkerCapabilityProfile(
+    job: Job,
+    subjectId: string,
+    role: WorkerSkillRole,
+    stage: WorkerProfileStage,
+    extraTraits: readonly string[] = [],
+  ): CapabilityWorkOrderEnvelope | undefined {
+    if (job.routingMode === "legacy") return undefined;
+    if (!job.policy || !job.projectId) {
+      throw new PermanentEffectError("Capability selection requires immutable project policy context");
+    }
+    const traits = selectedWorkerTraits(job, role, stage, extraTraits);
+    const selected = selectCapabilityProfile({
+      role,
+      recipe: job.taskRecipe,
+      stage,
+      traits,
+    });
+    const pipelineRole = role === "planner" || role === "critic" || role === "documentation";
+    const risk = job.taskRecipe === "architectural" || job.taskTraits.some((trait) => trait.id === "high-risk")
+      ? "high" as const
+      : job.taskRecipe === "direct" ? "low" as const : "medium" as const;
+    const assignments = selected.assignments.map((assignment) => ({
+      capabilityId: assignment.capabilityId,
+      descriptorDigest: assignment.descriptorDigest,
+      capabilityKind: "skill" as const,
+      mandatory: assignment.mandatory,
+    }));
+    const mode = job.routingMode === "active" ? "active" as const : "shadow" as const;
+    const reasonCodes = sortedUnique([
+      ...job.taskReasonCodes,
+      `worker_role:${role}`,
+      `worker_stage:${stage}`,
+    ]);
+    const existing = this.dependencies.store.getLatestCapabilityProfile("worker_attempt", subjectId);
+    const model = this.modelRouteForWorkerProfile(job, subjectId, stage, pipelineRole, risk, existing);
+    let profile = existing;
+    if (existing) {
+      const actualAssignments = existing.assignments.map((assignment) => ({
+        capabilityId: assignment.capabilityId,
+        descriptorDigest: assignment.descriptorDigest,
+        capabilityKind: assignment.capabilityKind,
+        mandatory: assignment.mandatory,
+      }));
+      const expectedIdentity = JSON.stringify({
+        recipeId: job.taskRecipe,
+        recipeVersion: job.recipeVersion,
+        registryDigest: CAPABILITY_REGISTRY_DIGEST,
+        graphDigest: CAPABILITY_GRAPH_DIGEST,
+        mode,
+        reasonCodes,
+        traits,
+        assignments: [...assignments].sort((left, right) => left.capabilityId.localeCompare(right.capabilityId)),
+      });
+      const actualIdentity = JSON.stringify({
+        recipeId: existing.recipeId,
+        recipeVersion: existing.recipeVersion,
+        registryDigest: existing.registryDigest,
+        graphDigest: existing.graphDigest,
+        mode: existing.mode,
+        reasonCodes: existing.reasonCodes,
+        traits: existing.traits,
+        assignments: actualAssignments,
+      });
+      if (expectedIdentity !== actualIdentity) {
+        throw new PermanentEffectError("Persisted capability profile does not match the immutable worker dispatch");
+      }
+      if (!sameModelRoute(existing.model, model)) {
+        if (MODEL_POOL_RANK[model.pool] <= MODEL_POOL_RANK[existing.model.pool]) {
+          throw new PermanentEffectError("Worker model route cannot change without a monotonic pool escalation");
+        }
+        const trials = this.dependencies.store.listModelRouteTrials("worker_attempt", subjectId, 256);
+        this.settleProfileForModelRouteChange(existing, trials, "model_route_escalated");
+        profile = this.dependencies.store.createCapabilityProfile({
+          subjectKind: "worker_attempt",
+          subjectId,
+          threadId: null,
+          recipeId: job.taskRecipe,
+          recipeVersion: job.recipeVersion,
+          registryDigest: CAPABILITY_REGISTRY_DIGEST,
+          graphDigest: CAPABILITY_GRAPH_DIGEST,
+          mode,
+          model,
+          assignments,
+          reasonCodes,
+          traits,
+          expectedRevision: existing.revision + 1,
+          now: this.now(),
+        });
+      }
+    } else {
+      profile = this.dependencies.store.createCapabilityProfile({
+        subjectKind: "worker_attempt",
+        subjectId,
+        threadId: null,
+        recipeId: job.taskRecipe,
+        recipeVersion: job.recipeVersion,
+        registryDigest: CAPABILITY_REGISTRY_DIGEST,
+        graphDigest: CAPABILITY_GRAPH_DIGEST,
+        mode,
+        model,
+        assignments,
+        reasonCodes,
+        traits,
+        expectedRevision: 1,
+        now: this.now(),
+      });
+    }
+    if (!profile) throw new Error("Capability profile disappeared before worker dispatch");
+    const receipts = this.dependencies.store.listCapabilityReceipts(profile.id, 256);
+    for (const denial of selected.denied) {
+      const descriptor = CAPABILITY_BY_ID.get(denial.capabilityId);
+      if (!descriptor) continue;
+      if (receipts.some((receipt) => receipt.eventType === "denied" &&
+        receipt.capabilityId === denial.capabilityId && receipt.reasonCode === denial.reasonCode)) continue;
+      this.dependencies.store.appendCapabilityReceipt({
+        profileId: profile.id,
+        capabilityId: descriptor.id,
+        capabilityKind: descriptor.kind,
+        descriptorDigest: descriptor.digest,
+        eventType: "denied",
+        reasonCode: denial.reasonCode,
+        mandatory: descriptor.evidence.requirement === "mandatory",
+        evidenceRefs: [],
+        now: this.now(),
+      });
+    }
+    return {
+      profileId: profile.id,
+      profileRevision: profile.revision,
+      profileDigest: capabilityProfileDigest(profile.assignments),
+      recipeId: job.taskRecipe,
+      recipeVersion: job.recipeVersion,
+      mode: profile.mode,
+      model: profile.model,
+      assignments: profile.assignments.map((assignment) => ({
+        capabilityId: assignment.capabilityId,
+        descriptorDigest: assignment.descriptorDigest,
+        mandatory: assignment.mandatory,
+      })),
+    };
+  }
+
+  private async reviewCapabilityTraits(effect: StoredEffect, job: Job): Promise<readonly string[]> {
+    const bb = this.dependencies.bb;
+    if (!bb?.getEnvironmentSnapshot || !job.environmentId || !job.policy) {
+      if (job.routingMode === "active") {
+        throw new PermanentEffectError("Exact review change surface is unavailable for active capability routing");
+      }
+      return ["strict-json", "change-surface-unavailable"];
+    }
+    this.assertFence();
+    const snapshot = await bb.getEnvironmentSnapshot(job.environmentId, job.policy.baseBranch);
+    this.renewOperationFence(effect);
+    const diff = environmentDiffText(snapshot.diff);
+    if (diff === null) {
+      if (job.routingMode === "active") {
+        throw new PermanentEffectError("Exact review change surface is unavailable for active capability routing");
+      }
+      return ["strict-json", "change-surface-unavailable"];
+    }
+    return reviewChangeSurfaceTraits(diff);
+  }
+
   private async adoptOrSpawn(
     effect: StoredEffect,
     job: Job,
     kind: "implementation" | "review",
     finalReview = false,
+    reviewLens: "quality" | "risk" = "quality",
+    reviewAttemptId?: string,
+    reviewOrdinal?: number,
+    extraTraits: readonly string[] = [],
   ): Promise<{ threadId: string; environmentId: string }> {
     const bb = this.dependencies.bb;
     if (!bb) throw new PermanentEffectError("BB runner is not configured");
-    const attemptInput = attemptFor(effect, job, kind);
+    const baseAttemptInput = attemptFor(effect, job, kind);
+    const attemptInput = {
+      ...baseAttemptInput,
+      ...(reviewAttemptId ? { id: reviewAttemptId } : {}),
+      ...(reviewOrdinal ? { ordinal: reviewOrdinal } : {}),
+    };
     const existingAttempt = this.dependencies.store.getAttempt(attemptInput.id);
     const attempt = this.dependencies.store.createExecutorAttempt({
       id: attemptInput.id,
       jobId: job.id,
       kind,
-      ordinal: existingAttempt?.ordinal ?? (
-        kind === "review"
-          ? this.dependencies.store.nextAttemptOrdinal(job.id, kind)
-          : attemptInput.ordinal
-      ),
+      ordinal: existingAttempt?.ordinal ?? attemptInput.ordinal,
       headSha: attemptInput.headSha,
+      reviewLens: kind === "review" ? reviewLens : null,
+      reviewStage: kind === "review" ? (finalReview ? "final_review" : "review") : null,
       ...this.executorFence(),
     });
     if (!attempt) throw new Error("executor lease was lost before attempt creation");
     const titleRole = finalReview ? "final-review" : kind;
+    const capabilityStage: WorkerProfileStage = kind === "implementation"
+      ? "implementation"
+      : finalReview && job.taskRecipe === "architectural"
+        ? "integrated-review"
+        : job.taskRecipe === "architectural"
+          ? "task-review"
+          : "review";
+    const capabilityProfile = this.ensureWorkerCapabilityProfile(
+      job,
+      attempt.id,
+      titleRole,
+      capabilityStage,
+      extraTraits,
+    );
+    const runnerAttempt: BbAttempt = { ...attempt, capabilityProfile };
+    if (kind === "review" && attempt.threadId && job.environmentId) {
+      this.settleRecoveredModelRoute(
+        attempt.id,
+        this.dependencies.store.getLatestCapabilityProfile("worker_attempt", attempt.id),
+      );
+      return { threadId: attempt.threadId, environmentId: job.environmentId };
+    }
     const expectedTitle = buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: titleRole });
     const list = listThreadsAdapter(bb);
     if (list && job.projectId) {
@@ -434,6 +947,10 @@ export class EffectRunner {
         const environmentId = candidate.environmentId ?? job.environmentId;
         if (!environmentId) throw new PermanentEffectError("matching BB thread has no environment id");
         this.updateExecutorAttempt(job.id, attempt.id, { threadId: candidate.id });
+        this.settleRecoveredModelRoute(
+          attempt.id,
+          this.dependencies.store.getLatestCapabilityProfile("worker_attempt", attempt.id),
+        );
         return { threadId: candidate.id, environmentId };
       }
     }
@@ -449,14 +966,21 @@ export class EffectRunner {
       : kind === "implementation" ? bb.spawnImplementation : finalReview ? bb.spawnFinalReview : bb.spawnReview;
     if (!spawn) throw new PermanentEffectError(`BB ${kind} runner is not configured`);
     this.assertFence();
-    const created = await spawn(job, attempt);
-    this.renewOperationFence(effect);
+    const created = await this.invokeModelProvider({
+      effect,
+      profile: capabilityProfile,
+      subjectId: attempt.id,
+      stage: capabilityStage,
+      operation: `spawn-${titleRole}`,
+      invoke: () => spawn(job, runnerAttempt),
+      validate: validateThreadResult,
+    });
     const threadId = threadResultId(created);
     const environmentId = threadResultEnvironment(created);
     this.updateExecutorAttempt(job.id, attempt.id, {
       threadId,
-      handoffPath: attempt.handoffPath ?? null,
-      handoffSha256: attempt.handoffSha256 ?? null,
+      handoffPath: runnerAttempt.handoffPath ?? null,
+      handoffSha256: runnerAttempt.handoffSha256 ?? null,
     });
     return { threadId, environmentId };
   }
@@ -545,8 +1069,17 @@ export class EffectRunner {
   private async spawnPlan(effect: StoredEffect, job: Job): Promise<void> {
     const bb = this.dependencies.bb;
     if (!bb?.spawnPlanner || !job.policy) throw new PermanentEffectError("BB planner runner is not configured");
+    const nativeAdapter = job.environmentId === null
+      ? this.prepareNativeAdapter(effect, job, "plan-worktree-created")
+      : undefined;
     const previousCritique = this.dependencies.store.getLatestPipelineStageAttempt(job.id, "CRITIQUE");
-    const workOrder = buildWorkOrder(job, job.policy);
+    const capabilityProfile = this.ensureWorkerCapabilityProfile(
+      job,
+      `stage:${effect.idempotencyKey}`,
+      "planner",
+      "planning",
+    );
+    const workOrder = buildWorkOrder(job, job.policy, capabilityProfile);
     const inputSha256 = previousCritique?.outputSha256
       ? stageInputSha(workOrder.sha256, previousCritique.outputSha256)
       : stageInputSha(workOrder.sha256);
@@ -556,10 +1089,25 @@ export class EffectRunner {
       : await this.findPipelineStageCandidate(effect, bb, job, attempt);
     if (!created) {
       this.assertFence();
-      const result = await bb.spawnPlanner(job, pipelineAttemptForRunner(attempt), previousCritique?.outputText);
-      this.renewOperationFence(effect);
+      const result = await this.invokeModelProvider({
+        effect,
+        profile: capabilityProfile,
+        subjectId: attempt.id,
+        stage: "planning",
+        operation: "spawn-planner",
+        invoke: () => bb.spawnPlanner!(
+          job,
+          pipelineAttemptForRunner(attempt, capabilityProfile),
+          previousCritique?.outputText,
+        ),
+        validate: validateThreadResult,
+      });
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
     }
+    this.settleRecoveredModelRoute(
+      attempt.id,
+      this.dependencies.store.getLatestCapabilityProfile("worker_attempt", attempt.id),
+    );
     this.bindPipelineAttempt(attempt, created.threadId, created.environmentId);
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
@@ -569,7 +1117,7 @@ export class EffectRunner {
         attemptId: attempt.id,
         threadId: created.threadId,
         environmentId: created.environmentId,
-      });
+      }, nativeAdapter);
     }
   }
 
@@ -584,7 +1132,13 @@ export class EffectRunner {
     if (plan.jobId !== job.id || plan.role !== "PLAN") {
       throw new PermanentEffectError("Critique plan artifact does not belong to the active job");
     }
-    const workOrder = buildWorkOrder(job, job.policy);
+    const capabilityProfile = this.ensureWorkerCapabilityProfile(
+      job,
+      `stage:${effect.idempotencyKey}`,
+      "critic",
+      "planning",
+    );
+    const workOrder = buildWorkOrder(job, job.policy, capabilityProfile);
     const planArtifact = buildPlanArtifact(plan.outputText);
     if (planArtifact.sha256 !== plan.outputSha256) throw new PermanentEffectError("Durable plan artifact hash does not match its output");
     const attempt = this.createPipelineAttempt(
@@ -598,10 +1152,25 @@ export class EffectRunner {
       : await this.findPipelineStageCandidate(effect, bb, job, attempt);
     if (!created) {
       this.assertFence();
-      const result = await bb.spawnCritic(job, pipelineAttemptForRunner(attempt), pipelineAttemptForRunner(plan));
-      this.renewOperationFence(effect);
+      const result = await this.invokeModelProvider({
+        effect,
+        profile: capabilityProfile,
+        subjectId: attempt.id,
+        stage: "planning",
+        operation: "spawn-critic",
+        invoke: () => bb.spawnCritic!(
+          job,
+          pipelineAttemptForRunner(attempt, capabilityProfile),
+          pipelineAttemptForRunner(plan),
+        ),
+        validate: validateThreadResult,
+      });
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
     }
+    this.settleRecoveredModelRoute(
+      attempt.id,
+      this.dependencies.store.getLatestCapabilityProfile("worker_attempt", attempt.id),
+    );
     if (created.environmentId !== plan.environmentId) {
       throw new PermanentEffectError("Critique did not reuse the planning environment");
     }
@@ -613,7 +1182,13 @@ export class EffectRunner {
     if (!bb?.spawnDocs || !job.policy || !job.prHeadSha || !job.environmentId) {
       throw new PermanentEffectError("BB docs runner requires reviewed job context");
     }
-    const workOrder = buildWorkOrder(job, job.policy);
+    const capabilityProfile = this.ensureWorkerCapabilityProfile(
+      job,
+      `stage:${effect.idempotencyKey}`,
+      "documentation",
+      "documentation",
+    );
+    const workOrder = buildWorkOrder(job, job.policy, capabilityProfile);
     const attempt = this.createPipelineAttempt(
       effect,
       job,
@@ -625,10 +1200,21 @@ export class EffectRunner {
       : await this.findPipelineStageCandidate(effect, bb, job, attempt);
     if (!created) {
       this.assertFence();
-      const result = await bb.spawnDocs(job, pipelineAttemptForRunner(attempt));
-      this.renewOperationFence(effect);
+      const result = await this.invokeModelProvider({
+        effect,
+        profile: capabilityProfile,
+        subjectId: attempt.id,
+        stage: "documentation",
+        operation: "spawn-documentation",
+        invoke: () => bb.spawnDocs!(job, pipelineAttemptForRunner(attempt, capabilityProfile)),
+        validate: validateThreadResult,
+      });
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
     }
+    this.settleRecoveredModelRoute(
+      attempt.id,
+      this.dependencies.store.getLatestCapabilityProfile("worker_attempt", attempt.id),
+    );
     if (created.environmentId !== job.environmentId) {
       throw new PermanentEffectError("Docs did not reuse the implementation environment");
     }
@@ -647,7 +1233,13 @@ export class EffectRunner {
 
   private async spawnImplementation(effect: StoredEffect, job: Job): Promise<void> {
     if (job.state !== "creating_implementation") return;
+    const nativeAdapter = this.prepareNativeAdapter(effect, job, "implementation-worktree-created");
     const created = await this.adoptOrSpawn(effect, job, "implementation");
+    if (this.dependencies.bb?.prepareProgressScratchpad) {
+      this.assertFence();
+      await this.dependencies.bb.prepareProgressScratchpad(created.environmentId);
+      this.renewOperationFence(effect);
+    }
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "creating_implementation") return;
@@ -655,35 +1247,106 @@ export class EffectRunner {
       job.id,
       current.version,
       { type: "IMPLEMENTATION_CREATED", threadId: created.threadId, environmentId: created.environmentId },
+      nativeAdapter,
     );
   }
 
   private async spawnReview(effect: StoredEffect, job: Job): Promise<void> {
     if (job.state !== "reviewing") return;
-    const created = await this.adoptOrSpawn(effect, job, "review");
+    const capabilityTraits = await this.reviewCapabilityTraits(effect, job);
+    const lenses = job.routingMode === "active"
+      ? job.taskRecipe === "direct" ? ["quality" as const] : ["quality" as const, "risk" as const]
+      : isSmallFixJob(job) ? ["quality" as const] : ["quality" as const, "risk" as const];
+    const nativeAdapter = this.prepareNativeAdapter(effect, job, "review-created", lenses.length);
+    const qualityAttemptId = `attempt:${effect.idempotencyKey}`;
+    const ordinal = this.dependencies.store.getAttempt(qualityAttemptId)?.ordinal ??
+      this.dependencies.store.nextAttemptOrdinal(job.id, "review");
+    const created = [] as Array<{ threadId: string; environmentId: string }>;
+    for (const lens of lenses) {
+      created.push(await this.adoptOrSpawn(
+        effect,
+        job,
+        "review",
+        false,
+        lens,
+        lens === "quality" ? qualityAttemptId : `attempt:${effect.idempotencyKey}:${lens}`,
+        ordinal,
+        [...capabilityTraits, `${lens}-lens`],
+      ));
+    }
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "reviewing") return;
-    const started = this.applyEvent(job.id, current.version, { type: "REVIEW_STARTED" });
+    if (nativeAdapter?.settled) {
+      if (current.reviewThreadId !== null && current.reviewThreadId !== created[0].threadId) {
+        throw new PermanentEffectError("Settled review adapter points at a different quality-review thread");
+      }
+      if (current.reviewThreadId === null && !this.dependencies.store.registerExecutorReviewThread({
+        jobId: job.id,
+        expectedVersion: current.version,
+        threadId: created[0].threadId,
+        ...this.executorFence(),
+      })) throw new Error("executor lease was lost before reconstructed review-thread registration");
+      return;
+    }
+    const started = this.applyEvent(job.id, current.version, {
+      type: "REVIEW_STARTED",
+      laneCount: lenses.length,
+    }, nativeAdapter);
     if (!this.dependencies.store.registerExecutorReviewThread({
       jobId: job.id,
       expectedVersion: started.version,
-      threadId: created.threadId,
+      threadId: created[0].threadId,
       ...this.executorFence(),
     })) throw new Error("executor lease was lost before review-thread registration");
   }
 
   private async spawnFinalReview(effect: StoredEffect, job: Job): Promise<void> {
     if (job.state !== "final_reviewing") return;
-    const created = await this.adoptOrSpawn(effect, job, "review", true);
+    const capabilityTraits = await this.reviewCapabilityTraits(effect, job);
+    const lenses = job.routingMode === "active"
+      ? job.taskRecipe === "direct" ? ["quality" as const] : ["quality" as const, "risk" as const]
+      : isSmallFixJob(job) ? ["quality" as const] : ["quality" as const, "risk" as const];
+    const nativeAdapter = this.prepareNativeAdapter(effect, job, "review-created", lenses.length);
+    const qualityAttemptId = `attempt:${effect.idempotencyKey}`;
+    const ordinal = this.dependencies.store.getAttempt(qualityAttemptId)?.ordinal ??
+      this.dependencies.store.nextAttemptOrdinal(job.id, "review");
+    const created = [] as Array<{ threadId: string; environmentId: string }>;
+    for (const lens of lenses) {
+      created.push(await this.adoptOrSpawn(
+        effect,
+        job,
+        "review",
+        true,
+        lens,
+        lens === "quality" ? qualityAttemptId : `attempt:${effect.idempotencyKey}:${lens}`,
+        ordinal,
+        [...capabilityTraits, `${lens}-lens`],
+      ));
+    }
     this.assertFence();
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== "final_reviewing") return;
-    const started = this.applyEvent(job.id, current.version, { type: "REVIEW_STARTED" });
+    if (nativeAdapter?.settled) {
+      if (current.reviewThreadId !== null && current.reviewThreadId !== created[0].threadId) {
+        throw new PermanentEffectError("Settled final-review adapter points at a different quality-review thread");
+      }
+      if (current.reviewThreadId === null && !this.dependencies.store.registerExecutorReviewThread({
+        jobId: job.id,
+        expectedVersion: current.version,
+        threadId: created[0].threadId,
+        ...this.executorFence(),
+      })) throw new Error("executor lease was lost before reconstructed final-review thread registration");
+      return;
+    }
+    const started = this.applyEvent(job.id, current.version, {
+      type: "REVIEW_STARTED",
+      laneCount: lenses.length,
+    }, nativeAdapter);
     if (!this.dependencies.store.registerExecutorReviewThread({
       jobId: job.id,
       expectedVersion: started.version,
-      threadId: created.threadId,
+      threadId: created[0].threadId,
       ...this.executorFence(),
     })) throw new Error("executor lease was lost before final review-thread registration");
   }
@@ -692,6 +1355,7 @@ export class EffectRunner {
     const owner = this.dependencies.store.getOwner();
     if (!owner) return;
     const payload = renderJobStatus(job, {
+      ...this.capabilityStatusContext(job),
       ...extra,
       workerLiveness: this.dependencies.store.getWorkerLiveness(job.id),
       resourceWait: job.policy === null ? [] : projectResourceWait({
@@ -716,47 +1380,209 @@ export class EffectRunner {
     }
   }
 
+  private capabilityStatusContext(job: Job): Record<string, unknown> {
+    const context: Record<string, unknown> = {};
+    const threadId = job.reviewThreadId ?? job.implementationThreadId;
+    const attempt = threadId ? this.dependencies.store.getAttemptByThreadId(threadId) : null;
+    const profile = attempt
+      ? this.dependencies.store.getLatestCapabilityProfile("worker_attempt", attempt.id)
+      : null;
+    if (profile?.model.pool === "strong" && job.taskRecipe !== "architectural") {
+      context.materialModelPool = "strong";
+    }
+    if (profile) {
+      const guardIds = new Set(["clean-code-guard", "docs-guard", "test-guard"]);
+      const selectedGuards = profile.assignments.filter((assignment) => guardIds.has(assignment.capabilityId));
+      if (selectedGuards.length > 0) {
+        const outcomes = new Map(
+          this.dependencies.store.listCapabilityReceipts(profile.id, 100)
+            .filter((receipt) => receipt.eventType === "outcome")
+            .map((receipt) => [receipt.capabilityId, receipt.outcome]),
+        );
+        const values = selectedGuards.map((assignment) => outcomes.get(assignment.capabilityId) ?? null);
+        context.mandatoryGuardOutcome = values.some((outcome) => outcome === null)
+          ? "missing"
+          : values.some((outcome) => outcome === "failed")
+            ? "failed"
+            : values.some((outcome) => outcome === "blocked")
+              ? "blocked"
+              : "passed";
+      }
+    }
+    const validation = this.dependencies.store.getLatestPipelineStageAttempt(job.id, "FINAL_TEST") ??
+      this.dependencies.store.getLatestPipelineStageAttempt(job.id, "TEST");
+    if (validation) {
+      const persistedOutcome = validation.outcome?.validationOutcome;
+      const outcome = typeof persistedOutcome === "string"
+        ? persistedOutcome
+        : validation.state === "completed" ? "passed"
+          : validation.state === "failed" ? "failed"
+            : validation.state;
+      context.validation = [{ name: validation.role === "FINAL_TEST" ? "final validation" : "validation", outcome }];
+    }
+    if (job.state === "awaiting_merge_approval") context.ownerDecision = "Merge approval required";
+    return context;
+  }
+
   private async inspectImplementation(effect: StoredEffect, job: Job): Promise<void> {
     const bb = this.dependencies.bb;
     if (!bb?.getEnvironmentSnapshot || !bb.getPullRequestSnapshot || !job.environmentId || !job.policy) {
       throw new PermanentEffectError("implementation inspection requires BB environment and policy context");
     }
+    const nativeAdapter = this.prepareNativeAdapter(effect, job, "branch-finished");
     const snapshot = await bb.getEnvironmentSnapshot(job.environmentId, job.policy.baseBranch);
     this.renewOperationFence(effect);
-    const pullRequest = await bb.getPullRequestSnapshot(job.environmentId) as {
-      outcome?: string;
-      pullRequest?: { number?: number; url?: string };
-    };
+    const existing = locatedPullRequest(await bb.getPullRequestSnapshot(job.environmentId));
     this.renewOperationFence(effect);
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== job.state) return;
-    const pullRequestNumber = pullRequest.pullRequest?.number;
-    const pullRequestUrl = pullRequest.pullRequest?.url;
-    if (pullRequest.outcome === "available" && Number.isInteger(pullRequestNumber) && typeof pullRequestUrl === "string") {
-      this.applyEvent(job.id, current.version, {
-        type: "PR_LOCATED",
-        number: pullRequestNumber as number,
-        url: pullRequestUrl,
-      });
+    if (existing) {
+      this.applyEvent(
+        job.id,
+        current.version,
+        { type: "PR_LOCATED", number: existing.number, url: existing.url },
+        nativeAdapter,
+      );
       return;
     }
     if (snapshot.status && typeof snapshot.status === "object" && "outcome" in snapshot.status && snapshot.status.outcome === "unavailable") {
-      this.applyEvent(job.id, current.version, { type: "PR_UNAVAILABLE", reason: "BB environment observation is unavailable" });
+      this.applyEvent(
+        job.id,
+        current.version,
+        { type: "PR_UNAVAILABLE", reason: "BB environment observation is unavailable" },
+        nativeAdapter ? nativeAdapterEnvelopeWithOutcome(nativeAdapter, "blocked") : undefined,
+      );
       return;
     }
-    this.applyEvent(job.id, current.version, { type: "PR_MISSING", reason: "No pull request was found for the implementation" });
+    if (this.dependencies.terminal) {
+      const published = await publishImplementationPullRequest({
+        runner: this.dependencies.terminal,
+        job: current,
+        policy: job.policy,
+        environmentId: job.environmentId,
+        environmentStatus: snapshot.status,
+        signal: this.dependencies.fence.signal,
+      });
+      this.renewOperationFence(effect);
+      const afterPublish = this.dependencies.store.getJob(job.id);
+      if (!afterPublish || afterPublish.state !== job.state) return;
+      if (published.outcome === "published") {
+        this.applyEvent(job.id, afterPublish.version, {
+          type: "PR_LOCATED",
+          number: published.number,
+          url: published.url,
+        }, nativeAdapter);
+        return;
+      }
+      const refreshed = locatedPullRequest(await bb.getPullRequestSnapshot(job.environmentId));
+      this.renewOperationFence(effect);
+      const refreshedJob = this.dependencies.store.getJob(job.id);
+      if (!refreshedJob || refreshedJob.state !== job.state) return;
+      if (refreshed) {
+        this.applyEvent(job.id, refreshedJob.version, {
+          type: "PR_LOCATED",
+          number: refreshed.number,
+          url: refreshed.url,
+        }, nativeAdapter);
+        return;
+      }
+      this.applyEvent(
+        job.id,
+        refreshedJob.version,
+        { type: "PR_MISSING", reason: published.reason },
+        nativeAdapter ? nativeAdapterEnvelopeWithOutcome(nativeAdapter, "failed") : undefined,
+      );
+      return;
+    }
+    this.applyEvent(
+      job.id,
+      current.version,
+      { type: "PR_MISSING", reason: "No pull request was found for the implementation" },
+      nativeAdapter ? nativeAdapterEnvelopeWithOutcome(nativeAdapter, "failed") : undefined,
+    );
   }
 
   private async resolvePrHead(effect: StoredEffect, job: Job): Promise<void> {
     if (!this.dependencies.resolvePrHead) throw new PermanentEffectError("PR head resolver is not configured");
+    if (!job.policy || job.prNumber === null) {
+      throw new PermanentEffectError("PR head resolution requires immutable policy and pull-request identity");
+    }
+    const workOrder = buildWorkOrder(job, job.policy);
+    const attempt = this.createPipelineAttempt(
+      effect,
+      job,
+      "BUILD",
+      stageInputSha(workOrder.sha256, String(job.prNumber), job.policy.githubRepository),
+    );
+    if (attempt.state === "completed") {
+      const evidence = attempt.outcome;
+      const headSha = evidence?.headSha;
+      const originRepository = evidence?.originRepository;
+      if (!fullSha(headSha) || originRepository !== job.policy.githubRepository.toLowerCase()) {
+        throw new PermanentEffectError("completed PR-head stage has invalid durable evidence");
+      }
+      const current = this.dependencies.store.getJob(job.id);
+      if (current && (current.state === "resolving_pr_head" || current.state === "resolving_docs_head")) {
+        this.applyEvent(job.id, current.version, { type: "PR_HEAD_RESOLVED", headSha });
+      }
+      return;
+    }
+    if (this.dependencies.terminal && this.dependencies.bb?.getEnvironmentSnapshot && job.environmentId && job.policy) {
+      const snapshot = await this.dependencies.bb.getEnvironmentSnapshot(job.environmentId, job.policy.baseBranch);
+      this.renewOperationFence(effect);
+      if (!environmentWorktreeIsClean(snapshot.status)) {
+        await publishImplementationPullRequest({
+          runner: this.dependencies.terminal,
+          job,
+          policy: job.policy,
+          environmentId: job.environmentId,
+          environmentStatus: snapshot.status,
+          signal: this.dependencies.fence.signal,
+        });
+        this.renewOperationFence(effect);
+      }
+    }
     const result = await this.dependencies.resolvePrHead(job, effect, this.dependencies.fence.signal);
     this.renewOperationFence(effect);
     const current = this.dependencies.store.getJob(job.id);
     if (!current || (current.state !== "resolving_pr_head" && current.state !== "resolving_docs_head")) return;
     if (result.event === "PR_HEAD_RESOLVED" && fullSha(result.headSha)) {
+      const originRepository = result.originRepository.toLowerCase();
+      if (originRepository !== job.policy.githubRepository.toLowerCase()) {
+        throw new PermanentEffectError("PR-head evidence repository does not match immutable policy");
+      }
+      const evidence = {
+        verdict: "success",
+        prNumber: job.prNumber,
+        headSha: result.headSha,
+        originRepository,
+      };
+      const outputText = JSON.stringify(evidence);
+      const completed = this.dependencies.store.completePipelineStageAttempt({
+        id: attempt.id,
+        outputText,
+        outputSha256: createHash("sha256").update(outputText, "utf8").digest("hex"),
+        outcome: evidence,
+        startSha: result.headSha,
+        endSha: result.headSha,
+        ownerId: this.dependencies.fence.ownerId,
+        generation: this.dependencies.fence.generation,
+        now: this.now(),
+      });
+      if (!completed) throw new Error("PR-head stage completion lost its executor fence");
       this.applyEvent(job.id, current.version, { type: "PR_HEAD_RESOLVED", headSha: result.headSha });
     } else {
-      this.applyEvent(job.id, current.version, { type: "PR_UNAVAILABLE", reason: result.reason ?? "PR head could not be resolved" });
+      if (!this.dependencies.store.failPipelineStageAttempt({
+        id: attempt.id,
+        error: "PR head could not be resolved",
+        ownerId: this.dependencies.fence.ownerId,
+        generation: this.dependencies.fence.generation,
+        now: this.now(),
+      })) throw new Error("PR-head stage failure lost its executor fence");
+      const reason = result.event === "PR_HEAD_RESOLUTION_FAILED"
+        ? result.reason ?? "PR head could not be resolved"
+        : "PR head resolver returned an invalid head SHA";
+      this.applyEvent(job.id, current.version, { type: "PR_UNAVAILABLE", reason });
     }
   }
 
@@ -845,7 +1671,7 @@ export class EffectRunner {
       });
       if (!bound) throw new Error("validation stage resource binding lost its executor fence");
     }
-    const evidence = validationStageEvidence(result);
+    const evidence = validationStageEvidence(result, job.policy);
     const outputText = JSON.stringify(evidence);
     const outputSha256 = createHash("sha256").update(outputText, "utf8").digest("hex");
     const completed = this.dependencies.store.completePipelineStageAttempt({
@@ -1031,42 +1857,83 @@ export class EffectRunner {
     const payload = recordPayload(effect);
     const resourceId = typeof payload.resourceId === "string" ? payload.resourceId : this.dependencies.store.getWorkerLiveness(job.id)?.resourceId;
     if (!bb?.stopWorker || !resourceId) throw new PermanentEffectError("cancellation has no BB worker resource");
-    const worker = this.dependencies.store.getWorkerLiveness(job.id);
-    if (!worker || worker.resourceId !== resourceId || worker.state === "unknown" || worker.state === "stale") {
-      throw new PermanentEffectError("cancellation requires fresh BB worker evidence");
+    const rawWorkers = payload.workers;
+    if (rawWorkers !== undefined && (!Array.isArray(rawWorkers) || rawWorkers.length < 2 || rawWorkers.length > 4)) {
+      throw new PermanentEffectError("cancellation worker group is invalid");
     }
-    await bb.stopWorker(worker);
-    this.renewOperationFence(effect);
+    const targetRecords = rawWorkers === undefined ? [payload] : rawWorkers;
+    const targets = targetRecords.map((candidate) => {
+      if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+        throw new PermanentEffectError("cancellation worker identity is invalid");
+      }
+      const target = candidate as Record<string, unknown>;
+      if (typeof target.resourceId !== "string" || target.resourceId.length === 0 ||
+        target.resourceKind !== "bb_thread" || typeof target.workerKind !== "string" ||
+        !Number.isInteger(target.generation) || Number(target.generation) < 1) {
+        throw new PermanentEffectError("cancellation worker identity is invalid");
+      }
+      return {
+        resourceId: target.resourceId,
+        resourceKind: target.resourceKind,
+        workerKind: target.workerKind,
+        generation: Number(target.generation),
+      };
+    });
+    if (new Set(targets.map((target) => target.resourceId)).size !== targets.length ||
+      targets[0]?.resourceId !== resourceId) {
+      throw new PermanentEffectError("cancellation worker group identity is invalid");
+    }
+    const workers = targets.map((target) => {
+      const worker = this.dependencies.store.getWorkerLivenessForResource(job.id, target.resourceId);
+      if (!worker || worker.resourceKind !== target.resourceKind || worker.workerKind !== target.workerKind ||
+        worker.generation !== target.generation || worker.state === "unknown" || worker.state === "stale") {
+        throw new PermanentEffectError("cancellation requires fresh BB worker evidence");
+      }
+      return worker;
+    });
+    for (const worker of workers) {
+      if (worker.state === "idle" || worker.state === "failed") continue;
+      await bb.stopWorker(worker);
+      this.renewOperationFence(effect);
+    }
     const maxChecks = 4;
+    const unsettled = new Set(workers
+      .filter((worker) => worker.state !== "idle" && worker.state !== "failed")
+      .map((worker) => worker.resourceId));
     for (let check = 0; check < maxChecks; check += 1) {
       this.assertFence();
       const current = this.dependencies.store.getJob(job.id);
       if (!current || current.cancelRequestedAt === null) return;
       if (!bb.getThread) break;
-      try {
-        const thread = await bb.getThread(resourceId);
-        this.renewOperationFence(effect);
-        const latest = this.dependencies.store.getJob(job.id);
-        if (!latest || latest.cancelRequestedAt === null) return;
-        const projected = projectWorkerLiveness(
-          this.dependencies.store,
-          latest,
-          thread,
-          this.now(),
-          worker.workerKind,
-          worker.generation,
-          this.executorFence(),
-        );
-        if (projected.state === "idle" || projected.state === "failed") {
-          this.assertFence();
-          const confirmed = this.dependencies.store.getJob(job.id);
-          if (confirmed && confirmed.cancelRequestedAt !== null && confirmed.state !== "blocked") {
-            this.applyEvent(confirmed.id, confirmed.version, { type: "CANCEL_CONFIRMED" });
-          }
-          return;
+      for (const worker of workers) {
+        if (!unsettled.has(worker.resourceId)) continue;
+        try {
+          const thread = await bb.getThread(worker.resourceId);
+          this.renewOperationFence(effect);
+          const latest = this.dependencies.store.getJob(job.id);
+          if (!latest || latest.cancelRequestedAt === null) return;
+          const projected = projectWorkerLiveness(
+            this.dependencies.store,
+            latest,
+            thread,
+            this.now(),
+            worker.workerKind,
+            worker.generation,
+            this.executorFence(),
+          );
+          if (projected.state === "idle" || projected.state === "failed") unsettled.delete(worker.resourceId);
+        } catch {
+          this.renewOperationFence(effect);
         }
-      } catch {
-        this.renewOperationFence(effect);
+      }
+      if (unsettled.size === 0) {
+        this.assertFence();
+        const confirmed = this.dependencies.store.getJob(job.id);
+        if (confirmed && confirmed.cancelRequestedAt !== null &&
+          confirmed.state !== "blocked" && confirmed.state !== "cancelled") {
+          this.applyEvent(confirmed.id, confirmed.version, { type: "CANCEL_CONFIRMED" });
+        }
+        return;
       }
       if (check + 1 < maxChecks) {
         await new Promise<void>((resolve, reject) => {
@@ -1097,9 +1964,52 @@ export class EffectRunner {
     }
   }
 
+  private async recoverWorker(effect: StoredEffect, job: Job): Promise<void> {
+    const payload = recordPayload(effect);
+    const recoveryId = textPayload(effect, "recoveryId");
+    const resourceId = textPayload(effect, "resourceId");
+    const classification = payload.classification;
+    if (!this.dependencies.bb?.retireWorker) {
+      throw new PermanentEffectError("worker recovery runner is not configured");
+    }
+    const recovery = this.dependencies.store.getWorkerRecovery(recoveryId);
+    if (!recovery || recovery.jobId !== job.id || recovery.resourceId !== resourceId ||
+      recovery.action !== "auto_retry" || recovery.state !== "retiring") {
+      throw new PermanentEffectError("worker recovery receipt does not match the active job");
+    }
+    const retryPayload = payload.retryPayload !== null && typeof payload.retryPayload === "object" && !Array.isArray(payload.retryPayload)
+      ? payload.retryPayload as Record<string, unknown>
+      : {};
+    const rawSiblingResources = retryPayload.retireResourceIds;
+    if (rawSiblingResources !== undefined && (
+      !Array.isArray(rawSiblingResources) || rawSiblingResources.length > 4 ||
+      rawSiblingResources.some((candidate) => typeof candidate !== "string" || candidate.length === 0 || candidate === resourceId)
+    )) throw new PermanentEffectError("worker recovery sibling resources are invalid");
+    const siblingResources = rawSiblingResources === undefined
+      ? []
+      : [...new Set(rawSiblingResources as string[])];
+    this.assertFence();
+    await this.dependencies.bb.retireWorker(resourceId, classification === "missing");
+    this.renewOperationFence(effect);
+    for (const siblingResourceId of siblingResources) {
+      this.assertFence();
+      await this.dependencies.bb.retireWorker(siblingResourceId, true);
+      this.renewOperationFence(effect);
+    }
+    const current = this.dependencies.store.getJob(job.id);
+    if (!current || current.state !== "recovering_worker") return;
+    this.applyEvent(job.id, current.version, {
+      type: "WORKER_RECOVERY_REQUEUED",
+      recoveryId,
+      retryPayload,
+    });
+  }
+
   private async reconcile(effect: StoredEffect, job: Job): Promise<void> {
     if (this.dependencies.reconcileJob) {
-      await this.dependencies.reconcileJob(job, this.dependencies.fence.signal, this.dependencies.fence);
+      const payload = recordPayload(effect);
+      const resourceId = typeof payload.threadId === "string" ? payload.threadId : undefined;
+      await this.dependencies.reconcileJob(job, this.dependencies.fence.signal, this.dependencies.fence, resourceId);
       this.renewOperationFence(effect);
       return;
     }
@@ -1113,7 +2023,7 @@ export class EffectRunner {
         const thread = await bb.getThread(resourceId);
         this.renewOperationFence(effect);
         const latest = this.dependencies.store.getJob(job.id) ?? current;
-        const worker = this.dependencies.store.getWorkerLiveness(job.id);
+        const worker = this.dependencies.store.getWorkerLivenessForResource(job.id, resourceId);
         projectWorkerLiveness(
           this.dependencies.store,
           latest,
@@ -1126,7 +2036,7 @@ export class EffectRunner {
       } catch {
         this.renewOperationFence(effect);
         const latest = this.dependencies.store.getJob(job.id) ?? current;
-        const worker = this.dependencies.store.getWorkerLiveness(job.id);
+        const worker = this.dependencies.store.getWorkerLivenessForResource(job.id, resourceId);
         projectUnknownWorker(
           this.dependencies.store,
           latest,
@@ -1210,6 +2120,9 @@ export class EffectRunner {
         return;
       case "verify_production":
         await this.runProduction(effect, job, "canary");
+        return;
+      case "recover_worker":
+        await this.recoverWorker(effect, job);
         return;
       case "stop_thread":
         await this.stopThread(effect, job);

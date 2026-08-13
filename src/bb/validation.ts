@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import type { Job, ProjectPolicy } from "../domain/models";
 import type { CommandResult, TerminalObservation } from "./terminal-command";
 
@@ -30,6 +31,10 @@ export type ValidationErrorCode =
   | "command_aborted"
   | "command_failed"
   | "invalid_pr_number"
+  | "invalid_pr_identity"
+  | "pr_not_open"
+  | "pr_is_draft"
+  | "wrong_base_branch"
   | "invalid_json"
   | "invalid_checks_exit"
   | "invalid_redaction_pattern";
@@ -76,6 +81,12 @@ export interface ValidationSnapshot {
   headSha: string;
   originRepository: string;
   commandReceipts: CommandReceipt[];
+  policyCommandReceipts?: Array<{
+    name: string;
+    commandSha256: string;
+    outcome: CommandReceipt["outcome"];
+    exitCode: number | null;
+  }>;
   githubPr?: GitHubPrSnapshot;
   requiredChecks: RequiredCheck[];
   validationOutcome: "pass" | "fail";
@@ -158,6 +169,16 @@ const requiredCheckSchema = z
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+export function environmentWorktreeIsClean(status: unknown): boolean {
+  const raw = asRecord(status);
+  const workspace = asRecord(raw.workspace);
+  const workingTree = asRecord(raw.workingTree ?? workspace.workingTree);
+  return raw.clean === true || (
+    workingTree.hasUncommittedChanges === false &&
+    (workingTree.state === "clean" || workingTree.state === "committed_unmerged")
+  );
 }
 
 function fail(code: ValidationErrorCode, message: string): never {
@@ -291,6 +312,17 @@ async function runCommand(
     fail("command_failed", `Command failed: ${redactedMessage}`);
   }
   receiptFor(collector, command, result);
+  if (result.outcome === "exited") {
+    const observation = lastObservation as TerminalObservation | null;
+    if (onTerminalObservation && observation && observation.status !== "exited") {
+      onTerminalObservation({
+        id: observation.id,
+        status: "exited",
+        updatedAt: Date.now(),
+        exitCode: result.exitCode,
+      });
+    }
+  }
   if (result.outcome === "timed_out" || result.outcome === "aborted") {
     const observation = lastObservation as TerminalObservation | null;
     if (onTerminalObservation && observation && observation.status !== result.outcome) {
@@ -314,12 +346,8 @@ function environmentEvidence(status: unknown): EnvironmentEvidence {
   }
 
   const workspace = asRecord(value.workspace);
-  const workingTree = asRecord(value.workingTree ?? workspace.workingTree);
   const checkout = asRecord(value.checkout ?? workspace.checkout);
-  const clean =
-    value.clean === true ||
-    (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false);
-  if (!clean) fail("environment_dirty", "Environment worktree is not clean");
+  if (!environmentWorktreeIsClean(value)) fail("environment_dirty", "Environment worktree is not clean");
   if (checkout.kind !== "branch") fail("checkout_not_branch", "Environment checkout is not a named branch");
   const headSha = checkout.headSha;
   if (typeof headSha !== "string" || !SHA.test(headSha)) fail("head_missing", "Environment checkout has no full head SHA");
@@ -396,24 +424,52 @@ async function collectHeadTruth(input: {
   return { originRepository, remoteHeadSha: firstSha, local };
 }
 
-function validationCommands(policy: ProjectPolicy): Array<{ command: string; timeoutMs: number }> {
-  return (policy.validationCommands as unknown as Array<unknown>).map((entry) => {
-    if (typeof entry === "string") return { command: entry, timeoutMs: 3_600_000 };
+type ValidationCommand = {
+  name: string;
+  command: string;
+  timeoutMs: number;
+};
+
+function validationCommands(policy: ProjectPolicy): ValidationCommand[] {
+  return (policy.validationCommands as unknown as Array<unknown>).map((entry, index) => {
+    if (typeof entry === "string") {
+      return { name: `validation-${String(index + 1)}`, command: entry, timeoutMs: 3_600_000 };
+    }
     const value = asRecord(entry);
     if (typeof value.command !== "string" || value.command.length === 0) {
       throw new TypeError("Validation command must be an owner-authored command");
     }
     return {
+      name: typeof value.name === "string" && value.name.length > 0
+        ? value.name
+        : `validation-${String(index + 1)}`,
       command: value.command,
       timeoutMs: typeof value.timeoutMs === "number" ? value.timeoutMs : 3_600_000,
     };
   });
 }
 
+function jsonPayload(output: string): string {
+  const trimmed = output.trim();
+  const objectStart = trimmed.indexOf("{");
+  const arrayStart = trimmed.indexOf("[");
+  const start = objectStart === -1
+    ? arrayStart
+    : arrayStart === -1 ? objectStart : Math.min(objectStart, arrayStart);
+  const end = Math.max(trimmed.lastIndexOf("}"), trimmed.lastIndexOf("]"));
+  if (start === -1 || end < start) return trimmed;
+  return trimmed.slice(start, end + 1);
+}
+
+function hasJsonPayload(output: string): boolean {
+  const payload = jsonPayload(output);
+  return payload.startsWith("[") || payload.startsWith("{");
+}
+
 function parseJson<T>(output: string, schema: z.ZodType<T>, label: string): T {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(output);
+    parsed = JSON.parse(jsonPayload(output));
   } catch {
     fail("invalid_json", `${label} did not return valid JSON`);
   }
@@ -426,6 +482,35 @@ function checksSchema(): z.ZodType<RequiredCheck[]> {
   return z.array(requiredCheckSchema);
 }
 
+function validateGithubPrIdentity(pr: GitHubPrSnapshot, input: ValidationInput["job"]): void {
+  if (pr.number !== input.prNumber) fail("invalid_pr_identity", "Pull-request number does not match the immutable job identity");
+  if (pr.state.toUpperCase() !== "OPEN") fail("pr_not_open", "Pull request must be open during validation");
+  if (pr.isDraft) fail("pr_is_draft", "Draft pull requests cannot pass validation");
+  if (pr.baseRefName !== input.policy.baseBranch) {
+    fail("wrong_base_branch", "Pull-request base branch does not match the immutable project policy");
+  }
+  let url: URL;
+  try {
+    url = new URL(pr.url);
+  } catch {
+    fail("invalid_pr_identity", "Pull-request URL is invalid");
+  }
+  const expectedPath = `/${input.policy.githubRepository.toLowerCase()}/pull/${String(input.prNumber)}`;
+  if (
+    url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com" || url.username || url.password ||
+    url.port || url.search || url.hash || url.pathname.replace(/\/$/u, "").toLowerCase() !== expectedPath
+  ) fail("invalid_pr_identity", "Pull-request URL does not match the immutable job identity");
+}
+
+function requiredChecksPass(checks: readonly RequiredCheck[], requiredNames: readonly string[]): boolean {
+  const seen = new Set<string>();
+  for (const check of checks) {
+    if (seen.has(check.name) || check.bucket.toLowerCase() !== "pass") return false;
+    seen.add(check.name);
+  }
+  return requiredNames.every((name) => seen.has(name));
+}
+
 export async function runValidation(input: ValidationInput): Promise<ValidationSnapshot> {
   validatePrNumber(input.job.prNumber);
   if (!input.job.policy) throw new TypeError("Validation requires an immutable project policy");
@@ -433,6 +518,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
   const redactor = buildRedactor(policy.outputRedactionPatterns);
   const collector: ReceiptCollector = { receipts: [], redactor };
   const terminalIds = new Set<string>();
+  const policyCommandReceipts: ValidationSnapshot["policyCommandReceipts"] = [];
   const observeTerminal = (observation: TerminalObservation): void => {
     terminalIds.add(observation.id);
     input.onTerminalObservation?.(observation);
@@ -460,11 +546,18 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
       input.signal,
       observeTerminal,
     );
+    policyCommandReceipts.push({
+      name: validation.name,
+      commandSha256: createHash("sha256").update(validation.command, "utf8").digest("hex"),
+      outcome: result.exitCode === 0 ? "pass" : "fail",
+      exitCode: result.exitCode,
+    });
     if (result.exitCode !== 0) {
       return {
         headSha: head.remoteHeadSha,
         originRepository: head.originRepository,
         commandReceipts: collector.receipts,
+        policyCommandReceipts,
         requiredChecks: [],
         validationOutcome: "fail",
         completedAt: new Date().toISOString(),
@@ -485,6 +578,7 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
   );
   if (pr.exitCode !== 0) fail("command_failed", "GitHub pull-request metadata lookup failed");
   const githubPr = parseJson(pr.output, githubPrSchema, "GitHub pull-request metadata") as GitHubPrSnapshot;
+  validateGithubPrIdentity(githubPr, input.job);
 
   const checks = await runCommand(
     input.runner,
@@ -496,7 +590,10 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     observeTerminal,
   );
   if (![0, 1, 8].includes(checks.exitCode)) fail("invalid_checks_exit", "GitHub checks lookup returned an infrastructure failure");
-  const requiredChecks = parseJson(checks.output, checksSchema(), "GitHub required checks");
+  // `gh pr checks --required` exits 1 with a plain-text notice when the branch has no required checks.
+  const requiredChecks = checks.exitCode === 1 && !hasJsonPayload(checks.output)
+    ? []
+    : parseJson(checks.output, checksSchema(), "GitHub required checks");
 
   const second = await runCommand(
     input.runner,
@@ -517,9 +614,10 @@ export async function runValidation(input: ValidationInput): Promise<ValidationS
     headSha: head.remoteHeadSha,
     originRepository: head.originRepository,
     commandReceipts: collector.receipts,
+    policyCommandReceipts,
     githubPr,
     requiredChecks,
-    validationOutcome: "pass",
+    validationOutcome: requiredChecksPass(requiredChecks, policy.requiredChecks) ? "pass" : "fail",
     completedAt: new Date().toISOString(),
     reviewAttemptId: input.currentReviewAttempt?.id,
     terminalIds: [...terminalIds],

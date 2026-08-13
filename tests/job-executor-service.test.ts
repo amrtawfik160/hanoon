@@ -7,6 +7,7 @@ import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { EffectRunner } from "../src/services/effect-runner";
 import {
   runJobExecutorService,
+  WORKER_RECONCILE_INTERVAL_MS,
   type JobExecutorDependencies,
 } from "../src/services/job-executor-service";
 import { TelegramApiError } from "../src/telegram/errors";
@@ -64,7 +65,9 @@ function prepareExecutorTestJob(
         },
         requiredChecks: [],
         outputRedactionPatterns: [],
+        workerStartGraceMs: 120_000,
         workerLivenessWatchdogMs: 60_000,
+        workerRecoveryLimit: 2,
         maxReviewCycles: 3,
         mergeMethod: "squash",
       },
@@ -412,6 +415,41 @@ function submitAnotherControllerTurn(
 }
 
 describe("singleton job executor", () => {
+  it("reconciles an otherwise silent admitted worker on a bounded interval", async () => {
+    const { store, db } = fixture();
+    const selected = queueProjectJob(store, "job_silent_sweep", "proj_silent_sweep", 1_000);
+    admitPreparedJobs(store, [selected], 2_000);
+    db.prepare(
+      `UPDATE jobs SET state = 'implementing', implementation_thread_id = 'thr_silent',
+         environment_id = 'env_silent' WHERE id = ?`,
+    ).run(selected.id);
+    db.prepare("UPDATE effects SET status = 'done' WHERE job_id = ?").run(selected.id);
+    let now = 2_100;
+    const waits: number[] = [];
+    let reconciliations = 0;
+    const abort = new AbortController();
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      maxConcurrentJobs: () => 1,
+      reconcileJob: async (job) => {
+        if (job.id !== selected.id) return;
+        reconciliations += 1;
+        if (reconciliations === 2) abort.abort();
+      },
+      effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+      waitForWork: async (milliseconds) => {
+        waits.push(milliseconds);
+        now += milliseconds;
+      },
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(reconciliations).toBe(2);
+    expect(waits.reduce((total, wait) => total + wait, 0)).toBe(WORKER_RECONCILE_INTERVAL_MS);
+  });
+
   it.each([1, 2])("admits only the validated cap %s and starts that many pipeline lanes", async (cap) => {
     const { store, db } = fixture();
     const selectedJobs = [
@@ -561,6 +599,60 @@ describe("singleton job executor", () => {
       firstWait.resolve();
       await execution;
       vi.useRealTimers();
+    }
+  });
+
+  it("re-adopts an expired claim before dispatching a retried job effect", async () => {
+    const { store, db } = fixture();
+    const selected = queueProjectJob(store, "job_retry_after_claim_expiry", "proj_retry_claim", 1_000);
+    admitPreparedJobs(store, [selected], 2_000);
+    settleSafeControlEffects(db, selected.id);
+    db.prepare("UPDATE effects SET next_attempt_at = ? WHERE job_id = ? AND kind = 'spawn_plan'")
+      .run(100_000, selected.id);
+
+    const firstPass = executorDeferred();
+    const retryReady = executorDeferred();
+    const abort = new AbortController();
+    const dispatched: string[] = [];
+    let now = 2_000;
+    let waitCount = 0;
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      leaseMs: 30_000,
+      maxConcurrentJobs: () => 1,
+      reconcileJob: async () => undefined,
+      effectRunnerFactory: () => ({
+        run: async (effect: StoredEffect) => {
+          dispatched.push(effect.kind);
+        },
+      }),
+      waitForWork: async () => {
+        waitCount += 1;
+        if (waitCount === 1) {
+          firstPass.resolve();
+          await retryReady.promise;
+        } else if (waitCount >= 3) {
+          abort.abort();
+        }
+      },
+    } as JobExecutorDependencies, abort.signal);
+
+    try {
+      await firstPass.promise;
+      now = 32_001;
+      db.prepare("UPDATE executor_lease SET heartbeat_at = ?, lease_expires_at = ? WHERE singleton = 1")
+        .run(now, now + 30_000);
+      db.prepare("UPDATE effects SET next_attempt_at = ? WHERE job_id = ? AND kind = 'spawn_plan'")
+        .run(now, selected.id);
+      retryReady.resolve();
+      await execution;
+
+      expect(dispatched).toEqual(["spawn_plan"]);
+    } finally {
+      abort.abort();
+      retryReady.resolve();
+      await execution;
     }
   });
 
@@ -1311,7 +1403,7 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), "");
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), "Connecting…");
     expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), "Luna is working live");
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBeGreaterThan(0);
@@ -1362,7 +1454,7 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledOnce();
-    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "");
+    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "Connecting…");
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage).toHaveBeenCalledWith("7", {
       text: "Final answer",
@@ -1451,7 +1543,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: { sendChatAction },
       warn: vi.fn(),
     });
@@ -1481,7 +1572,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: { sendChatAction: vi.fn(async () => undefined) },
       warn: vi.fn(),
     });
@@ -1499,7 +1589,7 @@ describe("singleton job executor", () => {
     expect(waitForWork).toHaveBeenCalledWith(60_000, expect.any(AbortSignal));
   });
 
-  it("stops pulsing after lease loss and resets the stale lease state", async () => {
+  it("stops pulsing after lease loss and resumes once the prior deadline passes", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);
     const abort = new AbortController();
@@ -1508,7 +1598,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: { sendChatAction },
       warn: vi.fn(),
     });
@@ -1531,6 +1620,45 @@ describe("singleton job executor", () => {
     expect(sendChatAction).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps presence throttled across rapid executor lease turnover after the 2026-08-12 incident", async () => {
+    const { store, db } = fixture();
+    addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    let now = 1_000;
+    let waits = 0;
+    const sendChatAction = vi.fn(async () => undefined);
+    const laneSnapshots = new JobLaneSnapshotProvider();
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: { sendChatAction },
+      warn: vi.fn(),
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork: vi.fn(async () => {
+        waits += 1;
+        if (waits === 1) {
+          const lease = db.prepare(
+            "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+          ).get() as { owner_id: string; generation: number };
+          expect(store.releaseExecutorLease(lease.owner_id, lease.generation, now)).toBe(true);
+          now += 1;
+          return;
+        }
+        abort.abort();
+      }),
+      presence,
+      laneSnapshots,
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+    }, abort.signal);
+
+    expect(waits).toBe(2);
+    expect(sendChatAction).toHaveBeenCalledOnce();
+  });
+
   it("stops cleanly when shutdown aborts an in-flight presence request", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);
@@ -1538,7 +1666,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: {
         sendChatAction: vi.fn(async (_chatId, _action, signal) => {
           abort.abort(new Error("executor stopped"));
@@ -1644,6 +1771,57 @@ describe("singleton job executor", () => {
       expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(1);
     },
   );
+
+  it("refreshes stale BB worker liveness before releasing a terminal job", async () => {
+    const { store } = fixture();
+    const jobId = "job_executor_stale_release";
+    queueExecutorBoundaryJob(store, jobId);
+    const abort = new AbortController();
+    const getWorkerThread = vi.fn(async (threadId: string) => ({
+      id: threadId,
+      status: "idle",
+      updatedAt: 20_000,
+      runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
+    }));
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 20_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      controller: terminalBoundaryController(store, jobId, 20_000, boundaryWorker(jobId, "stale", 1_000), true),
+      getWorkerThread,
+      effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(store.getWorkerLiveness(jobId)).toMatchObject({ state: "idle", observedAt: 20_000 });
+    expect(store.getAdmission(jobId)?.state).toBe("released");
+    expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(0);
+  });
+
+  it("keeps the claim and records an unknown worker when the BB refresh fails", async () => {
+    const { store } = fixture();
+    const jobId = "job_executor_stale_lookup_failure";
+    queueExecutorBoundaryJob(store, jobId);
+    const abort = new AbortController();
+    const getWorkerThread = vi.fn(async () => {
+      throw new Error("BB temporarily unavailable");
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 20_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      controller: terminalBoundaryController(store, jobId, 20_000, boundaryWorker(jobId, "stale", 1_000), true),
+      getWorkerThread,
+      effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(store.getWorkerLiveness(jobId)).toMatchObject({ state: "unknown", observedAt: 20_000 });
+    expect(store.getAdmission(jobId)?.state).toBe("draining");
+    expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(1);
+  });
 
   it("does not finalize a draining job while its sequential operation is still in memory", async () => {
     const { store } = fixture();

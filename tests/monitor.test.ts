@@ -58,6 +58,9 @@ it("wakes the agent with its own instruction once the watched thread finishes", 
   expect(turns).toHaveLength(1);
   expect(turns[0]?.inputText).toContain("Summarise what it changed and open a PR.");
   expect(turns[0]?.inputText).toContain("thr_work");
+  expect(turns[0]?.inputText).toContain("stay silent");
+  expect(turns[0]?.inputText).toMatch(/capability routing.*denial.*material escalation.*missing mandatory evidence/i);
+  expect(turns[0]?.inputText).not.toMatch(/tell the owner what happened/i);
   expect(store.listMonitors(CONTROLLER_KEY, true)).toMatchObject([{ state: "done", fireCount: 1 }]);
 });
 
@@ -115,6 +118,26 @@ it("re-arms a schedule for its next occurrence instead of retiring", async () =>
   expect(armed).toHaveLength(1);
   expect(armed[0]).toMatchObject({ state: "armed", fireCount: 1 });
   expect(armed[0]?.dueAt).toBeGreaterThan(dueAt);
+});
+
+it("identifies the fired schedule so the controller can cancel an obsolete poller", async () => {
+  const { store } = fixture();
+  const dueAt = nextCronOccurrence("*/5 * * * *", NOW);
+  if (dueAt === null) throw new Error("cron did not parse");
+  const monitor = store.createMonitor({
+    controllerKey: CONTROLLER_KEY,
+    kind: "schedule",
+    cron: "*/5 * * * *",
+    instruction: "Check whether the guarded job moved.",
+    dueAt,
+    now: NOW,
+  });
+
+  await expect(service(store, async () => "idle", () => dueAt).processDue()).resolves.toBe(true);
+
+  const prompt = store.listControllerTurns(CONTROLLER_KEY, 10)[0]?.inputText ?? "";
+  expect(prompt).toContain(monitor.id);
+  expect(prompt).toMatch(/cancel.*schedule|schedule.*cancel/i);
 });
 
 it("holds a schedule until its time arrives", async () => {

@@ -3,10 +3,17 @@ import {
   IllegalTransitionError,
   transition,
 } from "../src/domain/state-machine";
-import type { JobEvent, JobState } from "../src/domain/models";
+import { classifyDeliveryMode, type JobEvent, type JobState } from "../src/domain/models";
 import { activeWorkerFixture, jobFixture, policyFixture, sha, stateJob } from "./helpers";
 
 describe("job state machine", () => {
+  it("classifies only obvious small fixes from the task text", () => {
+    expect(classifyDeliveryMode("fix typo in the refund copy")).toBe("small_fix");
+    expect(classifyDeliveryMode("one-line lint fix")).toBe("small_fix");
+    expect(classifyDeliveryMode("fix typo", "full")).toBe("full");
+    expect(classifyDeliveryMode("rebuild checkout and add a regression")).toBe("full");
+  });
+
   it.each([
     ["awaiting_project", { type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture() }, "awaiting_confirmation", "render_status"],
     ["awaiting_confirmation", { type: "CONFIRMED" }, "planning", "spawn_plan"],
@@ -41,19 +48,164 @@ describe("job state machine", () => {
     expect(result.effects.map((item) => item.kind)).toContain(effect);
   });
 
-  it("blocks before approval when production deployment and canary are not configured", () => {
+  it("completes after final review when production deployment and canary are not configured", () => {
     const policy = policyFixture();
     delete (policy as Partial<typeof policy>).production;
     const result = transition(
-      stateJob("final_reviewing", { policy, prHeadSha: sha() }),
+      stateJob("final_reviewing", { policy, prHeadSha: sha(), prNumber: 7 }),
       { type: "REVIEW_PASSED", headSha: sha() },
       2_250,
     );
 
     expect(result.job).toMatchObject({
-      state: "blocked",
-      blockedReason: "configuration",
-      lastError: "Production deployment and canary are not configured",
+      state: "complete",
+      blockedReason: null,
+      lastError: null,
+      prNumber: 7,
+    });
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+  });
+
+  it("skips critique but requires validation and one review on the small-fix path", () => {
+    const confirmed = transition(
+      stateJob("awaiting_confirmation", { deliveryMode: "small_fix", projectId: "proj_1" }),
+      { type: "CONFIRMED" },
+      2_240,
+    );
+    expect(confirmed.job.state).toBe("creating_implementation");
+    expect(confirmed.effects.map((effect) => effect.kind)).toEqual(["spawn_implementation"]);
+
+    const published = transition(
+      stateJob("locating_pr", { deliveryMode: "small_fix" }),
+      { type: "PR_LOCATED", number: 11, url: "https://github.test/pr/11" },
+      2_241,
+    );
+    expect(published.job).toMatchObject({
+      state: "resolving_pr_head",
+      prNumber: 11,
+      prUrl: "https://github.test/pr/11",
+    });
+    expect(published.effects.map((effect) => effect.kind)).toEqual(["resolve_pr_head"]);
+
+    const reviewed = transition(
+      stateJob("reviewing", { deliveryMode: "small_fix", prNumber: 11, prHeadSha: sha() }),
+      { type: "REVIEW_PASSED", headSha: sha() },
+      2_242,
+    );
+    expect(reviewed.job.state).toBe("complete");
+    expect(reviewed.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+  });
+
+  it("resumes an existing pull request from review instead of replanning", () => {
+    const blocked = transition(
+      stateJob("blocked", {
+        blockedReason: "plan_limit",
+        lastError: "Plan needs revision: Still incomplete",
+        planCycle: 2,
+        prNumber: 19,
+        prUrl: "https://github.test/pr/19",
+        prHeadSha: sha(),
+      }),
+      { type: "CONTINUE_REVIEW" },
+      2_242,
+    );
+    expect(blocked.job).toMatchObject({
+      state: "reviewing",
+      blockedReason: null,
+      lastError: null,
+      prNumber: 19,
+    });
+    expect(blocked.effects.map((effect) => effect.kind)).toEqual(["spawn_review"]);
+
+    const failed = transition(
+      stateJob("failed", {
+        resumeState: "planning",
+        lastError: "temporary failure",
+        prNumber: 21,
+        prHeadSha: sha(),
+      }),
+      { type: "RETRY" },
+      2_243,
+    );
+    expect(failed.job.state).toBe("reviewing");
+    expect(failed.effects.map((effect) => effect.kind)).toEqual(["spawn_review"]);
+  });
+
+  it("retries a permanent effect failure when the next step is already known", () => {
+    const retried = transition(
+      stateJob("blocked", {
+        blockedReason: "permanent_effect_failure",
+        resumeState: "locating_pr",
+        lastError: "implementation inspection requires BB environment and policy context",
+      }),
+      { type: "RETRY" },
+      2_244,
+    );
+    expect(retried.job).toMatchObject({
+      state: "locating_pr",
+      blockedReason: null,
+      lastError: null,
+      resumeState: null,
+    });
+    expect(retried.effects.map((effect) => effect.kind)).toEqual(["inspect_implementation"]);
+  });
+
+  it("fences a silent worker before replaying its exact stage", () => {
+    const requested = transition(
+      stateJob("implementing", {
+        implementationThreadId: "thr_silent",
+        environmentId: "env_1",
+      }),
+      {
+        type: "WORKER_RECOVERY_REQUESTED",
+        recoveryId: "recovery_1",
+        workerKind: "implementation",
+        resourceId: "thr_silent",
+        classification: "no_progress",
+        signature: "silent:implementation:no_progress",
+      },
+      2_246,
+    );
+
+    expect(requested.job).toMatchObject({
+      state: "recovering_worker",
+      resumeState: "implementing",
+      implementationThreadId: "thr_silent",
+    });
+    expect(requested.effects.map((effect) => effect.kind)).toEqual(["render_status", "recover_worker"]);
+
+    const replayed = transition(
+      requested.job,
+      { type: "WORKER_RECOVERY_REQUEUED", recoveryId: "recovery_1" },
+      2_247,
+    );
+    expect(replayed.job).toMatchObject({
+      state: "creating_implementation",
+      resumeState: null,
+      implementationThreadId: null,
+      environmentId: "env_1",
+    });
+    expect(replayed.effects.map((effect) => effect.kind)).toEqual(["spawn_implementation"]);
+  });
+
+  it("finishes a reviewed pull request that was blocked only because production is missing", () => {
+    const policy = policyFixture();
+    delete (policy as Partial<typeof policy>).production;
+    const result = transition(
+      stateJob("blocked", {
+        policy,
+        blockedReason: "configuration",
+        lastError: "Production deployment and canary are not configured",
+        prNumber: 8,
+        prHeadSha: sha(),
+      }),
+      { type: "CONTINUE_REVIEW" },
+      2_245,
+    );
+    expect(result.job).toMatchObject({
+      state: "complete",
+      blockedReason: null,
+      lastError: null,
     });
     expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
   });
@@ -145,10 +297,55 @@ describe("job state machine", () => {
     expect(second.job).toMatchObject({
       state: "blocked",
       planCycle: 2,
-      blockedReason: "review_limit",
-      lastError: "Plan critique limit reached",
+      blockedReason: "plan_limit",
+      lastError: "Plan needs revision: Still incomplete",
     });
     expect(second.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+  });
+
+  it("sends a revised plan straight to implementation without a second critique", () => {
+    const result = transition(
+      stateJob("planning", { planCycle: 1 }),
+      { type: "PLAN_READY", attemptId: "stage_plan_2" },
+      2_050,
+    );
+
+    expect(result.job.state).toBe("creating_implementation");
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["spawn_implementation"]);
+  });
+
+  it("resumes a plan-limit block by starting a fresh plan, including legacy review_limit planning blocks", () => {
+    const current = transition(
+      stateJob("blocked", {
+        blockedReason: "plan_limit",
+        lastError: "Plan needs revision: Still incomplete",
+        planCycle: 2,
+      }),
+      { type: "CONTINUE_REVIEW" },
+      3_400,
+    );
+    expect(current.job).toMatchObject({
+      state: "planning",
+      blockedReason: null,
+      lastError: null,
+      planCycle: 0,
+    });
+    expect(current.effects.map((effect) => effect.kind)).toEqual(["spawn_plan"]);
+
+    const legacy = transition(
+      stateJob("blocked", {
+        blockedReason: "review_limit",
+        lastError: "Plan critique limit reached",
+        planCycle: 2,
+        reviewCycle: 0,
+        implementationThreadId: null,
+        prNumber: null,
+      }),
+      { type: "CONTINUE_REVIEW" },
+      3_410,
+    );
+    expect(legacy.job.state).toBe("planning");
+    expect(legacy.effects.map((effect) => effect.kind)).toEqual(["spawn_plan"]);
   });
 
   it("routes final-review changes through the bounded patch loop", () => {
@@ -191,6 +388,41 @@ describe("job state machine", () => {
       resourceId: activeWorker.resourceId,
       resourceKind: activeWorker.resourceKind,
       workerKind: activeWorker.workerKind,
+    });
+  });
+
+  it("stops all supplied active review lenses with one cancellation effect", () => {
+    const quality = activeWorkerFixture({ resourceId: "thr_quality", workerKind: "review", generation: 401 });
+    const risk = activeWorkerFixture({ resourceId: "thr_risk", workerKind: "review", generation: 401 });
+    const result = transition(
+      stateJob("reviewing", { reviewThreadId: quality.resourceId }),
+      { type: "CANCEL_REQUESTED", activeWorker: quality, activeWorkers: [quality, risk] },
+      2_000,
+    );
+
+    expect(result.effects.map((item) => item.kind)).toEqual([
+      "revoke_approvals",
+      "stop_thread",
+    ]);
+    expect(result.effects[1]?.payload).toEqual({
+      generation: quality.generation,
+      resourceId: quality.resourceId,
+      resourceKind: quality.resourceKind,
+      workerKind: quality.workerKind,
+      workers: [
+        {
+          generation: quality.generation,
+          resourceId: quality.resourceId,
+          resourceKind: quality.resourceKind,
+          workerKind: quality.workerKind,
+        },
+        {
+          generation: risk.generation,
+          resourceId: risk.resourceId,
+          resourceKind: risk.resourceKind,
+          workerKind: risk.workerKind,
+        },
+      ],
     });
   });
 

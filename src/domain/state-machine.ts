@@ -1,5 +1,10 @@
 import {
+  isResumablePermanentFailure,
+  isResumablePlanBlock,
+  isReviewedPrCompletionBlock,
+  isSmallFixJob,
   projectPolicySchema,
+  shouldResumeExistingPr,
   type Job,
   type JobEffect,
   type JobEvent,
@@ -7,6 +12,7 @@ import {
   type ReviewFinding,
   type WorkerLiveness,
 } from "./models";
+import { recipeExecutionPolicy } from "./recipes";
 
 export interface TransitionResult {
   job: Job;
@@ -120,6 +126,30 @@ function enterLocatingPr(job: Job, effects: JobEffect[]): void {
   emitEffect(job, effects, "inspect_implementation");
 }
 
+function completeReviewedWork(job: Job, effects: JobEffect[]): void {
+  job.state = "complete";
+  job.blockedReason = null;
+  job.lastError = null;
+  job.resumeState = null;
+  emitEffect(job, effects, "render_status");
+}
+
+function resumeFromExistingPr(job: Job, effects: JobEffect[]): void {
+  job.blockedReason = null;
+  job.lastError = null;
+  job.resumeState = null;
+  if (job.prHeadSha) {
+    job.state = "reviewing";
+    emitEffect(job, effects, "spawn_review", { headSha: job.prHeadSha });
+    return;
+  }
+  job.state = "resolving_pr_head";
+  emitEffect(job, effects, "resolve_pr_head", job.prNumber ? {
+    number: job.prNumber,
+    ...(job.prUrl ? { url: job.prUrl } : {}),
+  } : {});
+}
+
 function invalidateDriftedHead(job: Job, effects: JobEffect[]): void {
   clearHeadAndReceipts(job, effects);
   job.state = "resolving_pr_head";
@@ -130,7 +160,12 @@ function headMatches(job: Job, headSha: string | undefined): boolean {
   return job.prHeadSha !== null && headSha === job.prHeadSha;
 }
 
-function retryEffect(job: Job, effects: JobEffect[], resumeState: JobState): void {
+function retryEffect(
+  job: Job,
+  effects: JobEffect[],
+  resumeState: JobState,
+  payload: Record<string, unknown> = {},
+): void {
   const effectByState: Partial<Record<JobState, JobEffect["kind"]>> = {
     planning: "spawn_plan",
     critiquing: "spawn_critique",
@@ -152,21 +187,97 @@ function retryEffect(job: Job, effects: JobEffect[], resumeState: JobState): voi
   };
   const kind = effectByState[resumeState];
   if (!kind) throw new IllegalTransitionError(job.state, "RETRY");
-  emitEffect(job, effects, kind, job.prHeadSha ? { headSha: job.prHeadSha } : {});
+  emitEffect(job, effects, kind, {
+    ...(job.prHeadSha ? { headSha: job.prHeadSha } : {}),
+    ...payload,
+  });
 }
 
-function stopActiveWorker(
+const RECOVERABLE_WORKER_STATES = new Set<JobState>([
+  "planning",
+  "critiquing",
+  "creating_implementation",
+  "implementing",
+  "reviewing",
+  "remediating",
+  "documenting",
+  "final_reviewing",
+]);
+
+function requestWorkerRecovery(
   job: Job,
+  event: Extract<JobEvent, { type: "WORKER_RECOVERY_REQUESTED" }>,
   effects: JobEffect[],
-  worker: WorkerLiveness | null | undefined,
 ): void {
-  if (!worker || worker.jobId !== job.id || !ACTIVE_WORKER_STATES.has(worker.state)) return;
-  emitEffect(job, effects, "stop_thread", {
+  if (!RECOVERABLE_WORKER_STATES.has(job.state)) illegal(job, event);
+  assertNonEmpty(event.recoveryId, "recoveryId");
+  assertNonEmpty(event.resourceId, "resourceId");
+  assertNonEmpty(event.signature, "signature");
+  if (event.signature.length > 200) throw new TypeError("signature must be at most 200 characters");
+  const resumeState = job.state;
+  job.resumeState = resumeState;
+  job.state = "recovering_worker";
+  emitEffect(job, effects, "render_status");
+  emitEffect(job, effects, "recover_worker", {
+    recoveryId: event.recoveryId,
+    workerKind: event.workerKind,
+    resourceId: event.resourceId,
+    classification: event.classification,
+    signature: event.signature,
+    resumeState,
+    retryPayload: event.retryPayload ?? {},
+  });
+}
+
+function transitionRecoveringWorker(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type !== "WORKER_RECOVERY_REQUEUED" || job.resumeState === null) illegal(job, event);
+  assertNonEmpty(event.recoveryId, "recoveryId");
+  const resumeState = job.resumeState;
+  job.resumeState = null;
+  job.lastError = null;
+  job.blockedReason = null;
+
+  if (resumeState === "creating_implementation" || resumeState === "implementing" || resumeState === "remediating") {
+    job.implementationThreadId = null;
+    job.state = "creating_implementation";
+    emitEffect(job, effects, "spawn_implementation", {
+      recoveryId: event.recoveryId,
+      ...(event.retryPayload ?? {}),
+    });
+    return;
+  }
+  if (resumeState === "reviewing" || resumeState === "final_reviewing") {
+    job.reviewThreadId = null;
+  }
+  if (resumeState === "documenting") job.documentationThreadId = null;
+  job.state = resumeState;
+  retryEffect(job, effects, resumeState, {
+    recoveryId: event.recoveryId,
+    ...(event.retryPayload ?? {}),
+  });
+}
+
+function workerStopPayload(worker: WorkerLiveness): Record<string, unknown> {
+  return {
     generation: worker.generation,
     resourceId: worker.resourceId,
     resourceKind: worker.resourceKind,
     workerKind: worker.workerKind,
-  });
+  };
+}
+
+function stopActiveWorkers(
+  job: Job,
+  effects: JobEffect[],
+  workers: readonly WorkerLiveness[],
+): void {
+  const active = [...new Map(workers
+    .filter((worker) => worker.jobId === job.id && ACTIVE_WORKER_STATES.has(worker.state))
+    .map((worker) => [worker.resourceId, worker] as const)).values()];
+  if (active.length === 0) return;
+  const payload = workerStopPayload(active[0]);
+  if (active.length > 1) payload.workers = active.map(workerStopPayload);
+  emitEffect(job, effects, "stop_thread", payload);
 }
 
 function applyCancellation(
@@ -176,12 +287,19 @@ function applyCancellation(
   now: number,
 ): TransitionResult {
   if (["cancelled", "merged", "deploying", "verifying_production", "production_failed", "complete"].includes(job.state)) illegal(job, event);
-  const worker = event.activeWorker;
-  const workerActive = !!worker && worker.jobId === job.id && ACTIVE_WORKER_STATES.has(worker.state);
+  const workerEvidenceSupplied = event.activeWorker !== undefined || event.activeWorkers !== undefined;
+  const suppliedWorkers = [
+    ...(event.activeWorkers ?? []),
+    ...(event.activeWorker ? [event.activeWorker] : []),
+  ];
+  if (suppliedWorkers.length > 4) throw new TypeError("Cancellation accepts at most four worker resources");
+  const activeWorkers = [...new Map(suppliedWorkers
+    .filter((worker) => worker.jobId === job.id && ACTIVE_WORKER_STATES.has(worker.state))
+    .map((worker) => [worker.resourceId, worker] as const)).values()];
   if (job.cancelRequestedAt === null) {
     job.cancelRequestedAt = now;
     emitEffect(job, effects, "revoke_approvals");
-    if (workerActive) stopActiveWorker(job, effects, worker);
+    stopActiveWorkers(job, effects, activeWorkers);
   }
   // Nothing to stop, and CANCEL_CONFIRMED is otherwise applied only by the
   // stop_thread effect that an idle job never emits — so without this a
@@ -192,7 +310,7 @@ function applyCancellation(
   // already-stuck job recovers, and it makes cancelling twice harmless.
   // `undefined` means the caller offered no evidence either way, so it keeps
   // the conservative wait rather than orphaning a live worker.
-  if (!workerActive && worker !== undefined) {
+  if (activeWorkers.length === 0 && workerEvidenceSupplied) {
     job.state = "cancelled";
     emitEffect(job, effects, "render_status");
   }
@@ -233,6 +351,44 @@ function transitionAwaitingProject(job: Job, event: JobEvent, effects: JobEffect
 
 function transitionAwaitingConfirmation(job: Job, event: JobEvent, effects: JobEffect[]): void {
   if (event.type !== "CONFIRMED") illegal(job, event);
+  if (job.origin === "adopted_pr") {
+    if (!job.adoptedBranch || !job.adoptedHeadSha || !job.prNumber || !job.prUrl) {
+      throw new TypeError("Adopted pull-request job is missing immutable source evidence");
+    }
+    job.state = "creating_implementation";
+    emitEffect(job, effects, "spawn_implementation", {
+      deliveryMode: job.deliveryMode,
+      adoptedBranch: job.adoptedBranch,
+      adoptedHeadSha: job.adoptedHeadSha,
+      prNumber: job.prNumber,
+    });
+    return;
+  }
+  if (job.routingMode === "active") {
+    const policy = recipeExecutionPolicy(job.taskRecipe);
+    if (policy.planning === "plan-and-critique") {
+      job.state = "planning";
+      emitEffect(job, effects, "spawn_plan", {
+        policyVersion: job.policyVersion,
+        projectId: job.projectId,
+        recipeId: job.taskRecipe,
+        recipeVersion: job.recipeVersion,
+      });
+      return;
+    }
+    job.state = "creating_implementation";
+    emitEffect(job, effects, "spawn_implementation", {
+      deliveryMode: job.deliveryMode,
+      recipeId: job.taskRecipe,
+      recipeVersion: job.recipeVersion,
+    });
+    return;
+  }
+  if (isSmallFixJob(job)) {
+    job.state = "creating_implementation";
+    emitEffect(job, effects, "spawn_implementation", { deliveryMode: job.deliveryMode });
+    return;
+  }
   job.state = "planning";
   emitEffect(job, effects, "spawn_plan", {
     policyVersion: job.policyVersion,
@@ -251,6 +407,11 @@ function transitionPlanning(job: Job, event: JobEvent, effects: JobEffect[]): vo
   }
   if (event.type === "PLAN_READY") {
     assertNonEmpty(event.attemptId, "attemptId");
+    if (job.planCycle >= 1) {
+      job.state = "creating_implementation";
+      emitEffect(job, effects, "spawn_implementation", { planAttemptId: event.attemptId });
+      return;
+    }
     job.state = "critiquing";
     emitEffect(job, effects, "spawn_critique", { planAttemptId: event.attemptId });
     return;
@@ -272,8 +433,8 @@ function transitionCritiquing(job: Job, event: JobEvent, effects: JobEffect[]): 
     job.planCycle += 1;
     if (job.planCycle >= 2) {
       job.state = "blocked";
-      job.blockedReason = "review_limit";
-      job.lastError = "Plan critique limit reached";
+      job.blockedReason = "plan_limit";
+      job.lastError = planBlockSummary(event.summary);
       emitEffect(job, effects, "render_status");
       return;
     }
@@ -336,6 +497,40 @@ function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[])
   assertHeadSha(event.headSha);
   if (!headMatches(job, event.headSha)) {
     invalidateDriftedHead(job, effects);
+    return;
+  }
+  if (job.routingMode === "active") {
+    const documentation = event.documentation;
+    if (!documentation || !/^[0-9a-f]{64}$/u.test(documentation.diffDigest) ||
+      documentation.reasons.length > 16 ||
+      documentation.reasons.some((reason) => !/^[a-z][a-z0-9._:-]{0,127}$/u.test(reason)) ||
+      (documentation.required ? documentation.reasons.length === 0 : documentation.reasons.length !== 0)) {
+      throw new TypeError("Active review completion requires exact documentation diff evidence");
+    }
+    if (documentation.required) {
+      job.state = "documenting";
+      emitEffect(job, effects, "spawn_docs", {
+        headSha: event.headSha,
+        diffDigest: documentation.diffDigest,
+        reasons: [...documentation.reasons],
+      });
+      return;
+    }
+    if (recipeExecutionPolicy(job.taskRecipe).review === "task-and-integrated") {
+      job.state = "final_validating";
+      emitEffect(job, effects, "run_final_validation", { headSha: event.headSha });
+      return;
+    }
+    if (job.policy?.production) {
+      job.state = "awaiting_merge_approval";
+      emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
+      return;
+    }
+    completeReviewedWork(job, effects);
+    return;
+  }
+  if (isSmallFixJob(job)) {
+    completeReviewedWork(job, effects);
     return;
   }
   job.state = "documenting";
@@ -502,10 +697,7 @@ function transitionFinalReviewing(job: Job, event: JobEvent, effects: JobEffect[
       return;
     }
     if (!job.policy?.production) {
-      job.state = "blocked";
-      job.blockedReason = "configuration";
-      job.lastError = "Production deployment and canary are not configured";
-      emitEffect(job, effects, "render_status");
+      completeReviewedWork(job, effects);
       return;
     }
     job.state = "awaiting_merge_approval";
@@ -622,6 +814,10 @@ function transitionVerifyingProduction(job: Job, event: JobEvent, effects: JobEf
 
 function transitionFailed(job: Job, event: JobEvent, effects: JobEffect[]): void {
   if (event.type !== "RETRY" || job.resumeState === null) illegal(job, event);
+  if (shouldResumeExistingPr(job)) {
+    resumeFromExistingPr(job, effects);
+    return;
+  }
   const resumeState = job.resumeState;
   job.state = resumeState;
   job.resumeState = null;
@@ -630,11 +826,54 @@ function transitionFailed(job: Job, event: JobEvent, effects: JobEffect[]): void
 }
 
 function transitionBlocked(job: Job, event: JobEvent, effects: JobEffect[]): void {
-  if (event.type !== "CONTINUE_REVIEW" || job.blockedReason !== "review_limit") illegal(job, event);
+  if (event.type === "RETRY") {
+    if (!isResumablePermanentFailure(job) || job.resumeState === null) illegal(job, event);
+    if (shouldResumeExistingPr(job)) {
+      resumeFromExistingPr(job, effects);
+      return;
+    }
+    const resumeState = job.resumeState;
+    job.state = resumeState;
+    job.resumeState = null;
+    job.blockedReason = null;
+    job.lastError = null;
+    retryEffect(job, effects, resumeState);
+    return;
+  }
+  if (event.type !== "CONTINUE_REVIEW") illegal(job, event);
+  if (job.blockedReason === "cancellation_unconfirmed") illegal(job, event);
+  if (isReviewedPrCompletionBlock(job)) {
+    completeReviewedWork(job, effects);
+    return;
+  }
+  if (job.prNumber !== null) {
+    resumeFromExistingPr(job, effects);
+    return;
+  }
+  if (isResumablePlanBlock(job)) {
+    job.blockedReason = null;
+    job.lastError = null;
+    job.planCycle = 0;
+    job.state = "planning";
+    emitEffect(job, effects, "spawn_plan");
+    return;
+  }
+  if (job.blockedReason !== "review_limit") illegal(job, event);
   job.blockedReason = null;
+  job.lastError = null;
   job.reviewBlockAt = job.reviewCycle + 3;
   job.state = "reviewing";
   emitEffect(job, effects, "spawn_review", job.prHeadSha ? { headSha: job.prHeadSha } : {});
+}
+
+function planBlockSummary(summary: string): string {
+  const prefix = "Plan needs revision: ";
+  const combined = `${prefix}${summary.trim()}`;
+  const clipped = combined.length <= MAX_FAILURE_SUMMARY_LENGTH
+    ? combined
+    : combined.slice(0, MAX_FAILURE_SUMMARY_LENGTH);
+  assertSafeFailureSummary(clipped);
+  return clipped;
 }
 
 function transitionTerminal(job: Job, event: JobEvent): void {
@@ -661,6 +900,7 @@ const STATE_HANDLERS: Record<JobState, StateTransitionHandler> = {
   merging: transitionMerging,
   deploying: transitionDeploying,
   verifying_production: transitionVerifyingProduction,
+  recovering_worker: transitionRecoveringWorker,
   production_failed: transitionTerminal,
   complete: transitionTerminal,
   failed: transitionFailed,
@@ -690,6 +930,10 @@ export function transition(job: Job, event: JobEvent, now: number): TransitionRe
   }
   if (event.type === "THREAD_FAILED") {
     failOnThread(next, effects, event);
+    return finish(next, effects, now);
+  }
+  if (event.type === "WORKER_RECOVERY_REQUESTED") {
+    requestWorkerRecovery(next, event, effects);
     return finish(next, effects, now);
   }
 

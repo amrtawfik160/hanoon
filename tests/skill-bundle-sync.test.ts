@@ -29,13 +29,15 @@ function syncFixture(): { root: string; source: string; sentinel: string } {
   cpSync(join(repositoryRoot, "src/agent-skills/frontmatter.js"), join(root, "src/agent-skills/frontmatter.js"));
   cpSync(join(repositoryRoot, "skills/guards"), join(root, "skills/guards"), { recursive: true });
   cpSync(join(repositoryRoot, "skills/delivery"), join(root, "skills/delivery"), { recursive: true });
+  cpSync(join(repositoryRoot, "skills/discovery"), join(root, "skills/discovery"), { recursive: true });
+  cpSync(join(repositoryRoot, "skills/hanoon"), join(root, "skills/hanoon"), { recursive: true });
   cpSync(join(repositoryRoot, "skills/workflow-kit/LICENSE"), join(source, "LICENSE"));
   for (const entry of readdirSync(join(repositoryRoot, "skills/workflow-kit"), { withFileTypes: true })) {
     if (entry.isDirectory()) {
       cpSync(join(repositoryRoot, "skills/workflow-kit", entry.name), join(source, "skills", entry.name), { recursive: true });
     }
   }
-  writeFileSync(join(source, "package.json"), '{"name":"superpowers","version":"6.2.0"}\n');
+  writeFileSync(join(source, "package.json"), '{"name":"superpowers","version":"6.3.0"}\n');
   const sentinel = join(root, "skills/workflow-kit/sentinel.txt");
   writeFileSync(sentinel, "preserve me");
   writeFileSync(join(root, "skills/skills.lock.json"), "{}\n");
@@ -45,7 +47,7 @@ function syncFixture(): { root: string; source: string; sentinel: string } {
 function runSync(root: string, source: string) {
   return spawnSync(
     process.execPath,
-    [join(root, "scripts/sync-workflow-skills.mjs"), "--source", source, "--version", "6.2.0"],
+    [join(root, "scripts/sync-workflow-skills.mjs"), "--source", source, "--version", "6.3.0"],
     { encoding: "utf8" },
   );
 }
@@ -74,7 +76,7 @@ function runSyncWithFault(root: string, source: string, fault: "lock-publish" | 
       };
     }
     syncBuiltinESMExports();
-    process.argv = [process.execPath, ${JSON.stringify(script)}, "--source", ${JSON.stringify(source)}, "--version", "6.2.0"];
+    process.argv = [process.execPath, ${JSON.stringify(script)}, "--source", ${JSON.stringify(source)}, "--version", "6.3.0"];
     await import(pathToFileURL(${JSON.stringify(script)}).href + "?fault=" + fault);
   `;
   return spawnSync(process.execPath, ["--input-type=module", "--eval", harness], { encoding: "utf8" });
@@ -115,6 +117,8 @@ function sourceBundleRoots(root: string, source: string): string[] {
     join(source, "skills"),
     join(root, "skills/guards"),
     join(root, "skills/delivery"),
+    join(root, "skills/discovery"),
+    join(root, "skills/hanoon"),
   ];
 }
 
@@ -139,7 +143,7 @@ function extendDepth(parent: string, currentDepth: number, targetDepth: number):
 }
 
 function writePackageAtSize(path: string, bytes: number): void {
-  const metadata = { name: "superpowers", version: "6.2.0", padding: "" };
+  const metadata = { name: "superpowers", version: "6.3.0", padding: "" };
   const empty = `${JSON.stringify(metadata)}\n`;
   metadata.padding = "x".repeat(bytes - Buffer.byteLength(empty));
   writeFileSync(path, `${JSON.stringify(metadata)}\n`);
@@ -319,7 +323,7 @@ test("does not roll back a committed workflow and lock when backup deletion fail
 });
 
 test.each([
-  ["wrong source package identity", (source: string) => writeFileSync(join(source, "package.json"), '{"name":"other","version":"6.2.0"}\n')],
+  ["wrong source package identity", (source: string) => writeFileSync(join(source, "package.json"), '{"name":"other","version":"6.3.0"}\n')],
   ["non-MIT source license", (source: string) => writeFileSync(join(source, "LICENSE"), "not the reviewed MIT license\n")],
 ])("rejects %s before replacing the current vendor bundle", (_label, corruptSource) => {
   const { root, source, sentinel } = syncFixture();

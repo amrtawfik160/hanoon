@@ -9,6 +9,7 @@ import {
   parseExtractedMemories,
 } from "../src/services/job-memory-service";
 import { activeWorkerFixture, admitConfirmedJob, policyFixture } from "./helpers";
+import { DEFAULT_MODEL_POOL_REGISTRY, selectModelRoute, type ModelRoute } from "../src/capabilities/models";
 
 let fixtureNumber = 0;
 
@@ -54,7 +55,7 @@ function finishedJob(store: TelegramAgentStore, id: string, outcome: "blocked" |
 function service(
   store: TelegramAgentStore,
   threads: {
-    spawnHidden?: (input: { projectId: string; title: string; prompt: string }) => Promise<string>;
+    spawnHidden?: (input: { projectId: string; title: string; prompt: string; modelRoute: ModelRoute }) => Promise<string>;
     status?: (threadId: string) => Promise<"idle" | "active" | "error" | "missing">;
     output?: (threadId: string) => Promise<string>;
   } = {},
@@ -67,6 +68,12 @@ function service(
     service: new JobMemoryService({
       store,
       threads: { spawnHidden, status, output },
+      modelRoute: () => selectModelRoute({
+        executionClass: "background",
+        recipe: "direct",
+        stage: "extraction",
+        risk: "low",
+      }, DEFAULT_MODEL_POOL_REGISTRY),
       clock: { now },
       warn: () => undefined,
     }),
@@ -79,6 +86,31 @@ function service(
 it("appends the job memory migration after every shipped one", () => {
   expect(ALL_MIGRATIONS[20]).toContain("CREATE TABLE job_memory_extractions");
   expect(ALL_MIGRATIONS[20]).toContain("ALTER TABLE memories ADD COLUMN origin");
+});
+
+it("persists and sends one exact background route before extraction spawn", async () => {
+  const { store } = fixture();
+  const job = finishedJob(store, "memory_route", "blocked");
+  const { service: pass, spawnHidden } = service(store);
+
+  expect(await pass.processDue()).toBe(true);
+
+  const route = selectModelRoute({
+    executionClass: "background",
+    recipe: "direct",
+    stage: "extraction",
+    risk: "low",
+  }, DEFAULT_MODEL_POOL_REGISTRY);
+  expect(spawnHidden).toHaveBeenCalledWith(expect.objectContaining({ modelRoute: route }));
+  expect(store.listModelRouteTrials("worker_attempt", `memory:${job.id}`, 10)).toEqual([
+    expect.objectContaining({
+      attempt: 1,
+      stage: "extraction",
+      operation: "spawn-memory",
+      route,
+      outcome: "selected",
+    }),
+  ]);
 });
 
 it.each([
@@ -189,7 +221,7 @@ it("gives up on a project that can never be reached instead of retrying forever"
   const { store } = fixture();
   finishedJob(store, "job_blocked", "blocked");
   const { service: pass, spawnHidden } = service(store, {
-    spawnHidden: async () => { throw new Error("HTTP 404: Project not found"); },
+    spawnHidden: async () => { throw new Error("host temporarily unavailable"); },
   });
 
   // A retryable blip stays pending, but the attempt is counted...
@@ -203,6 +235,21 @@ it("gives up on a project that can never be reached instead of retrying forever"
   expect(store.listJobMemoryExtractions("pending", 10)).toEqual([]);
   expect(store.listJobMemoryExtractions("failed", 10)).toMatchObject([{ jobId: "job_blocked" }]);
   expect(spawnHidden.mock.calls.length).toBeLessThanOrEqual(2);
+});
+
+it("stops retrying memory extraction when the project is gone", async () => {
+  const { store } = fixture();
+  finishedJob(store, "job_blocked", "blocked");
+  const { service: pass, spawnHidden } = service(store, {
+    spawnHidden: async () => {
+      throw new Error("HTTP 404: Project not found");
+    },
+  });
+
+  await pass.processDue();
+
+  expect(store.listJobMemoryExtractions("failed", 10)).toMatchObject([{ jobId: "job_blocked" }]);
+  expect(spawnHidden).toHaveBeenCalledOnce();
 });
 
 it("refuses to store a lesson that carries a credential", async () => {

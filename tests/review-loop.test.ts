@@ -1,9 +1,28 @@
 import { describe, expect, it } from "vitest";
 
+import type { GuardAssessmentPolicy } from "../src/capabilities/guards";
 import { ReviewHandler } from "../src/services/review-handler";
 
 const EXPECTED_SHA = "a".repeat(40);
 const NEXT_SHA = "b".repeat(40);
+const DIFF_DIGEST = "c".repeat(64);
+const GUARD_DIGEST = "d".repeat(64);
+
+const guardPolicy: GuardAssessmentPolicy = {
+  profileId: "cap_profile:review-loop",
+  profileRevision: 1,
+  reviewedHeadSha: EXPECTED_SHA,
+  diffDigest: DIFF_DIGEST,
+  selectedGuards: [{
+    capabilityId: "docs-guard",
+    descriptorDigest: GUARD_DIGEST,
+    mandatory: true,
+    substitutes: [],
+  }],
+  requirementIds: [],
+  mustFixRuleIds: ["docs.rule-1"],
+  advisoryRuleIds: ["docs.rule-10"],
+};
 
 type ReviewOutput = {
   verdict: "pass" | "changes_requested" | "blocked";
@@ -52,7 +71,7 @@ function makeHarness({
   attemptState = { threadId: "review-thread-1", headSha: EXPECTED_SHA },
   synchronizeCorrectionClaims = false,
 }: {
-  reviewOutputs?: string[];
+  reviewOutputs?: unknown[];
   headSha?: string;
   clean?: boolean;
   attemptState?: Record<string, unknown>;
@@ -150,6 +169,7 @@ async function idle(
     reviewThreadId: string;
     implementationThreadId: string;
     expectedSha: string;
+    guardPolicy: GuardAssessmentPolicy;
   }> = {},
 ) {
   return handler.handleThreadIdle({
@@ -166,6 +186,42 @@ async function idle(
 }
 
 describe("review remediation loop", () => {
+  it("settles a strict guard envelope with controller-derived advisory disposition", async () => {
+    const harness = makeHarness({
+      reviewOutputs: [JSON.stringify({
+        schemaVersion: 1,
+        profileId: guardPolicy.profileId,
+        profileRevision: guardPolicy.profileRevision,
+        reviewedHeadSha: EXPECTED_SHA,
+        diffDigest: DIFF_DIGEST,
+        guards: [{
+          capabilityId: "docs-guard",
+          descriptorDigest: GUARD_DIGEST,
+          outcome: "findings",
+          findings: [{
+            ruleId: "docs.rule-10",
+            severity: "medium",
+            subject: "docs/usage.md",
+            line: 2,
+            evidence: "The example can be made clearer.",
+            evidenceClass: "documentation",
+            requirementId: null,
+          }],
+        }],
+      })],
+    });
+
+    const completion = await idle(harness.handler, { guardPolicy });
+
+    expect(completion.result).toMatchObject({
+      outcome: "pass",
+      reviewedHeadSha: EXPECTED_SHA,
+      guardAssessment: { outcome: "pass_with_advisories" },
+      guardPolicy,
+    });
+    expect(completion.event?.type).toBe("REVIEW_PASSED");
+  });
+
   it("does not rebind a trusted attempt from a repeated stale idle event", async () => {
     const harness = makeHarness({ reviewOutputs: [output()] });
     const cycle = await harness.handler.startReviewCycle({
@@ -308,6 +364,17 @@ describe("review remediation loop", () => {
     expect(harness.threads.sent[0]?.threadId).toBe("review-thread-1");
     expect(second.result.outcome).toBe("blocked");
     expect(second.event?.type).toBe("REVIEW_BLOCKED");
+  });
+
+  it("routes non-text BB output through the same single format-correction path", async () => {
+    const harness = makeHarness({ reviewOutputs: [{ unexpected: "shape" }, { unexpected: "again" }] });
+
+    const first = await idle(harness.handler);
+    const second = await idle(harness.handler);
+
+    expect(first.result.outcome).toBe("format_correction_sent");
+    expect(second.result.outcome).toBe("blocked");
+    expect(harness.threads.sent).toHaveLength(1);
   });
 
   it("routes schema-invalid JSON through correction and then durable blocking", async () => {

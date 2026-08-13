@@ -10,6 +10,10 @@ Plugin id: `telegram-agent`
 
 Research basis: [Hanoon Harness Research Review](hanoon-agent-operating-system-research.md)
 
+Capability-routing amendment: [Adaptive Capability Pipeline Specification](adaptive-capability-pipeline.md). The amendment is authoritative for task recipes, capability routing, universal receipts, guard disposition, and model pools.
+
+Implementation status (2026-08-13): the amendment's catalog, profiles/receipts, controller bundles, recipes, model trials, guard gates, read-only inventory, independent kill switches, fake-host acceptance, operator projections, and fail-closed durable promotion reader are implemented. The trusted disposable-live promotion collector is intentionally absent, so live promotion remains incomplete and fresh installations keep every adaptive recipe in shadow. Later-slice sections below remain roadmap material unless another document explicitly marks them implemented.
+
 ## Outcome
 
 Hanoon becomes a BB-native agent operating system: a durable controller that can answer, investigate, coordinate workers, run reviewed delivery pipelines, recover from failures, learn from evidence, execute bounded workflows, and handle rich artifacts without claiming work it cannot prove.
@@ -101,7 +105,7 @@ The controller never writes an authoritative outcome directly. It invokes a capa
 
 ## Power target
 
-Hanoon targets Valor-class breadth through context rollover, durable memory, evaluated provider/model routing, fallback and health circuits, reusable workflow graphs, capability policy, rich artifacts, trace replay, outcome evaluations, and adaptive orchestration.
+Hanoon targets production-operator breadth through context rollover, durable memory, evaluated provider/model routing, fallback and health circuits, reusable workflow graphs, capability policy, rich artifacts, trace replay, outcome evaluations, and adaptive orchestration.
 
 Hanoon is designed to exceed a process-centric harness where its existing architecture is stronger: the owner can operate it remotely from Telegram; BB supplies native provider sessions, interactions, hosts, environments, and worktrees; and the plugin binds autonomous work to transactional effects, resource claims, exact-head review, one-use approvals, deployment receipts, and duplicate-safe delivery. This is a design target, not a measured superiority claim. Power is measured by recoverable completed outcomes, safety, cost per successful outcome, and evidence under a disclosed harness and budget—not by the number of subprocess or prompt-management features copied into the plugin.
 
@@ -113,7 +117,7 @@ Ship one controller instruction path, an enforceable descriptor for every Hanoon
 
 ### Slice 2: proven autonomy
 
-Persist skill receipts, idempotent milestone notices, executable acceptance runs, and duration-aware scorecards. Complete the already-approved agent-experience design without altering merge or production authority.
+Persist universal capability profiles and receipts, idempotent milestone notices, executable acceptance runs, and duration-aware scorecards. Complete the already-approved agent-experience design without altering merge or production authority.
 
 ### Slice 3: trace ledger, cockpit, and evaluation lab
 
@@ -123,23 +127,23 @@ Expand the Slice 1 evaluation baseline with an append-only correlation ledger, b
 
 Add durable context capsules, proactive reset-first controller-generation rollover, task-specific context packs, project-aware recall, progressive-disclosure memory, evaluated lexical/vector fusion with lexical fallback, document references, repository knowledge maps, provenance, and outcome attribution.
 
-### Slice 5: provider resilience and adaptive routing
+### Slice 5: provider resilience and model evaluation
 
-Discover live BB providers and models, establish the most-capable eligible baseline, route by declared role requirements only after shadow evaluation, record immutable execution choices, add health circuits and controlled recovery, enforce concurrency/spend budgets, fingerprint repeated failures, and adapt orchestration intensity from durable task-type outcomes.
+Discover live BB providers and models, establish the most-capable eligible baseline, evaluate the amendment's explicit model pools, record immutable execution choices, add health circuits and controlled recovery, enforce concurrency/spend budgets, and fingerprint repeated failures.
 
-### Slice 6: durable workflow recipes and maintenance
+### Slice 6: general-purpose workflows and maintenance
 
-Add validated deterministic workflow recipes with dependencies, artifacts, gates, fenced nondeterministic effects, fan-out/join, approval signals, checkpoints, and history rollover. Add a leased maintenance registry with schedules, cost caps, run history, deduplication, and quiet notification policy. The existing delivery pipeline remains unchanged until recipe equivalence is proved.
+Generalize the amendment's promoted delivery recipes into non-delivery workflows with dependencies, artifacts, gates, fenced nondeterministic effects, fan-out/join, approval signals, checkpoints, and history rollover. Add a leased maintenance registry with schedules, cost caps, run history, deduplication, and quiet notification policy.
 
 ### Slice 7: artifact and capability fabric
 
-Add bounded Telegram voice, audio, document, URL, reply-chain, and outbound artifact support. Generalize the Slice 1 capability descriptors into a discoverable registry for every tool, skill, connector, and recipe, including schema, risk, data class, idempotency, credential scope, egress, host reach, cost class, and receipt type.
+Add bounded Telegram voice, audio, document, URL, reply-chain, and outbound artifact support. Admit external connectors through the capability registry and adapter contract after internal routing has promoted successfully.
 
-Each slice produces working software and an independently reviewable release. Slices execute in order because later decisions depend on the trust, evidence, and telemetry laid down earlier.
+Each slice produces working software and an independently reviewable release. Slices execute in order because later decisions depend on the trust, evidence, and telemetry laid down earlier. The capability-routing amendment uses its own per-recipe rollout once its named trust and evidence prerequisites exist.
 
 ## Research-adjusted execution strategy
 
-The external research and Valor audit select a thin-kernel sequence:
+The external research and local harness audit select a thin-kernel sequence:
 
 1. **Trust and measure.** Slice 1 makes every Hanoon capability explicit, gates side effects before execution, validates the only owner-visible final action, and records a before/after outcome baseline.
 2. **Prove existing autonomy.** Slice 2 turns the current skill, milestone, acceptance, and scorecard contracts into durable evidence.
@@ -149,7 +153,7 @@ The external research and Valor audit select a thin-kernel sequence:
 6. **Generalize deterministic execution.** Slice 6 moves predictable transitions into recipes while keeping provider and external calls as fenced effects.
 7. **Expand the surface.** Slice 7 adds artifacts and connectors only through the capability, approval, credential, evidence, and evaluation contracts established earlier.
 
-The roadmap borrows Valor's schema-first exits, context fidelity modes, bounded recovery, hybrid-retrieval hypothesis, telemetry, and budgets. It deliberately does not copy Valor's bridge/Redis/worker/process topology, fail-open completion cases, regex or prefixless answer delivery, raw unknown telemetry payloads, or active-checkout prompt experiments.
+The roadmap keeps schema-first exits, context fidelity modes, bounded recovery, hybrid-retrieval evaluation, telemetry, and budgets. It deliberately does not add a second bridge, Redis queue, worker fleet, or process harness; fail-open completion cases; regex or prefixless answer delivery; raw unknown telemetry payloads; or active-checkout prompt experiments.
 
 ## Common data and module boundaries
 
@@ -578,8 +582,8 @@ The following decisions are fixed by this umbrella design; their detailed schema
 
 ### Slice 2 fixed contracts
 
-- `skill_receipts` are append-only per attempt, skill id, and bundle digest.
-- Mandatory guards need terminal receipts before their stage advances.
+- Universal capability profiles and receipts follow the [Adaptive Capability Pipeline Specification](adaptive-capability-pipeline.md); `skill_receipts` is a read-only compatibility projection.
+- Mandatory capabilities need terminal receipts before their stage advances.
 - Milestone notices reuse the durable outbox and are keyed by entity id plus version.
 - `acceptance_runs` persist a bounded checklist and proof references; typed assertions cannot mark a step passed.
 - Scorecards expose denominators and time windows, plus median stage durations from durable timestamps.
@@ -613,17 +617,17 @@ The following decisions are fixed by this umbrella design; their detailed schema
 ### Slice 5 fixed contracts
 
 - Provider/model inventory comes from `bb.sdk.providers.list` and `bb.sdk.providers.models`, not a committed static catalog.
-- Each role declares required capabilities, acceptable latency/cost classes, and fallback order.
+- Each execution class declares required capabilities and acceptable latency/cost classes; model escalation follows the amendment's explicit pool order.
 - Every attempt records the selected provider, model, reasoning, service tier, permission mode, and selection reason before spawn.
 - An attempt never switches provider or model in place.
 - The most-capable eligible model establishes each task-class baseline; smaller models, reduced reasoning, lower context fidelity, or shorter retry budgets begin in shadow mode and control dispatch only after meeting explicit outcome and safety thresholds.
 - Circuit state, throttles, and recovery flags are durable and provider/host scoped.
 - Recovery admits work gradually and never duplicates a job/effect.
-- Adaptive task maturity may alter context fidelity, reasoning, model class, reviewer count, and retry budget; it may not weaken approval, review, validation, merge, deployment, security, or evidence gates.
+- Pre-attempt routing may increase context fidelity, reasoning, model class, reviewer count, and retry budget; it may not weaken approval, review, validation, merge, deployment, security, or evidence gates.
 
 ### Slice 6 fixed contracts
 
-- A recipe is a versioned validated graph of steps, dependencies, artifacts, gates, effects, and optional compensations.
+- A general-purpose workflow is a versioned validated graph of steps, dependencies, artifacts, gates, effects, and optional compensations.
 - Recipe transition logic is deterministic. Provider calls, shell work, connectors, and external mutations execute only as fenced effects with durable typed results.
 - Only the fenced executor advances runs, consumes approval decisions, and leases effects.
 - Fan-out joins only after every required child has a durable terminal result.
@@ -640,7 +644,7 @@ The following decisions are fixed by this umbrella design; their detailed schema
 - Images preserve the existing 10 MiB bound. Each new non-image artifact type receives an explicit product bound in its slice design and obeys any stricter BB or Telegram limit.
 - Extraction and transcription produce bounded derived artifacts with provider, model, timestamp, source hash, and failure state.
 - Unsupported or failed enrichment preserves the original owner message and reports the bounded limitation.
-- The Slice 1 descriptors generalize into a registry for tools, skills, connectors, and recipes; the registry declares schema, effect/risk/data class, reversibility, idempotency, approval requirement, credential scope and audience, egress, host reach, cost class, proof kinds, receipt kind, and result bounds.
+- The capability registry extends to admitted connectors with schema, effect/risk/data class, reversibility, idempotency, approval requirement, credential scope and audience, egress, host reach, cost class, proof kinds, receipt kind, and result bounds.
 - Hanoon-managed connector credentials are least-scope, audience-bound where supported, securely referenced rather than copied into context, and never passed through from one service to another.
 - Connector content is untrusted context and cannot modify capability policy.
 

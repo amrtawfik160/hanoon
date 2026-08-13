@@ -4,9 +4,16 @@ import { describe, expect, it, vi } from "vitest";
 import { BbRunner } from "../src/bb/runner";
 import { parseWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import {
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+} from "../src/capabilities/catalog";
+import { selectCapabilityProfile } from "../src/capabilities/profiles";
+import {
   buildCritiquePacket,
   buildPlanArtifact,
   parseCritiqueResult,
+  parseDocsReport,
+  parseVerificationPlan,
 } from "../src/bb/pipeline-handoffs";
 import { openStore } from "../src/storage/store";
 import { settlePipelineStageOutput } from "../src/services/pipeline-stage-runner";
@@ -80,7 +87,165 @@ function expectCriticPromptContract(prompt: string): void {
   expectForbiddenClause(prompt, /\bedit files?\b/i);
 }
 
+it("persists mandatory docs outcomes before an active docs transition", () => {
+  const { bb } = createFakePluginHost({ pluginId: "pipeline-active-docs-outcome" });
+  const store = openStore(bb.storage);
+  const db = bb.storage.database();
+  const policy = policyFixture({ production: undefined });
+  const draft = store.createJob({ id: "job_active_docs", sourceUpdateId: 77, requestText: "document behavior", now: 1_000 });
+  db.prepare(
+    `UPDATE jobs SET state = 'documenting', project_id = ?, policy_version = 1, policy_json = ?,
+       environment_id = 'env_docs', implementation_thread_id = 'thr_impl', documentation_thread_id = 'thr_docs',
+       pr_number = 42, pr_url = 'https://github.com/acme/cyndra/pull/42', pr_head_sha = ?,
+       routing_mode = 'active', task_recipe = 'bounded', task_traits_json = '[]',
+       task_reason_codes_json = '[]', version = 2 WHERE id = ?`,
+  ).run(policy.projectId, JSON.stringify(policy), "a".repeat(40), draft.id);
+  const lease = store.acquireExecutorLease("docs-executor", 1_001, 30_000);
+  if (!lease.acquired) throw new Error("executor lease missing");
+  const fence = { ownerId: "docs-executor", generation: lease.generation };
+  let attempt = store.createPipelineStageAttempt({
+    id: "stage:job_active_docs:2:spawn_docs",
+    jobId: draft.id,
+    role: "DOCS",
+    ordinal: 1,
+    inputSha256: "b".repeat(64),
+    ...fence,
+    now: 1_002,
+  });
+  expect(store.bindPipelineStageThread({
+    id: attempt.id,
+    threadId: "thr_docs",
+    environmentId: "env_docs",
+    ...fence,
+    now: 1_003,
+  })).toBe(true);
+  attempt = store.getPipelineStageAttempt(attempt.id)!;
+  const selected = selectCapabilityProfile({
+    role: "documentation",
+    recipe: "bounded",
+    stage: "documentation",
+    traits: ["docs-changed", "strict-json"],
+  });
+  const profile = store.createCapabilityProfile({
+    subjectKind: "worker_attempt",
+    subjectId: attempt.id,
+    threadId: null,
+    recipeId: "bounded",
+    recipeVersion: 1,
+    registryDigest: CAPABILITY_REGISTRY_DIGEST,
+    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    mode: "active",
+    model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+    assignments: selected.assignments.map((assignment) => ({
+      capabilityId: assignment.capabilityId,
+      descriptorDigest: assignment.descriptorDigest,
+      capabilityKind: "skill",
+      mandatory: assignment.mandatory,
+    })),
+    reasonCodes: [],
+    traits: ["docs-changed", "strict-json"],
+    now: 1_003,
+  });
+  const job = store.getJob(draft.id);
+  if (!job) throw new Error("docs job missing");
+  const output = JSON.stringify({
+    disposition: "changed",
+    files: ["docs/usage.md"],
+    checks: ["markdown check exited 0"],
+    summary: "Documented the behavior.",
+  });
+
+  expect(settlePipelineStageOutput({
+    store,
+    job,
+    attempt,
+    output,
+    docsObservation: {
+      clean: false,
+      diff: "diff --git a/docs/usage.md b/docs/usage.md\n+++ b/docs/usage.md",
+    },
+    fence,
+    now: 1_004,
+  })).toEqual({ outcome: "advanced", nextState: "resolving_docs_head" });
+  expect(store.listSkillReceiptProjection(profile.id, 10)).toEqual(expect.arrayContaining([
+    expect.objectContaining({ capabilityId: "docs-guard", outcome: "passed" }),
+    expect.objectContaining({ capabilityId: "verification-before-completion", outcome: "passed" }),
+  ]));
+});
+
 describe("pipeline handoffs", () => {
+  it("accepts only the exact owner-authored verification commands with exit-zero expectations", () => {
+    const policy = policyFixture({
+      validationCommands: [
+        { name: "unit", command: "npm test", timeoutMs: 600_000 },
+        { name: "types", command: "npm run typecheck", timeoutMs: 600_000 },
+      ],
+    });
+    const plan = [
+      "# Plan",
+      "",
+      "Implement the bounded change.",
+      "",
+      "## Verification",
+      "| Check | Command | Expected |",
+      "| --- | --- | --- |",
+      "| unit | `npm test` | exit code 0 |",
+      "| types | `npm run typecheck` | exit code 0 |",
+    ].join("\n");
+
+    expect(parseVerificationPlan(plan, policy)).toEqual({
+      disposition: "commands",
+      checks: [
+        { name: "unit", command: "npm test", expectedExitCode: 0 },
+        { name: "types", command: "npm run typecheck", expectedExitCode: 0 },
+      ],
+    });
+    expect(() => parseVerificationPlan(plan.replace("npm test", "npm test -- --update"), policy)).toThrow(/exact/i);
+    expect(() => parseVerificationPlan(plan.replace("exit code 0", "looks good"), policy)).toThrow(/exit code 0/i);
+    expect(() => parseVerificationPlan(plan.replace("| types | `npm run typecheck` | exit code 0 |", ""), policy)).toThrow(/exact/i);
+  });
+
+  it("requires an explicit skip when project policy has no validation commands", () => {
+    const policy = policyFixture({ validationCommands: [] });
+    expect(parseVerificationPlan([
+      "# Plan",
+      "",
+      "## Verification",
+      "Automated verification: skipped (project policy has no validation commands).",
+    ].join("\n"), policy)).toEqual({ disposition: "skipped", checks: [] });
+    expect(() => parseVerificationPlan("# Plan\n\nNo tests needed.\n", policy)).toThrow(/explicit/i);
+  });
+
+  it("binds docs reports to observed worktree evidence", () => {
+    expect(parseDocsReport(JSON.stringify({
+      disposition: "changed",
+      files: ["README.md"],
+      checks: ["npm test (exit code 0)"],
+      summary: "Documented the new behavior.",
+    }), {
+      clean: false,
+      diff: "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n+new docs\n",
+    })).toMatchObject({ disposition: "changed", files: ["README.md"] });
+    expect(parseDocsReport(JSON.stringify({
+      disposition: "skipped",
+      files: [],
+      checks: [],
+      reason: "The public behavior and operator workflow are unchanged.",
+    }), { clean: true, diff: "" })).toMatchObject({ disposition: "skipped" });
+    expect(() => parseDocsReport(JSON.stringify({
+      disposition: "skipped",
+      files: [],
+      checks: [],
+      reason: "No docs needed.",
+    }), { clean: false, diff: "diff --git a/README.md b/README.md\n" })).toThrow(/clean/i);
+    expect(() => parseDocsReport(JSON.stringify({
+      disposition: "changed",
+      files: ["README.md"],
+      checks: ["docs check (exit code 0)"],
+      summary: "Updated docs.",
+    }), { clean: false, diff: "diff --git a/docs/other.md b/docs/other.md\n" })).toThrow(/listed/i);
+  });
+
   it("turns bounded planner output into a hashed plan attachment and validates strict critique JSON", () => {
     const plan = buildPlanArtifact("# Plan\n\n1. Add the regression.\n");
     const critique = buildCritiquePacket(plannedJob, plan);
@@ -103,6 +268,10 @@ describe("pipeline handoffs", () => {
         merge: false,
         inspectPlannerConversation: false,
       },
+      blockingCriteria: [
+        expect.stringMatching(/missing the required outcome/i),
+        expect.stringMatching(/commit\/push\/pull-request/i),
+      ],
       outputContract: { format: "strict-json" },
     });
     expect(Object.keys(critiquePacket.outputContract.schema)).toEqual(["verdict", "summary"]);
@@ -251,8 +420,11 @@ describe("fresh planner, critic, and builder conversations", () => {
     if (!docsPacketUpload) throw new Error("docs packet upload missing");
     const docsPacket = JSON.parse(new TextDecoder().decode(docsPacketUpload.clientFile)) as {
       requiredSkills: string[];
+      rules: { commitAndPushChanges: boolean };
     };
     expect(docsPacket.requiredSkills).toEqual(["docs-guard", "verification-before-completion"]);
+    expect(docsPacket.rules.commitAndPushChanges).toBe(false);
+    expect((spawns[0].input as Array<{ type: string; text?: string }>)[0].text).toMatch(/do not commit, push/i);
     expect(parseWorkerThreadTitle(String(spawns[0].title))).toEqual({
       jobId: "job_1",
       attemptId: "stage:job_1:1:spawn_docs",
@@ -362,10 +534,23 @@ describe("fresh planner, critic, and builder conversations", () => {
       store,
       job,
       attempt,
-      output: "# Plan\n\n1. Add a regression test.\n",
+      output: [
+        "# Plan",
+        "",
+        "1. Add a regression test.",
+        "",
+        "## Verification",
+        "| Check | Command | Expected |",
+        "| --- | --- | --- |",
+        "| unit | `npm test` | exit code 0 |",
+      ].join("\n"),
       fence,
       now: 1_006,
     })).toEqual({ outcome: "advanced", nextState: "critiquing" });
+    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")?.outcome).toMatchObject({
+      verdict: "success",
+      verification: { disposition: "commands" },
+    });
 
     job = store.getJob(job.id)!;
     let critique = store.createPipelineStageAttempt({
@@ -439,10 +624,89 @@ describe("fresh planner, critic, and builder conversations", () => {
       store,
       job,
       attempt: docs,
-      output: "# Docs gate\n\nREADME remains accurate; docs checks passed.\n",
+      output: JSON.stringify({
+        disposition: "skipped",
+        files: [],
+        checks: [],
+        reason: "The public behavior and operator workflow are unchanged.",
+      }),
+      docsObservation: { clean: true, diff: "" },
       fence,
       now: 1_018,
     })).toEqual({ outcome: "advanced", nextState: "resolving_docs_head" });
+    expect(store.getLatestPipelineStageAttempt(job.id, "DOCS")?.outcome).toMatchObject({
+      verdict: "success",
+      documentation: { disposition: "skipped" },
+    });
     expect(store.getJob(job.id)).toMatchObject({ state: "resolving_docs_head", prHeadSha: null });
+  });
+
+  it("treats invalid critique JSON as a revision instead of killing the job", () => {
+    const { bb } = createFakePluginHost({ pluginId: "telegram-agent-pipeline-invalid-critique" });
+    const store = openStore(bb.storage);
+    const draft = store.createJob({ id: "job_bad_critique", sourceUpdateId: 2, requestText: "work", now: 1_000 });
+    store.applyJobEvent(draft.id, draft.version, {
+      type: "PROJECT_SELECTED",
+      projectId: "proj_1",
+      policyVersion: 1,
+      policy: policyFixture(),
+    }, 1_001);
+    let job = admitConfirmedJob(store, store.getJob(draft.id)!, 1_002);
+    const lease = store.acquireExecutorLease("executor", 1_003, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const fence = { ownerId: "executor", generation: lease.generation };
+    store.createPipelineStageAttempt({
+      id: "stage_plan_bad",
+      jobId: job.id,
+      role: "PLAN",
+      ordinal: 1,
+      inputSha256: "a".repeat(64),
+      ...fence,
+      now: 1_004,
+    });
+    store.bindPipelineStageThread({
+      id: "stage_plan_bad",
+      threadId: "thr_plan",
+      environmentId: "env_plan",
+      ...fence,
+      now: 1_005,
+    });
+    job = store.applyJobEvent(job.id, job.version, {
+      type: "PLAN_CREATED",
+      attemptId: "stage_plan_bad",
+      threadId: "thr_plan",
+      environmentId: "env_plan",
+    }, 1_005);
+    job = store.applyJobEvent(job.id, job.version, { type: "PLAN_READY", attemptId: "stage_plan_bad" }, 1_006);
+    const critique = store.createPipelineStageAttempt({
+      id: "stage_critique_bad",
+      jobId: job.id,
+      role: "CRITIQUE",
+      ordinal: 1,
+      inputSha256: "b".repeat(64),
+      ...fence,
+      now: 1_007,
+    });
+    store.bindPipelineStageThread({
+      id: critique.id,
+      threadId: "thr_critique",
+      environmentId: "env_plan",
+      ...fence,
+      now: 1_008,
+    });
+
+    expect(settlePipelineStageOutput({
+      store,
+      job,
+      attempt: store.getPipelineStageAttempt(critique.id)!,
+      output: "```json\n{not valid}\n```",
+      fence,
+      now: 1_009,
+    })).toEqual({ outcome: "advanced", nextState: "planning" });
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "planning",
+      planCycle: 1,
+      lastError: null,
+    });
   });
 });

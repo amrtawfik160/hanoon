@@ -258,6 +258,12 @@ export class TerminalCommandRunner {
       output = appendBounded(output, outputResult.value.output);
       const commandResult = parseCommandResult(output, resultMarker);
       if (commandResult) {
+        onObservation?.({
+          id: terminalId,
+          status: "exited",
+          updatedAt: Date.now(),
+          exitCode: commandResult.exitCode,
+        });
         closeOnce();
         return { outcome: "exited", ...commandResult };
       }

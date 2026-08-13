@@ -1,19 +1,45 @@
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
+import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import plugin from "../server";
+import { projectResourceKey } from "../src/autonomy/models";
 import { hashSecret } from "../src/crypto";
 import { ApprovalService } from "../src/services/approval-service";
+import {
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+} from "../src/capabilities/catalog";
+import { selectCapabilityProfile } from "../src/capabilities/profiles";
 import { openStore } from "../src/storage/store";
 import { policyFixture, sha } from "./helpers";
 
 let pluginNumber = 0;
 
+function recordingSdkSubscribe() {
+  const listeners = new Map<string, Array<(event: { id?: string; changes: readonly string[] }) => void>>();
+  return {
+    subscribe(args: { event: string; callback: (event: never) => void }) {
+      const existing = listeners.get(args.event) ?? [];
+      existing.push(args.callback as (event: { id?: string; changes: readonly string[] }) => void);
+      listeners.set(args.event, existing);
+      return () => {
+        listeners.set(args.event, (listeners.get(args.event) ?? []).filter((listener) => listener !== args.callback));
+      };
+    },
+    emit(event: string, payload: { id?: string; changes: readonly string[] }) {
+      for (const listener of listeners.get(event) ?? []) listener(payload);
+    },
+  };
+}
+
 async function loadPlugin() {
+  const realtime = recordingSdkSubscribe();
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-agent-task10-plugin-${pluginNumber++}`,
+    sdk: { subscribe: realtime.subscribe },
   });
   await plugin(bb);
-  return { bb, harness };
+  return { bb, harness, realtime };
 }
 
 it("requests the secret bot token when configuration is absent", async () => {
@@ -41,6 +67,34 @@ it("registers configurable controller execution settings with safe defaults", as
         "gpt-5.6-sol",
       ],
       default: "claude-opus-5[1m]",
+    },
+    controllerFallbackModel1: {
+      type: "select",
+      options: [
+        "disabled",
+        "claude-opus-5[1m]",
+        "claude-opus-4-8[1m]",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+      ],
+      default: "gpt-5.6-sol",
+    },
+    controllerFallbackModel2: {
+      type: "select",
+      options: [
+        "disabled",
+        "claude-opus-5[1m]",
+        "claude-opus-4-8[1m]",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+      ],
+      default: "disabled",
     },
     controllerReasoningLevel: {
       type: "select",
@@ -120,6 +174,24 @@ it("applies a changed concurrency cap to later admissions", async () => {
   }
 });
 
+it("re-arms a completed worker reconcile from a live BB thread change", async () => {
+  const { bb, realtime } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const job = store.createJob({ id: "abcdefghijklmnopqrstuv", sourceUpdateId: 4, requestText: "work", now: 1_000 });
+  bb.storage.database().prepare(
+    "UPDATE jobs SET state = 'implementing', implementation_thread_id = ?, environment_id = ?, version = ?, updated_at = ? WHERE id = ?",
+  ).run("thr_live", "env_live", job.version + 1, 1_001, job.id);
+  expect(store.enqueueReconcileForThread("thr_live", 2_000)).toBe(true);
+  bb.storage.database().prepare("UPDATE effects SET status = 'done' WHERE idempotency_key = ?")
+    .run("reconcile:abcdefghijklmnopqrstuv:thr_live");
+
+  realtime.emit("thread:changed", { id: "thr_live", changes: ["events-appended"] });
+
+  expect(store.getEffect(job.id, "reconcile:abcdefghijklmnopqrstuv:thr_live")).toMatchObject({
+    status: "pending",
+  });
+});
+
 it("registers both background services and all enqueue-only thread lifecycle handlers", async () => {
   const { bb, harness } = await loadPlugin();
   const serviceNames = harness.registrations.services.map((service) => service.name);
@@ -149,6 +221,69 @@ it("registers both background services and all enqueue-only thread lifecycle han
     lastAssistantText: null,
   })).errors).toEqual([]);
   expect(store.listEffectsForJob(job.id).map((effect) => effect.kind)).toEqual(["reconcile_job"]);
+});
+
+it("runs read-only capability discovery at startup and registers its bounded refresh service", async () => {
+  const providersList = vi.fn(async () => [{
+    id: "codex",
+    displayName: "Codex",
+    available: true,
+    capabilities: { supportsServiceTier: true },
+  }]);
+  const providerModels = vi.fn(async () => ({
+    providers: [],
+    permissionCeiling: "full",
+    models: [{
+      id: "gpt-5.6-sol",
+      model: "gpt-5.6-sol",
+      displayName: "Sol",
+      routeProviderId: "codex",
+      defaultReasoningEffort: "high",
+      supportedReasoningEfforts: [],
+      description: "",
+      isDefault: false,
+    }],
+    selectedOnlyModels: [],
+    modelLoadError: null,
+  }));
+  const pluginsList = vi.fn(async () => ({ plugins: [{
+    id: "docs-plugin",
+    version: "1.0.0",
+    enabled: true,
+    status: "running",
+  }] }));
+  const skillsList = vi.fn(async () => ({ skills: [{
+    id: "docs-guard",
+    name: "Docs Guard",
+    provider: "codex",
+    scope: "plugin",
+    pluginId: "docs-plugin",
+    manageable: false,
+  }] }));
+  const realtime = recordingSdkSubscribe();
+  const { bb, harness } = createFakePluginHost({
+    pluginId: `telegram-agent-inventory-${pluginNumber++}`,
+    sdk: {
+      providers: { list: providersList as never, models: providerModels as never },
+      plugins: { list: pluginsList as never },
+      skills: { list: skillsList as never },
+      subscribe: realtime.subscribe,
+    },
+  });
+  openStore(bb.storage).upsertProjectPolicy(policyFixture({ production: undefined }), 1_000);
+
+  await plugin(bb);
+
+  expect(providersList).toHaveBeenCalledOnce();
+  expect(providerModels).toHaveBeenCalledOnce();
+  expect(pluginsList).toHaveBeenCalledOnce();
+  expect(skillsList).toHaveBeenCalledWith({
+    projectId: "proj_1",
+    environmentId: null,
+    signal: expect.any(AbortSignal),
+  });
+  expect(openStore(bb.storage).listExternalCapabilityInventory("project:proj_1", 20).length).toBe(4);
+  expect(harness.registrations.services.map((service) => service.name)).toContain("capability-inventory");
 });
 
 it("wires submitted controller turns through the leased job executor", async () => {
@@ -251,7 +386,7 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
     await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
       status: "sent",
       messageId: null,
-      payload: { text: "Connecting to Luna Max…" },
+      payload: { text: "Connecting…" },
     }));
   } finally {
     run.controller.abort();
@@ -278,6 +413,328 @@ it("reconciles an authoritative implementation idle observation into the job sta
   expect(store.getJob(job.id)?.state).not.toBe("implementing");
   run.controller.abort();
   await run.done;
+});
+
+it.each([
+  ["with observed test and command evidence", true],
+  ["without observed test evidence", false],
+] as const)("gates active implementation completion %s", async (_label, completeEvidence) => {
+  const { bb, harness } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const db = bb.storage.database();
+  const now = Date.now();
+  const policy = policyFixture({ production: undefined });
+  const job = store.createJob({
+    id: completeEvidence ? "activeproofpassjobabcde" : "activeprooffailjobabcde",
+    sourceUpdateId: completeEvidence ? 31 : 32,
+    requestText: "change the feature and its regression test",
+    now,
+  });
+  db.prepare(
+    `UPDATE jobs SET state = 'implementing', project_id = ?, policy_version = 1, policy_json = ?,
+       environment_id = 'env_active', implementation_thread_id = 'thr_active_impl',
+       routing_mode = 'active', task_recipe = 'bounded', task_traits_json = ?,
+       task_reason_codes_json = '[]', version = 2, updated_at = ? WHERE id = ?`,
+  ).run(
+    policy.projectId,
+    JSON.stringify(policy),
+    JSON.stringify([{ id: "existing-flow", provenance: ["owner"] }]),
+    now,
+    job.id,
+  );
+  const attemptId = `attempt:${job.id}:2:spawn_implementation`;
+  store.createAttempt({ id: attemptId, jobId: job.id, kind: "implementation", ordinal: 1, now });
+  store.updateAttempt(attemptId, {
+    threadId: "thr_active_impl",
+    handoffPath: "/bounded/work-order.md",
+    handoffSha256: "a".repeat(64),
+  });
+  const selected = selectCapabilityProfile({
+    role: "implementation",
+    recipe: "bounded",
+    stage: "implementation",
+    traits: ["behavioral-change"],
+  });
+  const profile = store.createCapabilityProfile({
+    subjectKind: "worker_attempt",
+    subjectId: attemptId,
+    threadId: null,
+    recipeId: "bounded",
+    recipeVersion: 1,
+    registryDigest: CAPABILITY_REGISTRY_DIGEST,
+    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    mode: "active",
+    model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+    assignments: selected.assignments.map((assignment) => ({
+      capabilityId: assignment.capabilityId,
+      descriptorDigest: assignment.descriptorDigest,
+      capabilityKind: "skill",
+      mandatory: assignment.mandatory,
+    })),
+    reasonCodes: [],
+    traits: ["behavioral-change"],
+    now,
+  });
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({
+    id: "thr_active_impl",
+    projectId: policy.projectId,
+    status: "idle",
+    updatedAt: now + 1,
+  }));
+  harness.sdk.stub("environments.status", async () => ({
+    outcome: "available",
+    available: true,
+    workingTree: { state: "dirty", hasUncommittedChanges: true },
+    checkout: { kind: "branch", branchName: "feature/active", headSha: sha() },
+  }));
+  harness.sdk.stub("environments.diff", async () => ({
+    outcome: "available",
+    diff: {
+      diff: completeEvidence
+        ? "diff --git a/src/feature.ts b/src/feature.ts\n+++ b/src/feature.ts\ndiff --git a/tests/feature.test.ts b/tests/feature.test.ts\n+++ b/tests/feature.test.ts"
+        : "diff --git a/src/feature.ts b/src/feature.ts\n+++ b/src/feature.ts",
+      truncated: false,
+    },
+  }));
+  const terminalOutput = new Map<string, string>();
+  harness.sdk.stub("terminals.create", async ({ start }: { start: { command: string } }) => {
+    const id = "terminal_active_validation";
+    const marker = start.command.match(/__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/)?.[0];
+    if (!marker) throw new Error("terminal marker missing");
+    terminalOutput.set(id, `tests passed\n${marker}:0\n`);
+    return { id };
+  });
+  harness.sdk.stub("terminals.get", async () => ({ status: "running", exitCode: null }));
+  harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => ({
+    chunks: [{ seq: 0, dataBase64: Buffer.from(terminalOutput.get(terminalId) ?? "").toString("base64") }],
+  }));
+  harness.sdk.stub("terminals.close", async () => undefined);
+  expect(store.enqueueReconcileForThread("thr_active_impl", now + 2)).toBe(true);
+
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => {
+      const current = store.getJob(job.id);
+      expect(current?.state).not.toBe("implementing");
+    });
+    expect(store.listSkillReceiptProjection(profile.id, 10)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        capabilityId: "test-driven-development",
+        outcome: completeEvidence ? "passed" : "blocked",
+      }),
+      expect.objectContaining({ capabilityId: "verification-before-completion", outcome: "passed" }),
+    ]));
+    if (completeEvidence) {
+      expect(store.listEffectsForJob(job.id).some((effect) => effect.kind === "inspect_implementation")).toBe(true);
+    } else {
+      expect(store.getJob(job.id)).toMatchObject({
+        state: "failed",
+        lastError: "Mandatory capability evidence is incomplete",
+      });
+      expect(store.listEffectsForJob(job.id).some((effect) => effect.kind === "inspect_implementation")).toBe(false);
+    }
+  } finally {
+    run.controller.abort();
+    await run.done;
+  }
+});
+
+it("waits for both full-job reviewer threads before advancing", async () => {
+  const { bb, harness } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const db = bb.storage.database();
+  const now = Date.now();
+  const headSha = sha();
+  const policy = policyFixture({ production: undefined });
+  store.upsertProjectPolicy(policy, now);
+  const job = store.createJob({ id: "reviewlensjobabcdefghijk", sourceUpdateId: 20, requestText: "review this", now });
+  db.prepare(
+    `UPDATE jobs SET state = 'reviewing', project_id = ?, policy_version = 1, policy_json = ?,
+       environment_id = 'env_review', implementation_thread_id = 'thr_impl', review_thread_id = 'thr_quality',
+       pr_number = 17, pr_url = 'https://github.com/acme/cyndra/pull/17', pr_head_sha = ?,
+       delivery_mode = 'full', routing_mode = 'shadow', task_recipe = 'bounded',
+       task_traits_json = '[]', task_reason_codes_json = '[]', version = 2, updated_at = ? WHERE id = ?`,
+  ).run(policy.projectId, JSON.stringify(policy), headSha, now, job.id);
+  db.prepare(
+    `INSERT INTO job_admissions (
+       job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
+     ) VALUES (?, ?, 1, 'admitted', 'CONFIRMED', ?, ?)`,
+  ).run(job.id, policy.projectId, now, now);
+  db.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+     ) VALUES (?, ?, 'project', 'held', 'fixture-executor', 1, ?, ?, ?, NULL, NULL)`,
+  ).run(job.id, projectResourceKey(policy.projectId), now + 60_000, now, now);
+  const quality = store.createAttempt({
+    id: "attempt_review_quality",
+    jobId: job.id,
+    kind: "review",
+    ordinal: 1,
+    headSha,
+    now,
+  });
+  store.updateAttempt(quality.id, { threadId: "thr_quality" });
+  db.prepare("UPDATE attempts SET review_stage = 'review', review_lens = 'quality' WHERE id = ?").run(quality.id);
+  db.prepare(
+    `INSERT INTO attempts (
+       id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha, created_at
+     ) VALUES ('attempt_review_risk', ?, 'review', 'risk', 'review', 1, 'thr_risk', ?, ?)`,
+  ).run(job.id, headSha, now);
+  expect(store.enqueueReconcileForThread("thr_risk", now + 1)).toBe(true);
+  expect(store.shouldWakeForThread("thr_risk")).toBe(true);
+
+  harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({
+    id: threadId,
+    projectId: policy.projectId,
+    parentThreadId: "thr_impl",
+    status: "idle",
+    updatedAt: now + 2,
+  }));
+  harness.sdk.stub("threads.output", async () => ({
+    output: JSON.stringify({
+      verdict: "pass",
+      reviewedHeadSha: headSha,
+      summary: "No actionable findings.",
+      findings: [],
+      checks: [],
+    }),
+  }));
+  harness.sdk.stub("environments.status", async () => ({
+    available: true,
+    clean: true,
+    workingTree: { state: "clean", hasUncommittedChanges: false },
+    checkout: { kind: "branch", branchName: "feature/review", headSha },
+  }));
+
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(store.getJob(job.id)?.state).not.toBe("reviewing"));
+    expect(store.listReviewAttempts(job.id, "review", 1)).toMatchObject([
+      { reviewLens: "quality", completedAt: expect.any(Number) },
+      { reviewLens: "risk", completedAt: expect.any(Number) },
+    ]);
+  } finally {
+    run.controller.abort();
+    await run.done;
+  }
+});
+
+it("persists every selected active guard outcome before advancing the review group", async () => {
+  const { bb, harness } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const db = bb.storage.database();
+  const now = Date.now();
+  const headSha = sha();
+  const diff = "diff --git a/src/feature.ts b/src/feature.ts\n+++ b/src/feature.ts";
+  const policy = policyFixture({ production: undefined, requiredChecks: [] });
+  store.upsertProjectPolicy(policy, now);
+  const job = store.createJob({ id: "activeguardreviewjobabc", sourceUpdateId: 41, requestText: "review this", now });
+  db.prepare(
+    `UPDATE jobs SET state = 'reviewing', project_id = ?, policy_version = 1, policy_json = ?,
+       environment_id = 'env_guard_review', implementation_thread_id = 'thr_impl', review_thread_id = 'thr_guard_quality',
+       pr_number = 19, pr_url = 'https://github.com/acme/cyndra/pull/19', pr_head_sha = ?,
+       delivery_mode = 'small_fix', routing_mode = 'active', task_recipe = 'bounded',
+       task_traits_json = '[]', task_reason_codes_json = '[]', version = 2, updated_at = ? WHERE id = ?`,
+  ).run(policy.projectId, JSON.stringify(policy), headSha, now, job.id);
+  db.prepare(
+    `INSERT INTO job_admissions (
+       job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
+     ) VALUES (?, ?, 1, 'admitted', 'CONFIRMED', ?, ?)`,
+  ).run(job.id, policy.projectId, now, now);
+  db.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+     ) VALUES (?, ?, 'project', 'held', 'fixture-executor', 1, ?, ?, ?, NULL, NULL)`,
+  ).run(job.id, projectResourceKey(policy.projectId), now + 60_000, now, now);
+  const attempt = store.createAttempt({
+    id: "attempt_active_guard_quality",
+    jobId: job.id,
+    kind: "review",
+    ordinal: 1,
+    headSha,
+    now,
+  });
+  store.updateAttempt(attempt.id, { threadId: "thr_guard_quality" });
+  db.prepare("UPDATE attempts SET review_stage = 'review', review_lens = 'quality' WHERE id = ?").run(attempt.id);
+  const selected = selectCapabilityProfile({
+    role: "review",
+    recipe: "bounded",
+    stage: "review",
+    traits: ["strict-json", "quality-lens", "code-changed"],
+  });
+  const profile = store.createCapabilityProfile({
+    subjectKind: "worker_attempt",
+    subjectId: attempt.id,
+    threadId: null,
+    recipeId: "bounded",
+    recipeVersion: 1,
+    registryDigest: CAPABILITY_REGISTRY_DIGEST,
+    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    mode: "active",
+    model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+    assignments: selected.assignments.map((assignment) => ({
+      capabilityId: assignment.capabilityId,
+      descriptorDigest: assignment.descriptorDigest,
+      capabilityKind: "skill",
+      mandatory: assignment.mandatory,
+    })),
+    reasonCodes: [],
+    traits: ["code-changed", "quality-lens", "strict-json"],
+    now,
+  });
+  const guard = profile.assignments[0];
+  if (!guard) throw new Error("guard assignment missing");
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({
+    id: "thr_guard_quality",
+    projectId: policy.projectId,
+    parentThreadId: "thr_impl",
+    status: "idle",
+    updatedAt: now + 1,
+  }));
+  harness.sdk.stub("threads.output", async () => ({
+    output: JSON.stringify({
+      schemaVersion: 1,
+      profileId: profile.id,
+      profileRevision: profile.revision,
+      reviewedHeadSha: headSha,
+      diffDigest: createHash("sha256").update(diff).digest("hex"),
+      guards: [{
+        capabilityId: guard.capabilityId,
+        descriptorDigest: guard.descriptorDigest,
+        outcome: "passed",
+        findings: [],
+      }],
+    }),
+  }));
+  harness.sdk.stub("environments.status", async () => ({
+    outcome: "available",
+    available: true,
+    clean: true,
+    workingTree: { state: "clean", hasUncommittedChanges: false },
+    checkout: { kind: "branch", branchName: "feature/guard", headSha },
+  }));
+  harness.sdk.stub("environments.diff", async () => ({
+    outcome: "available",
+    diff: { diff, truncated: false },
+  }));
+  expect(store.enqueueReconcileForThread("thr_guard_quality", now + 2)).toBe(true);
+
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(store.getJob(job.id)?.state).not.toBe("reviewing"));
+    expect(store.listCapabilityReceipts(profile.id, 20)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        capabilityId: guard.capabilityId,
+        eventType: "outcome",
+        outcome: "passed",
+      }),
+    ]));
+  } finally {
+    run.controller.abort();
+    await run.done;
+  }
 });
 
 it("does not execute a merge effect without its held project claim", async () => {

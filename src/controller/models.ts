@@ -2,20 +2,67 @@ import type { SupervisorReason } from "./supervisor";
 
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
-export const CONTROLLER_IMAGE_MIME_TYPES = [
+export type ControllerCapabilityContinuationState = "requested" | "relaunching" | "resolved" | "blocked";
+export const CONTROLLER_STILL_MIME_TYPES = [
   "image/jpeg",
   "image/png",
   "image/webp",
   "image/gif",
 ] as const;
+export const CONTROLLER_MOTION_MIME_TYPES = [
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+] as const;
+export const CONTROLLER_IMAGE_MIME_TYPES = CONTROLLER_STILL_MIME_TYPES;
+export const CONTROLLER_MEDIA_MIME_TYPES = [
+  ...CONTROLLER_STILL_MIME_TYPES,
+  ...CONTROLLER_MOTION_MIME_TYPES,
+] as const;
 export const MAX_CONTROLLER_IMAGE_BYTES = 10 * 1024 * 1024;
-export type ControllerImageMimeType = (typeof CONTROLLER_IMAGE_MIME_TYPES)[number];
+/** Telegram Bot API `getFile` ceiling. Larger clips stay queued and use the preview still. */
+export const MAX_CONTROLLER_VIDEO_BYTES = 20 * 1024 * 1024;
+/** Largest size Telegram may report that we still persist. Download stays at the getFile ceiling. */
+export const MAX_PERSISTED_MEDIA_BYTES = 50 * 1024 * 1024;
+export type ControllerImageMimeType = (typeof CONTROLLER_STILL_MIME_TYPES)[number];
+export type ControllerMotionMimeType = (typeof CONTROLLER_MOTION_MIME_TYPES)[number];
+export type ControllerMediaMimeType = (typeof CONTROLLER_MEDIA_MIME_TYPES)[number];
+export type ControllerMediaKind = "image" | "animation" | "video";
+export type ControllerImageThumbnail = {
+  fileId: string;
+  fileName: string;
+  sizeBytes: number | null;
+};
 export type ControllerImage = {
   fileId: string;
   fileName: string;
-  mimeType: ControllerImageMimeType;
+  mimeType: ControllerMediaMimeType;
   sizeBytes: number | null;
+  kind?: ControllerMediaKind;
+  durationSeconds?: number | null;
+  thumbnail?: ControllerImageThumbnail | null;
 };
+
+export function normalizeControllerImage(image: ControllerImage): Required<ControllerImage> {
+  return {
+    fileId: image.fileId,
+    fileName: image.fileName,
+    mimeType: image.mimeType,
+    sizeBytes: image.sizeBytes,
+    kind: image.kind ?? "image",
+    durationSeconds: image.durationSeconds ?? null,
+    thumbnail: image.thumbnail ?? null,
+  };
+}
+
+export function isMotionMedia(image: Pick<ControllerImage, "kind" | "mimeType">): boolean {
+  return image.kind === "animation" || image.kind === "video" ||
+    (CONTROLLER_MOTION_MIME_TYPES as readonly string[]).includes(image.mimeType);
+}
+
+export function controllerDownloadLimitBytes(image: Pick<ControllerImage, "kind" | "mimeType">): number {
+  return isMotionMedia(image) ? MAX_CONTROLLER_VIDEO_BYTES : MAX_CONTROLLER_IMAGE_BYTES;
+}
 export type ControllerStreamPhase =
   | "queued"
   | "connecting"
@@ -34,6 +81,10 @@ export type ControllerThreadRecord = {
   threadId: string | null;
   state: ControllerThreadState;
   pendingSpawnToken: string | null;
+  /** Logical turn whose immutable profile configured the live provider session. */
+  capabilitySubjectId: string | null;
+  capabilityProfileId: string | null;
+  capabilityProfileRevision: number;
   lastError: string | null;
   createdAt: number;
   updatedAt: number;
@@ -51,6 +102,8 @@ export type ControllerTurnRecord = {
   leaseGeneration: number | null;
   dispatchAfterSeq: number;
   retryCount: number;
+  /** Zero is the primary model; one and two select the ordered fallback slots. */
+  modelFallbackIndex: number;
   bbEventSeq: number;
   streamText: string;
   telegramMessageId: number | null;
@@ -73,6 +126,14 @@ export type ControllerTurnRecord = {
   /** `system` marks a turn the plugin raised itself — a fired monitor or a
    *  delegation join — which must never be read as the owner reacting. */
   origin: "owner" | "system";
+  /** Exact immutable profile revision selected for this logical turn. */
+  capabilityProfileId: string | null;
+  capabilityProfileRevision: number;
+  /** Revision proven at the provider-session boundary. */
+  capabilityConfiguredRevision: number;
+  /** A logical turn may cross at most one capability relaunch boundary. */
+  capabilityContinuationCount: number;
+  capabilityContinuationState: ControllerCapabilityContinuationState | null;
   supervisorSteers: number;
   supervisorReasons: readonly SupervisorReason[];
   createdAt: number;

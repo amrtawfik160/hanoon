@@ -86,24 +86,41 @@ function effectIdempotencyKey(jobId: string, version: number, effectKind: string
 }
 
 describe("worker skill role table", () => {
-  test("contains exactly the seven selected manifest skill ids", () => {
+  test("contains exactly the selected manifest skill ids", () => {
     expect(BUNDLED_SKILL_IDS).toEqual([
+      "brainstorming",
+      "clean-code-guard",
+      "dispatching-parallel-agents",
+      "docs-guard",
+      "domain-modeling",
+      "executing-plans",
+      "finishing-a-development-branch",
+      "grill-with-docs",
+      "grilling",
+      "human-friendly-coding-communication",
+      "pr-writer",
+      "proportional-development-workflow",
+      "receiving-code-review",
+      "requesting-code-review",
+      "subagent-driven-development",
       "systematic-debugging",
       "test-driven-development",
-      "verification-before-completion",
-      "clean-code-guard",
       "test-guard",
-      "docs-guard",
-      "pr-writer",
+      "using-git-worktrees",
+      "using-superpowers",
+      "verification-before-completion",
+      "writing-plans",
+      "writing-skills",
     ]);
   });
 
   test.each([
-    ["planner", []],
-    ["critic", []],
+    ["planner", ["human-friendly-coding-communication"]],
+    ["critic", ["human-friendly-coding-communication"]],
     [
       "implementation",
       [
+        "human-friendly-coding-communication",
         "systematic-debugging",
         "test-driven-development",
         "verification-before-completion",
@@ -112,9 +129,9 @@ describe("worker skill role table", () => {
         "pr-writer",
       ],
     ],
-    ["review", ["clean-code-guard", "test-guard"]],
-    ["documentation", ["docs-guard", "verification-before-completion"]],
-    ["final-review", ["clean-code-guard", "test-guard", "docs-guard"]],
+    ["review", ["human-friendly-coding-communication", "clean-code-guard", "test-guard"]],
+    ["documentation", ["human-friendly-coding-communication", "docs-guard", "verification-before-completion"]],
+    ["final-review", ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "docs-guard"]],
   ] as const)("selects the exact skills for %s", (role, expectedSkills) => {
     const jobId = JOB_ID;
     const attemptId = `attempt:${effectIdempotencyKey(jobId, 7, role === "planner" ? "spawn_plan" : "spawn_implementation")}`;
@@ -136,7 +153,7 @@ describe("worker skill role table", () => {
 
     expect(profile.instructions).toBe(buildWorkerInstructions(profile));
     expect(profile.instructions).toContain("Verified worker role: implementation");
-    expect(profile.instructions).toContain("systematic-debugging, test-driven-development, verification-before-completion, clean-code-guard, test-guard");
+    expect(profile.instructions).toContain("human-friendly-coding-communication, systematic-debugging, test-driven-development, verification-before-completion, clean-code-guard, test-guard");
     expect(profile.instructions).toContain("immutable attached work order/review packet");
     expect(profile.instructions).toContain("durable project policy outrank skill suggestions");
     expect(profile.instructions).toContain("cannot authorize approval, merge, deploy, push, or state changes");
@@ -147,8 +164,8 @@ describe("worker skill role table", () => {
   });
 
   test.each([
-    ["planner", "systematic-debugging", "none"],
-    ["review", "docs-guard", "clean-code-guard, test-guard"],
+    ["planner", "systematic-debugging", "human-friendly-coding-communication"],
+    ["review", "docs-guard", "human-friendly-coding-communication, clean-code-guard, test-guard"],
   ] as const)("ignores forged repeated skill ids for the %s role", (role, forgedSkill, expectedSkills) => {
     const forgedProfile = {
       role,
@@ -161,7 +178,7 @@ describe("worker skill role table", () => {
     expect(instructions).not.toContain(forgedSkill);
   });
 
-  test("says none are selected for an empty profile", () => {
+  test("always selects the communication skill for a planner", () => {
     const identity = durableIdentity({
       attemptId: `stage:${effectIdempotencyKey(JOB_ID, 7, "spawn_plan")}`,
       role: "planner",
@@ -169,8 +186,8 @@ describe("worker skill role table", () => {
     const profile = resolve(context({ title: buildWorkerThreadTitle(identity) }), identity);
     if (!profile) throw new Error("expected a valid planner profile");
 
-    expect(profile.skills).toEqual([]);
-    expect(profile.instructions).toContain("Selected skill ids: none");
+    expect(profile.skills).toEqual(["human-friendly-coding-communication"]);
+    expect(profile.instructions).toContain("Selected skill ids: human-friendly-coding-communication");
   });
 });
 
@@ -262,6 +279,44 @@ describe("fail-closed worker profile resolution", () => {
     const identity = durableIdentity({ jobId: "other-job" });
     const title = buildWorkerThreadTitle({ jobId: JOB_ID, attemptId: ATTEMPT_ID, role: "implementation" });
     expect(resolve(context({ title }), identity)).toBeNull();
+  });
+
+  test("uses only the exact persisted skills when active routing is enabled", () => {
+    const identity = durableIdentity({
+      routingMode: "active",
+      persistedSkillProfile: {
+        profileId: "cap_profile:worker-1",
+        profileRevision: 2,
+        skills: ["test-driven-development", "verification-before-completion"],
+      },
+    });
+
+    const profile = resolve(context(), identity);
+
+    expect(profile?.skills).toEqual([
+      "test-driven-development",
+      "verification-before-completion",
+    ]);
+    expect(profile?.instructions).toContain("Selected skill ids: test-driven-development, verification-before-completion");
+    expect(profile?.instructions).not.toContain("systematic-debugging");
+    expect(profile?.instructions).not.toContain("clean-code-guard");
+  });
+
+  test("fails closed when active routing has no exact persisted profile", () => {
+    expect(resolve(context(), durableIdentity({ routingMode: "active" }))).toBeNull();
+  });
+
+  test("keeps the legacy role table while a persisted profile is shadow-only", () => {
+    const profile = resolve(context(), durableIdentity({
+      routingMode: "shadow",
+      persistedSkillProfile: {
+        profileId: "cap_profile:shadow-1",
+        profileRevision: 1,
+        skills: ["verification-before-completion"],
+      },
+    }));
+
+    expect(profile?.skills).toEqual(ROLE_SKILLS.implementation);
   });
 });
 

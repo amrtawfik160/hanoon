@@ -1,10 +1,14 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import {
   MAX_CONTROLLER_IMAGE_BYTES,
+  controllerDownloadLimitBytes,
+  isMotionMedia,
+  normalizeControllerImage,
   type ControllerImage,
   type ControllerThreadRecord,
   type ControllerTurnRecord,
 } from "./models";
+import { motionContextPrefix, sampleMotionFrames, type FrameSampler } from "./frames";
 import { buildInitialControllerPrompt } from "./instructions";
 import {
   controllerExecutionArguments,
@@ -31,6 +35,8 @@ export type ControllerEventObservation = {
   latestSeq: number;
   inputAccepted: boolean;
   assistantDelta: string;
+  /** Public thinking summary only — never the private reasoning chain. */
+  thinkingDelta?: string;
   completed: boolean;
   error: string | null;
   /** Set while the thread is blocked on a question only the owner can answer. */
@@ -39,7 +45,7 @@ export type ControllerEventObservation = {
   toolCalls: number;
   /** Non-zero command exits in this window; the caller accumulates them. */
   commandFailures: number;
-  /** Highest cumulative thread token total in this window, else 0. */
+  /** Highest cumulative uncached thread token total in this window, else 0. */
   totalTokens: number;
 };
 
@@ -61,17 +67,29 @@ export type ControllerAdapter = {
     text: string,
     signal: AbortSignal,
   ): Promise<void>;
+  /** Stops a live provider turn before its durable controller mapping retires. */
+  stop?(threadId: string, signal: AbortSignal): Promise<void>;
   answerQuestion(
     threadId: string,
     interactionId: string,
     answers: ControllerQuestionAnswers,
     signal: AbortSignal,
   ): Promise<void>;
-  status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
+  status(
+    threadId: string,
+    signal: AbortSignal,
+    modelFallbackIndex?: number,
+  ): Promise<ControllerStatus>;
   output(threadId: string, signal: AbortSignal): Promise<string>;
   latestSeq(threadId: string, signal: AbortSignal): Promise<number>;
   events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventObservation>;
-  findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null>;
+  findSpawnCandidate(
+    controllerKey: string,
+    signal: AbortSignal,
+    modelFallbackIndex?: number,
+  ): Promise<ControllerLocation | null>;
+  /** Whether another configured model exists for this durable attempt index. */
+  hasExecutionProfile(modelFallbackIndex: number): boolean;
 };
 
 const EVENT_PAGE_LIMIT = 100;
@@ -110,12 +128,13 @@ export class BbControllerAdapter implements ControllerAdapter {
   public constructor(private readonly dependencies: {
     sdk: BbSdk;
     pluginId: string;
-    executionProfile: () => ControllerExecutionProfile;
+    executionProfiles: () => readonly ControllerExecutionProfile[];
     downloadImage?: (
       fileId: string,
       maxBytes: number,
       signal: AbortSignal,
     ) => Promise<Uint8Array>;
+    sampleMotionFrames?: FrameSampler;
   }) {}
 
   public async spawn(
@@ -130,7 +149,7 @@ export class BbControllerAdapter implements ControllerAdapter {
       if (turn.image) throw new ControllerImagePreparationError(true);
       throw error;
     }
-    const execution = this.dependencies.executionProfile();
+    const execution = this.executionProfile(turn.modelFallbackIndex);
     const input = await this.promptInput(
       personal.projectId,
       buildInitialControllerPrompt(turn.inputText),
@@ -158,7 +177,7 @@ export class BbControllerAdapter implements ControllerAdapter {
     signal: AbortSignal,
     image: ControllerImage | null = null,
   ): Promise<void> {
-    const execution = this.dependencies.executionProfile();
+    const execution = this.executionProfile(0);
     let personal: { projectId: string; hostId: string } | null = null;
     if (image) {
       try {
@@ -191,6 +210,10 @@ export class BbControllerAdapter implements ControllerAdapter {
     });
   }
 
+  public async stop(threadId: string, _signal: AbortSignal): Promise<void> {
+    await this.dependencies.sdk.threads.stop({ threadId });
+  }
+
   public async answerQuestion(
     threadId: string,
     interactionId: string,
@@ -204,12 +227,16 @@ export class BbControllerAdapter implements ControllerAdapter {
     });
   }
 
-  public async status(threadId: string, signal: AbortSignal): Promise<ControllerStatus> {
+  public async status(
+    threadId: string,
+    signal: AbortSignal,
+    modelFallbackIndex = 0,
+  ): Promise<ControllerStatus> {
     const thread = await this.dependencies.sdk.threads.get({ threadId, signal });
     if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
     // Switching the configured model can move the conversation to another
     // provider; the old thread cannot run the new model, so it is retired.
-    if (thread.providerId !== controllerProviderFor(this.dependencies.executionProfile().model)) {
+    if (thread.providerId !== controllerProviderFor(this.executionProfile(modelFallbackIndex).model)) {
       return "incompatible";
     }
     return thread.status;
@@ -239,6 +266,7 @@ export class BbControllerAdapter implements ControllerAdapter {
     let latestSeq = afterSeq;
     let inputAccepted = false;
     let assistantDelta = "";
+    let thinkingDelta = "";
     let completed = false;
     let error: string | null = null;
     let pendingQuestion: ControllerPendingQuestion | null = null;
@@ -256,6 +284,7 @@ export class BbControllerAdapter implements ControllerAdapter {
         latestSeq = Math.max(latestSeq, row.seq);
         if (row.type === "turn/input/accepted") inputAccepted = true;
         if (row.type === "item/agentMessage/delta") assistantDelta += row.data.delta;
+        if (row.type === "item/reasoning/summaryTextDelta") thinkingDelta += row.data.delta;
         if (row.type === "turn/completed") completed = true;
         if (row.type === "item/started" && TOOL_ITEM_TYPES.has(row.data.item.type)) toolCalls += 1;
         if (row.type === "item/completed" && row.data.item.type === "commandExecution") {
@@ -263,8 +292,17 @@ export class BbControllerAdapter implements ControllerAdapter {
           if (typeof exitCode === "number" && exitCode !== 0) commandFailures += 1;
         }
         if (row.type === "thread/tokenUsage/updated") {
-          const total = row.data.tokenUsage.total.totalTokens;
-          if (Number.isFinite(total) && total > totalTokens) totalTokens = total;
+          const usage = row.data.tokenUsage.total;
+          const total = usage.totalTokens;
+          const cached = usage.cachedInputTokens;
+          // A long-lived controller resends a large, mostly cached context on
+          // every model step. Counting that cache hit as new work made three
+          // ordinary tool calls look like a runaway turn. The uncached total
+          // still bounds fresh input and every output token.
+          const effective = Number.isFinite(cached)
+            ? Math.max(0, total - Math.max(0, cached))
+            : total;
+          if (Number.isFinite(effective) && effective > totalTokens) totalTokens = effective;
         }
         if (row.type === "system/error" || row.type === "provider/error") {
           error = "Controller provider turn failed";
@@ -284,6 +322,7 @@ export class BbControllerAdapter implements ControllerAdapter {
       latestSeq,
       inputAccepted,
       assistantDelta,
+      thinkingDelta,
       completed,
       error,
       pendingQuestion,
@@ -293,8 +332,13 @@ export class BbControllerAdapter implements ControllerAdapter {
     };
   }
 
-  public async findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null> {
+  public async findSpawnCandidate(
+    controllerKey: string,
+    signal: AbortSignal,
+    modelFallbackIndex = 0,
+  ): Promise<ControllerLocation | null> {
     const personal = await this.resolvePersonalProject(signal);
+    const execution = this.executionProfile(modelFallbackIndex);
     const threads = await this.dependencies.sdk.threads.list({
       projectId: personal.projectId,
       includeHidden: true,
@@ -304,7 +348,7 @@ export class BbControllerAdapter implements ControllerAdapter {
     const candidates = threads.filter((thread) =>
       isControllerThreadTitle(thread.title, controllerKey) &&
       thread.projectId === personal.projectId &&
-      thread.providerId === controllerProviderFor(this.dependencies.executionProfile().model) &&
+      thread.providerId === controllerProviderFor(execution.model) &&
       thread.status !== "error" && thread.status !== "stopping" &&
       thread.visibility === "hidden" &&
       thread.originPluginId === this.dependencies.pluginId &&
@@ -316,41 +360,117 @@ export class BbControllerAdapter implements ControllerAdapter {
     return candidate ? { threadId: candidate.id, ...personal } : null;
   }
 
+  public hasExecutionProfile(modelFallbackIndex: number): boolean {
+    return Number.isInteger(modelFallbackIndex) && modelFallbackIndex >= 0 &&
+      this.dependencies.executionProfiles()[modelFallbackIndex] !== undefined;
+  }
+
+  private executionProfile(modelFallbackIndex: number): ControllerExecutionProfile {
+    if (!Number.isInteger(modelFallbackIndex) || modelFallbackIndex < 0) {
+      throw new TypeError("Controller model fallback index must be a non-negative integer");
+    }
+    const profile = this.dependencies.executionProfiles()[modelFallbackIndex];
+    if (!profile) throw new Error(`Controller model fallback ${modelFallbackIndex} is not configured`);
+    return profile;
+  }
+
   private async promptInput(
     projectId: string | null,
     text: string,
     image: ControllerImage | null,
     signal: AbortSignal,
   ): Promise<ControllerPromptInput> {
-    const input: ControllerPromptInput = [{ type: "text", text, mentions: [] }];
-    if (!image) return input;
+    if (!image) return [{ type: "text", text, mentions: [] }];
     if (!projectId || !this.dependencies.downloadImage) {
       throw new ControllerImagePreparationError(false);
     }
-    let bytes: Uint8Array;
-    try {
-      bytes = await this.dependencies.downloadImage(
-        image.fileId,
+    const media = normalizeControllerImage(image);
+    const prepared = isMotionMedia(media)
+      ? await this.motionFrames(media, signal)
+      : {
+        source: "original" as const,
+        frames: [{
+          fileName: media.fileName,
+          mimeType: media.mimeType,
+          bytes: await this.downloadMedia(media.fileId, MAX_CONTROLLER_IMAGE_BYTES, signal),
+        }],
+      };
+    const preface = isMotionMedia(media)
+      ? `${motionContextPrefix(media.kind, prepared.frames.length, prepared.source)}\n\n`
+      : "";
+    const frames = prepared.frames;
+    const input: ControllerPromptInput = [{ type: "text", text: `${preface}${text}`, mentions: [] }];
+    for (const frame of frames) {
+      if (frame.bytes.byteLength > MAX_CONTROLLER_IMAGE_BYTES) {
+        throw new ControllerImagePreparationError(false);
+      }
+      try {
+        const uploaded = await this.dependencies.sdk.projects.attachments.upload({
+          projectId,
+          clientFile: frame.bytes,
+          filename: frame.fileName,
+          mimeType: frame.mimeType,
+        });
+        if (uploaded.type !== "localImage") throw new ControllerImagePreparationError(false);
+        input.push({ type: "localImage", path: uploaded.path });
+      } catch (error) {
+        if (error instanceof ControllerImagePreparationError) throw error;
+        throw new ControllerImagePreparationError(true);
+      }
+    }
+    return input;
+  }
+
+  private async motionFrames(
+    image: Required<ControllerImage>,
+    signal: AbortSignal,
+  ): Promise<{
+    source: "sampled" | "preview" | "original";
+    frames: Array<{ fileName: string; mimeType: string; bytes: Uint8Array }>;
+  }> {
+    const sampler = this.dependencies.sampleMotionFrames ?? sampleMotionFrames;
+    const downloadLimit = controllerDownloadLimitBytes(image);
+    let original: Uint8Array | null = null;
+    if (image.sizeBytes === null || image.sizeBytes <= downloadLimit) {
+      try {
+        original = await this.downloadMedia(image.fileId, downloadLimit, signal);
+        const frames = [...await sampler({ bytes: original, fileName: image.fileName, signal })];
+        if (frames.length > 0) return { source: "sampled", frames };
+      } catch (error) {
+        if (error instanceof ControllerImagePreparationError && !error.retryable && !image.thumbnail && !original) {
+          throw error;
+        }
+        if (!(error instanceof ControllerImagePreparationError) && !image.thumbnail && !original) {
+          throw new ControllerImagePreparationError(true);
+        }
+      }
+    }
+    if (image.thumbnail) {
+      const bytes = await this.downloadMedia(
+        image.thumbnail.fileId,
         MAX_CONTROLLER_IMAGE_BYTES,
         signal,
       );
-    } catch (error) {
-      if (error instanceof ControllerImagePreparationError) throw error;
-      throw new ControllerImagePreparationError(true);
+      return {
+        source: "preview",
+        frames: [{ fileName: image.thumbnail.fileName, mimeType: "image/jpeg", bytes }],
+      };
     }
-    if (bytes.byteLength > MAX_CONTROLLER_IMAGE_BYTES) {
-      throw new ControllerImagePreparationError(false);
+    // A GIF document is already a still the provider can see if sampling failed.
+    if (original && image.mimeType.startsWith("image/")) {
+      return {
+        source: "original",
+        frames: [{ fileName: image.fileName, mimeType: image.mimeType, bytes: original }],
+      };
     }
+    throw new ControllerImagePreparationError(false);
+  }
+
+  private async downloadMedia(fileId: string, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
     try {
-      const uploaded = await this.dependencies.sdk.projects.attachments.upload({
-        projectId,
-        clientFile: bytes,
-        filename: image.fileName,
-        mimeType: image.mimeType,
-      });
-      if (uploaded.type !== "localImage") throw new ControllerImagePreparationError(false);
-      input.push({ type: "localImage", path: uploaded.path });
-      return input;
+      const bytes = await this.dependencies.downloadImage!(fileId, maxBytes, signal);
+      if (bytes.byteLength > maxBytes) throw new ControllerImagePreparationError(false);
+      return bytes;
     } catch (error) {
       if (error instanceof ControllerImagePreparationError) throw error;
       throw new ControllerImagePreparationError(true);

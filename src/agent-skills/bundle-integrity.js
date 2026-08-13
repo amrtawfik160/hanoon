@@ -4,6 +4,10 @@ import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:p
 import { fileURLToPath } from "node:url";
 import {
   BUNDLE_LIMITS,
+  DELIVERY_KIT,
+  DISCOVERY_KIT,
+  GUARD_KIT,
+  HANOON_KIT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
   REGISTERED_ROOTS,
@@ -23,6 +27,13 @@ const {
   maximumTreeDepth: MAX_TREE_DEPTH,
 } = BUNDLE_LIMITS;
 const requiredSkillsById = new Map(REQUIRED_SKILLS.map((skill) => [skill.id, skill]));
+const expectedKits = [
+  ["workflowKit", "workflow-kit", WORKFLOW_KIT],
+  ["guardKit", "guard-kit", GUARD_KIT],
+  ["deliveryKit", "delivery-kit", DELIVERY_KIT],
+  ["discoveryKit", "discovery-kit", DISCOVERY_KIT],
+  ["hanoonKit", "hanoon-kit", HANOON_KIT],
+];
 
 function integrityError(reason) {
   return new Error(`Skill bundle integrity error: ${reason}`);
@@ -273,6 +284,17 @@ function assertRequiredCatalog(records) {
   }
 }
 
+function verifyKitProvenance(pluginRoot, lock) {
+  for (const [lockKey, label, expected] of expectedKits) {
+    const actual = lock[lockKey];
+    if (!actual || typeof actual !== "object" || Array.isArray(actual)
+      || Object.entries(expected).some(([key, value]) => actual[key] !== value)) {
+      throw integrityError(`malformed ${label} provenance`);
+    }
+    readRegularFile(pluginRoot, join(pluginRoot, actual.licensePath), actual.licensePath, MAX_FILE_BYTES);
+  }
+}
+
 function verifySkills(pluginRoot, lock, roots) {
   const records = new Map();
   for (const record of lock.skills) {
@@ -303,11 +325,7 @@ function verifySkills(pluginRoot, lock, roots) {
     }
   }
   if (discovered.length !== records.size) throw integrityError("lock references a missing skill directory");
-  const workflow = lock.workflowKit;
-  if (workflow.version !== WORKFLOW_KIT.version || workflow.sourceUrl !== WORKFLOW_KIT.sourceUrl || workflow.license !== WORKFLOW_KIT.license || workflow.licensePath !== WORKFLOW_KIT.licensePath) {
-    throw integrityError("malformed workflow-kit provenance");
-  }
-  readRegularFile(pluginRoot, join(pluginRoot, workflow.licensePath), workflow.licensePath, MAX_FILE_BYTES);
+  verifyKitProvenance(pluginRoot, lock);
   for (const record of records.values()) {
     const expected = requiredSkillsById.get(record.id);
     if (record.source !== expected.source || record.license !== expected.license) throw integrityError(`invalid provenance for ${record.id}`);

@@ -16,6 +16,7 @@ Controller settings never override a job's stored project policy.
 - A standard BB project backed by a GitHub repository.
 - A reachable local or cloned BB project source with a named base branch.
 - GitHub CLI (`gh`) authenticated on every source host used by an enabled project.
+- Optional: `ffmpeg` and `ffprobe` on the PATH of the BB server host. They let the controller sample GIFs and short videos into stills. Without them, clips still arrive; the agent sees Telegram's preview still instead of frames.
 
 The hidden controller uses BB's personal project. That project must have a selected source host, or BB must have exactly one connected host when the personal project has no source binding.
 
@@ -67,15 +68,35 @@ The same plugin settings page controls subsequent turns in the hidden conversati
 | Setting | Options | Default |
 | --- | --- | --- |
 | Controller model | `claude-opus-5[1m]`, `claude-opus-4-8[1m]`, `claude-sonnet-5`, `claude-fable-5`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `claude-opus-5[1m]` |
-| Reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` |
-| Service tier | `fast`, `default` | `default` |
-| Permission mode | `auto`, `accept-edits`, `full` | `full` |
+| Fallback model 1 | `disabled` or any controller model | `gpt-5.6-sol` |
+| Fallback model 2 | `disabled` or any controller model | `disabled` |
+| Controller reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` |
+| Controller service tier | `fast`, `default` | `default` |
+| Controller permission mode | `auto`, `accept-edits`, `full` | `full` |
 
 The model selects its provider: `claude-*` models run on Claude Code, `gpt-*` models on Codex. Service tier is a Codex-only input and is not sent for Claude models.
+
+Each new Telegram message starts with the primary model. The ordered fallbacks are tried only when BB proves the preceding provider failed before accepting that message; they are never used after the model could have started tools or other effects. Disabled entries and duplicates are skipped. Fallbacks share the primary turn's reasoning, service-tier, and permission policy. The `strong-only` routing kill switch still wins and cannot be weakened by a fallback setting.
 
 Changing the model to one owned by the other provider retires the live BB conversation thread, because a thread cannot switch providers. The next message opens a replacement seeded with the recent conversation, so the change costs a pause rather than the conversation.
 
 Saved values apply when the next controller turn starts, including later turns in the existing durable conversation. They do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode.
+
+### Capability routing controls
+
+Three independent plugin settings control only newly created routing snapshots:
+
+| Setting | Options | Default | Effect |
+| --- | --- | --- | --- |
+| Capability job graph | `adaptive`, `legacy` | `adaptive` | `adaptive` classifies new jobs into versioned recipes and uses each recipe's rollout decision; `legacy` pins new jobs to the established full/small-fix graph. |
+| Controller capabilities | `bundled`, `all-tools` | `bundled` | `bundled` selects the minimum controller bundle for each new turn; `all-tools` restores all admitted controller bundles for new turns. |
+| Capability model routing | `adaptive`, `strong-only` | `adaptive` | `adaptive` selects the declared pool; `strong-only` applies a strong-pool floor to new controller turns and worker attempts. |
+
+These are kill switches, not data migrations. They do not rewrite an in-flight job, an existing controller or worker profile, a provider trial, or a capability receipt. Recipe promotion and rollback are also new-job decisions: a promoted job keeps `active` after rollback, while the next matching job returns to `shadow` (or `legacy` when the job-graph switch says so).
+
+Model route identity is the exact provider, model, reasoning, and service-tier tuple. Permission remains owned by controller or project policy and is never inferred from the model pool. `strong-only` raises the model floor without granting broader filesystem, command, merge, or production authority.
+
+No setting promotes a recipe. Promotion is an append-only operator decision available only after the production evidence reader resolves the required deterministic, live-recovery, model-comparison, and zero-tolerance records. This release has no trusted production collector or operator ingestion path for those records; the future collector must separately prove the acceptance job is disposable. Use `bb telegram-agent capability status [recipe] --json` to inspect the installed database and follow [Capability routing and rollout](operations.md#capability-routing-and-rollout) for the future promotion path or immediate rollback. A fresh installation starts every adaptive recipe in `shadow`.
 
 ### Background work
 
@@ -197,7 +218,9 @@ Use unmistakable placeholders and replace them with values verified for the targ
   },
   "requiredChecks": ["unit"],
   "outputRedactionPatterns": [],
+  "workerStartGraceMs": 120000,
   "workerLivenessWatchdogMs": 300000,
+  "workerRecoveryLimit": 2,
   "maxReviewCycles": 3,
   "mergeMethod": "squash"
 }
@@ -220,7 +243,9 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `production.convexDeployRequired` | When true, a deploy command must invoke `convex deploy` through the supported CLI form. |
 | `requiredChecks` | Up to 50 non-empty GitHub check names. |
 | `outputRedactionPatterns` | Up to 20 valid regular expressions, each at most 200 characters. |
+| `workerStartGraceMs` | `10000`–`900000`; default `120000`. How long a newly registered worker may remain missing or silent before recovery classification. |
 | `workerLivenessWatchdogMs` | `60000`–`3600000`; default `300000`. |
+| `workerRecoveryLimit` | `1`–`5`; default `2`. Maximum automatic recoveries for a job after the same failure signature has previously recovered. |
 | `maxReviewCycles` | `1`–`10`; default `3`. |
 | `mergeMethod` | `merge`, `rebase`, or `squash`. |
 

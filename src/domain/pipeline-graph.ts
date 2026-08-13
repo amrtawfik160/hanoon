@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { changedPathsFromGitDiff } from "../capabilities/change-surface";
+import { TASK_RECIPES, type TaskRecipe } from "./recipes";
+
 export type PipelineStage =
   | "INTAKE"
   | "PLAN"
@@ -16,11 +20,139 @@ export type PipelineStage =
   | "COMPLETE"
   | "BLOCKED";
 
+export type RecipeStage =
+  | "approved-design"
+  | "baseline"
+  | "critique"
+  | "delivery"
+  | "diagnosis"
+  | "diff-guards"
+  | "documentation"
+  | "implementation"
+  | "inspection"
+  | "integrated-review"
+  | "plan"
+  | "regression"
+  | "resolve-head"
+  | "review"
+  | "task-review"
+  | "validation";
+
+export type RecipeProjection = Readonly<{
+  recipe: TaskRecipe;
+  stages: readonly RecipeStage[];
+  implementationWritersPerWorktree: 1;
+  reviewLanes: readonly Readonly<{ id: string; independent: true }>[];
+}>;
+
+const RECIPE_STAGES: Readonly<Record<TaskRecipe, readonly RecipeStage[]>> = {
+  direct: ["implementation", "validation", "diff-guards", "delivery"],
+  bounded: ["approved-design", "implementation", "validation", "review", "delivery"],
+  bug: ["diagnosis", "regression", "implementation", "validation", "review", "delivery"],
+  architectural: ["plan", "critique", "implementation", "task-review", "validation", "integrated-review", "delivery"],
+  "skill-authoring": ["baseline", "implementation", "validation", "review", "delivery"],
+  "adopted-pr": ["resolve-head", "inspection", "validation", "review", "delivery"],
+};
+
+function reviewLanes(recipe: TaskRecipe): RecipeProjection["reviewLanes"] {
+  if (recipe === "architectural") {
+    return [
+      { id: "task-review", independent: true },
+      { id: "integrated-review", independent: true },
+    ];
+  }
+  return [{ id: recipe === "direct" ? "diff-guards" : "review", independent: true }];
+}
+
+export function runRecipe(
+  recipe: TaskRecipe,
+  options: Readonly<{ documentationRequired?: boolean }> = {},
+): RecipeProjection {
+  if (!TASK_RECIPES.includes(recipe)) throw new TypeError(`Unknown task recipe ${String(recipe)}`);
+  const stages = [...RECIPE_STAGES[recipe]];
+  if (options.documentationRequired === true) {
+    const insertionPoint = recipe === "architectural"
+      ? stages.indexOf("validation")
+      : stages.indexOf("delivery");
+    stages.splice(insertionPoint, 0, "documentation");
+  }
+  return Object.freeze({
+    recipe,
+    stages: Object.freeze(stages),
+    implementationWritersPerWorktree: 1,
+    reviewLanes: Object.freeze(reviewLanes(recipe)),
+  });
+}
+
+const DOCUMENTATION_PATH = /(^|\/)(?:docs?|documentation)(?:\/|$)|(^|\/)(?:readme|changelog|contributing)(?:\.[^/]*)?$/iu;
+const CLI_PATH = /(^|\/)(?:cli|commands?)(?:[./-]|\/)|(^|\/)bin\//iu;
+const CONFIG_PATH = /(^|\/)(?:config|configuration)(?:[./-]|\/)|(?:^|\.)config\.[^/]+$|(^|\/)package\.json$/iu;
+const PUBLIC_CONTRACT_PATH = /(^|\/)(?:api|public|schemas?)(?:[./-]|\/)|(^|\/)src\/index\.[^/]+$/iu;
+const PUBLIC_EXPORT = /^\+(?!\+\+\s)(?:export\s|module\.exports\b|exports\.)/mu;
+
+export type DocumentationRequirement = Readonly<{
+  required: boolean;
+  diffDigest: string;
+  paths: readonly string[];
+  reasons: readonly string[];
+}>;
+
+export function documentationRequirement(input: Readonly<{
+  diff: string;
+  traits: readonly string[];
+  reasonCodes: readonly string[];
+}>): DocumentationRequirement {
+  if (!Array.isArray(input.traits) || input.traits.length > 64 ||
+    !Array.isArray(input.reasonCodes) || input.reasonCodes.length > 64) {
+    throw new TypeError("Documentation selection requires bounded durable traits and reason codes");
+  }
+  const paths = changedPathsFromGitDiff(input.diff);
+  const reasons = new Set<string>();
+  if (paths.some((path) => DOCUMENTATION_PATH.test(path))) reasons.add("docs_path");
+  if (paths.some((path) => CLI_PATH.test(path))) reasons.add("cli_behavior");
+  if (paths.some((path) => CONFIG_PATH.test(path))) reasons.add("configuration_behavior");
+  if (paths.some((path) => PUBLIC_CONTRACT_PATH.test(path)) || PUBLIC_EXPORT.test(input.diff) ||
+    input.traits.includes("public-contract")) reasons.add("public_contract");
+  if (input.reasonCodes.includes("work_order:documentation_required") ||
+    input.traits.includes("documentation-only")) reasons.add("work_order_required");
+  return Object.freeze({
+    required: reasons.size > 0,
+    diffDigest: createHash("sha256").update(input.diff, "utf8").digest("hex"),
+    paths: Object.freeze(paths),
+    reasons: Object.freeze([...reasons].sort((left, right) => left.localeCompare(right))),
+  });
+}
+
+export type DeliveryMetadataPolicy = Readonly<{
+  mode: "deterministic" | "pr-writer";
+  capabilityId: "pr-writer" | null;
+  diffDigest: string;
+}>;
+
+export function deliveryMetadataPolicy(input: Readonly<{
+  recipe: TaskRecipe;
+  diff: string;
+}>): DeliveryMetadataPolicy {
+  if (!TASK_RECIPES.includes(input.recipe)) throw new TypeError(`Unknown task recipe ${String(input.recipe)}`);
+  const paths = changedPathsFromGitDiff(input.diff);
+  const addedLines = input.diff.split(/\r?\n/u)
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++ ")).length;
+  const trivialDirect = input.recipe === "direct" && addedLines <= 20 && paths.length > 0 &&
+    paths.every((path) => DOCUMENTATION_PATH.test(path) || /\.(?:css|scss|less|txt|md)$/iu.test(path));
+  return Object.freeze({
+    mode: trivialDirect ? "deterministic" : "pr-writer",
+    capabilityId: trivialDirect ? null : "pr-writer",
+    diffDigest: createHash("sha256").update(input.diff, "utf8").digest("hex"),
+  });
+}
+
 export type PipelineRouteInput = {
   stage: string;
   outcome: string;
   patchCycles: number;
   critiqueCycles: number;
+  productionConfigured?: boolean;
+  smallFix?: boolean;
 };
 
 const SUCCESS_ROUTES: Readonly<Record<string, PipelineStage>> = {
@@ -42,6 +174,19 @@ const SUCCESS_ROUTES: Readonly<Record<string, PipelineStage>> = {
 export function nextPipelineStage(input: PipelineRouteInput): PipelineStage {
   if (!Number.isInteger(input.patchCycles) || input.patchCycles < 0 ||
     !Number.isInteger(input.critiqueCycles) || input.critiqueCycles < 0) return "BLOCKED";
+  if (input.stage === "PLAN" && input.outcome === "success") {
+    if (input.smallFix) return "BUILD";
+    return input.critiqueCycles >= 1 ? "BUILD" : "CRITIQUE";
+  }
+  if (input.stage === "INTAKE" && input.outcome === "success" && input.smallFix) {
+    return "BUILD";
+  }
+  if (input.stage === "REVIEW" && input.outcome === "success" && input.smallFix) {
+    return "COMPLETE";
+  }
+  if (input.stage === "FINAL_REVIEW" && input.outcome === "success" && input.productionConfigured === false) {
+    return "COMPLETE";
+  }
   if (input.stage === "CRITIQUE" && input.outcome === "needs_revision") {
     return input.critiqueCycles < 1 ? "PLAN" : "BLOCKED";
   }

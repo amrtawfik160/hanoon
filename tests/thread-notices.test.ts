@@ -100,6 +100,28 @@ it("tells the owner when a watched thread finishes", async () => {
   expect(store.getOutbox("thread:thr_work:idle")?.payload.text).toContain("finished");
 });
 
+it("does not announce a Hanoon pipeline worker as a generic thread notice", async () => {
+  const store = fixture();
+  const title = "Telegram abcdefghijklmnopqrstuv plan abcdefghijklmnopqrstuv:3:spawn_plan";
+  const worker = watched({ id: "thr_plan", title, status: "active" });
+  await service(store, { threads: [worker] }).service.processDue();
+  await service(store, { threads: [{ ...worker, status: "idle" }] }).service.processDue();
+
+  expect(store.getOutbox("thread:thr_plan:idle")).toBeNull();
+});
+
+it("keeps a title with markdown markers from breaking the finished notice", async () => {
+  const store = fixture();
+  const title = "Fix *this* and login_bug_now";
+  await service(store, { threads: [watched({ title, status: "active" })] }).service.processDue();
+  await service(store, { threads: [watched({ title, status: "idle" })] }).service.processDue();
+
+  const payload = store.getOutbox("thread:thr_work:idle")?.payload;
+  expect(payload?.parse_mode).toBe("HTML");
+  expect(payload?.text).toContain("Fix *this* and login_bug_now");
+  expect(payload?.text).not.toMatch(/<i>/);
+});
+
 it("tells the owner when a watched thread fails", async () => {
   const store = fixture();
   await service(store, { threads: [watched({ status: "active" })] }).service.processDue();
@@ -226,6 +248,93 @@ it("stops offering a decision the thread resolved without the owner", async () =
     chatId: "7",
     now: 4_000,
   })).toEqual({ ok: false, reason: "stale" });
+});
+
+it("retires the Telegram card for a decision the owner answered in BB", async () => {
+  const store = fixture();
+  await service(store, { threads: [watched()], interactions: [approvalInteraction()] }).service.processDue();
+  const lease = store.acquireExecutorLease("executor", 3_000, 30_000);
+  if (!lease.acquired) throw new Error("executor lease missing");
+  const [asked] = store.leaseOutbox("executor", lease.generation, 3_000, 10, 30_000);
+  expect(asked?.logicalKey).toBe(`thread-interaction:${APPROVAL_ID}`);
+  expect(store.completeOutbox(asked!.logicalKey, "executor", lease.generation, 437, 3_000)).toBe(true);
+
+  // The owner answered in the BB app, so BB stops listing the interaction.
+  await service(store, { threads: [watched()], interactions: [] }).service.processDue();
+
+  const retired = store.getOutbox(`thread-interaction:${APPROVAL_ID}`);
+  expect(retired?.messageId).toBe(437);
+  expect(retired?.status).toBe("pending");
+  expect(retired?.payload.text).toContain("Fix the login bug");
+  expect(retired?.payload.text).toContain("answered in BB");
+  expect(retired?.payload.reply_markup).toEqual({ inline_keyboard: [] });
+  // A tap on the card that has not been edited yet still finds nothing to answer.
+  expect(store.answerThreadInteraction({
+    token: threadDecisionToken(APPROVAL_ID, "allow_once"),
+    userId: "7",
+    chatId: "7",
+    now: 4_000,
+  })).toEqual({ ok: false, reason: "stale" });
+});
+
+it("retires a card once rather than on every later sweep", async () => {
+  const store = fixture();
+  await service(store, { threads: [watched()], interactions: [approvalInteraction()] }).service.processDue();
+  const lease = store.acquireExecutorLease("executor", 3_000, 30_000);
+  if (!lease.acquired) throw new Error("executor lease missing");
+  const [asked] = store.leaseOutbox("executor", lease.generation, 3_000, 10, 30_000);
+  expect(store.completeOutbox(asked!.logicalKey, "executor", lease.generation, 437, 3_000)).toBe(true);
+  await service(store, { threads: [watched()], interactions: [] }).service.processDue();
+  const [retirement] = store.leaseOutbox("executor", lease.generation, 3_100, 10, 30_000);
+  expect(store.completeOutbox(retirement!.logicalKey, "executor", lease.generation, 437, 3_100)).toBe(true);
+
+  await service(store, { threads: [watched()], interactions: [], now: () => 30_000 }).service.processDue();
+
+  expect(store.getOutbox(`thread-interaction:${APPROVAL_ID}`)?.status).toBe("sent");
+});
+
+it("retires a card inside the sweep interval when a realtime change asks it to", async () => {
+  const store = fixture();
+  let pending: PendingThreadInteraction[] = [approvalInteraction()];
+  let now = 3_000;
+  const notices = new ThreadNoticeService({
+    store,
+    threads: {
+      listWatchable: vi.fn(async () => [watched()]),
+      interactions: vi.fn(async () => pending),
+      resolve: vi.fn(async () => undefined),
+    },
+    clock: { now: () => now },
+  });
+  await notices.processDue();
+  const lease = store.acquireExecutorLease("executor", 3_000, 30_000);
+  if (!lease.acquired) throw new Error("executor lease missing");
+  const [asked] = store.leaseOutbox("executor", lease.generation, 3_000, 10, 30_000);
+  expect(store.completeOutbox(asked!.logicalKey, "executor", lease.generation, 437, 3_000)).toBe(true);
+
+  // The owner answers in BB seconds after the sweep, so the pacing guard would
+  // otherwise hold the card on their phone until the next idle poll.
+  pending = [];
+  now = 3_500;
+  await notices.processDue();
+  expect(store.getOutbox(`thread-interaction:${APPROVAL_ID}`)?.status).toBe("sent");
+
+  notices.requestSweep();
+  await expect(notices.processDue()).resolves.toBe(true);
+
+  const retired = store.getOutbox(`thread-interaction:${APPROVAL_ID}`);
+  expect(retired?.status).toBe("pending");
+  expect(retired?.messageId).toBe(437);
+  expect(retired?.payload.reply_markup).toEqual({ inline_keyboard: [] });
+});
+
+it("wakes the executor for a thread that still owes the owner an answer", async () => {
+  const store = fixture();
+  expect(store.shouldWakeForThread("thr_work")).toBe(false);
+
+  await service(store, { threads: [watched()], interactions: [approvalInteraction()] }).service.processDue();
+
+  expect(store.shouldWakeForThread("thr_work")).toBe(true);
 });
 
 it("asks once for a block it has already reported", async () => {

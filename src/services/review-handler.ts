@@ -1,8 +1,15 @@
 import {
   assessReview,
   InvalidReviewOutputError,
+  parseGuardResultEnvelope,
   parseReviewVerdict,
 } from "../domain/review";
+import {
+  assessGuardEnvelope,
+  type GuardAssessmentPolicy,
+  type GuardEnvelopeAssessment,
+  type GuardResultEnvelope,
+} from "../capabilities/guards";
 import type {
   ReviewAssessment,
   ReviewAttemptResult,
@@ -80,7 +87,24 @@ export interface ReviewHandlerInvocationDependencies {
   threads: ReviewThreadClient;
   environment: ReviewEnvironmentClient;
   attempts: ReviewAttemptStore;
+  guards?: ReviewGuardSettlement;
   emit?: never;
+}
+
+export type ReviewGuardSettlementInput = Readonly<{
+  invocation: ReviewInvocation;
+  envelope: GuardResultEnvelope;
+  policy: GuardAssessmentPolicy;
+  assessment: GuardEnvelopeAssessment;
+}>;
+
+export interface ReviewGuardSettlement {
+  settle(input: ReviewGuardSettlementInput): Promise<GuardEnvelopeAssessment> | GuardEnvelopeAssessment;
+  block(input: Readonly<{
+    invocation: ReviewInvocation;
+    policy: GuardAssessmentPolicy;
+    reasonCode: string;
+  }>): Promise<void> | void;
 }
 
 export interface ReviewHandlerLegacyDependencies {
@@ -100,6 +124,7 @@ export type ReviewInvocation = Readonly<{
   environmentId: string;
   mergeBaseBranch: string;
   expectedSha: string;
+  guardPolicy?: GuardAssessmentPolicy;
   signal: AbortSignal;
 }>;
 
@@ -242,9 +267,41 @@ export class ReviewHandler {
     this.assertActive(input.signal);
     const rawOutput = await this.dependencies.threads.output(input.reviewThreadId, input.signal);
     this.assertActive(input.signal);
+    let text: string;
+    try {
+      text = outputText(rawOutput);
+    } catch (error) {
+      if (!(error instanceof InvalidReviewOutputError) && !(error instanceof SyntaxError)) throw error;
+      return this.handleInvalidOutput(input, attempt);
+    }
+    if (input.guardPolicy !== undefined) {
+      let envelope: GuardResultEnvelope;
+      try {
+        envelope = parseGuardResultEnvelope(text);
+      } catch (error) {
+        if (!(error instanceof InvalidReviewOutputError) && !(error instanceof SyntaxError)) throw error;
+        return this.handleInvalidOutput(input, attempt);
+      }
+      let guardAssessment = assessGuardEnvelope(envelope, input.guardPolicy);
+      const guards = !this.legacy && "guards" in this.dependencies
+        ? this.dependencies.guards
+        : undefined;
+      if (guards) {
+        this.assertActive(input.signal);
+        guardAssessment = await guards.settle({
+          invocation: input,
+          envelope,
+          policy: input.guardPolicy,
+          assessment: guardAssessment,
+        });
+        this.assertActive(input.signal);
+      }
+      return this.completeGuard(input, envelope, input.guardPolicy, guardAssessment);
+    }
+
     let verdict: ReviewVerdict;
     try {
-      verdict = parseReviewVerdict(outputText(rawOutput));
+      verdict = parseReviewVerdict(text);
     } catch (error) {
       if (!(error instanceof InvalidReviewOutputError) && !(error instanceof SyntaxError)) throw error;
       return this.handleInvalidOutput(input, attempt);
@@ -254,6 +311,67 @@ export class ReviewHandler {
     if (assessment.outcome === "pass") return this.pass(input, verdict, assessment);
     if (assessment.outcome === "changes_requested") return this.requestChanges(input, verdict, assessment);
     return this.completeBlocked(input, verdict, assessment);
+  }
+
+  private async completeGuard(
+    input: ReviewInvocation,
+    envelope: GuardResultEnvelope,
+    policy: GuardAssessmentPolicy,
+    assessment: GuardEnvelopeAssessment,
+  ): Promise<ReviewHandlerCompletion> {
+    const findings = assessment.findings.map((finding) => ({
+      severity: finding.severity,
+      file: finding.subject,
+      line: finding.line,
+      title: `${finding.capabilityId}:${finding.ruleId}`,
+      details: finding.evidence,
+    }));
+    const outcome = assessment.outcome === "blocked"
+      ? "blocked" as const
+      : assessment.outcome === "changes_requested"
+        ? "changes_requested" as const
+        : "pass" as const;
+    const result: ReviewHandlerResult = {
+      outcome,
+      reasons: [...assessment.reasons],
+      findings,
+      reviewedHeadSha: envelope.reviewedHeadSha,
+      guardEnvelope: envelope,
+      guardPolicy: policy,
+      guardAssessment: assessment,
+    };
+    await this.updateAttempt({
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      signal: input.signal,
+      patch: {
+        threadId: input.reviewThreadId,
+        headSha: input.expectedSha,
+        requiresNewHead: outcome === "changes_requested",
+        result,
+      },
+    });
+    if (outcome === "pass") {
+      return this.completion(result, {
+        type: "REVIEW_PASSED",
+        payload: { headSha: input.expectedSha, guardAssessment: assessment.outcome },
+      });
+    }
+    if (outcome === "changes_requested") {
+      return this.completion(result, {
+        type: "REVIEW_CHANGES_REQUESTED",
+        payload: {
+          headSha: input.expectedSha,
+          summary: "Mandatory guard findings require remediation",
+          findings,
+          reasons: result.reasons,
+        },
+      });
+    }
+    return this.completion(result, {
+      type: "REVIEW_BLOCKED",
+      payload: { headSha: input.expectedSha, reasons: result.reasons },
+    });
   }
 
   private async environmentStatus(input: ReviewInvocation): Promise<ReviewEnvironmentStatus> {
@@ -425,6 +543,18 @@ export class ReviewHandler {
   }
 
   private async block(input: ReviewInvocation, reason: string): Promise<ReviewHandlerCompletion> {
+    const guards = !this.legacy && "guards" in this.dependencies
+      ? this.dependencies.guards
+      : undefined;
+    if (input.guardPolicy !== undefined && guards) {
+      this.assertActive(input.signal);
+      await guards.block({
+        invocation: input,
+        policy: input.guardPolicy,
+        reasonCode: "guard_review_blocked",
+      });
+      this.assertActive(input.signal);
+    }
     const result: ReviewHandlerResult = {
       outcome: "blocked",
       reasons: [reason],

@@ -75,7 +75,7 @@ function adapterFixture(options: { events?: unknown[] } = {}) {
   const adapter = new BbControllerAdapter({
     sdk,
     pluginId: "telegram-agent",
-    executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+    executionProfiles: () => [DEFAULT_CONTROLLER_EXECUTION_PROFILE],
   });
   return { adapter, resolve, send, eventsList };
 }
@@ -310,6 +310,7 @@ function serviceAdapter(overrides: Partial<ControllerAdapter> = {}): ControllerA
       pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     findSpawnCandidate: vi.fn(async () => null),
+    hasExecutionProfile: () => false,
     ...overrides,
   };
 }
@@ -539,9 +540,10 @@ it("stops re-steering a message the thread keeps refusing", async () => {
 it("retires the wedged thread when a turn stalls, so the next message is not stuck behind it", async () => {
   const { store, fence } = storeFixture("stall-retires");
   const turn = submittedTurn(store, fence);
+  const stop = vi.fn(async () => undefined);
   const service = new LunaControllerService({
     store,
-    adapter: serviceAdapter(),
+    adapter: serviceAdapter({ stop }),
     clock: { now: () => 2_000 + CONTROLLER_STALL_MS + 1 },
   });
   const signal = AbortSignal.timeout(2_000);
@@ -554,4 +556,5 @@ it("retires the wedged thread when a turn stalls, so the next message is not stu
   const controller = store.getControllerForOwner("7", "7");
   expect(controller?.threadId).toBeNull();
   expect(controller?.state).toBe("pending_spawn");
+  expect(stop).toHaveBeenCalledWith("thr_controller", signal);
 });

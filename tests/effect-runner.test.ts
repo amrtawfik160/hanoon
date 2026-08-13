@@ -1,7 +1,8 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
-import type { JobEffect, StoredEffect } from "../src/domain/models";
+import type { JobEffect, StoredEffect, WorkerLiveness } from "../src/domain/models";
+import type { CapabilityWorkOrderEnvelope } from "../src/bb/handoffs";
 import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { admitConfirmedJob, policyFixture } from "./helpers";
@@ -102,6 +103,98 @@ function addPendingEffectForRecovery(db: Database.Database, effect: JobEffect): 
 }
 
 describe("leased effect execution", () => {
+  it("retires a silent worker and requeues the unanswered implementation stage", async () => {
+    const { store, db } = storeFixture();
+    const draft = store.createJob({ id: "job_silent_recovery", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    const selected = store.applyJobEvent(draft.id, draft.version, {
+      type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture(),
+    }, 1_001);
+    const admitted = admitConfirmedJob(store, selected, 1_002);
+    db.prepare(
+      `UPDATE jobs SET state = 'implementing', resume_state = NULL,
+         implementation_thread_id = 'thr_silent', environment_id = 'env_1',
+         version = version + 1 WHERE id = ?`,
+    ).run(admitted.id);
+    db.prepare("UPDATE effects SET status = 'done' WHERE job_id = ?").run(admitted.id);
+    const job = store.getJob(admitted.id)!;
+    const lease = store.acquireExecutorLease("owner-a", 1_003, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    expect(store.adoptHeldClaims({
+      jobId: job.id,
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_003,
+      leaseMs: 30_000,
+    })).toBe(true);
+    const registration = store.registerExecutorWorkerRecovery({
+      id: "recovery_silent",
+      jobId: job.id,
+      expectedVersion: job.version,
+      projectId: "proj_1",
+      jobState: "implementing",
+      workerKind: "implementation",
+      resourceId: "thr_silent",
+      workerGeneration: 42,
+      classification: "no_progress",
+      signature: "no_progress:implementation:active",
+      retryLimit: 2,
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_004,
+    });
+    expect(registration?.action).toBe("auto_retry");
+    const recovering = store.applyExecutorJobEvent({
+      jobId: job.id,
+      expectedVersion: job.version,
+      event: {
+        type: "WORKER_RECOVERY_REQUESTED",
+        recoveryId: "recovery_silent",
+        workerKind: "implementation",
+        resourceId: "thr_silent",
+        classification: "no_progress",
+        signature: "no_progress:implementation:active",
+        retryPayload: { retireResourceIds: ["thr_sibling_review"] },
+      },
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_005,
+    });
+    expect(recovering?.state).toBe("recovering_worker");
+    expect(store.getWorkerRecovery("recovery_silent")?.state).toBe("retiring");
+    db.prepare(
+      "UPDATE effects SET status = 'done' WHERE job_id = ? AND kind <> 'recover_worker'",
+    ).run(job.id);
+    const effect = store.leaseNextJobEffect({
+      jobId: job.id,
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_006,
+      leaseMs: 30_000,
+    });
+    if (!effect || effect.kind !== "recover_worker") throw new Error("recovery effect missing");
+    const retireWorker = vi.fn(async () => undefined);
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: { retireWorker },
+      now: () => 1_007,
+    }).run(effect);
+
+    expect(retireWorker.mock.calls).toEqual([
+      ["thr_silent", false],
+      ["thr_sibling_review", true],
+    ]);
+    expect(store.getWorkerRecovery("recovery_silent")?.state).toBe("requeued");
+    expect(store.getJob(job.id)).toMatchObject({
+      state: "creating_implementation",
+      implementationThreadId: null,
+      environmentId: "env_1",
+    });
+    expect(store.listEffectsForJob(job.id).some((candidate) =>
+      candidate.kind === "spawn_implementation" && candidate.status === "pending")).toBe(true);
+  });
+
   it("recovers an ordinary implementation thread by the centralized title bytes", async () => {
     const { store, db } = storeFixture();
     const job = selectedJobForRecovery(store, db, "job_ordinary_recovery", "creating_implementation");
@@ -122,6 +215,7 @@ describe("leased effect execution", () => {
     const title = "Telegram job_ordinary_recovery implementation attempt:job_ordinary_recovery:2:spawn_implementation";
     const decoyTitle = "Telegram job_ordinary_recovery implementation attempt:job_ordinary_recovery:2:spawn_implementation:decoy";
     const spawnImplementation = vi.fn(async () => ({ id: "thr_spawned_ordinary", environmentId: "env_spawned" }));
+    const prepareProgressScratchpad = vi.fn(async () => undefined);
     const listThreads = vi.fn(async () => ({
       threads: [{
         id: "thr_wrong_ordinary",
@@ -148,17 +242,106 @@ describe("leased effect execution", () => {
     await new EffectRunner({
       store,
       fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
-      bb: { listThreads, spawnImplementation },
+      bb: { listThreads, spawnImplementation, prepareProgressScratchpad },
       now: () => 1_002,
     }).run(claimed);
 
     expect(listThreads).toHaveBeenCalledWith(expect.objectContaining({ projectId: "proj_1" }));
     expect(spawnImplementation).not.toHaveBeenCalled();
+    expect(prepareProgressScratchpad).toHaveBeenCalledWith("env_ordinary");
     expect(store.getJob(job.id)).toMatchObject({
       state: "implementing",
       implementationThreadId: "thr_recovered_ordinary",
       environmentId: "env_ordinary",
     });
+  });
+
+  it.each([
+    ["shadow", "bug", ["systematic-debugging", "test-driven-development", "verification-before-completion"]],
+    ["active", "bug", ["systematic-debugging", "test-driven-development", "verification-before-completion"]],
+    ["active", "adopted-pr", ["verification-before-completion"]],
+  ] as const)(
+    "persists a least-capability profile before spawning a %s %s implementation worker",
+    async (routingMode, taskRecipe, expectedCapabilities) => {
+    const { store, db } = storeFixture();
+    const selected = selectedJobForRecovery(
+      store,
+      db,
+      `job_profiled_${routingMode}_${taskRecipe}`,
+      "creating_implementation",
+    );
+    if (!selected) throw new Error("job missing");
+    db.prepare(
+      `UPDATE jobs SET routing_mode = ?, task_recipe = ?,
+         task_traits_json = ?, task_reason_codes_json = ? WHERE id = ?`,
+    ).run(
+      routingMode,
+      taskRecipe,
+      JSON.stringify(taskRecipe === "bug" ? [{ id: "reproducible-bug", provenance: ["owner"] }] : []),
+      JSON.stringify(taskRecipe === "bug" ? ["owner_reproducible_bug"] : ["origin_adopted_pr"]),
+      selected.id,
+    );
+    const job = store.getJob(selected.id);
+    if (!job) throw new Error("profiled job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("spawn effect missing");
+    const expectedAttemptId = `attempt:${effect.idempotencyKey}`;
+    let attachedProfile: CapabilityWorkOrderEnvelope | undefined;
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      minimumModelPool: () => "strong",
+      bb: {
+        spawnImplementation: vi.fn(async (_activeJob, attempt) => {
+          expect(store.getLatestCapabilityProfile("worker_attempt", expectedAttemptId)).not.toBeNull();
+          attachedProfile = attempt.capabilityProfile;
+          return { id: "thr_profiled", environmentId: "env_profiled" };
+        }),
+      },
+    }).run(claimed);
+
+    const profile = store.getLatestCapabilityProfile("worker_attempt", expectedAttemptId);
+    expect(profile).toMatchObject({
+      subjectId: expectedAttemptId,
+      recipeId: taskRecipe,
+      recipeVersion: 1,
+      mode: routingMode,
+      revision: 1,
+      model: { pool: "strong", modelId: "gpt-5.6-sol" },
+    });
+    expect(profile?.assignments.map((assignment) => assignment.capabilityId)).toEqual(expectedCapabilities);
+    expect(attachedProfile).toMatchObject({
+      profileId: profile?.id,
+      profileRevision: 1,
+      recipeId: taskRecipe,
+      recipeVersion: 1,
+    });
+    expect(store.listCapabilityReceipts(profile?.id ?? "missing", 20)
+      .filter((receipt) => receipt.eventType === "selected")).toHaveLength(expectedCapabilities.length);
+    const nativeOutcomes = db.prepare(
+      `SELECT capability_id, outcome FROM capability_receipts
+        WHERE capability_kind = 'native-adapter' AND event_type = 'outcome'
+        ORDER BY capability_id ASC`,
+    ).all();
+    expect(nativeOutcomes).toEqual(routingMode === "active"
+      ? [
+          { capability_id: "hanoon-native-using-git-worktrees", outcome: "passed" },
+          { capability_id: "hanoon-native-using-superpowers", outcome: "passed" },
+        ]
+      : []);
   });
 
   it("recovers a pipeline planner thread by the same centralized title bytes", async () => {
@@ -225,6 +408,127 @@ describe("leased effect execution", () => {
       threadId: "thr_recovered_pipeline",
       environmentId: "env_pipeline",
     });
+  });
+
+  it("leaves an active model trial unresolved when the provider result has no usable environment", async () => {
+    const { store, db } = storeFixture();
+    const selected = selectedJobForRecovery(store, db, "job_invalid_provider_result", "creating_implementation");
+    if (!selected) throw new Error("job missing");
+    db.prepare(
+      `UPDATE jobs SET routing_mode = 'active', task_recipe = 'direct', delivery_mode = 'small_fix',
+         task_traits_json = '[]', task_reason_codes_json = '[]' WHERE id = ?`,
+    ).run(selected.id);
+    const effect: JobEffect = {
+      idempotencyKey: `${selected.id}:2:spawn_implementation`,
+      jobId: selected.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, selected.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("spawn effect missing");
+
+    await expect(new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      bb: { spawnImplementation: vi.fn(async () => ({ id: "thr_unbound", environmentId: null })) },
+    }).run(claimed)).rejects.toThrow(/environment id/i);
+
+    expect(store.listModelRouteTrials(
+      "worker_attempt",
+      `attempt:${effect.idempotencyKey}`,
+      10,
+    )).toMatchObject([{ attempt: 1, outcome: "selected", failureSignature: null }]);
+    expect(store.getJob(selected.id)).toMatchObject({ state: "creating_implementation" });
+  });
+
+  it("durably escalates a new model route only after two equivalent provider failures", async () => {
+    const { store, db } = storeFixture();
+    const selected = selectedJobForRecovery(store, db, "job_model_escalation", "creating_implementation");
+    if (!selected) throw new Error("job missing");
+    db.prepare(
+      `UPDATE jobs SET routing_mode = 'active', task_recipe = 'direct', delivery_mode = 'small_fix',
+         task_traits_json = '[]', task_reason_codes_json = '[]' WHERE id = ?`,
+    ).run(selected.id);
+    const job = store.getJob(selected.id);
+    if (!job) throw new Error("selected job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const exactModels: string[] = [];
+    const spawnImplementation = vi.fn(async (_activeJob, attempt: { capabilityProfile?: CapabilityWorkOrderEnvelope }) => {
+      exactModels.push(attempt.capabilityProfile?.model?.modelId ?? "missing");
+      if (exactModels.length <= 2) throw new Error("HTTP 503 provider unavailable for request volatile-id");
+      return { id: "thr_model_escalated", environmentId: "env_model_escalated" };
+    });
+    const attemptId = `attempt:${effect.idempotencyKey}`;
+
+    const runFailedAttempt = async (claimed: StoredEffect, now: number): Promise<void> => {
+      let providerFailure: unknown;
+      try {
+        await new EffectRunner({
+          store,
+          fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+          now: () => now,
+          bb: { spawnImplementation },
+        }).run(claimed);
+      } catch (error) {
+        providerFailure = error;
+      }
+      expect(providerFailure).toBeInstanceOf(Error);
+      expect(settleEffectFailure(
+        store,
+        claimed,
+        "owner-a",
+        lease.generation,
+        now,
+        providerFailure,
+        () => 0,
+      )).toBe(true);
+    };
+
+    const first = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)[0];
+    if (!first) throw new Error("first model attempt missing");
+    await runFailedAttempt(first, 1_002);
+    const second = leaseEffectsForTest(store, "owner-a", lease.generation, 2_000, 10, 30_000)[0];
+    if (!second) throw new Error("second model attempt missing");
+    await runFailedAttempt(second, 2_001);
+    const third = leaseEffectsForTest(store, "owner-a", lease.generation, 4_000, 10, 30_000)[0];
+    if (!third) throw new Error("third model attempt missing");
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 4_001,
+      bb: { spawnImplementation },
+    }).run(third);
+
+    expect(exactModels).toEqual(["gpt-5.6-luna", "gpt-5.6-luna", "gpt-5.6-terra"]);
+    expect(store.listModelRouteTrials("worker_attempt", attemptId, 10)).toMatchObject([
+      { attempt: 1, route: { pool: "fast" }, outcome: "failed", failureSignature: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      { attempt: 2, route: { pool: "fast" }, outcome: "failed", failureSignature: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      { attempt: 3, route: { pool: "standard" }, outcome: "passed", failureSignature: null },
+    ]);
+    const profiles = db.prepare(
+      `SELECT id, revision, model_pool FROM capability_profiles
+        WHERE subject_kind = 'worker_attempt' AND subject_id = ? ORDER BY revision`,
+    ).all(attemptId) as Array<{ id: string; revision: number; model_pool: string }>;
+    expect(profiles.map(({ revision, model_pool: modelPool }) => ({ revision, modelPool }))).toEqual([
+      { revision: 1, modelPool: "fast" },
+      { revision: 2, modelPool: "standard" },
+    ]);
+    expect(store.listMissingMandatoryCapabilityOutcomes(profiles[0]!.id)).toEqual([]);
   });
 
   it("allows exactly one executor generation to win a race", () => {
@@ -562,6 +866,10 @@ describe("leased effect execution", () => {
       type: "PROJECT_SELECTED", projectId: "proj_1", policyVersion: 1, policy: policyFixture(),
     }, 1_001);
     admitConfirmedJob(store, store.getJob(job.id)!, 1_002);
+    db.prepare(
+      `UPDATE jobs SET routing_mode = 'active', task_recipe = 'architectural', delivery_mode = 'full',
+         task_traits_json = '[]', task_reason_codes_json = '[]' WHERE id = ?`,
+    ).run(job.id);
     const effect = store.listEffectsForJob(job.id).find((item) => item.kind === "spawn_plan");
     if (!effect) throw new Error("spawn effect missing");
     const lease = store.acquireExecutorLease("owner-a", 1_003, 30_000);
@@ -589,6 +897,9 @@ describe("leased effect execution", () => {
       threadId: "thr_plan",
       environmentId: "env_1",
     });
+    expect(store.listModelRouteTrials("worker_attempt", `stage:${effect.idempotencyKey}`, 10)).toMatchObject([
+      { attempt: 1, route: { pool: "strong", modelId: "gpt-5.6-sol" }, outcome: "passed" },
+    ]);
     expect(db.prepare("SELECT COUNT(*) AS count FROM effects WHERE kind = 'spawn_plan'").get()).toEqual({ count: 1 });
   });
 
@@ -678,6 +989,22 @@ describe("leased effect execution", () => {
         headSha: "a".repeat(40),
         originRepository: "acme/cyndra",
         commandReceipts: [{ command: "npm test", outcome: "pass" as const, exitCode: 0, output: "42 passed" }],
+        githubPr: {
+          number: 7,
+          url: "https://github.com/acme/cyndra/pull/7",
+          state: "OPEN",
+          isDraft: false,
+          baseRefName: "main",
+          headRefName: "feature/test",
+          mergeStateStatus: "CLEAN",
+          mergeable: "MERGEABLE",
+          reviewDecision: null,
+          changedFiles: 1,
+          additions: 1,
+          deletions: 0,
+          mergeCommit: null,
+          mergedAt: null,
+        },
         requiredChecks: [{ name: "test", bucket: "pass", state: "SUCCESS", link: null }],
         validationOutcome: "pass" as const,
         completedAt: "2026-08-10T00:00:00.000Z",
@@ -694,6 +1021,311 @@ describe("leased effect execution", () => {
       endSha: "a".repeat(40),
       outcome: expect.objectContaining({ validationOutcome: "pass", headSha: "a".repeat(40) }),
     });
+  });
+
+  it("persists authoritative PR-head evidence before advancing to validation", async () => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_head", sourceUpdateId: 91, requestText: "work", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = 'resolving_pr_head', project_id = 'proj_1', policy_version = 1, policy_json = ?,
+         environment_id = 'env_1', pr_number = 7, pr_url = 'https://github.com/acme/cyndra/pull/7',
+         version = 2 WHERE id = ?`,
+    ).run(JSON.stringify(policyFixture()), job.id);
+    const effect: JobEffect = {
+      idempotencyKey: "job_head:3:resolve_pr_head",
+      jobId: job.id,
+      kind: "resolve_pr_head",
+      payload: { prNumber: 7 },
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("head effect missing");
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      resolvePrHead: vi.fn(async () => ({
+        event: "PR_HEAD_RESOLVED" as const,
+        headSha: "a".repeat(40),
+        originRepository: "acme/cyndra",
+      })),
+    }).run(claimed);
+
+    expect(store.getJob(job.id)).toMatchObject({ state: "validating", prHeadSha: "a".repeat(40) });
+    expect(store.getLatestPipelineStageAttempt(job.id, "BUILD")).toMatchObject({
+      state: "completed",
+      startSha: "a".repeat(40),
+      endSha: "a".repeat(40),
+      outcome: {
+        verdict: "success",
+        prNumber: 7,
+        headSha: "a".repeat(40),
+        originRepository: "acme/cyndra",
+      },
+    });
+  });
+
+  it.each([
+    ["full", ["quality", "risk"]],
+    ["small_fix", ["quality"]],
+  ] as const)("spawns the required %s review lenses at the same head", async (deliveryMode, expectedLenses) => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: `job_review_${deliveryMode}`, sourceUpdateId: deliveryMode === "full" ? 92 : 93, requestText: "work", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = 'reviewing', project_id = 'proj_1', policy_version = 1, policy_json = ?,
+         delivery_mode = ?, environment_id = 'env_1', implementation_thread_id = 'thr_impl',
+         pr_number = 7, pr_url = 'https://github.com/acme/cyndra/pull/7', pr_head_sha = ?, version = 2
+       WHERE id = ?`,
+    ).run(JSON.stringify(policyFixture()), deliveryMode, "a".repeat(40), job.id);
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:3:spawn_review`,
+      jobId: job.id,
+      kind: "spawn_review",
+      payload: { headSha: "a".repeat(40) },
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)[0];
+    if (!claimed) throw new Error("review effect missing");
+    const spawned: string[] = [];
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      bb: {
+        spawnReview: vi.fn(async (_job, attempt) => {
+          spawned.push(attempt.id);
+          return { id: `thr_${attempt.id}`, environmentId: "env_1" };
+        }),
+      },
+    }).run(claimed);
+
+    const attempts = store.listReviewAttempts(job.id, "review", 1);
+    expect(attempts.map((attempt) => attempt.reviewLens)).toEqual(expectedLenses);
+    expect(attempts.every((attempt) => attempt.headSha === "a".repeat(40) && attempt.threadId !== null)).toBe(true);
+    expect(spawned).toHaveLength(expectedLenses.length);
+    expect(store.getJob(job.id)?.reviewThreadId).toBe(attempts[0].threadId);
+  });
+
+  it("selects active review guards from the exact observed change surface", async () => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_profiled_review", sourceUpdateId: 194, requestText: "review", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = 'reviewing', project_id = 'proj_1', policy_version = 1, policy_json = ?,
+         delivery_mode = 'full', routing_mode = 'active', task_recipe = 'bounded',
+         task_traits_json = '[]', task_reason_codes_json = '[]',
+         environment_id = 'env_1', implementation_thread_id = 'thr_impl',
+         pr_number = 7, pr_url = 'https://github.com/acme/cyndra/pull/7', pr_head_sha = ?, version = 2
+       WHERE id = ?`,
+    ).run(JSON.stringify(policyFixture()), "a".repeat(40), job.id);
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:3:spawn_review`,
+      jobId: job.id,
+      kind: "spawn_review",
+      payload: { headSha: "a".repeat(40) },
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)[0];
+    if (!claimed) throw new Error("review effect missing");
+    const attachedSkills: string[][] = [];
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      minimumModelPool: () => "strong",
+      bb: {
+        getEnvironmentSnapshot: vi.fn(async () => ({
+          status: { outcome: "available" } as never,
+          diff: {
+            outcome: "available",
+            diff: {
+              diff: [
+                "diff --git a/src/feature.ts b/src/feature.ts",
+                "+++ b/src/feature.ts",
+                String.raw`diff --git "a/tests/\303\251xample.test.ts" "b/tests/\303\251xample.test.ts"`,
+                String.raw`+++ "b/tests/\303\251xample.test.ts"`,
+              ].join("\n"),
+              truncated: false,
+            },
+          } as never,
+        })),
+        spawnReview: vi.fn(async (_activeJob, attempt) => {
+          const profile = store.getActiveCapabilityProfile("worker_attempt", attempt.id);
+          attachedSkills.push(profile?.assignments.map((assignment) => assignment.capabilityId) ?? []);
+          expect(attempt.capabilityProfile?.profileId).toBe(profile?.id);
+          expect(profile?.model).toMatchObject({ pool: "strong", modelId: "gpt-5.6-sol" });
+          return { id: `thr_${attempt.id}`, environmentId: "env_1" };
+        }),
+      },
+    }).run(claimed);
+
+    expect(attachedSkills).toEqual([
+      ["clean-code-guard", "test-guard"],
+      [],
+    ]);
+    expect(db.prepare(
+      `SELECT capability_id, outcome FROM capability_receipts
+        WHERE capability_kind = 'native-adapter' AND event_type = 'outcome'
+        ORDER BY capability_id ASC`,
+    ).all()).toEqual([
+      { capability_id: "hanoon-native-dispatching-parallel-agents", outcome: "passed" },
+      { capability_id: "hanoon-native-requesting-code-review", outcome: "passed" },
+      { capability_id: "hanoon-native-using-superpowers", outcome: "passed" },
+    ]);
+  });
+
+  it.each([
+    ["reviewing", "spawn_review", "spawnReview"],
+    ["final_reviewing", "spawn_final_review", "spawnFinalReview"],
+  ] as const)(
+    "reconstructs one atomic native profile when %s review registration crashes",
+    async (state, effectKind, spawnMethod) => {
+      const { store, db } = storeFixture();
+      const job = store.createJob({
+        id: `job_review_crash_${state}`,
+        sourceUpdateId: state === "reviewing" ? 296 : 297,
+        requestText: "review",
+        now: 1_000,
+      });
+      db.prepare(
+        `UPDATE jobs SET state = ?, project_id = 'proj_1', policy_version = 1, policy_json = ?,
+           delivery_mode = 'full', routing_mode = 'active', task_recipe = 'architectural',
+           task_traits_json = '[]', task_reason_codes_json = '[]',
+           environment_id = 'env_1', implementation_thread_id = 'thr_impl', review_thread_id = NULL,
+           pr_number = 7, pr_url = 'https://github.com/acme/cyndra/pull/7', pr_head_sha = ?, version = 2
+         WHERE id = ?`,
+      ).run(state, JSON.stringify(policyFixture()), "a".repeat(40), job.id);
+      const effect: JobEffect = {
+        idempotencyKey: `${job.id}:3:${effectKind}`,
+        jobId: job.id,
+        kind: effectKind,
+        payload: { headSha: "a".repeat(40) },
+      };
+      db.prepare(
+        `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+      ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+      const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+      if (!lease.acquired) throw new Error("lease missing");
+      const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)[0];
+      if (!claimed) throw new Error("review effect missing");
+      const spawn = vi.fn(async (_activeJob, attempt: { id: string }) => ({
+        id: `thr_${attempt.id}`,
+        environmentId: "env_1",
+      }));
+      const bb = {
+        getEnvironmentSnapshot: vi.fn(async () => ({
+          status: { outcome: "available" } as never,
+          diff: {
+            outcome: "available",
+            diff: { diff: "diff --git a/src/a.ts b/src/a.ts\n+++ b/src/a.ts", truncated: false },
+          } as never,
+        })),
+        [spawnMethod]: spawn,
+      };
+      const crash = vi.spyOn(store, "registerExecutorReviewThread")
+        .mockImplementationOnce(() => { throw new Error("simulated crash after REVIEW_STARTED"); });
+
+      await expect(new EffectRunner({
+        store,
+        fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+        now: () => 1_002,
+        bb,
+      }).run(claimed)).rejects.toThrow(/simulated crash/i);
+      crash.mockRestore();
+
+      expect(store.getJob(job.id)).toMatchObject({ state, reviewThreadId: null, version: 3 });
+      expect(spawn).toHaveBeenCalledTimes(2);
+      expect(db.prepare(
+        `SELECT COUNT(DISTINCT profile_id) AS count FROM capability_receipts
+          WHERE capability_kind = 'native-adapter' AND event_type = 'outcome'`,
+      ).get()).toEqual({ count: 1 });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM capability_receipts
+          WHERE capability_kind = 'native-adapter' AND event_type = 'outcome'`,
+      ).get()).toEqual({ count: 3 });
+
+      const retryRunner = new EffectRunner({
+        store,
+        fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+        now: () => 1_003,
+        bb,
+      });
+      await retryRunner.run(claimed);
+      const reconstructed = store.getJob(job.id);
+      expect(reconstructed).toMatchObject({ state, reviewThreadId: expect.stringMatching(/^thr_/) });
+      expect(spawn).toHaveBeenCalledTimes(2);
+      const reconstructedVersion = reconstructed?.version;
+
+      await retryRunner.run(claimed);
+      expect(store.getJob(job.id)?.version).toBe(reconstructedVersion);
+      expect(spawn).toHaveBeenCalledTimes(2);
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM capability_receipts
+          WHERE capability_kind = 'native-adapter' AND event_type = 'outcome'`,
+      ).get()).toEqual({ count: 3 });
+    },
+  );
+
+  it("fails closed before active review spawn when the exact diff is unavailable", async () => {
+    const { store, db } = storeFixture();
+    const job = store.createJob({ id: "job_missing_review_diff", sourceUpdateId: 195, requestText: "review", now: 1_000 });
+    db.prepare(
+      `UPDATE jobs SET state = 'reviewing', project_id = 'proj_1', policy_version = 1, policy_json = ?,
+         delivery_mode = 'small_fix', routing_mode = 'active', task_recipe = 'direct',
+         task_traits_json = '[]', task_reason_codes_json = '[]',
+         environment_id = 'env_1', implementation_thread_id = 'thr_impl',
+         pr_number = 7, pr_url = 'https://github.com/acme/cyndra/pull/7', pr_head_sha = ?, version = 2
+       WHERE id = ?`,
+    ).run(JSON.stringify(policyFixture()), "a".repeat(40), job.id);
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:3:spawn_review`,
+      jobId: job.id,
+      kind: "spawn_review",
+      payload: { headSha: "a".repeat(40) },
+    };
+    db.prepare(
+      `INSERT INTO effects (idempotency_key, job_id, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', 0, 1000, 1000, 1000)`,
+    ).run(effect.idempotencyKey, effect.jobId, effect.kind, JSON.stringify(effect.payload));
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)[0];
+    if (!claimed) throw new Error("review effect missing");
+    const spawnReview = vi.fn(async () => ({ id: "thr_review", environmentId: "env_1" }));
+
+    await expect(new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      bb: {
+        getEnvironmentSnapshot: vi.fn(async () => ({
+          status: { outcome: "available" } as never,
+          diff: { outcome: "available", diff: { diff: "partial", truncated: true } } as never,
+        })),
+        spawnReview,
+      },
+    }).run(claimed)).rejects.toThrow(/exact review change surface/i);
+
+    expect(spawnReview).not.toHaveBeenCalled();
   });
 
   it("blocks cancellation when the stopped BB worker never reaches a terminal state", async () => {
@@ -760,6 +1392,63 @@ describe("leased effect execution", () => {
     });
     expect(store.getWorkerLiveness(job.id)?.state).toBe("stopping");
     expect(cancelled.cancelRequestedAt).not.toBeNull();
+  });
+
+  it("stops and confirms every active reviewer before cancelling a two-lens job", async () => {
+    const { store, db } = storeFixture();
+    const draft = store.createJob({ id: "job_review_cancel", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    db.prepare(
+      "UPDATE jobs SET state = 'reviewing', review_thread_id = ?, version = ?, updated_at = ? WHERE id = ?",
+    ).run("thr_quality", 2, 1_000, draft.id);
+    const current = store.getJob(draft.id);
+    if (!current) throw new Error("job missing");
+    const workers = ["thr_quality", "thr_risk"].map((resourceId) => ({
+      jobId: current.id,
+      workerKind: "review" as const,
+      resourceKind: "bb_thread" as const,
+      resourceId,
+      generation: 204,
+      state: "active" as const,
+      sourceUpdatedAt: 1_000,
+      observedAt: 1_000,
+      staleNotifiedAt: null,
+    }));
+    for (const worker of workers) store.upsertWorkerLiveness(worker);
+    store.applyJobEvent(current.id, current.version, {
+      type: "CANCEL_REQUESTED",
+      activeWorker: workers[0],
+      activeWorkers: workers,
+    }, 1_001);
+    const effect = store.listEffectsForJob(current.id).find((item) => item.kind === "stop_thread");
+    if (!effect) throw new Error("stop effect missing");
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("executor lease missing");
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((item) => item.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("stop effect was not leased");
+    const stopWorker = vi.fn(async (_worker: WorkerLiveness) => undefined);
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: {
+        stopWorker,
+        getThread: vi.fn(async (threadId: string) => ({
+          id: threadId,
+          projectId: "proj_1",
+          environmentId: null,
+          parentThreadId: null,
+          title: "review",
+          status: "idle",
+          updatedAt: 1_002,
+          runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
+        })),
+      },
+      now: () => 1_002,
+    }).run(claimed);
+
+    expect(stopWorker.mock.calls.map(([worker]) => worker.resourceId)).toEqual(["thr_quality", "thr_risk"]);
+    expect(store.getJob(current.id)?.state).toBe("cancelled");
   });
 });
 

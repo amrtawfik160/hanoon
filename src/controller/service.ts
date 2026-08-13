@@ -1,8 +1,10 @@
 import type { TelegramAgentStore } from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
+import { containsForbiddenCallbackMaterial } from "../telegram/callback-material";
 import {
   ControllerImagePreparationError,
   type ControllerAdapter,
+  type ControllerEventObservation,
   type ControllerLocation,
   type ControllerStatus,
 } from "./bb-controller";
@@ -10,6 +12,7 @@ import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { projectControllerStream } from "./stream";
 import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
+import { enforceControllerPromiseGate } from "./promise-gate";
 
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
@@ -18,11 +21,16 @@ export type LunaControllerServiceDependencies = {
 };
 
 const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
+const CONTROLLER_THINKING_DRAFT_REFRESH_MS = 2_000;
 // How long a queued message may wait for a busy controller thread before the
 // owner is told it will not be answered.
 const CONTROLLER_BUSY_WAIT_MS = 10 * 60_000;
 const CONTROLLER_IMAGE_FAILURE_MESSAGE =
-  "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.";
+  "I couldn't read that photo or clip. Please resend a smaller JPEG, PNG, WebP, GIF, or short video.";
+const CONTROLLER_UNSAFE_RESPONSE_MESSAGE =
+  "I couldn't return that response safely. Please ask again.";
+const CONTROLLER_MODELS_UNAVAILABLE_MESSAGE =
+  "I couldn't connect using any configured controller model. Check provider login or change the controller fallback models in Settings, then resend.";
 /**
  * How long a submitted turn may go without producing a single BB event before
  * it is treated as wedged. Any event at all — reasoning, a tool call, output —
@@ -50,6 +58,14 @@ function fenceAt(fence: EffectFence, now: number) {
   return { ownerId: fence.ownerId, generation: fence.generation, now };
 }
 
+function controllerFallbackIsSafe(observation: ControllerEventObservation): boolean {
+  return !observation.inputAccepted && !observation.completed &&
+    observation.assistantDelta.trim().length === 0 &&
+    (observation.thinkingDelta ?? "").trim().length === 0 &&
+    observation.pendingQuestion === null && observation.toolCalls === 0 &&
+    observation.commandFailures === 0;
+}
+
 export class LunaControllerService {
   public constructor(private readonly dependencies: LunaControllerServiceDependencies) {}
 
@@ -71,7 +87,11 @@ export class LunaControllerService {
     if (controller.threadId !== null) {
       let status: ControllerStatus;
       try {
-        status = await this.dependencies.adapter.status(controller.threadId, signal);
+        status = await this.dependencies.adapter.status(
+          controller.threadId,
+          signal,
+          turn.modelFallbackIndex,
+        );
       } catch {
         this.fail(turn, fence, "Controller status could not be verified");
         return true;
@@ -205,7 +225,11 @@ export class LunaControllerService {
 
     let status: ControllerStatus;
     try {
-      status = await this.dependencies.adapter.status(controller.threadId, signal);
+      status = await this.dependencies.adapter.status(
+        controller.threadId,
+        signal,
+        submitted.modelFallbackIndex,
+      );
     } catch {
       return false;
     }
@@ -249,10 +273,15 @@ export class LunaControllerService {
     // would only replace the question with stale half-written output.
     const parked = this.dependencies.store.getControllerTurn(submitted.id)?.awaitingInteractionId ?? null;
     if (parked === null) {
+      const quietPreview = submitted.streamText.trim().length === 0 &&
+        (submitted.streamPhase === "queued" || submitted.streamPhase === "connecting" ||
+          submitted.streamPhase === "thinking" || submitted.streamPhase === "using_tools");
       this.dependencies.store.refreshControllerDraft({
         ...fenceAt(fence, refreshedAt),
         turnId: submitted.id,
-        sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
+        sentBefore: Math.max(0, refreshedAt - (
+          quietPreview ? CONTROLLER_THINKING_DRAFT_REFRESH_MS : CONTROLLER_DRAFT_REFRESH_MS
+        )),
       });
     }
     if (status === "active" || status === "starting" || status === "stopping") {
@@ -290,6 +319,12 @@ export class LunaControllerService {
         // Retiring the thread is the half that matters. Failing only the turn
         // leaves the wedge in place, and every later message then waits out the
         // busy timeout against a thread that will never go idle.
+        try {
+          await this.dependencies.adapter.stop?.(controller.threadId, signal);
+        } catch {
+          // The durable retirement below still prevents the next message from
+          // being routed back into the wedged provider session.
+        }
         this.dependencies.store.resetControllerThread({
           ...fenceAt(fence, this.dependencies.clock.now()),
           controllerKey: controller.controllerKey,
@@ -328,12 +363,17 @@ export class LunaControllerService {
         }
       }
       if (observation !== null) {
-        if (!observation.inputAccepted && submitted.retryCount === 0) {
+        const nextFallbackIndex = submitted.modelFallbackIndex + 1;
+        if (
+          controllerFallbackIsSafe(observation) &&
+          this.dependencies.adapter.hasExecutionProfile(nextFallbackIndex)
+        ) {
           if (this.dependencies.store.retryUnacceptedControllerTurn({
             ...fenceAt(fence, this.dependencies.clock.now()),
             turnId: submitted.id,
             controllerKey: controller.controllerKey,
             expectedThreadId: controller.threadId,
+            nextFallbackIndex,
           })) return true;
         }
         // The turn window spans the whole answer here, so an answer BB already
@@ -341,11 +381,7 @@ export class LunaControllerService {
         const answered = observation.completed && observation.error === null
           ? boundedResponse(observation.assistantDelta)
           : null;
-        if (answered && this.dependencies.store.completeControllerTurn({
-          ...fenceAt(fence, this.dependencies.clock.now()),
-          turnId: submitted.id,
-          responseText: answered,
-        })) {
+        if (answered && this.settleResponse(submitted, answered, fence)) {
           this.dependencies.store.resetControllerThread({
             ...fenceAt(fence, this.dependencies.clock.now()),
             controllerKey: controller.controllerKey,
@@ -361,7 +397,37 @@ export class LunaControllerService {
         expectedThreadId: controller.threadId,
         reason: "Provider turn failed",
       });
-      this.fail(submitted, fence, "Controller provider turn failed");
+      this.fail(
+        submitted,
+        fence,
+        "Controller provider turn failed",
+        observation !== null && controllerFallbackIsSafe(observation)
+          ? CONTROLLER_MODELS_UNAVAILABLE_MESSAGE
+          : undefined,
+      );
+      return true;
+    }
+
+    const current = this.dependencies.store.getControllerTurn(submitted.id);
+    if (current?.capabilityContinuationState === "requested") {
+      try {
+        await this.dependencies.adapter.stop?.(controller.threadId, signal);
+      } catch {
+        // An idle provider cannot make another tool call. Durable retirement
+        // below still prevents it from being adopted for the continuation.
+      }
+      if (this.dependencies.store.prepareControllerCapabilityContinuation({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: current.id,
+        controllerKey: controller.controllerKey,
+        expectedThreadId: controller.threadId,
+      })) return true;
+      this.fail(
+        current,
+        fence,
+        "Controller capability continuation could not prove a safe session boundary",
+        "I couldn't safely activate the requested capability, so I stopped this turn.",
+      );
       return true;
     }
 
@@ -370,11 +436,7 @@ export class LunaControllerService {
       this.fail(submitted, fence, "Controller completed without a usable response");
       return true;
     }
-    if (!this.dependencies.store.completeControllerTurn({
-      ...fenceAt(fence, this.dependencies.clock.now()),
-      turnId: submitted.id,
-      responseText: response,
-    })) {
+    if (!this.settleResponse(submitted, response, fence)) {
       throw new Error("Controller turn changed before its response was recorded");
     }
     return true;
@@ -417,7 +479,14 @@ export class LunaControllerService {
       });
     }
     // Retiring the thread is the half that matters: a turn stopped for cost
-    // that left its thread alive would let the next message resume the loop.
+    // that left its provider alive could keep calling tools after its durable
+    // authorization disappeared. Stop it first; retirement still proceeds if
+    // BB cannot confirm the stop.
+    try {
+      await this.dependencies.adapter.stop?.(controller.threadId, signal);
+    } catch {
+      // Resetting the mapping and failing the turn remains the safe fallback.
+    }
     this.dependencies.store.resetControllerThread({
       ...fenceAt(fence, this.dependencies.clock.now()),
       controllerKey: controller.controllerKey,
@@ -439,9 +508,13 @@ export class LunaControllerService {
     // title match cannot prove that the image was attached, and adopting it
     // would silently drop the image. Recovery after an uncertain actual spawn
     // remains available in the catch block below.
-    if (!turn.image) {
+    if (!turn.image && turn.capabilityProfileRevision === 0) {
       try {
-        candidate = await this.dependencies.adapter.findSpawnCandidate(controller.controllerKey, signal);
+        candidate = await this.dependencies.adapter.findSpawnCandidate(
+          controller.controllerKey,
+          signal,
+          turn.modelFallbackIndex,
+        );
       } catch {
         this.fail(turn, fence, "Controller spawn candidates are ambiguous");
         return null;
@@ -455,10 +528,16 @@ export class LunaControllerService {
       return await this.dependencies.adapter.spawn(seeded, controller, signal);
     } catch (error) {
       if (this.handleImagePreparationError(error, turn, fence, signal)) return null;
-      try {
-        candidate = await this.dependencies.adapter.findSpawnCandidate(controller.controllerKey, signal);
-      } catch {
-        candidate = null;
+      if (turn.capabilityProfileRevision === 0) {
+        try {
+          candidate = await this.dependencies.adapter.findSpawnCandidate(
+            controller.controllerKey,
+            signal,
+            turn.modelFallbackIndex,
+          );
+        } catch {
+          candidate = null;
+        }
       }
       if (candidate) return candidate;
       this.fail(turn, fence, "Controller spawn outcome is uncertain");
@@ -475,7 +554,10 @@ export class LunaControllerService {
       turnId: turn.id,
       now: this.dependencies.clock.now(),
     });
-    return composeTurnInput(context, turn.inputText);
+    const input = composeTurnInput(context, turn.inputText);
+    return turn.capabilityContinuationState === "relaunching"
+      ? `Resume the same owner request after the approved capability relaunch. Use only the capabilities configured for this fresh session.\n\n${input}`
+      : input;
   }
 
   private waitForIdle(turn: ControllerTurnRecord, fence: EffectFence): void {
@@ -494,6 +576,26 @@ export class LunaControllerService {
       "Controller image preparation failed",
       CONTROLLER_IMAGE_FAILURE_MESSAGE,
     );
+  }
+
+  private settleResponse(turn: ControllerTurnRecord, response: string, fence: EffectFence): boolean {
+    if (containsForbiddenCallbackMaterial(response)) {
+      return this.fail(
+        turn,
+        fence,
+        "Controller response contained protected callback material",
+        CONTROLLER_UNSAFE_RESPONSE_MESSAGE,
+      );
+    }
+    const gated = enforceControllerPromiseGate(
+      response,
+      this.dependencies.store.listToolReceipts(turn.id),
+    );
+    return this.dependencies.store.completeControllerTurn({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      responseText: gated.response,
+    });
   }
 
   private handleImagePreparationError(
@@ -523,8 +625,8 @@ export class LunaControllerService {
     fence: EffectFence,
     error: string,
     ownerMessage?: string,
-  ): void {
-    this.dependencies.store.failControllerTurn({
+  ): boolean {
+    return this.dependencies.store.failControllerTurn({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       error,

@@ -66,3 +66,36 @@ export function formattedMessage(text: string): { text: string; parse_mode?: "HT
   if (rendered === text) return { text };
   return rendered.length <= TELEGRAM_TEXT_LIMIT ? { text: rendered, parse_mode: "HTML" } : { text };
 }
+
+export function telegramSafeTitle(title: string): string {
+  const cleaned = title.replace(/[*_~`[\]]/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned.length > 0 ? cleaned.slice(0, 180) : "Untitled thread";
+}
+
+/** An empty keyboard prevents taps after BB has already closed the interaction. */
+export function renderThreadInteractionRetired(title: string): {
+  text: string;
+  parse_mode: "HTML";
+  disable_web_page_preview: true;
+  reply_markup: { inline_keyboard: never[] };
+} {
+  const clipped = title.length <= 180 ? title : `${title.slice(0, 179)}…`;
+  return {
+    text: `<b>${escapeHtml(clipped)}</b> was answered in BB.`,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: [] },
+  };
+}
+
+export function renderThreadLifecycleNotice(
+  title: string,
+  notice: "finished" | "failed",
+): { text: string; parse_mode: "HTML"; disable_web_page_preview: true } {
+  const clipped = title.length <= 180 ? title : `${title.slice(0, 179)}…`;
+  return {
+    text: `<b>${escapeHtml(clipped)}</b> ${notice}.`,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+}

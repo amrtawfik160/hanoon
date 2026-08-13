@@ -34,7 +34,7 @@ function acquire(store: ReturnType<typeof openStore>) {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(28);
+  expect(ALL_MIGRATIONS).toHaveLength(40);
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -68,6 +68,22 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[25]).toContain("sealed_at");
   expect(ALL_MIGRATIONS[26]).toContain("ADD COLUMN origin");
   expect(ALL_MIGRATIONS[27]).toContain("CREATE TABLE production_health");
+  expect(ALL_MIGRATIONS[28]).toContain("'CONTINUE_REVIEW', 'RETRY'");
+  expect(ALL_MIGRATIONS[29]).toContain("image_kind");
+  expect(ALL_MIGRATIONS[30]).toContain("delivery_mode");
+  expect(ALL_MIGRATIONS[31]).toContain("CREATE TABLE worker_recoveries");
+  expect(ALL_MIGRATIONS[32]).toContain("adopted_branch");
+  expect(ALL_MIGRATIONS[33]).toContain("review_lens");
+  expect(ALL_MIGRATIONS[34]).toContain("PRIMARY KEY(job_id, resource_id)");
+  expect(ALL_MIGRATIONS[35]).toContain("CREATE TABLE capability_profiles");
+  expect(ALL_MIGRATIONS[35]).toContain("CREATE VIEW skill_receipts");
+  expect(ALL_MIGRATIONS[35]).not.toContain("settled_at");
+  expect(ALL_MIGRATIONS[36]).toContain("ADD COLUMN task_recipe");
+  expect(ALL_MIGRATIONS[36]).toContain("routing_mode");
+  expect(ALL_MIGRATIONS[37]).toContain("capability_continuation_count");
+  expect(ALL_MIGRATIONS[38]).toContain("CREATE TABLE recipe_promotion_evidence_manifests");
+  expect(ALL_MIGRATIONS[38]).toContain("ALTER TABLE model_route_trials ADD COLUMN settled_at");
+  expect(ALL_MIGRATIONS[39]).toContain("model_fallback_index");
 });
 
 it("enqueues Telegram controller turns idempotently and rejects changed replay input", () => {
@@ -90,6 +106,7 @@ it("enqueues Telegram controller turns idempotently and rejects changed replay i
     state: "queued",
     dispatchAfterSeq: 0,
     retryCount: 0,
+    modelFallbackIndex: 0,
     bbEventSeq: 0,
     streamText: "",
     telegramMessageId: null,
@@ -124,6 +141,28 @@ it("claims exactly one FIFO turn while a controller turn is dispatching or submi
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ updateId: 202, ordinal: 2 });
 });
 
+it("persists a Telegram animation and its preview still", () => {
+  const { store } = fixture();
+  const image = {
+    fileId: "animation-file-id",
+    fileName: "telegram-clip.mp4",
+    mimeType: "video/mp4" as const,
+    sizeBytes: 400_000,
+    kind: "animation" as const,
+    durationSeconds: 3,
+    thumbnail: {
+      fileId: "thumb-file-id",
+      fileName: "telegram-clip-thumb.jpg",
+      sizeBytes: 12_000,
+    },
+  };
+
+  expect(store.enqueueControllerTurn({ ...turnInput(110, "look at this"), image })).toMatchObject({
+    inputText: "look at this",
+    image,
+  });
+});
+
 it("counts a retryable image preparation failure while returning the turn to the queue", () => {
   const { store } = fixture();
   const turn = store.enqueueControllerTurn({
@@ -140,7 +179,11 @@ it("counts a retryable image preparation failure while returning the turn to the
 
   expect(store.recordControllerImagePreparationFailure({ ...fence, turnId: turn.id })).toBe(true);
 
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", retryCount: 1 });
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "queued",
+    retryCount: 1,
+    modelFallbackIndex: 0,
+  });
 });
 
 it("fences controller mutations against a stale executor generation", () => {
@@ -205,15 +248,43 @@ it("requeues one unaccepted controller turn in a fresh generation without losing
     turnId: first.id,
     controllerKey: "owner-7-controller",
     expectedThreadId: "thr_failed_init",
+    nextFallbackIndex: 1,
     ...fence,
   })).toBe(true);
 
   expect(store.listControllerTurns("owner-7-controller", 10)).toMatchObject([
-    { id: first.id, state: "queued", retryCount: 1, dispatchAfterSeq: 0 },
-    { updateId: 372, state: "queued", retryCount: 0 },
+    { id: first.id, state: "queued", retryCount: 1, modelFallbackIndex: 1, dispatchAfterSeq: 0 },
+    { updateId: 372, state: "queued", retryCount: 0, modelFallbackIndex: 0 },
   ]);
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
-  expect(store.claimNextControllerTurn(fence)).toMatchObject({ id: first.id, state: "dispatching", retryCount: 1 });
+  expect(store.claimNextControllerTurn(fence)).toMatchObject({
+    id: first.id,
+    state: "dispatching",
+    retryCount: 1,
+    modelFallbackIndex: 1,
+  });
+  expect(store.markControllerSpawned({
+    turnId: first.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_failed_fallback_one",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: first.id, dispatchAfterSeq: 31, ...fence })).toBe(true);
+
+  expect(store.retryUnacceptedControllerTurn({
+    turnId: first.id,
+    controllerKey: "owner-7-controller",
+    expectedThreadId: "thr_failed_fallback_one",
+    nextFallbackIndex: 2,
+    ...fence,
+  })).toBe(true);
+  expect(store.claimNextControllerTurn(fence)).toMatchObject({
+    id: first.id,
+    state: "dispatching",
+    retryCount: 2,
+    modelFallbackIndex: 2,
+  });
 });
 
 it("keeps one durable Telegram message id from controller placeholder through live edits", () => {
@@ -232,7 +303,7 @@ it("keeps one durable Telegram message id from controller placeholder through li
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     messageId: null,
     status: "pending",
-    payload: { text: "Connecting to Luna Max…" },
+    payload: { text: "Connecting…" },
   });
 
   const leased = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
@@ -349,6 +420,35 @@ it("sends a controller answer as Telegram HTML so its formatting renders", () =>
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
     text: "<b>Reduce complexity</b> — active\n• one item",
     parse_mode: "HTML",
+  });
+});
+
+it("completes a controller reply containing ordinary percent text", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(702));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_percent",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
+
+  expect(store.completeControllerTurn({
+    turnId: turn.id,
+    ...fence,
+    responseText: "Still implementing; disk fine at 73%.",
+  })).toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "completed",
+    responseText: "Still implementing; disk fine at 73%.",
+  });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
+    text: "Still implementing; disk fine at 73%.",
   });
 });
 

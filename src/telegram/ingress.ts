@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { hashSecret } from "../crypto";
-import type { Job } from "../domain/models";
+import {
+  isResumablePermanentFailure,
+  isResumablePlanBlock,
+  isResumableReviewBlock,
+  isReviewedPrCompletionBlock,
+  isRetryableJob,
+  type Job,
+} from "../domain/models";
 import type { MergeHandler } from "../services/merge-handler";
 import {
   OWNER_MEMORY_SCOPE,
@@ -31,8 +38,8 @@ import {
 } from "./view";
 import { TelegramRequestError } from "./client";
 import { TelegramApiError } from "./errors";
-import { MAX_CONTROLLER_IMAGE_BYTES } from "../controller/models";
-import { CAPTIONLESS_IMAGE_PROMPT, controllerImageFromMessage } from "./image";
+import { MAX_CONTROLLER_IMAGE_BYTES, isMotionMedia } from "../controller/models";
+import { captionlessPromptFor, clipTooLargeForDownload, controllerImageFromMessage } from "./image";
 
 export type TelegramIngressTransport = {
   sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }>;
@@ -215,7 +222,7 @@ export class TelegramIngress {
   private async handleMessage(message: TelegramMessage, updateId: number, now: number): Promise<void> {
     const identity = privateHumanIdentity(message.from, message.chat);
     const image = controllerImageFromMessage(message);
-    const text = message.text ?? (image ? message.caption ?? CAPTIONLESS_IMAGE_PROMPT : undefined);
+    const text = message.text ?? (image ? message.caption ?? captionlessPromptFor(image) : undefined);
     if (text === undefined) return;
 
     const pairingCode = this.pairingCode(text);
@@ -243,8 +250,12 @@ export class TelegramIngress {
       this.audit("unauthorized_message", updateId, message.from, message.chat);
       return;
     }
-    if (image && image.sizeBytes !== null && image.sizeBytes > MAX_CONTROLLER_IMAGE_BYTES) {
+    if (image && image.sizeBytes !== null && !isMotionMedia(image) && image.sizeBytes > MAX_CONTROLLER_IMAGE_BYTES) {
       await this.sendPlain(identity.chatId, "That image is larger than BB's 10 MB image limit. Please resend a smaller copy.");
+      return;
+    }
+    if (image && isMotionMedia(image) && clipTooLargeForDownload(image) && !image.thumbnail) {
+      await this.sendPlain(identity.chatId, "That clip is larger than Telegram lets me download. Please send a shorter video, a GIF, or a few screenshots.");
       return;
     }
     const normalized = boundedText(text);
@@ -597,10 +608,13 @@ export class TelegramIngress {
   ): Promise<void> {
     let cancelled = job;
     if (job.cancelRequestedAt === null && !jobIsTerminal(job)) {
+      const activeWorkers = this.store.getCurrentWorkerLiveness(job.id);
       cancelled = this.store.applyJobEvent(
         job.id,
         job.version,
-        { type: "CANCEL_REQUESTED", activeWorker: this.store.getWorkerLiveness(job.id) },
+        activeWorkers === null
+          ? { type: "CANCEL_REQUESTED" }
+          : { type: "CANCEL_REQUESTED", activeWorker: activeWorkers[0] ?? null, activeWorkers },
         now,
       );
       this.onWorkAvailable();
@@ -620,10 +634,16 @@ export class TelegramIngress {
     now: number,
     callback?: TelegramCallbackQuery,
   ): Promise<void> {
-    if (job.state !== "failed") return;
-    const retried = this.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, now);
-    await this.deliverJobView(retried, this.renderStatus(retried), chatId, messageId, now);
-    if (callback) await this.finishCallback(callback.id, retried.id, chatId, "retry", "accepted", now, "Retry scheduled.");
+    if (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job)) {
+      await this.reviewJob(job, chatId, messageId ?? job.statusMessageId ?? 0, now, callback);
+      return;
+    }
+    if (job.state !== "failed" && !isResumablePermanentFailure(job)) return;
+    const retryResult = this.store.retryFailedJob(job.id, job.version, now);
+    if (retryResult.outcome === "unavailable") return;
+    this.onWorkAvailable();
+    await this.deliverJobView(retryResult.job, this.renderStatus(retryResult.job), chatId, messageId, now);
+    if (callback) await this.finishCallback(callback.id, retryResult.job.id, chatId, "retry", "accepted", now, "Retry scheduled.");
   }
 
   private async reviewJob(
@@ -633,7 +653,9 @@ export class TelegramIngress {
     now: number,
     callback?: TelegramCallbackQuery,
   ): Promise<void> {
-    if (job.state !== "blocked" || job.blockedReason !== "review_limit") return;
+    if (job.state !== "blocked" ||
+      (job.blockedReason !== "review_limit" && job.blockedReason !== "plan_limit" &&
+        !isReviewedPrCompletionBlock(job))) return;
     const queued = this.store.requeueReviewAdmission(job.id, job.version, now);
     if (queued.outcome === "unavailable") return;
     const current = this.store.getJob(job.id) ?? job;
@@ -647,7 +669,13 @@ export class TelegramIngress {
         "review",
         stillCleaningUp ? "rejected" : "accepted",
         now,
-        stillCleaningUp ? "Review is still cleaning up." : "Review queued.",
+        stillCleaningUp
+          ? (isReviewedPrCompletionBlock(job)
+            ? "Finish is still cleaning up."
+            : isResumablePlanBlock(job) ? "Plan revision is still cleaning up." : "Review is still cleaning up.")
+          : (isReviewedPrCompletionBlock(job)
+            ? "Finish queued."
+            : isResumablePlanBlock(job) ? "Plan revision queued." : "Review queued."),
       );
     }
     if (!stillCleaningUp) this.onWorkAvailable();
@@ -666,7 +694,7 @@ export class TelegramIngress {
   }
 
   private controlEligible(job: Job, kind: Exclude<JobControlKind, "status">): boolean {
-    if (kind === "retry") return job.state === "failed" && job.cancelRequestedAt === null;
+    if (kind === "retry") return isRetryableJob(job);
     return !jobIsTerminal(job) && job.cancelRequestedAt === null;
   }
 

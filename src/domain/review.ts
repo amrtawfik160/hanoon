@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  guardResultEnvelopeSchema,
+  type GuardResultEnvelope,
+} from "../capabilities/guards";
 import type {
   ReviewAssessment,
   ReviewCheck,
@@ -63,6 +67,25 @@ export function parseReviewVerdict(text: string): ReviewVerdict {
     if (!(error instanceof z.ZodError)) throw error;
     throw new InvalidReviewOutputError();
   }
+}
+
+export function parseGuardResultEnvelope(text: string): GuardResultEnvelope {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    throw new InvalidReviewOutputError("Guard output does not match the strict JSON contract");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new InvalidReviewOutputError("Guard output does not match the strict JSON contract");
+  }
+  const result = guardResultEnvelopeSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new InvalidReviewOutputError("Guard output does not match the strict JSON contract");
+  }
+  return result.data;
 }
 
 const SEVERITY_RANK: Record<ReviewSeverity, number> = {

@@ -1,4 +1,9 @@
 import { z } from "zod";
+import type {
+  GuardAssessmentPolicy,
+  GuardEnvelopeAssessment,
+  GuardResultEnvelope,
+} from "../capabilities/guards";
 
 export const executionProfileSchema = z
   .object({
@@ -60,7 +65,9 @@ export const projectPolicySchema = z
     production: productionPolicySchema.optional(),
     requiredChecks: z.array(z.string().min(1)).max(50),
     outputRedactionPatterns: z.array(z.string().min(1).max(200)).max(20),
+    workerStartGraceMs: z.number().int().min(10_000).max(900_000).default(120_000),
     workerLivenessWatchdogMs: z.number().int().min(60_000).max(3_600_000).default(300_000),
+    workerRecoveryLimit: z.number().int().min(1).max(5).default(2),
     maxReviewCycles: z.number().int().min(1).max(10).default(3),
     mergeMethod: z.enum(["merge", "rebase", "squash"]),
   })
@@ -126,6 +133,9 @@ export interface ReviewAttemptResult {
   findings: ReviewFinding[];
   reviewedHeadSha: string | null;
   verdict?: ReviewVerdict;
+  guardEnvelope?: GuardResultEnvelope;
+  guardPolicy?: GuardAssessmentPolicy;
+  guardAssessment?: GuardEnvelopeAssessment;
   formatCorrectionSent?: boolean;
 }
 
@@ -163,6 +173,7 @@ export type JobState =
   | "merging"
   | "deploying"
   | "verifying_production"
+  | "recovering_worker"
   | "production_failed"
   | "complete"
   | "failed"
@@ -171,6 +182,7 @@ export type JobState =
   | "merged";
 
 export type WorkerKind = "plan" | "critique" | "implementation" | "review" | "validation" | "docs" | "merge" | "deploy" | "canary";
+export type WorkerRecoveryClassification = "never_started" | "no_progress" | "missing" | "crash";
 export type WorkerResourceKind = "bb_thread" | "bb_terminal";
 export type WorkerLivenessState =
   | "starting"
@@ -194,11 +206,125 @@ export interface WorkerLiveness {
 }
 
 export type BlockedReason =
+  | "plan_limit"
   | "review_limit"
   | "configuration"
   | "cancellation_unconfirmed"
   | "permanent_effect_failure"
   | null;
+
+export type DeliveryMode = "full" | "small_fix";
+export type JobOrigin = "requested" | "adopted_pr";
+export type RoutingMode = "legacy" | "shadow" | "active";
+
+export const PRODUCTION_NOT_CONFIGURED = "Production deployment and canary are not configured";
+
+const RETRYABLE_RESUME_STATES = new Set<JobState>([
+  "planning",
+  "critiquing",
+  "creating_implementation",
+  "implementing",
+  "locating_pr",
+  "resolving_pr_head",
+  "reviewing",
+  "remediating",
+  "validating",
+  "documenting",
+  "resolving_docs_head",
+  "final_validating",
+  "final_reviewing",
+  "awaiting_merge_approval",
+  "merging",
+  "deploying",
+  "verifying_production",
+]);
+
+const EARLY_RESUME_STATES = new Set<JobState>([
+  "planning",
+  "critiquing",
+  "creating_implementation",
+  "implementing",
+]);
+
+const SMALL_FIX_TASK =
+  /\b(?:typos?|lint(?:ing)?|wording|copy(?:\s+edit|\s+change)?|changelog|whitespace|nits?|one[\s-](?:line|file)|renames?|bump(?:\s+the)?\s+version|small[\s-]fix|quick[\s-]fix|tiny[\s-]fix)\b/i;
+
+export function classifyDeliveryMode(task: string, explicit?: DeliveryMode | null): DeliveryMode {
+  if (explicit === "full" || explicit === "small_fix") return explicit;
+  const text = task.trim();
+  if (text.length === 0 || text.length > 240) return "full";
+  return SMALL_FIX_TASK.test(text) ? "small_fix" : "full";
+}
+
+export function isSmallFixJob(job: Pick<Job, "deliveryMode">): boolean {
+  return job.deliveryMode === "small_fix";
+}
+
+export function isResumablePlanBlock(job: Pick<Job, "state" | "blockedReason" | "implementationThreadId" | "prNumber" | "reviewCycle">): boolean {
+  if (job.state !== "blocked" || job.prNumber !== null) return false;
+  if (job.blockedReason === "plan_limit") return true;
+  return job.blockedReason === "review_limit"
+    && job.implementationThreadId === null
+    && job.reviewCycle === 0;
+}
+
+export function isResumableReviewBlock(job: Pick<Job, "state" | "blockedReason" | "implementationThreadId" | "prNumber" | "reviewCycle">): boolean {
+  if (job.state !== "blocked") return false;
+  if (job.prNumber !== null && (job.blockedReason === "plan_limit" || job.blockedReason === "review_limit")) {
+    return true;
+  }
+  return job.blockedReason === "review_limit" && !isResumablePlanBlock(job);
+}
+
+export function isResumablePermanentFailure(
+  job: Pick<Job, "state" | "blockedReason" | "resumeState" | "cancelRequestedAt">,
+): boolean {
+  return job.state === "blocked"
+    && job.blockedReason === "permanent_effect_failure"
+    && job.resumeState !== null
+    && job.cancelRequestedAt === null
+    && RETRYABLE_RESUME_STATES.has(job.resumeState);
+}
+
+export function isReviewedPrCompletionBlock(
+  job: Pick<Job, "state" | "blockedReason" | "lastError" | "prNumber" | "policy">,
+): boolean {
+  return job.state === "blocked"
+    && job.blockedReason === "configuration"
+    && job.lastError === PRODUCTION_NOT_CONFIGURED
+    && job.prNumber !== null
+    && job.policy?.production === undefined;
+}
+
+export function shouldResumeExistingPr(
+  job: Pick<Job, "prNumber" | "deliveryMode" | "resumeState">,
+): boolean {
+  if (job.prNumber === null) return false;
+  if (isSmallFixJob(job)) return true;
+  return job.resumeState !== null && EARLY_RESUME_STATES.has(job.resumeState);
+}
+
+export function isRetryableJob(
+  job: Pick<
+    Job,
+    | "state"
+    | "blockedReason"
+    | "implementationThreadId"
+    | "prNumber"
+    | "reviewCycle"
+    | "resumeState"
+    | "cancelRequestedAt"
+    | "lastError"
+    | "policy"
+  >,
+): boolean {
+  if (job.cancelRequestedAt !== null) return false;
+  if (job.state === "failed" && job.resumeState !== null) return true;
+  return isResumablePlanBlock(job)
+    || isResumableReviewBlock(job)
+    || isResumablePermanentFailure(job)
+    || isReviewedPrCompletionBlock(job);
+}
 
 export interface Job {
   id: string;
@@ -222,6 +348,16 @@ export interface Job {
   deploymentSummary: string | null;
   canarySummary: string | null;
   statusMessageId: number | null;
+  deliveryMode: DeliveryMode;
+  taskRecipe: import("./recipes").TaskRecipe;
+  recipeVersion: number;
+  recipePromotionCount: number;
+  routingMode: RoutingMode;
+  taskTraits: readonly import("../capabilities/routing").TaskTraitEvidence[];
+  taskReasonCodes: readonly string[];
+  origin: JobOrigin;
+  adoptedBranch: string | null;
+  adoptedHeadSha: string | null;
   planCycle: number;
   reviewCycle: number;
   reviewBlockAt: number;
@@ -254,6 +390,7 @@ export interface JobEffect {
     | "merge_pr"
     | "deploy_production"
     | "verify_production"
+    | "recover_worker"
     | "stop_thread"
     | "steer_implementation"
     | "reconcile_job";
@@ -290,8 +427,16 @@ export type JobEvent =
   | { type: "IMPLEMENTATION_IDLE" }
   | { type: "PR_LOCATED"; number: number; url: string }
   | { type: "PR_HEAD_RESOLVED"; headSha: string }
-  | { type: "REVIEW_STARTED" }
-  | { type: "REVIEW_PASSED"; headSha: string }
+  | { type: "REVIEW_STARTED"; laneCount?: number }
+  | {
+      type: "REVIEW_PASSED";
+      headSha: string;
+      documentation?: Readonly<{
+        required: boolean;
+        diffDigest: string;
+        reasons: readonly string[];
+      }>;
+    }
   | {
       type: "REVIEW_CHANGES_REQUESTED";
       headSha?: string;
@@ -319,9 +464,23 @@ export type JobEvent =
   | { type: "CANARY_SUCCEEDED"; summary: string }
   | { type: "CANARY_FAILED"; reason: string }
   | { type: "THREAD_FAILED"; workerKind?: WorkerKind; error?: string }
+  | {
+      type: "WORKER_RECOVERY_REQUESTED";
+      recoveryId: string;
+      workerKind: WorkerKind;
+      resourceId: string;
+      classification: WorkerRecoveryClassification;
+      signature: string;
+      retryPayload?: Record<string, unknown>;
+    }
+  | { type: "WORKER_RECOVERY_REQUEUED"; recoveryId: string; retryPayload?: Record<string, unknown> }
   | { type: "FAILED"; error: string }
   | { type: "RETRY" }
-  | { type: "CANCEL_REQUESTED"; activeWorker?: WorkerLiveness | null }
+  | {
+      type: "CANCEL_REQUESTED";
+      activeWorker?: WorkerLiveness | null;
+      activeWorkers?: WorkerLiveness[];
+    }
   | { type: "CANCEL_CONFIRMED" }
   | { type: "CANCELLATION_UNCONFIRMED"; reason?: string }
   | { type: "CONTINUE_REVIEW" };

@@ -1,6 +1,7 @@
 import { redactError } from "../errors";
 import type { MonitorThreadStatus } from "./monitor-service";
 import type { JobMemoryExtractionRecord, MemoryKind, TelegramAgentStore } from "../storage/store";
+import type { ModelRoute } from "../capabilities/models";
 
 /**
  * Jobs are the only place this plugin spends inference of its own. A finished
@@ -29,7 +30,7 @@ const EXTRACTED_CONFIDENCE = 0.5;
 const EXTRACTED_IMPORTANCE = 0.4;
 
 export type JobMemoryThreads = {
-  spawnHidden(input: { projectId: string; title: string; prompt: string }): Promise<string>;
+  spawnHidden(input: { projectId: string; title: string; prompt: string; modelRoute: ModelRoute }): Promise<string>;
   status(threadId: string): Promise<MonitorThreadStatus>;
   output(threadId: string): Promise<string>;
 };
@@ -46,8 +47,10 @@ export type JobMemoryServiceDependencies = {
     | "failJobMemoryExtraction"
     | "getJob"
     | "rememberMemory"
+    | "recordModelRouteSelection"
   >;
   threads: JobMemoryThreads;
+  modelRoute(): ModelRoute;
   clock: { now(): number };
   warn?: (message: string) => void;
 };
@@ -160,6 +163,18 @@ export class JobMemoryService {
     }
     let threadId: string;
     try {
+      const modelRoute = this.dependencies.modelRoute();
+      // This durable selection precedes spawn. Retrying the same extraction
+      // attempt with a different tuple is rejected by the repository.
+      this.dependencies.store.recordModelRouteSelection({
+        subjectKind: "worker_attempt",
+        subjectId: `memory:${extraction.jobId}`,
+        attempt: extraction.attempts + 1,
+        stage: "extraction",
+        operation: "spawn-memory",
+        route: modelRoute,
+        now,
+      });
       threadId = await this.dependencies.threads.spawnHidden({
         projectId: extraction.projectId,
         title: `Telegram Agent memory extraction ${extraction.jobId}`,
@@ -170,10 +185,18 @@ export class JobMemoryService {
           blockedReason: job.blockedReason,
           lastError: job.lastError,
         }),
+        modelRoute,
       });
     } catch (error) {
       const detail = redactError(error).slice(0, 200);
       this.dependencies.warn?.(`Memory extraction for ${extraction.jobId} could not start: ${detail}`);
+      if (/404|project not found/i.test(detail)) {
+        return this.dependencies.store.failJobMemoryExtraction({
+          jobId: extraction.jobId,
+          error: `Memory extraction could not start: ${detail}`.slice(0, 500),
+          now: this.dependencies.clock.now(),
+        });
+      }
       // Counted, so a project that will never come back stops being retried.
       return this.dependencies.store.recordJobMemoryExtractionFailure({
         jobId: extraction.jobId,

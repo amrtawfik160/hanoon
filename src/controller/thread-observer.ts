@@ -175,12 +175,45 @@ async function projectHostId(sdk: BbSdk, projectId: string, signal: AbortSignal)
   return source.hostId;
 }
 
+export type ThreadImage = {
+  fileName: string;
+  mimeType: string;
+  bytes: Uint8Array;
+};
+
+type ThreadPromptPart =
+  | { type: "text"; text: string; mentions: [] }
+  | { type: "localImage"; path: string };
+
+async function promptWithImages(
+  sdk: BbSdk,
+  projectId: string,
+  text: string,
+  images: readonly ThreadImage[],
+): Promise<ThreadPromptPart[]> {
+  const input: ThreadPromptPart[] = [{ type: "text", text, mentions: [] }];
+  for (const image of images) {
+    const uploaded = await sdk.projects.attachments.upload({
+      projectId,
+      clientFile: image.bytes,
+      filename: image.fileName,
+      mimeType: image.mimeType,
+    });
+    if (uploaded.type !== "localImage") {
+      throw new Error("BB did not accept the image attachment for that project");
+    }
+    input.push({ type: "localImage", path: uploaded.path });
+  }
+  return input;
+}
+
 /** Opens a working thread the owner can watch in BB, on its own worktree. */
 export async function createProjectThread(input: {
   sdk: BbSdk;
   projectId: string;
   title: string;
   prompt: string;
+  images?: readonly ThreadImage[];
   signal: AbortSignal;
 }) {
   const hostId = await projectHostId(input.sdk, input.projectId, input.signal);
@@ -188,14 +221,21 @@ export async function createProjectThread(input: {
     projectId: input.projectId,
     title: input.title,
     visibility: "visible",
-    input: [{ type: "text", text: input.prompt, mentions: [] }],
+    input: await promptWithImages(input.sdk, input.projectId, input.prompt, input.images ?? []),
     environment: {
       type: "host",
       hostId,
       workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
     },
   });
-  return { thread: { id: thread.id, title: input.title, projectId: input.projectId } };
+  return {
+    thread: {
+      id: thread.id,
+      title: input.title,
+      projectId: input.projectId,
+      imageCount: input.images?.length ?? 0,
+    },
+  };
 }
 
 /** Continues a thread the owner can see; hidden threads stay off limits. */
@@ -203,6 +243,7 @@ export async function sendToVisibleThread(input: {
   sdk: BbSdk;
   threadId: string;
   text: string;
+  images?: readonly ThreadImage[];
   signal: AbortSignal;
 }) {
   const thread = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
@@ -212,9 +253,15 @@ export async function sendToVisibleThread(input: {
   await input.sdk.threads.send({
     threadId: input.threadId,
     mode: "auto",
-    input: [{ type: "text", text: input.text, mentions: [] }],
+    input: await promptWithImages(input.sdk, thread.projectId, input.text, input.images ?? []),
   });
-  return { sent: { threadId: input.threadId, status: thread.status } };
+  return {
+    sent: {
+      threadId: input.threadId,
+      status: thread.status,
+      imageCount: input.images?.length ?? 0,
+    },
+  };
 }
 
 export async function visibleThreadStatus(input: {

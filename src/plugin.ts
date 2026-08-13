@@ -1,7 +1,35 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { controllerExecutionProfile, extractionModel, parseGlobalConfig, systemUpkeepEnabled } from "./config";
-import { BbRunner } from "./bb/runner";
-import { resolvePrHead, runValidation } from "./bb/validation";
+import { createHash } from "node:crypto";
+import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes";
+import { CAPABILITY_BY_ID } from "./capabilities/catalog";
+import {
+  guardRequirementBindings,
+  persistBlockedGuardSettlement,
+  persistGuardEnvelopeSettlement,
+  requiredGuardsForChangeSurface,
+  type GuardAssessmentPolicy,
+} from "./capabilities/guards";
+import {
+  backgroundCapabilityModelRoute,
+  capabilityMinimumModelPool,
+  capabilityRoutingSettings,
+  controllerCapabilityModelRoute,
+  controllerExecutionProfiles,
+  parseGlobalConfig,
+  systemUpkeepEnabled,
+} from "./config";
+import {
+  RecipePromotionService,
+} from "./capabilities/promotion";
+import { DurableRecipePromotionEvidenceReader } from "./capabilities/promotion-evidence";
+import { DEFAULT_CONTROLLER_CAPABILITY_MODEL } from "./capabilities/controller-bundles";
+import { BbRunner, environmentDiffText } from "./bb/runner";
+import {
+  environmentChangeShouldWake,
+  threadChangeShouldWake,
+  threadInteractionsChanged,
+} from "./bb/realtime-events";
+import { environmentWorktreeIsClean, resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { TelegramClient, TelegramFileTooLargeError } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
@@ -15,6 +43,8 @@ import { runJobExecutorService } from "./services/job-executor-service";
 import { createTask9FreshGateCollector, MergeHandler } from "./services/merge-handler";
 import type { GateInput } from "./domain/gates";
 import type { ReviewFinding } from "./domain/models";
+import { documentationRequirement } from "./domain/pipeline-graph";
+import { assessReviewGroup } from "./domain/review-lenses";
 import {
   ReviewHandler,
   ReviewInvocationStaleError,
@@ -27,6 +57,7 @@ import {
 } from "./services/review-handler";
 import { runTelegramService } from "./services/telegram-service";
 import {
+  classifyThreadRecovery,
   projectUnknownWorker,
   projectTerminalLiveness,
   projectWorkerLiveness,
@@ -35,8 +66,10 @@ import {
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
 import { registerControllerTools } from "./controller/tools";
+import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
 import { BbControllerAdapter, ControllerImagePreparationError } from "./controller/bb-controller";
 import {
+  CONTROLLER_FALLBACK_MODELS,
   CONTROLLER_MODELS,
   CONTROLLER_PERMISSION_MODES,
   CONTROLLER_REASONING_LEVELS,
@@ -57,9 +90,15 @@ import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
 import { runProductionStage } from "./services/production-runner";
+import { CapabilityInventoryService } from "./services/capability-inventory-service";
 
 function clock(): number {
   return Date.now();
+}
+
+function reviewLineageScopeId(jobId: string, reviewStage: string): string {
+  const digest = createHash("sha256").update(`${jobId}\0${reviewStage}`, "utf8").digest("hex");
+  return `review-lineage:${digest}`;
 }
 
 export async function createPlugin(bb: BbPluginApi): Promise<void> {
@@ -79,6 +118,20 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       description: "Model for Telegram conversation turns. Claude models run on Claude Code, gpt models on Codex. Job workers remain project-controlled.",
       options: [...CONTROLLER_MODELS],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.model,
+    },
+    controllerFallbackModel1: {
+      type: "select",
+      label: "Fallback model 1",
+      description: "Tried only when the primary model fails before accepting the Telegram message.",
+      options: [...CONTROLLER_FALLBACK_MODELS],
+      default: "gpt-5.6-sol",
+    },
+    controllerFallbackModel2: {
+      type: "select",
+      label: "Fallback model 2",
+      description: "Tried after fallback 1 only when the message was still not accepted. Disabled by default.",
+      options: [...CONTROLLER_FALLBACK_MODELS],
+      default: "disabled",
     },
     controllerReasoningLevel: {
       type: "select",
@@ -115,12 +168,52 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       options: ["enabled", "disabled"],
       default: "enabled",
     },
+    capabilityJobGraph: {
+      type: "select",
+      label: "Capability job graph",
+      description: "Adaptive keeps unpromoted recipes in shadow. Legacy is an independent new-job kill switch.",
+      options: ["adaptive", "legacy"],
+      default: "adaptive",
+    },
+    controllerCapabilityMode: {
+      type: "select",
+      label: "Controller capabilities",
+      description: "Bundled is least-capability. All-tools is an independent new-turn kill switch.",
+      options: ["bundled", "all-tools"],
+      default: "bundled",
+    },
+    capabilityModelRouting: {
+      type: "select",
+      label: "Capability model routing",
+      description: "Adaptive uses the selected pool. Strong-only is an independent new-attempt kill switch.",
+      options: ["adaptive", "strong-only"],
+      default: "adaptive",
+    },
   });
-  const store = openStore(bb.storage);
+  let config = parseGlobalConfig(await settings.get());
+  const store = openStore(
+    bb.storage,
+    bb.storage.kv,
+    clock,
+    () => config.ok ? controllerCapabilityModelRoute(config.value) : DEFAULT_CONTROLLER_CAPABILITY_MODEL,
+    () => config.ok ? capabilityRoutingSettings(config.value) : {
+      jobGraph: "adaptive",
+      controllerTools: "bundled",
+    },
+  );
+  const retiredLivePollers = retireLiveWorkPollingSchedules(store, clock());
+  if (retiredLivePollers > 0) {
+    bb.log.warn(`Retired ${retiredLivePollers} controller schedule(s) that polled live work`);
+  }
+  const promotionEvidence = new DurableRecipePromotionEvidenceReader(store);
+  const recipePromotions = new RecipePromotionService({
+    store,
+    readEvidence: (recipe) => promotionEvidence.read(recipe),
+    now: clock,
+  });
   const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()));
   const executorNudge = new ExecutorNudge();
   const laneSnapshots = new JobLaneSnapshotProvider();
-  let config = parseGlobalConfig(await settings.get());
   if (!config.ok) bb.status.needsConfiguration(config.message);
 
   settings.onChange((next) => {
@@ -129,6 +222,21 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
     executorNudge.notify();
   });
+
+  const capabilityInventory = new CapabilityInventoryService({
+    store,
+    client: {
+      providers: {
+        list: (args) => bb.sdk.providers.list(args),
+        models: (args) => bb.sdk.providers.models(args),
+      },
+      plugins: { list: (args) => bb.sdk.plugins.list(args) },
+      skills: { list: (workspace) => bb.sdk.skills.list(workspace) },
+    },
+    clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
+  });
+  await capabilityInventory.refresh();
 
   const telegramForToken = (token: string): TelegramClient => new TelegramClient(token);
   const telegramTransport = {
@@ -156,6 +264,14 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     store,
     sdk: bb.sdk,
     threadOperations,
+    downloadImage: async (fileId, maxBytes, signal) => {
+      if (!config.ok) throw new Error(config.message);
+      return telegramForToken(config.value.botToken).downloadFile(
+        fileId,
+        maxBytes,
+        signal ?? new AbortController().signal,
+      );
+    },
     health: (now) => buildHealthReport(
       bb.storage.database(),
       now,
@@ -175,6 +291,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--json]" },
       { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
+      { name: "capability", summary: "Inspect capability evidence and control recipe rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
       { name: "doctor", summary: "Check Telegram, BB, host, provider, and GitHub readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
     ],
     run: (argv, context) => runTelegramAgentCli({
@@ -184,6 +301,12 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       now: clock,
       getBotToken: () => config.ok ? config.value.botToken : undefined,
       createTelegramClient: (token) => telegramForToken(token),
+      capabilityPromotions: recipePromotions,
+      capabilitySettings: () => config.ok ? capabilityRoutingSettings(config.value) : {
+        jobGraph: "adaptive",
+        controllerTools: "bundled",
+        modelRouting: "adaptive",
+      },
       revokeAllApprovals: (now) => {
         const db = bb.storage.database();
         const revoke = db.transaction(() => {
@@ -199,6 +322,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         });
         return revoke();
       },
+      notify: () => executorNudge.notify(),
     }, argv, context),
   });
   const bbRunner = new BbRunner(bb.sdk);
@@ -209,10 +333,15 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   ): ReviewHandler => {
     const reviewJobMatches = (): boolean => {
       const current = store.getJob(invocation.jobId);
+      const currentQuality = current?.reviewThreadId ? store.getAttemptByThreadId(current.reviewThreadId) : null;
+      const invocationAttempt = store.getAttempt(invocation.attemptId);
       return current !== null && current.id === invocation.jobId && current.version === expectedVersion &&
         (current.state === "reviewing" || current.state === "final_reviewing") &&
         current.environmentId === invocation.environmentId && current.prHeadSha === invocation.expectedSha &&
-        current.reviewThreadId === invocation.reviewThreadId &&
+        currentQuality !== null && invocationAttempt !== null &&
+        currentQuality.jobId === current.id && currentQuality.kind === "review" && currentQuality.reviewLens === "quality" &&
+        invocationAttempt.jobId === current.id && invocationAttempt.kind === "review" &&
+        invocationAttempt.reviewStage === currentQuality.reviewStage && invocationAttempt.ordinal === currentQuality.ordinal &&
         current.implementationThreadId === invocation.implementationThreadId;
     };
     const reviewAttemptMatches = (): boolean => {
@@ -269,11 +398,10 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           assertCurrent();
           const raw = value as unknown as Record<string, unknown>;
           const workspace = (raw.workspace ?? {}) as Record<string, unknown>;
-          const workingTree = (raw.workingTree ?? workspace.workingTree ?? {}) as Record<string, unknown>;
           const checkout = (raw.checkout ?? workspace.checkout ?? {}) as Record<string, unknown>;
           return {
             available: raw.available !== false && raw.outcome !== "unavailable" && raw.outcome !== "not_applicable",
-            clean: raw.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false),
+            clean: environmentWorktreeIsClean(value),
             headSha: typeof checkout.headSha === "string" ? checkout.headSha : null,
           };
         },
@@ -349,6 +477,35 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           return claimed;
         },
       },
+      guards: {
+        settle: ({ envelope, policy }) => {
+          assertCurrent();
+          const attempt = store.getAttempt(invocation.attemptId);
+          if (!attempt?.reviewStage) throw new ReviewInvocationStaleError("guard review stage changed");
+          const assessment = persistGuardEnvelopeSettlement({
+            repository: store,
+            scopeId: reviewLineageScopeId(invocation.jobId, attempt.reviewStage),
+            envelope,
+            policy,
+            now: clock(),
+          });
+          assertCurrent();
+          return assessment;
+        },
+        block: ({ policy, reasonCode }) => {
+          assertCurrent();
+          const attempt = store.getAttempt(invocation.attemptId);
+          if (!attempt?.reviewStage) throw new ReviewInvocationStaleError("guard review stage changed");
+          persistBlockedGuardSettlement({
+            repository: store,
+            scopeId: reviewLineageScopeId(invocation.jobId, attempt.reviewStage),
+            policy,
+            reasonCode,
+            now: clock(),
+          });
+          assertCurrent();
+        },
+      },
     });
   };
   const collectGateInput = createTask9FreshGateCollector({
@@ -420,7 +577,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           projectId: job.projectId,
           status: rawStatus.outcome === "available" || rawStatus.status === "available" ? "available" : String(rawStatus.status ?? rawStatus.outcome ?? "unavailable"),
           worktree: {
-            clean: rawStatus.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false),
+            clean: environmentWorktreeIsClean(rawStatus),
             untrackedFiles: Array.isArray(workingTree.untrackedFiles) ? workingTree.untrackedFiles.filter((item): item is string => typeof item === "string") : [],
           },
           checkout: {
@@ -466,9 +623,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     adapter: new BbControllerAdapter({
       sdk: bb.sdk,
       pluginId: bb.pluginId,
-      executionProfile: () => {
+      executionProfiles: () => {
         if (!config.ok) throw new Error(config.message);
-        return controllerExecutionProfile(config.value);
+        return controllerExecutionProfiles(config.value);
       },
       downloadImage: async (fileId, maxBytes, signal) => {
         if (!config.ok) throw new Error(config.message);
@@ -502,12 +659,15 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const jobMemory = new JobMemoryService({
     store,
+    modelRoute: () => {
+      if (!config.ok) throw new Error(config.message);
+      return backgroundCapabilityModelRoute(config.value);
+    },
     threads: {
-      spawnHidden: async ({ projectId, title, prompt }) => {
+      spawnHidden: async ({ projectId, title, prompt, modelRoute }) => {
         const hosts = await bb.sdk.hosts.list({});
         const host = hosts.find((candidate) => candidate.status === "connected");
         if (!host) throw new Error("No connected BB host can run a memory extraction");
-        const model = config.ok ? extractionModel(config.value) : null;
         const thread = await bb.sdk.threads.spawn({
           projectId,
           title,
@@ -518,13 +678,18 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
             hostId: host.id,
             workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
           },
-          // Extraction reads a repository and writes three sentences; the
-          // conversational tier's reasoning budget is wasted on it.
-          ...(model === null ? {} : {
-            model,
-            reasoningLevel: "low" as const,
-            executionInputSources: { model: "explicit" as const, reasoningLevel: "explicit" as const },
-          }),
+          providerId: modelRoute.providerId,
+          model: modelRoute.modelId,
+          reasoningLevel: modelRoute.reasoning,
+          serviceTier: modelRoute.serviceTier,
+          permissionMode: "auto",
+          executionInputSources: {
+            providerId: "explicit",
+            model: "explicit",
+            reasoningLevel: "explicit",
+            serviceTier: "explicit",
+            permissionMode: "explicit",
+          },
         });
         return thread.id;
       },
@@ -624,7 +789,6 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const presence = new TelegramPresenceCoordinator({
     store,
-    jobLanes: laneSnapshots,
     telegram: {
       sendChatAction: (chatId, action, signal) => {
         if (!config.ok) throw new Error(config.message);
@@ -649,6 +813,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     ) => bbRunner.sendRemediation(job, findings, reasons),
     sendSteering: (threadId: string, text: string) => bbRunner.sendSteering(threadId, text),
     stopWorker: (worker: Parameters<BbRunner["stopWorker"]>[0]) => bbRunner.stopWorker(worker),
+    retireWorker: (resourceId: string, allowMissing: boolean) => bbRunner.retireWorker(resourceId, allowMissing),
+    prepareProgressScratchpad: (environmentId: string) => bbRunner.prepareProgressScratchpad(environmentId),
     getThread: (threadId: string) => bbRunner.getThread(threadId),
     getEnvironmentSnapshot: (environmentId: string, baseBranch: string) => bbRunner.getEnvironmentSnapshot(environmentId, baseBranch),
     getPullRequestSnapshot: (environmentId: string) => bbRunner.getPullRequestSnapshot(environmentId),
@@ -658,6 +824,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     job: NonNullable<ReturnType<typeof store.getJob>>,
     signal: AbortSignal,
     fence: EffectFence,
+    requestedResourceId?: string,
   ): Promise<void> => {
     const fenceCurrent = (): boolean => !signal.aborted && !fence.signal.aborted &&
       store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock());
@@ -672,6 +839,79 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       });
       if (!updated) throw new Error("executor lease was lost before reconciliation transition");
     };
+    const recoverWorker = (
+      current: NonNullable<ReturnType<TelegramAgentStore["getJob"]>>,
+      workerKind: Parameters<TelegramAgentStore["registerExecutorWorkerRecovery"]>[0]["workerKind"],
+      resourceId: string,
+      workerGeneration: number,
+      classification: Parameters<TelegramAgentStore["registerExecutorWorkerRecovery"]>[0]["classification"],
+      signature: string,
+      attempt: ReturnType<TelegramAgentStore["getLatestPipelineStageAttempt"]>,
+      retryPayload: Record<string, unknown>,
+    ): boolean => {
+      if (!current.projectId || !current.policy) return false;
+      if (workerKind === "critique" && (
+        typeof retryPayload.planAttemptId !== "string" || retryPayload.planAttemptId.length === 0
+      )) {
+        applyExecutorEvent(current.id, current.version, {
+          type: "THREAD_FAILED",
+          workerKind,
+          error: "Critique recovery requires a durable plan attempt",
+        });
+        return true;
+      }
+      const recoveryId = `recovery_${createHash("sha256")
+        .update(`${current.id}\0${resourceId}\0${String(workerGeneration)}\0${signature}`, "utf8")
+        .digest("base64url")
+        .slice(0, 28)}`;
+      const registered = store.registerExecutorWorkerRecovery({
+        id: recoveryId,
+        jobId: current.id,
+        expectedVersion: current.version,
+        projectId: current.projectId,
+        jobState: current.state,
+        workerKind,
+        resourceId,
+        workerGeneration,
+        classification,
+        signature,
+        retryLimit: current.policy.workerRecoveryLimit,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: clock(),
+      });
+      if (!registered) throw new Error("executor lease was lost before recovery registration");
+      if (registered.action === "already_recorded" && registered.record.state !== "detected") return true;
+      if (attempt?.state === "running") {
+        if (!store.failPipelineStageAttempt({
+          id: attempt.id,
+          error: `${workerKind} worker was retired before it produced evidence`,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: clock(),
+        })) throw new Error("executor lease was lost before retired attempt persistence");
+      }
+      const latest = store.getJob(current.id);
+      if (!latest || latest.state !== current.state) return true;
+      if (registered.action === "owner_required") {
+        applyExecutorEvent(latest.id, latest.version, {
+          type: "THREAD_FAILED",
+          workerKind,
+          error: `${workerKind} worker stopped unexpectedly and needs a manual retry`,
+        });
+        return true;
+      }
+      applyExecutorEvent(latest.id, latest.version, {
+        type: "WORKER_RECOVERY_REQUESTED",
+        recoveryId: registered.record.id,
+        workerKind,
+        resourceId,
+        classification,
+        signature,
+        retryPayload,
+      });
+      return true;
+    };
     if (!fenceCurrent()) return;
 
     const pipelineRole = job.state === "planning" ? "PLAN" as const
@@ -680,39 +920,104 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       : null;
     const pipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
     const reviewStage = job.state === "reviewing" || job.state === "final_reviewing";
-    const implementationStage = ["creating_implementation", "implementing", "locating_pr", "resolving_pr_head", "remediating"].includes(job.state);
-    const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? job.reviewThreadId : implementationStage ? job.implementationThreadId : null);
+    const implementationStage = ["implementing", "remediating"].includes(job.state);
+    if (reviewStage && requestedResourceId === undefined && job.reviewThreadId) {
+      const quality = store.getAttemptByThreadId(job.reviewThreadId);
+      if (quality?.reviewStage && quality.kind === "review") {
+        const attempts = store.listReviewAttempts(job.id, quality.reviewStage, quality.ordinal)
+          .filter((attempt) => attempt.threadId !== null);
+        if (attempts.length > 0) {
+          for (const attempt of attempts) {
+            if (signal.aborted || fence.signal.aborted || attempt.threadId === null) return;
+            const current = store.getJob(job.id);
+            if (!current || current.version !== job.version || current.state !== job.state) return;
+            await reconcileJob(current, signal, fence, attempt.threadId);
+          }
+          return;
+        }
+      }
+    }
+    const qualityReviewAttempt = reviewStage && job.reviewThreadId ? store.getAttemptByThreadId(job.reviewThreadId) : null;
+    const requestedReviewAttempt = reviewStage && requestedResourceId ? store.getAttemptByThreadId(requestedResourceId) : null;
+    const requestedReviewMatches = requestedReviewAttempt !== null && qualityReviewAttempt !== null &&
+      requestedReviewAttempt.jobId === job.id && requestedReviewAttempt.kind === "review" &&
+      requestedReviewAttempt.reviewStage === qualityReviewAttempt.reviewStage &&
+      requestedReviewAttempt.ordinal === qualityReviewAttempt.ordinal;
+    if (requestedResourceId !== undefined) {
+      const requestedResourceMatches = pipelineAttempt?.threadId === requestedResourceId ||
+        (reviewStage && requestedReviewMatches) ||
+        (implementationStage && job.implementationThreadId === requestedResourceId);
+      if (!requestedResourceMatches) return;
+    }
+    const reviewResourceId = requestedReviewMatches ? requestedResourceId ?? null : job.reviewThreadId;
+    const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? reviewResourceId : implementationStage ? job.implementationThreadId : null);
     if (!resourceId) return;
+    const recoveryRetryPayload = (): Record<string, unknown> => {
+      if (pipelineRole === "CRITIQUE") {
+        return { planAttemptId: store.getLatestPipelineStageAttempt(job.id, "PLAN")?.id ?? "" };
+      }
+      if (reviewStage && qualityReviewAttempt?.reviewStage) {
+        const retireResourceIds = store
+          .listReviewAttempts(job.id, qualityReviewAttempt.reviewStage, qualityReviewAttempt.ordinal)
+          .map((attempt) => attempt.threadId)
+          .filter((threadId): threadId is string => threadId !== null && threadId !== resourceId);
+        return retireResourceIds.length > 0 ? { retireResourceIds } : {};
+      }
+      return {};
+    };
     const workerKind = pipelineRole === "PLAN" ? "plan" as const
       : pipelineRole === "CRITIQUE" ? "critique" as const
       : pipelineRole === "DOCS" ? "docs" as const
       : reviewStage ? "review" as const
       : "implementation" as const;
     const generation = workerRegistrationGeneration(job, workerKind);
+    const previousLiveness = store.getWorkerLivenessForResource(job.id, resourceId);
     let thread: Awaited<ReturnType<BbRunner["getThread"]>>;
     try {
       thread = await bbRunner.getThread(resourceId);
     } catch {
       if (!fenceCurrent()) return;
       const current = store.getJob(job.id);
-      if (current) projectUnknownWorker(store, current, resourceId, clock(), workerKind, generation, {
-        ownerId: fence.ownerId,
-        generation: fence.generation,
-        now: clock(),
-      });
+      if (current) {
+        const observedAt = clock();
+        projectUnknownWorker(store, current, resourceId, observedAt, workerKind, generation, {
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: observedAt,
+        });
+        const recovery = classifyThreadRecovery(current, null, previousLiveness, observedAt, workerKind);
+        if (recovery) {
+          const retryPayload = recoveryRetryPayload();
+          recoverWorker(current, workerKind, resourceId, generation, recovery.classification, recovery.signature, pipelineAttempt, retryPayload);
+        }
+      }
       return;
     }
     if (!fenceCurrent()) return;
     const current = store.getJob(job.id);
     const currentPipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
-    const currentResourceId = currentPipelineAttempt?.threadId ?? (reviewStage ? current?.reviewThreadId : current?.implementationThreadId);
+    const currentQualityAttempt = reviewStage && current?.reviewThreadId ? store.getAttemptByThreadId(current.reviewThreadId) : null;
+    const currentRequestedAttempt = reviewStage ? store.getAttemptByThreadId(resourceId) : null;
+    const currentReviewResourceMatches = currentRequestedAttempt !== null && currentQualityAttempt !== null &&
+      currentRequestedAttempt.jobId === current?.id && currentRequestedAttempt.kind === "review" &&
+      currentRequestedAttempt.reviewStage === currentQualityAttempt.reviewStage &&
+      currentRequestedAttempt.ordinal === currentQualityAttempt.ordinal;
+    const currentResourceId = currentPipelineAttempt?.threadId ??
+      (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId) : current?.implementationThreadId);
     if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
-    const projected = projectWorkerLiveness(store, current, thread, clock(), workerKind, generation, {
+    const observedAt = clock();
+    const projected = projectWorkerLiveness(store, current, thread, observedAt, workerKind, generation, {
       ownerId: fence.ownerId,
       generation: fence.generation,
-      now: clock(),
+      now: observedAt,
     });
+    const recovery = classifyThreadRecovery(current, thread, previousLiveness, observedAt, workerKind);
+    if (recovery) {
+      const retryPayload = recoveryRetryPayload();
+      recoverWorker(current, workerKind, resourceId, generation, recovery.classification, recovery.signature, currentPipelineAttempt, retryPayload);
+      return;
+    }
     const failed = thread.status === "error" || thread.runtime.displayStatus === "error";
     if (failed) {
       if (!fenceCurrent()) return;
@@ -735,8 +1040,17 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
 
     if (pipelineRole && currentPipelineAttempt) {
       let output: string;
+      let docsObservation: { clean: boolean; diff: string | null } | undefined;
       try {
         output = await bbRunner.getThreadOutput(resourceId);
+        if (pipelineRole === "DOCS") {
+          if (!current.environmentId || !current.policy) throw new Error("docs environment is unavailable");
+          const snapshot = await bbRunner.getEnvironmentSnapshot(current.environmentId, current.policy.baseBranch);
+          docsObservation = {
+            clean: environmentWorktreeIsClean(snapshot.status),
+            diff: environmentDiffText(snapshot.diff),
+          };
+        }
       } catch {
         if (!fenceCurrent()) return;
         if (!store.failPipelineStageAttempt({
@@ -758,6 +1072,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         job: current,
         attempt: currentPipelineAttempt,
         output,
+        docsObservation,
         fence: { ownerId: fence.ownerId, generation: fence.generation },
         now: clock(),
       });
@@ -768,6 +1083,88 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       if (!fenceCurrent()) return;
       const latest = store.getJob(job.id);
       if (latest && (latest.state === "implementing" || latest.state === "remediating")) {
+        if (latest.routingMode !== "legacy") {
+          const attempt = store.getAttemptByThreadId(resourceId);
+          const profile = attempt
+            ? store.getLatestCapabilityProfile("worker_attempt", attempt.id)
+            : null;
+          const profileMatches = profile !== null && profile.subjectId === attempt?.id &&
+            profile.recipeId === latest.taskRecipe && profile.recipeVersion === latest.recipeVersion &&
+            profile.mode === latest.routingMode;
+          if (!attempt || !profileMatches || !attempt.handoffSha256 || !latest.environmentId || !latest.policy) {
+            if (latest.routingMode === "active") {
+              applyExecutorEvent(job.id, latest.version, {
+                type: "FAILED",
+                error: "Mandatory capability evidence is incomplete",
+              });
+              return;
+            }
+          } else {
+            let diff: string | null = null;
+            try {
+              const snapshot = await bbRunner.getEnvironmentSnapshot(latest.environmentId, latest.policy.baseBranch);
+              if (!fenceCurrent()) return;
+              diff = environmentDiffText(snapshot.diff);
+            } catch {
+              if (!fenceCurrent()) return;
+            }
+            const commandEvidence = [] as Array<{
+              commandSha256: string;
+              outcome: "pass" | "fail" | "timed_out" | "aborted";
+              terminalId?: string;
+            }>;
+            for (const validation of latest.policy.validationCommands) {
+              let terminalId: string | undefined;
+              try {
+                const result = await terminal.run({
+                  scope: { kind: "environment", environmentId: latest.environmentId },
+                  title: `Capability verification ${validation.name}`,
+                  command: validation.command,
+                  timeoutMs: validation.timeoutMs,
+                  signal,
+                  onObservation: (observation) => {
+                    terminalId = observation.id;
+                  },
+                });
+                if (!fenceCurrent()) return;
+                commandEvidence.push({
+                  commandSha256: createHash("sha256").update(validation.command, "utf8").digest("hex"),
+                  outcome: result.outcome === "exited"
+                    ? result.exitCode === 0 ? "pass" : "fail"
+                    : result.outcome,
+                  ...(terminalId ? { terminalId } : {}),
+                });
+              } catch {
+                if (!fenceCurrent()) return;
+                commandEvidence.push({
+                  commandSha256: createHash("sha256").update(validation.command, "utf8").digest("hex"),
+                  outcome: "aborted",
+                  ...(terminalId ? { terminalId } : {}),
+                });
+              }
+            }
+            const settlement = recordImplementationCapabilityOutcomes({
+              store,
+              profileId: profile.id,
+              handoffSha256: attempt.handoffSha256,
+              diff,
+              commands: commandEvidence,
+              validationPolicy: {
+                commandSha256s: latest.policy.validationCommands.map((validation) =>
+                  createHash("sha256").update(validation.command, "utf8").digest("hex")),
+              },
+              now: clock(),
+            });
+            if (!fenceCurrent()) return;
+            if (!settlement.satisfied && latest.routingMode === "active") {
+              applyExecutorEvent(job.id, latest.version, {
+                type: "FAILED",
+                error: "Mandatory capability evidence is incomplete",
+              });
+              return;
+            }
+          }
+        }
         applyExecutorEvent(job.id, latest.version, { type: "IMPLEMENTATION_IDLE" });
       }
       return;
@@ -781,6 +1178,59 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       return;
     }
     if (attempt.jobId !== current.id || attempt.kind !== "review" || attempt.headSha !== current.prHeadSha) return;
+    let guardPolicy: GuardAssessmentPolicy | undefined;
+    if (current.routingMode === "active" && attempt.reviewLens === "quality") {
+      if (!current.environmentId || !current.policy) {
+        if (!fenceCurrent()) return;
+        applyExecutorEvent(job.id, current.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+        return;
+      }
+      const profile = store.getLatestCapabilityProfile("worker_attempt", attempt.id);
+      let diff: string | null = null;
+      try {
+        const snapshot = await bbRunner.getEnvironmentSnapshot(current.environmentId, current.policy.baseBranch);
+        if (!fenceCurrent()) return;
+        diff = environmentDiffText(snapshot.diff);
+      } catch {
+        if (!fenceCurrent()) return;
+      }
+      const guardAssignments = profile?.assignments.filter((assignment) =>
+        CAPABILITY_BY_ID.get(assignment.capabilityId)?.evidence.receiptType === "guard") ?? [];
+      const requiredGuards = diff === null ? [] : [...requiredGuardsForChangeSurface(diff)];
+      const selectedGuardIds = guardAssignments.map((assignment) => assignment.capabilityId)
+        .sort((left, right) => left.localeCompare(right));
+      const profileMatches = profile !== null && profile.subjectId === attempt.id &&
+        profile.recipeId === current.taskRecipe && profile.recipeVersion === current.recipeVersion &&
+        profile.mode === current.routingMode &&
+        JSON.stringify(selectedGuardIds) === JSON.stringify(requiredGuards) &&
+        guardAssignments.every((assignment) => CAPABILITY_BY_ID.get(assignment.capabilityId)?.digest === assignment.descriptorDigest);
+      if (!profileMatches || diff === null) {
+        if (!fenceCurrent()) return;
+        applyExecutorEvent(job.id, current.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+        return;
+      }
+      if (guardAssignments.length > 0) {
+        guardPolicy = {
+          profileId: profile.id,
+          profileRevision: profile.revision,
+          reviewedHeadSha: current.prHeadSha,
+          diffDigest: createHash("sha256").update(diff, "utf8").digest("hex"),
+          selectedGuards: guardAssignments.map((assignment) => {
+            const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+            if (!descriptor) throw new Error("Selected guard disappeared before review settlement");
+            return {
+              capabilityId: assignment.capabilityId,
+              descriptorDigest: assignment.descriptorDigest,
+              mandatory: assignment.mandatory,
+              substitutes: descriptor.composition.substitutes,
+            };
+          }),
+          requirementIds: guardRequirementBindings(current.policy.requiredChecks).map((requirement) => requirement.id),
+          mustFixRuleIds: ["clean.rule-1", "docs.rule-1", "tests.rule-1"],
+          advisoryRuleIds: ["clean.rule-10", "docs.rule-10", "tests.rule-10"],
+        };
+      }
+    }
     const invocation: ReviewInvocation = {
       jobId: current.id,
       attemptId: attempt.id,
@@ -789,6 +1239,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       environmentId: current.environmentId ?? "",
       mergeBaseBranch: current.policy?.baseBranch ?? "",
       expectedSha: current.prHeadSha,
+      ...(guardPolicy === undefined ? {} : { guardPolicy }),
       signal,
     };
     if (!invocation.environmentId || !invocation.mergeBaseBranch || !fenceCurrent()) return;
@@ -803,25 +1254,71 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     if (!completion.event || !fenceCurrent()) return;
     const latest = store.getJob(invocation.jobId);
     const latestAttempt = store.getAttempt(invocation.attemptId);
+    const latestQualityAttempt = latest?.reviewThreadId ? store.getAttemptByThreadId(latest.reviewThreadId) : null;
     if (!latest || !latestAttempt || latestAttempt.jobId !== invocation.jobId ||
       latestAttempt.threadId !== invocation.reviewThreadId || latestAttempt.headSha !== invocation.expectedSha ||
+      !latestQualityAttempt || latestQualityAttempt.jobId !== invocation.jobId || latestQualityAttempt.kind !== "review" ||
+      latestQualityAttempt.reviewLens !== "quality" || latestAttempt.reviewStage !== latestQualityAttempt.reviewStage ||
+      latestAttempt.ordinal !== latestQualityAttempt.ordinal ||
       latest.id !== invocation.jobId || latest.version !== current.version ||
       (latest.state !== "reviewing" && latest.state !== "final_reviewing") ||
       latest.environmentId !== invocation.environmentId || latest.prHeadSha !== invocation.expectedSha ||
-      latest.reviewThreadId !== invocation.reviewThreadId ||
       latest.implementationThreadId !== invocation.implementationThreadId || !fenceCurrent()) return;
-    const event = completion.event;
-    if (event.type === "REVIEW_PASSED") {
-      applyExecutorEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: String(event.payload.headSha) });
-    } else if (event.type === "REVIEW_CHANGES_REQUESTED") {
+    if (!latestQualityAttempt.reviewStage) return;
+    const assessment = assessReviewGroup(
+      store.listReviewAttempts(latest.id, latestQualityAttempt.reviewStage, latestQualityAttempt.ordinal),
+      latest.deliveryMode,
+      invocation.expectedSha,
+    );
+    if (assessment.outcome === "pending") return;
+    if (assessment.outcome === "pass") {
+      if (latest.routingMode === "active") {
+        if (!latest.environmentId || !latest.policy) {
+          applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+          return;
+        }
+        let exactDiff: string | null = null;
+        try {
+          const snapshot = await bbRunner.getEnvironmentSnapshot(latest.environmentId, latest.policy.baseBranch);
+          if (!fenceCurrent()) return;
+          exactDiff = environmentDiffText(snapshot.diff);
+        } catch {
+          if (!fenceCurrent()) return;
+        }
+        if (exactDiff === null) {
+          applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+          return;
+        }
+        let documentation;
+        try {
+          documentation = documentationRequirement({
+            diff: exactDiff,
+            traits: latest.taskTraits.map((trait) => trait.id),
+            reasonCodes: latest.taskReasonCodes,
+          });
+        } catch {
+          applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+          return;
+        }
+        applyExecutorEvent(job.id, latest.version, {
+          type: "REVIEW_PASSED",
+          headSha: invocation.expectedSha,
+          documentation: {
+            required: documentation.required,
+            diffDigest: documentation.diffDigest,
+            reasons: documentation.reasons,
+          },
+        });
+      } else {
+        applyExecutorEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: invocation.expectedSha });
+      }
+    } else if (assessment.outcome === "changes_requested") {
       applyExecutorEvent(job.id, latest.version, {
         type: "REVIEW_CHANGES_REQUESTED",
-        headSha: typeof event.payload.headSha === "string" ? event.payload.headSha : undefined,
-        summary: typeof event.payload.summary === "string" ? event.payload.summary : undefined,
-        findings: Array.isArray(event.payload.findings) ? event.payload.findings as ReviewFinding[] : undefined,
-        reasons: Array.isArray(event.payload.reasons)
-          ? event.payload.reasons.filter((reason): reason is string => typeof reason === "string")
-          : undefined,
+        headSha: invocation.expectedSha,
+        summary: assessment.summary ?? undefined,
+        findings: assessment.findings as ReviewFinding[],
+        reasons: assessment.reasons,
       });
     } else {
       applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
@@ -831,6 +1328,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     store,
     fence,
     now: clock,
+    minimumModelPool: () => config.ok ? capabilityMinimumModelPool(config.value) : undefined,
     bb: bbEffectAdapter,
     terminal,
     mergeHandler,
@@ -895,6 +1393,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       warn: (message) => bb.log.warn(message),
     }, signal),
   });
+  bb.background.service("capability-inventory", {
+    start: (signal) => capabilityInventory.run(signal),
+  });
   bb.background.service("job-executor", {
     start: (signal) => runJobExecutorService({
       store,
@@ -904,6 +1405,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       onWorkAvailable: () => executorNudge.notify(),
       clock: { now: clock },
       reconcileJob,
+      getWorkerThread: (threadId) => bbRunner.getThread(threadId),
       telegramToken: () => config.ok ? config.value.botToken : undefined,
       getTelegramClient: () => {
         if (!config.ok) throw new Error(config.message);
@@ -932,7 +1434,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
 
   const queueThreadReconcile = (threadId: string): void => {
     const jobQueued = store.enqueueReconcileForThread(threadId, clock());
-    if (jobQueued || store.getControllerByThreadId(threadId) !== null) executorNudge.notify();
+    if (jobQueued || store.shouldWakeForThread(threadId)) executorNudge.notify();
+  };
+  const queueEnvironmentReconcile = (environmentId: string): void => {
+    const jobQueued = store.enqueueReconcileForEnvironment(environmentId, clock());
+    if (jobQueued || store.shouldWakeForEnvironment(environmentId)) executorNudge.notify();
   };
   bb.events.on("thread.created", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.active", ({ thread }) => queueThreadReconcile(thread.id));
@@ -940,4 +1446,23 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   bb.events.on("thread.failed", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.archived", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.deleted", ({ thread }) => queueThreadReconcile(thread.id));
+  const unsubscribeThreadChanges = bb.sdk.subscribe({
+    event: "thread:changed",
+    callback: (event) => {
+      if (!event.id || !threadChangeShouldWake(event.changes)) return;
+      // A question answered in BB leaves a live card on the owner's phone. That
+      // is worth one unpaced sweep; ordinary ticks keep their 15-second pacing.
+      if (threadInteractionsChanged(event.changes)) threadNotices.requestSweep();
+      queueThreadReconcile(event.id);
+    },
+  });
+  const unsubscribeEnvironmentChanges = bb.sdk.subscribe({
+    event: "environment:changed",
+    callback: (event) => {
+      if (!event.id || !environmentChangeShouldWake(event.changes)) return;
+      queueEnvironmentReconcile(event.id);
+    },
+  });
+  bb.onDispose(unsubscribeThreadChanges);
+  bb.onDispose(unsubscribeEnvironmentChanges);
 }

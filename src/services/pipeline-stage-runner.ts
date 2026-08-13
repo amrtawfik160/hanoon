@@ -3,7 +3,11 @@ import {
   buildDocsReportArtifact,
   buildPlanArtifact,
   parseCritiqueResult,
+  parseDocsReport,
+  parseVerificationPlan,
+  type DocsObservation,
 } from "../bb/pipeline-handoffs";
+import { recordDocumentationCapabilityOutcomes } from "../capabilities/outcomes";
 import type { Job, JobEvent } from "../domain/models";
 import type { PipelineStageAttempt, TelegramAgentStore } from "../storage/store";
 
@@ -39,6 +43,26 @@ function invalidStageOutput(
   return { outcome: "invalid", error };
 }
 
+function failCapabilityStage(
+  store: TelegramAgentStore,
+  job: Job,
+  attempt: PipelineStageAttempt,
+  fence: PipelineStageFence,
+  now: number,
+): PipelineStageSettlement {
+  const error = "Mandatory capability evidence is incomplete";
+  if (!store.failPipelineStageAttempt({ id: attempt.id, error, ...fence, now })) {
+    return { outcome: "ignored" };
+  }
+  const latest = store.getJob(job.id);
+  if (latest?.state === "documenting" && latest.cancelRequestedAt === null) {
+    if (!applyExecutorEvent(store, job.id, latest.version, { type: "FAILED", error }, fence, now)) {
+      return { outcome: "ignored" };
+    }
+  }
+  return { outcome: "invalid", error };
+}
+
 function applyExecutorEvent(
   store: TelegramAgentStore,
   jobId: string,
@@ -55,10 +79,11 @@ export function settlePipelineStageOutput(input: {
   job: Job;
   attempt: PipelineStageAttempt;
   output: string;
+  docsObservation?: DocsObservation;
   fence: PipelineStageFence;
   now: number;
 }): PipelineStageSettlement {
-  const { store, job, attempt, output, fence, now } = input;
+  const { store, job, attempt, output, docsObservation, fence, now } = input;
   const expectedRole = job.state === "planning" ? "PLAN"
     : job.state === "critiquing" ? "CRITIQUE"
     : job.state === "documenting" ? "DOCS"
@@ -67,8 +92,11 @@ export function settlePipelineStageOutput(input: {
 
   if (attempt.role === "PLAN") {
     let artifact;
+    let verification;
     try {
       artifact = buildPlanArtifact(output);
+      if (!job.policy) throw new TypeError("Plan requires immutable project policy");
+      verification = parseVerificationPlan(new TextDecoder().decode(artifact.bytes), job.policy);
     } catch {
       return invalidStageOutput(store, job, attempt, fence, now);
     }
@@ -76,7 +104,7 @@ export function settlePipelineStageOutput(input: {
       id: attempt.id,
       outputText: new TextDecoder().decode(artifact.bytes),
       outputSha256: artifact.sha256,
-      outcome: { verdict: "success" },
+      outcome: { verdict: "success", verification },
       ...fence,
       now,
     });
@@ -90,16 +118,40 @@ export function settlePipelineStageOutput(input: {
 
   if (attempt.role === "DOCS") {
     let artifact;
+    let documentation;
     try {
       artifact = buildDocsReportArtifact(output);
+      if (!docsObservation) throw new TypeError("Docs settlement requires observed worktree evidence");
+      documentation = parseDocsReport(new TextDecoder().decode(artifact.bytes), docsObservation);
     } catch {
       return invalidStageOutput(store, job, attempt, fence, now);
+    }
+    if (job.routingMode !== "legacy") {
+      const profile = store.getLatestCapabilityProfile("worker_attempt", attempt.id);
+      const profileMatches = profile !== null && profile.subjectId === attempt.id &&
+        profile.recipeId === job.taskRecipe && profile.recipeVersion === job.recipeVersion &&
+        profile.mode === job.routingMode;
+      if (!profileMatches) {
+        if (job.routingMode === "active") return failCapabilityStage(store, job, attempt, fence, now);
+      } else {
+        const settlement = recordDocumentationCapabilityOutcomes({
+          store,
+          profileId: profile.id,
+          reportSha256: artifact.sha256,
+          report: documentation,
+          observation: docsObservation,
+          now,
+        });
+        if (!settlement.satisfied && job.routingMode === "active") {
+          return failCapabilityStage(store, job, attempt, fence, now);
+        }
+      }
     }
     const completed = store.completePipelineStageAttempt({
       id: attempt.id,
       outputText: new TextDecoder().decode(artifact.bytes),
       outputSha256: artifact.sha256,
-      outcome: { verdict: "success" },
+      outcome: { verdict: "success", documentation },
       ...fence,
       now,
     });
@@ -115,7 +167,10 @@ export function settlePipelineStageOutput(input: {
   try {
     verdict = parseCritiqueResult(output);
   } catch {
-    return invalidStageOutput(store, job, attempt, fence, now);
+    verdict = {
+      verdict: "needs_revision" as const,
+      summary: "Critique output was not valid JSON; rewrite the plan so it is concrete and testable.",
+    };
   }
   const artifact = buildCritiqueArtifact(verdict);
   const completed = store.completePipelineStageAttempt({

@@ -1,7 +1,12 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { Job, ProjectPolicy, WorkerLiveness } from "../domain/models";
 import { buildWorkerThreadTitle } from "../agent-skills/role-resolver";
-import { buildReviewPacket, buildWorkOrder, type HandoffArtifact } from "./handoffs";
+import {
+  buildReviewPacket,
+  buildWorkOrder,
+  type CapabilityWorkOrderEnvelope,
+  type HandoffArtifact,
+} from "./handoffs";
 import {
   buildCritiqueArtifact,
   buildCritiquePacket,
@@ -11,10 +16,13 @@ import {
 } from "./pipeline-handoffs";
 import {
   buildImplementationInstruction,
+  buildAdoptedPrInstruction,
   buildRemediationPrompt,
   buildReviewInstruction,
   type ReviewFinding,
 } from "./prompts";
+import { TerminalCommandRunner } from "./terminal-command";
+import type { ModelRoute } from "../capabilities/models";
 
 type BbSdk = BbPluginApi["sdk"];
 type SpawnArgs = Parameters<BbSdk["threads"]["spawn"]>[0];
@@ -30,6 +38,14 @@ type UploadedLocalFile = {
   mimeType?: string;
 };
 
+export const PROGRESS_SCRATCHPAD_COMMAND = [
+  'exclude_path="$(git rev-parse --git-path info/exclude)"',
+  'mkdir -p "$(dirname "$exclude_path")"',
+  'grep -qxF "/PROGRESS.md" "$exclude_path" || printf "\\n/PROGRESS.md\\n" >> "$exclude_path"',
+  'if [ ! -f PROGRESS.md ]; then printf "# Progress\\n\\n## Current state\\n- Work has not started.\\n\\n## Next step\\n- Read the work order and inspect the repository.\\n" > PROGRESS.md; fi',
+  "git check-ignore -q PROGRESS.md",
+].join(" && ");
+
 export type BbAttempt = {
   id: string;
   kind?: "implementation" | "review" | "validation";
@@ -37,6 +53,8 @@ export type BbAttempt = {
   threadId?: string | null;
   handoffPath?: string | null;
   handoffSha256?: string | null;
+  reviewLens?: "quality" | "risk" | null;
+  capabilityProfile?: CapabilityWorkOrderEnvelope;
 };
 
 export type PipelineThreadAttempt = {
@@ -46,6 +64,7 @@ export type PipelineThreadAttempt = {
   threadId?: string | null;
   environmentId?: string | null;
   outputText?: string | null;
+  capabilityProfile?: CapabilityWorkOrderEnvelope;
 };
 
 export type EnvironmentSnapshot = {
@@ -77,6 +96,45 @@ function executionArgs(policy: ProjectPolicy["implementation"]): Record<string, 
   }
   if (Object.keys(sources).length > 0) args.executionInputSources = sources;
   return args;
+}
+
+function routeExecutionArgs(
+  route: ModelRoute,
+  permissionMode: ProjectPolicy["implementation"]["permissionMode"],
+): Record<string, unknown> {
+  return {
+    providerId: route.providerId,
+    model: route.modelId,
+    reasoningLevel: route.reasoning,
+    serviceTier: route.serviceTier,
+    ...(permissionMode === undefined ? {} : { permissionMode }),
+    executionInputSources: {
+      providerId: "explicit",
+      model: "explicit",
+      reasoningLevel: "explicit",
+      serviceTier: "explicit",
+      ...(permissionMode === undefined ? {} : { permissionMode: "explicit" }),
+    },
+  };
+}
+
+function workerExecutionArgs(
+  job: Job,
+  capability: CapabilityWorkOrderEnvelope | undefined,
+  policy: ProjectPolicy["implementation"],
+): Record<string, unknown> {
+  if (job.routingMode !== "active") return executionArgs(policy);
+  if (!capability?.model) throw new TypeError("Active worker dispatch is missing its persisted model route");
+  return routeExecutionArgs(capability.model, policy.permissionMode);
+}
+
+function pipelineExecutionArgs(
+  job: Job,
+  capability: CapabilityWorkOrderEnvelope | undefined,
+): Record<string, unknown> {
+  if (job.routingMode !== "active") return LUNA_MAX_EXECUTION;
+  if (!capability?.model) throw new TypeError("Active pipeline dispatch is missing its persisted model route");
+  return routeExecutionArgs(capability.model, "auto");
 }
 
 // Pipeline workers pin their own execution tuple. Retuning the conversational
@@ -112,9 +170,9 @@ function requireImplementationThreadId(job: Job): string {
   return job.implementationThreadId;
 }
 
-function diffText(snapshot: EnvironmentDiff): string {
-  if (snapshot.outcome !== "available") throw new Error("Complete environment diff is unavailable");
-  if (snapshot.diff.truncated) throw new Error("Cannot create a review packet from a truncated environment diff");
+export function environmentDiffText(snapshot: EnvironmentDiff): string | null {
+  if (snapshot.outcome !== "available") return null;
+  if (snapshot.diff.truncated) return null;
   return snapshot.diff.diff;
 }
 
@@ -149,31 +207,59 @@ export class BbRunner {
     return { ...uploaded, type: "localFile" };
   }
 
+  public async prepareProgressScratchpad(environmentId: string): Promise<void> {
+    if (typeof environmentId !== "string" || environmentId.length === 0) {
+      throw new TypeError("Implementation environment id is required");
+    }
+    const result = await new TerminalCommandRunner(this.sdk).run({
+      scope: { kind: "environment", environmentId },
+      title: "Prepare implementation progress scratchpad",
+      command: PROGRESS_SCRATCHPAD_COMMAND,
+      timeoutMs: 60_000,
+    });
+    if (result.outcome !== "exited" || result.exitCode !== 0) {
+      throw new Error("Implementation progress scratchpad could not be prepared safely");
+    }
+  }
+
   public async spawnImplementation(
     job: Job,
     attempt: BbAttempt,
     _suppliedPolicy?: ProjectPolicy,
   ): Promise<ThreadResult> {
     const policy = selectedPolicy(job);
-    const artifact = buildWorkOrder(job, policy);
+    const artifact = buildWorkOrder(job, policy, attempt.capabilityProfile);
     const project = projectId(job, policy);
     const hostId = await this.resolveProjectHost(project);
     const uploaded = await this.upload(project, artifact);
     recordHandoff(attempt, artifact, uploaded);
+    const adopted = job.origin === "adopted_pr";
+    if (adopted && (!job.adoptedBranch || !job.adoptedHeadSha || job.prHeadSha !== job.adoptedHeadSha)) {
+      throw new TypeError("Adopted implementation requires its verified branch and exact immutable head");
+    }
     const request = spawnRequest({
       projectId: project,
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "implementation" }),
-      visibility: "visible",
+      visibility: "hidden",
       input: [
-        { type: "text", text: buildImplementationInstruction(artifact), mentions: [] },
+        {
+          type: "text",
+          text: adopted
+            ? buildAdoptedPrInstruction(artifact, job.adoptedHeadSha!)
+            : buildImplementationInstruction(artifact),
+          mentions: [],
+        },
         uploaded,
       ],
       environment: {
         type: "host",
         hostId,
-        workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: policy.baseBranch } },
+        workspace: {
+          type: "managed-worktree",
+          baseBranch: { kind: "named", name: adopted ? job.adoptedBranch! : policy.baseBranch },
+        },
       },
-      ...executionArgs(policy.implementation),
+      ...workerExecutionArgs(job, attempt.capabilityProfile, policy.implementation),
     });
     const thread = await this.sdk.threads.spawn(request);
     attempt.threadId = thread.id;
@@ -187,14 +273,14 @@ export class BbRunner {
   ): Promise<ThreadResult> {
     const policy = selectedPolicy(job);
     const project = projectId(job, policy);
-    const workOrder = buildWorkOrder(job, policy);
+    const workOrder = buildWorkOrder(job, policy, attempt.capabilityProfile);
     const revisionText = previousCritique?.trim();
     const critique = revisionText ? buildCritiqueArtifact(parseCritiqueResult(revisionText)) : null;
     const uploadedWorkOrder = await this.upload(project, workOrder);
     const uploadedCritique = critique ? await this.upload(project, critique) : null;
     const prompt = revisionText
-      ? "Read the attached immutable work order and critique artifact. Return only the complete replacement plan as Markdown. Do not edit files, commit, push, merge, or deploy."
-      : "Read the attached immutable work order and produce a concrete, bounded implementation and verification plan as Markdown. Do not edit files, commit, push, merge, or deploy.";
+      ? "Read the attached immutable work order and critique artifact. Return only the complete replacement implementation and verification plan as Markdown. Include a ## Verification section containing the exact table or explicit skip line required by the work order. Do not edit files, commit, push, create a pull request, merge, or deploy."
+      : "Read the attached immutable work order and produce a concrete, bounded implementation and verification plan as Markdown. Include a ## Verification section containing the exact table or explicit skip line required by the work order. Do not edit files, commit, push, create a pull request, merge, or deploy.";
     const environment = job.environmentId
       ? { type: "reuse", environmentId: job.environmentId }
       : {
@@ -205,14 +291,14 @@ export class BbRunner {
     const thread = await this.sdk.threads.spawn(spawnRequest({
       projectId: project,
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "planner" }),
-      visibility: "visible",
+      visibility: "hidden",
       input: [
         { type: "text", text: prompt, mentions: [] },
         uploadedWorkOrder,
         ...(uploadedCritique ? [uploadedCritique] : []),
       ],
       environment,
-      ...LUNA_MAX_EXECUTION,
+      ...pipelineExecutionArgs(job, attempt.capabilityProfile),
     }));
     attempt.threadId = thread.id;
     attempt.environmentId = thread.environmentId;
@@ -233,7 +319,7 @@ export class BbRunner {
     }
     if (!planAttempt.threadId) throw new TypeError("Critique requires the planner thread identity");
     if (!planAttempt.outputText) throw new TypeError("Critique requires completed planner output");
-    const workOrder = buildWorkOrder(job, policy);
+    const workOrder = buildWorkOrder(job, policy, attempt.capabilityProfile);
     const plan = buildPlanArtifact(planAttempt.outputText);
     const packet = buildCritiquePacket(job, plan);
     const uploadedWorkOrder = await this.upload(project, workOrder);
@@ -243,11 +329,11 @@ export class BbRunner {
       projectId: project,
       parentThreadId: planAttempt.threadId,
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "critic" }),
-      visibility: "visible",
+      visibility: "hidden",
       input: [
         {
           type: "text",
-          text: "Read the attached immutable work order, plan, and critique contract. Assess the plan independently and return strict JSON only. Do not inspect the planner conversation or edit files.",
+          text: "Read the attached immutable work order, plan, and critique contract. Assess the plan independently and return strict JSON only. Request revision only for missing outcome, unbounded scope, missing verification, or an unimplementable plan. Do not request revision for polish or for commit, push, or pull-request steps. Do not inspect the planner conversation or edit files.",
           mentions: [],
         },
         uploadedWorkOrder,
@@ -255,7 +341,7 @@ export class BbRunner {
         uploadedPacket,
       ],
       environment: { type: "reuse", environmentId },
-      ...LUNA_MAX_EXECUTION,
+      ...pipelineExecutionArgs(job, attempt.capabilityProfile),
     }));
     attempt.threadId = thread.id;
     attempt.environmentId = thread.environmentId ?? environmentId;
@@ -277,7 +363,7 @@ export class BbRunner {
     if (!planAttempt.threadId || !planAttempt.outputText) {
       throw new TypeError("Builder requires a completed plan attempt");
     }
-    const workOrder = buildWorkOrder(job, policy);
+    const workOrder = buildWorkOrder(job, policy, attempt.capabilityProfile);
     const plan = buildPlanArtifact(planAttempt.outputText);
     const uploadedWorkOrder = await this.upload(project, workOrder);
     const uploadedPlan = await this.upload(project, plan);
@@ -286,18 +372,18 @@ export class BbRunner {
       projectId: project,
       parentThreadId: planAttempt.threadId,
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "implementation" }),
-      visibility: "visible",
+      visibility: "hidden",
       input: [
         {
           type: "text",
-          text: `Read the attached immutable work order ${workOrder.filename} and plan ${plan.filename}. Follow both files, implement the requested change, verify it, and report the required outcome.`,
+          text: `Read the attached immutable work order ${workOrder.filename}, plan ${plan.filename}, and the gitignored PROGRESS.md scratchpad. Keep PROGRESS.md current after meaningful milestones so a replacement worker can continue. Follow both attachments, implement the requested change, verify it, and report the required outcome. Do not commit, push, or open a pull request.`,
           mentions: [],
         },
         uploadedWorkOrder,
         uploadedPlan,
       ],
       environment: { type: "reuse", environmentId },
-      ...executionArgs(policy.implementation),
+      ...workerExecutionArgs(job, attempt.capabilityProfile, policy.implementation),
     }));
     attempt.threadId = thread.id;
     return thread;
@@ -314,7 +400,7 @@ export class BbRunner {
     const project = projectId(job, policy);
     const environmentId = requireEnvironmentId(job);
     const parentThreadId = requireImplementationThreadId(job);
-    const workOrder = buildWorkOrder(job, policy);
+    const workOrder = buildWorkOrder(job, policy, attempt.capabilityProfile);
     const packet = buildDocsPacket(job);
     const uploadedWorkOrder = await this.upload(project, workOrder);
     const uploadedPacket = await this.upload(project, packet);
@@ -322,18 +408,18 @@ export class BbRunner {
       projectId: project,
       parentThreadId,
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "documentation" }),
-      visibility: "visible",
+      visibility: "hidden",
       input: [
         {
           type: "text",
-          text: "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, commit and push, then report bounded evidence.",
+          text: "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes.",
           mentions: [],
         },
         uploadedWorkOrder,
         uploadedPacket,
       ],
       environment: { type: "reuse", environmentId },
-      ...LUNA_MAX_EXECUTION,
+      ...pipelineExecutionArgs(job, attempt.capabilityProfile),
     }));
     attempt.threadId = thread.id;
     attempt.environmentId = thread.environmentId ?? environmentId;
@@ -365,7 +451,17 @@ export class BbRunner {
     requirePullRequestSnapshot(job, pullRequest);
     if (job.prHeadSha === null) throw new Error("Active job has no authoritative review head SHA");
     const remoteHeadSha = job.prHeadSha;
-    const artifact = buildReviewPacket(job, policy, remoteHeadSha, diffText(snapshot.diff));
+    const artifact = buildReviewPacket(
+      job,
+      policy,
+      remoteHeadSha,
+      await this.reviewDiff(environmentId, job, snapshot.diff),
+      attempt.reviewLens ?? "quality",
+      attempt.capabilityProfile,
+      job.taskRecipe === "architectural"
+        ? role === "final-review" ? "integrated-review" : "task-review"
+        : job.taskRecipe === "direct" ? "diff-guards" : "review",
+    );
     const project = projectId(job, policy);
     const uploaded = await this.upload(project, artifact);
     recordHandoff(attempt, artifact, uploaded);
@@ -373,13 +469,13 @@ export class BbRunner {
       projectId: project,
       parentThreadId,
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role }),
-      visibility: "visible",
+      visibility: "hidden",
       input: [
         { type: "text", text: buildReviewInstruction(artifact), mentions: [] },
         uploaded,
       ],
       environment: { type: "reuse", environmentId },
-      ...executionArgs(policy.review),
+      ...workerExecutionArgs(job, attempt.capabilityProfile, policy.review),
     });
     const thread = await this.sdk.threads.spawn(request);
     attempt.threadId = thread.id;
@@ -408,6 +504,25 @@ export class BbRunner {
     await this.sdk.threads.stop({ threadId: worker.resourceId });
   }
 
+  public async retireWorker(resourceId: string, allowMissing: boolean): Promise<void> {
+    if (typeof resourceId !== "string" || resourceId.length === 0) {
+      throw new TypeError("Worker resource id is required");
+    }
+    try {
+      await this.sdk.threads.stop({ threadId: resourceId });
+      return;
+    } catch (stopError) {
+      try {
+        const thread = await this.sdk.threads.get({ threadId: resourceId });
+        const display = thread.runtime.displayStatus;
+        if (thread.status === "idle" || thread.status === "error" || display === "idle" || display === "error") return;
+      } catch {
+        if (allowMissing) return;
+      }
+      throw stopError;
+    }
+  }
+
   public async getThread(threadId: string): Promise<Awaited<ReturnType<BbSdk["threads"]["get"]>>> {
     return this.sdk.threads.get({ threadId });
   }
@@ -420,6 +535,24 @@ export class BbRunner {
 
   public async getPullRequestSnapshot(environmentId: string): Promise<PullRequestSnapshot> {
     return this.sdk.environments.pullRequest({ environmentId });
+  }
+
+  private async reviewDiff(environmentId: string, job: Job, snapshot: EnvironmentDiff): Promise<string> {
+    const local = environmentDiffText(snapshot);
+    if (local !== null) return local;
+    if (job.prNumber === null) {
+      throw new Error("Complete environment diff is unavailable and the job has no pull request");
+    }
+    const result = await new TerminalCommandRunner(this.sdk).run({
+      scope: { kind: "environment", environmentId },
+      title: `Telegram review diff ${job.id}`,
+      command: `gh pr diff ${String(job.prNumber)}`,
+      timeoutMs: 60_000,
+    });
+    if (result.outcome === "exited" && result.exitCode === 0 && result.output.trim().length > 0) {
+      return result.output;
+    }
+    throw new Error("Complete review diff is unavailable from the environment and GitHub");
   }
 }
 

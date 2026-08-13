@@ -107,7 +107,7 @@ function observingAdapter(pages: readonly (readonly unknown[])[]) {
   return new BbControllerAdapter({
     sdk,
     pluginId: "telegram-agent",
-    executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+    executionProfiles: () => [DEFAULT_CONTROLLER_EXECUTION_PROFILE],
   });
 }
 
@@ -125,6 +125,26 @@ it("counts tool starts, failed commands, and the cumulative token total", async 
   const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
 
   expect(observation).toMatchObject({ toolCalls: 2, commandFailures: 1, totalTokens: 9_004 });
+});
+
+it("does not count cached context as fresh supervisor spend", async () => {
+  const adapter = observingAdapter([[
+    event(1, "thread/tokenUsage/updated", {
+      tokenUsage: {
+        total: {
+          totalTokens: 420_000,
+          inputTokens: 415_000,
+          cachedInputTokens: 390_000,
+          outputTokens: 5_000,
+          reasoningOutputTokens: 1_000,
+        },
+      },
+    }),
+  ]]);
+
+  const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
+
+  expect(observation.totalTokens).toBe(30_000);
 });
 
 it("reports no usage for a window that carried none", async () => {
@@ -266,6 +286,7 @@ function serviceAdapter(observation: () => Observation, status: () => Controller
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
+    hasExecutionProfile: () => false,
   };
 }
 
@@ -324,6 +345,23 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
     .toContain("ran past its budget");
+});
+
+it("stops the live provider turn before retiring a hard-budget controller", async () => {
+  const { store, fence } = storeFixture("hard-stop-provider");
+  submittedTurn(store, fence);
+  const adapter = serviceAdapter(
+    () => observation({ latestSeq: 2, toolCalls: SUPERVISOR_HARD_TOOL_CALLS }),
+    () => "active",
+  );
+  const stop = vi.fn(async () => undefined);
+  Object.assign(adapter, { stop });
+  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
+
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  expect(stop).toHaveBeenCalledWith("thr_controller", runFence.signal);
 });
 
 it("leaves a turn parked on an owner question alone however much it has spent", async () => {

@@ -101,6 +101,49 @@ describe("Telegram callback grammar", () => {
 });
 
 describe("deterministic Telegram views", () => {
+  it("shows quiet routing, verification, guard, decision, and delivery facts without a capability dump", () => {
+    const rendered = renderJobStatus(jobFixture({
+      id: telegramJobId,
+      state: "validating",
+      taskRecipe: "bounded",
+      recipeVersion: 1,
+      recipePromotionCount: 1,
+      routingMode: "active",
+    }), {
+      materialModelPool: "strong",
+      mandatoryGuardOutcome: "passed",
+      ownerDecision: "Merge approval required",
+      validation: [{ name: "unit", outcome: "passed" }],
+    });
+
+    expect(rendered.text).toContain("Recipe: <code>bounded@1</code>");
+    expect(rendered.text).toContain("Stage: <code>validating</code>");
+    expect(rendered.text).toContain("Rigor: promoted 1/2");
+    expect(rendered.text).toContain("Model escalation: <code>strong</code>");
+    expect(rendered.text).toContain("Verification: passed");
+    expect(rendered.text).toContain("Mandatory guards: passed");
+    expect(rendered.text).toContain("Decision: Merge approval required");
+    expect(rendered.text).toContain("Delivery: in progress");
+    expect(rendered.text).not.toMatch(/cap_profile:|descriptor|receipt|test-driven-development/u);
+  });
+
+  it("keeps routine routing quiet beyond recipe, stage, and delivery", () => {
+    const rendered = renderJobStatus(jobFixture({
+      id: telegramJobId,
+      state: "implementing",
+      taskRecipe: "direct",
+      recipeVersion: 1,
+      recipePromotionCount: 0,
+      routingMode: "shadow",
+    }));
+
+    expect(rendered.text).toContain("Recipe: <code>direct@1</code>");
+    expect(rendered.text).toContain("Stage: <code>implementing</code>");
+    expect(rendered.text).toContain("Delivery: in progress");
+    expect(rendered.text).not.toContain("Model escalation:");
+    expect(rendered.text).not.toContain("Mandatory guards:");
+  });
+
   it("renders bounded plural status groups with an exact remaining count", () => {
     const jobs = Array.from({ length: 10 }, (_, index) => ({
       job: jobFixture({
@@ -214,6 +257,75 @@ describe("deterministic Telegram views", () => {
     expect(rendered.text).not.toContain("/environments/");
   });
 
+  it("offers revise-plan for a planning block and review only when there is implementation", () => {
+    const planBlocked = jobFixture({
+      id: telegramJobId,
+      state: "blocked",
+      blockedReason: "plan_limit",
+      lastError: "Plan needs revision: Add the refund fact",
+      planCycle: 2,
+    });
+    const legacyPlanBlocked = jobFixture({
+      id: telegramJobId,
+      state: "blocked",
+      blockedReason: "review_limit",
+      lastError: "Plan critique limit reached",
+      planCycle: 2,
+      reviewCycle: 0,
+      implementationThreadId: null,
+      prNumber: null,
+    });
+    const reviewBlocked = jobFixture({
+      id: telegramJobId,
+      state: "blocked",
+      blockedReason: "review_limit",
+      reviewCycle: 3,
+      implementationThreadId: "thr_implementation",
+      prNumber: 17,
+      prUrl: "https://github.com/acme/cyndra/pull/17",
+    });
+    const configured = jobFixture({
+      id: telegramJobId,
+      state: "blocked",
+      blockedReason: "configuration",
+      lastError: "Production deployment and canary are not configured",
+    });
+    const finishable = jobFixture({
+      id: telegramJobId,
+      state: "blocked",
+      blockedReason: "configuration",
+      lastError: "Production deployment and canary are not configured",
+      prNumber: 18,
+      prUrl: "https://github.com/acme/cyndra/pull/18",
+    });
+    const permanent = jobFixture({
+      id: telegramJobId,
+      state: "blocked",
+      blockedReason: "permanent_effect_failure",
+      resumeState: "locating_pr",
+      lastError: "implementation inspection requires BB environment and policy context",
+    });
+
+    expect(renderJobStatus(planBlocked).reply_markup?.inline_keyboard.flat().map((button) => button.text)).toContain("Revise plan");
+    expect(renderJobStatus(legacyPlanBlocked).reply_markup?.inline_keyboard.flat().map((button) => button.text)).toContain("Revise plan");
+    expect(renderJobStatus(reviewBlocked).reply_markup?.inline_keyboard.flat().map((button) => button.text)).toContain("Re-run Review");
+    expect(renderJobStatus(configured).reply_markup?.inline_keyboard.flat().map((button) => button.text)).not.toContain("Re-run Review");
+    expect(renderJobStatus(configured).reply_markup?.inline_keyboard.flat().map((button) => button.text)).not.toContain("Revise plan");
+    expect(renderJobStatus(finishable).reply_markup?.inline_keyboard.flat().map((button) => button.text)).toContain("Finish");
+    expect(renderJobStatus(permanent).reply_markup?.inline_keyboard.flat().map((button) => button.text)).toContain("Retry");
+    expect(renderJobStatus(planBlocked).text).toContain("Plan needs revision: Add the refund fact");
+  });
+
+  it("titles a completed job without a merge as a ready pull request", () => {
+    const rendered = renderJobStatus(jobFixture({
+      id: telegramJobId,
+      state: "complete",
+      prNumber: 22,
+      prUrl: "https://github.com/acme/cyndra/pull/22",
+    }));
+    expect(rendered.text).toContain("Done — pull request ready");
+  });
+
   it("offers only the state-appropriate bounded controls", () => {
     const failed = jobFixture({ id: telegramJobId, state: "failed", lastError: "temporary failure" });
     const rendered = renderJobStatus(failed);
@@ -307,10 +419,12 @@ describe("deterministic Telegram views", () => {
       now: 61_000,
     });
 
-    expect(rendered.text).toContain("Worker: thr_worker");
-    expect(rendered.text).toContain("stale");
-    expect(rendered.text).toContain("60s ago");
+    expect(rendered.text).toContain("Worker: implementation");
+    expect(rendered.text).toContain("checking");
+    expect(rendered.text).not.toContain("60s ago");
     expect(rendered.text).toContain("fresh BB observation");
+    expect(fresh.text).toContain("active");
+    expect(fresh.text).not.toContain("checking");
     expect(fresh.reply_markup?.inline_keyboard.flat().map((button) => button.callback_data)).toContain(`r:${telegramJobId}`);
     expect(rendered.reply_markup?.inline_keyboard.flat().map((button) => button.text)).not.toContain("Retry");
   });

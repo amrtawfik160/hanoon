@@ -80,8 +80,8 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
   bb.storage.migrate(bb.storage.database(), [...ALL_MIGRATIONS]);
 }
 
-it("keeps the autonomy migration after the frozen legacy positions and appends images", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 12);
+it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 24);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -97,6 +97,18 @@ it("keeps the autonomy migration after the frozen legacy positions and appends i
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 9]).toContain("sealed_at");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 10]).toContain("ADD COLUMN origin");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 11]).toContain("CREATE TABLE production_health");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 12]).toContain("'CONTINUE_REVIEW', 'RETRY'");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 13]).toContain("image_kind");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 14]).toContain("delivery_mode");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 15]).toContain("CREATE TABLE worker_recoveries");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 16]).toContain("adopted_branch");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 17]).toContain("review_lens");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 18]).toContain("PRIMARY KEY(job_id, resource_id)");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 19]).toContain("CREATE TABLE capability_profiles");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 20]).toContain("ADD COLUMN task_recipe");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 21]).toContain("capability_continuation_count");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 22]).toContain("ADD COLUMN settled_at");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 23]).toContain("model_fallback_index");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {

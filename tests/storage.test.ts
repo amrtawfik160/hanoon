@@ -18,7 +18,9 @@ function policy(overrides: Partial<ProjectPolicy> = {}): ProjectPolicy {
     ],
     requiredChecks: ["test"],
     outputRedactionPatterns: [],
+    workerStartGraceMs: 120_000,
     workerLivenessWatchdogMs: 300_000,
+    workerRecoveryLimit: 2,
     maxReviewCycles: 3,
     mergeMethod: "squash",
     ...overrides,
@@ -30,6 +32,50 @@ it("creates secrets from injectable randomness and hashes them", () => {
   expect(hashSecret("pair-me")).toBe(
     "508499891a8ecb2c56515e8b9794481bb087970f282e8054290f8fc468abd767",
   );
+});
+
+it("delegates immutable capability profiles and receipts through the store", () => {
+  const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
+  const store = openStore(bb.storage);
+  const profile = store.createCapabilityProfile({
+    subjectKind: "worker_attempt",
+    subjectId: "attempt_store_1",
+    threadId: "thread_store_1",
+    recipeId: "bounded",
+    recipeVersion: 1,
+    registryDigest: "a".repeat(64),
+    graphDigest: "b".repeat(64),
+    mode: "active",
+    model: {
+      pool: "standard",
+      providerId: "codex",
+      modelId: "gpt-5.6-terra",
+      reasoning: "medium",
+      serviceTier: "fast",
+    },
+    assignments: [{
+      capabilityId: "test-driven-development",
+      capabilityKind: "skill",
+      descriptorDigest: "c".repeat(64),
+      mandatory: true,
+    }],
+    reasonCodes: ["logic_change"],
+    traits: ["logic"],
+    now: 1_000,
+  });
+
+  expect(store.getActiveCapabilityProfile("worker_attempt", "attempt_store_1")?.id).toBe(profile.id);
+  expect(store.getCapabilityProfileForThread("thread_store_1")?.id).toBe(profile.id);
+  expect(store.appendCapabilityTerminalOutcome({
+    profileId: profile.id,
+    capabilityId: "test-driven-development",
+    descriptorDigest: "c".repeat(64),
+    outcome: "passed",
+    evidenceRefs: ["command:test"],
+    now: 2_000,
+  })).toBe(true);
+  expect(store.listCapabilityReceipts(profile.id, 10)).toHaveLength(2);
+  expect(store.listSkillReceiptProjection(profile.id, 10)[0]?.outcome).toBe("passed");
 });
 
 it("pairs with a code exactly once without storing plaintext", () => {

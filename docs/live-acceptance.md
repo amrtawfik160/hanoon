@@ -23,6 +23,14 @@ Keep these proof classes separate in the final record:
 | Disposable deploy command | Exact merged checkout, production-target exclusion, command receipt, and failure classification. |
 | Disposable canary command | Post-deploy verification and the terminal `complete` decision. |
 
+## Adaptive recipe promotion status
+
+The automated fake-host suite exercises all six recipe graphs, active-mode failure and recovery, restart reconstruction, mandatory guard gating, stale approval rejection, and rollback snapshot behavior. That proof is deterministic; it is not a disposable Telegram, BB-provider, GitHub, deployment, or canary run.
+
+The production promotion reader and append-only evidence ledger are wired. It reads only the newest manifest and accepts it only when its integrity-bound artifact, job, receipt, model-trial, chronology, and safety references resolve to stored rows. The status command reports `incomplete` for missing, corrupt, duplicate, non-causal, or mismatched data, and typed envelopes alone cannot create evidence.
+
+The trusted production collector is not implemented or exposed in this release. Treat the live promotion gate as **not run/incomplete** and keep every recipe in `shadow` while following this runbook. Do not turn a passing local suite into a live receipt, insert evidence with ad hoc SQL, or enable a recipe to make this runbook easier to complete.
+
 ## Token configuration pause
 
 Before this runbook begins, the owner must perform exactly this UI action:
@@ -43,6 +51,15 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | task/status/review/approval/completion message ids | `<message ids only>` |
 | controller BB thread/project/host ids | `<thread id>`, `<personal project id>`, `<host id>` |
 | controller execution tuple | `codex`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
+| selected job recipe and routing mode | `<recipe>@<version>`, `<shadow/active>` |
+| controller/worker capability profiles | `<profile id>`, `<revision>`, `<registry digest>`, `<graph digest>` |
+| mandatory capability outcomes | `<capability id>`, `<terminal outcome>`, `<bounded evidence references>` |
+| candidate/baseline model trials | `<trial ids>`, `<provider/model/reasoning/tier>`, `<terminal outcomes>`, `<harness/budget digests>` |
+| deterministic promotion artifacts | `<category>`, `<suite id>`, `<run id>`, `<artifact digest>`, `<passed/failed>` |
+| classifier promotion artifact | `<corpus digest>`, `<run id>`, `<result digest>`, `<total/correct/unsafe downgrade>` |
+| live failure/recovery receipts | `<live run id>`, `<job id>`, `<failure receipt id>`, `<recovery receipt id>` |
+| zero-tolerance safety snapshots | `<counter>`, `<count>`, `<snapshot id>`, `<evidence digest>` |
+| promotion manifest and status | `<manifest id>`, `<recipe>`, `<incomplete/failed/passed>` |
 | controller conversation check | `<ordinary question received a natural answer and created no job>` |
 | paired owner identity | `<redacted Telegram user/chat identifiers>` |
 | configured project alias | `<alias, not a private path>` |
@@ -53,10 +70,10 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | review BB thread ids | `<thread id>` per attempt |
 | implementation environment id | `<environment id>` |
 | review environment ids | `<same environment id>` per attempt |
-| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
-| review skill-provider evidence | real thread id: `<pending>`; role: `review`; selected ids: `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
-| documentation skill-provider evidence | real thread id: `<pending>`; role: `documentation`; selected ids: `docs-guard`, `verification-before-completion`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
-| final-review skill-provider evidence | real thread id: `<pending>`; role: `final-review`; selected ids: `clean-code-guard`, `test-guard`, `docs-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| review skill-provider evidence | real thread id: `<pending>`; role: `review`; selected ids: `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| documentation skill-provider evidence | real thread id: `<pending>`; role: `documentation`; selected ids: `human-friendly-coding-communication`, `docs-guard`, `verification-before-completion`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| final-review skill-provider evidence | real thread id: `<pending>`; role: `final-review`; selected ids: `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | spawn-versus-fork proof | `<spawned=true, forked=false>` |
 | executor owner and generation | `<owner id>`, `<generation>` |
 | losing executor owner/generation result | `<not acquired or fenced>` |
@@ -135,11 +152,11 @@ Do not record raw private message text or claim-owner internals. Finish or cance
 
 ### 5. Capture implementation handoff and worker isolation
 
-Verify that the leased executor creates a visible implementation thread in a managed worktree on the disposable project's exact source host. Record the thread id, environment id, work-order filename/digest, executor owner/generation, and liveness source/state. Confirm the implementation input uses an attachment and a small handoff prompt. Prove that the thread was spawned and not forked. Confirm the hidden controller remains in its personal workspace and cannot see the implementation checkout.
+Verify that the leased executor creates a hidden implementation thread in a managed worktree on the disposable project's exact source host. Record the thread id, environment id, work-order filename/digest, executor owner/generation, and liveness source/state from bounded BB/operator projections. Confirm the implementation input uses an attachment and a small handoff prompt. Prove that the thread was spawned and not forked. Confirm the hidden controller remains in its personal workspace and cannot see the implementation checkout.
 
-#### Skill-provider observations (pending follow-up slice)
+#### Capability and skill-provider observations
 
-The deterministic `npm run skills:verify` gate proves only the committed bundle's structure, provenance, and bytes. It does not prove provider skill use. In the separately approved receipt/acceptance slice, capture one real BB thread id, the exact role, selected skill ids, the verifier's bundle digest, and the bounded provider-session outcome for each non-empty profile: `implementation`, `review`, `documentation`, and `final-review`. Keep the four evidence rows above **pending** during this slice; persistent skill receipts do not exist yet, so these observations cannot be marked passed or treated as complete live skill-use evidence.
+The deterministic `npm run skills:verify` gate proves only the committed bundle's structure, provenance, and bytes. It does not prove provider use. For each non-empty implementation, review, documentation, and final-review profile, record the real BB thread id, profile id and revision, recipe/version, exact model tuple, selected skill ids, verifier bundle digest, and every mandatory terminal outcome. Confirm the profile existed before the provider call and that the outcome receipt belongs to the same subject. A `selected` event without its required terminal outcome is incomplete. A shadow profile is observational evidence only and cannot be counted as active delivery success.
 
 ### 6. Observe the PR and bind its exact head
 
@@ -147,7 +164,7 @@ When the implementation thread is idle with a pull request, record the PR number
 
 ### 7. Run the first review and forced remediation
 
-Verify a visible spawned review child in the implementation environment, its immutable review-packet filename/digest, and its liveness source/state. Confirm it has a fresh provider conversation rather than the implementation transcript. Supply a strict JSON `changes_requested` verdict. Record the verdict and bounded finding summary. Confirm remediation is sent to the original implementation thread and that the review attempt remains bound to its original head.
+Verify a hidden spawned review child in the implementation environment, its immutable review-packet filename/digest, and its liveness source/state. Confirm it has a fresh provider conversation rather than the implementation transcript. Supply a strict JSON `changes_requested` verdict. Record the verdict and bounded finding summary. Confirm remediation is sent to the original implementation thread and that the review attempt remains bound to its original head.
 
 ### 8. Produce a new implementation head and fresh review
 
@@ -180,6 +197,31 @@ Record the final installed/running status and confirm logs contain no crash loop
 
 Also exercise one recoverable Telegram failure: an expired callback must not replay, or an uneditable status must be replaced and its new message id persisted. Record the classification and bounded recovery outcome without recording the response body.
 
+### 13. Future gate: record adaptive promotion evidence without operator assertions
+
+Run this step separately for each recipe, in the fixed order `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, then `architectural`. Use a fresh disposable active-mode job and a disclosed fixed harness and budget. Induce one recoverable provider failure, verify its terminal failed or blocked model trial, recover through a distinct passed trial on the same job, and finish the disposable job through merge. Record at least five independent candidate trials and five strong-baseline trials for the recipe.
+
+A later trusted acceptance collector—not an operator CLI argument—must derive and append one bounded evidence bundle containing:
+
+- all eight deterministic artifact categories and their digests;
+- the fixed classifier corpus/result with 100% correct and zero unsafe downgrades;
+- the active post-merge disposable job and distinct failure/recovery receipt ids;
+- candidate and baseline model-trial references under identical harness and budget digests;
+- all five zero-tolerance safety counter snapshots;
+- one manifest that references those exact stored records.
+
+The bundle write must be transactional. If any job, receipt, trial, artifact, recipe, chronology, or identity does not resolve, the write must leave no partial manifest. The current release has no such collector, so stop here and mark this gate **incomplete**; do not substitute direct database inserts.
+
+Inspect the result before any rollout decision:
+
+```bash
+bb telegram-agent capability status <recipe> --json
+```
+
+Only a future `passed` and `ready: true` result may permit `capability promote <recipe>`. After promotion, create a new matching job and prove it is `active`; the acceptance job used as evidence must not be retroactively rewritten. Exercise `capability rollback <recipe>` and prove that the in-flight active job stays pinned while a later matching job returns to `shadow`. Record both append-only decisions. Do not promote the next recipe until every earlier recipe remains active.
+
 ## Final acceptance decision
 
-Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Until then, live provider skill-use evidence remains **pending**, not passed or complete. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the live acceptance as **not run**, not successful.
+Accept the base live run only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, canary, and promotion conclusions separate. The four role-specific capability rows must contain real thread ids, profiles, selected ids, bundle digest, exact model tuple, and mandatory terminal outcomes; deterministic bundle verification alone cannot satisfy them.
+
+A recipe promotion is a separate acceptance decision. It remains **incomplete** until step 13 has a resolved durable manifest and the status command reports `ready: true`. If the owner did not configure the token, production commands, disposable projects, or trusted collection harness needed for every case, report the affected live acceptance as **not run**, never successful. This release cannot create that manifest because the trusted collector is absent; do not approve a recipe for activation from local evidence.

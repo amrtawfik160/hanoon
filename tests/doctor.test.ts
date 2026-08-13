@@ -9,6 +9,7 @@ let pluginNumber = 0;
 async function loadPlugin() {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-agent-task11-doctor-${pluginNumber++}`,
+    sdk: { subscribe: () => () => undefined },
   });
   await plugin(bb);
   return { bb, harness, store: openStore(bb.storage) };
@@ -194,6 +195,7 @@ it("runs a project-less doctor with only global checks and keeps JSON strict", a
   expect(output.checks.map((check) => check.name)).toEqual(expect.arrayContaining([
     "token presence",
     "owner pairing",
+    "enabled projects",
   ]));
   expect(output.checks.map((check) => check.name)).not.toContain("gh repo view");
   expect(result.stderr).toBe("");
