@@ -15,6 +15,7 @@ export type AnswerClause = Readonly<{
 }>;
 
 export const ANSWER_RUBRIC_VERSION = "answer-contract-hybrid-v1" as const;
+export const ANSWER_LIVE_GATE_SCHEMA_VERSION = "answer-live-gate-v1" as const;
 
 export const ANSWER_JUDGE_PROFILE = Object.freeze({
   provider: "codex",
@@ -61,10 +62,11 @@ export type AnswerJudgeSpawnInput = Readonly<{
   title: string;
   prompt: string;
   workspace: string;
+  parentThreadId?: string | null;
 }>;
 
 export function buildAnswerJudgeSpawnArgs(input: AnswerJudgeSpawnInput): string[] {
-  return [
+  const args = [
     "thread", "spawn",
     "--project", input.project,
     "--environment", input.workspace,
@@ -78,6 +80,8 @@ export function buildAnswerJudgeSpawnArgs(input: AnswerJudgeSpawnInput): string[
     "--prompt", input.prompt,
     "--json",
   ];
+  if (input.parentThreadId) args.splice(20, 0, "--parent-thread", input.parentThreadId);
+  return args;
 }
 
 export type ClauseVerdict = Readonly<{
@@ -114,6 +118,50 @@ export type AnswerCaseExpectation = Readonly<{
 export type AnswerExpectationArtifact = Readonly<{
   rubricVersion: typeof ANSWER_RUBRIC_VERSION;
   cases: readonly AnswerCaseExpectation[];
+}>;
+
+export type LiveGateClauseResult = Readonly<{
+  id: AnswerClauseId;
+  expected: boolean;
+  result: boolean | null;
+  source: "deterministic" | "model" | "infrastructure";
+  judgeThreadId: string | null;
+  isolation: JudgeIsolationEvidence | null;
+}>;
+
+export type LiveGateCaseResult = Readonly<{
+  id: string;
+  expected: "pass" | "fail";
+  result: "pass" | "fail" | "infrastructure-error";
+  matchesGolden: boolean;
+  clauses: readonly LiveGateClauseResult[];
+}>;
+
+export type LiveGateArtifact = Readonly<{
+  schemaVersion: typeof ANSWER_LIVE_GATE_SCHEMA_VERSION;
+  rubricVersion: typeof ANSWER_RUBRIC_VERSION;
+  judgeProfile: typeof ANSWER_JUDGE_PROFILE;
+  goldenSha256: string;
+  expectationsSha256: string;
+  selectedCaseCount: number;
+  selectedClauseCount: number;
+  cases: readonly LiveGateCaseResult[];
+  infrastructureErrors: readonly Readonly<{ id: string; detail: string }>[];
+  audit: Readonly<{
+    clauseConcurrency: 1;
+    eventLogsAudited: boolean;
+    noToolActivity: boolean;
+    workspacesCleaned: boolean;
+    cleanup: Readonly<{
+      judgeThreads: "complete" | "incomplete";
+      workspaces: "complete" | "incomplete";
+    }>;
+  }>;
+  aggregate: Readonly<{
+    cases: Readonly<{ agreed: number; total: number }>;
+    clauses: Readonly<{ agreed: number; total: number }>;
+  }>;
+  status: "passed" | "failed";
 }>;
 
 export function buildClauseAssessment(input: {
@@ -202,6 +250,7 @@ export function detectExplicitClauseViolation(
       ) return "Explicitly narrates tools, mechanisms, or unavailable capabilities.";
       return null;
     case "no-invented-progress":
+      if (isQualifiedForecast(normalized)) return null;
       if (
         /\b\d+(?:\.\d+)?\s*%\s*(?:complete|completed|done|finished|through|along)\b/i.test(normalized)
         || /\b(?:progress|completion)\s+(?:is|at)\s+\d+(?:\.\d+)?\s*%\b/i.test(normalized)
@@ -218,6 +267,11 @@ export function detectExplicitClauseViolation(
     case "bounded-uncertainty":
       return null;
   }
+}
+
+function isQualifiedForecast(answer: string): boolean {
+  return /\b(?:if|unless|provided|assuming|when|once)\b/i.test(answer)
+    || /\b(?:according to|reports?|reported|says?|said|estimates?|estimated|forecast(?:s|ed)?|expects?|expected by|per)\b/i.test(answer);
 }
 
 export function parseClauseVerdict(
@@ -429,6 +483,113 @@ export function parseAnswerExpectations(input: unknown): AnswerExpectationArtifa
     cases.push({ id: candidate.id, aggregate: candidate.aggregate as "pass" | "fail", clauses });
   }
   return { rubricVersion: ANSWER_RUBRIC_VERSION, cases };
+}
+
+export function parseLiveGateArtifact(
+  output: string,
+  forbiddenValues: readonly string[] = [],
+): LiveGateArtifact | null {
+  const trimmed = output.trim();
+  if (!trimmed || hasDuplicateJsonObjectKey(trimmed)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || containsForbiddenValue(parsed, forbiddenValues)) return null;
+  if (!hasExactKeys(parsed, [
+    "aggregate", "audit", "cases", "expectationsSha256", "goldenSha256",
+    "infrastructureErrors", "judgeProfile", "rubricVersion", "schemaVersion",
+    "selectedCaseCount", "selectedClauseCount", "status",
+  ])) return null;
+  if (parsed.schemaVersion !== ANSWER_LIVE_GATE_SCHEMA_VERSION || parsed.rubricVersion !== ANSWER_RUBRIC_VERSION) return null;
+  if (!isPinnedJudgeProfile(parsed.judgeProfile) || !isSha256(parsed.goldenSha256) || !isSha256(parsed.expectationsSha256)) return null;
+  if (!isNonNegativeInteger(parsed.selectedCaseCount) || !isNonNegativeInteger(parsed.selectedClauseCount) || parsed.selectedClauseCount !== parsed.selectedCaseCount * ANSWER_CLAUSES.length) return null;
+  if (!Array.isArray(parsed.cases) || parsed.cases.length !== parsed.selectedCaseCount) return null;
+  const cases = parsed.cases.map((candidate) => parseLiveGateCase(candidate));
+  if (cases.some((candidate) => candidate === null)) return null;
+  const parsedCases = cases as LiveGateCaseResult[];
+  if (new Set(parsedCases.map((candidate) => candidate.id)).size !== parsedCases.length) return null;
+  if (!Array.isArray(parsed.infrastructureErrors) || parsed.infrastructureErrors.some((candidate) => !isInfrastructureError(candidate))) return null;
+  const audit = parseLiveGateAudit(parsed.audit);
+  const aggregate = parseLiveGateAggregate(parsed.aggregate, parsed.selectedCaseCount, parsed.selectedClauseCount);
+  if (!audit || !aggregate || !["passed", "failed"].includes(parsed.status as string)) return null;
+  if (parsed.status === "passed" && (parsed.infrastructureErrors.length > 0 || aggregate.cases.agreed !== aggregate.cases.total || aggregate.clauses.agreed !== aggregate.clauses.total || parsedCases.some((candidate) => !candidate.matchesGolden))) return null;
+  return { ...parsed, cases: parsedCases, infrastructureErrors: parsed.infrastructureErrors, audit, aggregate } as unknown as LiveGateArtifact;
+}
+
+function parseLiveGateCase(input: unknown): LiveGateCaseResult | null {
+  if (!isRecord(input) || !hasExactKeys(input, ["clauses", "expected", "id", "matchesGolden", "result"]) || typeof input.id !== "string" || !/^[a-z0-9-]{1,80}$/.test(input.id) || !["pass", "fail"].includes(input.expected as string) || !["pass", "fail", "infrastructure-error"].includes(input.result as string) || typeof input.matchesGolden !== "boolean" || !Array.isArray(input.clauses) || input.clauses.length !== ANSWER_CLAUSES.length) return null;
+  const clauses = input.clauses.map((candidate) => parseLiveGateClause(candidate));
+  if (clauses.some((candidate) => candidate === null)) return null;
+  const parsedClauses = clauses as LiveGateClauseResult[];
+  if (new Set(parsedClauses.map((candidate) => candidate.id)).size !== parsedClauses.length || new Set(ANSWER_CLAUSE_IDS).size !== parsedClauses.length || parsedClauses.some((candidate) => !ANSWER_CLAUSE_IDS.includes(candidate.id))) return null;
+  const expectedAggregate = parsedClauses.every((candidate) => candidate.expected) ? "pass" : "fail";
+  const actualResult = parsedClauses.some((candidate) => candidate.result === null)
+    ? "infrastructure-error"
+    : parsedClauses.every((candidate) => candidate.result) ? "pass" : "fail";
+  const matchesGolden = actualResult !== "infrastructure-error"
+    && actualResult === input.expected
+    && parsedClauses.every((candidate) => candidate.result === candidate.expected);
+  if (input.expected !== expectedAggregate || input.result !== actualResult || input.matchesGolden !== matchesGolden) return null;
+  return { ...input, clauses: parsedClauses } as unknown as LiveGateCaseResult;
+}
+
+function parseLiveGateClause(input: unknown): LiveGateClauseResult | null {
+  if (!isRecord(input) || !hasExactKeys(input, ["expected", "id", "isolation", "judgeThreadId", "result", "source"]) || !ANSWER_CLAUSE_IDS.includes(input.id as AnswerClauseId) || typeof input.expected !== "boolean" || (input.result !== null && typeof input.result !== "boolean") || !["deterministic", "model", "infrastructure"].includes(input.source as string) || (input.judgeThreadId !== null && typeof input.judgeThreadId !== "string") || (input.isolation !== null && !isJudgeIsolationEvidence(input.isolation))) return null;
+  if (input.source === "infrastructure" && (input.result !== null || input.judgeThreadId !== null || input.isolation !== null)) return null;
+  if (input.source === "deterministic" && (input.judgeThreadId !== null || input.isolation !== null)) return null;
+  if (input.source === "model" && (typeof input.judgeThreadId !== "string" || !input.judgeThreadId || !isJudgeIsolationEvidence(input.isolation))) return null;
+  if (["deterministic", "model"].includes(input.source as string) && typeof input.result !== "boolean") return null;
+  return input as LiveGateClauseResult;
+}
+
+function isJudgeIsolationEvidence(input: unknown): input is JudgeIsolationEvidence {
+  return isRecord(input) && hasExactKeys(input, ["eventCount", "eventLog", "toolActivity", "workspace", "workspaceCleanup"])
+    && input.workspace === "empty-temporary"
+    && input.eventLog === "completed-audited"
+    && input.toolActivity === "none-observed"
+    && input.workspaceCleanup === "complete"
+    && isNonNegativeInteger(input.eventCount);
+}
+
+function parseLiveGateAudit(input: unknown): LiveGateArtifact["audit"] | null {
+  if (!isRecord(input) || !hasExactKeys(input, ["cleanup", "clauseConcurrency", "eventLogsAudited", "noToolActivity", "workspacesCleaned"]) || input.clauseConcurrency !== 1 || typeof input.eventLogsAudited !== "boolean" || typeof input.noToolActivity !== "boolean" || typeof input.workspacesCleaned !== "boolean" || !isRecord(input.cleanup) || !hasExactKeys(input.cleanup, ["judgeThreads", "workspaces"]) || !["complete", "incomplete"].includes(input.cleanup.judgeThreads as string) || !["complete", "incomplete"].includes(input.cleanup.workspaces as string)) return null;
+  return input as LiveGateArtifact["audit"];
+}
+
+function parseLiveGateAggregate(input: unknown, caseTotal: number, clauseTotal: number): LiveGateArtifact["aggregate"] | null {
+  if (!isRecord(input) || !hasExactKeys(input, ["cases", "clauses"]) || !isAggregateCount(input.cases, caseTotal) || !isAggregateCount(input.clauses, clauseTotal)) return null;
+  return input as LiveGateArtifact["aggregate"];
+}
+
+function isAggregateCount(input: unknown, total: number): input is { agreed: number; total: number } {
+  return isRecord(input) && hasExactKeys(input, ["agreed", "total"]) && input.total === total && isNonNegativeInteger(input.agreed) && input.agreed <= total;
+}
+
+function isInfrastructureError(input: unknown): input is { id: string; detail: string } {
+  return isRecord(input) && hasExactKeys(input, ["detail", "id"]) && typeof input.id === "string" && /^[a-z0-9-]{1,80}$/.test(input.id) && typeof input.detail === "string" && input.detail.length <= 400;
+}
+
+function isPinnedJudgeProfile(input: unknown): input is typeof ANSWER_JUDGE_PROFILE {
+  return isRecord(input) && hasExactKeys(input, Object.keys(ANSWER_JUDGE_PROFILE))
+    && Object.entries(ANSWER_JUDGE_PROFILE).every(([key, value]) => input[key] === value);
+}
+
+function isSha256(input: unknown): input is string {
+  return typeof input === "string" && /^[a-f0-9]{64}$/.test(input);
+}
+
+function isNonNegativeInteger(input: unknown): input is number {
+  return typeof input === "number" && Number.isSafeInteger(input) && input >= 0;
+}
+
+function containsForbiddenValue(input: unknown, forbiddenValues: readonly string[]): boolean {
+  if (typeof input === "string") return forbiddenValues.some((forbidden) => forbidden.length > 0 && input.includes(forbidden));
+  if (Array.isArray(input)) return input.some((candidate) => containsForbiddenValue(candidate, forbiddenValues));
+  if (isRecord(input)) return Object.values(input).some((candidate) => containsForbiddenValue(candidate, forbiddenValues));
+  return false;
 }
 
 export function sanitizeInfrastructureDetail(

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { expect, it } from "vitest";
@@ -21,7 +22,9 @@ import {
 const repositoryRoot = join(import.meta.dirname, "..");
 const execFileAsync = promisify(execFile);
 
-function fakeBbPath(directory: string, mode: "all-hold" | "wrong-bounded-uncertainty"): string {
+type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "infra" | "ambiguous-spawn" | "spawn-error";
+
+function fakeBbPath(directory: string, mode: FakeBbMode): string {
   const commandPath = join(directory, "bb");
   const logPath = join(directory, "bb-commands.jsonl");
   writeFileSync(commandPath, `#!/usr/bin/env node
@@ -29,15 +32,36 @@ import fs from "node:fs";
 const args = process.argv.slice(2);
 const logPath = process.env.ANSWER_EVAL_FAKE_BB_LOG;
 fs.appendFileSync(logPath, JSON.stringify(args) + "\\n");
+const mode = process.env.ANSWER_EVAL_FAKE_BB_MODE;
+const status = process.env.ANSWER_EVAL_FAKE_BB_STATUS ?? "idle";
+const statePath = logPath + ".state";
 const clauseFromThread = (threadId) => threadId.replace(/^thr_fake_/, "");
 if (args[0] === "thread" && args[1] === "spawn") {
   const title = args[args.indexOf("--title") + 1];
-  const clause = title.split(" ").at(-1);
-  process.stdout.write(JSON.stringify({ id: "thr_fake_" + clause }));
+  const match = title.match(/^answer-eval\\s+(\\S+)\\s+(\\S+)/);
+  const clause = match?.[2] ?? title.split(" ").at(-1);
+  if (mode === "ambiguous-spawn" || mode === "spawn-error") {
+    fs.writeFileSync(statePath, JSON.stringify({
+      title,
+      projectId: args[args.indexOf("--project") + 1],
+      environmentId: args[args.indexOf("--environment") + 1],
+      parentThreadId: process.env.BB_THREAD_ID ?? null,
+    }));
+    if (mode === "spawn-error") process.exit(124);
+    process.stdout.write("created-but-not-json");
+  } else {
+    process.stdout.write(JSON.stringify({ id: "thr_fake_" + clause }));
+  }
 } else if (args[0] === "thread" && args[1] === "wait") {
   process.stdout.write(JSON.stringify({ status: "idle" }));
 } else if (args[0] === "thread" && args[1] === "show") {
-  process.stdout.write(JSON.stringify({ status: "idle" }));
+  process.stdout.write(JSON.stringify({ thread: { status } }));
+} else if (args[0] === "thread" && args[1] === "list") {
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  process.stdout.write(JSON.stringify([
+    { ...state, id: "thr_fake_decoy", title: state.title.replace(/correlation=[^ ]+/, "correlation=other") },
+    { ...state, id: "thr_fake_reconciled", status: "active" },
+  ]));
 } else if (args[0] === "thread" && args[1] === "log") {
   process.stdout.write(JSON.stringify([
     { type: "thread/started" },
@@ -48,6 +72,9 @@ if (args[0] === "thread" && args[1] === "spawn") {
   ]));
 } else if (args[0] === "thread" && args[1] === "output") {
   const clause = clauseFromThread(args[2]);
+  if (mode === "infra" && clause === "outcome-first") {
+    process.stdout.write("malformed verdict");
+  } else {
   const holds = ${JSON.stringify(mode)} === "wrong-bounded-uncertainty"
     ? clause !== "bounded-uncertainty"
     : true;
@@ -56,6 +83,7 @@ if (args[0] === "thread" && args[1] === "spawn") {
     holds,
     why: "fixture reason",
   }));
+  }
 } else if (args[0] === "thread" && (args[1] === "stop" || args[1] === "archive")) {
   process.stdout.write(JSON.stringify({ ok: true }));
 } else {
@@ -68,27 +96,32 @@ if (args[0] === "thread" && args[1] === "spawn") {
   return commandPath;
 }
 
-async function runWithFakeBb(caseId: string, mode: "all-hold" | "wrong-bounded-uncertainty") {
-  const directory = mkdtempSync(join(repositoryRoot, ".answer-eval-test-"));
+async function runWithFakeBb(caseId: string, mode: FakeBbMode, status = "idle") {
+  const directory = mkdtempSync(join(tmpdir(), "answer-eval-test-"));
   const logPath = join(directory, "bb-commands.jsonl");
+  const artifactPath = join(directory, "live-gate.json");
   fakeBbPath(directory, mode);
   try {
     const result = await execFileAsync(process.execPath, [
       join(repositoryRoot, "scripts/eval-controller-answers.mjs"),
       "--project", "proj_fake",
       "--case", caseId,
+      "--artifact", artifactPath,
     ], {
       env: {
         ...process.env,
         PATH: `${directory}${process.env.PATH ? `:${process.env.PATH}` : ""}`,
         ANSWER_EVAL_FAKE_BB_LOG: logPath,
+        ANSWER_EVAL_FAKE_BB_MODE: mode,
+        ANSWER_EVAL_FAKE_BB_STATUS: status,
+        BB_THREAD_ID: "thr_test_origin",
       },
       maxBuffer: 2 * 1024 * 1024,
       timeout: 120_000,
     });
-    return { directory, logPath, result };
+    return { directory, logPath, artifactPath, result };
   } catch (error) {
-    return { directory, logPath, error };
+    return { directory, logPath, artifactPath, error };
   }
 }
 
@@ -281,9 +314,18 @@ it.each([
 it.each([
   ["completion forecast", "The batch will finish in 2 minutes."],
   ["completion percentage", "The batch is 72% complete."],
+  ["unqualified future claim", "The batch will finish after this step."],
 ])("deterministically rejects only high-confidence invented progress: %s", (_label, answer) => {
   // Catches weakening the fail-only guard until explicit unsupported progress passes.
   expect(detectExplicitClauseViolation("no-invented-progress", answer)).toContain("progress");
+});
+
+it.each([
+  ["reported future claim", "The provider reports it will finish after this step."],
+  ["conditional future claim", "If the provider succeeds, it will finish after this step."],
+  ["reported numeric forecast", "The provider reports it will finish in 2 minutes."],
+])("delegates supported or conditional future wording to the judge: %s", (_label, answer) => {
+  expect(detectExplicitClauseViolation("no-invented-progress", answer)).toBeNull();
 });
 
 it("deterministically rejects explicit first-person tool narration but delegates ambiguous wording", () => {
@@ -417,7 +459,9 @@ it("runs each judge with bounded cleanup and an auditable isolated workspace", a
     expect(spawnCommands).toHaveLength(ANSWER_CLAUSES.length);
     expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log")).toHaveLength(ANSWER_CLAUSES.length);
     expect(invocations.filter((args) => args[0] === "thread" && args[1] === "archive")).toHaveLength(ANSWER_CLAUSES.length);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "stop")).toHaveLength(0);
     expect(spawnCommands.every((args) => args.includes("--environment"))).toBe(true);
+    expect(spawnCommands.every((args) => args.includes("--parent-thread") && args[args.indexOf("--parent-thread") + 1] === "thr_test_origin")).toBe(true);
     for (const args of spawnCommands) {
       const workspace = args[args.indexOf("--environment") + 1];
       expect(workspace).toBeTruthy();
@@ -425,7 +469,120 @@ it("runs each judge with bounded cleanup and an auditable isolated workspace", a
     }
   } finally {
     rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
   }
+});
+
+it("does not stop a judge already reported as stopped", async () => {
+  const run = await runWithFakeBb("status-good", "all-hold", "stopped");
+  try {
+    expect("error" in run).toBe(false);
+    if ("error" in run) return;
+    const invocations = readFileSync(run.logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "stop")).toHaveLength(0);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "archive")).toHaveLength(ANSWER_CLAUSES.length);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
+  }
+});
+
+it.each([
+  ["invalid JSON", "ambiguous-spawn"],
+  ["spawn transport failure", "spawn-error"],
+])("reconciles an ambiguous %s by exact correlation and cleans only the exact judge", async (_label, mode) => {
+  const run = await runWithFakeBb("status-good", mode as FakeBbMode);
+  try {
+    expect("error" in run).toBe(true);
+    const invocations = readFileSync(run.logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "list")).toHaveLength(ANSWER_CLAUSES.length);
+    const archives = invocations.filter((args) => args[0] === "thread" && args[1] === "archive");
+    expect(archives).toHaveLength(ANSWER_CLAUSES.length);
+    expect(archives.every((args) => args[2] === "thr_fake_reconciled")).toBe(true);
+    expect(archives.some((args) => args[2] === "thr_fake_decoy")).toBe(false);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
+  }
+});
+
+it("writes a private schema-shaped artifact with complete selected denominators", async () => {
+  const run = await runWithFakeBb("status-good", "all-hold");
+  try {
+    expect("error" in run).toBe(false);
+    if ("error" in run) return;
+    const artifactText = readFileSync(run.artifactPath, "utf8");
+    const artifact = JSON.parse(artifactText) as Record<string, any>;
+    expect(statSync(run.artifactPath).mode & 0o777).toBe(0o600);
+    expect(artifact.schemaVersion).toBe("answer-live-gate-v1");
+    expect(artifact.selectedCaseCount).toBe(1);
+    expect(artifact.selectedClauseCount).toBe(ANSWER_CLAUSES.length);
+    expect(artifact.aggregate).toEqual({
+      cases: { agreed: 1, total: 1 },
+      clauses: { agreed: ANSWER_CLAUSES.length, total: ANSWER_CLAUSES.length },
+    });
+    expect(artifact.cases[0].clauses).toHaveLength(ANSWER_CLAUSES.length);
+    expect(artifact.infrastructureErrors).toEqual([]);
+    expect(artifactText).not.toContain("fixture reason");
+    expect(artifactText).not.toContain("why");
+    const contract = await import("../src/eval/answer-contract");
+    expect(contract.parseLiveGateArtifact(artifactText)).not.toBeNull();
+    const modelReasonArtifact = JSON.parse(artifactText) as Record<string, any>;
+    modelReasonArtifact.cases[0].clauses[0].why = "opaque model detail";
+    expect(contract.parseLiveGateArtifact(JSON.stringify(modelReasonArtifact))).toBeNull();
+    const secretArtifact = JSON.parse(artifactText) as Record<string, any>;
+    secretArtifact.status = "failed";
+    secretArtifact.infrastructureErrors = [{ id: "status-good", detail: "owner-private-answer" }];
+    expect(contract.parseLiveGateArtifact(JSON.stringify(secretArtifact), ["owner-private-answer"])).toBeNull();
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
+  }
+});
+
+it("writes a failed artifact without shrinking denominators when infrastructure fails", async () => {
+  const run = await runWithFakeBb("status-good", "infra");
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
+    const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as Record<string, any>;
+    expect(artifact.status).toBe("failed");
+    expect(artifact.aggregate.cases.total).toBe(1);
+    expect(artifact.aggregate.clauses.total).toBe(ANSWER_CLAUSES.length);
+    expect(artifact.infrastructureErrors.length).toBeGreaterThan(0);
+    const failureOutput = (run.error as { stdout?: string }).stdout ?? "";
+    expect(failureOutput).toContain("aggregate agreement 0/1");
+    expect(failureOutput).toContain(`clause agreement 0/${ANSWER_CLAUSES.length}`);
+    expect(artifactTextHasOnlySanitizedFields(run.artifactPath)).toBe(true);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
+  }
+});
+
+function artifactTextHasOnlySanitizedFields(path: string): boolean {
+  const text = readFileSync(path, "utf8");
+  return !text.includes("fixture reason") && !text.includes("\"ownerMessage\"") && !text.includes("\"answer\"");
+}
+
+it("rejects duplicate keys and secret-bearing live artifacts", async () => {
+  const contract = await import("../src/eval/answer-contract");
+  const parseArtifact = (contract as typeof contract & {
+    parseLiveGateArtifact?: (output: string, forbiddenValues?: readonly string[]) => unknown;
+  }).parseLiveGateArtifact;
+  expect(parseArtifact).toBeTypeOf("function");
+  expect(parseArtifact?.('{"schemaVersion":"answer-live-gate-v1","schemaVersion":"secret"}')).toBeNull();
+  expect(parseArtifact?.(JSON.stringify({
+    schemaVersion: "answer-live-gate-v1",
+    secret: "owner-private-answer",
+  }), ["owner-private-answer"])).toBeNull();
 });
 
 it("rejects a wrong clause even when the aggregate golden label still matches", async () => {
@@ -437,6 +594,7 @@ it("rejects a wrong clause even when the aggregate golden label still matches", 
     expect(run.error).toMatchObject({ code: 1 });
   } finally {
     rmSync(run.directory, { recursive: true, force: true });
+    expect(existsSync(run.directory)).toBe(false);
   }
 });
 
