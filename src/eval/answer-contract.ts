@@ -57,6 +57,12 @@ export const ANSWER_CLAUSE_IDS: readonly AnswerClauseId[] = Object.freeze(
   ANSWER_CLAUSES.map((clause) => clause.id),
 );
 
+// The evaluator checks the checked-in fixtures against this release corpus before judging.
+export const ANSWER_LIVE_GATE_RELEASE_CORPUS = Object.freeze({
+  caseCount: 7,
+  clauseCount: 7 * ANSWER_CLAUSES.length,
+} as const);
+
 export type AnswerJudgeSpawnInput = Readonly<{
   project: string;
   title: string;
@@ -506,6 +512,7 @@ export function parseLiveGateArtifact(
   if (parsed.schemaVersion !== ANSWER_LIVE_GATE_SCHEMA_VERSION || parsed.rubricVersion !== ANSWER_RUBRIC_VERSION) return null;
   if (!isPinnedJudgeProfile(parsed.judgeProfile) || !isSha256(parsed.goldenSha256) || !isSha256(parsed.expectationsSha256)) return null;
   if (!isNonNegativeInteger(parsed.selectedCaseCount) || !isNonNegativeInteger(parsed.selectedClauseCount) || parsed.selectedClauseCount !== parsed.selectedCaseCount * ANSWER_CLAUSES.length) return null;
+  if (parsed.selectedCaseCount === 0) return null;
   if (!Array.isArray(parsed.cases) || parsed.cases.length !== parsed.selectedCaseCount) return null;
   const cases = parsed.cases.map((candidate) => parseLiveGateCase(candidate));
   if (cases.some((candidate) => candidate === null)) return null;
@@ -515,7 +522,15 @@ export function parseLiveGateArtifact(
   const audit = parseLiveGateAudit(parsed.audit);
   const aggregate = parseLiveGateAggregate(parsed.aggregate, parsed.selectedCaseCount, parsed.selectedClauseCount);
   if (!audit || !aggregate || !["passed", "failed"].includes(parsed.status as string)) return null;
-  if (parsed.status === "passed" && (parsed.infrastructureErrors.length > 0 || aggregate.cases.agreed !== aggregate.cases.total || aggregate.clauses.agreed !== aggregate.clauses.total || parsedCases.some((candidate) => !candidate.matchesGolden))) return null;
+  if (parsed.status === "passed" && (
+    parsed.selectedCaseCount !== ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount
+    || parsed.selectedClauseCount !== ANSWER_LIVE_GATE_RELEASE_CORPUS.clauseCount
+    || parsed.infrastructureErrors.length > 0
+    || aggregate.cases.agreed !== aggregate.cases.total
+    || aggregate.clauses.agreed !== aggregate.clauses.total
+    || parsedCases.some((candidate) => !candidate.matchesGolden)
+    || !hasCompleteLiveGateAudit(audit)
+  )) return null;
   return { ...parsed, cases: parsedCases, infrastructureErrors: parsed.infrastructureErrors, audit, aggregate } as unknown as LiveGateArtifact;
 }
 
@@ -557,6 +572,14 @@ function isJudgeIsolationEvidence(input: unknown): input is JudgeIsolationEviden
 function parseLiveGateAudit(input: unknown): LiveGateArtifact["audit"] | null {
   if (!isRecord(input) || !hasExactKeys(input, ["cleanup", "clauseConcurrency", "eventLogsAudited", "noToolActivity", "workspacesCleaned"]) || input.clauseConcurrency !== 1 || typeof input.eventLogsAudited !== "boolean" || typeof input.noToolActivity !== "boolean" || typeof input.workspacesCleaned !== "boolean" || !isRecord(input.cleanup) || !hasExactKeys(input.cleanup, ["judgeThreads", "workspaces"]) || !["complete", "incomplete"].includes(input.cleanup.judgeThreads as string) || !["complete", "incomplete"].includes(input.cleanup.workspaces as string)) return null;
   return input as LiveGateArtifact["audit"];
+}
+
+function hasCompleteLiveGateAudit(audit: LiveGateArtifact["audit"]): boolean {
+  return audit.eventLogsAudited
+    && audit.noToolActivity
+    && audit.workspacesCleaned
+    && audit.cleanup.judgeThreads === "complete"
+    && audit.cleanup.workspaces === "complete";
 }
 
 function parseLiveGateAggregate(input: unknown, caseTotal: number, clauseTotal: number): LiveGateArtifact["aggregate"] | null {

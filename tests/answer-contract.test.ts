@@ -16,6 +16,7 @@ import {
   detectExplicitClauseViolation,
   parseAnswerExpectations,
   parseClauseVerdict,
+  parseLiveGateArtifact,
   sanitizeInfrastructureDetail,
 } from "../src/eval/answer-contract";
 
@@ -124,6 +125,50 @@ async function runWithFakeBb(caseId: string, mode: FakeBbMode, status = "idle") 
     return { directory, logPath, artifactPath, error };
   }
 }
+
+function buildReleasePassedArtifact(): Record<string, any> {
+  const clauses = ANSWER_CLAUSES.map((clause) => ({
+    id: clause.id,
+    expected: true,
+    result: true,
+    source: "deterministic",
+    judgeThreadId: null,
+    isolation: null,
+  }));
+  return {
+    schemaVersion: "answer-live-gate-v1",
+    rubricVersion: ANSWER_RUBRIC_VERSION,
+    judgeProfile: ANSWER_JUDGE_PROFILE,
+    goldenSha256: "a".repeat(64),
+    expectationsSha256: "b".repeat(64),
+    selectedCaseCount: 7,
+    selectedClauseCount: 7 * ANSWER_CLAUSES.length,
+    cases: Array.from({ length: 7 }, (_, index) => ({
+      id: `synthetic-case-${index + 1}`,
+      expected: "pass",
+      result: "pass",
+      matchesGolden: true,
+      clauses,
+    })),
+    infrastructureErrors: [],
+    audit: {
+      clauseConcurrency: 1,
+      eventLogsAudited: true,
+      noToolActivity: true,
+      workspacesCleaned: true,
+      cleanup: { judgeThreads: "complete", workspaces: "complete" },
+    },
+    aggregate: {
+      cases: { agreed: 7, total: 7 },
+      clauses: { agreed: 7 * ANSWER_CLAUSES.length, total: 7 * ANSWER_CLAUSES.length },
+    },
+    status: "passed",
+  };
+}
+
+it("accepts a complete release-shaped artifact", () => {
+  expect(parseLiveGateArtifact(JSON.stringify(buildReleasePassedArtifact()))).not.toBeNull();
+});
 
 it("keeps every clause id unique and stable", () => {
   expect(new Set(ANSWER_CLAUSE_IDS).size).toBe(ANSWER_CLAUSES.length);
@@ -512,13 +557,50 @@ it.each([
   }
 });
 
-it("writes a private schema-shaped artifact with complete selected denominators", async () => {
+it.each([
+  ["zero-case", () => ({
+    selectedCaseCount: 0,
+    selectedClauseCount: 0,
+    cases: [],
+    aggregate: { cases: { agreed: 0, total: 0 }, clauses: { agreed: 0, total: 0 } },
+  })],
+  ["subset", () => {
+    const artifact = buildReleasePassedArtifact();
+    return {
+      selectedCaseCount: 1,
+      selectedClauseCount: ANSWER_CLAUSES.length,
+      cases: artifact.cases.slice(0, 1),
+      aggregate: {
+        cases: { agreed: 1, total: 1 },
+        clauses: { agreed: ANSWER_CLAUSES.length, total: ANSWER_CLAUSES.length },
+      },
+    };
+  }],
+  ["partial cleanup", () => ({
+    audit: {
+      ...buildReleasePassedArtifact().audit,
+      cleanup: { judgeThreads: "incomplete", workspaces: "complete" },
+    },
+  })],
+  ["false audit", () => ({
+    audit: {
+      ...buildReleasePassedArtifact().audit,
+      eventLogsAudited: false,
+    },
+  })],
+])("rejects a %s artifact that claims release pass", (_label, patch) => {
+  const artifact = { ...buildReleasePassedArtifact(), ...patch() };
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
+});
+
+it("keeps a targeted artifact diagnostic and never reports it passed", async () => {
   const run = await runWithFakeBb("status-good", "all-hold");
   try {
     expect("error" in run).toBe(false);
     if ("error" in run) return;
     const artifactText = readFileSync(run.artifactPath, "utf8");
     const artifact = JSON.parse(artifactText) as Record<string, any>;
+    expect(artifact.status).toBe("failed");
     expect(statSync(run.artifactPath).mode & 0o777).toBe(0o600);
     expect(artifact.schemaVersion).toBe("answer-live-gate-v1");
     expect(artifact.selectedCaseCount).toBe(1);
@@ -531,15 +613,15 @@ it("writes a private schema-shaped artifact with complete selected denominators"
     expect(artifact.infrastructureErrors).toEqual([]);
     expect(artifactText).not.toContain("fixture reason");
     expect(artifactText).not.toContain("why");
-    const contract = await import("../src/eval/answer-contract");
-    expect(contract.parseLiveGateArtifact(artifactText)).not.toBeNull();
+    expect(run.result.stdout).toContain("diagnostic");
+    expect(parseLiveGateArtifact(artifactText)).not.toBeNull();
     const modelReasonArtifact = JSON.parse(artifactText) as Record<string, any>;
-    modelReasonArtifact.cases[0].clauses[0].why = "opaque model detail";
-    expect(contract.parseLiveGateArtifact(JSON.stringify(modelReasonArtifact))).toBeNull();
+    modelReasonArtifact.cases[0].clauses[0].isolation = { eventCount: 1 };
+    expect(parseLiveGateArtifact(JSON.stringify(modelReasonArtifact))).toBeNull();
     const secretArtifact = JSON.parse(artifactText) as Record<string, any>;
     secretArtifact.status = "failed";
     secretArtifact.infrastructureErrors = [{ id: "status-good", detail: "owner-private-answer" }];
-    expect(contract.parseLiveGateArtifact(JSON.stringify(secretArtifact), ["owner-private-answer"])).toBeNull();
+    expect(parseLiveGateArtifact(JSON.stringify(secretArtifact), ["owner-private-answer"])).toBeNull();
   } finally {
     rmSync(run.directory, { recursive: true, force: true });
     expect(existsSync(run.directory)).toBe(false);

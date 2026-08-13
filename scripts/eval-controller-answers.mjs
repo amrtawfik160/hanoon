@@ -27,6 +27,7 @@ import { promisify } from "node:util";
 import {
   ANSWER_CLAUSES,
   ANSWER_LIVE_GATE_SCHEMA_VERSION,
+  ANSWER_LIVE_GATE_RELEASE_CORPUS,
   ANSWER_JUDGE_PROFILE,
   ANSWER_RUBRIC_VERSION,
   auditJudgeEventLog,
@@ -381,6 +382,13 @@ function createRuntimeAudit() {
   };
 }
 
+function hasCompleteRuntimeAudit(runtimeAudit) {
+  return runtimeAudit.eventLogsAudited
+    && runtimeAudit.noToolActivity
+    && runtimeAudit.workspacesCleaned
+    && runtimeAudit.judgeThreadsCleaned;
+}
+
 function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
@@ -454,7 +462,11 @@ function buildLiveGateArtifact({ selected, caseResults, infrastructureErrors, ru
       cases: { agreed: caseAgreed, total: selected.length },
       clauses: { agreed: clauseAgreed, total: selectedClauseCount },
     },
-    status: infrastructureErrors.length === 0 && caseAgreed === selected.length && clauseAgreed === selectedClauseCount
+    status: selected.length === ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount
+      && infrastructureErrors.length === 0
+      && caseAgreed === selected.length
+      && clauseAgreed === selectedClauseCount
+      && hasCompleteRuntimeAudit(runtimeAudit)
       ? "passed"
       : "failed",
   };
@@ -487,6 +499,9 @@ async function main() {
   const { cases } = JSON.parse(readFileSync(CASES_PATH, "utf8"));
   const expectations = parseAnswerExpectations(JSON.parse(readFileSync(EXPECTATIONS_PATH, "utf8")));
   const expectationsById = new Map(expectations.cases.map((each) => [each.id, each]));
+  if (cases.length !== ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount || expectations.cases.length !== ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount) {
+    fail(`answer corpus must contain exactly ${ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount} cases`);
+  }
   const selected = options.only ? cases.filter((each) => each.id === options.only) : cases;
   if (selected.length === 0) fail(`no case matched ${options.only}`);
   if (expectations.cases.length !== cases.length || cases.some((testCase) => !expectationsById.has(testCase.id))) {
@@ -554,6 +569,9 @@ async function main() {
   const forbiddenValues = selected.flatMap((testCase) => [testCase.ownerMessage, testCase.answer]);
   writeLiveGateArtifact(artifactPath, artifact, forbiddenValues);
 
+  if (options.only) {
+    process.stdout.write("diagnostic --case selection: artifact is incomplete and cannot be release-passed\n");
+  }
   process.stdout.write(`\naggregate agreement ${artifact.aggregate.cases.agreed}/${selected.length}\n`);
   process.stdout.write(`clause agreement ${artifact.aggregate.clauses.agreed}/${selected.length * ANSWER_CLAUSES.length}\n`);
   if (infrastructureErrors.length > 0) {
