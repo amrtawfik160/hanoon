@@ -44,7 +44,7 @@
   ],
   "recoveryPrompt": {
     "scenarioId": "process-only-finalization",
-    "exactText": "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.",
+    "exactText": "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.",
     "requiredMarkers": ["telegram_agent_turn_evidence", "telegram_agent_respond"]
   }
 }

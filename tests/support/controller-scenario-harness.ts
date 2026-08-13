@@ -1115,6 +1115,7 @@ async function runExtendedScenario(
     availableDecisions: ["allow_once", "deny"],
   };
   let interactionStatus: "pending" | "resolved" = "pending";
+  let interactionResolution: Record<string, unknown> | null = null;
   const resolutionAttempts: Record<string, unknown>[] = [];
   let successfulResolutions = 0;
   let unboundRejectionCode: string | null = null;
@@ -1268,6 +1269,7 @@ async function runExtendedScenario(
           threadId: requestedThreadId,
           status: interactionStatus,
           payload: approvalPayload,
+          resolution: interactionResolution,
         }),
       } : {}),
     },
@@ -1282,13 +1284,16 @@ async function runExtendedScenario(
           id: requestedInteractionId,
           threadId: requestedThreadId,
           status: interactionStatus,
+          resolution: interactionResolution,
         }),
         resolve: async (input) => {
-          resolutionAttempts.push(JSON.parse(JSON.stringify(input.resolution)) as Record<string, unknown>);
+          const resolution = JSON.parse(JSON.stringify(input.resolution)) as Record<string, unknown>;
+          resolutionAttempts.push(resolution);
           if (scenarioCase.id === "restart-after-owner-tap" && resolutionAttempts.length === 1) return null;
           interactionStatus = "resolved";
+          interactionResolution = resolution;
           successfulResolutions += 1;
-          return { id: input.interactionId, threadId: input.threadId, status: "resolved" };
+          return { id: input.interactionId, threadId: input.threadId, status: "resolved", resolution };
         },
       },
     })
@@ -1518,13 +1523,16 @@ async function runExtendedScenario(
             id: requestedInteractionId,
             threadId: requestedThreadId,
             status: interactionStatus,
+            resolution: interactionResolution,
           }),
           resolve: async (input) => {
-            resolutionAttempts.push(JSON.parse(JSON.stringify(input.resolution)) as Record<string, unknown>);
+            const resolution = JSON.parse(JSON.stringify(input.resolution)) as Record<string, unknown>;
+            resolutionAttempts.push(resolution);
             if (resolutionAttempts.length === 1) return null;
             interactionStatus = "resolved";
+            interactionResolution = resolution;
             successfulResolutions += 1;
-            return { id: input.interactionId, threadId: input.threadId, status: "resolved" };
+            return { id: input.interactionId, threadId: input.threadId, status: "resolved", resolution };
           },
         },
       });
