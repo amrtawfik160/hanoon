@@ -164,7 +164,7 @@ const INSTALL_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tool
 const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|tools?|services?|extensions?|deployments?|resources?)";
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
-const SUCCESS_ADVERB = "(?:already|just|now|still|successfully|formally|fully|permanently|finally|definitely|actually|eventually|barely)";
+const SUCCESS_ADVERB = "(?:already|just|now|still|[a-z]+ly)";
 const SUCCESS_ADVERB_LINK = `\\s+${SUCCESS_ADVERB}`;
 const BOUNDED_SUCCESS_ADVERBS = `(?:${SUCCESS_ADVERB_LINK}){0,2}`;
 // Distribute at most two qualifiers across either side of "been" without
@@ -328,7 +328,7 @@ const NON_SUCCESS_SIBLING = [
   /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
   /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
-  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|likely|seemingly|apparently|arguably|supposedly|ostensibly|reportedly|allegedly|potentially|presumably|conceivably|appears?|seems?)\b/i,
+  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|likely|unlikely|seemingly|apparently|arguably|supposedly|ostensibly|reportedly|allegedly|purportedly|putatively|potentially|presumably|conceivably|theoretically|nominally|appears?|seems?)\b/i,
 ];
 /**
  * Every high-impact success assertion, with the claim kinds under which it can
