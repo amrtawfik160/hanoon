@@ -660,6 +660,16 @@ it("allows lifecycle-only BB event high-water advancement after acceptance", () 
   });
   expect(accepted.outcome).toBe("accepted");
 
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 4,
+    throughSeq: 5,
+    items: [],
+  })).toBe("recorded");
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ evidenceEventSeq: 5 });
+
   expect(store.completeControllerTurnFromFinalization({
     ...fence,
     turnId: turn.id,
@@ -668,6 +678,33 @@ it("allows lifecycle-only BB event high-water advancement after acceptance", () 
   })).toBe("completed");
   expect(store.getControllerTurn(turn.id)?.state).toBe("completed");
   expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(fence.now);
+});
+
+it("rejects completion while raw BB high-water is ahead of durable evidence projection", () => {
+  const { store, turn, fence } = submittedControllerFixture({
+    turnColumns: { evidenceEventSeq: 4 },
+  });
+  const accepted = store.proposeControllerFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbEventHighWaterSeq: 4,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "must wait for projection" }],
+      obligationRefs: [],
+    },
+  });
+  expect(accepted.outcome).toBe("accepted");
+
+  expect(store.completeControllerTurnFromFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbHighWaterSeq: 5,
+  })).toBe("evidence_advanced");
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", evidenceEventSeq: 4 });
+  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
 });
 
 it("exposes the fixed proof-kind vocabulary once from controller models", async () => {

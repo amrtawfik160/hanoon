@@ -806,6 +806,15 @@ it("accepts finalizer completion and ordinary lifecycle events after acceptance"
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
   const accepted = acceptControllerFinalization(store, turn.id);
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 4,
+    items: [],
+  })).toBe("recorded");
   const adapter: ControllerAdapter = {
     spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
@@ -833,6 +842,100 @@ it("accepts finalizer completion and ordinary lifecycle events after acceptance"
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: accepted.renderedMessage });
   expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(2_004);
+});
+
+it("waits for the exact projected high-water before retiring a late evidence turn", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 673, inputText: "project before completing" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_project_gap", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  let projectEvidence = false;
+  const projectedEvidence = {
+    sourceName: "commandExecution",
+    sourceItemId: "late-native",
+    outcome: "succeeded" as const,
+    argsSha256: "c".repeat(64),
+    resultSha256: "d".repeat(64),
+    proofKinds: ["command_result"] as const,
+    subjectRefs: ["bb-item:late-native"] as const,
+  };
+  const projector = {
+    reconcile: vi.fn(async (...args: unknown[]) => {
+      const projectedTurn = args[1] as { evidenceEventSeq: number };
+      const targetSeq = args[4] as number;
+      if (targetSeq > projectedTurn.evidenceEventSeq) {
+        expect(store.recordControllerNativeEvidence({
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: 2_000,
+          turnId: turn.id,
+          controllerKey: turn.controllerKey,
+          fromSeq: projectedTurn.evidenceEventSeq,
+          throughSeq: targetSeq,
+          items: projectEvidence ? [projectedEvidence] : [],
+        })).toBe("recorded");
+      }
+      return {
+        outcome: "reconciled" as const,
+        reconciliationIncomplete: null,
+        fromSeq: projectedTurn.evidenceEventSeq,
+        throughSeq: targetSeq,
+        targetSeq,
+      };
+    }),
+  };
+  const latestSequences = [0, 1, 1, 1];
+  const eventSequences = [0, 1];
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => latestSequences.shift() ?? 1),
+    events: vi.fn(async () => ({
+      latestSeq: eventSequences.shift() ?? 1,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: true,
+      completed: true,
+      error: null,
+      interactionReferences: [],
+      toolCalls: 1,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector: projector,
+    clock: { now: () => 2_004 },
+  });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", evidenceEventSeq: 0 });
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+
+  projectEvidence = true;
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  expect(store.listControllerEvidence(turn.id, 10)).toMatchObject([
+    { sourceKind: "bb_item", sourceItemId: "late-native" },
+  ]);
 });
 
 it("does not continue from a stale provider cursor", async () => {

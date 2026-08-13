@@ -3378,7 +3378,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (
           !Number.isSafeInteger(completionHighWater) || completionHighWater < 0 ||
           completionHighWater < accepted.bbEventHighWaterSeq ||
-          completionHighWater < turn.evidence_event_seq) {
+          completionHighWater !== turn.evidence_event_seq) {
         return "evidence_advanced" as const;
       }
       const laterEvidence = this.db.prepare(

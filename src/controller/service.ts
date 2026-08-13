@@ -55,8 +55,9 @@ const CONTROLLER_IMAGE_FAILURE_MESSAGE =
 export const CONTROLLER_STALL_MS = 8 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
 const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
-export const CONTROLLER_RECOVERY_PROMPT =
+export const CONTROLLER_COMPLETION_RECOVERY_PROMPT =
   "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.";
+export const CONTROLLER_RECOVERY_PROMPT = CONTROLLER_COMPLETION_RECOVERY_PROMPT;
 
 function retireReason(status: ControllerStatus): string {
   if (status === "missing") return "Thread was deleted or archived";
@@ -654,6 +655,8 @@ export class LunaControllerService {
       }
       return true;
     }
+    const currentTurn = this.dependencies.store.getControllerTurn(turn.id);
+    if (currentTurn && bbHighWaterSeq > currentTurn.evidenceEventSeq) return false;
     if (outcome === "evidence_advanced") {
       this.failAndRetire(turn, controller, fence, "Controller evidence advanced after finalization");
     }
@@ -693,7 +696,7 @@ export class LunaControllerService {
       return true;
     }
     try {
-      await this.dependencies.adapter.send(controller.threadId, CONTROLLER_RECOVERY_PROMPT, signal);
+      await this.dependencies.adapter.send(controller.threadId, CONTROLLER_COMPLETION_RECOVERY_PROMPT, signal);
     } catch {
       this.failAndRetire(turn, controller, fence, "Controller continuation outcome is uncertain");
     }
