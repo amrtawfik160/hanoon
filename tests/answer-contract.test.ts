@@ -614,12 +614,21 @@ it("ships golden cases covering both a passing and a failing shape of every kind
   }
 });
 
-it("keeps dead-end referral's direct-result and tool-boundary expectations independent", () => {
+it("keeps dead-end referral's golden answer and expectations independent", () => {
   // Catches hiding the intended owner-referral failure by marking its concrete disposition or owner-directed action as failures too.
+  const answers = JSON.parse(
+    readFileSync(join(repositoryRoot, "evals/answers.json"), "utf8"),
+  ) as { cases: { id: string; expect: "pass" | "fail"; ownerMessage: string; answer: string }[] };
   const expectations = JSON.parse(
     readFileSync(join(repositoryRoot, "evals/answer-expectations.json"), "utf8"),
   ) as { cases: { id: string; aggregate: "pass" | "fail"; clauses: Record<string, boolean> }[] };
 
+  expect(answers.cases.find((each) => each.id === "dead-end-referral")).toEqual({
+    id: "dead-end-referral",
+    expect: "fail",
+    ownerMessage: "can you stop the cyndra thread?",
+    answer: "The Cyndra thread is still running. Open the BB app and stop it from the thread panel.",
+  });
   expect(expectations.cases.find((each) => each.id === "dead-end-referral")).toEqual({
     id: "dead-end-referral",
     aggregate: "fail",

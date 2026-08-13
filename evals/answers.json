@@ -29,7 +29,7 @@
       "id": "dead-end-referral",
       "expect": "fail",
       "ownerMessage": "can you stop the cyndra thread?",
-      "answer": "You'll need to open the BB app and stop that thread from the thread panel yourself."
+      "answer": "The Cyndra thread is still running. Open the BB app and stop it from the thread panel."
     },
     {
       "id": "bounded-uncertainty",
