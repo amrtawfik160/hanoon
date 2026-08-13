@@ -222,6 +222,9 @@ it("handles resolved-before-record reorder, restart, and generation-scoped id re
   expect(record(repository)).toBe(true);
   const reopened = new ControllerInteractionRepository(db);
   expect(reopened.getPending("owner-7-controller")).toMatchObject({ interactionId: "int-question", state: "pending" });
+  expect(reopened.markResolved({ ...fence, now: 3, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(true);
+  expect(db.prepare("SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = 'int-question'").get())
+    .toEqual({ state: "delivered", delivered_at: 3 });
   db.prepare("UPDATE controller_generations SET ended_at = 3 WHERE id = 'gen-current'").run();
   db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at) VALUES ('gen-successor', 'owner-7-controller', 'thr-current', 3)").run();
   expect(reopened.record({ ...fence, now: 4, turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thr-current", controllerGenerationId: "gen-successor", interaction: question })).toBe(false);
@@ -247,13 +250,116 @@ it("allows exactly one owner answer when a button races free text", () => {
   expect([button, text].filter((answer) => answer.ok)).toHaveLength(1);
 });
 
-it("rejects stale executor identity and a revoked or mismatched owner", () => {
+it.each([
+  ["user", "8", "7"],
+  ["chat", "7", "8"],
+])("rejects a mismatched owner %s", (_identityField, userId, chatId) => {
+  const { repository } = fixture();
+  expect(record(repository)).toBe(true);
+  expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId, chatId, text: "yes", now: 3 }))
+    .toEqual({ ok: false, reason: "stale" });
+});
+
+it("rejects stale executor identity and a revoked owner", () => {
   const { db, repository } = fixture();
   expect(repository.record({ ...fence, generation: 2, turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thr-current", controllerGenerationId: "gen-current", interaction: question })).toBe(false);
   record(repository);
-  expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "8", chatId: "7", text: "yes", now: 3 })).toEqual({ ok: false, reason: "stale" });
   db.prepare("UPDATE owners SET revoked_at = 3").run();
   expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "yes", now: 3 })).toEqual({ ok: false, reason: "stale" });
+});
+
+it("rejects free text when the current question disallows it", () => {
+  const { db, repository } = fixture();
+  const buttonsOnly = { ...question, questions: [{ ...question.questions[0]!, allowFreeText: false }] };
+  expect(record(repository, buttonsOnly)).toBe(true);
+
+  expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "typed", now: 3 }))
+    .toEqual({ ok: false, reason: "stale" });
+  expect(db.prepare("SELECT state, answer_json, answered_at FROM controller_interactions WHERE interaction_id = 'int-question'").get())
+    .toEqual({ state: "pending", answer_json: null, answered_at: null });
+});
+
+it("rejects a 2,000-code-point free-text answer above the canonical byte limit", () => {
+  const { db, repository } = fixture();
+  expect(record(repository)).toBe(true);
+
+  expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "€".repeat(2_000), now: 3 }))
+    .toEqual({ ok: false, reason: "stale" });
+  expect(db.prepare("SELECT state, answer_json, answered_at FROM controller_interactions WHERE interaction_id = 'int-question'").get())
+    .toEqual({ state: "pending", answer_json: null, answered_at: null });
+});
+
+it("fails owner and executor mutations closed for a cross-controller interaction row", () => {
+  const { db, repository } = fixture();
+  expect(record(repository)).toBe(true);
+  db.prepare("INSERT INTO controller_threads (controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at, bb_thread_id) VALUES ('other-controller', '7', '7', 'active', 1, 1, 'thr-other')").run();
+  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at) VALUES ('gen-other', 'other-controller', 'thr-other', 1)").run();
+  db.exec("PRAGMA foreign_keys = OFF; UPDATE controller_interactions SET controller_key = 'other-controller', bb_thread_id = 'thr-other', controller_generation_id = 'gen-other' WHERE interaction_id = 'int-question'; PRAGMA foreign_keys = ON");
+
+  expect(repository.answerWithText({ controllerKey: "other-controller", userId: "7", chatId: "7", text: "answer", now: 3 }))
+    .toEqual({ ok: false, reason: "stale" });
+  expect(repository.sourceIsActive({ ...fence, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-other" })).toBe(false);
+  expect(repository.markResolved({ ...fence, now: 3, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-other" })).toBe(false);
+  db.prepare("UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = 3 WHERE interaction_id = 'int-question'")
+    .run(JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }));
+  expect(repository.markDelivered({ ...fence, now: 4, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-other" })).toBe(false);
+  expect(db.prepare("SELECT state, answer_json, delivered_at FROM controller_interactions WHERE interaction_id = 'int-question'").get())
+    .toEqual({ state: "answered", answer_json: JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }), delivered_at: null });
+});
+
+it("fails owner and executor mutations closed when the source has two open generations", () => {
+  const { db, repository } = fixture();
+  expect(record(repository)).toBe(true);
+  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at) VALUES ('gen-second', 'owner-7-controller', 'thr-current', 2)").run();
+
+  expect(repository.answerByToken({ token: questionOptionToken("int-question", "q1", "yes"), userId: "7", chatId: "7", now: 3 }))
+    .toEqual({ ok: false, reason: "stale" });
+  expect(repository.sourceIsActive({ ...fence, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(false);
+  expect(repository.markResolved({ ...fence, now: 3, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(false);
+  db.prepare("UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = 3 WHERE interaction_id = 'int-question'")
+    .run(JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }));
+  expect(repository.markDelivered({ ...fence, now: 4, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(false);
+  expect(db.prepare("SELECT state, answer_json, delivered_at FROM controller_interactions WHERE interaction_id = 'int-question'").get())
+    .toEqual({ state: "answered", answer_json: JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }), delivered_at: null });
+});
+
+it("reconstructs pending repository state after closing and reopening file-backed SQLite", () => {
+  const directory = mkdtempSync(resolve(".task10-interaction-restart-"));
+  let db: Database.Database | undefined;
+  try {
+    const seeded = seededRaceDatabase(directory);
+    db = seeded.db;
+    db.close();
+    db = new Database(seeded.databasePath);
+    db.pragma("foreign_keys = ON");
+    const reopened = new ControllerInteractionRepository(db);
+    expect(reopened.getPending("owner-7-controller")).toMatchObject({
+      interactionId: "int-question",
+      state: "pending",
+      answer: null,
+    });
+  } finally {
+    db?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("persists a canonical partial button answer before the terminal question", () => {
+  const { db, repository } = fixture();
+  const twoQuestions = {
+    ...question,
+    questions: [question.questions[0]!, { ...question.questions[0]!, id: "q2" }],
+  };
+  expect(record(repository, twoQuestions)).toBe(true);
+  expect(repository.answerByToken({ token: questionOptionToken("int-question", "q1", "yes"), userId: "7", chatId: "7", now: 3 }))
+    .toMatchObject({ ok: true, interactionId: "int-question" });
+  expect(db.prepare("SELECT state, answer_json, answered_at FROM controller_interactions WHERE interaction_id = 'int-question'").get())
+    .toEqual({
+      state: "pending",
+      answer_json: JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }),
+      answered_at: null,
+    });
+  expect(repository.getPending("owner-7-controller")).toMatchObject({ state: "pending" });
 });
 
 it("does not bind a record unless the submitted turn is held by the exact executor lease", () => {
@@ -310,6 +416,7 @@ it.each([
 it.each([
   ["pending answer with answered timestamp", "pending", JSON.stringify({ decision: "deny" }), 3, null],
   ["answered row without an answer", "answered", null, 3, null],
+  ["answered timestamp before asked", "answered", JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }), 1, null],
   ["delivered row without delivery timestamp", "delivered", JSON.stringify({ kind: "user_answer", answers: { q1: { selected: ["yes"] } } }), 3, null],
 ])("rejects inconsistent persisted lifecycle: %s", (_scenario, state, answerJson, answeredAt, deliveredAt) => {
   const { db, repository } = fixture();
@@ -319,6 +426,17 @@ it.each([
 
   expect(repository.getPending("owner-7-controller")).toBeNull();
   expect(repository.getAnswered("owner-7-controller")).toBeNull();
+});
+
+it("rejects a delivered row with only half of its nullable source identity", () => {
+  const { db, repository } = fixture();
+  expect(record(repository)).toBe(true);
+  expect(repository.markResolved({ ...fence, now: 3, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(true);
+  db.prepare("UPDATE controller_interactions SET controller_generation_id = NULL WHERE interaction_id = 'int-question'").run();
+
+  expect(repository.getPending("owner-7-controller")).toBeNull();
+  expect(repository.getAnswered("owner-7-controller")).toBeNull();
+  expect(repository.markResolved({ ...fence, now: 4, interactionId: "int-question", turnId: "turn-1", bbThreadId: "thr-current" })).toBe(false);
 });
 
 it.each([

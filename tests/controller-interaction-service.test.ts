@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { resolve } from "node:path";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import Database from "better-sqlite3";
 import { expect, it, vi } from "vitest";
 import { ControllerInteractionService } from "../src/controller/interaction-service";
 import { parseControllerInteraction, renderQuestion, threadDecisionToken } from "../src/controller/questions";
@@ -7,10 +10,7 @@ import { ALL_MIGRATIONS } from "../src/storage/migrations";
 
 let deliverySequence = 0;
 
-function deliveryFixture() {
-  const { bb } = createFakePluginHost({ pluginId: `controller-delivery-${deliverySequence++}` });
-  const db = bb.storage.database();
-  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+function seedDelivery(db: Database.Database): ControllerInteractionRepository {
   db.prepare("INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at) VALUES (1, '7', '7', 1)").run();
   db.prepare("INSERT INTO controller_threads (controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at, bb_thread_id) VALUES ('owner-7-controller', '7', '7', 'active', 1, 1, 'thread-1')").run();
   db.prepare("INSERT INTO controller_turns (id, telegram_update_id, controller_key, ordinal, input_text, state, lease_owner, lease_generation, submitted_at, created_at, updated_at) VALUES ('turn-1', 1, 'owner-7-controller', 1, 'question', 'submitted', 'executor', 1, 1, 1, 1)").run();
@@ -20,7 +20,24 @@ function deliveryFixture() {
   const approval = { kind: "approval" as const, interactionId: "approval-1", summary: "wants to write file.ts", decisions: ["deny" as const] };
   expect(repository.record({ ownerId: "executor", generation: 1, now: 2, turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thread-1", controllerGenerationId: "generation-1", interaction: approval })).toBe(true);
   expect(repository.answerByToken({ token: threadDecisionToken("approval-1", "deny"), userId: "7", chatId: "7", now: 3 })).toMatchObject({ ok: true });
+  return repository;
+}
+
+function deliveryFixture() {
+  const { bb } = createFakePluginHost({ pluginId: `controller-delivery-${deliverySequence++}` });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+  const repository = seedDelivery(db);
   return { db, repository };
+}
+
+function fileBackedDeliveryFixture() {
+  const directory = mkdtempSync(resolve(".task10-delivery-restart-"));
+  const databasePath = resolve(directory, "delivery.sqlite");
+  const db = new Database(databasePath);
+  db.pragma("foreign_keys = ON");
+  for (const migration of ALL_MIGRATIONS) db.exec(migration);
+  return { directory, databasePath, db, repository: seedDelivery(db) };
 }
 
 it("projects a safe approval while removing session approval and command credentials", () => {
@@ -44,6 +61,36 @@ it("fails closed for unsupported approvals and projects only bounded safe metada
     subject: { kind: "permission_grant", permissions: { network: { enabled: true } } },
     availableDecisions: ["allow_once"],
   })).toEqual({ kind: "unsupported", interactionId: "approval-2", metadata: { sourceKind: "approval" } });
+});
+
+it("excludes environment and raw-output fields from projection and persistence", () => {
+  const projected = parseControllerInteraction("approval-private", {
+    kind: "approval",
+    subject: {
+      kind: "command",
+      command: "npm test",
+      environment: { ACCESS_TOKEN: "environment-secret" },
+      output: "raw-output-secret",
+      rawOutput: "neighbor-secret",
+    },
+    availableDecisions: ["deny"],
+  });
+  expect(projected).toEqual({
+    kind: "approval",
+    interactionId: "approval-private",
+    summary: "wants to run:\n\n`npm test`",
+    decisions: ["deny"],
+  });
+  const { db, repository } = deliveryFixture();
+  db.prepare("DELETE FROM controller_interactions").run();
+  expect(projected && repository.record({
+    ownerId: "executor", generation: 1, now: 4, turnId: "turn-1", controllerKey: "owner-7-controller",
+    bbThreadId: "thread-1", controllerGenerationId: "generation-1", interaction: projected,
+  })).toBe(true);
+  const serialized = db.prepare("SELECT payload_json FROM controller_interactions WHERE interaction_id = 'approval-private'").pluck().get() as string;
+  expect(serialized).not.toContain("environment-secret");
+  expect(serialized).not.toContain("raw-output-secret");
+  expect(serialized).not.toContain("neighbor-secret");
 });
 
 it("uses a basename only for safe file-change paths", () => {
@@ -75,6 +122,18 @@ it("rejects oversized question identifiers and option values", () => {
     .toMatchObject({ kind: "unsupported" });
 });
 
+it("accepts exact Unicode identifier code-point and byte boundaries", () => {
+  const interactionId = "🙂".repeat(200);
+  const projected = parseControllerInteraction(interactionId, { kind: "user_question", questions: [{
+    id: "🙂".repeat(120),
+    prompt: "question",
+    multiSelect: false,
+    allowFreeText: true,
+    options: [],
+  }] });
+  expect(projected).toMatchObject({ kind: "user_question", interactionId });
+});
+
 it.each([
   ["missing decisions", undefined],
   ["malformed decisions", "deny"],
@@ -100,6 +159,24 @@ it("preserves an answered row when BB resolve throws with an unknown outcome", a
   });
   await expect(service.deliverAnswered({ ownerId: "executor", generation: 1, now: 4, controllerKey: "owner-7-controller" }))
     .rejects.toThrow("connection lost after send");
+  expect(db.prepare("SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = 'approval-1'").get())
+    .toEqual({ state: "answered", delivered_at: null });
+});
+
+it("preserves an answered row when the SDK get rejects a missing interaction", async () => {
+  const { db, repository } = deliveryFixture();
+  const resolve = vi.fn();
+  const service = new ControllerInteractionService({
+    store: repository,
+    interactions: {
+      get: vi.fn(async () => { throw new Error('Interaction "approval-1" not found'); }),
+      resolve,
+    } as never,
+    clock: () => 4,
+  });
+  await expect(service.deliverAnswered({ ownerId: "executor", generation: 1, now: 4, controllerKey: "owner-7-controller" }))
+    .rejects.toThrow("not found");
+  expect(resolve).not.toHaveBeenCalled();
   expect(db.prepare("SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = 'approval-1'").get())
     .toEqual({ state: "answered", delivered_at: null });
 });
@@ -143,6 +220,35 @@ it("bounds Unicode question projections to Telegram UTF-8 limits", () => {
   expect(Buffer.byteLength(rendered.reply_markup.inline_keyboard[0]![0]!.text, "utf8")).toBeLessThanOrEqual(64);
   expect(Buffer.byteLength(rendered.reply_markup.inline_keyboard[0]![0]!.callback_data, "utf8")).toBeLessThanOrEqual(64);
   expect(Buffer.byteLength(`w:${threadDecisionToken("approval", "allow_once")}`, "utf8")).toBeLessThanOrEqual(64);
+});
+
+it("keeps the worst-case six-option question inside Telegram aggregate and callback budgets", () => {
+  const projected = parseControllerInteraction("aggregate", { kind: "user_question", questions: [{
+    id: "q",
+    prompt: "🙂".repeat(400),
+    shortLabel: "🙂".repeat(60),
+    multiSelect: true,
+    allowFreeText: true,
+    options: Array.from({ length: 6 }, (_, index) => ({
+      value: `${index}-${"🙂".repeat(110)}`,
+      label: "🙂".repeat(60),
+      description: "🙂".repeat(200),
+    })),
+  }] });
+  if (!projected || projected.kind !== "user_question") throw new Error("worst-case question was not projected");
+
+  const rendered = renderQuestion(projected.interactionId, projected.questions[0]!);
+  expect(Buffer.byteLength(rendered.text, "utf8")).toBeLessThanOrEqual(4096);
+  expect(Buffer.from(rendered.text, "utf8").toString("utf8")).toBe(rendered.text);
+  expect(rendered.text).not.toContain("�");
+  expect(rendered.text).toContain("🙂");
+  expect(rendered.reply_markup.inline_keyboard).toHaveLength(6);
+  for (const [button] of rendered.reply_markup.inline_keyboard) {
+    expect(Buffer.byteLength(button!.text, "utf8")).toBeLessThanOrEqual(64);
+    expect(Buffer.byteLength(button!.callback_data, "utf8")).toBeLessThanOrEqual(64);
+  }
+  const customPrefix = renderQuestion(projected.interactionId, projected.questions[0]!, "🙂".repeat(40));
+  expect(Buffer.byteLength(customPrefix.reply_markup.inline_keyboard[0]![0]!.callback_data, "utf8")).toBeLessThanOrEqual(64);
 });
 
 it("reads the exact BB interaction before resolving a durable answer", async () => {
@@ -242,6 +348,7 @@ it("keeps the answer durable before resolve and adopts interrupted state without
 
 it.each([
   ["mismatched get", async () => ({ id: "other", threadId: "thread-1", status: "pending" }), async () => ({ id: "approval-1", threadId: "thread-1", status: "resolved" })],
+  ["returned thread mismatch", async () => ({ id: "approval-1", threadId: "thread-other", status: "pending" }), async () => ({ id: "approval-1", threadId: "thread-1", status: "resolved" })],
   ["unknown get state", async () => ({ id: "approval-1", threadId: "thread-1", status: "resolving" }), async () => ({ id: "approval-1", threadId: "thread-1", status: "resolved" })],
   ["ambiguous resolve", async () => ({ id: "approval-1", threadId: "thread-1", status: "pending" }), async () => ({ id: "approval-1", threadId: "thread-1", status: "pending" })],
 ] as const)("leaves the durable answer repairable after %s", async (_scenario, get, resolve) => {
@@ -252,32 +359,41 @@ it.each([
     .toEqual({ state: "answered", delivered_at: null });
 });
 
-it("recovers after a crash boundary following successful BB resolve without resolving twice", async () => {
-  const { db, repository } = deliveryFixture();
-  expect(repository.record({ ownerId: "executor", generation: 1, now: 4, turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thread-1", controllerGenerationId: "generation-1", interaction: { kind: "unsupported", interactionId: "later", metadata: { sourceKind: "plugin" } } })).toBe(true);
-  const resolve = vi.fn(async () => {
-    db.prepare("UPDATE executor_lease SET owner_id = 'successor', generation = 2, lease_expires_at = 100000 WHERE singleton = 1").run();
-    db.prepare("UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = 'turn-1'").run();
-    return { id: "approval-1", threadId: "thread-1", status: "resolved" };
-  });
-  const firstService = new ControllerInteractionService({
-    store: repository,
-    interactions: { get: vi.fn(async () => ({ id: "approval-1", threadId: "thread-1", status: "pending" })), resolve } as never,
-    clock: () => 4,
-  });
-  await expect(firstService.deliverAnswered({ ownerId: "executor", generation: 1, now: 4, controllerKey: "owner-7-controller" })).resolves.toBe(false);
-  expect(db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = 'approval-1'").get()).toEqual({ state: "answered" });
+it("closes and reopens file-backed SQLite after a post-resolve crash without resolving twice", async () => {
+  const seeded = fileBackedDeliveryFixture();
+  let db: Database.Database | undefined = seeded.db;
+  try {
+    expect(seeded.repository.record({ ownerId: "executor", generation: 1, now: 4, turnId: "turn-1", controllerKey: "owner-7-controller", bbThreadId: "thread-1", controllerGenerationId: "generation-1", interaction: { kind: "unsupported", interactionId: "later", metadata: { sourceKind: "plugin" } } })).toBe(true);
+    const resolveInteraction = vi.fn(async () => {
+      db!.prepare("UPDATE executor_lease SET owner_id = 'successor', generation = 2, lease_expires_at = 100000 WHERE singleton = 1").run();
+      db!.prepare("UPDATE controller_turns SET lease_owner = 'successor', lease_generation = 2 WHERE id = 'turn-1'").run();
+      return { id: "approval-1", threadId: "thread-1", status: "resolved" };
+    });
+    const firstService = new ControllerInteractionService({
+      store: seeded.repository,
+      interactions: { get: vi.fn(async () => ({ id: "approval-1", threadId: "thread-1", status: "pending" })), resolve: resolveInteraction } as never,
+      clock: () => 4,
+    });
+    await expect(firstService.deliverAnswered({ ownerId: "executor", generation: 1, now: 4, controllerKey: "owner-7-controller" })).resolves.toBe(false);
+    expect(db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = 'approval-1'").get()).toEqual({ state: "answered" });
+    db.close();
+    db = new Database(seeded.databasePath);
+    db.pragma("foreign_keys = ON");
 
-  const reopened = new ControllerInteractionRepository(db);
-  const retryResolve = vi.fn();
-  const retryService = new ControllerInteractionService({
-    store: reopened,
-    interactions: { get: vi.fn(async () => ({ id: "approval-1", threadId: "thread-1", status: "resolved" })), resolve: retryResolve } as never,
-    clock: () => 5,
-  });
-  await expect(retryService.deliverAnswered({ ownerId: "successor", generation: 2, now: 5, controllerKey: "owner-7-controller" })).resolves.toBe(true);
-  expect(resolve).toHaveBeenCalledTimes(1);
-  expect(retryResolve).not.toHaveBeenCalled();
-  expect(db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = 'approval-1'").get()).toEqual({ state: "delivered" });
-  expect(db.prepare("SELECT awaiting_interaction_id FROM controller_turns WHERE id = 'turn-1'").get()).toEqual({ awaiting_interaction_id: "later" });
+    const reopenedRepository = new ControllerInteractionRepository(db);
+    const retryResolve = vi.fn();
+    const retryService = new ControllerInteractionService({
+      store: reopenedRepository,
+      interactions: { get: vi.fn(async () => ({ id: "approval-1", threadId: "thread-1", status: "resolved" })), resolve: retryResolve } as never,
+      clock: () => 5,
+    });
+    await expect(retryService.deliverAnswered({ ownerId: "successor", generation: 2, now: 5, controllerKey: "owner-7-controller" })).resolves.toBe(true);
+    expect(resolveInteraction).toHaveBeenCalledTimes(1);
+    expect(retryResolve).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT state FROM controller_interactions WHERE interaction_id = 'approval-1'").get()).toEqual({ state: "delivered" });
+    expect(db.prepare("SELECT awaiting_interaction_id FROM controller_turns WHERE id = 'turn-1'").get()).toEqual({ awaiting_interaction_id: "later" });
+  } finally {
+    db?.close();
+    rmSync(seeded.directory, { recursive: true, force: true });
+  }
 });

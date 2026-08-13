@@ -152,7 +152,7 @@ function validUserAnswers(rawAnswers: unknown, interaction: Extract<ControllerIn
     if (!selected.every((entry) => typeof entry === "string") || new Set(selected).size !== selected.length ||
       (!question.multiSelect && selected.length > 1) || selected.some((entry) => !question.options.some((option) => option.value === entry))) return false;
     const freeText = rawAnswer.freeText;
-    if (freeText !== undefined && !boundedText(freeText, 2_000, 4_000)) return false;
+    if (freeText !== undefined && (!question.allowFreeText || !boundedText(freeText, 2_000, 4_000))) return false;
     return selected.length > 0 || freeText !== undefined;
   });
 }
@@ -313,7 +313,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
 
   public answerWithText(input: { controllerKey: string; userId: string; chatId: string; text: string; now: number }): ControllerInteractionAnswer {
     if (!isSafeIdentifier(input.controllerKey) || !isSafeIdentifier(input.userId) || !isSafeIdentifier(input.chatId) ||
-      typeof input.text !== "string" || input.text.trim().length === 0 || input.text.length > 2_000 ||
+      typeof input.text !== "string" || !boundedText(input.text.trim(), 2_000, 4_000) ||
       !Number.isSafeInteger(input.now) || input.now < 0) return { ok: false, reason: "stale" };
     return this.db.transaction((): ControllerInteractionAnswer => {
       const row = this.ownedPending(input.userId, input.chatId, input.controllerKey)[0];
@@ -323,7 +323,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
       if (record.interaction.kind !== "user_question") return { ok: false, reason: "stale" };
       const answers = this.userAnswers(record);
       const next = nextUnansweredQuestion(record.interaction.questions, answers);
-      if (!next) return { ok: false, reason: "stale" };
+      if (!next || !next.question.allowFreeText) return { ok: false, reason: "stale" };
       return this.answerQuestion(record, { ...answers, [next.question.id]: { selected: [], freeText: input.text.trim() } }, input.now);
     }).immediate();
   }
@@ -332,7 +332,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     if (!isSafeIdentifier(controllerKey)) return null;
     const row = this.db.prepare(
       `SELECT interaction.* FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
+          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
        WHERE interaction.controller_key = ? AND interaction.state = 'pending'
        ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC LIMIT 1`,
     ).get(controllerKey) as InteractionRow | undefined;
@@ -343,7 +344,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     if (!isSafeIdentifier(controllerKey)) return null;
     const row = this.db.prepare(
       `SELECT interaction.* FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
+          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
        WHERE interaction.controller_key = ? AND interaction.state = 'answered'
        ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC LIMIT 1`,
     ).get(controllerKey) as InteractionRow | undefined;
@@ -372,7 +374,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     return this.db.transaction(() => this.db.prepare(
       `SELECT 1 FROM executor_lease AS lease
         JOIN controller_interactions AS interaction ON interaction.interaction_id = ? AND interaction.turn_id = ? AND interaction.bb_thread_id = ?
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
+          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
           AND turn.lease_owner = lease.owner_id AND turn.lease_generation = lease.generation
         JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
           AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
@@ -396,8 +399,9 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   private answerQuestion(record: ControllerInteractionRecord, answers: ControllerQuestionAnswers, now: number): ControllerInteractionAnswer {
     if (record.interaction.kind !== "user_question") return { ok: false, reason: "stale" };
     const complete = nextUnansweredQuestion(record.interaction.questions, answers) === null;
+    const resolution = { kind: "user_answer" as const, answers };
+    if (!validResolution(resolution, record.interaction)) return { ok: false, reason: "stale" };
     if (!complete) {
-      const resolution = { kind: "user_answer" as const, answers };
       const changed = this.db.prepare(
         `UPDATE controller_interactions SET answer_json = ? WHERE interaction_id = ? AND state = 'pending'`,
       ).run(JSON.stringify(resolution), record.interactionId).changes === 1;
@@ -405,10 +409,11 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         ? { ok: true, interactionId: record.interactionId, turnId: record.turnId, resolution }
         : { ok: false, reason: "stale" };
     }
-    return this.answer(record, { kind: "user_answer", answers }, now);
+    return this.answer(record, resolution, now);
   }
 
   private answer(record: ControllerInteractionRecord, resolution: ControllerInteractionResolution, now: number): ControllerInteractionAnswer {
+    if (!validResolution(resolution, record.interaction)) return { ok: false, reason: "stale" };
     const changed = this.db.prepare(
       `UPDATE controller_interactions SET state = 'answered', answer_json = ?, answered_at = ?
         WHERE interaction_id = ? AND state = 'pending'`,
@@ -426,7 +431,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   private ownedPending(userId: string, chatId: string, controllerKey?: string): InteractionRow[] {
     return this.db.prepare(
       `SELECT interaction.* FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
+          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
         JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
           AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
         JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
@@ -436,6 +442,10 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
           AND owners.telegram_user_id = controller.telegram_user_id AND owners.telegram_chat_id = controller.telegram_chat_id
        WHERE interaction.state = 'pending' AND controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
          AND (? IS NULL OR interaction.controller_key = ?)
+         AND (SELECT COUNT(*) FROM controller_generations AS open_generation
+               WHERE open_generation.controller_key = interaction.controller_key
+                 AND open_generation.thread_id = interaction.bb_thread_id
+                 AND open_generation.ended_at IS NULL) = 1
        ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC`,
     ).all(userId, chatId, controllerKey ?? null, controllerKey ?? null) as InteractionRow[];
   }
@@ -444,10 +454,12 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     this.db.prepare(
       `UPDATE controller_turns SET awaiting_interaction_id = (
          SELECT interaction_id FROM controller_interactions
-          WHERE turn_id = ? AND state IN (${interactionStates})
+          WHERE turn_id = ? AND controller_key = (
+            SELECT controller_key FROM controller_turns WHERE id = ?
+          ) AND state IN (${interactionStates})
           ORDER BY asked_at ASC, interaction_id ASC LIMIT 1
        ), updated_at = ? WHERE id = ?`,
-    ).run(turnId, now, turnId);
+    ).run(turnId, turnId, now, turnId);
   }
 
   private validFence(input: ControllerLeaseFence): boolean {
@@ -482,7 +494,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   private activeInteraction(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
     return this.db.prepare(
       `SELECT 1 FROM controller_interactions AS interaction
-        JOIN controller_turns AS turn ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+        JOIN controller_turns AS turn ON turn.id = interaction.turn_id
+          AND turn.controller_key = interaction.controller_key AND turn.state = 'submitted'
         JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
           AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
         JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id

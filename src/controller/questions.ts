@@ -51,6 +51,11 @@ function boundedString(rawText: unknown, limit: number, byteLimit = limit * 4): 
   return kept.length > 0 ? `${kept.join("")}…` : null;
 }
 
+function boundedIdentifier(rawIdentifier: unknown, characterLimit: number): rawIdentifier is string {
+  return typeof rawIdentifier === "string" && rawIdentifier.length > 0 &&
+    [...rawIdentifier].length <= characterLimit && Buffer.byteLength(rawIdentifier, "utf8") <= characterLimit * 4;
+}
+
 function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
@@ -64,7 +69,7 @@ function parseOption(raw: unknown): ControllerQuestionOption | null {
 function parseQuestion(raw: unknown): ControllerQuestion | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const id = typeof candidate.id === "string" && candidate.id.length > 0 && candidate.id.length <= MAX_QUESTION_ID ? candidate.id : null;
+  const id = boundedIdentifier(candidate.id, MAX_QUESTION_ID) ? candidate.id : null;
   const prompt = boundedString(candidate.prompt, MAX_PROMPT);
   if (!id || !prompt) return null;
   const options = Array.isArray(candidate.options)
@@ -86,7 +91,7 @@ function parseQuestion(raw: unknown): ControllerQuestion | null {
  * with, so it is treated as absent rather than parked on.
  */
 export function parsePendingQuestion(interactionId: unknown, payload: unknown): ControllerPendingQuestion | null {
-  if (typeof interactionId !== "string" || interactionId.length === 0 || interactionId.length > MAX_INTERACTION_ID) return null;
+  if (!boundedIdentifier(interactionId, MAX_INTERACTION_ID)) return null;
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind !== "user_question" || !Array.isArray(candidate.questions)) return null;
@@ -119,6 +124,27 @@ export type RenderedQuestion = {
   reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] };
 };
 
+const TELEGRAM_TEXT_BYTES = 4_096;
+
+function boundedTelegramText(text: string): string {
+  if (Buffer.byteLength(text, "utf8") <= TELEGRAM_TEXT_BYTES) return text;
+  const ellipsis = "…";
+  const kept: string[] = [];
+  let usedBytes = Buffer.byteLength(ellipsis, "utf8");
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > TELEGRAM_TEXT_BYTES) break;
+    kept.push(character);
+    usedBytes += characterBytes;
+  }
+  return `${kept.join("")}${ellipsis}`;
+}
+
+function interactionCallback(prefix: string, interactionId: string, questionId: string, optionValue: string): string {
+  const safePrefix = /^[A-Za-z0-9_-]{1,30}$/.test(prefix) ? prefix : "q";
+  return `${safePrefix}:${questionOptionToken(interactionId, questionId, optionValue)}`;
+}
+
 /**
  * One question per message. Telegram gives a button no room to say which
  * question it belongs to, so asking them in sequence is what keeps a tap
@@ -135,11 +161,11 @@ export function renderQuestion(
   }
   if (question.allowFreeText) lines.push("Or just reply with your own answer.");
   return {
-    text: lines.join("\n\n"),
+    text: boundedTelegramText(lines.join("\n\n")),
     reply_markup: {
       inline_keyboard: question.options.map((option) => [{
-        text: option.label,
-        callback_data: `${callbackPrefix}:${questionOptionToken(interactionId, question.id, option.value)}`,
+        text: boundedString(option.label, MAX_LABEL, 64) ?? "Option",
+        callback_data: interactionCallback(callbackPrefix, interactionId, question.id, option.value),
       }]),
     },
   };
@@ -241,7 +267,7 @@ function controllerApprovalSummary(subject: unknown): string | null {
  * controller may retain. Lifecycle payloads are deliberately not accepted here.
  */
 export function parseControllerInteraction(interactionId: unknown, payload: unknown): ControllerInteraction | null {
-  if (typeof interactionId !== "string" || interactionId.length === 0 || interactionId.length > 200 ||
+  if (!boundedIdentifier(interactionId, MAX_INTERACTION_ID) ||
     typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind === "user_question") {
