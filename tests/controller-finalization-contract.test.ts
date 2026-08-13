@@ -288,6 +288,48 @@ describe("unsafe candidate redaction", () => {
   });
 
   it.each([
+    ["GitHub token", `ghp_${"A".repeat(32)}`],
+    ["AWS access key", `AKIA${"7".repeat(16)}`],
+    ["provider key", `sk-proj-${"B".repeat(24)}`],
+    ["Telegram bot token", `1234567890:${"C".repeat(35)}`],
+    ["private-key material", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"],
+    ["nested encoded provider key", encodeURIComponent(encodeURIComponent(`Bearer rk-live-${"D".repeat(24)}`))],
+  ])("rejects and erases %s before persistence", (_label, unsafeToken) => {
+    const validation = validateControllerFinalization(
+      claimFinalization({
+        kind: "uncertainty",
+        outcome: "uncertain",
+        text: `Protected output: ${unsafeToken}`,
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+    );
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(JSON.stringify(validation)).not.toContain(unsafeToken);
+    expect(JSON.stringify(validation)).not.toContain(decodeURIComponent(decodeURIComponent(unsafeToken)));
+  });
+
+  it("scans rendered output across claim boundaries before accepting it", () => {
+    const providerToken = `ghs_${"E".repeat(28)}`;
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "Protected output: ghs_" },
+        claimFinalization({
+          kind: "uncertainty",
+          outcome: "uncertain",
+          text: "E".repeat(28),
+        }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+    const validation = validateControllerFinalization(candidate, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state"),
+    ));
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(JSON.stringify(validation)).not.toContain(providerToken);
+  });
+
+  it.each([
     ["subject ref", claimFinalization({ subjectRef: "token=SUBJECT_SECRET_12345" })],
     ["obligation ref", {
       disposition: "deferred",
@@ -758,6 +800,17 @@ describe("bounded text heuristics", () => {
     "I can confirm the fix is implemented.",
   ])("rejects unclaimed high-impact assertion: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    ["deployment success", "Deployment succeeded.", "high_impact_text_unclaimed"],
+    ["all tests pass", "All tests pass.", "high_impact_text_unclaimed"],
+    ["thread success", "The thread operation succeeded.", "high_impact_text_unclaimed"],
+    ["job mutation", "I cancelled the job.", "high_impact_text_unclaimed"],
+    ["thread mutation", "I sent a message to the thread.", "high_impact_text_unclaimed"],
+    ["process-only investigation", "I am investigating.", "process_only"],
+  ] as const)("dispositions evidence-free operational text: %s", (_label, text, code) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), code);
   });
 
   it.each([

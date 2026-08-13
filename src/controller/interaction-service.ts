@@ -1,4 +1,5 @@
 import type { ControllerLeaseFence } from "./models";
+import { canonicalControllerJson } from "./capability-executor";
 import {
   type ControllerInteractionDelivery,
   type ControllerInteractionDeliveryFence,
@@ -9,7 +10,20 @@ export type ControllerInteractionRemote = Readonly<{
   id: string;
   threadId: string;
   status: string;
+  resolution?: unknown;
 }>;
+
+export function controllerInteractionResolutionMatches(
+  observed: unknown,
+  expected: Record<string, unknown>,
+): boolean {
+  if (observed === null || observed === undefined) return false;
+  try {
+    return canonicalControllerJson(observed) === canonicalControllerJson(expected);
+  } catch {
+    return false;
+  }
+}
 
 type ControllerInteractionApi = Readonly<{
   get(
@@ -63,7 +77,7 @@ export class ControllerInteractionService {
     const observed = await this.authoritativeGet(answered, signal);
     if (!observed || this.isAborted(signal)) return false;
 
-    if (this.isTerminal(observed)) {
+    if (this.isResolvedWithExactAnswer(observed, answered.resolution)) {
       return this.markDelivered(answered, fence, signal);
     }
     if (observed.status !== "pending") return false;
@@ -81,7 +95,8 @@ export class ControllerInteractionService {
       // remain available for a later authoritative retry.
       return false;
     }
-    if (!resolved || !this.matches(answered, resolved) || !this.isTerminal(resolved)) return false;
+    if (!resolved || !this.matches(answered, resolved) ||
+        !this.isResolvedWithExactAnswer(resolved, answered.resolution)) return false;
     return this.markDelivered(answered, fence, signal);
   }
 
@@ -142,7 +157,10 @@ export class ControllerInteractionService {
     return remote.id === answered.interactionId && remote.threadId === answered.bbThreadId;
   }
 
-  private isTerminal(remote: ControllerInteractionRemote): boolean {
-    return remote.status === "resolved" || remote.status === "interrupted";
+  private isResolvedWithExactAnswer(
+    remote: ControllerInteractionRemote,
+    expected: Record<string, unknown>,
+  ): boolean {
+    return remote.status === "resolved" && controllerInteractionResolutionMatches(remote.resolution, expected);
   }
 }

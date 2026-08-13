@@ -1,7 +1,6 @@
 import { z } from "zod";
-import { containsCredentialLikeText } from "../domain/state-machine";
-import { assertNoRawMergeCallback } from "../storage/job-persistence";
 import { CONTROLLER_PROOF_KINDS, type ControllerProofKind } from "./models";
+import { canonicalControllerText } from "./questions";
 
 export const CONTROLLER_CLAIM_KINDS = [
   "observed_state",
@@ -148,9 +147,9 @@ export function controllerFinalizationCorrection(code: FinalizationRejectionCode
 }
 
 const PROCESS_OBJECT_WORD = "(?!(?:and|then|if)\\b)[a-z0-9_'/:-]+";
-const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigate|work\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
+const PROCESS_ACTION = `(?:check|look(?:\\s+into)?|investigat(?:e|ing)|work\\s+on|try|get\\s+back(?:\\s+to\\s+you)?|follow\\s+up)(?:\\s+${PROCESS_OBJECT_WORD}){0,12}`;
 const PROCESS_CLAUSE = new RegExp(
-  `^(?:(?:i(?:'ll| will)|let me)\\s+)?${PROCESS_ACTION}[.!]?$`,
+  `^(?:(?:i(?:'ll| will| am|'m)|let me)\\s+)?${PROCESS_ACTION}[.!]?$`,
   "i",
 );
 const FOLLOW_UP_OBJECT_WORD = "[a-z0-9_'/:-]+";
@@ -177,6 +176,7 @@ const HIGH_IMPACT_SUCCESS = [
   /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
   /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
   /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
+  /\b(?:all\s+)?tests?(?:\s+suite)?\s+(?:pass|passed|succeed|succeeded|complete|completed)\b/i,
   /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
   /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i,
   /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i,
@@ -192,6 +192,11 @@ const HIGH_IMPACT_SUCCESS = [
   new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"),
   new RegExp(`\\b${MONEY_AMOUNT}\\s+${PASSIVE_AUXILIARY}\\s+(?:spent|paid)\\b`, "i"),
   new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
+  /\b(?:the\s+)?(?:deployment|release)\s+(?:succeeded|passed|completed|finished)\b/i,
+  /\b(?:the\s+)?(?:thread|job)(?:\s+[a-z][a-z0-9_-]*){0,3}\s+(?:succeeded|completed|finished|passed)\b/i,
+  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:started|stopped|restarted|retried|cancelled|canceled|resumed|paused|queued|created|deleted|removed)\\s+(?:the\\s+)?(?:thread|job)\\b`, "i"),
+  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:sent|posted|delivered)\\s+(?:a\\s+)?(?:message|request|instruction)\\s+to\\s+(?:the\\s+)?(?:thread|job)\\b`, "i"),
+  /\b(?:the\s+)?(?:thread|job)\s+(?:is|was|has been|had been)\s+(?:started|stopped|restarted|retried|cancelled|canceled|resumed|paused|queued|created|deleted|removed)\b/i,
 ];
 
 export function renderControllerFinalization(candidate: ControllerFinalization): string {
@@ -217,18 +222,10 @@ function fixedStorageProjection(): ControllerFinalization {
   };
 }
 
-function hasUnsafeCallbackMaterial(candidateString: string): boolean {
-  try {
-    assertNoRawMergeCallback(candidateString, "controller finalization");
-    return false;
-  } catch (error) {
-    if (error instanceof TypeError) return true;
-    throw error;
-  }
-}
+const MAX_FINALIZATION_TEXT_SCAN = 16_384;
 
 function isUnsafeCandidateString(candidateString: string): boolean {
-  return containsCredentialLikeText(candidateString) || hasUnsafeCallbackMaterial(candidateString);
+  return canonicalControllerText(candidateString, MAX_FINALIZATION_TEXT_SCAN) === null;
 }
 
 function nonTextCandidateStrings(candidate: ControllerFinalization): string[] {

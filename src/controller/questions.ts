@@ -68,7 +68,7 @@ const SENSITIVE_CONTROLLER_TEXT_PATTERNS = [
   /\bbearer\s+\S+/iu,
   new RegExp(`\\b(?:${CREDENTIAL_QUERY_KEY}|credential)\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|\\S+)`, "iu"),
   /\b(?:access|refresh|id)\s+token|\bclient\s+secret|\bapi\s+key|\bauth(?:orization)?\s+(?:token|key)|\bsession\s+token|\bprivate\s+key/iu,
-  /\b(?:authorization|auth|session|private\s+key|credentials?|password|passwd|secret|token|key|jwt|signature|sig)\b\s+(?:is\s+)?\S+/iu,
+  /\b(?:authorization|auth|session|credentials?|password|passwd|secret|token|jwt|signature|sig)\b\s+(?:is\s+)?(?:bearer\s+)?[A-Za-z0-9_+/=-]{12,}\b/iu,
   /(?:^|[^A-Za-z0-9_])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;|&]*)/u,
   /(?:^|[\s"'`])(?:export\s+)?[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|KEY|AUTH)[A-Z0-9_]*\s*=\s*\S+/iu,
   new RegExp(`(?:^|[\\s;|&"'])(?:export\\s+)?(?:${CREDENTIAL_QUERY_KEY})\\s*=\\s*(?:"[^"]*"|'[^']*'|\\S+)`, "iu"),

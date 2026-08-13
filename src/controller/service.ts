@@ -9,7 +9,10 @@ import {
   type ControllerLocation,
   type ControllerStatus,
 } from "./bb-controller";
-import { ControllerInteractionService } from "./interaction-service";
+import {
+  ControllerInteractionService,
+  controllerInteractionResolutionMatches,
+} from "./interaction-service";
 import { parseControllerInteraction } from "./questions";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { normalizeControllerEventObservation, projectControllerStream } from "./stream";
@@ -52,8 +55,8 @@ const CONTROLLER_IMAGE_FAILURE_MESSAGE =
 export const CONTROLLER_STALL_MS = 8 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
 const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
-const CONTROLLER_RECOVERY_PROMPT =
-  "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";
+export const CONTROLLER_RECOVERY_PROMPT =
+  "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.";
 
 function retireReason(status: ControllerStatus): string {
   if (status === "missing") return "Thread was deleted or archived";
@@ -276,36 +279,37 @@ export class LunaControllerService {
     const parked = turn.awaitingInteractionId;
     if (parked !== null) return true;
     if (status === "active" || status === "starting" || status === "stopping") {
-      if (accepted) return true;
-      this.dependencies.store.refreshControllerDraft({
-        ...fenceAt(fence, refreshedAt),
-        turnId: turn.id,
-        sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
-      });
-      // Anything the owner says while an answer is being written belongs to that
-      // answer. Holding it back until the turn ends is how a correction arrives
-      // too late to correct anything.
-      const waiting = parked === null
-        ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
-        : null;
-      if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
-        if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
-        try {
-          await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
-        } catch {
-          // Out of attempts it stays queued, and the ordinary dispatch answers
-          // it once the turn in flight finishes.
-          this.dependencies.store.recordControllerSteerFailure({
+      if (!accepted) {
+        this.dependencies.store.refreshControllerDraft({
+          ...fenceAt(fence, refreshedAt),
+          turnId: turn.id,
+          sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
+        });
+        // Anything the owner says while an answer is being written belongs to that
+        // answer. Holding it back until the turn ends is how a correction arrives
+        // too late to correct anything.
+        const waiting = parked === null
+          ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
+          : null;
+        if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
+          if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
+          try {
+            await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
+          } catch {
+            // Out of attempts it stays queued, and the ordinary dispatch answers
+            // it once the turn in flight finishes.
+            this.dependencies.store.recordControllerSteerFailure({
+              ...fenceAt(fence, this.dependencies.clock.now()),
+              turnId: waiting.id,
+            });
+            return true;
+          }
+          this.dependencies.store.foldControllerTurnIntoRunning({
             ...fenceAt(fence, this.dependencies.clock.now()),
             turnId: waiting.id,
           });
           return true;
         }
-        this.dependencies.store.foldControllerTurnIntoRunning({
-          ...fenceAt(fence, this.dependencies.clock.now()),
-          turnId: waiting.id,
-        });
-        return true;
       }
       // The owner's own words outrank a budget nudge, so this runs only once
       // nothing of theirs is waiting. A turn parked on a question is waiting on
@@ -462,6 +466,22 @@ export class LunaControllerService {
       // executor retry after an authoritative read on the next pass.
       return;
     }
+    const getInteraction = this.dependencies.adapter.getInteraction;
+    if (!getInteraction) return;
+    let observed: ControllerInteractionSnapshot;
+    try {
+      observed = await getInteraction.call(
+        this.dependencies.adapter,
+        controller.threadId,
+        ownerAnswer.interactionId,
+        signal,
+      );
+    } catch {
+      return;
+    }
+    if (observed.id !== ownerAnswer.interactionId || observed.threadId !== ownerAnswer.bbThreadId ||
+        observed.status !== "resolved" ||
+        !controllerInteractionResolutionMatches(observed.resolution, ownerAnswer.resolution)) return;
     this.dependencies.store.markControllerInteractionDelivered({
       ...fenceAt(fence, this.dependencies.clock.now()),
       interactionId: ownerAnswer.interactionId,
@@ -513,9 +533,6 @@ export class LunaControllerService {
       context.controller.threadId!,
     );
     if (!generationBefore) return false;
-    if (reference.status === "resolved" || reference.status === "interrupted") {
-      return this.settleInteractionReference(reference, context);
-    }
     const snapshot = await this.readInteraction(reference, context);
     if (!snapshot) return false;
     const generationAfter = this.currentControllerGeneration(
@@ -524,8 +541,10 @@ export class LunaControllerService {
     );
     if (!generationAfter || generationAfter.id !== generationBefore.id ||
         snapshot.id !== reference.interactionId || snapshot.threadId !== context.controller.threadId) return false;
+    if (reference.status === "interrupted") return false;
+    if (reference.status === "resolved") return this.settleInteractionReference(reference, snapshot, context);
     if (snapshot.status === "resolved" || snapshot.status === "interrupted") {
-      return this.settleInteractionReference(reference, context);
+      return this.settleInteractionReference(reference, snapshot, context);
     }
     if (snapshot.status !== "pending") return false;
     const interaction = parseControllerInteraction(snapshot.id, snapshot.payload);
@@ -564,11 +583,24 @@ export class LunaControllerService {
     }
   }
 
-  private settleInteractionReference(
+  private async settleInteractionReference(
     reference: ControllerInteractionReference,
+    snapshot: ControllerInteractionSnapshot,
     context: InteractionReconciliationContext,
-  ): boolean {
-    const settled = this.dependencies.store.markControllerInteractionResolved({
+  ): Promise<boolean> {
+    if (reference.status !== "resolved" || snapshot.status !== "resolved") return false;
+    const answered = this.dependencies.store.getAnsweredControllerInteraction(context.controller.controllerKey);
+    if (!answered) {
+      const pending = this.dependencies.store.getPendingControllerInteraction(context.controller.controllerKey);
+      // A previously proven delivery removes the row. A still-pending row is
+      // different: BB resolving it without the durable answer is not proof.
+      return pending === null || pending.interactionId !== reference.interactionId;
+    }
+    if (answered.turnId !== context.turn.id ||
+        answered.interactionId !== reference.interactionId ||
+        answered.bbThreadId !== context.controller.threadId ||
+        !controllerInteractionResolutionMatches(snapshot.resolution, answered.resolution)) return false;
+    const settled = this.dependencies.store.markControllerInteractionDelivered({
       ...fenceAt(context.fence, this.dependencies.clock.now()),
       interactionId: reference.interactionId,
       turnId: context.turn.id,

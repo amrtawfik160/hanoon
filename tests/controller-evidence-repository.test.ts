@@ -643,7 +643,7 @@ it("persists the accepted evidence seal and immutable BB event seal separately",
   });
 });
 
-it("rejects completion when the BB event high-water advances after acceptance", () => {
+it("allows lifecycle-only BB event high-water advancement after acceptance", () => {
   const { store, turn, fence } = submittedControllerFixture({
     turnColumns: { evidenceEventSeq: 4 },
   });
@@ -665,9 +665,9 @@ it("rejects completion when the BB event high-water advances after acceptance", 
     turnId: turn.id,
     controllerKey: turn.controllerKey,
     bbHighWaterSeq: 5,
-  })).toBe("evidence_advanced");
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
+  })).toBe("completed");
+  expect(store.getControllerTurn(turn.id)?.state).toBe("completed");
+  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(fence.now);
 });
 
 it("exposes the fixed proof-kind vocabulary once from controller models", async () => {

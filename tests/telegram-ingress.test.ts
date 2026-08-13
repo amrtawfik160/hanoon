@@ -435,7 +435,12 @@ const interactions = {
       join(barrierDir, "provider-resolution-owner"),
       join(barrierDir, "provider-resolution-duplicate-" + label),
     );
-    return { id: input.interactionId, threadId: input.threadId, status: "resolved" };
+    return {
+      id: input.interactionId,
+      threadId: input.threadId,
+      status: "resolved",
+      resolution: input.resolution,
+    };
   },
 };
 const interactionService = new ControllerInteractionService({

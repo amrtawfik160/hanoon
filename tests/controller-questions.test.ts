@@ -619,7 +619,7 @@ it("rejects an exact interaction read after the controller generation changes", 
   expect(store.getPendingControllerInteraction(turn.controllerKey)).toBeNull();
 });
 
-it.each(["resolved", "interrupted"] as const)("settles a lifecycle reference when the exact interaction is already %s", async (status) => {
+it.each(["resolved", "interrupted"] as const)("does not settle a lifecycle reference without a durable exact answer when BB is %s", async (status) => {
   const { store, fence } = storeFixture("service-resolved-interaction");
   const turn = submittedTurn(store, fence);
   expect(recordQuestion(store, fence, turn)).toBe(true);
@@ -649,8 +649,8 @@ it.each(["resolved", "interrupted"] as const)("settles a lifecycle reference whe
 
   expect(adapter.getInteraction).toHaveBeenCalledWith("thr_controller", INTERACTION_ID, signal);
   expect(adapter.answerQuestion).not.toHaveBeenCalled();
-  expect(store.getPendingControllerInteraction(turn.controllerKey)).toBeNull();
-  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBeNull();
+  expect(store.getPendingControllerInteraction(turn.controllerKey)).toMatchObject({ interactionId: INTERACTION_ID });
+  expect(store.getControllerTurn(turn.id)?.awaitingInteractionId).toBe(INTERACTION_ID);
 });
 
 it("delivers the owner's answer back to the blocked BB thread", async () => {
@@ -663,7 +663,18 @@ it("delivers the owner's answer back to the blocked BB thread", async () => {
     chatId: "7",
     now: 4_000,
   }).ok).toBe(true);
-  const adapter = serviceAdapter();
+  const adapter = serviceAdapter({
+    getInteraction: vi.fn(async (threadId: string, interactionId: string) => {
+      const answered = store.getAnsweredControllerInteraction(turn.controllerKey);
+      return {
+        id: interactionId,
+        threadId,
+        status: answered ? "resolved" : "pending",
+        payload: questionPayload(),
+        resolution: answered?.resolution ?? null,
+      };
+    }),
+  });
   const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 4_100 } });
   const signal = AbortSignal.timeout(2_000);
 

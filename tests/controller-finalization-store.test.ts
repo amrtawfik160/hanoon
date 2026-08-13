@@ -115,7 +115,7 @@ try {
     });
     if (outcome === "claimed") {
       writeFileSync(join(barrierDir, "sent-" + label),
-        "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.");
+        "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.");
     }
     raceResult = { outcome };
   } else if (operation === "crash") {
@@ -1217,7 +1217,7 @@ it("claims one continuation and sends one recovery prompt across SQLite workers"
     const sentLabels = ["0", "1"].filter((label) => existsSync(resolve(barrierDir, `sent-${label}`)));
     expect(sentLabels).toHaveLength(1);
     expect(readFileSync(resolve(barrierDir, `sent-${sentLabels[0]}`), "utf8"))
-      .toBe("Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.");
+      .toBe("Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.");
 
     db = new Database(seeded.databasePath);
     expect(db.prepare(

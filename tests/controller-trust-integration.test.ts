@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 
 const NOW = 2_000;
-const RECOVERY_PROMPT = "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";
+const RECOVERY_PROMPT = "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.";
 const RAW_PROVIDER_SENTINEL = "RAW PROVIDER PROSE MUST NOT SHIP";
 const NATURAL_RESPONSE = "The enabled project is available.";
 const DENIAL_RESPONSE = "The requested command was denied.";
@@ -1113,6 +1113,26 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
     assertRegisteredControllerMapping(recording, state);
     expect(recording.drafts.every((draft) => draft.payload.text !== NATURAL_RESPONSE)).toBe(true);
 
+    state.events = [
+      eventRow(state.threadId, 1, "item/started", { item: { type: "toolCall", id: "finalizer-call" } }),
+      eventRow(state.threadId, 2, "item/completed", {
+        providerThreadId: "provider-thread-1",
+        item: {
+          type: "toolCall",
+          id: "finalizer-call",
+          server: "plugin",
+          tool: "telegram_agent_respond",
+          arguments: { disposition: "answered" },
+          status: "completed",
+          result: { outcome: "accepted" },
+        },
+      }),
+      eventRow(state.threadId, 3, "thread/tokenUsage/updated", {
+        tokenUsage: { total: { totalTokens: 1 } },
+      }),
+      eventRow(state.threadId, 4, "turn/completed", {}),
+    ];
+    state.maxSeq = 4;
     state.status = "idle";
     await nudgeExecutor(fixture, "4");
     await waitForCondition(() => expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
@@ -1173,8 +1193,8 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
       lease_owner: expect.any(String),
       lease_generation: expect.any(Number),
       dispatch_after_seq: 0,
-      bb_event_seq: 0,
-      evidence_event_seq: 0,
+      bb_event_seq: 4,
+      evidence_event_seq: 4,
       completion_continuations: 0,
       accepted_finalization_id: 1,
       stream_text: "",
@@ -1624,6 +1644,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         "settings-5-to-4-invoked",
         "settings-callback-5-to-4",
         "target-nudge-notify",
+        "provider-terminal-read",
         "continuation-send",
         "continuation-events",
       ]);
@@ -1828,13 +1849,14 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         "settings-5-to-4-invoked",
         "settings-callback-5-to-4",
         "target-nudge-notify",
+        "provider-terminal-read",
         "continuation-send",
         "continuation-events",
         "finalization",
         "final-delivery",
       ]);
       expect(state.providerResolveCount).toBe(1);
-      expect(state.providerGetCount).toBe(2);
+      expect(state.providerGetCount).toBe(3);
       assertRegisteredControllerMapping(recording, state);
       expect(storedInteractionState(restartedHost.bb.storage.database(), interactionId)).toMatchObject({ state: "delivered" });
       const ownerVisible = {
@@ -1885,6 +1907,7 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         "settings-5-to-4-invoked",
         "settings-callback-5-to-4",
         "target-nudge-notify",
+        "provider-terminal-read",
         "continuation-send",
         "continuation-events",
         "finalization",

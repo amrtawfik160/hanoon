@@ -206,8 +206,19 @@ function remote(fixture: ReturnType<typeof setup>, status: string, overrides: Pa
     id: fixture.interaction.interactionId,
     threadId: fixture.threadId,
     status,
+    resolution: status === "resolved"
+      ? { decision: "allow_once", grantedPermissions: null }
+      : null,
     ...overrides,
   };
+}
+
+function remoteWithResolution(
+  fixture: ReturnType<typeof setup>,
+  status: string,
+  resolution: Record<string, unknown> | null,
+): ControllerInteractionRemote {
+  return { ...remote(fixture, status), resolution };
 }
 
 it("gets the exact pending interaction before resolving and marks it delivered after proof", async () => {
@@ -236,14 +247,30 @@ it("gets the exact pending interaction before resolving and marks it delivered a
   fixture.close();
 });
 
-it.each(["resolved", "interrupted"] as const)("adopts an already-%s remote interaction without resolving again", async (status) => {
+it("adopts an already-resolved remote interaction only with the exact durable resolution", async () => {
   const fixture = setup();
-  const { get, resolve, service } = fixture.service(remote(fixture, status));
+  const { get, resolve, service } = fixture.service(remote(fixture, "resolved"));
 
   await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(true);
   expect(get).toHaveBeenCalledTimes(1);
   expect(resolve).not.toHaveBeenCalled();
   expect(fixture.repository.getAnswered(fixture.controllerKey)).toBeNull();
+  fixture.close();
+});
+
+it.each([
+  ["interrupted", "interrupted", { decision: "allow_once", grantedPermissions: null }],
+  ["resolved without a resolution", "resolved", null],
+  ["resolved with a mismatched resolution", "resolved", { decision: "deny" }],
+] as const)("keeps an answered interaction undelivered when BB reports %s", async (label, status, resolution) => {
+  const fixture = setup();
+  const observed = remoteWithResolution(fixture, status, resolution);
+  const { get, resolve, service } = fixture.service(observed);
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
+  expect(get).toHaveBeenCalledTimes(1);
+  expect(resolve).not.toHaveBeenCalled();
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).toMatchObject({ interactionId: fixture.interaction.interactionId });
   fixture.close();
 });
 

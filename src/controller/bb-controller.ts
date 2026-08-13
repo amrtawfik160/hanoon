@@ -40,6 +40,7 @@ export type ControllerInteractionSnapshot = Readonly<{
   threadId: string;
   status: string;
   payload: unknown;
+  resolution?: unknown;
 }>;
 export type ControllerEventObservation = {
   latestSeq: number;
@@ -431,6 +432,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       threadId: interaction.threadId,
       status: interaction.status,
       payload: "payload" in interaction ? interaction.payload : null,
+      resolution: "resolution" in interaction ? interaction.resolution : null,
     };
   }
 
