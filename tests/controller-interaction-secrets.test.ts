@@ -171,6 +171,15 @@ it.each([
   ["an AMQP URI credential", "worker amqp://alice:hunter2@broker:5672"],
   ["an encoded database URI credential", "psql postgresql://alice:hunter2%40db.internal/app"],
   ["a doubly-encoded proxy credential", "curl -U%2570roxyuser:hunter2 https://example.com"],
+  ["a single-quoted whole flag", "curl '-Uproxyuser:hunter2' https://example.com"],
+  ["a double-quoted whole flag", "mysql \"-phunter2\" -h db.internal"],
+  ["a quoted flag beside a quoted value", "curl '-u' 'alice:hunter2' https://example.com"],
+  ["a quoted long-form proxy flag", "curl '--proxy-user' 'alice:hunter2' https://example.com"],
+  ["adjacent quotes splitting a flag", "curl '-U''proxyuser:hunter2' https://example.com"],
+  ["a backslash-escaped flag", "curl \\-Uproxyuser:hunter2 https://example.com"],
+  ["a curly-quoted flag", "curl \u2018-Uproxyuser:hunter2\u2019 https://example.com"],
+  ["a quoted encoded flag", "curl '-U%2570roxyuser:hunter2' https://example.com"],
+  ["a quoted credential URI", "psql 'postgresql://alice:hunter2@db.internal/app'"],
 ] as const)("makes an approval carrying %s unsupported", (_scenario, command) => {
   const projected = parseControllerInteraction(INTERACTION_ID, {
     kind: "approval",
@@ -221,6 +230,10 @@ it.each([
   ["a negated long option", "provision --no-user bob"],
   ["a prefixed long option", "provision --superuser-check on"],
   ["a suffixed long option", "curl --user-agent hanoon https://example.com"],
+  ["a quoted ordinary flag", "sort '-u' names.txt"],
+  ["a quoted commit message", "git commit -m 'fix the -p handling'"],
+  ["a quoted path", "cat 'src/controller/service.ts'"],
+  ["a quoted port mapping", "docker run '-p' '8080:8080' app"],
 ] as const)("still offers a decision on %s", (_scenario, command) => {
   expect(parseControllerInteraction(INTERACTION_ID, {
     kind: "approval",

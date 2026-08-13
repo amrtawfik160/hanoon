@@ -67,10 +67,57 @@ const SENSITIVE_PATH_NAME = [
  * Fail-closed by construction — anything carrying credential or callback
  * material is unsafe, and callers downgrade rather than redact in place.
  */
+/** How many nested percent-encodings are unwrapped before giving up. */
+const MAX_DECODE_DEPTH = 4;
+
+/**
+ * Quotes and backslash escapes hide a flag from any rule that anchors on
+ * whitespace: `curl '-Uproxy:pw'` is the same command as `curl -Uproxy:pw`, and
+ * `'-U''proxy:pw'` is too. Removing the quoting characters is deliberately
+ * cruder than parsing a shell — it can only ever join tokens that were already
+ * adjacent, which is the direction that fails closed.
+ */
+function unquoted(text: string): string {
+  return text.replace(/[\\'"`\u2018\u2019\u201C\u201D]/g, "");
+}
+
+/** Each successful percent-decoding of a view, up to the depth cap. */
+function decodedViews(text: string): string[] {
+  const views: string[] = [];
+  let current = text;
+  for (let depth = 0; depth < MAX_DECODE_DEPTH; depth += 1) {
+    if (!current.includes("%")) break;
+    let next: string;
+    try {
+      next = decodeURIComponent(current);
+    } catch {
+      // Malformed encoding is not decoded further here. Callers that must fail
+      // closed on it — the approval command screen — do so themselves, so that
+      // ordinary prose containing a stray `%` is not condemned by this policy.
+      break;
+    }
+    if (next === current) break;
+    current = next;
+    views.push(current);
+  }
+  return views;
+}
+
+/**
+ * The readings of one string that a screen has to consider. A secret hidden by
+ * quoting, escaping, or encoding is still a secret, so the rules are applied to
+ * each reading rather than to the raw text alone.
+ */
+function credentialViews(text: string): string[] {
+  return [...new Set([text, unquoted(text)].flatMap((view) => [view, ...decodedViews(view)]))];
+}
+
 export function isUnsafeProviderText(text: string): boolean {
-  return containsCredentialLikeText(text) || hasUnsafeCallbackMaterial(text) ||
-    CLI_CREDENTIAL_FLAG.some((pattern) => pattern.test(text)) ||
-    CREDENTIAL_URI.test(text);
+  return credentialViews(text).some((view) => (
+    containsCredentialLikeText(view) || hasUnsafeCallbackMaterial(view) ||
+    CLI_CREDENTIAL_FLAG.some((pattern) => pattern.test(view)) ||
+    CREDENTIAL_URI.test(view)
+  ));
 }
 
 /** True when a bare file name is one that conventionally holds a secret. */

@@ -171,12 +171,30 @@ const TEST_OBJECT = "(?:the\\s+)?(?:[a-z]+\\s+){0,2}tests?\\b";
 /** A question mark ending the part that carries the wording. */
 const QUESTION_SIBLING = /\?\s*$/;
 /**
- * The short confirmations that turn a statement into a question about itself.
- * They are the one thing allowed to carry question scope backwards, because
- * "The tests passed, right?" asks about the assertion — whereas "The tests
- * passed: what should I do next?" asserts it and then asks something else.
+ * The confirmations that turn a statement into a question about itself. They are
+ * the one thing allowed to carry question scope backwards, because "The tests
+ * passed, haven't they?" asks about the assertion — whereas "The tests passed:
+ * what should I do next?" asserts it and then asks something else.
+ *
+ * The auxiliary form is a grammar rather than a list, so ordinary tags do not
+ * have to be enumerated one at a time, but it is still bounded: an auxiliary,
+ * an optional negation, a pronoun, and then the question mark. Anything with a
+ * word after the pronoun — "should I do next?" — is a new question, not a tag.
  */
-const TAG_QUESTION = /^\s*(?:right|correct|ok|okay|yes|no|yeah|isn't it|is it|wasn't it|didn't it|didn't they|weren't they|aren't they|don't you think)\s*\?\s*$/i;
+const TAG_AUXILIARY = "(?:is|are|was|were|do|does|did|has|have|had|will|would|can|could|should|shall|might|must)";
+const TAG_PRONOUN = "(?:i|you|we|they|he|she|it|there)";
+const TAG_QUESTION = new RegExp(
+  `^\\s*(?:` +
+    `(?:right|correct|ok|okay|yes|no|yeah|agreed|don't you think)` +
+    `|${TAG_AUXILIARY}(?:n't|\\s+not)?\\s+${TAG_PRONOUN}` +
+  `)\\s*\\?\\s*$`,
+  "i",
+);
+
+/** Curly apostrophes are the same contraction; the grammar reads one spelling. */
+function normalizedApostrophes(text: string): string {
+  return text.replace(/[\u2018\u2019]/g, "'");
+}
 /**
  * Polarity that belongs to the comma sibling actually carrying the wording. A
  * comma does not let one half of a sentence vouch for the other: "I did not
@@ -467,7 +485,7 @@ function assertionIsSuppressed(clause: string, start: number, end: number): bool
   // question, or the part right after it is a tag confirming that same wording.
   if (overlapping.some((sibling) => QUESTION_SIBLING.test(sibling.text))) return true;
   const last = overlapping.at(-1);
-  return last !== undefined && TAG_QUESTION.test(siblings[last.index + 1]?.text ?? "");
+  return last !== undefined && TAG_QUESTION.test(normalizedApostrophes(siblings[last.index + 1]?.text ?? ""));
 }
 
 /**

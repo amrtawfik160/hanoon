@@ -882,6 +882,11 @@ describe("claim outcome compatibility", () => {
     ["a bare tag question", "The tests passed, right?"],
     ["a confirming tag", "The tests passed, correct?"],
     ["a plural tag", "The tests passed, didn't they?"],
+    ["a perfect-aspect tag", "The tests passed, haven't they?"],
+    ["a first-person tag", "I implemented the fix, didn't I?"],
+    ["a curly-apostrophe tag", "The tests passed, haven\u2019t they?"],
+    ["an affirmative auxiliary tag", "The tests passed, did they?"],
+    ["a modal tag", "The deployment is live, isn't it?"],
     ["a question about the assertion itself", "Did the tests pass?"],
     ["a question in the asserting part", "The tests passed?"],
   ] as const)("still accepts %s", (_scenario, text) => {
