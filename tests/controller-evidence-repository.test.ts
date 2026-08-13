@@ -1,13 +1,18 @@
 import Database from "better-sqlite3";
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import {
   ControllerEvidenceRepository,
   type ControllerNativeEvidenceCandidate,
 } from "../src/storage/controller-evidence-repository";
 import {
+  disposeControllerTrustFixtures,
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 
 function nativeEvidenceCandidate(sourceItemId: string): ControllerNativeEvidenceCandidate {
   return {

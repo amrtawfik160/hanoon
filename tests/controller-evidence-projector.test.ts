@@ -1,4 +1,4 @@
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
 import { sha256ControllerJson } from "../src/controller/capability-executor";
 import {
@@ -9,9 +9,14 @@ import {
 } from "../src/controller/evidence-projector";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "../src/controller/models";
 import {
+  disposeControllerTrustFixtures,
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 
 type CommandItem = Extract<ControllerCompletedNativeItem, { type: "commandExecution" }>;
 type FileItem = Extract<ControllerCompletedNativeItem, { type: "fileChange" }>;

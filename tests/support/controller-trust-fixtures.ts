@@ -8,6 +8,21 @@ import { openStore, type TelegramAgentStore } from "../../src/storage/store";
 import { policyFixture } from "../helpers";
 
 let fixtureNumber = 0;
+type DisposableControllerFixture = Readonly<{ dispose(): Promise<void> }>;
+const activeControllerFixtures = new Set<DisposableControllerFixture>();
+
+export async function disposeControllerTrustFixtures(): Promise<void> {
+  const fixtures = [...activeControllerFixtures];
+  let firstError: unknown;
+  for (const fixture of fixtures) {
+    try {
+      await fixture.dispose();
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError !== undefined) throw firstError;
+}
 
 type SubmittedTurnColumns = Readonly<{
   evidenceEventSeq?: number;
@@ -103,6 +118,18 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
 
   const turn = store.getControllerTurn(queued.id);
   if (!turn) throw new Error("submitted controller turn disappeared");
+  let disposed = false;
+  const dispose = async (): Promise<void> => {
+    if (disposed) return;
+    disposed = true;
+    try {
+      await harness.lifecycle.dispose();
+    } finally {
+      activeControllerFixtures.delete(disposable);
+    }
+  };
+  const disposable = { dispose };
+  activeControllerFixtures.add(disposable);
   return {
     bb,
     harness,
@@ -112,6 +139,7 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
     fence,
     replacementFence,
     reopen: () => openStore(bb.storage, bb.storage.kv, () => 2_000),
+    ...disposable,
   };
 }
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 const assertionIdSchema = z.string().regex(/^[a-z][a-z0-9_]{0,79}$/);
@@ -37,6 +38,25 @@ const assertionListSchema = z.array(assertionIdSchema).max(16).refine(unique, "a
 const layerStatusSchema = z.enum(["passed", "failed", "incomplete", "not_applicable"]);
 const scenarioLayerStatusSchema = z.enum(["passed", "failed", "incomplete"]);
 const proofReferencesSchema = z.array(z.string().min(1).max(256)).max(128).refine(unique, "proof references must be unique");
+const proofFactValueSchema = z.union([
+  z.string().max(160),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+]);
+const evidenceRecordRefSchema = z.string()
+  .regex(/^fact:[a-z0-9]+(?:-[a-z0-9]+)*:(?:outcome|trace|answer):[a-z][a-z0-9_]{0,79}$/)
+  .max(256);
+const controllerScenarioEvidenceRecordSchema = z.object({
+  ref: evidenceRecordRefSchema,
+  subject: scenarioIdSchema,
+  layer: z.enum(["outcome", "trace", "answer"]),
+  assertion: assertionIdSchema,
+  observed: z.boolean(),
+  /** Redacted observations only; raw provider or owner text is never a fact value. */
+  facts: z.record(z.string().min(1).max(64), proofFactValueSchema)
+    .refine((facts) => Object.keys(facts).length <= 48, "evidence facts must remain bounded"),
+}).strict();
 const controllerLayerGradeFieldsSchema = z.object({
   status: layerStatusSchema,
   graderId: graderIdSchema,
@@ -99,6 +119,7 @@ export const controllerScenarioTrialSchema = z.object({
   trace: controllerLayerGradeSchemaFor(scenarioLayerStatusSchema),
   answer: controllerLayerGradeSchema,
   metrics: controllerMetricsSchema,
+  evidenceRecords: z.array(controllerScenarioEvidenceRecordSchema).max(64).optional(),
 }).strict();
 
 const reportStatusSchema = z.enum(["passed", "failed", "incomplete"]);
@@ -171,6 +192,9 @@ export const controllerEvaluationComparisonSchema = z.object({
 }).strict();
 
 export type ControllerScenarioTrial = z.infer<typeof controllerScenarioTrialSchema>;
+export type ControllerScenarioCase = z.infer<typeof controllerScenarioCaseSchema>;
+export type ControllerScenarioCorpus = z.infer<typeof controllerScenarioCorpusSchema>;
+export type ControllerScenarioEvidenceRecord = z.infer<typeof controllerScenarioEvidenceRecordSchema>;
 export type ControllerEvaluationReport = z.infer<typeof controllerEvaluationReportSchema>;
 export type ControllerEvaluationComparison = z.infer<typeof controllerEvaluationComparisonSchema>;
 
@@ -252,6 +276,27 @@ export function parseControllerScenarioTrial(candidate: unknown): ControllerScen
   return controllerScenarioTrialSchema.parse(candidate);
 }
 
+function validateEvidenceRecords(trial: ControllerScenarioTrial): void {
+  const records = trial.evidenceRecords ?? [];
+  const recordsByRef = new Map<string, ControllerScenarioEvidenceRecord>();
+  for (const record of records) {
+    if (recordsByRef.has(record.ref)) throw new Error(`duplicate evidence record ${record.ref}`);
+    if (record.subject !== trial.scenarioId) {
+      throw new Error(`evidence record ${record.ref} is not bound to ${trial.scenarioId}`);
+    }
+    const expectedRef = `fact:${record.subject}:${record.layer}:${record.assertion}`;
+    if (record.ref !== expectedRef) throw new Error(`evidence record ${record.ref} has an invalid subject or assertion binding`);
+    recordsByRef.set(record.ref, record);
+  }
+  for (const layer of [trial.outcome, trial.trace, trial.answer]) {
+    for (const proofRef of layer.proofRefs) {
+      if (proofRef.startsWith("fact:") && !recordsByRef.has(proofRef)) {
+        throw new Error(`proof reference ${proofRef} has no resolvable evidence record`);
+      }
+    }
+  }
+}
+
 /**
  * Validate evidence produced by the current evaluator. Historical reports may
  * still parse with their older proof spelling, but a new fixed trial must bind
@@ -261,6 +306,7 @@ export function validateControllerScenarioTrialEvidence(
   candidate: unknown,
 ): ControllerScenarioTrial {
   const trial = parseControllerScenarioTrial(candidate);
+  validateEvidenceRecords(trial);
   for (const [layerName, layer] of Object.entries({
     outcome: trial.outcome,
     trace: trial.trace,
@@ -337,6 +383,111 @@ function canonicalComparisonValue(comparisonValue: unknown): string {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalComparisonValue(entry)}`)
     .join(",")}}`;
+}
+
+export function controllerScenarioDefinitionSha256(scenarioCase: ControllerScenarioCase): string {
+  return createHash("sha256")
+    .update(canonicalComparisonValue(scenarioCase), "utf8")
+    .digest("hex");
+}
+
+function matchingScenarioDefinitions(
+  trial: ControllerScenarioTrial,
+  corpus: ControllerScenarioCorpus,
+): ControllerScenarioCase[] {
+  return corpus.cases.filter((scenarioCase) => (
+    scenarioCase.id === trial.scenarioId && scenarioCase.scenarioVersion === trial.scenarioVersion
+  ));
+}
+
+function assertCurrentTrialIdentity(trial: ControllerScenarioTrial): void {
+  if (trial.scenarioDefinitionSha256 === undefined) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing scenario definition identity; historical reports may remain incomplete`);
+  }
+  if (trial.harness.outerTaskTools === undefined) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing outer task tool identity; historical reports may remain incomplete`);
+  }
+  if (trial.evidenceRecords === undefined) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing redacted evidence records; historical reports may remain incomplete`);
+  }
+}
+
+function assertCurrentTrialFactReferences(trial: ControllerScenarioTrial): void {
+  for (const [layerName, layer] of Object.entries({
+    outcome: trial.outcome,
+    trace: trial.trace,
+    answer: trial.answer,
+  })) {
+    if (!layer.proofRefs.every((proofRef) => proofRef.startsWith("fact:"))) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} ${layerName} proof references must resolve to redacted evidence facts`);
+    }
+  }
+}
+
+function currentScenarioDefinition(
+  trial: ControllerScenarioTrial,
+  corpus: ControllerScenarioCorpus,
+): ControllerScenarioCase {
+  const matches = matchingScenarioDefinitions(trial, corpus);
+  if (matches.length === 0) {
+    throw new Error(`current trial references an unknown or unsupported scenario version ${trial.scenarioId}:${trial.scenarioVersion}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`current trial references an ambiguous scenario version ${trial.scenarioId}:${trial.scenarioVersion}`);
+  }
+  const scenarioCase = matches[0];
+  if (!scenarioCase) throw new Error(`current trial references an unknown scenario ${trial.scenarioId}:${trial.scenarioVersion}`);
+  if (controllerScenarioDefinitionSha256(scenarioCase) !== trial.scenarioDefinitionSha256) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} has a scenario definition identity mismatch`);
+  }
+  return scenarioCase;
+}
+
+function assertExpectedEvidenceRecords(
+  trial: ControllerScenarioTrial,
+  scenarioCase: ControllerScenarioCase,
+): void {
+  const expectedEvidenceRefs = [
+    ...scenarioCase.requiredOutcomeAssertions.map((assertion) => `fact:${trial.scenarioId}:outcome:${assertion}`),
+    ...scenarioCase.forbiddenOutcomeAssertions.map((assertion) => `fact:${trial.scenarioId}:outcome:${assertion}`),
+    ...scenarioCase.requiredTraceAssertions.map((assertion) => `fact:${trial.scenarioId}:trace:${assertion}`),
+    ...(scenarioCase.answerGrader === "required" ? [`fact:${trial.scenarioId}:answer:answer_grader`] : []),
+  ];
+  const actualEvidenceRefs = new Set(trial.evidenceRecords?.map((record) => record.ref));
+  for (const expectedRef of expectedEvidenceRefs) {
+    if (!actualEvidenceRefs.has(expectedRef)) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing evidence record ${expectedRef}`);
+    }
+  }
+  if (scenarioCase.answerGrader === "required" && trial.answer.status === "not_applicable") {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} cannot relabel a required answer grader as not_applicable`);
+  }
+}
+
+export function validateControllerScenarioTrialAgainstCorpus(
+  candidate: unknown,
+  corpus: ControllerScenarioCorpus,
+): ControllerScenarioTrial {
+  const trial = validateControllerScenarioTrialEvidence(candidate);
+  assertCurrentTrialIdentity(trial);
+  assertCurrentTrialFactReferences(trial);
+  const scenarioCase = currentScenarioDefinition(trial, corpus);
+  assertExpectedEvidenceRecords(trial, scenarioCase);
+  return trial;
+}
+
+export function validateControllerScenarioTrialsAgainstCorpus(
+  candidates: readonly unknown[],
+  corpus: ControllerScenarioCorpus,
+): { trials: ControllerScenarioTrial[]; criticalSafetyFailed: boolean } {
+  const trials = candidates.map((candidate) => validateControllerScenarioTrialAgainstCorpus(candidate, corpus));
+  return {
+    trials,
+    criticalSafetyFailed: trials.some((trial) => {
+      const [scenarioCase] = matchingScenarioDefinitions(trial, corpus);
+      return scenarioCase?.criticalSafety === true && trial.outcome.status === "failed";
+    }),
+  };
 }
 
 function trialSignature(trial: ControllerScenarioTrial): ComparableTrialSignature {

@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process";
-import { chmodSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { expect, it, vi } from "vitest";
 import { aggregateControllerEvaluation } from "../src/eval/controller-scenario-contract";
+import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
+import { composeControllerInstructions } from "../src/controller/instructions";
 import {
   CONTROLLER_ASSERTION_REGISTRY,
   controllerScenarioResourceStats,
@@ -44,6 +47,30 @@ const execFileAsync = promisify(execFile);
 
 function evaluationOutput(): string {
   return join(mkdtempSync(join(tmpdir(), "hanoon-eval-")), "baseline.json");
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function rebindTrialSubject(
+  trial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number],
+  scenarioId: string,
+) {
+  const rebind = (proofRefs: readonly string[]) => proofRefs.map((proofRef) => proofRef.replaceAll(trial.scenarioId, scenarioId));
+  return {
+    ...trial,
+    scenarioId,
+    scenarioDefinitionSha256: "0".repeat(64),
+    outcome: { ...trial.outcome, proofRefs: rebind(trial.outcome.proofRefs) },
+    trace: { ...trial.trace, proofRefs: rebind(trial.trace.proofRefs) },
+    answer: { ...trial.answer, proofRefs: rebind(trial.answer.proofRefs) },
+    evidenceRecords: trial.evidenceRecords?.map((record) => ({
+      ...record,
+      subject: scenarioId,
+      ref: record.ref.replaceAll(trial.scenarioId, scenarioId),
+    })),
+  };
 }
 
 it("writes a bounded fixed-harness report with disclosed denominators", async () => {
@@ -93,7 +120,7 @@ it("seeds downstream completed state without invoking production completion meth
       payload: { text: "independently seeded answer" },
     });
   } finally {
-    await fixture.harness.lifecycle.dispose();
+    await fixture.dispose();
   }
 });
 
@@ -176,22 +203,151 @@ it("records the current job status through the registered controller tool", asyn
   expect(statusTrial?.trace).toMatchObject({
     status: "passed",
     proofRefs: [
-      expect.stringMatching(/^proof:current-job-status:/),
-      expect.stringMatching(/assertion:job_status_capability_observed:true:sha256:[0-9a-f]{64}$/),
+      "fact:current-job-status:trace:job_status_capability_observed",
     ],
   });
 
 });
 
-it("classifies missing fixed identity as strong evidence rather than fixed", async () => {
+it("binds provenance to composed instructions and redacted fact records", async () => {
+  const trials = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const plainTrial = trials.find((trial) => trial.scenarioId === "plain-conversation");
+  if (!plainTrial) throw new Error("plain-conversation trial was not produced");
+  const evidenceRecords = plainTrial.evidenceRecords ?? [];
+
+  expect(plainTrial.harness.instructionSha256).toBe(sha256(composeControllerInstructions(null)));
+  expect(plainTrial.harness.instructionSha256).not.toBe(sha256("fixed-controller-scenario-instruction-v1"));
+  expect(plainTrial.harness.contextSha256).not.toBe(sha256(`${plainTrial.scenarioId}:${plainTrial.trial}:8122026`));
+  expect(evidenceRecords.length).toBeGreaterThan(0);
+  expect(evidenceRecords.every((record) => record.subject === plainTrial.scenarioId)).toBe(true);
+  expect(evidenceRecords.every((record) => Object.keys(record.facts).length > 0)).toBe(true);
+  expect(JSON.stringify(evidenceRecords)).not.toContain("Hello from Hanoon.");
+  expect(plainTrial.outcome.proofRefs.some((proofRef) => /assertion:.*:(?:true|false):/.test(proofRef))).toBe(false);
+  const recordsByRef = new Map(evidenceRecords.map((record) => [record.ref, record]));
+  expect(plainTrial.outcome.proofRefs.filter((proofRef) => proofRef.startsWith("fact:")).every((proofRef) => recordsByRef.has(proofRef))).toBe(true);
+});
+
+it("rejects missing fixed identity rather than labeling it strong", async () => {
   const runner = await runnerModule();
   const [fixedTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
-  expect(runner.classifyControllerEvidence([
+  expect(() => runner.classifyControllerEvidence([
     { ...fixedTrial, scenarioDefinitionSha256: undefined },
-  ])).toBe("strong");
-  expect(runner.classifyControllerEvidence([
+  ])).toThrow(/identity|incomplete/i);
+  expect(() => runner.classifyControllerEvidence([
     { ...fixedTrial, harness: { ...fixedTrial.harness, outerTaskTools: undefined } },
-  ])).toBe("strong");
+  ])).toThrow(/identity|incomplete/i);
+});
+
+it.each([
+  ["unknown scenario id", (trial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => rebindTrialSubject(trial, "unknown-scenario")],
+  ["unknown scenario version", (trial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => ({
+    ...trial,
+    scenarioVersion: 2,
+    scenarioDefinitionSha256: "0".repeat(64),
+  })],
+  ["wrong scenario definition", (trial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => ({
+    ...trial,
+    scenarioDefinitionSha256: "0".repeat(64),
+  })],
+] as const)("rejects %s without replacing the output", async (_label, mutate) => {
+  const runner = await runnerModule();
+  const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const output = evaluationOutput();
+  writeFileSync(output, "keep this report\n", { mode: 0o600 });
+  const cleanTrial = { ...sourceTrial, harness: { ...sourceTrial.harness, dirty: false } };
+
+  await expect(runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: true,
+  }, {
+    readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+    runTrials: async () => [mutate(cleanTrial)],
+  })).rejects.toThrow(/scenario|definition|version/i);
+
+  expect(readFileSync(output, "utf8")).toBe("keep this report\n");
+});
+
+it("rejects a required answer grader relabeled not_applicable before writing", async () => {
+  const runner = await runnerModule();
+  const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const output = evaluationOutput();
+  const invalidTrial = {
+    ...sourceTrial,
+    harness: { ...sourceTrial.harness, dirty: false },
+    answer: { ...sourceTrial.answer, status: "not_applicable" as const, proofRefs: [] },
+  };
+
+  await expect(runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: true,
+  }, {
+    readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+    runTrials: async () => [invalidTrial],
+  })).rejects.toThrow(/answer|not_applicable|required/i);
+
+  expect(existsSync(output)).toBe(false);
+});
+
+it.each([
+  ["scenario definition identity", (trial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => ({
+    ...trial,
+    scenarioDefinitionSha256: undefined,
+  })],
+  ["outer task tool identity", (trial: Awaited<ReturnType<typeof runControllerScenarioTrials>>[number]) => ({
+    ...trial,
+    harness: { ...trial.harness, outerTaskTools: undefined },
+  })],
+] as const)("rejects a current trial missing %s instead of writing strong evidence", async (_label, mutate) => {
+  const runner = await runnerModule();
+  const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const output = evaluationOutput();
+  const cleanTrial = { ...sourceTrial, harness: { ...sourceTrial.harness, dirty: false } };
+
+  await expect(runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: true,
+  }, {
+    readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+    runTrials: async () => [mutate(cleanTrial)],
+  })).rejects.toThrow(/identity|incomplete/i);
+
+  expect(existsSync(output)).toBe(false);
+});
+
+it("rejects self-attesting current proof strings in favor of resolvable facts", async () => {
+  const runner = await runnerModule();
+  const [sourceTrial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const output = evaluationOutput();
+  const invalidTrial = {
+    ...sourceTrial,
+    harness: { ...sourceTrial.harness, dirty: false },
+    outcome: {
+      ...sourceTrial.outcome,
+      proofRefs: [`proof:${sourceTrial.scenarioId}:assertion:controller_turn_completed:false`],
+    },
+  };
+
+  await expect(runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: true,
+  }, {
+    readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+    runTrials: async () => [invalidTrial],
+  })).rejects.toThrow(/fact|evidence|proof/i);
+
+  expect(existsSync(output)).toBe(false);
 });
 
 it("fails closed when the corpus adds an unknown or decorative assertion", () => {
@@ -206,7 +362,9 @@ it("fails closed when the corpus adds an unknown or decorative assertion", () =>
 
 it("fails before writing when the current identity or trial is dirty", async () => {
   const runner = await runnerModule();
-  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const trial = (await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 }))
+    .find((candidate) => candidate.scenarioId === "process-only-finalization");
+  if (!trial) throw new Error("process-only-finalization trial was not produced");
   const output = evaluationOutput();
   await expect(runner.evaluateControllerOutcomes({
     checkpoint: "baseline",
@@ -233,7 +391,7 @@ it("preserves the process-only recovery send in durable assertion evidence", asy
 
   expect(processOnlyTrial?.trace.status).toBe("passed");
   expect(processOnlyTrial?.trace.proofRefs).toContainEqual(
-    expect.stringMatching(/assertion:recovery_prompt_sent:true:sha256:[0-9a-f]{64}$/),
+    "fact:process-only-finalization:trace:recovery_prompt_sent",
   );
 });
 
@@ -244,6 +402,30 @@ it("disposes every repeated scenario resource, including restart scenarios", asy
   expect(after.created - before.created).toBe(18);
   expect(after.disposed - before.disposed).toBe(18);
   expect(after.active).toBe(0);
+});
+
+it("uses a real fake-host lifecycle reload for restart-after-owner-tap", async () => {
+  const before = controllerScenarioResourceStats() as Readonly<{ lifecycleReloads?: number }>;
+  const trials = await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 });
+  const after = controllerScenarioResourceStats() as Readonly<{ lifecycleReloads?: number }>;
+  const restartTrial = trials.find((trial) => trial.scenarioId === "restart-after-owner-tap");
+  const restartEvidenceRecords = restartTrial?.evidenceRecords ?? [];
+
+  expect(after.lifecycleReloads).toBe((before.lifecycleReloads ?? 0) + 1);
+  expect(restartTrial?.outcome.status).toBe("passed");
+  expect(restartTrial?.trace.status).toBe("passed");
+  expect(restartEvidenceRecords.some((record) => (
+    record.assertion === "service_reopened_before_resolution" && record.facts.lifecycleHostsChanged === true
+  ))).toBe(true);
+});
+
+it("requires an explicit cleanup contract on shared controller trust fixtures", async () => {
+  const fixture = submittedControllerFixture();
+  try {
+    expect(typeof (fixture as unknown as { dispose?: unknown }).dispose).toBe("function");
+  } finally {
+    await fixture.dispose();
+  }
 });
 
 it("disposes the current resource when trial construction throws", async () => {
@@ -272,6 +454,9 @@ it("discloses the registered controller tool surface deterministically", async (
   const firstSurface = firstRun[0]?.harness;
 
   expect(firstStatusTrial?.harness.advertisedTools).toContain("telegram_agent_job_status");
+  expect(firstStatusTrial?.harness.advertisedTools).toEqual([...CONTROLLER_TOOL_NAMES].sort());
+  expect(Object.keys(firstStatusTrial?.harness.parameterSchemaSha256 ?? {}).sort())
+    .toEqual([...CONTROLLER_TOOL_NAMES].sort());
   expect(firstStatusTrial?.harness.parameterSchemaSha256.telegram_agent_job_status)
     .toMatch(/^[0-9a-f]{64}$/);
   expect(firstStatusTrial?.harness.capabilityManifestSha256)
@@ -319,7 +504,9 @@ it("labels fixed-scenario identity variation as strong evidence", async () => {
 it("returns a nonzero evaluation result for an injected critical-safety outcome failure", async () => {
   const runner = await runnerModule();
 
-  const [trial] = await runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 });
+  const trial = (await runControllerScenarioTrials({ checkpoint: "cutover", trials: 1, seed: 8122026 }))
+    .find((candidate) => candidate.scenarioId === "process-only-finalization");
+  if (!trial) throw new Error("process-only-finalization trial was not produced");
   const output = evaluationOutput();
   const evaluation = await runner.evaluateControllerOutcomes({
     checkpoint: "baseline",
@@ -331,19 +518,8 @@ it("returns a nonzero evaluation result for an injected critical-safety outcome 
     readGitIdentity: () => ({ commit: "a".repeat(40), dirty: false }),
     runTrials: async () => [{
       ...trial,
-      scenarioId: "process-only-finalization",
       harness: { ...trial.harness, dirty: false, hanoonCommit: "a".repeat(40) },
       outcome: { ...trial.outcome, status: "failed" as const },
-      trace: {
-        ...trial.trace,
-        proofRefs: trial.trace.proofRefs.map((_, index) =>
-          `proof:process-only-finalization:injected-trace-${index}`),
-      },
-      answer: {
-        ...trial.answer,
-        proofRefs: trial.answer.proofRefs.map((_, index) =>
-          `proof:process-only-finalization:injected-answer-${index}`),
-      },
     }],
   });
 
@@ -447,8 +623,8 @@ it("requires stale approval settlement denial and zero-effect proof in the fixed
   expect(staleTrial.outcome.status).toBe("passed");
   expect(staleTrial.trace.status).toBe("passed");
   expect(staleTrial.outcome.proofRefs).toEqual(expect.arrayContaining([
-    expect.stringMatching(/assertion:stale_approval_denied:true:/),
-    expect.stringMatching(/assertion:stale_approval_no_effect:true:/),
+    "fact:stale-capability-fence:outcome:stale_approval_denied",
+    "fact:stale-capability-fence:outcome:stale_approval_no_effect",
   ]));
 });
 

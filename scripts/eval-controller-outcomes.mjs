@@ -142,7 +142,7 @@ export function classifyControllerEvidence(trials) {
   const identityIncomplete = trials.some((trial) => (
     trial.scenarioDefinitionSha256 === undefined || trial.harness.outerTaskTools === undefined
   ));
-  if (identityIncomplete) return "strong";
+  if (identityIncomplete) throw new Error("current evaluation identity is incomplete; refusing to label it strong");
   const nonFixedTrials = trials.filter((trial) => (
     trial.harness.provider !== "fake-bb" || trial.harness.model !== "scripted-controller"
   )).length;
@@ -183,9 +183,9 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     if (priorDirty === undefined) delete process.env.HANOON_EVAL_DIRTY;
     else process.env.HANOON_EVAL_DIRTY = priorDirty;
   }
-  const validatedTrials = trials
-    .map(contract.validateControllerScenarioTrialEvidence)
-    .map(contract.validateControllerScenarioTrialBudget);
+  const scenarioCorpus = harness.loadControllerScenarioCorpus();
+  const currentValidation = contract.validateControllerScenarioTrialsAgainstCorpus(trials, scenarioCorpus);
+  const validatedTrials = currentValidation.trials.map(contract.validateControllerScenarioTrialBudget);
   assertCurrentEvaluationIdentity(validatedTrials, identity);
   const baseReport = contract.aggregateControllerEvaluation({
     label: classifyControllerEvidence(validatedTrials),
@@ -195,7 +195,7 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     ? contract.compareControllerEvaluations({
         baseline,
         after: baseReport,
-        scenarioDefinitions: harness.loadControllerScenarioCorpus().cases.map((scenarioCase) => ({
+        scenarioDefinitions: scenarioCorpus.cases.map((scenarioCase) => ({
           id: scenarioCase.id,
           scenarioVersion: scenarioCase.scenarioVersion,
           criticalSafety: scenarioCase.criticalSafety,
@@ -207,15 +207,7 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     : baseReport;
   contract.controllerEvaluationReportSchema.parse(report);
   writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace);
-  const scenarios = new Map(harness.loadControllerScenarioCorpus().cases.map((scenarioCase) => [
-    scenarioCase.id,
-    scenarioCase,
-  ]));
-  const criticalSafetyFailed = validatedTrials.some((trial) => {
-    const scenarioCase = scenarios.get(trial.scenarioId);
-    if (!scenarioCase) throw new Error(`trial references an unknown scenario ${trial.scenarioId}`);
-    return scenarioCase.criticalSafety && trial.outcome.status === "failed";
-  });
+  const criticalSafetyFailed = currentValidation.criticalSafetyFailed;
   return {
     report,
     criticalSafetyFailed,

@@ -1,14 +1,21 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { afterAll, expect, it, vi } from "vitest";
+import { afterAll, afterEach, expect, it, vi } from "vitest";
 import plugin from "../server";
 import { controllerSpawnTitle } from "../src/controller/bb-controller";
 import { ExecutorNudge } from "../src/services/executor-nudge";
 import type { TelegramUpdate } from "../src/telegram/types";
 import { openStore, type StoredOutbox } from "../src/storage/store";
 import { policyFixture } from "./helpers";
-import { submittedControllerFixture } from "./support/controller-trust-fixtures";
+import {
+  disposeControllerTrustFixtures,
+  submittedControllerFixture,
+} from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 
 const NOW = 2_000;
 const RECOVERY_PROMPT = "Inspect telegram_agent_turn_evidence and call telegram_agent_respond with the evidence already available.";

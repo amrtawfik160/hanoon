@@ -4,14 +4,19 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import { ControllerEvidenceRepository } from "../src/storage/controller-evidence-repository";
 import { openStore } from "../src/storage/store";
 import {
+  disposeControllerTrustFixtures,
   insertControllerTestJob,
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 
 type RaceWorker = Readonly<{
   child: ChildProcessWithoutNullStreams;

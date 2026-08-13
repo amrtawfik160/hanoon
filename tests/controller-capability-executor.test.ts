@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   canonicalControllerJson,
   ControllerCapabilityExecutionError,
@@ -11,10 +11,15 @@ import {
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
 import { registerControllerTools, verifiedPipelineOutcome } from "../src/controller/tools";
 import {
+  disposeControllerTrustFixtures,
   registeredControllerFixture,
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 import { policyFixture } from "./helpers";
 import { EffectRunner } from "../src/services/effect-runner";
 import { runProductionStage } from "../src/services/production-runner";
