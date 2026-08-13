@@ -8,6 +8,7 @@ import { CONTROLLER_STALL_MS, LunaControllerService } from "../src/controller/se
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
 import {
   questionOptionToken,
+  renderQuestion,
   renderControllerInteraction,
 } from "../src/controller/questions";
 
@@ -54,7 +55,7 @@ function lifecycleEvent(seq: number, status: string) {
 function adapterFixture(options: { events?: unknown[] } = {}) {
   const resolve = vi.fn(async () => ({ id: INTERACTION_ID, status: "resolving" }));
   const send = vi.fn(async () => ({ ok: true }));
-  const eventsList = vi.fn(async () => options.events ?? []);
+  const eventsList = vi.fn(async (_input?: { afterSeq?: string }) => options.events ?? []);
   const sdk = {
     projects: { list: vi.fn(async () => []) },
     hosts: { list: vi.fn(async () => []) },
@@ -137,6 +138,45 @@ it("emits bounded references for both question and permission lifecycles without
   });
 });
 
+it("does not advance the lifecycle cursor past the omitted 257th reference", async () => {
+  const references = Array.from({ length: 257 }, (_, index) => {
+    const event = lifecycleEvent(index + 1, "pending");
+    return {
+      ...event,
+      data: { ...event.data, interactionId: `interaction-${index + 1}` },
+    };
+  });
+  const events = [
+    ...references.slice(0, 256),
+    { id: "accepted", threadId: "thr_controller", seq: 257, createdAt: 257, scope: { kind: "turn" }, type: "turn/input/accepted", data: {} },
+    references[256]!,
+    { id: "tool", threadId: "thr_controller", seq: 259, createdAt: 259, scope: { kind: "turn" }, type: "item/started", data: { item: { type: "commandExecution" } } },
+    { id: "tokens", threadId: "thr_controller", seq: 260, createdAt: 260, scope: { kind: "turn" }, type: "thread/tokenUsage/updated", data: { tokenUsage: { total: { totalTokens: 42 } } } },
+    { id: "error", threadId: "thr_controller", seq: 261, createdAt: 261, scope: { kind: "turn" }, type: "system/error", data: {} },
+  ];
+  const { adapter, eventsList } = adapterFixture({ events });
+  eventsList.mockImplementation(async (input?: { afterSeq?: string }) =>
+    input?.afterSeq === "0" ? events : events.slice(257),
+  );
+
+  const first = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
+  expect(first.interactionReferences).toHaveLength(256);
+  expect(first.latestSeq).toBe(257);
+  expect(first.inputAccepted).toBe(true);
+  expect(first.toolActivityObserved).toBe(false);
+  expect(first.totalTokens).toBe(0);
+  expect(first.error).toBeNull();
+
+  const second = await adapter.events("thr_controller", first.latestSeq, AbortSignal.timeout(1_000));
+  expect(second.interactionReferences).toEqual([
+    { interactionId: "interaction-257", kind: "user_question", status: "pending" },
+  ]);
+  expect(second.latestSeq).toBe(261);
+  expect(second.toolActivityObserved).toBe(true);
+  expect(second.totalTokens).toBe(42);
+  expect(second.error).toBe("Controller provider turn failed");
+});
+
 it("retains a lifecycle reference even when its inline payload is not answerable", async () => {
   const bare = lifecycleEvent(5, "pending");
   const { adapter } = adapterFixture({
@@ -172,6 +212,18 @@ it("answers a pending question through the BB interaction resolution", async () 
   });
 });
 
+it("rejects session-wide approval resolutions at the SDK boundary", async () => {
+  const { adapter, resolve } = adapterFixture();
+
+  await expect(adapter.resolveInteraction(
+    "thr_controller",
+    INTERACTION_ID,
+    { decision: "allow_for_session", grantedPermissions: null } as never,
+    AbortSignal.timeout(1_000),
+  )).rejects.toThrow();
+  expect(resolve).not.toHaveBeenCalled();
+});
+
 it("steers a busy controller thread instead of starting a competing turn", async () => {
   const { adapter, send } = adapterFixture();
 
@@ -190,6 +242,14 @@ it("derives a stable, callback-sized token for each question option", () => {
   expect(token).toBe(questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_A));
   expect(token).not.toBe(questionOptionToken(INTERACTION_ID, QUESTION_ID, OPTION_B));
   expect(token).toMatch(/^[A-Za-z0-9_-]{32}$/);
+});
+
+it("rejects a question writer outside the explicit controller namespaces", () => {
+  expect(() => renderQuestion(
+    INTERACTION_ID,
+    questionPayload().questions[0]!,
+    "q" as never,
+  )).toThrow();
 });
 
 it("renders controller questions, approvals, and unsupported interactions with the controller callback namespace", () => {

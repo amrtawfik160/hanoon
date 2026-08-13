@@ -27,7 +27,7 @@ import {
   renderJobChoices,
   renderJobStatus,
   renderJobStatusSummary,
-  type CallbackAction,
+  type ParsedCallbackAction,
 } from "./view";
 import { TelegramRequestError } from "./client";
 import { TelegramApiError } from "./errors";
@@ -117,7 +117,7 @@ function boundedText(value: string): string | null {
   return text.length > 0 && text.length <= MAX_TASK_TEXT ? text : null;
 }
 
-function callbackJobId(action: CallbackAction): string | null {
+function callbackJobId(action: ParsedCallbackAction): string | null {
   return "jobId" in action ? action.jobId : null;
 }
 
@@ -391,7 +391,7 @@ export class TelegramIngress {
       return;
     }
 
-    let action: CallbackAction;
+    let action: ParsedCallbackAction;
     try {
       action = parseCallbackData(callback.data ?? "");
     } catch {

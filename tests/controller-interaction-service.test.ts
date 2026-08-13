@@ -26,12 +26,22 @@ class LeaseLossRepository extends ControllerInteractionRepository {
     super(database);
   }
 
-  public override isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean {
+  public override isControllerInteractionDeliveryFenceCurrent(
+    input: Parameters<ControllerInteractionRepository["isControllerInteractionDeliveryFenceCurrent"]>[0],
+  ): boolean {
     this.calls += 1;
     if (this.calls === this.loseOnCall) {
       this.database.prepare("UPDATE executor_lease SET owner_id = 'successor', generation = 2 WHERE singleton = 1").run();
     }
-    return super.isExecutorLeaseCurrent(ownerId, generation, now);
+    return super.isControllerInteractionDeliveryFenceCurrent(input);
+  }
+}
+
+class DeliveryFenceRejectRepository extends ControllerInteractionRepository {
+  public override isControllerInteractionDeliveryFenceCurrent(
+    _input: Parameters<ControllerInteractionRepository["isControllerInteractionDeliveryFenceCurrent"]>[0],
+  ): boolean {
+    return false;
   }
 }
 
@@ -117,6 +127,7 @@ function setup() {
         resolve,
         service: new ControllerInteractionService({
           store: repository,
+          clock: { now: () => FENCE.now },
           interactions: { get, resolve },
         }),
       };
@@ -153,7 +164,11 @@ it("gets the exact pending interaction before resolving and marks it delivered a
     return current;
   });
   const get = vi.fn(async () => current);
-  const service = new ControllerInteractionService({ store: fixture.repository, interactions: { get, resolve } });
+  const service = new ControllerInteractionService({
+    store: fixture.repository,
+    clock: { now: () => FENCE.now },
+    interactions: { get, resolve },
+  });
 
   await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(true);
   expect(get).toHaveBeenCalledWith(fixture.threadId, fixture.interaction.interactionId, expect.any(AbortSignal));
@@ -217,6 +232,56 @@ it("does not contact BB from a stale executor fence", async () => {
   fixture.close();
 });
 
+it("does not contact BB when the exact delivery fence is rejected", async () => {
+  const fixture = setup();
+  const { get, resolve } = fixture.service(remote(fixture, "pending"));
+  const repository = new DeliveryFenceRejectRepository(fixture.db);
+  const service = new ControllerInteractionService({
+    store: repository,
+    clock: { now: () => FENCE.now },
+    interactions: { get, resolve },
+  });
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
+  expect(get).not.toHaveBeenCalled();
+  expect(resolve).not.toHaveBeenCalled();
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).not.toBeNull();
+  fixture.close();
+});
+
+it("does not contact BB when the delivery signal is already aborted", async () => {
+  const fixture = setup();
+  const { get, resolve, service } = fixture.service(remote(fixture, "pending"));
+  const controller = new AbortController();
+  controller.abort();
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, controller.signal)).resolves.toBe(false);
+  expect(get).not.toHaveBeenCalled();
+  expect(resolve).not.toHaveBeenCalled();
+  fixture.close();
+});
+
+it("does not resolve after the delivery signal aborts during the authoritative get", async () => {
+  const fixture = setup();
+  const controller = new AbortController();
+  const get = vi.fn(async () => {
+    controller.abort();
+    return remote(fixture, "pending");
+  });
+  const resolve = vi.fn(async () => remote(fixture, "resolved"));
+  const service = new ControllerInteractionService({
+    store: fixture.repository,
+    clock: { now: () => FENCE.now },
+    interactions: { get, resolve },
+  });
+
+  await expect(service.deliverAnswered(fixture.controllerKey, FENCE, controller.signal)).resolves.toBe(false);
+  expect(get).toHaveBeenCalledTimes(1);
+  expect(resolve).not.toHaveBeenCalled();
+  expect(fixture.repository.getAnswered(fixture.controllerKey)).not.toBeNull();
+  fixture.close();
+});
+
 it("fails closed when the fence is lost immediately before authoritative resolve", async () => {
   const fixture = setup();
   let current = remote(fixture, "pending");
@@ -225,8 +290,12 @@ it("fails closed when the fence is lost immediately before authoritative resolve
     return current;
   });
   const get = vi.fn(async () => current);
-  const repository = new LeaseLossRepository(fixture.db, 3);
-  const service = new ControllerInteractionService({ store: repository, interactions: { get, resolve } });
+  const repository = new LeaseLossRepository(fixture.db, 2);
+  const service = new ControllerInteractionService({
+    store: repository,
+    clock: { now: () => FENCE.now },
+    interactions: { get, resolve },
+  });
 
   await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
   expect(resolve).not.toHaveBeenCalled();
@@ -238,7 +307,11 @@ it("fails closed when the fence is lost at the repository mark-delivered transit
   const fixture = setup();
   const { get, resolve } = fixture.service(remote(fixture, "resolved"));
   const repository = new TransitionFenceLossRepository(fixture.db, fixture.turnId);
-  const service = new ControllerInteractionService({ store: repository, interactions: { get, resolve } });
+  const service = new ControllerInteractionService({
+    store: repository,
+    clock: { now: () => FENCE.now },
+    interactions: { get, resolve },
+  });
 
   await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
   expect(resolve).not.toHaveBeenCalled();
@@ -263,6 +336,7 @@ it("keeps an ambiguous resolve available for an authoritative retry", async () =
   const secondResolve = vi.fn(async () => current);
   const secondService = new ControllerInteractionService({
     store: fixture.repository,
+    clock: { now: () => FENCE.now },
     interactions: { get: secondGet, resolve: secondResolve },
   });
   await expect(secondService.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(true);
@@ -283,7 +357,11 @@ it("recovers the durable answer after a real database close and reopen", async (
   const repository = new ControllerInteractionRepository(reopened);
   const get = vi.fn(async () => remote(fixture, "resolved"));
   const resolve = vi.fn(async () => remote(fixture, "resolved"));
-  const service = new ControllerInteractionService({ store: repository, interactions: { get, resolve } });
+  const service = new ControllerInteractionService({
+    store: repository,
+    clock: { now: () => FENCE.now },
+    interactions: { get, resolve },
+  });
 
   await expect(service.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(true);
   expect(get).toHaveBeenCalledTimes(1);
@@ -305,6 +383,7 @@ it("does not resolve twice after a crash between BB resolution and local deliver
   const firstGet = vi.fn(async () => current);
   const firstService = new ControllerInteractionService({
     store: fixture.repository,
+    clock: { now: () => FENCE.now },
     interactions: { get: firstGet, resolve },
   });
   await expect(firstService.deliverAnswered(fixture.controllerKey, FENCE, AbortSignal.timeout(1_000))).resolves.toBe(false);
@@ -314,6 +393,7 @@ it("does not resolve twice after a crash between BB resolution and local deliver
   const secondGet = vi.fn(async () => current);
   const secondService = new ControllerInteractionService({
     store: fixture.repository,
+    clock: { now: () => successorFence.now },
     interactions: { get: secondGet, resolve },
   });
   await expect(secondService.deliverAnswered(fixture.controllerKey, successorFence, AbortSignal.timeout(1_000))).resolves.toBe(true);

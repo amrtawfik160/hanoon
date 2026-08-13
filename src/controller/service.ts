@@ -2,6 +2,7 @@ import type { TelegramAgentStore } from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
 import {
   ControllerImagePreparationError,
+  parseControllerInteractionResolution,
   type ControllerInteractionReference,
   type ControllerInteractionSnapshot,
   type ControllerAdapter,
@@ -264,7 +265,7 @@ export class LunaControllerService {
         ...normalizeControllerEventObservation(rawObservation),
         interactionReferences: rawObservation.interactionReferences ?? [],
       };
-      if (!Number.isSafeInteger(observation.latestSeq) || observation.latestSeq < turn.bbEventSeq) return true;
+      if (!Number.isSafeInteger(observation.latestSeq)) return true;
       const projected = projectControllerStream(observation, {
         cursor: turn.bbEventSeq,
         text: turn.streamText,
@@ -464,10 +465,11 @@ export class LunaControllerService {
         !this.providerMutationAllowed(turn, controller, fence, signal)) return;
     try {
       if (this.dependencies.adapter.resolveInteraction) {
+        const resolution = parseControllerInteractionResolution(ownerAnswer.resolution);
         await this.dependencies.adapter.resolveInteraction(
           controller.threadId,
           ownerAnswer.interactionId,
-          ownerAnswer.resolution,
+          resolution,
           signal,
         );
       } else if (ownerAnswer.interaction.kind === "user_question") {

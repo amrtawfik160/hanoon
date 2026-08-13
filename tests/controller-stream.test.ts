@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectControllerStream } from "../src/controller/stream";
+import { normalizeControllerEventObservation, projectControllerStream } from "../src/controller/stream";
 import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 
 describe("controller stream projection", () => {
@@ -23,7 +23,7 @@ describe("controller stream projection", () => {
       toolActivityObserved: false,
       completed: false,
       error: null,
-      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 10,
       text: "",
@@ -45,7 +45,7 @@ describe("controller stream projection", () => {
       toolActivityObserved: false,
       completed: false,
       error: null,
-      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 13,
       text: "Hello world",
@@ -67,7 +67,7 @@ describe("controller stream projection", () => {
       toolActivityObserved: true,
       completed: false,
       error: null,
-      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 0,
       text: "",
@@ -78,6 +78,23 @@ describe("controller stream projection", () => {
       cursor: 2,
       text: "Hanoon is using tools…",
       phase: "using_tools",
+    });
+  });
+
+  it("preserves bounded interaction references during live normalization", () => {
+    expect(normalizeControllerEventObservation({
+      latestSeq: 4,
+      inputAccepted: true,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      interactionReferences: [{ interactionId: "interaction-1", kind: "approval", status: "pending" }],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })).toMatchObject({
+      interactionReferences: [{ interactionId: "interaction-1", kind: "approval", status: "pending" }],
     });
   });
 });

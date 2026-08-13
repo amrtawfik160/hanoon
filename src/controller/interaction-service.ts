@@ -1,6 +1,7 @@
 import type { ControllerLeaseFence } from "./models";
 import {
   type ControllerInteractionDelivery,
+  type ControllerInteractionDeliveryFence,
   type ControllerInteractionStore,
 } from "../storage/controller-interaction-repository";
 
@@ -27,19 +28,22 @@ type ControllerInteractionApi = Readonly<{
 }>;
 
 type FencedInteractionStore = ControllerInteractionStore & Readonly<{
-  isExecutorLeaseCurrent: (ownerId: string, generation: number, now: number) => boolean;
+  isControllerInteractionDeliveryFenceCurrent: (input: ControllerInteractionDeliveryFence) => boolean;
 }>;
 
 export class ControllerInteractionService {
   private readonly store: FencedInteractionStore;
   private readonly interactions: ControllerInteractionApi;
+  private readonly clock: { now(): number };
 
   public constructor(input: {
     store: FencedInteractionStore;
     interactions: ControllerInteractionApi;
+    clock: { now(): number };
   }) {
     this.store = input.store;
     this.interactions = input.interactions;
+    this.clock = input.clock;
   }
 
   /**
@@ -52,18 +56,18 @@ export class ControllerInteractionService {
     fence: ControllerLeaseFence,
     signal?: AbortSignal,
   ): Promise<boolean> {
-    if (!this.fenceIsCurrent(fence)) return false;
+    if (this.isAborted(signal)) return false;
     const answered = this.store.getAnswered(controllerKey);
-    if (!answered || !this.fenceIsCurrent(fence)) return false;
+    if (!answered || this.isAborted(signal) || !this.fenceIsCurrent(answered, fence, signal)) return false;
 
     const observed = await this.authoritativeGet(answered, signal);
-    if (!observed || !this.fenceIsCurrent(fence)) return false;
+    if (!observed || this.isAborted(signal)) return false;
 
     if (this.isTerminal(observed)) {
-      return this.markDelivered(answered, fence);
+      return this.markDelivered(answered, fence, signal);
     }
     if (observed.status !== "pending") return false;
-    if (!this.fenceIsCurrent(fence)) return false;
+    if (!this.fenceIsCurrent(answered, fence, signal)) return false;
 
     let resolved: ControllerInteractionRemote | null;
     try {
@@ -78,7 +82,7 @@ export class ControllerInteractionService {
       return false;
     }
     if (!resolved || !this.matches(answered, resolved) || !this.isTerminal(resolved)) return false;
-    return this.markDelivered(answered, fence);
+    return this.markDelivered(answered, fence, signal);
   }
 
   private async authoritativeGet(
@@ -97,8 +101,9 @@ export class ControllerInteractionService {
   private markDelivered(
     answered: ControllerInteractionDelivery,
     fence: ControllerLeaseFence,
+    signal?: AbortSignal,
   ): boolean {
-    if (!this.fenceIsCurrent(fence)) return false;
+    if (this.isAborted(signal) || !this.fenceIsCurrent(answered, fence, signal)) return false;
     return this.store.markDelivered({
       ...fence,
       interactionId: answered.interactionId,
@@ -107,8 +112,29 @@ export class ControllerInteractionService {
     });
   }
 
-  private fenceIsCurrent(fence: ControllerLeaseFence): boolean {
-    return this.store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, fence.now);
+  private fenceIsCurrent(
+    answered: ControllerInteractionDelivery,
+    fence: ControllerLeaseFence,
+    signal?: AbortSignal,
+  ): boolean {
+    if (this.isAborted(signal)) return false;
+    try {
+      return this.store.isControllerInteractionDeliveryFenceCurrent({
+        ...fence,
+        now: this.clock.now(),
+        interactionId: answered.interactionId,
+        turnId: answered.turnId,
+        controllerKey: answered.controllerKey,
+        bbThreadId: answered.bbThreadId,
+        controllerGenerationId: answered.controllerGenerationId,
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private isAborted(signal?: AbortSignal): boolean {
+    return signal?.aborted === true;
   }
 
   private matches(

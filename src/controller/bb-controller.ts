@@ -45,8 +45,6 @@ export type ControllerEventObservation = {
   error: string | null;
   /** Bounded lifecycle references; BB interaction payloads are never event authority. */
   interactionReferences?: readonly ControllerInteractionReference[];
-  /** Legacy fixture-only field; live adapters never populate it or parse it. */
-  pendingQuestion?: unknown;
   /** Tool-shaped item starts in this window; the caller accumulates them. */
   toolCalls: number;
   /** Non-zero command exits in this window; the caller accumulates them. */
@@ -93,7 +91,7 @@ type ControllerAdapterMethods = {
   resolveInteraction?(
     threadId: string,
     interactionId: string,
-    resolution: Record<string, unknown>,
+    resolution: ControllerInteractionResolution,
     signal: AbortSignal,
   ): Promise<void>;
   status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
@@ -121,12 +119,123 @@ const TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
 
 type BbSdk = BbPluginApi["sdk"];
 type ControllerPromptInput = Parameters<BbSdk["threads"]["send"]>[0]["input"];
+type ControllerEventRow = Awaited<ReturnType<BbSdk["threads"]["events"]["list"]>>[number];
+
+type ControllerGrantedPermissions = {
+  network: { enabled: boolean | null } | null;
+  fileSystem: { read: string[]; write: string[] } | null;
+};
+
+export type ControllerInteractionResolution =
+  | { decision: "allow_once"; grantedPermissions: ControllerGrantedPermissions | null }
+  | { decision: "deny" }
+  | { kind: "user_answer"; answers: ControllerQuestionAnswers };
+
+type LifecycleReferenceCandidate = Readonly<{
+  key: string;
+  interactionId: string;
+  kind: ControllerInteractionReference["kind"];
+  status: ControllerInteractionReference["status"];
+}>;
 
 export class ControllerImagePreparationError extends Error {
   public constructor(public readonly retryable: boolean) {
     super("Controller image could not be prepared");
     this.name = "ControllerImagePreparationError";
   }
+}
+
+function isRecord(candidate: unknown): candidate is Record<string, unknown> {
+  return typeof candidate === "object" && candidate !== null && !Array.isArray(candidate);
+}
+
+function boundedStringList(rawList: unknown, field: string): string[] {
+  if (!Array.isArray(rawList) || rawList.length > 64) {
+    throw new TypeError(`${field} is invalid`);
+  }
+  const strings: string[] = [];
+  for (const entry of rawList) {
+    if (typeof entry !== "string" || entry.length > 4_000) throw new TypeError(`${field} is invalid`);
+    strings.push(entry);
+  }
+  return strings;
+}
+
+function nullableGrantedPermissions(candidate: unknown): ControllerGrantedPermissions | null {
+  if (candidate === null) return null;
+  if (!isRecord(candidate)) throw new TypeError("grantedPermissions is invalid");
+  const networkValue = candidate.network;
+  const fileSystemValue = candidate.fileSystem;
+  let network: ControllerGrantedPermissions["network"] = null;
+  if (networkValue !== null) {
+    if (!isRecord(networkValue)) throw new TypeError("grantedPermissions.network is invalid");
+    const networkEnabled = networkValue.enabled;
+    if (networkEnabled !== null && typeof networkEnabled !== "boolean") {
+      throw new TypeError("grantedPermissions.network is invalid");
+    }
+    network = { enabled: networkEnabled };
+  }
+  let fileSystem: ControllerGrantedPermissions["fileSystem"] = null;
+  if (fileSystemValue !== null) {
+    if (!isRecord(fileSystemValue)) throw new TypeError("grantedPermissions.fileSystem is invalid");
+    fileSystem = {
+      read: boundedStringList(fileSystemValue.read, "grantedPermissions.fileSystem.read"),
+      write: boundedStringList(fileSystemValue.write, "grantedPermissions.fileSystem.write"),
+    };
+  }
+  return { network, fileSystem };
+}
+
+function parseUserAnswerResolution(rawAnswers: Record<string, unknown>): ControllerQuestionAnswers {
+  if (Object.keys(rawAnswers).length > 64) throw new TypeError("controller interaction has too many answers");
+  const answers: ControllerQuestionAnswers = {};
+  for (const [questionId, rawAnswer] of Object.entries(rawAnswers)) {
+    if (questionId.length === 0 || questionId.length > 256 ||
+        ["__proto__", "constructor", "prototype"].includes(questionId) || !isRecord(rawAnswer)) {
+      throw new TypeError("controller interaction answer is invalid");
+    }
+    const answer: ControllerQuestionAnswers[string] = {
+      selected: boundedStringList(rawAnswer.selected, "controller interaction answer.selected"),
+    };
+    if (Object.hasOwn(rawAnswer, "freeText")) {
+      if (typeof rawAnswer.freeText !== "string" || rawAnswer.freeText.length > 4_000) {
+        throw new TypeError("controller interaction answer.freeText is invalid");
+      }
+      answer.freeText = rawAnswer.freeText;
+    }
+    answers[questionId] = answer;
+  }
+  return answers;
+}
+
+function lifecycleReferenceCandidate(row: ControllerEventRow): LifecycleReferenceCandidate | null {
+  if (row.type !== "system/userQuestion/lifecycle" && row.type !== "system/permissionGrant/lifecycle") return null;
+  const lifecyclePayload = row.data as { interactionId?: unknown; status?: unknown };
+  if (typeof lifecyclePayload.interactionId !== "string" || lifecyclePayload.interactionId.length === 0 ||
+      lifecyclePayload.interactionId.length > 256) return null;
+  if (lifecyclePayload.status !== "pending" && lifecyclePayload.status !== "resolved" &&
+      lifecyclePayload.status !== "interrupted") return null;
+  const kind = row.type === "system/userQuestion/lifecycle" ? "user_question" : "approval";
+  return {
+    key: `${kind}:${lifecyclePayload.interactionId}`,
+    interactionId: lifecyclePayload.interactionId,
+    kind,
+    status: lifecyclePayload.status,
+  };
+}
+
+export function parseControllerInteractionResolution(
+  candidate: Record<string, unknown>,
+): ControllerInteractionResolution {
+  if (candidate.decision === "deny") return { decision: "deny" };
+  if (candidate.decision === "allow_once") {
+    if (!Object.hasOwn(candidate, "grantedPermissions")) throw new TypeError("grantedPermissions is required");
+    return { decision: "allow_once", grantedPermissions: nullableGrantedPermissions(candidate.grantedPermissions) };
+  }
+  if (candidate.kind !== "user_answer" || !isRecord(candidate.answers)) {
+    throw new TypeError("controller interaction resolution is invalid");
+  }
+  return { kind: "user_answer", answers: parseUserAnswerResolution(candidate.answers) };
 }
 
 function controllerTitle(controllerKey: string): string {
@@ -249,14 +358,15 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
   public async resolveInteraction(
     threadId: string,
     interactionId: string,
-    resolution: Record<string, unknown>,
+    resolution: ControllerInteractionResolution,
     signal: AbortSignal,
   ): Promise<void> {
     if (signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+    const validatedResolution = parseControllerInteractionResolution(resolution);
     await this.dependencies.sdk.threads.interactions.resolve({
       threadId,
       interactionId,
-      resolution: resolution as never,
+      resolution: validatedResolution,
     });
   }
 
@@ -297,6 +407,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     let toolCalls = 0;
     let commandFailures = 0;
     let totalTokens = 0;
+    let cursorBlocked = false;
     for (let page = 0; page < MAX_CONTROLLER_EVENT_PAGES; page += 1) {
       const rows = await this.dependencies.sdk.threads.events.list({
         threadId,
@@ -305,6 +416,12 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
         signal,
       });
       for (const row of rows) {
+        const lifecycle = lifecycleReferenceCandidate(row);
+        if (lifecycle && !interactionReferences.has(lifecycle.key) &&
+            interactionReferences.size >= MAX_CONTROLLER_INTERACTION_REFERENCES) {
+          cursorBlocked = true;
+          break;
+        }
         latestSeq = Math.max(latestSeq, row.seq);
         if (row.type === "turn/input/accepted") inputAccepted = true;
         if (row.type === "item/agentMessage/delta") assistantOutputObserved = true;
@@ -324,20 +441,20 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
         if (row.type === "system/error" || row.type === "provider/error") {
           error = "Controller provider turn failed";
         }
-        if (row.type === "system/userQuestion/lifecycle" || row.type === "system/permissionGrant/lifecycle") {
-          const lifecyclePayload = row.data as { interactionId?: unknown; status?: unknown };
-          const interactionId = lifecyclePayload.interactionId;
-          const status = lifecyclePayload.status;
-          if (typeof interactionId !== "string" || interactionId.length === 0 || interactionId.length > 256) continue;
-          if (status !== "pending" && status !== "resolved" && status !== "interrupted") continue;
-          const kind = row.type === "system/userQuestion/lifecycle" ? "user_question" : "approval";
-          const key = `${kind}:${interactionId}`;
-          const previous = interactionReferences.get(key);
+        if (lifecycle) {
+          const previous = interactionReferences.get(lifecycle.key);
           if (previous && previous.seq > row.seq) continue;
-          if (!previous && interactionReferences.size >= MAX_CONTROLLER_INTERACTION_REFERENCES) continue;
-          interactionReferences.set(key, { reference: { interactionId, kind, status }, seq: row.seq });
+          interactionReferences.set(lifecycle.key, {
+            reference: {
+              interactionId: lifecycle.interactionId,
+              kind: lifecycle.kind,
+              status: lifecycle.status,
+            },
+            seq: row.seq,
+          });
         }
       }
+      if (cursorBlocked) break;
       if (rows.length < CONTROLLER_EVENT_PAGE_LIMIT) break;
     }
     return {

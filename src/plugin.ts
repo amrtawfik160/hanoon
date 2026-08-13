@@ -35,7 +35,11 @@ import {
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
-import { BbControllerAdapter, ControllerImagePreparationError } from "./controller/bb-controller";
+import {
+  BbControllerAdapter,
+  ControllerImagePreparationError,
+  parseControllerInteractionResolution,
+} from "./controller/bb-controller";
 import { ControllerEvidenceProjector } from "./controller/evidence-projector";
 import {
   CONTROLLER_MODELS,
@@ -491,7 +495,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const controllerInteractionService = new ControllerInteractionService({
     store: {
-      isExecutorLeaseCurrent: (ownerId, generation, now) => store.isExecutorLeaseCurrent(ownerId, generation, now),
+      isControllerInteractionDeliveryFenceCurrent: (input) =>
+        store.isControllerInteractionDeliveryFenceCurrent(input),
       record: (input) => store.recordControllerInteraction(input),
       markResolved: (input) => store.markControllerInteractionResolved(input),
       answerByToken: (input) => store.answerControllerInteractionByToken(input),
@@ -500,6 +505,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       getAnswered: (controllerKey) => store.getAnsweredControllerInteraction(controllerKey),
       markDelivered: (input) => store.markControllerInteractionDelivered(input),
     },
+    clock: { now: clock },
     interactions: {
       get: async (threadId, interactionId, signal) => controllerAdapter.getInteraction(
         threadId,
@@ -508,7 +514,12 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       ),
       resolve: async (input, signal) => {
         const effectiveSignal = signal ?? AbortSignal.timeout(30_000);
-        await controllerAdapter.resolveInteraction(input.threadId, input.interactionId, input.resolution, effectiveSignal);
+        await controllerAdapter.resolveInteraction(
+          input.threadId,
+          input.interactionId,
+          parseControllerInteractionResolution(input.resolution),
+          effectiveSignal,
+        );
         return controllerAdapter.getInteraction(input.threadId, input.interactionId, effectiveSignal);
       },
     },

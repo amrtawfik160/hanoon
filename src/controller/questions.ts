@@ -506,6 +506,8 @@ export type RenderedQuestion = {
   reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] };
 };
 
+export type ControllerQuestionCallbackPrefix = "i" | "w";
+
 /**
  * One question per message. Telegram gives a button no room to say which
  * question it belongs to, so asking them in sequence is what keeps a tap
@@ -514,8 +516,11 @@ export type RenderedQuestion = {
 export function renderQuestion(
   interactionId: string,
   question: ControllerQuestion,
-  callbackPrefix = "q",
+  callbackPrefix: ControllerQuestionCallbackPrefix,
 ): RenderedQuestion {
+  if (callbackPrefix !== "i" && callbackPrefix !== "w") {
+    throw new TypeError("controller question callback prefix is invalid");
+  }
   const lines = [question.prompt];
   for (const option of question.options) {
     lines.push(option.description === null ? `• ${option.label}` : `• ${option.label} — ${option.description}`);

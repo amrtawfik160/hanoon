@@ -29,12 +29,14 @@ export type CallbackAction =
   | { type: "review"; jobId: string }
   | { type: "merge"; nonce: string }
   | { type: "operation"; nonce: string }
-  /** One option of a question the controller thread is blocked on. */
-  | { type: "question"; token: string }
   /** One choice from a generic controller interaction. */
   | { type: "controller_interaction"; token: string }
   /** One choice offered for a watched thread that is waiting on the owner. */
   | { type: "thread_interaction"; token: string };
+
+/** Legacy question callbacks remain parseable for already-rendered Telegram messages. */
+export type LegacyQuestionCallbackAction = { type: "question"; token: string };
+export type ParsedCallbackAction = CallbackAction | LegacyQuestionCallbackAction;
 
 export type ReviewView = {
   verdict?: string;
@@ -334,10 +336,6 @@ export function encodeCallbackData(action: CallbackAction): string {
       if (!NONCE_PATTERN.test(action.nonce)) throw new TypeError("nonce is not valid callback data");
       encoded = `o:${action.nonce}`;
       break;
-    case "question":
-      if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
-      encoded = `q:${action.token}`;
-      break;
     case "controller_interaction":
       if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
       encoded = `i:${action.token}`;
@@ -353,7 +351,7 @@ export function encodeCallbackData(action: CallbackAction): string {
   return encoded;
 }
 
-export function parseCallbackData(data: string): CallbackAction {
+export function parseCallbackData(data: string): ParsedCallbackAction {
   if (typeof data !== "string" || Buffer.byteLength(data, "utf8") > MAX_CALLBACK_BYTES) {
     throw new TypeError("Telegram callback data is invalid");
   }

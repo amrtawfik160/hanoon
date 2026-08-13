@@ -26,6 +26,15 @@ it("round-trips generic controller interaction callbacks within Telegram's limit
   expect(() => encodeCallbackData({ type: "controller_interaction", token: "T".repeat(33) })).toThrow();
 });
 
+it("keeps the legacy q namespace parse-only", () => {
+  const legacyQuestion = {
+    type: "question",
+    token: "T".repeat(32),
+  } as unknown as CallbackAction;
+
+  expect(() => encodeCallbackData(legacyQuestion)).toThrow();
+});
+
 function expectWellFormedTelegramHtml(text: string): void {
   const openTags: string[] = [];
   const tokenPattern = /<\/(b|code|a)>|<(b|code|a)(?:\s+href="[^"]*")?>|&(amp|lt|gt|quot|#39);/g;

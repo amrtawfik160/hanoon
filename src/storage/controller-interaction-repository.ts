@@ -42,7 +42,16 @@ export type ControllerInteractionDelivery = ControllerInteractionRecord & Readon
   answeredAt: number;
 }>;
 
+export type ControllerInteractionDeliveryFence = ControllerLeaseFence & Readonly<{
+  interactionId: string;
+  turnId: string;
+  controllerKey: string;
+  bbThreadId: string;
+  controllerGenerationId: string;
+}>;
+
 export interface ControllerInteractionStore {
+  isControllerInteractionDeliveryFenceCurrent(input: ControllerInteractionDeliveryFence): boolean;
   record(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -288,6 +297,71 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     return this.executorFenceIsCurrent(input);
   }
 
+  public isControllerInteractionDeliveryFenceCurrent(input: ControllerInteractionDeliveryFence): boolean {
+    assertFence(input);
+    assertIdentifier(input.interactionId, "interactionId");
+    assertIdentifier(input.turnId, "turnId");
+    assertControllerKey(input.controllerKey);
+    assertIdentifier(input.bbThreadId, "bbThreadId");
+    assertIdentifier(input.controllerGenerationId, "controllerGenerationId");
+    return this.db.prepare(
+      `SELECT 1
+         FROM controller_interactions AS interaction
+         JOIN controller_turns AS turn
+           ON turn.id = interaction.turn_id
+          AND turn.id = ?
+          AND turn.controller_key = ?
+          AND turn.state = 'submitted'
+          AND turn.awaiting_interaction_id = interaction.interaction_id
+          AND turn.lease_owner = ?
+          AND turn.lease_generation = ?
+         JOIN executor_lease AS lease
+           ON lease.singleton = 1
+          AND lease.owner_id = ?
+          AND lease.generation = ?
+          AND lease.lease_expires_at IS NOT NULL
+          AND lease.lease_expires_at > ?
+         JOIN controller_threads AS controller
+           ON controller.controller_key = interaction.controller_key
+          AND controller.controller_key = ?
+          AND controller.state = 'active'
+          AND controller.bb_thread_id = ?
+         JOIN controller_generations AS generation
+           ON generation.id = interaction.controller_generation_id
+          AND generation.id = ?
+          AND generation.controller_key = controller.controller_key
+          AND generation.thread_id = controller.bb_thread_id
+          AND generation.ended_at IS NULL
+        WHERE interaction.interaction_id = ?
+          AND interaction.turn_id = ?
+          AND interaction.controller_key = ?
+          AND interaction.bb_thread_id = ?
+          AND interaction.controller_generation_id = ?
+          AND interaction.state = 'answered'
+          AND interaction.answer_json IS NOT NULL
+          AND interaction.answered_at IS NOT NULL
+          AND (SELECT COUNT(*) FROM controller_generations AS open_generation
+                 WHERE open_generation.controller_key = controller.controller_key
+                   AND open_generation.ended_at IS NULL) = 1`,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.ownerId,
+      input.generation,
+      input.now,
+      input.controllerKey,
+      input.bbThreadId,
+      input.controllerGenerationId,
+      input.interactionId,
+      input.turnId,
+      input.controllerKey,
+      input.bbThreadId,
+      input.controllerGenerationId,
+    ) !== undefined;
+  }
+
   public record(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -362,15 +436,13 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     assertCanonicalPositiveDecimal(input.chatId, "chatId");
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): ControllerInteractionAnswer => {
-      const rows = this.pendingOwnerRows(input.userId, input.chatId);
-      for (const row of rows) {
-        const stored = parseStoredRow(row);
-        if (!stored) continue;
-        const matched = answerForInteraction(stored.interaction, stored.answers, input.token);
-        if (!matched) continue;
-        return this.persistOwnerAnswer(row, stored, matched, input.now);
-      }
-      return { ok: false, reason: "stale" };
+      const row = this.pendingOwnerRow(input.userId, input.chatId);
+      if (!row) return { ok: false, reason: "stale" };
+      const stored = parseStoredRow(row);
+      if (!stored) return { ok: false, reason: "stale" };
+      const matched = answerForInteraction(stored.interaction, stored.answers, input.token);
+      if (!matched) return { ok: false, reason: "stale" };
+      return this.persistOwnerAnswer(row, stored, matched, input.now);
     }).immediate();
   }
 
@@ -412,6 +484,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
             AND interaction.kind = 'user_question'
             AND controller.telegram_user_id = ?
             AND controller.telegram_chat_id = ?
+            AND turn.awaiting_interaction_id = interaction.interaction_id
             AND interaction.bb_thread_id = controller.bb_thread_id
             AND (SELECT COUNT(*) FROM controller_generations AS open_generation
                   WHERE open_generation.controller_key = controller.controller_key
@@ -531,7 +604,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     ).get(controllerKey, state) as InteractionRow | undefined;
   }
 
-  private pendingOwnerRows(userId: string, chatId: string): InteractionRow[] {
+  private pendingOwnerRow(userId: string, chatId: string): InteractionRow | undefined {
     return this.db.prepare(
       `SELECT interaction.*
          FROM controller_interactions AS interaction
@@ -553,12 +626,14 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
           AND generation.ended_at IS NULL
         WHERE interaction.state = 'pending'
           AND controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
+          AND turn.awaiting_interaction_id = interaction.interaction_id
           AND interaction.bb_thread_id = controller.bb_thread_id
           AND (SELECT COUNT(*) FROM controller_generations AS open_generation
                 WHERE open_generation.controller_key = controller.controller_key
                   AND open_generation.ended_at IS NULL) = 1
-        ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC`,
-    ).all(userId, chatId) as InteractionRow[];
+        ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC
+        LIMIT 1`,
+    ).get(userId, chatId) as InteractionRow | undefined;
   }
 
   private persistOwnerAnswer(
@@ -619,6 +694,11 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
       });
       if (!turn) return false;
       this.beforeExecutorInteractionTransition();
+      if (states.length === 1 && states[0] === "answered" && !this.isControllerInteractionDeliveryFenceCurrent({
+        ...input,
+        controllerKey: turn.controller_key,
+        controllerGenerationId: turn.controller_generation_id,
+      })) return false;
       const updated = this.db.prepare(
         `UPDATE controller_interactions
             SET state = 'delivered', delivered_at = ?

@@ -1,5 +1,5 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { hashSecret } from "../src/crypto";
@@ -277,7 +277,7 @@ function statusPayload(fixture: ReturnType<typeof ingressFixture>): SendMessageP
 function seedControllerInteraction(
   fixture: ReturnType<typeof ingressFixture>,
   interaction: ControllerInteraction,
-): { controllerKey: string; token: string } {
+): { controllerKey: string; token: string; interactionId: string } {
   const controllerKey = createHash("sha256")
     .update("telegram-controller:7:70", "utf8")
     .digest("base64url")
@@ -318,7 +318,7 @@ function seedControllerInteraction(
   const token = interaction.kind === "approval"
     ? controllerInteractionToken(interaction.interactionId, interaction.decisions[0] ?? "deny")
     : questionOptionToken(interaction.interactionId, interaction.questions[0]!.id, interaction.questions[0]!.options[0]!.value);
-  return { controllerKey, token };
+  return { controllerKey, token, interactionId: interaction.interactionId };
 }
 
 it("reveals no project information to an unauthorized chat", async () => {
@@ -395,6 +395,63 @@ it("authenticates and atomically records a generic controller callback before nu
   expect(durableBeforeNudge).toBe(true);
   expect(nudges).toBe(1);
   expect(fixture.store.listControllerTurns(seeded.controllerKey, 10)).toHaveLength(1);
+});
+
+it("records distinct callback replays across two real store connections without a second nudge", async () => {
+  let nudges = 0;
+  const fixture = ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    onWorkAvailable: () => { nudges += 1; },
+  });
+  const seeded = seedControllerInteraction(fixture, {
+    kind: "approval",
+    interactionId: "ingress_two_connection_replay",
+    summary: "wants to run a bounded command",
+    decisions: ["allow_once", "deny"],
+  });
+  const secondaryDb = new Database(fixture.db.name);
+  secondaryDb.pragma("busy_timeout = 5000");
+  secondaryDb.pragma("foreign_keys = ON");
+  const secondaryStorage = {
+    database: () => secondaryDb,
+    kv: memoryKv(),
+    migrate: () => undefined,
+  } as unknown as Parameters<typeof openStore>[0];
+  const secondaryStore = openStore(secondaryStorage, memoryKv(), () => 9_002);
+  const secondaryIngress = new TelegramIngress({
+    store: secondaryStore,
+    telegram: new FakeTelegram(),
+    onWorkAvailable: () => { nudges += 1; },
+  });
+
+  try {
+    await fixture.ingress.handleClaimed(callbackUpdate(
+      90_020,
+      "controller-replay-one",
+      7,
+      70,
+      encodeCallbackData({ type: "controller_interaction", token: seeded.token }),
+    ), 9_001);
+    await secondaryIngress.handleClaimed(callbackUpdate(
+      90_021,
+      "controller-replay-two",
+      7,
+      70,
+      encodeCallbackData({ type: "controller_interaction", token: seeded.token }),
+    ), 9_002);
+
+    expect(fixture.store.getCallback("controller-replay-one")).toMatchObject({ outcome: "accepted" });
+    expect(fixture.store.getCallback("controller-replay-two")).toMatchObject({ outcome: "stale" });
+    expect(fixture.store.getOutbox("callback:controller-replay-one")?.payload.text).toBe("Got it.");
+    expect(fixture.store.getOutbox("callback:controller-replay-two")?.payload.text)
+      .toBe("That interaction is no longer open.");
+    expect(fixture.db.prepare(
+      "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+    ).get(seeded.interactionId)).toMatchObject({ state: "answered" });
+    expect(nudges).toBe(1);
+  } finally {
+    secondaryDb.close();
+  }
 });
 
 it("does not let wrong-identity controller callbacks consume the parked interaction", async () => {

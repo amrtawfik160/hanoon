@@ -102,6 +102,7 @@ import {
   ControllerInteractionRepository,
   type ControllerInteraction,
   type ControllerInteractionAnswer,
+  type ControllerInteractionDeliveryFence,
   type ControllerInteractionDelivery,
   type ControllerInteractionRecord,
 } from "./controller-interaction-repository";
@@ -2150,6 +2151,7 @@ export interface TelegramAgentStore {
   renewExecutorLease(ownerId: string, generation: number, now: number, leaseMs: number): boolean;
   releaseExecutorLease(ownerId: string, generation: number, now: number): boolean;
   isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean;
+  isControllerInteractionDeliveryFenceCurrent(input: ControllerInteractionDeliveryFence): boolean;
   leaseControlEffects(input: ControlEffectLeaseInput): StoredEffect[];
   leaseNextJobEffect(input: JobEffectLeaseInput): StoredEffect | null;
   renewJobOperationFences(input: JobOperationFenceRenewalInput): boolean;
@@ -6984,6 +6986,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!Number.isInteger(generation) || generation < 1) return false;
     if (!Number.isInteger(now) || now < 0) return false;
     return this.executorLeaseIsCurrent(ownerId, generation, now);
+  }
+
+  public isControllerInteractionDeliveryFenceCurrent(input: ControllerInteractionDeliveryFence): boolean {
+    return this.controllerInteractionRepository.isControllerInteractionDeliveryFenceCurrent(input);
   }
 
   public leaseControlEffects(input: ControlEffectLeaseInput): StoredEffect[] {

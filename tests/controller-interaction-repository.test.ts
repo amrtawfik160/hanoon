@@ -1251,8 +1251,8 @@ it("answers only the oldest pending user question with plain text", () => {
   const first = controllerInteraction("question_oldest");
   const approval = controllerInteraction("approval_middle", "approval");
   const later = controllerInteraction("question_later");
-  fixture.repository.record(recordInput(fixture, approval, 2_000));
-  fixture.repository.record(recordInput(fixture, first, 2_001));
+  fixture.repository.record(recordInput(fixture, first, 2_000));
+  fixture.repository.record(recordInput(fixture, approval, 2_001));
   fixture.repository.record(recordInput(fixture, later, 2_002));
 
   const answer = fixture.repository.answerWithText({
@@ -1384,6 +1384,173 @@ it("allows exactly one winner for a two-connection button race", () => {
     secondary.close();
     closeCurrentFixture(fixture);
   }
+});
+
+it("requires the complete current identity and lease fence before delivery", () => {
+  const cases: Array<{
+    name: string;
+    invalidate: (fixture: CurrentFixture) => void;
+    input?: (fixture: CurrentFixture) => Record<string, unknown>;
+  }> = [
+    {
+      name: "global takeover",
+      invalidate: (fixture) => {
+        fixture.db.prepare(
+          "UPDATE executor_lease SET owner_id = 'successor', generation = 2 WHERE singleton = 1",
+        ).run();
+      },
+    },
+    {
+      name: "expired global lease",
+      invalidate: (fixture) => {
+        fixture.db.prepare("UPDATE executor_lease SET lease_expires_at = 2_000 WHERE singleton = 1").run();
+      },
+    },
+    {
+      name: "turn lease loss",
+      invalidate: (fixture) => {
+        fixture.db.prepare("UPDATE controller_turns SET lease_generation = 2 WHERE id = ?").run(fixture.turnId);
+      },
+    },
+    {
+      name: "turn state change",
+      invalidate: (fixture) => {
+        fixture.db.prepare("UPDATE controller_turns SET state = 'completed' WHERE id = ?").run(fixture.turnId);
+      },
+    },
+    {
+      name: "controller thread change",
+      invalidate: (fixture) => {
+        fixture.db.prepare("UPDATE controller_threads SET state = 'failed' WHERE controller_key = ?")
+          .run(fixture.controllerKey);
+      },
+    },
+    {
+      name: "ended generation",
+      invalidate: (fixture) => {
+        fixture.db.prepare("UPDATE controller_generations SET ended_at = 2_100 WHERE id = ?").run(fixture.generationId);
+      },
+    },
+    {
+      name: "replacement generation ambiguity",
+      invalidate: (fixture) => {
+        fixture.db.prepare("UPDATE controller_generations SET ended_at = 2_100 WHERE id = ?").run(fixture.generationId);
+        fixture.db.prepare(
+          `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+           VALUES ('gen_replacement', ?, ?, 2_101, NULL, NULL)`,
+        ).run(fixture.controllerKey, fixture.threadId);
+      },
+    },
+    {
+      name: "answered row identity",
+      invalidate: () => {},
+      input: (fixture) => ({
+        interactionId: "other-interaction",
+        turnId: fixture.turnId,
+        controllerKey: fixture.controllerKey,
+        bbThreadId: fixture.threadId,
+        controllerGenerationId: fixture.generationId,
+      }),
+    },
+    {
+      name: "answered row state",
+      invalidate: (fixture) => {
+        fixture.db.prepare("UPDATE controller_interactions SET state = 'pending' WHERE interaction_id = ?")
+          .run("interaction_delivery_fence");
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const fixture = currentInteractionFixture();
+    const interaction = controllerInteraction("interaction_delivery_fence", "approval");
+    expect(fixture.repository.record(recordInput(fixture, interaction))).toBe(true);
+    expect(fixture.repository.answerByToken({
+      token: controllerInteractionToken(interaction.interactionId, "deny"),
+      userId: "7",
+      chatId: "70",
+      now: 2_100,
+    })).toMatchObject({ ok: true });
+    const baseInput = {
+      ...fixture.fence,
+      now: 2_200,
+      interactionId: interaction.interactionId,
+      turnId: fixture.turnId,
+      controllerKey: fixture.controllerKey,
+      bbThreadId: fixture.threadId,
+      controllerGenerationId: fixture.generationId,
+    };
+    expect(fixture.repository.isControllerInteractionDeliveryFenceCurrent(baseInput)).toBe(true);
+    testCase.invalidate(fixture);
+    const input = { ...baseInput, ...(testCase.input?.(fixture) ?? {}) };
+    expect(fixture.repository.isControllerInteractionDeliveryFenceCurrent(input)).toBe(false);
+    closeCurrentFixture(fixture);
+  }
+});
+
+it("answers only the interaction exposed by the submitted turn pointer", () => {
+  const fixture = currentInteractionFixture();
+  const first = controllerInteraction("interaction_exposed_first");
+  const second = controllerInteraction("interaction_exposed_second");
+  expect(fixture.repository.record(recordInput(fixture, first, 2_000))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, second, 2_001))).toBe(true);
+
+  expect(fixture.repository.answerByToken({
+    token: questionOptionToken(second.interactionId, "question_1", "first"),
+    userId: "7",
+    chatId: "70",
+    now: 2_100,
+  })).toEqual({ ok: false, reason: "stale" });
+  expect(fixture.db.prepare(
+    "SELECT interaction_id FROM controller_interactions WHERE state = 'pending' ORDER BY asked_at",
+  ).all()).toEqual([
+    { interaction_id: first.interactionId },
+    { interaction_id: second.interactionId },
+  ]);
+
+  expect(fixture.repository.answerByToken({
+    token: questionOptionToken(first.interactionId, "question_1", "first"),
+    userId: "7",
+    chatId: "70",
+    now: 2_101,
+  })).toMatchObject({ ok: true, interactionId: first.interactionId });
+  expect(fixture.repository.markDelivered({
+    ...fixture.fence,
+    now: 2_102,
+    interactionId: first.interactionId,
+    turnId: fixture.turnId,
+    bbThreadId: fixture.threadId,
+  })).toBe(true);
+  expect(fixture.repository.answerByToken({
+    token: questionOptionToken(second.interactionId, "question_1", "first"),
+    userId: "7",
+    chatId: "70",
+    now: 2_103,
+  })).toMatchObject({ ok: true, interactionId: second.interactionId });
+  closeCurrentFixture(fixture);
+});
+
+it("does not let text skip an exposed approval to answer a later question", () => {
+  const fixture = currentInteractionFixture();
+  const approval = controllerInteraction("interaction_exposed_approval", "approval");
+  const question = controllerInteraction("interaction_hidden_question");
+  expect(fixture.repository.record(recordInput(fixture, approval, 2_000))).toBe(true);
+  expect(fixture.repository.record(recordInput(fixture, question, 2_001))).toBe(true);
+
+  expect(fixture.repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "answer the question",
+    now: 2_100,
+  })).toEqual({ ok: false, reason: "stale" });
+  expect(fixture.db.prepare(
+    "SELECT interaction_id FROM controller_interactions WHERE state = 'pending' ORDER BY asked_at",
+  ).all()).toEqual([
+    { interaction_id: approval.interactionId },
+    { interaction_id: question.interactionId },
+  ]);
+  closeCurrentFixture(fixture);
 });
 
 it("allows exactly one winner for a two-connection button versus text race", () => {
