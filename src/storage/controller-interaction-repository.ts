@@ -120,13 +120,18 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
     return this.db.transaction((): boolean => {
       if (!this.currentLease(input)) return false;
       if (!this.activeSource(input)) return false;
+      const serialized = JSON.stringify(input.interaction);
+      const known = this.db.prepare("SELECT turn_id, controller_key, bb_thread_id, controller_generation_id, payload_json FROM controller_interactions WHERE interaction_id = ?")
+        .get(input.interaction.interactionId) as { turn_id: string; controller_key: string; bb_thread_id: string; controller_generation_id: string; payload_json: string } | undefined;
+      if (known) return known.turn_id === input.turnId && known.controller_key === input.controllerKey &&
+        known.bb_thread_id === input.bbThreadId && known.controller_generation_id === input.controllerGenerationId && known.payload_json === serialized;
       const inserted = this.db.prepare(
         `INSERT OR IGNORE INTO controller_interactions
            (interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id, kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, NULL)`,
       ).run(
         input.interaction.interactionId, input.turnId, input.controllerKey, input.bbThreadId,
-        input.controllerGenerationId, input.interaction.kind, JSON.stringify(input.interaction), input.now,
+        input.controllerGenerationId, input.interaction.kind, serialized, input.now,
       );
       if (inserted.changes !== 1) return false;
       this.promote(input.turnId, input.now);
@@ -150,8 +155,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   public answerByToken(input: { token: string; userId: string; chatId: string; now: number }): ControllerInteractionAnswer {
     if (!isSafeIdentifier(input.token) || !isSafeIdentifier(input.userId) || !isSafeIdentifier(input.chatId) || !Number.isSafeInteger(input.now) || input.now < 0) return { ok: false, reason: "stale" };
     return this.db.transaction((): ControllerInteractionAnswer => {
-      const rows = this.ownedPending(input.userId, input.chatId);
-      for (const row of rows) {
+      const row = this.ownedPending(input.userId, input.chatId)[0];
+      if (row) {
         const record = parseRow(row);
         if (record.interaction.kind === "approval") {
           for (const decision of record.interaction.decisions) {
@@ -161,7 +166,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
               : { decision }, input.now);
           }
         }
-        if (record.interaction.kind !== "user_question") continue;
+        if (record.interaction.kind !== "user_question") return { ok: false, reason: "stale" };
         const previous = this.userAnswers(record);
         for (const question of record.interaction.questions) {
           if (question.id in previous) continue;
@@ -181,8 +186,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
       typeof input.text !== "string" || input.text.trim().length === 0 || input.text.length > 2_000 ||
       !Number.isSafeInteger(input.now) || input.now < 0) return { ok: false, reason: "stale" };
     return this.db.transaction((): ControllerInteractionAnswer => {
-      const row = this.ownedPending(input.userId, input.chatId, input.controllerKey)
-        .find((candidate) => parseRow(candidate).interaction.kind === "user_question");
+      const row = this.ownedPending(input.userId, input.chatId, input.controllerKey)[0];
       if (!row) return { ok: false, reason: "stale" };
       const record = parseRow(row);
       if (record.interaction.kind !== "user_question") return { ok: false, reason: "stale" };
@@ -233,7 +237,19 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
 
   /** Read-only fence used immediately before external BB effects. */
   public sourceIsActive(input: ControllerLeaseFence & { interactionId: string; turnId: string; bbThreadId: string }): boolean {
-    return this.validFence(input) && this.currentLease(input) && this.activeInteraction(input);
+    if (!this.validFence(input)) return false;
+    return this.db.transaction(() => this.db.prepare(
+      `SELECT 1 FROM executor_lease AS lease
+        JOIN controller_interactions AS interaction ON interaction.interaction_id = ? AND interaction.turn_id = ? AND interaction.bb_thread_id = ?
+        JOIN controller_turns AS turn ON turn.id = interaction.turn_id AND turn.state = 'submitted'
+          AND turn.lease_owner = lease.owner_id AND turn.lease_generation = lease.generation
+        JOIN controller_threads AS controller ON controller.controller_key = interaction.controller_key
+          AND controller.state = 'active' AND controller.bb_thread_id = interaction.bb_thread_id
+        JOIN controller_generations AS generation ON generation.id = interaction.controller_generation_id
+          AND generation.controller_key = interaction.controller_key AND generation.thread_id = interaction.bb_thread_id
+          AND generation.ended_at IS NULL
+       WHERE lease.singleton = 1 AND lease.owner_id = ? AND lease.generation = ? AND lease.lease_expires_at > ?`,
+    ).get(input.interactionId, input.turnId, input.bbThreadId, input.ownerId, input.generation, input.now) !== undefined).immediate();
   }
 
   private answerQuestion(record: ControllerInteractionRecord, answers: ControllerQuestionAnswers, now: number): ControllerInteractionAnswer {

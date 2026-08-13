@@ -19,7 +19,7 @@ export class ControllerInteractionService {
     const delivery = this.dependencies.store.getAnswered(input.controllerKey);
     if (!delivery) return false;
     if (!this.dependencies.store.sourceIsActive({
-      ...input, interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
+      ...input, now: this.dependencies.clock(), interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
     })) return false;
     const current = await this.dependencies.interactions.get({
       threadId: delivery.bbThreadId,
@@ -38,7 +38,7 @@ export class ControllerInteractionService {
     }
     if (current.status !== "pending") return false;
     if (!this.dependencies.store.sourceIsActive({
-      ...input, interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
+      ...input, now: this.dependencies.clock(), interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
     })) return false;
     const resolved = await this.dependencies.interactions.resolve({
       threadId: delivery.bbThreadId,

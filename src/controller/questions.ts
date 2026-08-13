@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertNoRawMergeCallback } from "../storage/job-persistence";
 
 /** One selectable answer to a question the controller thread asked. */
 export type ControllerQuestionOption = {
@@ -171,10 +172,17 @@ function approvalSummary(subject: Record<string, unknown>): string | null {
 }
 
 function containsApprovalSecret(value: string): boolean {
-  return /\b(?:bearer|authorization|token|secret|password|api[_-]?key)\b/i.test(value) ||
+  try {
+    assertNoRawMergeCallback(value, "command");
+  } catch {
+    return true;
+  }
+  return /\b(?:bearer|authorization|token|secret|password|api[_-]?key|callback(?:[-_ ]?(?:url|nonce|code))?)\b/i.test(value) ||
     /(?:https?|ssh):\/\/[^\s/@]*:[^\s/@]*@/i.test(value) ||
     /[?&](?:token|secret|key|callback|nonce|code)=[^&\s]+/i.test(value) ||
-    /\b[A-Z][A-Z0-9_]{1,}=[^\s]+/.test(value);
+    /\b[a-z_][a-z0-9_]*=[^\s]+/i.test(value) ||
+    /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%/.test(value) ||
+    /(?:env|environment)\b/i.test(value);
 }
 
 function safeApprovalPath(value: unknown): string | null {

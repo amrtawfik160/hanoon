@@ -2,6 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import { questionOptionToken } from "../src/controller/questions";
 import { ControllerInteractionRepository } from "../src/storage/controller-interaction-repository";
+import type { ControllerInteraction } from "../src/controller/questions";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 
 let sequence = 0;
@@ -36,7 +37,7 @@ const question = {
   questions: [{ id: "q1", prompt: "Choose", shortLabel: null, multiSelect: false, allowFreeText: true, options: [{ value: "yes", label: "Yes", description: null }] }],
 };
 
-function record(repository: ControllerInteractionRepository, interaction = question, turnId = "turn-1", now = 2) {
+function record(repository: ControllerInteractionRepository, interaction: ControllerInteraction = question, turnId = "turn-1", now = 2) {
   return repository.record({ ...fence, now, turnId, controllerKey: "owner-7-controller", bbThreadId: "thr-current", controllerGenerationId: "gen-current", interaction });
 }
 
@@ -88,4 +89,12 @@ it("does not bind a record unless the submitted turn is held by the exact execut
   const { db, repository } = fixture();
   db.prepare("UPDATE controller_turns SET lease_owner = 'other', lease_generation = 2 WHERE id = 'turn-1'").run();
   expect(record(repository)).toBe(false);
+});
+
+it("does not let a token or free text skip the oldest pending interaction", () => {
+  const { repository } = fixture();
+  expect(record(repository, { kind: "approval", interactionId: "older", summary: "safe", decisions: ["deny"] }, "turn-1", 1)).toBe(true);
+  expect(record(repository, question, "turn-1", 2)).toBe(true);
+  expect(repository.answerByToken({ token: questionOptionToken("int-question", "q1", "yes"), userId: "7", chatId: "7", now: 3 })).toEqual({ ok: false, reason: "stale" });
+  expect(repository.answerWithText({ controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "yes", now: 3 })).toEqual({ ok: false, reason: "stale" });
 });
