@@ -13,7 +13,6 @@ import {
   type ControllerFinalizationValidationContext,
   type PersistedFinalizationRejectionCode,
 } from "../controller/finalization-contract";
-import { formattedMessage } from "../telegram/markdown";
 
 type SqliteDatabase = Database.Database;
 
@@ -421,13 +420,16 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
         "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id > ? LIMIT 1",
       ).get(input.turnId, accepted.evidenceHighWaterId);
       if (turn.evidence_limit_exceeded_at !== null || laterEvidence) return "evidence_advanced" as const;
+      // The brief requires successful completion to clear the draft: stream
+      // text is donated to '' while the sole durable answer lives in
+      // response_text / digest / final-answer outbox as the exact rendered
+      // message. A cleared draft leaves no phase placeholder beside the answer.
       const completed = this.db.prepare(
         `UPDATE controller_turns
-            SET state = 'completed', response_text = ?, stream_text = ?,
+            SET state = 'completed', response_text = ?, stream_text = '',
                 stream_phase = 'complete', last_error = NULL, completed_at = ?, updated_at = ?
           WHERE id = ? AND state = 'submitted' AND accepted_finalization_id = ?`,
       ).run(
-        accepted.renderedMessage,
         accepted.renderedMessage,
         input.now,
         input.now,
@@ -506,7 +508,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       turn.controller_key,
       turn.ordinal,
       turn.input_text.slice(0, MAX_DIGEST_TEXT),
-      accepted.renderedMessage.slice(0, MAX_DIGEST_TEXT),
+      accepted.renderedMessage,
       now,
     );
     this.db.prepare(
@@ -523,8 +525,13 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     renderedMessage: string,
     now: number,
   ): void {
+    // The final-answer outbox is plain by contract: its textual content must be
+    // exactly the accepted rendered message (the brief rejects passing it
+    // through Markdown rewriting unless a test proves text is unchanged). We
+    // ship a plain payload equal to rendered_message with only the safe fixed
+    // preview option, never a transform or parse_mode.
     const payloadJson = JSON.stringify({
-      ...formattedMessage(renderedMessage),
+      text: renderedMessage,
       disable_web_page_preview: true,
     });
     this.db.prepare(
@@ -802,12 +809,18 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
   }
 
   private advanceNativeCursor(input: ControllerNativeEvidenceInput): void {
+    // A native batch that does not move the cursor (throughSeq === fromSeq) must
+    // not refresh the durable stall clock: repeated empty reconciliations would
+    // otherwise keep a wedged turn alive across restart forever. updated_at is
+    // only rewritten when the cursor actually advances.
     const advanced = this.db.prepare(
-      `UPDATE controller_turns SET evidence_event_seq = ?, updated_at = ?
+      `UPDATE controller_turns SET evidence_event_seq = ?,
+              updated_at = CASE WHEN ? > evidence_event_seq THEN ? ELSE updated_at END
         WHERE id = ? AND controller_key = ? AND state = 'submitted'
           AND lease_owner = ? AND lease_generation = ?
           AND evidence_event_seq = ?`,
     ).run(
+      input.throughSeq,
       input.throughSeq,
       input.now,
       input.turnId,

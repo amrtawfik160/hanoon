@@ -30,7 +30,10 @@ export type ControllerStatus =
 export type ControllerEventObservation = {
   latestSeq: number;
   inputAccepted: boolean;
-  assistantDelta: string;
+  /** True when the provider emitted a streamed assistant message in this window. */
+  assistantOutputObserved: boolean;
+  /** True when a tool-shaped item started in this window. */
+  toolActivityObserved: boolean;
   completed: boolean;
   error: string | null;
   /** Set while the thread is blocked on a question only the owner can answer. */
@@ -68,7 +71,6 @@ export type ControllerAdapter = {
     signal: AbortSignal,
   ): Promise<void>;
   status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
-  output(threadId: string, signal: AbortSignal): Promise<string>;
   latestSeq(threadId: string, signal: AbortSignal): Promise<number>;
   events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventObservation>;
   findSpawnCandidate(controllerKey: string, signal: AbortSignal): Promise<ControllerLocation | null>;
@@ -83,6 +85,8 @@ const TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
   "commandExecution",
   "toolCall",
   "webSearch",
+  "webFetch",
+  "imageView",
   "fileChange",
   "backgroundTask",
 ]);
@@ -215,11 +219,6 @@ export class BbControllerAdapter implements ControllerAdapter {
     return thread.status;
   }
 
-  public async output(threadId: string, signal: AbortSignal): Promise<string> {
-    const result = await this.dependencies.sdk.threads.output({ threadId, signal });
-    return result.output ?? "";
-  }
-
   // The high-water sequence, so a new turn's baseline cannot land inside the
   // thread's history and replay older answers into the live reply.
   public async latestSeq(threadId: string, signal: AbortSignal): Promise<number> {
@@ -238,7 +237,8 @@ export class BbControllerAdapter implements ControllerAdapter {
   ): Promise<ControllerEventObservation> {
     let latestSeq = afterSeq;
     let inputAccepted = false;
-    let assistantDelta = "";
+    let assistantOutputObserved = false;
+    let toolActivityObserved = false;
     let completed = false;
     let error: string | null = null;
     let pendingQuestion: ControllerPendingQuestion | null = null;
@@ -255,9 +255,12 @@ export class BbControllerAdapter implements ControllerAdapter {
       for (const row of rows) {
         latestSeq = Math.max(latestSeq, row.seq);
         if (row.type === "turn/input/accepted") inputAccepted = true;
-        if (row.type === "item/agentMessage/delta") assistantDelta += row.data.delta;
+        if (row.type === "item/agentMessage/delta") assistantOutputObserved = true;
         if (row.type === "turn/completed") completed = true;
-        if (row.type === "item/started" && TOOL_ITEM_TYPES.has(row.data.item.type)) toolCalls += 1;
+        if (row.type === "item/started" && TOOL_ITEM_TYPES.has(row.data.item.type)) {
+          toolCalls += 1;
+          toolActivityObserved = true;
+        }
         if (row.type === "item/completed" && row.data.item.type === "commandExecution") {
           const exitCode = row.data.item.exitCode;
           if (typeof exitCode === "number" && exitCode !== 0) commandFailures += 1;
@@ -283,7 +286,8 @@ export class BbControllerAdapter implements ControllerAdapter {
     return {
       latestSeq,
       inputAccepted,
-      assistantDelta,
+      assistantOutputObserved,
+      toolActivityObserved,
       completed,
       error,
       pendingQuestion,

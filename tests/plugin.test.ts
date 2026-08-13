@@ -1,6 +1,7 @@
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import plugin from "../server";
+import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 import { hashSecret } from "../src/crypto";
 import { ApprovalService } from "../src/services/approval-service";
 import { openStore } from "../src/storage/store";
@@ -182,17 +183,40 @@ it("wires submitted controller turns through the leased job executor", async () 
     threadId: "thr_controller",
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: "setup", generation: lease.generation, now: Date.now() })).toBe(true);
+  expect(store.proposeControllerFinalization({
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    ownerId: "setup",
+    generation: lease.generation,
+    now: Date.now(),
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "Hello from accepted finalization." }],
+      obligationRefs: [],
+    },
+  })).toMatchObject({ outcome: "accepted" });
   expect(store.releaseExecutorLease("setup", lease.generation, Date.now())).toBe(true);
   harness.sdk.stub("threads.get", async () => makeThreadResponse({
     id: "thr_controller",
     projectId: "proj_personal",
+    environmentId: "env_controller",
     status: "idle",
     providerId: "claude-code",
   }));
-  harness.sdk.stub("threads.output", async () => ({ output: "Hello from Luna." }));
+  harness.sdk.stub("environments.get", async () => ({
+    id: "env_controller",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    path: "/workspace/personal",
+    status: "ready",
+    workspaceProvisionType: "personal",
+  }));
+  harness.sdk.stub("threads.timeline", async () => ({ maxSeq: 0 }));
+  harness.sdk.stub("threads.events.list", async () => []);
 
   const run = harness.behavior.runService("job-executor");
-  await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe("Hello from Luna."));
+  await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
+    .toBe("Hello from accepted finalization."));
   run.controller.abort();
   await run.done;
   vi.unstubAllGlobals();
@@ -239,10 +263,21 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
   harness.sdk.stub("threads.get", async () => makeThreadResponse({
     id: "thr_presence_controller",
     projectId: "proj_personal",
+    environmentId: "env_presence_controller",
     status: "active",
     providerId: "claude-code",
     runtime: { displayStatus: "active", hostReconnectGraceExpiresAt: null },
   }));
+  harness.sdk.stub("environments.get", async () => ({
+    id: "env_presence_controller",
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    path: "/workspace/personal",
+    status: "ready",
+    workspaceProvisionType: "personal",
+  }));
+  harness.sdk.stub("threads.timeline", async () => ({ maxSeq: 0 }));
+  harness.sdk.stub("threads.events.list", async () => []);
 
   const run = harness.behavior.runService("job-executor");
   try {
@@ -251,7 +286,7 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
     await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
       status: "sent",
       messageId: null,
-      payload: { text: "Connecting to Luna Max…" },
+      payload: { text: CONTROLLER_PHASE_TEXT.connecting },
     }));
   } finally {
     run.controller.abort();

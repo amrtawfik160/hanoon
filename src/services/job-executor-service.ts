@@ -7,6 +7,7 @@ import { redactError } from "../errors";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
 import { classifyTelegramError } from "../telegram/errors";
 import { JobLaneRunner, type JobLaneKind, type JobLaneSnapshotProvider } from "./job-lane-runner";
+import { CONTROLLER_PHASE_TEXT } from "../controller/models";
 
 type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
@@ -735,7 +736,17 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             const callback = callbackId(item.logicalKey);
             const turnId = controllerTurnId(item.logicalKey);
             const controllerTurn = turnId ? deps.store.getControllerTurn(turnId) : null;
-            if (callback && telegram.answerCallback) {
+            const terminalControllerDraft = turnId !== null &&
+              controllerTurn?.state === "submitted" &&
+              (controllerTurn.streamPhase === "complete" || controllerTurn.streamPhase === "failed");
+            if (terminalControllerDraft) {
+              // Suppress terminal placeholders before choosing draft, edit, or
+              // ordinary-send transport. A pre-cutover row can already carry a
+              // message id, and some Telegram clients do not expose drafts;
+              // neither case may turn stale stream payload into owner-visible
+              // text beside the real terminal writer's message.
+              deliveredMessageId = knownMessageId;
+            } else if (callback && telegram.answerCallback) {
               await telegram.answerCallback(callback, payloadText(item));
             } else if (
               turnId !== null &&
@@ -743,10 +754,13 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               knownMessageId === null &&
               telegram.sendMessageDraft
             ) {
+              // The draft is derived from the durable stream phase, never from
+              // a persisted raw stream_text, so provider prose can never reach
+              // Telegram as a preview.
               await telegram.sendMessageDraft(
                 item.chatId,
                 stableChatDraftId(item.chatId),
-                controllerTurn.streamText,
+                CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
               );
             } else if (knownMessageId !== null) {
               await telegram.editMessage(item.chatId, knownMessageId, item.payload);

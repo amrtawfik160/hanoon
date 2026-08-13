@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type { ControllerAdapter } from "../../src/controller/bb-controller";
 import { LunaControllerService } from "../../src/controller/service";
+import type { ControllerEvidenceReconciler } from "../../src/controller/evidence-projector";
 import { registerControllerTools } from "../../src/controller/tools";
 import {
   parseControllerScenarioCorpus,
@@ -67,32 +68,26 @@ export function loadControllerScenarioCorpus(): ReturnType<typeof parseControlle
   return parseControllerScenarioCorpus(JSON.parse(readFileSync(path, "utf8")));
 }
 
-function scriptedAdapter(
-  observeToolCall: () => Promise<boolean>,
-  reply: () => Promise<string>,
-): ControllerAdapter {
+function scriptedAdapter(observedToolCalls: () => number): ControllerAdapter {
   return {
     spawn: async () => ({ threadId: "thr_fixed_controller", projectId: "proj_fixed", hostId: "host_fixed" }),
     send: async () => undefined,
     steer: async () => undefined,
     answerQuestion: async () => undefined,
     status: async () => "idle",
-    output: reply,
     latestSeq: async () => 0,
-    events: async () => {
-      const toolCalls = await observeToolCall() ? 1 : 0;
-      return {
+    events: async () => ({
         latestSeq: 1,
         inputAccepted: true,
-        assistantDelta: "",
+        assistantOutputObserved: true,
+        toolActivityObserved: observedToolCalls() > 0,
         completed: true,
         error: null,
         pendingQuestion: null,
-        toolCalls,
+        toolCalls: observedToolCalls(),
         commandFailures: 0,
         totalTokens: 0,
-      };
-    },
+      }),
     findSpawnCandidate: async () => null,
   };
 }
@@ -149,9 +144,19 @@ async function runScenario(
   const lease = store.acquireExecutorLease(`eval-${fixtureId}`, FIXTURE_NOW, 30_000);
   if (!lease.acquired) throw new Error("fixed scenario executor lease was unavailable");
   const signal = AbortSignal.timeout(2_000);
+  const evidenceProjector: ControllerEvidenceReconciler = {
+    reconcile: async (_controller, turn) => ({
+      outcome: "reconciled",
+      reconciliationIncomplete: null,
+      fromSeq: turn.evidenceEventSeq,
+      throughSeq: turn.evidenceEventSeq,
+      targetSeq: turn.evidenceEventSeq,
+    }),
+  };
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
+    evidenceProjector,
     threadOperations: { request: async () => { throw new Error("thread operations are not part of this baseline"); } },
     health: () => ({ status: "ok" }),
     notify: () => undefined,
@@ -165,6 +170,7 @@ async function runScenario(
   const jobBefore = queuedJob ? store.getJob(JOB_ID) : null;
   const effectsBefore = queuedJob ? store.listEffectsForJob(JOB_ID) : [];
   const observed = { jobStatus: null as JobStatusProjection | null };
+  let observedToolCalls = 0;
   let response = "Hello from Hanoon.";
   const observeToolCall = async () => {
     if (!queuedJob) return false;
@@ -176,8 +182,8 @@ async function runScenario(
     response = `Job ${observed.jobStatus.id} is currently ${observed.jobStatus.state}.`;
     return true;
   };
-  const adapter = scriptedAdapter(observeToolCall, async () => response);
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => FIXTURE_NOW } });
+  const adapter = scriptedAdapter(() => observedToolCalls);
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => FIXTURE_NOW } });
   const turn = store.enqueueControllerTurn({
     controllerKey: CONTROLLER_KEY,
     telegramUserId: OWNER_ID,
@@ -189,6 +195,21 @@ async function runScenario(
   const fence = { ownerId: `eval-${fixtureId}`, generation: lease.generation, signal };
 
   await service.processOne(fence, signal);
+  observedToolCalls = await observeToolCall() ? 1 : 0;
+  const finalization = store.proposeControllerFinalization({
+    ...fence,
+    now: FIXTURE_NOW,
+    turnId: turn.id,
+    controllerKey: CONTROLLER_KEY,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: response }],
+      obligationRefs: [],
+    },
+  });
+  if (finalization.outcome !== "accepted") {
+    throw new Error(`fixed scenario finalization was not accepted: ${finalization.outcome}`);
+  }
   await service.reconcile(fence, signal);
 
   const completed = store.getControllerTurn(turn.id);

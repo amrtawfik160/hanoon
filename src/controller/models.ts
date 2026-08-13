@@ -41,6 +41,22 @@ export type ControllerStreamPhase =
   | "complete"
   | "failed";
 
+/**
+ * The only text a live controller draft may ever carry. A draft is a progress
+ * placeholder derived from the observed phase, never raw provider prose: raw
+ * assistant output and the legacy pre-cutover `stream_text` value must never
+ * surface as a draft, digest, final-answer outbox, or completed response.
+ */
+export const CONTROLLER_PHASE_TEXT: Readonly<Record<ControllerStreamPhase, string>> = {
+  queued: "Queued…",
+  connecting: "Connecting to Hanoon…",
+  thinking: "Hanoon is thinking…",
+  using_tools: "Hanoon is checking the current state…",
+  responding: "Hanoon is preparing the answer…",
+  complete: "Hanoon finished.",
+  failed: "Hanoon could not finish safely.",
+};
+
 export type ControllerThreadRecord = {
   controllerKey: string;
   telegramUserId: string;

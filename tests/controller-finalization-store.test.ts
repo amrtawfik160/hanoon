@@ -78,7 +78,7 @@ try {
           ...("revision" in proposal ? { revision: proposal.revision } : {}),
         }
       : { outcome: proposal.outcome };
-  } else {
+  } else if (operation === "completion") {
     raceResult = {
       outcome: repository.completeFromFinalization({
         ...fence,
@@ -86,6 +86,17 @@ try {
         controllerKey: "controller_race",
       }),
     };
+  } else {
+    const outcome = repository.claimCompletionContinuation({
+      ...fence,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      bbHighWaterSeq: 0,
+    });
+    if (outcome === "claimed") {
+      writeFileSync(join(barrierDir, "sent-" + label), "sent");
+    }
+    raceResult = { outcome };
   }
   process.stdout.write(JSON.stringify(raceResult) + "\n");
 } finally {
@@ -132,7 +143,7 @@ function startRaceWorker(
   databasePath: string,
   barrierDir: string,
   label: string,
-  operation: "proposal" | "completion",
+  operation: "proposal" | "completion" | "continuation",
 ): RaceWorker {
   const child = spawn(resolve("node_modules/.bin/vite-node"), [
     "--script",
@@ -210,12 +221,13 @@ function deferredFinalization(ref: string) {
 
 function acceptPlainFinalization(
   fixture: ReturnType<typeof submittedControllerFixture>,
+  text = "The answer is complete.",
 ) {
   const accepted = fixture.store.proposeControllerFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
-    candidate: plainFinalization(),
+    candidate: plainFinalization(text),
   });
   if (accepted.outcome !== "accepted") throw new Error("finalization fixture was not accepted");
   return accepted.finalization;
@@ -388,7 +400,9 @@ it("completes from accepted rendered text exactly once", () => {
   expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
     state: "completed",
     responseText: accepted.renderedMessage,
-    streamText: accepted.renderedMessage,
+    // The Task 9 brief requires successful completion to clear the draft:
+    // stream_text is "" while the answer lives in response_text/digest/outbox.
+    streamText: "",
     streamPhase: "complete",
   });
   expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([{
@@ -402,6 +416,50 @@ it("completes from accepted rendered text exactly once", () => {
   expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
     consumedAt: fixture.fence.now,
   });
+});
+
+it("completes with exact Markdown-bearing text, an empty stream, and no HTML transform", () => {
+  const fixture = submittedControllerFixture();
+  const markdown = "**bold** line and a _link_ https://example.com/a?x=1";
+  const accepted = acceptPlainFinalization(fixture, markdown);
+
+  expect(fixture.store.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+  })).toBe("completed");
+
+  // The accepted rendered message is the exact segment text; the brief forbids
+  // passing it through Markdown rewriting. Every owner-visible copy must equal
+  // it byte-for-byte while the draft stream is cleared to "".
+  const turn = fixture.store.getControllerTurn(fixture.turn.id);
+  expect(turn?.responseText).toBe(markdown);
+  expect(turn?.streamText).toBe("");
+  const digest = fixture.store.readControllerDigest(fixture.turn.controllerKey, 10);
+  expect(digest[0]?.agentText).toBe(markdown);
+  const outbox = fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`);
+  expect(outbox?.payload.text).toBe(markdown);
+  expect(outbox?.payload).not.toHaveProperty("parse_mode");
+  expect(outbox?.payload.text).not.toContain("<b>");
+  expect(outbox?.payload.text).not.toContain("&lt;");
+  expect(accepted.renderedMessage).toBe(markdown);
+});
+
+it("preserves a 4,000-code-point accepted rendered message in every completion record", () => {
+  const fixture = submittedControllerFixture();
+  const message = "x".repeat(4_000);
+  const accepted = acceptPlainFinalization(fixture, message);
+
+  expect(Array.from(accepted.renderedMessage)).toHaveLength(4_000);
+  expect(fixture.store.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+  })).toBe("completed");
+
+  expect(fixture.store.getControllerTurn(fixture.turn.id)?.responseText).toBe(message);
+  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)[0]?.agentText).toBe(message);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)?.payload.text).toBe(message);
 });
 
 it("keeps direct evidence sealed but admits late native evidence and refuses completion", () => {
@@ -554,6 +612,69 @@ it("retrieves zero-evidence accepted state across reopen and after consumption",
     id: accepted.id,
     consumedAt: fixture.fence.now,
   });
+});
+
+it("settles once exactly on a reopened store after acceptance-before-completion", () => {
+  const fixture = submittedControllerFixture();
+  const accepted = acceptPlainFinalization(fixture);
+  const reopened = fixture.reopen();
+
+  expect(reopened.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+  })).toBe("completed");
+  expect(reopened.getControllerTurn(fixture.turn.id)).toMatchObject({
+    state: "completed",
+    responseText: accepted.renderedMessage,
+    streamText: "",
+    streamPhase: "complete",
+  });
+  expect(reopened.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([{
+    ownerText: fixture.turn.inputText,
+    agentText: accepted.renderedMessage,
+  }]);
+  expect(reopened.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
+    id: accepted.id,
+    consumedAt: fixture.fence.now,
+  });
+  expect(reopened.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+  })).toBe("stale");
+});
+
+it("rolls back turn, digest, consumption, and outbox together on injected failure", () => {
+  const fixture = submittedControllerFixture();
+  const accepted = acceptPlainFinalization(fixture);
+  const db = fixture.db;
+  const outboxBefore = fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`);
+  db.exec(`
+    CREATE TRIGGER boom_completion
+    AFTER UPDATE ON outbox
+    WHEN NEW.logical_key = 'controller:${fixture.turn.id}:reply'
+    BEGIN
+      SELECT RAISE(ABORT, 'boom-completion');
+    END
+  `);
+
+  expect(() => fixture.store.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+  })).toThrow(/boom-completion/);
+
+  expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
+    state: "submitted",
+    responseText: null,
+  });
+  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([]);
+  expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
+    id: accepted.id,
+    consumedAt: null,
+  });
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toEqual(outboxBefore);
 });
 
 it("does not expose an accepted finalization through another turn", () => {
@@ -921,6 +1042,61 @@ it("persists one digest, outbox row, and consumption when completion races", asy
     expect(db.prepare(
       "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = 'turn_race' AND consumed_at IS NOT NULL",
     ).get()).toEqual({ count: 1 });
+  } finally {
+    stopRaceWorkers(workers);
+    db?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("permits one continuation send across a real two-process claim race and restart", async () => {
+  const directory = mkdtempSync(resolve(".task9-race-continuation-"));
+  const barrierDir = resolve(directory, "barriers");
+  const scriptPath = resolve(directory, "race-worker.ts");
+  let db: Database.Database | undefined;
+  const workers: RaceWorker[] = [];
+  try {
+    const seeded = seededRaceDatabase(directory);
+    db = seeded.db;
+    db.exec(`
+      CREATE TRIGGER pause_continuation_claim
+      BEFORE UPDATE OF completion_continuations ON controller_turns
+      WHEN NEW.id = 'turn_race' AND NEW.completion_continuations = 1
+      BEGIN
+        SELECT task8_race_pause();
+      END
+    `);
+    db.close();
+    db = undefined;
+    writeFileSync(scriptPath, raceWorkerSource());
+    mkdirSync(barrierDir);
+    workers.push(
+      startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "0", "continuation"),
+      startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "1", "continuation"),
+    );
+
+    const results = await releaseRace(barrierDir, workers);
+    expect(results.map(({ outcome }) => outcome).sort()).toEqual(["already_claimed", "claimed"]);
+    expect([0, 1].filter((label) => existsSync(resolve(barrierDir, `sent-${label}`)))).toHaveLength(1);
+
+    db = new Database(seeded.databasePath);
+    const reopened = new ControllerEvidenceRepository(db);
+    expect(reopened.claimCompletionContinuation({
+      ownerId: "executor",
+      generation: 1,
+      now: 2_001,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      bbHighWaterSeq: 0,
+    })).toBe("already_claimed");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM controller_turns WHERE controller_key = 'controller_race'").get())
+      .toEqual({ count: 1 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM controller_digest WHERE controller_key = 'controller_race'").get())
+      .toEqual({ count: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = 'turn_race'").get())
+      .toEqual({ count: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM outbox WHERE logical_key = 'controller:turn_race:reply'").get())
+      .toEqual({ count: 0 });
   } finally {
     stopRaceWorkers(workers);
     db?.close();
