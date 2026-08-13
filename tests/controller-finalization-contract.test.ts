@@ -653,6 +653,28 @@ describe("claim outcome compatibility", () => {
     )).toMatchObject({ outcome: "accepted" });
   });
 
+  it("screens a clause joined by a conjunction, not only a new sentence", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "observed_state",
+        outcome: "succeeded",
+        text: "The project is configured and I merged the branch.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it("refuses a high-impact assertion filed as uncertainty", () => {
+    // Hedged wording is already excluded by the non-success controls, so a claim
+    // reaching here asserts the merge outright whatever kind it declares.
+    expectRejection(
+      claimFinalization({ kind: "uncertainty", outcome: "succeeded", text: "I merged the branch." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
   it("screens each clause of a claim separately", () => {
     // The state reading is fine; the merge riding along beside it is not.
     expectRejection(

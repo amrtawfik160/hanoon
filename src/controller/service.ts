@@ -7,7 +7,6 @@ import {
   type ControllerLocation,
   type ControllerStatus,
 } from "./bb-controller";
-import type { ControllerInteraction } from "./questions";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { projectControllerStream } from "./stream";
 import { buildTurnContext, composeTurnInput } from "./context";
