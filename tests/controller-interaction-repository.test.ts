@@ -24,6 +24,7 @@ const SHIPPED_MIGRATION_COUNT = 29;
 const CURRENT_OWNER = "executor";
 const CURRENT_GENERATION = 1;
 const CURRENT_NOW = 2_000;
+type LegacyInteractionId = string | number | Buffer | null;
 const SENSITIVE_QUERY_KEYS = [
   "access_token",
   "refresh_token",
@@ -202,7 +203,7 @@ function legacyQuestionDatabaseFixture() {
     generationId,
     insertQuestion(
       state: "pending" | "answered" | "delivered",
-      interactionId = "legacy_interaction",
+      interactionId: LegacyInteractionId = "legacy_interaction",
       answersJson: string | null = state === "pending" ? "{}" : JSON.stringify({ question_1: { selected: ["first"] } }),
       questionsJson = JSON.stringify(questionPayload().questions),
     ) {
@@ -221,10 +222,26 @@ function legacyQuestionDatabaseFixture() {
         state === "pending" ? null : 2_002,
       );
     },
+    legacyRows() {
+      return db.prepare("SELECT * FROM controller_questions ORDER BY rowid").all();
+    },
     migrateRemaining() {
       migrateControllerInteractionStorage(bb.storage);
     },
   };
+}
+
+function expectLegacyMigrationRollback(
+  fixture: ReturnType<typeof legacyQuestionDatabaseFixture>,
+  originalRows: unknown[],
+): void {
+  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: SHIPPED_MIGRATION_COUNT,
+  });
+  expect(fixture.db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
+  ).get()).toBeUndefined();
+  expect(fixture.legacyRows()).toEqual(originalRows);
 }
 
 function controllerInteraction(
@@ -503,15 +520,10 @@ it.each([
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("pending");
   changeSource(fixture);
+  const originalRows = fixture.legacyRows();
 
   expect(() => fixture.migrateRemaining()).toThrow();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
-    count: SHIPPED_MIGRATION_COUNT,
-  });
-  expect(fixture.db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-  ).get()).toBeUndefined();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_questions").get()).toEqual({ count: 1 });
+  expectLegacyMigrationRollback(fixture, originalRows);
 });
 
 it.each([
@@ -528,14 +540,10 @@ it.each([
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("answered", "legacy_answered_identity");
   changeSource(fixture);
+  const originalRows = fixture.legacyRows();
 
   expect(() => fixture.migrateRemaining()).toThrow();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
-    count: SHIPPED_MIGRATION_COUNT,
-  });
-  expect(fixture.db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-  ).get()).toBeUndefined();
+  expectLegacyMigrationRollback(fixture, originalRows);
 });
 
 it.each([
@@ -545,17 +553,51 @@ it.each([
 ] as const)("rolls back a pending legacy row with %s answers", (_name, answersJson) => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("pending", "legacy_invalid_partial", answersJson);
+  const originalRows = fixture.legacyRows();
 
   expect(() => fixture.migrateRemaining()).toThrow();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
-    count: SHIPPED_MIGRATION_COUNT,
-  });
-  expect(fixture.db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-  ).get()).toBeUndefined();
+  expectLegacyMigrationRollback(fixture, originalRows);
 });
 
+const SHELL_ASSIGNMENT_TEXTS = [
+  ["a command-substitution assignment", "$(lowercase=plain-value command)"],
+  ["a quoted-script assignment", "sh -c 'lowercase=plain-value command'"],
+] as const;
+
+const SHELL_ASSIGNMENT_LEGACY_PROJECTIONS = SHELL_ASSIGNMENT_TEXTS.flatMap(([name, unsafeText]) => [
+  [`${name} in the prompt`, "pending", legacyQuestionsJson((questions) => { questions[0]!.prompt = unsafeText; }), "{}"],
+  [`${name} in the option label`, "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[0]!.label = unsafeText;
+  }), "{}"],
+  [`${name} in the option value`, "pending", legacyQuestionsJson((questions) => {
+    const options = questions[0]!.options as Record<string, unknown>[];
+    options[0]!.value = unsafeText;
+  }), "{}"],
+  [`${name} in owner free text`, "pending", legacyQuestionsJson(), JSON.stringify({
+    question_1: { selected: [], freeText: unsafeText },
+  })],
+] as const);
+
+const RAW_TOKEN_LEGACY_PROJECTIONS = [
+  ["an AKIA access key", `AKIA${"A".repeat(16)}`],
+  ["an sk token", `sk-${"A".repeat(20)}`],
+  ["an rk token", `rk-${"A".repeat(20)}`],
+  ...(["p", "o", "u", "s", "r"] as const).map((prefix) => [
+    `a GitHub gh${prefix} token`,
+    `gh${prefix}_${"A".repeat(20)}`,
+  ] as const),
+  ["a Telegram bot token", `1234567890:${"A".repeat(35)}`],
+].map(([name, unsafeText]) => [
+  name,
+  "pending",
+  legacyQuestionsJson((questions) => { questions[0]!.prompt = unsafeText; }),
+  "{}",
+] as const);
+
 const INVALID_LEGACY_PROJECTIONS = [
+  ...SHELL_ASSIGNMENT_LEGACY_PROJECTIONS,
+  ...RAW_TOKEN_LEGACY_PROJECTIONS,
   ["missing prompt", "pending", legacyQuestionsJson((questions) => { delete questions[0]!.prompt; }), "{}"],
   ["empty question list", "pending", "[]", "{}"],
   ["too many questions", "pending", legacyQuestionsJson((questions) => {
@@ -639,47 +681,46 @@ it.each(INVALID_LEGACY_PROJECTIONS)(
   (_name, state, questionsJson, answersJson) => {
     const fixture = legacyQuestionDatabaseFixture();
     fixture.insertQuestion(state, "legacy_invalid_projection", answersJson, questionsJson);
+    const originalRows = fixture.legacyRows();
 
     expect(() => fixture.migrateRemaining()).toThrow();
-    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
-      count: SHIPPED_MIGRATION_COUNT,
-    });
-    expect(fixture.db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-    ).get()).toBeUndefined();
-    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_questions").get()).toEqual({ count: 1 });
+    expectLegacyMigrationRollback(fixture, originalRows);
   },
 );
 
-it("rejects an oversized legacy interaction id before creating the tail table", () => {
-  const fixture = legacyQuestionDatabaseFixture();
-  fixture.insertQuestion("pending", "i".repeat(257));
+const INVALID_LEGACY_INTERACTION_IDS = [
+  ["a null interaction id", null],
+  ["an empty interaction id", ""],
+  // A BLOB is the closest faithful non-string corruption because TEXT affinity coerces numeric inserts.
+  ["a non-string BLOB interaction id", Buffer.from("legacy_non_string")],
+  ["an oversized interaction id", "i".repeat(257)],
+] as const;
 
-  expect(() => fixture.migrateRemaining()).toThrow();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
-    count: SHIPPED_MIGRATION_COUNT,
-  });
-  expect(fixture.db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-  ).get()).toBeUndefined();
-});
+it.each(INVALID_LEGACY_INTERACTION_IDS)(
+  "rejects %s before creating the tail table",
+  (_name, interactionId) => {
+    const fixture = legacyQuestionDatabaseFixture();
+    fixture.insertQuestion("pending", interactionId);
+    const originalRows = fixture.legacyRows();
+
+    expect(() => fixture.migrateRemaining()).toThrow();
+    expectLegacyMigrationRollback(fixture, originalRows);
+  },
+);
 
 it("rejects an active pending legacy row without an answer map", () => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("pending", "legacy_missing_pending_answers", null);
+  const originalRows = fixture.legacyRows();
 
   expect(() => fixture.migrateRemaining()).toThrow();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
-    count: SHIPPED_MIGRATION_COUNT,
-  });
-  expect(fixture.db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-  ).get()).toBeUndefined();
+  expectLegacyMigrationRollback(fixture, originalRows);
 });
 
 it("rolls back a nested tail failure after the exact legacy preflight", () => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("pending", "legacy_nested_failure");
+  const originalRows = fixture.legacyRows();
   const originalMigrate = fixture.bb.storage.migrate.bind(fixture.bb.storage);
   fixture.bb.storage.migrate = (database, statements) => {
     const failingStatements = statements.length === ALL_MIGRATIONS.length
@@ -689,13 +730,7 @@ it("rolls back a nested tail failure after the exact legacy preflight", () => {
   };
 
   expect(() => migrateControllerInteractionStorage(fixture.bb.storage)).toThrow();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
-    count: SHIPPED_MIGRATION_COUNT,
-  });
-  expect(fixture.db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-  ).get()).toBeUndefined();
-  expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_questions").get()).toEqual({ count: 1 });
+  expectLegacyMigrationRollback(fixture, originalRows);
 });
 
 it("projects only safe controller approval decisions", () => {
@@ -712,6 +747,7 @@ it.each([
   ["a lowercase single-quoted assignment", "lowercase='quoted value'"],
   ["a lowercase double-quoted assignment", 'lowercase="quoted value"'],
   ["an empty generic assignment", "lowercase="],
+  ...SHELL_ASSIGNMENT_TEXTS,
   ["an embedded callback nonce", `prefixxm:${"A".repeat(32)}suffix`],
 ] as const)("rejects %s at every controller text boundary", (_name, unsafeText) => {
   const commandProjection = parseControllerInteraction("boundary_command", approvalPayload({
@@ -722,12 +758,14 @@ it.each([
   const questionProjection = parseControllerInteraction("boundary_question", questionPayload(unsafeText));
   expect(questionProjection).toEqual({ kind: "unsupported", interactionId: "boundary_question" });
 
-  const optionPayload = questionPayload();
-  const optionQuestion = optionPayload.questions as Record<string, unknown>[];
-  const optionList = optionQuestion[0]!.options as Record<string, unknown>[];
-  optionList[0]!.label = unsafeText;
-  const optionProjection = parseControllerInteraction("boundary_option", optionPayload);
-  expect(optionProjection).toEqual({ kind: "unsupported", interactionId: "boundary_option" });
+  for (const [field, interactionId] of [["label", "boundary_option_label"], ["value", "boundary_option_value"]] as const) {
+    const optionPayload = questionPayload();
+    const optionQuestion = optionPayload.questions as Record<string, unknown>[];
+    const optionList = optionQuestion[0]!.options as Record<string, unknown>[];
+    optionList[0]![field] = unsafeText;
+    const optionProjection = parseControllerInteraction(interactionId, optionPayload);
+    expect(optionProjection).toEqual({ kind: "unsupported", interactionId });
+  }
 
   const fixture = currentInteractionFixture();
   const interaction = controllerInteraction("boundary_owner_text");
