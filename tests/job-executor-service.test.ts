@@ -17,6 +17,7 @@ import type { WorkerLiveness } from "../src/domain/models";
 import { AutonomyRepository } from "../src/storage/autonomy-repository";
 import { AutonomyScheduler } from "../src/autonomy/scheduler";
 import { policyFixture } from "./helpers";
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -1469,13 +1470,11 @@ describe("singleton job executor", () => {
       controller: {
         reconcile: vi.fn(async (fence) => {
           if (loop === 1) {
-            expect(store.completeControllerTurn({
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-              turnId,
-              responseText: "Final answer",
-            })).toBe(true);
+            completeTurnThroughFinalization(
+              store,
+              { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 },
+              { turnId, controllerKey: "executor-presence-controller", responseText: "Final answer" },
+            );
           }
           return true;
         }),
@@ -1523,13 +1522,11 @@ describe("singleton job executor", () => {
           // The owner reads the answer and immediately asks the next question,
           // while Telegram still shows the previous 30-second preview.
           if (loop === 1) {
-            expect(store.completeControllerTurn({
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-              turnId: firstTurnId,
-              responseText: "First answer",
-            })).toBe(true);
+            completeTurnThroughFinalization(
+              store,
+              { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 },
+              { turnId: firstTurnId, controllerKey: "executor-presence-controller", responseText: "First answer" },
+            );
             submitAnotherControllerTurn(store, fence, 901, 2_000);
           }
           return true;

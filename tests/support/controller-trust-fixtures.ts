@@ -254,3 +254,39 @@ export function configuredControllerFixture(options: { staleLease?: boolean } = 
       fixture.harness.behavior.resolveAgentConfiguration({ ...context, ...overrides } as never),
   };
 }
+
+/**
+ * Completes a submitted turn the only way production can: an accepted
+ * structured finalization, then its consumption. Tests used to call the raw
+ * completion API, which wrote an answer with no finalization behind it.
+ */
+export function completeTurnThroughFinalization(
+  store: ReturnType<typeof openStore>,
+  fence: Readonly<{ ownerId: string; generation: number; now: number }>,
+  input: Readonly<{ turnId: string; controllerKey: string; responseText: string }>,
+): void {
+  // The real path adopts the submitted turn under the current executor lease
+  // before any finalization work, so the helper does too.
+  if (!store.adoptSubmittedControllerTurnFence({ ...fence, turnId: input.turnId })) {
+    throw new Error("submitted controller turn could not be adopted");
+  }
+  const proposed = store.proposeControllerFinalization({
+    ...fence,
+    turnId: input.turnId,
+    controllerKey: input.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: input.responseText }],
+      obligationRefs: [],
+    },
+  });
+  if (proposed.outcome !== "accepted") {
+    throw new Error(`finalization was not accepted: ${JSON.stringify(proposed)}`);
+  }
+  const completion = store.completeControllerTurnFromFinalization({
+    ...fence,
+    turnId: input.turnId,
+    controllerKey: input.controllerKey,
+  });
+  if (completion !== "completed") throw new Error(`turn was not completed: ${completion}`);
+}

@@ -2,6 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 import {
   resolveTelegramPresenceTarget,
   TelegramPresenceCoordinator,
@@ -74,11 +75,11 @@ describe("Telegram presence target resolution", () => {
       chatId: "70",
     });
 
-    expect(queued.store.completeControllerTurn({
-      ...queued.fence,
+    completeTurnThroughFinalization(queued.store, queued.fence, {
       turnId: queued.turn.id,
+      controllerKey: queued.turn.controllerKey,
       responseText: "Done.",
-    })).toBe(true);
+    });
     expect(resolveTelegramPresenceTarget(queued.store, emptyLanes)).toBeNull();
   });
 

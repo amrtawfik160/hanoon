@@ -2,6 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 import {
   buildTurnContext,
   composeTurnInput,
@@ -150,11 +151,11 @@ describe("conversation digest durability", () => {
     })).toBe(true);
     expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
 
-    expect(store.completeControllerTurn({
-      ...fence,
+    completeTurnThroughFinalization(store, fence, {
       turnId: turn.id,
+      controllerKey: turn.controllerKey,
       responseText: "Two threads are running.",
-    })).toBe(true);
+    });
 
     expect(store.readControllerDigest("owner-7-controller", 5)).toEqual([
       { ownerText: "what is running?", agentText: "Two threads are running." },

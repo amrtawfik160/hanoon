@@ -6,6 +6,7 @@ import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore } from "../src/storage/store";
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -184,7 +185,9 @@ it("claims exactly one FIFO turn while a controller turn is dispatching or submi
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: first.id, ...fence })).toBe(true);
   expect(store.claimNextControllerTurn(fence)).toBeNull();
-  expect(store.completeControllerTurn({ turnId: first.id, ...fence, responseText: "Hello." })).toBe(true);
+  completeTurnThroughFinalization(store, fence, {
+    turnId: first.id, controllerKey: first.controllerKey, responseText: "Hello.",
+  });
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ updateId: 202, ordinal: 2 });
 });
 
@@ -376,7 +379,9 @@ it("keeps one durable Telegram message id from controller placeholder through li
   const edit = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
   expect(edit).toHaveLength(1);
   expect(store.completeOutbox(edit[0]!.logicalKey, fence.ownerId, fence.generation, 501, fence.now)).toBe(true);
-  expect(store.completeControllerTurn({ turnId: turn.id, responseText: "Hello final", ...fence })).toBe(true);
+  completeTurnThroughFinalization(store, fence, {
+    turnId: turn.id, controllerKey: turn.controllerKey, responseText: "Hello final",
+  });
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     messageId: 501,
     status: "pending",
@@ -446,7 +451,7 @@ it("rejects credential-shaped controller failure text", () => {
   expect(store.listControllerTurns("owner-7-controller", 10)[0]?.state).toBe("dispatching");
 });
 
-it("sends a controller answer as Telegram HTML so its formatting renders", () => {
+it("sends the accepted answer byte-for-byte, with no rewriting and no parse mode", () => {
   const { store } = fixture();
   const turn = store.enqueueControllerTurn(turnInput(701));
   const fence = acquire(store);
@@ -460,15 +465,18 @@ it("sends a controller answer as Telegram HTML so its formatting renders", () =>
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ...fence })).toBe(true);
 
-  expect(store.completeControllerTurn({
+  completeTurnThroughFinalization(store, fence, {
     turnId: turn.id,
-    ...fence,
+    controllerKey: turn.controllerKey,
     responseText: "**Reduce complexity** — active\n- one item",
-  })).toBe(true);
+  });
 
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
-    text: "<b>Reduce complexity</b> — active\n• one item",
-    parse_mode: "HTML",
+  // The trust kernel delivers the accepted rendered message exactly. Markdown
+  // rewriting is deliberately not applied: the owner must read the text the
+  // finalization contract validated, not a transform of it.
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toEqual({
+    text: "**Reduce complexity** — active\n- one item",
+    disable_web_page_preview: true,
   });
 });
 
