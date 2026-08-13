@@ -1736,7 +1736,8 @@ export interface TelegramAgentStore {
     chatId: string;
     text: string;
     now: number;
-  }): ControllerInteractionAnswer;
+    settleUpdateId?: number;
+  }): ControllerInteractionAnswer & { updateSettled: boolean };
   observeThread(input: {
     threadId: string;
     title: string;
@@ -3647,17 +3648,55 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     chatId: string;
     text: string;
     now: number;
-  }): ControllerInteractionAnswer {
+    /**
+     * The claimed Telegram update this answer came from. Passing it settles the
+     * claim in the same commit as the answer, which is what makes a crash
+     * between the two impossible: a replay of this update finds it already
+     * processed, so the owner's words can never be spent twice.
+     */
+    settleUpdateId?: number;
+  }): ControllerInteractionAnswer & { updateSettled: boolean } {
     assertControllerKey(input.controllerKey);
     assertCanonicalPositiveDecimal(input.userId, "userId");
     assertCanonicalPositiveDecimal(input.chatId, "chatId");
     assertControllerText(input.text, "controller interaction answer");
     assertNonNegativeInteger(input.now, "now");
-    return this.db.transaction((): ControllerInteractionAnswer => {
+    const settleUpdateId = input.settleUpdateId;
+    if (settleUpdateId !== undefined) assertNonNegativeInteger(settleUpdateId, "settleUpdateId");
+    const claimGeneration = settleUpdateId === undefined
+      ? undefined
+      : this.claimedUpdates.get(settleUpdateId);
+    if (settleUpdateId !== undefined && claimGeneration === undefined) {
+      throw new UpdateClaimConflictError(settleUpdateId);
+    }
+    const result = this.db.transaction((): ControllerInteractionAnswer & { updateSettled: boolean } => {
       const answered = this.controllerInteractionRepository.answerWithText(input);
-      if (answered.ok) this.askRemainingControllerQuestion(answered.interactionId, input.now);
-      return answered;
+      if (!answered.ok) return { ...answered, updateSettled: false };
+      this.askRemainingControllerQuestion(answered.interactionId, input.now);
+      if (settleUpdateId === undefined) return { ...answered, updateSettled: false };
+      const updated = this.db
+        .prepare(
+          `UPDATE telegram_updates
+              SET status = 'processed', outcome = 'processed', last_error = NULL, processed_at = ?,
+                  claim_owner = NULL, claim_expires_at = NULL
+            WHERE update_id = ?
+              AND status = 'processing'
+              AND claim_owner = ?
+              AND claim_generation = ?
+              AND claim_expires_at > ?`,
+        )
+        .run(input.now, settleUpdateId, this.claimOwner, claimGeneration, input.now);
+      // Someone else owns this update now, so this process has no right to have
+      // answered on its behalf either. Throwing takes the answer back out.
+      if (updated.changes !== 1) {
+        this.claimedUpdates.delete(settleUpdateId);
+        throw new UpdateClaimConflictError(settleUpdateId);
+      }
+      advanceTelegramCursor(this.db);
+      return { ...answered, updateSettled: true };
     }).immediate();
+    if (result.updateSettled && settleUpdateId !== undefined) this.claimedUpdates.delete(settleUpdateId);
+    return result;
   }
 
   private askControllerInteraction(

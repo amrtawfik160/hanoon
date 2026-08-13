@@ -406,7 +406,7 @@ it("keeps a button and a competing free-text answer to one winner", () => {
   })).toMatchObject({ ok: true });
   expect(store.answerControllerInteractionWithText({
     controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "cluster them", now: 4_001,
-  })).toEqual({ ok: false, reason: "stale" });
+  })).toEqual({ ok: false, reason: "stale", updateSettled: false });
   expect(store.getAnsweredControllerInteraction("owner-7-controller")?.answer)
     .toEqual({ kind: "user_answer", answers: { [QUESTION_ID]: { selected: [OPTION_B] } } });
 });
@@ -438,7 +438,7 @@ it("never lets free text answer an approval", () => {
 
   expect(store.answerControllerInteractionWithText({
     controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "yes go ahead", now: 4_000,
-  })).toEqual({ ok: false, reason: "stale" });
+  })).toEqual({ ok: false, reason: "stale", updateSettled: false });
   expect(store.getPendingControllerInteraction("owner-7-controller")?.state).toBe("pending");
 });
 
@@ -861,7 +861,7 @@ it("retires a parked interaction when its turn dies, so later messages are not s
     chatId: "7",
     text: "cluster them",
     now: 4_100,
-  })).toEqual({ ok: false, reason: "stale" });
+  })).toEqual({ ok: false, reason: "stale", updateSettled: false });
 });
 
 it("does not deliver an answer whose turn died before BB heard it", async () => {
@@ -1316,7 +1316,7 @@ it("refuses an answer from an owner whose pairing was revoked", () => {
   })).toEqual({ ok: false, reason: "stale" });
   expect(store.answerControllerInteractionWithText({
     controllerKey: "owner-7-controller", userId: "7", chatId: "7", text: "go ahead", now: 4_001,
-  })).toEqual({ ok: false, reason: "stale" });
+  })).toEqual({ ok: false, reason: "stale", updateSettled: false });
   // The row survives — it is BB's block, not the owner's — but nothing a
   // revoked owner sends can settle it.
   expect(store.getPendingControllerInteraction("owner-7-controller")?.state).toBe("pending");

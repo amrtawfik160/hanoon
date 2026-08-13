@@ -1109,9 +1109,13 @@ it("never lets a controller callback from another user or chat decide anything",
 it("reads a plain reply as the answer to an open controller question", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const { controllerKey } = parkedControllerInteraction(fixture, questionFixtureInteraction);
+  // The answer settles this update's own claim, so the claim has to exist —
+  // exactly as it does when the poller hands a claimed update to the ingress.
+  expect(fixture.store.beginTelegramUpdate(915, 3_999)).toBe("process");
 
-  await fixture.ingress.handleClaimed(messageUpdate(915, 7, 70, "use the release branch"), 4_000);
+  const outcome = await fixture.ingress.handleClaimed(messageUpdate(915, 7, 70, "use the release branch"), 4_000);
 
+  expect(outcome).toEqual({ updateSettled: true });
   expect(fixture.store.getAnsweredControllerInteraction(controllerKey)?.answer).toEqual({
     kind: "user_answer",
     answers: { which: { selected: [], freeText: "use the release branch" } },

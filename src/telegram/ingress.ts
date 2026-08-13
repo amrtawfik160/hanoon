@@ -167,6 +167,15 @@ function isTypedTelegramDeliveryError(error: unknown): boolean {
   return error instanceof TelegramApiError || error instanceof TelegramRequestError;
 }
 
+/**
+ * What the ingress did with the claim on the update it was handed. An answer
+ * settles its own claim inside the answer's transaction, so the caller must not
+ * settle it a second time; everything else leaves the claim for the caller.
+ */
+export type TelegramIngressOutcome = { updateSettled: boolean };
+
+const UPDATE_STILL_CLAIMED: TelegramIngressOutcome = { updateSettled: false };
+
 export class TelegramIngress {
   private readonly store: TelegramAgentStore;
   private readonly telegram: TelegramIngressTransport;
@@ -199,20 +208,26 @@ export class TelegramIngress {
     }
   }
 
-  public async handleClaimed(update: TelegramUpdate, now: number): Promise<void> {
+  public async handleClaimed(update: TelegramUpdate, now: number): Promise<TelegramIngressOutcome> {
     if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
     const parsed = telegramUpdateSchema.safeParse(update);
-    if (!parsed.success) return;
+    if (!parsed.success) return UPDATE_STILL_CLAIMED;
     if (parsed.data.message) {
-      await this.handleMessage(parsed.data.message, parsed.data.update_id, now);
-      return;
+      // Only the answer path settles its own claim; every other message route
+      // simply falls out, which is the ordinary "caller still owns it" case.
+      return await this.handleMessage(parsed.data.message, parsed.data.update_id, now) ?? UPDATE_STILL_CLAIMED;
     }
     if (parsed.data.callback_query) {
       await this.handleCallback(parsed.data.callback_query, parsed.data.update_id, now);
     }
+    return UPDATE_STILL_CLAIMED;
   }
 
-  private async handleMessage(message: TelegramMessage, updateId: number, now: number): Promise<void> {
+  private async handleMessage(
+    message: TelegramMessage,
+    updateId: number,
+    now: number,
+  ): Promise<TelegramIngressOutcome | void> {
     const identity = privateHumanIdentity(message.from, message.chat);
     const image = controllerImageFromMessage(message);
     const text = message.text ?? (image ? message.caption ?? CAPTIONLESS_IMAGE_PROMPT : undefined);
@@ -336,11 +351,14 @@ export class TelegramIngress {
         chatId: identity.chatId,
         text: normalized,
         now,
+        // The answer and this update's claim are settled together, so a crash
+        // here cannot replay these words onto the next question.
+        settleUpdateId: updateId,
       });
       if (answered.ok) {
         this.rememberStandingInstruction(normalized, answered.turnId, now);
         this.onWorkAvailable();
-        return;
+        return { updateSettled: answered.updateSettled };
       }
     }
 

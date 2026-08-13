@@ -4,6 +4,7 @@ import { needsConfiguration, redactError } from "../errors";
 import { MAX_TELEGRAM_UPDATE_ATTEMPTS, type TelegramAgentStore } from "../storage/store";
 import { TelegramConflictError } from "../telegram/client";
 import { classifyTelegramError } from "../telegram/errors";
+import type { TelegramIngressOutcome } from "../telegram/ingress";
 import type { TelegramUpdate } from "../telegram/types";
 
 export type TelegramServiceClient = {
@@ -25,7 +26,7 @@ export type TelegramServiceDeps = {
     | "hasUnreleasedAdmissions"
   >;
   client: (token: string) => TelegramServiceClient;
-  ingress: { handleClaimed(update: TelegramUpdate, now: number): Promise<void> };
+  ingress: { handleClaimed(update: TelegramUpdate, now: number): Promise<TelegramIngressOutcome> };
   getConfig: () =>
     | { ok: true; value: Pick<GlobalConfig, "botToken"> }
     | { ok: false; message: string };
@@ -114,8 +115,12 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
       const claim = deps.store.beginTelegramUpdate(update.update_id, deps.clock.now());
       if (claim === "processed") continue;
       try {
-        await deps.ingress.handleClaimed(update, deps.clock.now());
-        deps.store.completeTelegramUpdate(update.update_id, "processed", deps.clock.now());
+        const outcome = await deps.ingress.handleClaimed(update, deps.clock.now());
+        // An answer already settled this claim in the same commit as the answer
+        // itself; completing it again would only fail on a claim it no longer holds.
+        if (!outcome.updateSettled) {
+          deps.store.completeTelegramUpdate(update.update_id, "processed", deps.clock.now());
+        }
       } catch (error) {
         recordUpdateFailure(update.update_id, error);
       }
