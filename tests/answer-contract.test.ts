@@ -200,7 +200,7 @@ function buildReleasePassedArtifact(): Record<string, any> {
     isolation: null,
   }));
   return {
-    schemaVersion: "answer-live-gate-v1",
+    schemaVersion: "answer-live-gate-v2",
     rubricVersion: ANSWER_RUBRIC_VERSION,
     judgeProfile: ANSWER_JUDGE_PROFILE,
     hanoonCommit: "a".repeat(40),
@@ -739,7 +739,7 @@ it("keeps a targeted artifact diagnostic and never reports it passed", async () 
     const artifact = JSON.parse(artifactText) as Record<string, any>;
     expect(artifact.status).toBe("failed");
     expect(statSync(run.artifactPath).mode & 0o777).toBe(0o600);
-    expect(artifact.schemaVersion).toBe("answer-live-gate-v1");
+    expect(artifact.schemaVersion).toBe("answer-live-gate-v2");
     expect(artifact.selectedCaseCount).toBe(1);
     expect(artifact.selectedClauseCount).toBe(ANSWER_CLAUSES.length);
     expect(artifact.aggregate).toEqual({
@@ -797,9 +797,9 @@ it("rejects duplicate keys and secret-bearing live artifacts", async () => {
     parseLiveGateArtifact?: (output: string, forbiddenValues?: readonly string[]) => unknown;
   }).parseLiveGateArtifact;
   expect(parseArtifact).toBeTypeOf("function");
-  expect(parseArtifact?.('{"schemaVersion":"answer-live-gate-v1","schemaVersion":"secret"}')).toBeNull();
+  expect(parseArtifact?.('{"schemaVersion":"answer-live-gate-v2","schemaVersion":"secret"}')).toBeNull();
   expect(parseArtifact?.(JSON.stringify({
-    schemaVersion: "answer-live-gate-v1",
+    schemaVersion: "answer-live-gate-v2",
     secret: "owner-private-answer",
   }), ["owner-private-answer"])).toBeNull();
 });

@@ -16,7 +16,7 @@ export type AnswerClause = Readonly<{
 }>;
 
 export const ANSWER_RUBRIC_VERSION = "answer-contract-hybrid-v1" as const;
-export const ANSWER_LIVE_GATE_SCHEMA_VERSION = "answer-live-gate-v1" as const;
+export const ANSWER_LIVE_GATE_SCHEMA_VERSION = "answer-live-gate-v2" as const;
 
 export const ANSWER_JUDGE_PROFILE = Object.freeze({
   provider: "codex",
