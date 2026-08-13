@@ -172,25 +172,78 @@ const NON_SUCCESS_CLAUSE = [
   /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
   /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
 ];
-const HIGH_IMPACT_SUCCESS = [
-  /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i,
-  /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
-  /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
-  /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
-  /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i,
-  /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i,
-  /\b(?:the\s+)?(?:branch|pull request|change)\s+(?:is|was|has been|had been)\s+merged\b/i,
-  /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
-  /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:deleted|removed|purged)\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+installed\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
-  new RegExp(`\\b(?:the\\s+)?${CREDENTIAL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:rotated|updated|created|issued|changed)\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"),
-  new RegExp(`\\b${MONEY_AMOUNT}\\s+${PASSIVE_AUXILIARY}\\s+(?:spent|paid)\\b`, "i"),
-  new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
+/**
+ * Every high-impact success assertion, with the claim kinds under which it can
+ * honestly be made. Outside a claim these are the patterns that must not appear
+ * as bare prose at all; inside one they additionally fix what the claim is
+ * allowed to say it is. Both rules read this single table, so an assertion
+ * cannot be high-impact for one check and invisible to the other.
+ *
+ * Deleting and installing carry two kinds because the same sentence covers a
+ * change to the workspace and a change to something outside it, and nothing in
+ * the wording distinguishes them.
+ */
+const HIGH_IMPACT_ASSERTIONS: readonly Readonly<{
+  pattern: RegExp;
+  kinds: readonly ControllerClaimKind[];
+}>[] = [
+  { pattern: /\b(?:i|we)\s+(?:have\s+)?(?:implemented|fixed|shipped)\b/i, kinds: ["workspace_change"] },
+  {
+    pattern: /\b(?:the\s+)?(?:fix|change|feature|implementation|code)\s+(?:is|was|has been|had been)\s+(?:implemented|fixed|shipped|complete|completed)\b/i,
+    kinds: ["workspace_change"],
+  },
+  {
+    pattern: /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
+    kinds: ["execution_result"],
+  },
+  {
+    pattern: /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  { pattern: /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i, kinds: ["pipeline_outcome"] },
+  { pattern: /\b(?:i|we)\s+(?:have\s+)?merged\s+(?:the\s+)?(?:branch|pull request|change)\b/i, kinds: ["pipeline_outcome"] },
+  {
+    pattern: /\b(?:the\s+)?(?:branch|pull request|change)\s+(?:is|was|has been|had been)\s+merged\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
+    kinds: ["pipeline_outcome"],
+  },
+  {
+    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}${DOMAIN_OBJECT}\\b`, "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp(`\\b(?:the\\s+)?${DOMAIN_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:deleted|removed|purged)\\b`, "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?installed\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${INSTALL_OBJECT}\\b`, "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp(`\\b(?:the\\s+)?${INSTALL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+installed\\b`, "i"),
+    kinds: ["workspace_change", "external_mutation"],
+  },
+  {
+    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:rotated|updated|created|issued|changed)\\s+(?:the\\s+)?${CREDENTIAL_OBJECT}\\b`, "i"),
+    kinds: ["external_mutation"],
+  },
+  {
+    pattern: new RegExp(`\\b(?:the\\s+)?${CREDENTIAL_OBJECT}\\s+${PASSIVE_AUXILIARY}\\s+(?:rotated|updated|created|issued|changed)\\b`, "i"),
+    kinds: ["external_mutation"],
+  },
+  { pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?(?:spent|paid)\\s+${MONEY_AMOUNT}\\b`, "i"), kinds: ["external_mutation"] },
+  { pattern: new RegExp(`\\b${MONEY_AMOUNT}\\s+${PASSIVE_AUXILIARY}\\s+(?:spent|paid)\\b`, "i"), kinds: ["external_mutation"] },
+  {
+    pattern: new RegExp(`\\b(?:i|we)\\s+(?:have\\s+)?purchased\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,2}${PURCHASE_OBJECT}\\b`, "i"),
+    kinds: ["external_mutation"],
+  },
 ];
 
 export function renderControllerFinalization(candidate: ControllerFinalization): string {
@@ -332,8 +385,32 @@ function isProcessOnly(candidate: ControllerFinalization, renderedMessage: strin
 }
 
 function clauseHasHighImpactSuccess(clause: string): boolean {
-  if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) return false;
-  return HIGH_IMPACT_SUCCESS.some((pattern) => pattern.test(clause));
+  return highImpactAssertionsIn(clause).length > 0;
+}
+
+/**
+ * The high-impact assertions a clause actually makes. A clause that is a
+ * question, a negation, a failure, an intention, or a hedge asserts nothing, so
+ * the same non-success controls that keep such wording out of the plain-text
+ * screen keep it out of this one.
+ */
+function highImpactAssertionsIn(clause: string): readonly (typeof HIGH_IMPACT_ASSERTIONS)[number][] {
+  if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) return [];
+  return HIGH_IMPACT_ASSERTIONS.filter((assertion) => assertion.pattern.test(clause));
+}
+
+/**
+ * True when a claim's own words assert something its declared kind cannot
+ * carry — "I merged the branch" filed as an observation of project state. The
+ * proof rules already bound what evidence a kind admits, so pinning the kind to
+ * the wording is what stops a mutation from being proved by having looked.
+ *
+ * Each clause is judged on its own, because a claim that reads state and
+ * announces a merge in the same breath is still announcing a merge.
+ */
+function hasIncompatibleClaimText(candidateClaims: readonly ControllerClaim[]): boolean {
+  return candidateClaims.some((claim) => textClauses(claim.text).some((clause) =>
+    highImpactAssertionsIn(clause).some((assertion) => !assertion.kinds.includes(claim.kind))));
 }
 
 function plainTextRuns(candidate: ControllerFinalization): string[] {
@@ -381,6 +458,7 @@ function claimRejectionCode(
   if (hasMissingEvidence(candidateClaims, context)) return "evidence_missing";
   if (hasSubjectMismatch(candidateClaims, context)) return "subject_mismatch";
   if (hasProofIncompatibility(candidateClaims, context)) return "proof_incompatible";
+  if (hasIncompatibleClaimText(candidateClaims)) return "proof_incompatible";
   return null;
 }
 

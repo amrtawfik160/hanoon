@@ -586,6 +586,97 @@ describe("claim outcome compatibility", () => {
     if (expected === "rejected") expect(validation).toMatchObject({ code: "proof_incompatible" });
   });
 
+  // A high-impact assertion inside a claim segment used to have its wording
+  // ignored entirely: only the plain-text runs between claims were screened. So
+  // "I implemented the fix" could be declared observed_state and proved by
+  // having looked at the project.
+  it.each([
+    ["an implementation", "I implemented the fix.", "workspace_change"],
+    ["a fix", "The fix is complete.", "workspace_change"],
+    ["a test run", "The tests passed.", "execution_result"],
+    ["a completed review", "The review is approved.", "pipeline_outcome"],
+    ["a merge", "I merged the branch.", "pipeline_outcome"],
+    ["a deployment", "The deployment is live.", "pipeline_outcome"],
+    ["a credential rotation", "I rotated the credentials.", "external_mutation"],
+    ["a spend", "I spent $40.", "external_mutation"],
+    ["a purchase", "I purchased the service.", "external_mutation"],
+  ] as const)("refuses %s asserted under observed_state", (_scenario, text, _required) => {
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["an implementation", "I implemented the fix.", "workspace_change", "workspace_change"],
+    ["a test run", "The tests passed.", "execution_result", "command_result"],
+    ["a merge", "I merged the branch.", "pipeline_outcome", "pipeline_outcome"],
+    ["a credential rotation", "I rotated the credentials.", "external_mutation", "external_mutation"],
+  ] as const)("accepts %s asserted under its own claim kind", (_scenario, text, kind, proofKind) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind, outcome: "succeeded", text, subjectRef: "job:job_1" }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["deleting", "I deleted the files.", "workspace_change", "workspace_change"],
+    ["deleting externally", "I deleted the resources.", "external_mutation", "external_mutation"],
+    ["installing", "I installed the dependencies.", "workspace_change", "workspace_change"],
+    ["installing externally", "I installed the service.", "external_mutation", "external_mutation"],
+  ] as const)("accepts %s under either of its two admissible kinds", (_scenario, text, kind, proofKind) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("refuses deleting asserted as a pipeline outcome", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "I deleted the files." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["a question", "Did the tests pass?"],
+    ["a negation", "The tests did not pass."],
+    ["a failure", "The tests failed."],
+    ["an intention", "I will run the tests."],
+    ["a hedge", "The tests may have passed."],
+  ] as const)("leaves %s outside the high-impact claim screen", (_scenario, text) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("screens each clause of a claim separately", () => {
+    // The state reading is fine; the merge riding along beside it is not.
+    expectRejection(
+      claimFinalization({
+        kind: "observed_state",
+        outcome: "succeeded",
+        text: "The project is configured. I merged the branch.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it("still accepts an ordinary project-state reading", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "observed_state",
+        outcome: "observed",
+        text: "The project has three configured worker profiles.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
   it.each([
     ["observed_state", "project_state"],
     ["pipeline_outcome", "pipeline_outcome"],

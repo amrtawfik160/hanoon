@@ -269,6 +269,24 @@ it("answers one owner turn end to end through the registered trust path", async 
   expect(hanoonEvidence.subjectRefs).toEqual([`project:${policyFixture().projectId}`]);
   const subjectRef = hanoonEvidence.subjectRefs[0] as string;
 
+  // Having looked at the project proves what the project is, and nothing more.
+  // The same evidence dressed up as a shipped implementation is refused through
+  // the registered tool itself, not merely by the validator in isolation.
+  const refused = JSON.parse(await callTool(fixture, "telegram_agent_respond", {
+    disposition: "answered",
+    segments: [{
+      type: "claim",
+      text: "I implemented the fix in your project.",
+      kind: "observed_state",
+      outcome: "succeeded",
+      subjectRef,
+      evidenceRefs: [evidenceRef],
+    }],
+    obligationRefs: [],
+  }) as string);
+  expect(refused).toMatchObject({ outcome: "rejected", code: "proof_incompatible" });
+  expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+
   const accepted = JSON.parse(await callTool(fixture, "telegram_agent_respond", {
     disposition: "answered",
     segments: [{
@@ -281,7 +299,8 @@ it("answers one owner turn end to end through the registered trust path", async 
     }],
     obligationRefs: [],
   }) as string);
-  expect(accepted).toMatchObject({ outcome: "accepted", ref: "finalization:1" });
+  // Revision 2: the refused candidate above is itself durably recorded.
+  expect(accepted).toMatchObject({ outcome: "accepted", ref: "finalization:2" });
 
   await expect(fixture.service.reconcile(
     { ...fixture.fence, signal: fixture.signal },
