@@ -177,16 +177,24 @@ const QUESTION_SIBLING = /\?\s*$/;
  * what should I do next?" asserts it and then asks something else.
  *
  * The auxiliary form is a grammar rather than a list, so ordinary tags do not
- * have to be enumerated one at a time, but it is still bounded: an auxiliary,
- * an optional negation, a pronoun, and then the question mark. Anything with a
- * word after the pronoun — "should I do next?" — is a new question, not a tag.
+ * have to be enumerated one at a time, but it is still bounded: an auxiliary, a
+ * negation, a pronoun, and then the question mark. Anything with a word after
+ * the pronoun — "should I do next?" — is a new question, not a tag.
+ *
+ * The negation is required rather than optional. English tags a positive
+ * statement negatively — "The tests passed, didn't they?" — so beside a success
+ * assertion a *positive* auxiliary is not a tag at all: "The tests passed,
+ * should I?" and "…, did they?" are unrelated elliptical questions, and reading
+ * them as confirmation would let one excuse the assertion in front of it.
  */
 const TAG_AUXILIARY = "(?:is|are|was|were|do|does|did|has|have|had|will|would|can|could|should|shall|might|must)";
 const TAG_PRONOUN = "(?:i|you|we|they|he|she|it|there)";
 const TAG_QUESTION = new RegExp(
   `^\\s*(?:` +
     `(?:right|correct|ok|okay|yes|no|yeah|agreed|don't you think)` +
-    `|${TAG_AUXILIARY}(?:n't|\\s+not)?\\s+${TAG_PRONOUN}` +
+    `|${TAG_AUXILIARY}(?:n't|\\s+not)\\s+${TAG_PRONOUN}` +
+    // The same negative tag with the older word order: "is it not?".
+    `|${TAG_AUXILIARY}\\s+${TAG_PRONOUN}\\s+not` +
   `)\\s*\\?\\s*$`,
   "i",
 );

@@ -869,6 +869,12 @@ describe("claim outcome compatibility", () => {
     ["an en dash", "The tests passed – what should I do next?"],
     ["a semicolon", "The tests passed; what should I do next?"],
     ["a comma", "The tests passed, what should I do next?"],
+    // A positive modal beside a positive assertion is an unrelated elliptical
+    // question, not a tag: English tags a positive statement negatively.
+    ["a positive modal", "The tests passed, should I?"],
+    ["another positive modal", "The tests passed, could I?"],
+    ["a positive auxiliary", "The tests passed, will they?"],
+    ["a bare positive auxiliary", "The tests passed, did they?"],
   ] as const)("does not let an unrelated question after %s suppress the success", (_scenario, text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
     expectRejection(
@@ -885,8 +891,8 @@ describe("claim outcome compatibility", () => {
     ["a perfect-aspect tag", "The tests passed, haven't they?"],
     ["a first-person tag", "I implemented the fix, didn't I?"],
     ["a curly-apostrophe tag", "The tests passed, haven\u2019t they?"],
-    ["an affirmative auxiliary tag", "The tests passed, did they?"],
     ["a modal tag", "The deployment is live, isn't it?"],
+    ["an inverted-order negative tag", "The tests passed, is it not?"],
     ["a question about the assertion itself", "Did the tests pass?"],
     ["a question in the asserting part", "The tests passed?"],
   ] as const)("still accepts %s", (_scenario, text) => {

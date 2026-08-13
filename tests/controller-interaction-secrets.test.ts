@@ -180,6 +180,10 @@ it.each([
   ["a curly-quoted flag", "curl \u2018-Uproxyuser:hunter2\u2019 https://example.com"],
   ["a quoted encoded flag", "curl '-U%2570roxyuser:hunter2' https://example.com"],
   ["a quoted credential URI", "psql 'postgresql://alice:hunter2@db.internal/app'"],
+  ["encoded single-quote delimiters", "curl %27-Uproxyuser:hunter2%27 https://example.com"],
+  ["encoded double-quote delimiters", "curl %22-Uproxyuser:hunter2%22 https://example.com"],
+  ["repeatedly encoded quote delimiters", "curl %2527-Uproxyuser:hunter2%2527 https://example.com"],
+  ["an encoded quote around a long-form flag", "curl %27--proxy-user%27 alice:hunter2 https://example.com"],
 ] as const)("makes an approval carrying %s unsupported", (_scenario, command) => {
   const projected = parseControllerInteraction(INTERACTION_ID, {
     kind: "approval",
@@ -446,4 +450,34 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
   }
   // The owner is still told the thread is blocked, just not with the secret.
   expect(outbox).toContain("can't answer from here");
+});
+
+it.each([
+  ["encoded single-quote delimiters", "Run curl %27-Uproxyuser:hunter2%27 now?"],
+  ["encoded double-quote delimiters", "Run curl %22-Uproxyuser:hunter2%22 now?"],
+  ["repeatedly encoded quote delimiters", "Run curl %2527-Uproxyuser:hunter2%2527 now?"],
+  ["literal quotes", "Run curl '-Uproxyuser:hunter2' now?"],
+] as const)("downgrades a question prompt carrying %s", (_scenario, prompt) => {
+  // The question path has no second decoding step of its own, so this is the
+  // central policy answering alone: decoding and dequoting must compose there.
+  const projected = parseControllerInteraction(INTERACTION_ID, {
+    kind: "user_question",
+    questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
+  });
+
+  expect(projected).toEqual({
+    kind: "unsupported", interactionId: INTERACTION_ID, metadata: { sourceKind: "user_question" },
+  });
+  expect(JSON.stringify(projected)).not.toContain("hunter2");
+});
+
+it.each([
+  ["an ordinary encoded space", "Deploy the %20release%20 build?"],
+  ["an encoded path", "Read %2Fsrc%2Fcontroller%2Fservice.ts?"],
+  ["a quoted ordinary flag", "Should I run sort '-u' names.txt?"],
+])("still projects a question prompt carrying %s", (_scenario, prompt) => {
+  expect(parseControllerInteraction(INTERACTION_ID, {
+    kind: "user_question",
+    questions: [{ id: "q1", prompt, multiSelect: false, allowFreeText: true, options: [] }],
+  })).toMatchObject({ kind: "user_question" });
 });

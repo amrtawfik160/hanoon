@@ -107,9 +107,22 @@ function decodedViews(text: string): string[] {
  * The readings of one string that a screen has to consider. A secret hidden by
  * quoting, escaping, or encoding is still a secret, so the rules are applied to
  * each reading rather than to the raw text alone.
+ *
+ * The two transforms compose in both directions on purpose: quoting can hide an
+ * encoding and an encoding can hide the quoting, so `%27-Uproxy:pw%27` decodes
+ * into a quoted flag that has to be dequoted afterwards to be seen at all.
+ * Every decoded view is therefore screened dequoted as well.
  */
 function credentialViews(text: string): string[] {
-  return [...new Set([text, unquoted(text)].flatMap((view) => [view, ...decodedViews(view)]))];
+  const views = new Set<string>();
+  for (const base of [text, unquoted(text)]) {
+    views.add(base);
+    for (const decoded of decodedViews(base)) {
+      views.add(decoded);
+      views.add(unquoted(decoded));
+    }
+  }
+  return [...views];
 }
 
 export function isUnsafeProviderText(text: string): boolean {
