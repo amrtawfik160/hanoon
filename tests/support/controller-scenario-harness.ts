@@ -104,9 +104,10 @@ function parseJobStatusProjection(result: unknown): JobStatusProjection {
 }
 
 /**
- * The digest of the project policies actually stored for this trial, in a
+ * The digest of the project policies actually in force for this trial, in a
  * canonical order so two runs over the same policies agree and a changed policy
- * cannot pass for the same conditions.
+ * cannot pass for the same conditions. Disabled policies are deliberately
+ * absent: they govern nothing, so they are not part of what the trial ran under.
  */
 function durablePolicySha256(store: TelegramAgentStore): string {
   const policies = store.listEnabledProjectPolicies()
