@@ -1128,6 +1128,16 @@ describe("bounded text heuristics", () => {
   });
 
   it.each([
+    ["modal", "Tests can pass with either configuration."],
+    ["conditional result", "The function returns true when tests pass."],
+    ["imperative", "Pass the tests before merging."],
+    ["infinitive", "To pass the tests, configure the service."],
+  ] as const)("leaves non-result base success grammar as ordinary prose: %s", (_label, text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
     "Should I deploy the service?",
     "I did not deploy the service.",
     "The deployment failed.",
@@ -1274,6 +1284,63 @@ describe("bounded text heuristics", () => {
     expectRejection(
       claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("keeps a semicolon production qualifier bound to the execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed; they ran against production.",
+    }).segments[0];
+    expectRejection(
+      { disposition: "answered", segments: [claim], obligationRefs: [] },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("keeps a plain-segment production qualifier bound to the execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: " and used production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["CI object", "CI passed every test.", "pipeline_outcome"],
+    ["review object", "The review passed all tests.", "pipeline_outcome"],
+    ["deployment object", "The deployment passed every test.", "production_outcome"],
+    ["release object", "The release passed all regression tests.", "production_outcome"],
+    ["compound subjects", "Tests and CI passed.", "pipeline_outcome"],
+  ] as const)("fails closed when a test noun shares a larger success predicate: %s", (_label, text, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["CI before tests", "CI and tests passed.", "pipeline_outcome"],
+    ["review before tests", "The review and tests passed.", "pipeline_outcome"],
+    ["deployment before tests", "The deployment and tests passed.", "production_outcome"],
+    ["tests with review", "Tests together with review passed.", "pipeline_outcome"],
+  ] as const)("fails closed for mixed subject order in one predicate: %s", (_label, text, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
       "proof_incompatible",
     );
   });
@@ -1440,14 +1507,47 @@ describe("bounded text heuristics", () => {
     );
   });
 
-  it.each([
-    ["explicit CI subject", "CI passed every test."],
-    ["reported CI subject", "Tests reported CI passed."],
-  ] as const)("keeps a larger CI predicate bound to pipeline evidence: %s", (_label, text) => {
+  it("keeps a larger CI predicate bound to pipeline evidence when tests are only the reporter", () => {
+    const text = "Tests reported CI passed.";
     expect(validateControllerFinalization(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["adverbial result", "Tests did indeed pass."],
+    ["named test suite", "Ada's test suite passed."],
+    ["possessive test suite", "The team's test suite passed."],
+    ["named prepositional subject", "The tests of Ada passed."],
+    ["reduced relative", "The tests run by CI passed."],
+  ] as const)("recognizes whole local test predicates: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Passed tests and the review.",
+    "Passed the review and tests.",
+    "Passed tests and CI.",
+  ])("fails closed for reverse/postposed compound test predicates: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
     expectRejection(
       claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
@@ -1479,6 +1579,22 @@ describe("bounded text heuristics", () => {
         evidenceRow("evidence:2", "command_result", "succeeded"),
       ),
     )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["test production qualifier", "execution_result", "Tests passed in ", "command_result"],
+    ["release production qualifier", "pipeline_outcome", "The release was published to ", "pipeline_outcome"],
+  ] as const)("does not let production qualifiers escape across segments: %s", (_label, kind, claimText, proofKind) => {
+    const claim = claimFinalization({ kind, outcome: "succeeded", text: claimText }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: "production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
   });
 
   it.each([
@@ -1517,6 +1633,7 @@ describe("bounded text heuristics", () => {
     ["negative positive state", "Production is not live.", "pipeline_outcome", "failed", "pipeline_outcome", "failed"],
     ["negative production state", "The tests passed because production is down.", "execution_result", "succeeded", "command_result", "succeeded"],
     ["success outside production", "The release was published outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
+    ["unrelated earlier negation", "The release was not delayed and was published outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
     ["only outside production", "The release was published only outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
     ["all outside production", "The release was published all outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
     ["non-production", "The release was published in non-production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
@@ -1534,7 +1651,12 @@ describe("bounded text heuristics", () => {
     ["nowhere at all outside", "The release was published nowhere at all outside production.", "pipeline_outcome", "pipeline_outcome"],
     ["not outside", "The release was published not outside production.", "pipeline_outcome", "pipeline_outcome"],
     ["within rather than outside", "The release was published within rather than outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["inside rather than outside", "The release was published inside rather than outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["within instead of outside", "The release was published within instead of outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["everywhere but outside", "The release was published everywhere but outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["anything other than outside", "The release was published anything other than outside production.", "pipeline_outcome", "pipeline_outcome"],
     ["anything but outside", "The release was published anything but outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["anything but non-production", "The release was published anything but non-production.", "pipeline_outcome", "pipeline_outcome"],
     ["not non-production", "The release was published not non-production.", "pipeline_outcome", "pipeline_outcome"],
     ["not without touching", "The tests passed not without touching production.", "execution_result", "command_result"],
   ] as const)("requires production proof for ambiguous non-production wording: %s", (_label, text, kind, proofKind) => {
@@ -1564,6 +1686,40 @@ describe("bounded text heuristics", () => {
         text: "The tests passed not without touching production.",
       }),
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    "All tests are passing.",
+    "tests ran successfully",
+    "tests were a success",
+    "No tests failed.",
+  ])("rejects a natural test result in plain text: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "parser passed the value to next stage",
+    "Use the passed value as default",
+    "Pass the test fixture into helper",
+  ])("keeps non-result pass grammar ordinary: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it("rejects a Cyrillic confusable in a plain operational result", () => {
+    expectRejection(
+      textFinalization("Tests p\u0430ssed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it("rejects a Cyrillic confusable test subject in a pipeline-only claim", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Te\u0455ts passed." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
       "proof_incompatible",
     );
   });

@@ -204,17 +204,23 @@ const TEST_SUBJECT_TOKEN = /^test(?:s|ing|ed)?$/i;
 const LOCAL_SUBJECT_BOUNDARY_WORD = /^(?:and|although|because|but|however|or|so|therefore|then|while|yet)$/i;
 const LOCAL_SUBJECT_QUANTIFIER_WORD = /^(?:all|another|any|both|each|either|enough|every|few|less|many|more|most|neither|no|several|some)$/i;
 const LOCAL_RELATIVE_MARKER = /^(?:that|which|who|whom|whose)$/i;
-const LOCAL_FOCUS_MODIFIER_WORD = /^(?:also|even|just|now|still)$/i;
 const LOCAL_RELATIVE_PRONOUN = /^(?:i|we|you|he|she|they|it)$/i;
+const LOCAL_SUCCESS_VERB_WORD = /^(?:pass(?:ed)?|succeed(?:ed)?|complete(?:d)?|finish(?:ed)?|fail(?:ed)?|live|green)$/i;
+const NON_RESULT_TEST_SCOPE_WORD = /^(?:can|could|may|might|will|would|shall|should|must|if|when|unless|to)$/i;
 const MAX_PREDICATE_CONTEXT_CHARS = 256;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
+const MIXED_SCRIPT_CONFUSABLES: ReadonlyMap<string, string> = new Map([
+  ["а", "a"], ["А", "A"], ["е", "e"], ["Е", "E"], ["о", "o"], ["О", "O"],
+  ["р", "p"], ["Р", "P"], ["с", "c"], ["С", "C"], ["х", "x"], ["Х", "X"],
+  ["ѕ", "s"], ["Ѕ", "S"], ["і", "i"], ["І", "I"], ["ј", "j"], ["Ј", "J"],
+]);
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
   kinds: readonly ControllerClaimKind[];
   requiredProofKinds?: readonly ControllerProofKind[];
   genericSuccess?: boolean;
   testOnlySuccess?: boolean;
-  dominatesTestParticipation?: boolean;
+  testParticipationSensitive?: boolean;
 }>;
 
 const OPERATIONAL_SUCCESS_STATE = "(?:done|complete|completed|finished|successful|succeed|succeeded|passed|green|live|healthy|verified|ready|all\\s+set)";
@@ -280,12 +286,23 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     kinds: ["workspace_change"],
   },
   {
-    pattern: /\b(?:(?:the|all)\s+)?(?:production\s+)?(?:tests?(?:\s+suite)?|test\s+cases?)\s+(?:all\s+)?(?:is|are|was|were|has been|have been|had been)?\s*(?:pass|passed|succeed|succeeded|complete|completed|finished)\b/i,
+    pattern: /\b(?:(?:the|all)\s+)?(?:production\s+)?(?:tests?(?:\s+suite)?|test\s+cases?)\s+(?:all\s+)?(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|complete|completed|finished)\b/i,
     kinds: ["execution_result"],
+  },
+  {
+    pattern: /\b(?:all\s+)?tests?(?:\s+(?:cases?|suite))?\s+(?:(?:are|were|have been|has been|had been)\s+)?(?:passing|ran\s+successfully|a\s+success)\b/i,
+    kinds: ["execution_result"],
+    testParticipationSensitive: true,
+  },
+  {
+    pattern: /\bno\s+(?:tests?|test\s+cases?|test\s+suite)\s+failed\b/i,
+    kinds: ["execution_result"],
+    testParticipationSensitive: true,
   },
   {
     pattern: /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
     kinds: ["pipeline_outcome"],
+    testParticipationSensitive: true,
   },
   {
     pattern: /\b(?:i|we)\s+(?:have\s+)?(?:approved|completed)\s+(?:the\s+)?review\b/i,
@@ -349,6 +366,7 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     pattern: /\b(?:the\s+)?(?:deployment|release)\s+(?:succeed|succeeded|passed|completed|finished)\b/i,
     kinds: ["pipeline_outcome"],
     requiredProofKinds: ["production_outcome"],
+    testParticipationSensitive: true,
   },
   {
     pattern: /\b(?:the\s+)?(?:thread|job)(?:\s+[a-z][a-z0-9_-]*){0,3}\s+(?:succeeded|completed|finished|passed)\b/i,
@@ -378,16 +396,18 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   {
     pattern: new RegExp("\\b(?:ci|continuous integration|pipeline)\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished)\\b", "i"),
     kinds: ["pipeline_outcome"],
-    dominatesTestParticipation: true,
+    testParticipationSensitive: true,
   },
   {
     pattern: new RegExp("\\b(?:the\\s+)?checks?\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished)\\b", "i"),
     kinds: ["execution_result", "pipeline_outcome"],
+    testParticipationSensitive: true,
   },
   {
     pattern: new RegExp("\\b(?:the\\s+)?(?:rollout|release|deployment)\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished|live|healthy|verified)\\b", "i"),
     kinds: ["pipeline_outcome"],
     requiredProofKinds: ["production_outcome"],
+    testParticipationSensitive: true,
   },
   {
     pattern: /\b(?:the\s+)?(?:production\s+)?canary\s+(?:(?:is|was|has been|had been)\s+)?(?:succeeded|passed|completed|finished|green|healthy|verified|live)\b/i,
@@ -594,13 +614,11 @@ function predicateTokenIsPreposition(token: string): boolean {
 
 type LocalPredicateToken = Readonly<{
   word: string;
-  raw: string;
 }>;
 
 function localPredicateTokens(text: string): LocalPredicateToken[] {
   return [...text.matchAll(PREDICATE_TOKEN)].map((token) => ({
     word: token[0]!.toLowerCase(),
-    raw: token[0]!,
   }));
 }
 
@@ -615,142 +633,150 @@ function isLocalStructuralToken(token: string): boolean {
     || LOCAL_SUBJECT_BOUNDARY_WORD.test(token)
     || LOCAL_SUBJECT_QUANTIFIER_WORD.test(token)
     || LOCAL_RELATIVE_MARKER.test(token)
-    || LOCAL_FOCUS_MODIFIER_WORD.test(token)
     || isLocalAdverb(token);
-}
-
-function isLocalBoundaryToken(token: string): boolean {
-  return LOCAL_SUBJECT_BOUNDARY_WORD.test(token);
-}
-
-function relativeClauseMarkerBefore(
-  tokens: readonly LocalPredicateToken[],
-  endIndex: number,
-): number | null {
-  for (let index = endIndex - 1; index >= 0; index -= 1) {
-    if (isLocalBoundaryToken(tokens[index]!.word)) return null;
-    if (!LOCAL_RELATIVE_MARKER.test(tokens[index]!.word)) continue;
-    const relativeClause = tokens.slice(index + 1, endIndex + 1);
-    if (relativeClause.some((token) => PREDICATE_CHAIN_WORDS.has(token.word))) return index;
-    const significantTokens = relativeClause.filter((token) => !isLocalStructuralToken(token.word));
-    if (significantTokens.length >= 2) return index;
-    if (significantTokens.length === 1
-      && !relativeClause.some((token) => PREDICATE_DETERMINERS.has(token.word))
-      && !/^[A-Z]/.test(significantTokens[0]!.raw)) return index;
-  }
-  return null;
-}
-
-function reducedRelativeSubjectBefore(
-  tokens: readonly LocalPredicateToken[],
-  endIndex: number,
-): number | null {
-  for (let index = endIndex - 1; index >= 0; index -= 1) {
-    if (isLocalBoundaryToken(tokens[index]!.word)) return null;
-    if (!TEST_SUBJECT_TOKEN.test(tokens[index]!.word)) continue;
-    const following = tokens.slice(index + 1, endIndex + 1);
-    const significantTokens = following.filter((token) => !isLocalStructuralToken(token.word));
-    if (significantTokens.length === 2 && LOCAL_RELATIVE_PRONOUN.test(significantTokens[0]!.word)) return index;
-  }
-  return null;
-}
-
-function prepositionalObjectBefore(
-  tokens: readonly LocalPredicateToken[],
-  endIndex: number,
-): number | null {
-  const previous = tokens[endIndex - 1]?.word;
-  if (previous && predicateTokenIsPreposition(previous)) return endIndex - 1;
-  if (previous && (PREDICATE_DETERMINERS.has(previous) || LOCAL_SUBJECT_QUANTIFIER_WORD.test(previous))) {
-    const preposition = tokens[endIndex - 2]?.word;
-    if (preposition && predicateTokenIsPreposition(preposition)) return endIndex - 2;
-  }
-  return null;
-}
-
-function nearestSignificantSubject(tokens: readonly LocalPredicateToken[]): LocalPredicateToken | null {
-  let index = tokens.length - 1;
-  while (index >= 0) {
-    const token = tokens[index]!;
-    if (isLocalBoundaryToken(token.word)) return null;
-    if (isLocalStructuralToken(token.word)) {
-      index -= 1;
-      continue;
-    }
-    const relativeMarker = relativeClauseMarkerBefore(tokens, index);
-    if (relativeMarker !== null) {
-      index = relativeMarker - 1;
-      continue;
-    }
-    const reducedRelativeSubject = reducedRelativeSubjectBefore(tokens, index);
-    if (reducedRelativeSubject !== null) {
-      index = reducedRelativeSubject;
-      continue;
-    }
-    const preposition = prepositionalObjectBefore(tokens, index);
-    if (preposition !== null) {
-      index = preposition - 1;
-      continue;
-    }
-    const testModifier = tokens[index - 1];
-    if (testModifier && TEST_SUBJECT_TOKEN.test(testModifier.word)) return testModifier;
-    return token;
-  }
-  return null;
-}
-
-function firstSignificantSubject(tokens: readonly LocalPredicateToken[]): LocalPredicateToken | null {
-  let firstNonTestSubject: LocalPredicateToken | null = null;
-  let index = 0;
-  while (index < tokens.length) {
-    const token = tokens[index]!;
-    if (isLocalBoundaryToken(token.word)) return null;
-    if (isLocalStructuralToken(token.word)) {
-      index += 1;
-      continue;
-    }
-    if (TEST_SUBJECT_TOKEN.test(token.word)) return token;
-    firstNonTestSubject ??= token;
-    index += 1;
-  }
-  return firstNonTestSubject;
 }
 
 type LocalTestSubjectEntitlement = "none" | "execution" | "ambiguous";
 
-function hasCompoundTestParticipant(clause: string, match: OperationalMatch): boolean {
-  if (match.assertion.dominatesTestParticipation) return false;
-  const localStart = Math.max(0, match.start - MAX_PREDICATE_CONTEXT_CHARS);
-  const tokens = localPredicateTokens(clause.slice(localStart, match.end));
-  for (let index = 0; index < tokens.length; index += 1) {
-    if (!/^(?:and|or)$/.test(tokens[index]!.word)) continue;
-    if (!tokens.slice(0, index).some((token) => TEST_SUBJECT_TOKEN.test(token.word))) continue;
-    const following = tokens.slice(index + 1);
-    if (following.some((token) => TEST_SUBJECT_TOKEN.test(token.word))) continue;
-    if (following.some((token) => !isLocalStructuralToken(token.word))) return true;
+function isLocalCompoundConnector(
+  tokens: readonly LocalPredicateToken[],
+  index: number,
+): boolean {
+  const word = tokens[index]!.word;
+  if (/^(?:and|or)$/.test(word)) return true;
+  return word === "with" && /^(?:along|together)$/.test(tokens[index - 1]?.word ?? "");
+}
+
+function localSignificantTokens(tokens: readonly LocalPredicateToken[]): LocalPredicateToken[] {
+  return tokens.filter((token) => !isLocalStructuralToken(token.word));
+}
+
+function testNounIndex(
+  tokens: readonly LocalPredicateToken[],
+  fromEnd: boolean,
+): number | null {
+  const indexes = tokens.map((token, index) => TEST_SUBJECT_TOKEN.test(token.word) ? index : -1)
+    .filter((index) => index >= 0);
+  if (indexes.length === 0) return null;
+  return fromEnd ? indexes[indexes.length - 1]! : indexes[0]!;
+}
+
+function hasCompoundAroundTest(
+  tokens: readonly LocalPredicateToken[],
+  testIndex: number,
+  prefix: readonly LocalPredicateToken[],
+  suffix: readonly LocalPredicateToken[],
+): boolean {
+  const combined = [...prefix, ...tokens, ...suffix];
+  const combinedTestIndex = prefix.length + testIndex;
+  return combined.some((_, index) => {
+    if (!isLocalCompoundConnector(combined, index)) return false;
+    if (index < combinedTestIndex) return localSignificantTokens(combined.slice(0, index)).length > 0;
+    return localSignificantTokens(combined.slice(index + 1)).length > 0;
+  });
+}
+
+function matchSubjectTokens(clause: string, match: OperationalMatch): LocalPredicateToken[] {
+  if (match.assertion.testParticipationSensitive !== true) return [];
+  return localSignificantTokens(localPredicateTokens(clause.slice(match.start, match.end)))
+    .filter((token) => !LOCAL_SUCCESS_VERB_WORD.test(token.word));
+}
+
+function testParticipantBeforeMatch(
+  tokens: readonly LocalPredicateToken[],
+  testIndex: number,
+  matchedSubjectTokens: readonly LocalPredicateToken[],
+): LocalTestSubjectEntitlement {
+  if (hasCompoundAroundTest(tokens, testIndex, [], matchedSubjectTokens)) return "ambiguous";
+  const relation = tokens.slice(testIndex + 1);
+  const significant = [...localSignificantTokens(relation), ...matchedSubjectTokens];
+  const hasRelativeStructure = relation.some((token) => (
+    LOCAL_RELATIVE_MARKER.test(token.word) || predicateTokenIsPreposition(token.word)
+  ));
+  if (significant.length >= 2 && !hasRelativeStructure) {
+    if (LOCAL_RELATIVE_PRONOUN.test(significant[0]!.word)) return "execution";
+    return "none";
   }
-  return false;
+  return "execution";
+}
+
+function testParticipantAfterMatch(
+  tokens: readonly LocalPredicateToken[],
+  matchedSubjectTokens: readonly LocalPredicateToken[],
+): LocalTestSubjectEntitlement {
+  const testIndex = testNounIndex(tokens, false);
+  if (testIndex === null) return "none";
+  const combined = [...matchedSubjectTokens, ...tokens];
+  const combinedTestIndex = matchedSubjectTokens.length + testIndex;
+  const connectorBeforeTest = combined.findIndex((_, index) => (
+    index < combinedTestIndex && isLocalCompoundConnector(combined, index)
+  ));
+  if (connectorBeforeTest >= 0) {
+    return localSignificantTokens(combined.slice(0, connectorBeforeTest)).length > 0
+      ? "ambiguous"
+      : "none";
+  }
+  return hasCompoundAroundTest(tokens, testIndex, matchedSubjectTokens, []) ? "ambiguous" : "execution";
 }
 
 function localTestSubjectEntitlement(
   clause: string,
   match: OperationalMatch,
 ): LocalTestSubjectEntitlement {
-  if (hasCompoundTestParticipant(clause, match)) return "ambiguous";
-  const before = nearestSignificantSubject(localPredicateTokens(predicateContextBeforeMatch(clause, match)));
-  if (before) return TEST_SUBJECT_TOKEN.test(before.word) ? "execution" : "none";
-  const after = clause.slice(match.end, match.end + MAX_PREDICATE_CONTEXT_CHARS);
-  const afterSubject = firstSignificantSubject(localPredicateTokens(after));
-  return afterSubject !== null && TEST_SUBJECT_TOKEN.test(afterSubject.word) ? "execution" : "none";
+  const before = localPredicateTokens(predicateContextBeforeMatch(clause, match));
+  const matchedSubjectTokens = matchSubjectTokens(clause, match);
+  const matchContainsTest = localPredicateTokens(clause.slice(match.start, match.end))
+    .some((token) => TEST_SUBJECT_TOKEN.test(token.word));
+  if (matchContainsTest) return "execution";
+  const after = localPredicateTokens(clause.slice(match.end, match.end + MAX_PREDICATE_CONTEXT_CHARS));
+  const beforeIndex = testNounIndex(before, true);
+  const beforeEntitlement = beforeIndex === null
+    ? "none"
+    : testParticipantBeforeMatch(before, beforeIndex, matchedSubjectTokens);
+  const afterEntitlement = testParticipantAfterMatch(after, matchedSubjectTokens);
+  if (beforeEntitlement === "ambiguous" || afterEntitlement === "ambiguous") return "ambiguous";
+  if (beforeEntitlement === "execution" || afterEntitlement === "execution") return "execution";
+  return "none";
+}
+
+function isAffirmativeTestResult(clause: string, match: OperationalMatch): boolean {
+  const before = localPredicateTokens(predicateContextBeforeMatch(clause, match));
+  const testIndex = testNounIndex(before, true);
+  if (testIndex === null) return false;
+  const prefix = before.slice(0, testIndex);
+  const relation = before.slice(testIndex + 1);
+  const after = localPredicateTokens(clause.slice(match.end, match.end + MAX_PREDICATE_CONTEXT_CHARS));
+  return ![...prefix, ...relation, ...after].some((token) => NON_RESULT_TEST_SCOPE_WORD.test(token.word));
+}
+
+function genericSuccessMatchIsResult(
+  clause: string,
+  match: OperationalMatch,
+  entitlement: LocalTestSubjectEntitlement,
+): boolean {
+  if (entitlement !== "none") return true;
+  if (clause.slice(match.start, match.end).trim().toLowerCase() !== "passed") return true;
+  const before = localPredicateTokens(predicateContextBeforeMatch(clause, match));
+  const previous = before.at(-1)?.word;
+  if (previous && PREDICATE_DETERMINERS.has(previous)) return false;
+  const after = localPredicateTokens(clause.slice(match.end, match.end + MAX_PREDICATE_CONTEXT_CHARS));
+  const next = after[0]?.word;
+  return next === undefined
+    || (!PREDICATE_DETERMINERS.has(next) && !LOCAL_SUBJECT_QUANTIFIER_WORD.test(next));
 }
 
 function applySubjectEntitlement(clause: string, match: OperationalMatch): OperationalMatch | null {
   const entitlement = localTestSubjectEntitlement(clause, match);
-  if (match.assertion.testOnlySuccess && entitlement === "none") return null;
+  if (match.assertion.testOnlySuccess && !isAffirmativeTestResult(clause, match)) return null;
+  if (match.assertion.genericSuccess && !genericSuccessMatchIsResult(clause, match, entitlement)) return null;
   if (entitlement === "ambiguous") {
     return { ...match, assertion: { ...match.assertion, kinds: [] } };
   }
-  if (match.assertion.testOnlySuccess || (match.assertion.genericSuccess && entitlement === "execution")) {
+  if (entitlement === "execution" && (
+    match.assertion.genericSuccess
+    || match.assertion.testOnlySuccess
+    || match.assertion.testParticipationSensitive
+  )) {
     return { ...match, assertion: { ...match.assertion, kinds: ["execution_result"] } };
   }
   return match;
@@ -778,12 +804,15 @@ function operationalMatchesIn(clause: string): OperationalMatch[] {
 
 function effectiveOperationalMatches(clause: string): OperationalMatch[] {
   const matches = operationalMatchesIn(clause);
-  return matches.filter((match) => !matches.some((other) => (
-    other !== match &&
-    other.start <= match.start &&
-    other.end >= match.end &&
-    other.end - other.start > match.end - match.start
-  )));
+  return matches.filter((match) => {
+    const enclosingMatch = matches.some((other) => (
+      other !== match
+      && other.start <= match.start
+      && other.end >= match.end
+      && other.end - other.start > match.end - match.start
+    ));
+    return !enclosingMatch || match.assertion.kinds.includes("execution_result");
+  });
 }
 
 type SourceTextSpan = Readonly<{ text: string; start: number }>;
@@ -837,6 +866,17 @@ function hasObfuscatedOperationalAssertion(text: string): boolean {
   return operationalClauseSpans(canonical).some((span) => clauseHasHighImpactSuccess(span.text));
 }
 
+function repairedMixedScriptText(text: string): string {
+  if (!/\p{Script=Latin}/u.test(text) || !/\p{Script=Cyrillic}/u.test(text)) return text;
+  return Array.from(text, (character) => MIXED_SCRIPT_CONFUSABLES.get(character) ?? character).join("");
+}
+
+function hasMixedScriptConfusableOperationalAssertion(text: string): boolean {
+  const repaired = repairedMixedScriptText(text.normalize("NFKC"));
+  if (repaired === text) return false;
+  return operationalClauseSpans(repaired).some((span) => clauseHasHighImpactSuccess(span.text));
+}
+
 function isConcreteFollowUp(sentence: string): boolean {
   return CONTROLLER_COMMITMENT.test(sentence)
     && !NON_AFFIRMATIVE_FOLLOW_UP.test(sentence)
@@ -856,22 +896,49 @@ function clauseHasHighImpactSuccess(clause: string): boolean {
 }
 
 type ProductionClaimRange = Readonly<{ start: number; end: number }>;
+type ProductionTargetRequest = Readonly<{
+  renderedMessage: string;
+  match: OperationalMatch;
+  sourceStart: number;
+  claimRange: ProductionClaimRange;
+  segmentSpans: readonly FinalizationSegmentSpan[];
+}>;
 
 function productionTargetForMatch(
-  clause: string,
-  match: OperationalMatch,
-  claimRange: ProductionClaimRange,
+  request: ProductionTargetRequest,
 ): boolean {
-  const productionMentions = [...clause.matchAll(/\bproduction\b/gi)].map((mention) => ({
+  const { renderedMessage, match, sourceStart, claimRange, segmentSpans } = request;
+  const globalMatch: OperationalMatch = {
+    ...match,
+    start: sourceStart + match.start,
+    end: sourceStart + match.end,
+  };
+  const productionMentions = [...renderedMessage.matchAll(/\bproduction\b/gi)].map((mention) => ({
     start: mention.index ?? 0,
     end: (mention.index ?? 0) + mention[0].length,
   }));
   return productionMentions.some((mention) => (
-    mention.start >= claimRange.start
-    && mention.end <= claimRange.end
-    &&
-    !productionMentionIsExplicitlyNonTarget(clause, match, mention)
-  ));
+    productionMentionIsWithinClaim(mention, claimRange)
+      || productionMentionContinuesPlainText(renderedMessage, globalMatch, mention, segmentSpans)
+  ) && !productionMentionIsExplicitlyNonTarget(renderedMessage, globalMatch, mention));
+}
+
+function productionMentionIsWithinClaim(
+  mention: Readonly<{ start: number; end: number }>,
+  claimRange: ProductionClaimRange,
+): boolean {
+  return mention.start >= claimRange.start && mention.end <= claimRange.end;
+}
+
+function productionMentionContinuesPlainText(
+  renderedMessage: string,
+  match: OperationalMatch,
+  mention: Readonly<{ start: number; end: number }>,
+  segmentSpans: readonly FinalizationSegmentSpan[],
+): boolean {
+  if (mention.start <= match.end || /[.!?;]/.test(renderedMessage.slice(match.end, mention.start))) return false;
+  const owningSpan = segmentSpans.find((span) => mention.start >= span.start && mention.end <= span.end);
+  return owningSpan?.segment.type === "text";
 }
 
 function productionMentionIsExplicitlyNonTarget(
@@ -881,7 +948,7 @@ function productionMentionIsExplicitlyNonTarget(
 ): boolean {
   return isNoTouchProductionMention(clause, match, mention)
     || isGenuineNegativeProductionPredicate(clause, mention)
-    || isExplicitlyNonProductionMention(clause, mention);
+    || isExplicitlyNonProductionMention(clause, match, mention);
 }
 
 function isNoTouchProductionMention(
@@ -905,19 +972,19 @@ function isGenuineNegativeProductionPredicate(
 
 function isExplicitlyNonProductionMention(
   clause: string,
+  match: OperationalMatch,
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
-  const before = clause.slice(0, mention.start);
-  const outsideRelation = /\boutside\s+(?:the\s+)?$/i.exec(before);
+  const localRelation = clause.slice(match.end, mention.start).trim();
+  const outsideRelation = /\boutside(?:\s+the)?$/i.exec(localRelation);
   if (outsideRelation) {
-    const beforeOutside = before.slice(0, outsideRelation.index);
+    const beforeOutside = localRelation.slice(0, outsideRelation.index);
     if (/\b(?:not|never|no|nowhere|nothing|none)\b/i.test(beforeOutside)) return false;
-    if (/\b(?:within\s+rather\s+than|anything\s+but)\s*$/i.test(beforeOutside)) return false;
+    if (/(?:rather than|instead of|other than|anything but|everywhere but)\s*$/i.test(beforeOutside)) return false;
     return true;
   }
-  const nonProduction = /\bnon[-\s]$/i.exec(before);
-  if (!nonProduction) return false;
-  return !/\b(?:not|never|no|nowhere|nothing|none)\b/i.test(before.slice(0, nonProduction.index));
+  if (!/\bnon[-\s]$/i.test(localRelation)) return false;
+  return !/\b(?:not|never|no|nowhere|nothing|none|anything but)\b/i.test(localRelation);
 }
 
 type FinalizationSegmentSpan = Readonly<{
@@ -962,12 +1029,20 @@ function hasIncompatibleClaimText(
       if (!match.assertion.kinds.includes(onlySegment.kind) || onlySegment.outcome !== "succeeded") return true;
       const rows = evidenceRows(onlySegment, context);
       const claimRange: ProductionClaimRange = {
-        start: Math.max(0, onlyClaimSpan.start - sourceSpan.start),
-        end: Math.min(clause.length, onlyClaimSpan.end - sourceSpan.start),
+        start: onlyClaimSpan.start,
+        end: onlyClaimSpan.end,
       };
       const requiredProofKinds = [
         ...(match.assertion.requiredProofKinds ?? []),
-        ...(productionTargetForMatch(clause, match, claimRange) ? ["production_outcome" as const] : []),
+        ...(productionTargetForMatch({
+          renderedMessage,
+          match,
+          sourceStart: sourceSpan.start,
+          claimRange,
+          segmentSpans,
+        })
+          ? ["production_outcome" as const]
+          : []),
       ];
       if (requiredProofKinds.some((requiredProof) => (
         !rows.some((row) => row.proofKinds.includes(requiredProof))
@@ -994,9 +1069,10 @@ function plainTextRuns(candidate: ControllerFinalization): string[] {
 
 function hasUnclaimedHighImpactText(candidate: ControllerFinalization): boolean {
   return plainTextRuns(candidate).some((run) => (
-    normalizedSentences(run)
-      .flatMap((sentence) => splitOperationalSentence({ text: sentence, start: 0 }))
-      .some((span) => clauseHasHighImpactSuccess(span.text))
+    hasMixedScriptConfusableOperationalAssertion(run)
+      || normalizedSentences(run)
+        .flatMap((sentence) => splitOperationalSentence({ text: sentence, start: 0 }))
+        .some((span) => clauseHasHighImpactSuccess(span.text))
   ));
 }
 
@@ -1029,7 +1105,10 @@ function claimRejectionCode(
   if (hasMissingEvidence(candidateClaims, context)) return "evidence_missing";
   if (hasSubjectMismatch(candidateClaims, context)) return "subject_mismatch";
   if (hasProofIncompatibility(candidateClaims, context)) return "proof_incompatible";
-  if (candidateClaims.length > 0 && hasObfuscatedOperationalAssertion(renderedMessage)) return "proof_incompatible";
+  if (candidateClaims.length > 0 && (
+    hasObfuscatedOperationalAssertion(renderedMessage)
+    || hasMixedScriptConfusableOperationalAssertion(renderedMessage)
+  )) return "proof_incompatible";
   if (hasIncompatibleClaimText(candidate, renderedMessage, context)) return "proof_incompatible";
   return null;
 }
