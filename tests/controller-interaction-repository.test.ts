@@ -55,6 +55,12 @@ function percentEncodeLayers(value: string, layers: number): string {
   return encoded;
 }
 
+function unicodeEscapeLayer(value: string): string {
+  return Array.from(value)
+    .map((character) => `\\u{${character.codePointAt(0)!.toString(16)}}`)
+    .join("");
+}
+
 type CurrentFixture = {
   db: Database.Database;
   directory: string;
@@ -73,7 +79,7 @@ function approvalPayload(overrides: Record<string, unknown> = {}): Record<string
       kind: "command",
       itemId: "item_1",
       command: "npm test",
-      cwd: "/workspace/project",
+      cwd: "project",
       actions: [],
     },
     availableDecisions: ["allow_once", "allow_for_session", "deny"],
@@ -851,12 +857,28 @@ it.each([
   expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_nested_encoding" });
 });
 
+it("fails closed when another textual secret layer remains at the encoding depth cap", () => {
+  let encoded = "API_KEY=secret-value";
+  for (let depth = 0; depth < 5; depth += 1) encoded = Buffer.from(encoded, "utf8").toString("base64url");
+  expect(parseControllerInteraction("approval_encoding_depth_cap", approvalPayload({
+    subject: { kind: "command", command: `printf ${encoded}`, cwd: "project" },
+  }))).toEqual({ kind: "unsupported", interactionId: "approval_encoding_depth_cap" });
+});
+
+it("fails closed when nested Unicode escapes remain at the encoding depth cap", () => {
+  let encoded = "API_KEY=secret-value";
+  for (let depth = 0; depth < 5; depth += 1) encoded = unicodeEscapeLayer(encoded);
+  expect(parseControllerInteraction("approval_unicode_depth_cap", approvalPayload({
+    subject: { kind: "command", command: `printf ${encoded}`, cwd: "project" },
+  }))).toEqual({ kind: "unsupported", interactionId: "approval_unicode_depth_cap" });
+});
+
 it("keeps an opaque UUID command actionable while scanning encoded text", () => {
   expect(parseControllerInteraction("approval_uuid", approvalPayload({
     subject: {
       kind: "command",
       command: "echo 550e8400-e29b-41d4-a716-446655440000",
-      cwd: "/workspace/project",
+      cwd: "project",
     },
   }))).toMatchObject({ kind: "approval" });
 });
@@ -864,6 +886,7 @@ it("keeps an opaque UUID command actionable while scanning encoded text", () => 
 it.each([
   ["an absolute workspace path", "cat /workspace/project/README.md"],
   ["a private path", "cat /private/data/report.txt"],
+  ["a private filename", "cat .env"],
   ["a traversal path", "cat ../notes.txt"],
   ["a Windows absolute path", String.raw`type C:\workspace\project\README.md`],
 ] as const)("rejects %s in an approval command without rewriting its identity", (_name, command) => {
@@ -872,6 +895,46 @@ it.each([
   }));
   expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_command_path" });
   expect(JSON.stringify(projection)).not.toContain(command);
+});
+
+it.each([
+  ["an absolute cwd", { kind: "command", command: "npm test", cwd: "/workspace/project" }],
+  ["a private cwd", { kind: "command", command: "npm test", cwd: "/private/workspace" }],
+  ["a relative private cwd", { kind: "command", command: "npm test", cwd: "private/workspace" }],
+  ["a traversal cwd", { kind: "command", command: "npm test", cwd: "../private" }],
+  ["an absolute write scope", { kind: "file_change", writeScope: "/workspace/project/src/index.ts" }],
+  ["a private write scope", { kind: "file_change", writeScope: "/workspace/.env" }],
+  ["a relative private write scope", { kind: "file_change", writeScope: "private/credentials.json" }],
+  ["a session grant attached to a command", {
+    kind: "command",
+    command: "npm test",
+    cwd: "project",
+    sessionGrant: { network: null, fileSystem: null },
+  }],
+  ["a hidden absolute path field", {
+    kind: "file_change",
+    writeScope: "src",
+    path: "/workspace/.env",
+  }],
+  ["an attached redirect", { kind: "command", command: "echo hi 2>/tmp/output", cwd: "project" }],
+  ["an attached traversal redirect", { kind: "command", command: "echo hi >../output", cwd: "project" }],
+  ["an option-attached relative cwd", { kind: "command", command: "npm test --cwd=project", cwd: "project" }],
+] as const)("does not expose buttons for %s", (_name, subject) => {
+  const projection = parseControllerInteraction("approval_strict_identity", approvalPayload({ subject }));
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_strict_identity" });
+});
+
+it("shows exact safe relative approval paths without basename rewriting", () => {
+  expect(parseControllerInteraction("approval_relative_path", {
+    kind: "approval",
+    subject: { kind: "file_change", itemId: "file_1", writeScope: "src/index.ts" },
+    availableDecisions: ["allow_once", "deny"],
+  })).toEqual({
+    kind: "approval",
+    interactionId: "approval_relative_path",
+    summary: "wants to write files under src/index.ts",
+    decisions: ["allow_once", "deny"],
+  });
 });
 
 it.each([
@@ -922,28 +985,26 @@ it("does not offer buttons when an otherwise safe command cannot be shown lossle
 });
 
 it.each([
-  ["a safe basename", "/workspace/project/src/index.ts", "index.ts"],
-  ["the filesystem root", "/", "a protected path"],
-  ["a traversal to a secret file", "../../.env", "a protected path"],
-  ["a credentials suffix", "/workspace/credentials.json", "a protected path"],
-  ["a local environment file", "/workspace/.env.local", "a protected path"],
-  ["a private key suffix", "/workspace/private-key.txt", "a protected path"],
-  ["the shadow password file", "/etc/shadow", "a protected path"],
-  ["an Ed25519 private key", "/workspace/.ssh/id_ed25519", "a protected path"],
-  ["an ECDSA private key", "/workspace/.ssh/id_ecdsa", "a protected path"],
-  ["a DSA private key", "/workspace/.ssh/id_dsa", "a protected path"],
-  ["an SSH host key", "/etc/ssh/ssh_host_rsa_key", "a protected path"],
-  ["an SSH host certificate", "/etc/ssh/ssh_host_rsa_key-cert", "a protected path"],
-  ["a certificate file", "/workspace/client.crt", "a protected path"],
-] as const)("confines %s to %s", (_name, writeScope, expectedPath) => {
+  ["the filesystem root", "/"],
+  ["an absolute workspace path", "/workspace/project/src/index.ts"],
+  ["a traversal to a secret file", "../../.env"],
+  ["a credentials suffix", "/workspace/credentials.json"],
+  ["a local environment file", "/workspace/.env.local"],
+  ["a private key suffix", "/workspace/private-key.txt"],
+  ["the shadow password file", "/etc/shadow"],
+  ["an Ed25519 private key", "/workspace/.ssh/id_ed25519"],
+  ["an ECDSA private key", "/workspace/.ssh/id_ecdsa"],
+  ["a DSA private key", "/workspace/.ssh/id_dsa"],
+  ["an SSH host key", "/etc/ssh/ssh_host_rsa_key"],
+  ["an SSH host certificate", "/etc/ssh/ssh_host_rsa_key-cert"],
+  ["a certificate file", "/workspace/client.crt"],
+] as const)("does not expose a lossy projection for %s", (_name, writeScope) => {
   const projection = parseControllerInteraction("approval_path", {
     kind: "approval",
     subject: { kind: "file_change", itemId: "file_1", writeScope, sessionGrant: null },
     availableDecisions: ["allow_once", "deny"],
   });
-  expect(projection).toMatchObject({ kind: "approval" });
-  expect(JSON.stringify(projection)).toContain(expectedPath);
-  expect(JSON.stringify(projection)).not.toContain(writeScope);
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "approval_path" });
 });
 
 it.each([

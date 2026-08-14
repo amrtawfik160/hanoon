@@ -1,4 +1,4 @@
-import type { TelegramAgentStore } from "../storage/store";
+import type { ControllerSteerReservation, TelegramAgentStore } from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
 import {
   ControllerImagePreparationError,
@@ -7,6 +7,7 @@ import {
   type ControllerInteractionSnapshot,
   type ControllerAdapter,
   type ControllerLocation,
+  type ControllerSteerReconciliation,
   type ControllerStatus,
 } from "./bb-controller";
 import {
@@ -214,6 +215,11 @@ export class LunaControllerService {
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
 
+    if (await this.reconcileReservedSteer(controller.controllerKey, fence, signal)) return true;
+    turn = this.dependencies.store.getControllerTurn(submitted.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+
     if (await this.deliverAnsweredInteraction(turn, controller, fence, signal)) return true;
 
     const evidenceOutcome = await this.reconcileEvidence(controller, turn, fence, signal);
@@ -300,23 +306,28 @@ export class LunaControllerService {
             controllerKey: turn.controllerKey,
             expectedThreadId: controller.threadId,
           })) return true;
+          let outcome: ControllerSteerReconciliation = "applied";
           try {
             await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
           } catch {
-            // Out of attempts it stays queued, and the ordinary dispatch answers
-            // it once the turn in flight finishes.
-            this.dependencies.store.recordControllerSteerFailure({
-              ...fenceAt(fence, this.dependencies.clock.now()),
+            // A thrown call may have reached BB; reconcile before choosing any retry.
+            outcome = await this.reconcileProviderSteer({
+              controllerKey: turn.controllerKey,
               runningTurnId: turn.id,
               waitingTurnId: waiting.id,
-            });
-            return true;
+              threadId: controller.threadId,
+              inputText: waiting.inputText,
+              idempotencyKey: `controller-steer:${turn.id}:${waiting.id}`,
+            }, signal);
           }
-          this.dependencies.store.foldControllerTurnIntoRunning({
+          const settled = this.dependencies.store.settleControllerSteer({
             ...fenceAt(fence, this.dependencies.clock.now()),
             runningTurnId: turn.id,
             waitingTurnId: waiting.id,
+            controllerKey: turn.controllerKey,
+            outcome,
           });
+          if (settled === "stale") return true;
           return true;
         }
       }
@@ -362,6 +373,49 @@ export class LunaControllerService {
     }
     if (status === "idle" || observation.completed) return this.requestCompletionContinuation(turn, controller, fence, signal);
     return true;
+  }
+
+  private async reconcileReservedSteer(
+    controllerKey: string,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const reservation = this.dependencies.store.getControllerSteerReservation(controllerKey);
+    if (!reservation) return false;
+    const outcome = await this.reconcileProviderSteer(reservation, signal);
+    const settled = this.dependencies.store.settleControllerSteer({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      runningTurnId: reservation.runningTurnId,
+      waitingTurnId: reservation.waitingTurnId,
+      controllerKey: reservation.controllerKey,
+      outcome,
+    });
+    return settled === "settled" || settled === "stale";
+  }
+
+  private async reconcileProviderSteer(
+    reservation: ControllerSteerReservation,
+    signal: AbortSignal,
+  ): Promise<ControllerSteerReconciliation> {
+    const reconcile = this.dependencies.adapter.reconcileSteer;
+    if (!reconcile || signal.aborted || reservation.threadId.length === 0 || reservation.inputText === null) {
+      return "unknown";
+    }
+    try {
+      const outcome = await reconcile({
+        threadId: reservation.threadId,
+        text: reservation.inputText,
+        idempotencyKey: reservation.idempotencyKey,
+        signal,
+      });
+      return outcome === "applied" || outcome === "not_applied" || outcome === "unknown"
+        ? outcome
+        : "unknown";
+    } catch {
+      // A transport or provider error cannot distinguish delivery from refusal.
+      // The caller must settle it as unknown so a successor never replays it.
+      return "unknown";
+    }
   }
 
   private async reconcileEvidence(

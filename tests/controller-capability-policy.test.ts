@@ -60,7 +60,7 @@ const EXPECTED_CAPABILITIES = {
     project_scope: "exact_entity",
     credential_scope: { credential: "none", audience: "none" },
     egress: ["none"],
-    proof_kinds: ["job_state", "pipeline_outcome", "obligation"],
+    proof_kinds: ["job_state", "pipeline_outcome", "production_outcome", "obligation"],
     receipt_kind: "observation",
     result_limit: 8_000,
   },

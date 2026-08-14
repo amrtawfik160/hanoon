@@ -434,6 +434,31 @@ export type ExecutorAttemptPatch = ExecutorFence & Readonly<{
   };
 }>;
 
+export type ControllerSteerReservation = Readonly<{
+  controllerKey: string;
+  runningTurnId: string;
+  waitingTurnId: string;
+  threadId: string;
+  inputText: string | null;
+  idempotencyKey: string;
+}>;
+export type ControllerSteerSettlement = "applied" | "not_applied" | "unknown";
+export type ControllerSteerSettlementResult = "settled" | "stale";
+export type ControllerSteerSettlementInput = ControllerLeaseFence & Readonly<{
+  runningTurnId: string;
+  waitingTurnId: string;
+  controllerKey: string;
+  outcome: ControllerSteerSettlement;
+}>;
+
+type ControllerSteerSettlementRow = Readonly<{
+  controllerKey: string;
+  waitingState: ControllerTurnState | null;
+  waitingOrdinal: number | null;
+  inputText: string | null;
+  telegramChatId: string;
+}>;
+
 export type ExecutorReviewThreadInput = ExecutorFence & Readonly<{
   jobId: string;
   expectedVersion: number;
@@ -1888,12 +1913,14 @@ export interface TelegramAgentStore {
     expectedThreadId?: string | null;
   }): boolean;
   getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null;
+  getControllerSteerReservation(controllerKey: string): ControllerSteerReservation | null;
   reserveControllerSteer(input: ControllerLeaseFence & {
     runningTurnId: string;
     waitingTurnId: string;
     controllerKey: string;
     expectedThreadId: string;
   }): boolean;
+  settleControllerSteer(input: ControllerSteerSettlementInput): ControllerSteerSettlementResult;
   recordControllerSteerFailure(input: ControllerLeaseFence & {
     runningTurnId: string;
     waitingTurnId: string;
@@ -4150,6 +4177,159 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  public getControllerSteerReservation(controllerKey: string): ControllerSteerReservation | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT running.id AS running_turn_id,
+              running.steer_reservation_turn_id AS waiting_turn_id,
+              running.controller_key,
+              controller.bb_thread_id AS thread_id,
+              waiting.input_text
+         FROM controller_turns AS running
+         JOIN controller_threads AS controller ON controller.controller_key = running.controller_key
+         LEFT JOIN controller_turns AS waiting
+           ON waiting.id = running.steer_reservation_turn_id
+        WHERE running.controller_key = ?
+          AND running.state = 'submitted'
+          AND running.steer_reservation_turn_id IS NOT NULL
+        ORDER BY running.ordinal ASC
+        LIMIT 1`,
+    ).get(controllerKey) as {
+      running_turn_id: string;
+      waiting_turn_id: string;
+      controller_key: string;
+      thread_id: string | null;
+      input_text: string | null;
+    } | undefined;
+    if (!row) return null;
+    return {
+      controllerKey: row.controller_key,
+      runningTurnId: row.running_turn_id,
+      waitingTurnId: row.waiting_turn_id,
+      threadId: row.thread_id ?? "",
+      inputText: row.input_text,
+      idempotencyKey: `controller-steer:${row.running_turn_id}:${row.waiting_turn_id}`,
+    };
+  }
+
+  private controllerSteerSettlementRow(input: ControllerSteerSettlementInput): ControllerSteerSettlementRow | null {
+    const row = this.db.prepare(
+      `SELECT running.controller_key AS controllerKey,
+              waiting.state AS waitingState,
+              waiting.ordinal AS waitingOrdinal,
+              waiting.input_text AS inputText,
+              controller.telegram_chat_id AS telegramChatId
+         FROM controller_turns AS running
+         JOIN controller_threads AS controller ON controller.controller_key = running.controller_key
+         LEFT JOIN controller_turns AS waiting
+           ON waiting.id = running.steer_reservation_turn_id
+        WHERE running.id = ? AND running.controller_key = ? AND running.state = 'submitted'
+          AND running.lease_owner = ? AND running.lease_generation = ?
+          AND running.accepted_finalization_id IS NULL
+          AND running.steer_reservation_turn_id = ?`,
+    ).get(
+      input.runningTurnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.waitingTurnId,
+    ) as ControllerSteerSettlementRow | undefined;
+    return row ?? null;
+  }
+
+  private clearControllerSteerReservation(input: ControllerSteerSettlementInput): boolean {
+    return this.db.prepare(
+      `UPDATE controller_turns
+          SET steer_reservation_turn_id = NULL, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'submitted'
+          AND lease_owner = ? AND lease_generation = ?
+          AND accepted_finalization_id IS NULL
+          AND steer_reservation_turn_id = ?`,
+    ).run(
+      input.now,
+      input.runningTurnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.waitingTurnId,
+    ).changes === 1;
+  }
+
+  private completeAppliedControllerSteer(
+    input: ControllerSteerSettlementInput,
+    row: ControllerSteerSettlementRow,
+  ): void {
+    const folded = "(sent to the answer already in progress)";
+    const updated = this.db.prepare(
+      `UPDATE controller_turns
+          SET state = 'completed', response_text = ?, stream_phase = 'complete',
+              completed_at = ?, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
+    ).run(folded, input.now, input.now, input.waitingTurnId, input.controllerKey);
+    if (updated.changes !== 1) return;
+    if (row.waitingOrdinal === null) throw new Error("queued controller steer has no ordinal");
+    this.appendControllerDigestRow({
+      controllerKey: row.controllerKey,
+      ordinal: row.waitingOrdinal,
+      ownerText: row.inputText ?? "",
+      agentText: folded,
+      now: input.now,
+    });
+  }
+
+  private retryUnappliedControllerSteer(input: ControllerSteerSettlementInput): void {
+    this.db.prepare(
+      `UPDATE controller_turns
+          SET retry_count = retry_count + 1, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
+    ).run(input.now, input.waitingTurnId, input.controllerKey);
+  }
+
+  private failAmbiguousControllerSteer(
+    input: ControllerSteerSettlementInput,
+    row: ControllerSteerSettlementRow,
+  ): void {
+    const error = "Controller steer result was ambiguous; the queued message was not replayed";
+    const failed = this.db.prepare(
+      `UPDATE controller_turns
+          SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
+              completed_at = ?, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
+    ).run(error, input.now, input.now, input.waitingTurnId, input.controllerKey);
+    if (failed.changes !== 1) return;
+    persistControllerOutbox(
+      this.db,
+      controllerFailureOutbox(input.waitingTurnId, row.telegramChatId),
+      input.now,
+    );
+  }
+
+  public settleControllerSteer(input: ControllerSteerSettlementInput): ControllerSteerSettlementResult {
+    this.assertControllerSteerInput(input);
+    assertControllerKey(input.controllerKey);
+    if (input.outcome !== "applied" && input.outcome !== "not_applied" && input.outcome !== "unknown") {
+      throw new TypeError("controller steer settlement outcome is invalid");
+    }
+    return this.db.transaction((): ControllerSteerSettlementResult => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+      const row = this.controllerSteerSettlementRow(input);
+      if (!row) return "stale";
+
+      if (!this.clearControllerSteerReservation(input)) return "stale";
+      if (row.waitingState !== "queued") return "settled";
+      if (input.outcome === "applied") {
+        this.completeAppliedControllerSteer(input, row);
+        return "settled";
+      }
+      if (input.outcome === "not_applied") {
+        this.retryUnappliedControllerSteer(input);
+        return "settled";
+      }
+      this.failAmbiguousControllerSteer(input, row);
+      return "settled";
+    }).immediate();
+  }
+
   /**
    * Counts a steer BB would not take and releases its reservation together
    * with the retry increment. The reconcile loop runs at draft speed while an
@@ -4160,32 +4340,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     runningTurnId: string;
     waitingTurnId: string;
   }): boolean {
-    this.assertControllerSteerInput(input);
-    return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const updated = this.db.prepare(
-        `UPDATE controller_turns
-            SET retry_count = retry_count + 1, updated_at = ?
-          WHERE id = ? AND state = 'queued'
-            AND EXISTS (
-              SELECT 1 FROM controller_turns AS running
-               WHERE running.id = ? AND running.controller_key = controller_turns.controller_key
-                 AND running.state = 'submitted'
-                 AND running.lease_owner = ? AND running.lease_generation = ?
-                 AND running.accepted_finalization_id IS NULL
-                 AND running.steer_reservation_turn_id = controller_turns.id
-            )`,
-      ).run(input.now, input.waitingTurnId, input.runningTurnId, input.ownerId, input.generation);
-      if (updated.changes !== 1) return false;
-      const cleared = this.db.prepare(
-        `UPDATE controller_turns
-            SET steer_reservation_turn_id = NULL, updated_at = ?
-          WHERE id = ? AND state = 'submitted' AND lease_owner = ? AND lease_generation = ?
-            AND steer_reservation_turn_id = ?`,
-      ).run(input.now, input.runningTurnId, input.ownerId, input.generation, input.waitingTurnId);
-      if (cleared.changes !== 1) throw new Error("controller steer reservation disappeared during failure");
-      return true;
-    }).immediate();
+    const running = this.getControllerTurn(input.runningTurnId);
+    if (!running) return false;
+    return this.settleControllerSteer({
+      ...input,
+      controllerKey: running.controllerKey,
+      outcome: "not_applied",
+    }) === "settled";
   }
 
   /** The oldest message still waiting behind an answer that is being written. */
@@ -4208,62 +4369,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     runningTurnId: string;
     waitingTurnId: string;
   }): boolean {
-    this.assertControllerSteerInput(input);
-    return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const row = this.db.prepare(
-        `SELECT waiting.* FROM controller_turns AS waiting
-          WHERE waiting.id = ? AND waiting.state = 'queued'
-            AND EXISTS (
-              SELECT 1 FROM controller_turns AS running
-               WHERE running.id = ? AND running.controller_key = waiting.controller_key
-                 AND running.state = 'submitted'
-                 AND running.lease_owner = ? AND running.lease_generation = ?
-                 AND running.accepted_finalization_id IS NULL
-                 AND running.steer_reservation_turn_id = waiting.id
-            )`,
-      ).get(input.waitingTurnId, input.runningTurnId, input.ownerId, input.generation) as ControllerTurnRow | undefined;
-      if (!row) return false;
-      const folded = "(sent to the answer already in progress)";
-      const updated = this.db.prepare(
-        `UPDATE controller_turns
-            SET state = 'completed', response_text = ?, stream_phase = 'complete',
-                completed_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'queued'
-            AND EXISTS (
-              SELECT 1 FROM controller_turns AS running
-               WHERE running.id = ? AND running.controller_key = controller_turns.controller_key
-                 AND running.state = 'submitted'
-                 AND running.lease_owner = ? AND running.lease_generation = ?
-                 AND running.accepted_finalization_id IS NULL
-                 AND running.steer_reservation_turn_id = controller_turns.id
-            )`,
-      ).run(
-        folded,
-        input.now,
-        input.now,
-        input.waitingTurnId,
-        input.runningTurnId,
-        input.ownerId,
-        input.generation,
-      );
-      if (updated.changes !== 1) return false;
-      const cleared = this.db.prepare(
-        `UPDATE controller_turns
-            SET steer_reservation_turn_id = NULL, updated_at = ?
-          WHERE id = ? AND state = 'submitted' AND lease_owner = ? AND lease_generation = ?
-            AND accepted_finalization_id IS NULL AND steer_reservation_turn_id = ?`,
-      ).run(input.now, input.runningTurnId, input.ownerId, input.generation, input.waitingTurnId);
-      if (cleared.changes !== 1) throw new Error("controller steer reservation disappeared during fold");
-      this.appendControllerDigestRow({
-        controllerKey: row.controller_key,
-        ordinal: row.ordinal,
-        ownerText: row.input_text,
-        agentText: folded,
-        now: input.now,
-      });
-      return true;
-    }).immediate();
+    const running = this.getControllerTurn(input.runningTurnId);
+    if (!running) return false;
+    return this.settleControllerSteer({
+      ...input,
+      controllerKey: running.controllerKey,
+      outcome: "applied",
+    }) === "settled";
   }
 
   /**

@@ -22,7 +22,7 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, readonly ControllerProofKind[]> 
   execution_result: ["command_result", "tool_result"],
   workspace_change: ["workspace_change"],
   external_mutation: ["external_mutation"],
-  pipeline_outcome: ["pipeline_outcome"],
+  pipeline_outcome: ["pipeline_outcome", "production_outcome"],
   health_assessment: ["health_snapshot"],
   uncertainty: CONTROLLER_PROOF_KINDS,
 };
@@ -499,6 +499,14 @@ describe("ordered rejection branches", () => {
     );
   });
 
+  it("does not treat merge-only pipeline evidence as production proof", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Deployment succeeded." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
   it("requires an owner boundary for needs_owner", () => {
     const candidate: ControllerFinalization = {
       disposition: "needs_owner",
@@ -782,6 +790,8 @@ describe("fail-closed operational claim binding", () => {
     ["build success", "The build succeeded."],
     ["CI success", "CI is green."],
     ["rollout success", "The rollout succeeded."],
+    ["canary health", "The canary was healthy."],
+    ["production canary", "Production canary passed."],
     ["finished work", "The work is finished."],
   ] as const)("rejects %s when declared as an observed state without its outcome", (_label, text) => {
     expectRejection(
@@ -795,7 +805,7 @@ describe("fail-closed operational claim binding", () => {
     ["generic completion", "Everything is done.", "pipeline_outcome", "pipeline_outcome"],
     ["build success", "The build succeeded.", "execution_result", "command_result"],
     ["CI success", "CI is green.", "pipeline_outcome", "pipeline_outcome"],
-    ["rollout success", "The rollout succeeded.", "pipeline_outcome", "pipeline_outcome"],
+    ["rollout success", "The rollout succeeded.", "pipeline_outcome", "production_outcome"],
     ["finished work", "The work is finished.", "pipeline_outcome", "pipeline_outcome"],
   ] as const)("accepts %s when its claim kind and evidence carry the assertion", (_label, text, kind, proofKind) => {
     expect(validateControllerFinalization(
@@ -839,6 +849,14 @@ describe("fail-closed operational claim binding", () => {
   it("does not let a negative subordinate clause suppress an earlier success assertion", () => {
     expectRejection(
       textFinalization("The tests passed, although deployment failed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it("does not let a negative because-clause suppress an earlier success assertion", () => {
+    expectRejection(
+      textFinalization("The tests passed because deployment failed."),
       emptyFinalizationContext(),
       "high_impact_text_unclaimed",
     );
@@ -1116,7 +1134,19 @@ describe("bounded text heuristics", () => {
         outcome: "succeeded",
         text: "The deployment succeeded in production.",
       }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("requires production proof for a canary claim", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Production canary passed." }),
       contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Production canary passed." }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
   });
 

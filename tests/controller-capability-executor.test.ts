@@ -1066,6 +1066,12 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   const completeJob = fixture.store.getJob(job.id);
   if (!completeJob) throw new Error("complete pipeline job disappeared");
   expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(true);
+  const completeStatus = JSON.parse(await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    { jobId: job.id },
+    { threadId: controller.threadId, projectId: controller.projectId },
+  ) as string) as { _hanoonEvidence: { proofKinds: string[] } };
+  expect(completeStatus._hanoonEvidence.proofKinds).toContain("production_outcome");
 
   const mutateProduction = (id: string, snapshot: Record<string, unknown>) => {
     const outputText = JSON.stringify(snapshot);

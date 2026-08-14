@@ -32,7 +32,7 @@ function approvalInteraction(): PendingThreadInteraction {
     status: "pending",
     payload: {
       kind: "approval",
-      subject: { kind: "command", itemId: "i1", command: "rm -rf build", cwd: "/repo", actions: [] },
+      subject: { kind: "command", itemId: "i1", command: "rm -rf build", cwd: "repo", actions: [] },
       availableDecisions: ["allow_once", "allow_for_session", "deny"],
     },
   };
@@ -149,7 +149,7 @@ it("asks the owner to approve a command a thread is blocked on", async () => {
   });
 });
 
-it("renders only canonical provider decisions and hides protected absolute paths", async () => {
+it("does not render an approval with a protected absolute cwd", async () => {
   const store = fixture();
   const interaction: PendingThreadInteraction = {
     id: "pint_canonical",
@@ -170,17 +170,13 @@ it("renders only canonical provider decisions and hides protected absolute paths
   await service(store, { threads: [watched()], interactions: [interaction] }).service.processDue();
 
   const asked = store.getOutbox("thread-interaction:pint_canonical");
-  expect(asked?.payload.text).toContain("in a protected path");
+  expect(asked?.payload.text).toContain("can't answer from here");
   expect(asked?.payload.text).not.toContain("/home/");
   expect(asked?.payload.text).not.toContain("id_rsa");
-  const keyboard = asked?.payload.reply_markup as
-    | { inline_keyboard: Array<Array<{ text: string }>> }
-    | undefined;
-  expect(keyboard?.inline_keyboard.flat().map((button) => button.text))
-    .toEqual(["Allow once", "Deny"]);
+  expect(asked?.payload.reply_markup).toBeUndefined();
 });
 
-it("hides absolute write scopes in generic approval summaries", async () => {
+it("does not render an approval with a protected absolute write scope", async () => {
   const store = fixture();
   const interaction: PendingThreadInteraction = {
     id: "pint_write_scope",
@@ -195,9 +191,10 @@ it("hides absolute write scopes in generic approval summaries", async () => {
   await service(store, { threads: [watched()], interactions: [interaction] }).service.processDue();
 
   const asked = store.getOutbox("thread-interaction:pint_write_scope");
-  expect(asked?.payload.text).toContain("a protected path");
+  expect(asked?.payload.text).toContain("can't answer from here");
   expect(asked?.payload.text).not.toContain("/srv/");
   expect(asked?.payload.text).not.toContain("credentials.json");
+  expect(asked?.payload.reply_markup).toBeUndefined();
 });
 
 it("does not offer approval buttons when a command cannot be displayed losslessly", async () => {

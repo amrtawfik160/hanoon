@@ -64,6 +64,7 @@ type LegacyControllerEventObservation = Omit<ControllerEventObservation, "assist
 } & Record<string, unknown>;
 
 export type ControllerEventResult = ControllerEventObservation | LegacyControllerEventObservation;
+export type ControllerSteerReconciliation = "applied" | "not_applied" | "unknown";
 
 type ControllerAdapterMethods = {
   spawn(
@@ -83,6 +84,13 @@ type ControllerAdapterMethods = {
     text: string,
     signal: AbortSignal,
   ): Promise<void>;
+  /** Reconciles a previously reserved steer without replaying it. */
+  reconcileSteer?(input: {
+    threadId: string;
+    text: string;
+    idempotencyKey: string;
+    signal: AbortSignal;
+  }): Promise<ControllerSteerReconciliation>;
   answerQuestion(
     threadId: string,
     interactionId: string,

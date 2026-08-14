@@ -307,7 +307,7 @@ it("matches the exact trusted 21-tool projection permission matrix", () => {
   const expected = [
     ["telegram_agent_list_projects", ["project_state"]],
     ["telegram_agent_start_job", ["job_state", "external_mutation", "obligation"]],
-    ["telegram_agent_job_status", ["job_state", "pipeline_outcome", "obligation"]],
+    ["telegram_agent_job_status", ["job_state", "pipeline_outcome", "production_outcome", "obligation"]],
     ["telegram_agent_retry_job", ["job_state", "external_mutation", "obligation"]],
     ["telegram_agent_cancel_job", ["job_state", "external_mutation"]],
     ["telegram_agent_list_threads", ["thread_state"]],

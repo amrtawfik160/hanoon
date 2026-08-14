@@ -876,7 +876,7 @@ it("hands a message sent mid-answer to the thread already writing it", async () 
   expect(store.getControllerTurn(running.id)?.state).toBe("submitted");
 });
 
-it("leaves a mid-answer message queued when the thread will not take it", async () => {
+it("fails a mid-answer message when the provider steer result is ambiguous", async () => {
   const { store, fence } = storeFixture("service-steer-fails");
   submittedTurn(store, fence);
   const correction = store.enqueueControllerTurn({
@@ -895,7 +895,10 @@ it("leaves a mid-answer message queued when the thread will not take it", async 
 
   await service.reconcile({ ...fence, signal }, signal);
 
-  expect(store.getControllerTurn(correction.id)?.state).toBe("queued");
+  expect(store.getControllerTurn(correction.id)).toMatchObject({
+    state: "failed",
+    lastError: expect.stringContaining("ambiguous"),
+  });
 });
 
 it("retires a parked question when its turn dies, so later messages are not swallowed", () => {
@@ -940,7 +943,7 @@ it("does not deliver an answer whose turn died before BB heard it", async () => 
   expect(adapter.answerQuestion).not.toHaveBeenCalled();
 });
 
-it("stops re-steering a message the thread keeps refusing", async () => {
+it("does not replay a message when the provider keeps returning ambiguous steer results", async () => {
   const { store, fence } = storeFixture("steer-bounded");
   submittedTurn(store, fence);
   const correction = store.enqueueControllerTurn({
@@ -963,7 +966,7 @@ it("stops re-steering a message the thread keeps refusing", async () => {
   // Bounded: the reconcile loop runs every 250ms while streaming, so an
   // unbounded retry here would hammer BB for as long as the answer takes.
   expect(steer.mock.calls.length).toBeLessThanOrEqual(3);
-  expect(store.getControllerTurn(correction.id)?.state).toBe("queued");
+  expect(store.getControllerTurn(correction.id)).toMatchObject({ state: "failed" });
 });
 
 it("retires the wedged thread when a turn stalls, so the next message is not stuck behind it", async () => {

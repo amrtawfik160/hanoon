@@ -720,6 +720,7 @@ it("exposes the fixed proof-kind vocabulary once from controller models", async 
     "workspace_change",
     "external_mutation",
     "pipeline_outcome",
+    "production_outcome",
     "obligation",
     "retrieved_content",
     "health_snapshot",

@@ -286,7 +286,7 @@ function fakeControllerInteraction(
         kind: "command",
         itemId: "command-approval-1",
         command: "npm test",
-        cwd: "/workspace",
+        cwd: "workspace",
         actions: [],
         sessionGrant: null,
       },

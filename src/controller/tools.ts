@@ -892,6 +892,10 @@ export function verifiedPipelineOutcome(store: TelegramAgentStore, job: Job): bo
     failedProductionStage(store, job, { role: "CANARY", phase: "canary", mergeSha: facts.mergeSha });
 }
 
+function verifiedProductionOutcome(store: TelegramAgentStore, job: Job): boolean {
+  return terminalPipelineFacts(job)?.production !== undefined && verifiedPipelineOutcome(store, job);
+}
+
 function jobProjectionEvidence(
   dependencies: ToolDependencies,
   domain: ControllerJsonObject,
@@ -920,11 +924,15 @@ function jobProjectionEvidence(
   const current = exactId ? dependencies.store.getJob(exactId) : null;
   const before = trustedState(resolution).beforeJob;
   const changed = current !== null && before !== null && before !== undefined && current.version !== before.version;
-  const proofKinds: ("job_state" | "pipeline_outcome" | "external_mutation" | "obligation")[] = ["job_state"];
+  const proofKinds: ("job_state" | "pipeline_outcome" | "production_outcome" | "external_mutation" | "obligation")[] = ["job_state"];
   const verifiedPipeline = mutation === "read" && current !== null && verifiedPipelineOutcome(dependencies.store, current);
+  const verifiedProduction = mutation === "read" && current !== null && verifiedProductionOutcome(dependencies.store, current);
   if (mutation !== "read" && changed) proofKinds.push("external_mutation");
   if (verifiedPipeline) {
     proofKinds.push("pipeline_outcome");
+  }
+  if (verifiedProduction) {
+    proofKinds.push("production_outcome");
   }
   if (current !== null && !TERMINAL_JOB_STATES.has(current.state) && mutation !== "cancel") proofKinds.push("obligation");
   return {

@@ -112,7 +112,7 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, ReadonlySet<ControllerProofKind>
   execution_result: new Set(["command_result", "tool_result"]),
   workspace_change: new Set(["workspace_change"]),
   external_mutation: new Set(["external_mutation"]),
-  pipeline_outcome: new Set(["pipeline_outcome"]),
+  pipeline_outcome: new Set(["pipeline_outcome", "production_outcome"]),
   health_assessment: new Set(["health_snapshot"]),
   uncertainty: new Set(CONTROLLER_PROOF_KINDS),
 };
@@ -180,6 +180,7 @@ const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u1
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
   kinds: readonly ControllerClaimKind[];
+  requiredProofKinds?: readonly ControllerProofKind[];
 }>;
 
 const OPERATIONAL_SUCCESS_STATE = "(?:done|complete|completed|finished|successful|succeeded|passed|green|live|healthy|verified|ready|all\\s+set)";
@@ -204,8 +205,13 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     kinds: ["execution_result"],
   },
   {
-    pattern: /\b(?:shipped|deployed|released|rolled\s+out|merged|published|promoted|provisioned|configured|enabled|activated|launched|landed)\b/i,
+    pattern: /\b(?:shipped|merged|published|configured|enabled|activated|launched|landed)\b/i,
     kinds: ["external_mutation", "pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:deployed|released|rolled\s+out|promoted|provisioned)\b/i,
+    kinds: ["external_mutation", "pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
   },
   {
     pattern: /\b(?:done|complete|completed|finished|successful|succeeded|passed|green|live|resolved|wrapped\s+up|good\s+to\s+go|went\s+smoothly|cleared\s+(?:its|the)\s+(?:final\s+)?gate)\b/i,
@@ -250,10 +256,12 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   {
     pattern: /\b(?:i|we)\s+(?:have\s+)?deployed\s+(?:the\s+)?(?:[a-z]+\s+){0,3}(?:service|deployment|production)\b/i,
     kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
   },
   {
     pattern: /\b(?:the\s+)?(?:service|deployment|production)\s+(?:is|was|has been|had been)\s+(?:deployed|live|healthy|verified)\b/i,
     kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
   },
   {
     pattern: new RegExp("\\b(?:i|we)\\s+(?:have\\s+)?(?:deleted|removed|purged)\\s+(?:the\\s+)?(?:[a-z]+\\s+){0,3}" + DOMAIN_OBJECT + "\\b", "i"),
@@ -294,6 +302,7 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   {
     pattern: /\b(?:the\s+)?(?:deployment|release)\s+(?:succeeded|passed|completed|finished)\b/i,
     kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
   },
   {
     pattern: /\b(?:the\s+)?(?:thread|job)(?:\s+[a-z][a-z0-9_-]*){0,3}\s+(?:succeeded|completed|finished|passed)\b/i,
@@ -330,14 +339,22 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   {
     pattern: new RegExp("\\b(?:the\\s+)?(?:rollout|release|deployment)\\s+" + OPERATIONAL_STATE_LINK + "\\s*(?:green|successful|succeeded|passed|complete|completed|finished|live|healthy|verified)\\b", "i"),
     kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
+  },
+  {
+    pattern: /\b(?:the\s+)?(?:production\s+)?canary\s+(?:(?:is|was|has been|had been)\s+)?(?:succeeded|passed|completed|finished|green|healthy|verified|live)\b/i,
+    kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
   },
   {
     pattern: /\bproduction\s+(?:is|was|has been|had been)\s+(?:up|online)\b/i,
     kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
   },
   {
     pattern: /\b(?:the\s+)?release\s+(?:went|has gone|had gone)\s+out\b/i,
     kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
   },
 ];
 
@@ -465,7 +482,7 @@ function normalizedSentences(text: string): string[] {
 
 function textClauses(text: string): string[] {
   return normalizedSentences(text)
-    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|although|however|which|while|then)\b\s+|;\s*/i))
+    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then)\b\s+|;\s*/i))
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
@@ -531,7 +548,7 @@ function sentenceSourceSpans(text: string): SourceTextSpan[] {
 
 function splitOperationalSentence(sentence: SourceTextSpan): SourceTextSpan[] {
   const clauses: SourceTextSpan[] = [];
-  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|although|however|which|while|then)\b\s+|;\s*/gi;
+  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then)\b\s+|;\s*/gi;
   let cursor = 0;
   let separator = clauseSeparator.exec(sentence.text);
   while (separator !== null) {
@@ -597,7 +614,11 @@ function finalizationSegmentSpans(candidate: ControllerFinalization): Finalizati
  * rejected closed; a complete match in plain text is left to the unclaimed-text
  * branch below.
  */
-function hasIncompatibleClaimText(candidate: ControllerFinalization, renderedMessage: string): boolean {
+function hasIncompatibleClaimText(
+  candidate: ControllerFinalization,
+  renderedMessage: string,
+  context: ControllerFinalizationValidationContext,
+): boolean {
   const segmentSpans = finalizationSegmentSpans(candidate);
   for (const sourceSpan of operationalClauseSpans(renderedMessage)) {
     const clause = sourceSpan.text.replace(/[’‘]/g, "'");
@@ -609,6 +630,10 @@ function hasIncompatibleClaimText(candidate: ControllerFinalization, renderedMes
       const onlySegment = touched.length === 1 ? touched[0]!.segment : null;
       if (!onlySegment || onlySegment.type !== "claim") return true;
       if (!match.assertion.kinds.includes(onlySegment.kind) || onlySegment.outcome !== "succeeded") return true;
+      const rows = evidenceRows(onlySegment, context);
+      if (match.assertion.requiredProofKinds?.some((requiredProof) => (
+        !rows.some((row) => row.proofKinds.includes(requiredProof))
+      ))) return true;
     }
   }
   return false;
@@ -663,7 +688,7 @@ function claimRejectionCode(
   if (hasSubjectMismatch(candidateClaims, context)) return "subject_mismatch";
   if (hasProofIncompatibility(candidateClaims, context)) return "proof_incompatible";
   if (candidateClaims.length > 0 && hasObfuscatedOperationalAssertion(renderedMessage)) return "proof_incompatible";
-  if (hasIncompatibleClaimText(candidate, renderedMessage)) return "proof_incompatible";
+  if (hasIncompatibleClaimText(candidate, renderedMessage, context)) return "proof_incompatible";
   return null;
 }
 

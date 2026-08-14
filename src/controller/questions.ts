@@ -186,14 +186,6 @@ function decodedUnicodeForm(value: string): string | null {
   return changed ? decoded : null;
 }
 
-function unicodeCanonicalForms(value: string): string[] {
-  const normalized = value.normalize("NFKC");
-  const forms = [normalized, normalized.replace(DEFAULT_IGNORABLES, "")];
-  const decoded = decodedUnicodeForm(forms[1]!);
-  if (decoded) forms.push(decoded, decoded.replace(DEFAULT_IGNORABLES, ""));
-  return [...new Set(forms)].filter((form) => form.length > 0 && form.length <= MAX_CANONICAL_SCAN);
-}
-
 function decodedBase64Tokens(value: string): string[] {
   const decoded: string[] = [];
   BASE64_TOKEN.lastIndex = 0;
@@ -222,25 +214,50 @@ function containsEncodedSensitiveText(value: string): boolean {
     visited.add(key);
     nodes += 1;
     if (nodes > MAX_ENCODING_NODES) return true;
-    const forms = canonicalForms(node.value);
-    if (!forms) {
-      if (node.depth > 0 && /(?:%|\\u|%u)/iu.test(node.value)) return true;
+    if (node.value.includes("%") && !decodeCanonicalForm(node.value)) return true;
+    const forms = [...new Set([
+      node.value.normalize("NFKC"),
+      node.value.normalize("NFKC").replace(DEFAULT_IGNORABLES, ""),
+    ])].filter((form) => form.length > 0 && form.length <= MAX_CANONICAL_SCAN);
+    for (const form of forms) {
+      if (SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form))) return true;
+    }
+    const children = encodedTextChildren(node.value);
+    if (node.depth >= MAX_ENCODING_DEPTH) {
+      // A bounded scan cannot prove that a still-decodable textual layer is
+      // harmless. Opaque UUIDs are excluded by decodedBase64Tokens, while a
+      // real percent/base64/Unicode layer remains fail-closed.
+      if (children.length > 0) return true;
       continue;
     }
-    for (const form of forms.flatMap(unicodeCanonicalForms)) {
-      if (SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form))) return true;
-      if (node.depth >= MAX_ENCODING_DEPTH) continue;
-      for (const decoded of decodedBase64Tokens(form)) queue.push({ value: decoded, depth: node.depth + 1 });
-    }
+    for (const child of children) queue.push({ value: child, depth: node.depth + 1 });
   }
   return false;
 }
 
-function hasProtectedBasename(value: string): boolean {
-  const basename = value.replaceAll("\\", "/").split("/").filter(Boolean).at(-1);
-  if (!basename) return true;
-  const normalized = basename.toLowerCase();
-  return PROTECTED_BASENAME_MARKERS.some((marker) => normalized.includes(marker));
+function encodedTextChildren(value: string): string[] {
+  const children: string[] = [];
+  if (value.includes("%")) {
+    const decoded = decodeCanonicalForm(value);
+    if (decoded && decoded !== value) children.push(decoded);
+  }
+  const unicodeDecoded = decodedUnicodeForm(value);
+  if (unicodeDecoded && unicodeDecoded !== value) children.push(unicodeDecoded);
+  const forms = [...new Set([
+    value.normalize("NFKC"),
+    value.normalize("NFKC").replace(DEFAULT_IGNORABLES, ""),
+  ])];
+  for (const form of forms) children.push(...decodedBase64Tokens(form));
+  return [...new Set(children)].filter((child) => child.length > 0 && child.length <= MAX_CANONICAL_SCAN);
+}
+
+function hasProtectedPathSegment(value: string): boolean {
+  const segments = value.replaceAll("\\", "/").split("/").filter(Boolean);
+  if (segments.length === 0) return true;
+  return segments.some((segment) => {
+    const normalized = segment.toLowerCase();
+    return PROTECTED_BASENAME_MARKERS.some((marker) => normalized.includes(marker));
+  });
 }
 
 /**
@@ -255,7 +272,7 @@ export function canonicalControllerText(
   if (typeof value !== "string") return null;
   const forms = canonicalForms(value);
   if (!forms) return null;
-  if (mode === "path" && forms.some(hasProtectedBasename)) return null;
+  if (mode === "path" && forms.some(hasProtectedPathSegment)) return null;
   if (forms.some((form) => SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form)))) {
     return null;
   }
@@ -368,7 +385,17 @@ const MAX_CONTROLLER_INTERACTION_ID = 256;
 const MAX_CONTROLLER_APPROVAL_SUMMARY = 400;
 const MAX_CONTROLLER_QUESTION_ID = 128;
 const MAX_CONTROLLER_OPTION_VALUE = 256;
-const PROTECTED_PATH_TEXT = "a protected path";
+const MAX_APPROVAL_PATH = 256;
+const ABSOLUTE_APPROVAL_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/u;
+const SAFE_RELATIVE_APPROVAL_PATH = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/u;
+const UNPROJECTED_APPROVAL_PATH_FIELDS = [
+  "path",
+  "paths",
+  "movePath",
+  "sourcePath",
+  "targetPath",
+  "changes",
+] as const;
 const RESERVED_QUESTION_IDS = new Set([
   "__proto__",
   "constructor",
@@ -385,29 +412,52 @@ const RESERVED_QUESTION_IDS = new Set([
   "__lookupSetter__",
 ]);
 
-function safePathBasename(value: unknown): string {
-  const canonical = canonicalControllerText(value, 80, "path");
-  if (!canonical) return PROTECTED_PATH_TEXT;
-  const normalized = canonical.replaceAll("\\", "/").trim();
-  const segments = normalized.split("/").filter((segment) => segment.length > 0);
-  const basename = segments.at(-1);
-  if (!basename || basename === "." || basename === ".." || segments.includes("..")) return PROTECTED_PATH_TEXT;
-  if (!/^[A-Za-z0-9._-]{1,80}$/.test(basename)) return PROTECTED_PATH_TEXT;
-  return basename;
+function exactRelativeApprovalPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || ABSOLUTE_APPROVAL_PATH.test(value)) return null;
+  const canonical = canonicalControllerText(value, MAX_APPROVAL_PATH, "path");
+  if (!canonical || canonical !== value || !SAFE_RELATIVE_APPROVAL_PATH.test(canonical)) return null;
+  const segments = canonical.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) return null;
+  return canonical;
 }
 
 function hasUnsupportedCommandPath(command: string): boolean {
-  if (/(?:^|[\s"'=(])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s"';&|),]*/u.test(command)) return true;
-  if (/(?:^|[\s"'=(\\/])\.\.(?:[\\/]|$)/u.test(command)) return true;
-  return command.split(/\s+/u).some((token) => {
-    const candidate = token.replace(/^[("'\\x60]+|["'\\x60,;)]+$/gu, "");
+  if (/[<>]/u.test(command) || /[$\\]/u.test(command)) return true;
+  let quote: "'" | '"' | null = null;
+  for (const character of command) {
+    if (character !== "'" && character !== '"') continue;
+    if (quote === null) quote = character;
+    else if (quote === character) quote = null;
+  }
+  if (quote !== null) return true;
+  if (/(?:^|[\s"'=(|;])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s"';&|),]*/u.test(command)) return true;
+  if (/(?:^|[\s"'=(|;])[^\s"';&|),]*[\\/]\.\.(?:[\\/]|$)/u.test(command) ||
+      /(?:^|[\s"'=(|;])\.\.(?:[\\/]|$)/u.test(command)) return true;
+  return command.split(/[\s"'(),;|]+/u).some((token) => {
+    const candidate = token.replace(/^[("']+|["',;)]+$/gu, "");
+    const attachedOption = /^-{1,2}[^=]+=/.test(candidate);
+    if (attachedOption) return true;
+    if (candidate.length === 0) return false;
     const path = candidate.includes("=") ? candidate.slice(candidate.lastIndexOf("=") + 1) : candidate;
-    if (!/[\\/]/u.test(path) || /^(?:https?|wss?):\/\//iu.test(path)) return false;
-    return path.replaceAll("\\", "/").split("/").filter(Boolean).some((segment) => {
-      const normalized = segment.toLowerCase();
-      return PROTECTED_BASENAME_MARKERS.some((marker) => normalized.includes(marker));
-    });
+    if (/^(?:https?|wss?):\/\//iu.test(path)) return false;
+    if (hasProtectedPathSegment(path)) return true;
+    if (!/[\\/]/u.test(candidate)) return false;
+    return exactRelativeApprovalPath(path) === null;
   });
+}
+
+function hasAmbiguousApprovalSubject(subject: Record<string, unknown>): boolean {
+  if (UNPROJECTED_APPROVAL_PATH_FIELDS.some((field) => Object.hasOwn(subject, field))) return true;
+  if (Object.hasOwn(subject, "env") || Object.hasOwn(subject, "output")) return true;
+  if (Object.hasOwn(subject, "sessionGrant") && subject.sessionGrant !== null) return true;
+  if (!Object.hasOwn(subject, "actions")) return false;
+  return !Array.isArray(subject.actions) || subject.actions.length > 0;
+}
+
+function exactApprovalCwd(subject: Record<string, unknown>): string | null | undefined {
+  if (!Object.hasOwn(subject, "cwd")) return undefined;
+  if (subject.cwd === null) return null;
+  return exactRelativeApprovalPath(subject.cwd);
 }
 
 function boundedApprovalSummary(summary: string): string | null {
@@ -418,20 +468,20 @@ function controllerApprovalSummary(subject: Record<string, unknown>): string | n
   if (subject.kind === "command") {
     const rawCommand = typeof subject.command === "string" ? subject.command : "";
     if (rawCommand.length === 0) return null;
+    if (hasAmbiguousApprovalSubject(subject)) return null;
     if (hasUnsupportedCommandPath(rawCommand)) return null;
     const command = canonicalControllerText(rawCommand, MAX_PROMPT);
     if (!command || command !== rawCommand || command.includes("`") || /[\r\n\u0000-\u001f\u007f]/u.test(command)) return null;
-    const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
-      ? safePathBasename(subject.cwd)
-      : null;
+    const cwd = exactApprovalCwd(subject);
+    if (Object.hasOwn(subject, "cwd") && subject.cwd !== null && !cwd) return null;
     return boundedApprovalSummary(cwd
       ? `wants to run:\n\n\`${command}\`\n\nin ${cwd}`
       : `wants to run:\n\n\`${command}\``);
   }
   if (subject.kind === "file_change") {
-    const rawScope = subject.writeScope;
-    if (rawScope === null || rawScope === undefined || rawScope === "") return "wants to write files";
-    return boundedApprovalSummary(`wants to write files under ${safePathBasename(rawScope)}`);
+    if (hasAmbiguousApprovalSubject(subject)) return null;
+    const scope = exactRelativeApprovalPath(subject.writeScope);
+    return scope ? boundedApprovalSummary(`wants to write files under ${scope}`) : null;
   }
   return null;
 }
@@ -724,22 +774,7 @@ const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
 };
 
 function approvalSummary(subject: Record<string, unknown>): string | null {
-  if (subject.kind === "command") {
-    const rawCommand = typeof subject.command === "string" ? subject.command : "";
-    if (hasUnsupportedCommandPath(rawCommand)) return null;
-    const command = canonicalControllerText(rawCommand, MAX_PROMPT);
-    if (!command || command !== rawCommand || command.includes("`") || /[\r\n\u0000-\u001f\u007f]/u.test(command)) return null;
-    const cwd = typeof subject.cwd === "string" && subject.cwd.trim().length > 0
-      ? safePathBasename(subject.cwd)
-      : null;
-    return cwd ? `wants to run:\n\n\`${command}\`\n\nin ${cwd}` : `wants to run:\n\n\`${command}\``;
-  }
-  if (subject.kind === "file_change") {
-    const rawScope = subject.writeScope;
-    if (rawScope === null || rawScope === undefined || rawScope === "") return "wants to write files";
-    return `wants to write files under ${safePathBasename(rawScope)}`;
-  }
-  return null;
+  return controllerApprovalSummary(subject);
 }
 
 /**
