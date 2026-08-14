@@ -116,10 +116,6 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, ReadonlySet<ControllerProofKind>
   health_assessment: new Set(["health_snapshot"]),
   uncertainty: new Set(CONTROLLER_PROOF_KINDS),
 };
-const PRIMARY_EXECUTION_PROOF_KINDS: ReadonlySet<ControllerProofKind> = new Set([
-  "command_result",
-  "tool_result",
-]);
 
 const CURRENT_OBSERVATION_SUCCESS_KINDS: ReadonlySet<ControllerClaimKind> = new Set([
   "observed_state",
@@ -203,13 +199,18 @@ const NON_AFFIRMATIVE_SCOPE_NEGATORS = new Set([
   "couldn't", "shouldn't",
 ]);
 const PREDICATE_DETERMINERS = new Set(["the", "a", "an"]);
-const PREDICATE_PREPOSITION = /^(?:about|above|across|after|against|along|among|around|as|at|before|behind|below|beneath|beside|between|beyond|by|despite|during|for|from|in|inside|into|near|of|off|on|onto|over|through|throughout|to|toward|under|until|upon|via|with|within|without)$/i;
+const PREDICATE_PREPOSITION = /^(?:about|above|across|after|against|along|among|around|as|at|before|behind|below|beneath|beside|between|beyond|by|despite|during|for|from|in|inside|into|near|of|off|on|onto|over|through|throughout|to|toward|under|until|upon|using|via|with|within|without)$/i;
+const TEST_SUBJECT_TOKEN = /^test(?:s|ing|ed)?$/i;
+const LOCAL_SUBJECT_BOUNDARY_WORD = /^(?:and|although|because|but|however|or|so|therefore|then|while|yet)$/i;
+const LOCAL_SUBJECT_QUANTIFIER_WORD = /^(?:all|another|any|both|each|either|enough|every|few|less|many|more|most|neither|no|several|some)$/i;
+const LOCAL_RELATIVE_MARKER = /^(?:that|which|who|whom|whose)$/i;
 const MAX_PREDICATE_CONTEXT_CHARS = 256;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
   kinds: readonly ControllerClaimKind[];
   requiredProofKinds?: readonly ControllerProofKind[];
+  genericSuccess?: boolean;
 }>;
 
 const OPERATIONAL_SUCCESS_STATE = "(?:done|complete|completed|finished|successful|succeed|succeeded|passed|green|live|healthy|verified|ready|all\\s+set)";
@@ -253,8 +254,9 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     requiredProofKinds: ["production_outcome"],
   },
   {
-    pattern: /\b(?:done|complete|completed|finished|successful|succeeded|passed|green|live|resolved|wrapped\s+up|good\s+to\s+go|went\s+smoothly|cleared\s+(?:its|the)\s+(?:final\s+)?gate)\b/i,
+    pattern: /\b(?:done|complete|completed|finished|successful|succeed(?:ed)?|pass(?:ed)?|green|live|resolved|wrapped\s+up|good\s+to\s+go|went\s+smoothly|cleared\s+(?:its|the)\s+(?:final\s+)?gate)\b/i,
     kinds: ["pipeline_outcome"],
+    genericSuccess: true,
   },
   {
     pattern: /\b(?:the\s+)?(?:agent|system|service|health(?:\s+check)?|monitoring)\s+(?:is|was|has\s+been|had\s+been)?\s*(?:healthy|ready|good\s+to\s+go)\b/i,
@@ -358,6 +360,7 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   {
     pattern: new RegExp("\\b" + GENERIC_COMPLETION_SUBJECT + "\\s+" + OPERATIONAL_STATE_LINK + "\\s*" + OPERATIONAL_SUCCESS_STATE + "\\b", "i"),
     kinds: ["pipeline_outcome"],
+    genericSuccess: true,
   },
   {
     pattern: new RegExp("\\b(?:the\\s+)?(?:build|compile|compilation|artifact)\\s+" + OPERATIONAL_STATE_LINK + "\\s*" + OPERATIONAL_SUCCESS_STATE + "\\b", "i"),
@@ -494,16 +497,7 @@ function evidenceOutcomesSupportClaim(claim: ControllerClaim, rows: readonly Evi
 
 function evidenceProofsSupportClaim(claim: ControllerClaim, rows: readonly EvidenceRow[]): boolean {
   const compatibleProofs = CLAIM_PROOFS[claim.kind];
-  if (claim.kind !== "execution_result") {
-    return rows.every((row) => row.proofKinds.some((proofKind) => compatibleProofs.has(proofKind)));
-  }
-  const hasPrimaryExecutionProof = rows.some((row) => (
-    row.proofKinds.some((proofKind) => PRIMARY_EXECUTION_PROOF_KINDS.has(proofKind))
-  ));
-  const rowsHaveCompatibleProof = rows.every((row) => row.proofKinds.some((proofKind) => (
-    compatibleProofs.has(proofKind) || proofKind === "production_outcome"
-  )));
-  return hasPrimaryExecutionProof && rowsHaveCompatibleProof;
+  return rows.every((row) => row.proofKinds.some((proofKind) => compatibleProofs.has(proofKind)));
 }
 
 function evidenceSupportsClaim(claim: ControllerClaim, rows: readonly EvidenceRow[]): boolean {
@@ -588,35 +582,107 @@ function predicateTokenIsPreposition(token: string): boolean {
   return PREDICATE_PREPOSITION.test(token);
 }
 
-function hasCompetingNominalSubject(afterSubject: string): boolean {
-  const tokens = [...afterSubject.matchAll(PREDICATE_TOKEN)];
-  for (let index = 0; index < tokens.length - 1; index += 1) {
-    const determiner = tokens[index]![0]!;
-    if (!PREDICATE_DETERMINERS.has(determiner.toLowerCase())) continue;
-    const previous = tokens[index - 1];
-    if (!previous) return true;
-    const gap = afterSubject.slice(previous.index! + previous[0]!.length, tokens[index]!.index!);
-    if (/[,:;()[\]]/.test(gap)) return true;
-    if (predicateTokenIsPreposition(previous[0]!)) continue;
-    if (/ly$/i.test(previous[0]!)) continue;
-    return true;
-  }
-  return false;
+type LocalPredicateToken = Readonly<{
+  word: string;
+}>;
+
+function localPredicateTokens(text: string): LocalPredicateToken[] {
+  return [...text.matchAll(PREDICATE_TOKEN)].map((token) => ({ word: token[0]!.toLowerCase() }));
 }
 
-function hasTestSubjectEntitlement(clause: string, match: OperationalMatch): boolean {
-  const prefix = predicateContextBeforeMatch(clause, match);
-  const subject = /\b(?:test\s+(?:cases?|suites?)|tests?)\b/gi;
-  const subjects = [...prefix.matchAll(subject)];
-  const subjectMatch = subjects.at(-1);
-  if (!subjectMatch || subjectMatch.index === undefined) return false;
-  const subjectEnd = subjectMatch.index + subjectMatch[0].length;
-  const subjectToPredicate = clause.slice(subjectEnd, match.end);
-  return !hasCompetingNominalSubject(subjectToPredicate);
+function isLocalAdverb(token: string): boolean {
+  return /^[\p{L}\p{N}]+ly$/iu.test(token);
+}
+
+function isLocalStructuralToken(token: string): boolean {
+  return PREDICATE_CHAIN_WORDS.has(token)
+    || PREDICATE_DETERMINERS.has(token)
+    || predicateTokenIsPreposition(token)
+    || LOCAL_SUBJECT_BOUNDARY_WORD.test(token)
+    || LOCAL_SUBJECT_QUANTIFIER_WORD.test(token)
+    || LOCAL_RELATIVE_MARKER.test(token)
+    || isLocalAdverb(token);
+}
+
+function isLocalBoundaryToken(token: string): boolean {
+  return LOCAL_SUBJECT_BOUNDARY_WORD.test(token);
+}
+
+function relativeClauseMarkerBefore(
+  tokens: readonly LocalPredicateToken[],
+  endIndex: number,
+): number | null {
+  for (let index = endIndex - 1; index >= 0; index -= 1) {
+    if (isLocalBoundaryToken(tokens[index]!.word)) return null;
+    if (!LOCAL_RELATIVE_MARKER.test(tokens[index]!.word)) continue;
+    const between = tokens.slice(index + 1, endIndex);
+    if (between.some((token) => PREDICATE_CHAIN_WORDS.has(token.word))) return index;
+  }
+  return null;
+}
+
+function prepositionalObjectBefore(
+  tokens: readonly LocalPredicateToken[],
+  endIndex: number,
+): number | null {
+  const previous = tokens[endIndex - 1]?.word;
+  if (previous && predicateTokenIsPreposition(previous)) return endIndex - 1;
+  if (previous && (PREDICATE_DETERMINERS.has(previous) || LOCAL_SUBJECT_QUANTIFIER_WORD.test(previous))) {
+    const preposition = tokens[endIndex - 2]?.word;
+    if (preposition && predicateTokenIsPreposition(preposition)) return endIndex - 2;
+  }
+  return null;
+}
+
+function nearestSignificantSubject(tokens: readonly LocalPredicateToken[]): LocalPredicateToken | null {
+  let index = tokens.length - 1;
+  while (index >= 0) {
+    const token = tokens[index]!;
+    if (isLocalBoundaryToken(token.word)) return null;
+    if (isLocalStructuralToken(token.word)) {
+      index -= 1;
+      continue;
+    }
+    const relativeMarker = relativeClauseMarkerBefore(tokens, index);
+    if (relativeMarker !== null) {
+      index = relativeMarker - 1;
+      continue;
+    }
+    const preposition = prepositionalObjectBefore(tokens, index);
+    if (preposition !== null) {
+      index = preposition - 1;
+      continue;
+    }
+    return token;
+  }
+  return null;
+}
+
+function firstSignificantSubject(tokens: readonly LocalPredicateToken[]): LocalPredicateToken | null {
+  let index = 0;
+  while (index < tokens.length) {
+    const token = tokens[index]!;
+    if (isLocalBoundaryToken(token.word)) return null;
+    if (isLocalStructuralToken(token.word)) {
+      index += 1;
+      continue;
+    }
+    return token;
+  }
+  return null;
+}
+
+function hasNearestTestSubject(clause: string, match: OperationalMatch): boolean {
+  if (match.assertion.genericSuccess !== true) return false;
+  const before = nearestSignificantSubject(localPredicateTokens(predicateContextBeforeMatch(clause, match)));
+  if (before) return TEST_SUBJECT_TOKEN.test(before.word);
+  const after = clause.slice(match.end, match.end + MAX_PREDICATE_CONTEXT_CHARS);
+  const afterSubject = firstSignificantSubject(localPredicateTokens(after));
+  return afterSubject !== null && TEST_SUBJECT_TOKEN.test(afterSubject.word);
 }
 
 function applySubjectEntitlement(clause: string, match: OperationalMatch): OperationalMatch {
-  if (!match.assertion.kinds.includes("pipeline_outcome") || !hasTestSubjectEntitlement(clause, match)) {
+  if (!hasNearestTestSubject(clause, match)) {
     return match;
   }
   return {
@@ -730,8 +796,29 @@ function productionTargetForMatch(clause: string, match: OperationalMatch): bool
     end: (mention.index ?? 0) + mention[0].length,
   }));
   return productionMentions.some((mention) => (
+    productionMentionIsInLocalClause(clause, match, mention)
+    &&
     !productionMentionIsExplicitlyNonTarget(clause, match, mention)
   ));
+}
+
+function productionMentionIsInLocalClause(
+  clause: string,
+  match: OperationalMatch,
+  mention: Readonly<{ start: number; end: number }>,
+): boolean {
+  if (mention.start >= match.start && mention.start < match.end) return true;
+  const start = Math.min(match.end, mention.end);
+  const end = Math.max(match.start, mention.start);
+  const between = clause.slice(start, end);
+  const boundaryPattern = /(?:;|,\s*(?:and|but|although|because|however|so|therefore|yet)\b|\b(?:and|but|although|because|however|so|therefore|yet)\b)/gi;
+  let boundary = boundaryPattern.exec(between);
+  while (boundary !== null) {
+    const boundaryOffset = start + boundary.index;
+    if (operationalMatchesIn(clause.slice(0, boundaryOffset)).some((prior) => prior.end > 0)) return false;
+    boundary = boundaryPattern.exec(between);
+  }
+  return true;
 }
 
 function productionMentionIsExplicitlyNonTarget(
@@ -768,8 +855,10 @@ function isExplicitlyNonProductionMention(
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
   const before = clause.slice(0, mention.start);
-  if (/\b(?:not|never|no(?:where)?)\s+(?:outside|away from|rather than)\s+(?:the\s+)?$/i.test(before)) return false;
-  return /\bnon[-\s]$|\b(?:outside|away from|rather than)\s+(?:the\s+)?$|\b(?:not|never|no)(?:\s+to)?\s+(?:the\s+)?$/i.test(before);
+  const outsideRelation = /\boutside\s+(?:the\s+)?$/i.exec(before);
+  if (!outsideRelation) return false;
+  const beforeOutside = before.slice(0, outsideRelation.index);
+  return !/\b(?:not|never|no|nowhere|nothing|none|only|all|any)\b/i.test(beforeOutside);
 }
 
 type FinalizationSegmentSpan = Readonly<{

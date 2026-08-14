@@ -1249,34 +1249,64 @@ describe("bounded text heuristics", () => {
       contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
       "proof_incompatible",
     );
-    const claimWithSeparateEvidence = claimFinalization({
+    const claimWithCombinedEvidence = claimFinalization({
       kind: "execution_result",
       outcome: "succeeded",
       text,
       evidenceRefs: ["evidence:1", "evidence:2"],
     });
-    expect(validateControllerFinalization(
-      claimWithSeparateEvidence,
-      contextWithEvidence(
-        evidenceRow("evidence:1", "command_result", "succeeded"),
-        evidenceRow("evidence:2", "production_outcome", "succeeded"),
-      ),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("keeps production proof auxiliary to execution claims only", () => {
     expectRejection(
-      claimFinalization({
-        kind: "pipeline_outcome",
-        outcome: "succeeded",
-        text: "The deployment succeeded in production.",
-        evidenceRefs: ["evidence:1", "evidence:2"],
-      }),
+      claimWithCombinedEvidence,
       contextWithEvidence(
         evidenceRow("evidence:1", "command_result", "succeeded"),
         evidenceRow("evidence:2", "production_outcome", "succeeded"),
       ),
       "proof_incompatible",
+    );
+  });
+
+  it("accepts separately subject-bound execution and production claims", () => {
+    const executionClaim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+      subjectRef: "bb-item:command-1",
+      evidenceRefs: ["evidence:1"],
+    }).segments[0];
+    const productionClaim = claimFinalization({
+      kind: "pipeline_outcome",
+      outcome: "succeeded",
+      text: "Production release succeeded.",
+      subjectRef: "job:job_1",
+      evidenceRefs: ["evidence:2"],
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [executionClaim, { type: "text", text: " and " }, productionClaim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded", "bb-item:command-1"),
+        evidenceRow("evidence:2", "production_outcome", "succeeded", "job:job_1"),
+      ),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("rejects a direct production test claim with command and production subjects", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: "Production tests passed.",
+        subjectRef: "bb-item:command-1",
+        evidenceRefs: ["evidence:1", "evidence:2"],
+      }),
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded", "bb-item:command-1"),
+        evidenceRow("evidence:2", "production_outcome", "succeeded", "job:job_1"),
+      ),
+      "subject_mismatch",
     );
   });
 
@@ -1342,6 +1372,27 @@ describe("bounded text heuristics", () => {
       claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["nearer non-test subject", "Tests reported CI passed.", false],
+    ["auxiliary and adverbial chain", "Tests did ultimately pass.", true],
+    ["gerund test subject", "Regression testing passed.", true],
+    ["compound test subject", "Unit and integration tests passed.", true],
+    ["relative test subject", "The tests that were run passed.", true],
+    ["postposed test subject", "Passed tests.", true],
+  ] as const)("binds success to the nearest local subject: %s", (_label, text, testSubjectIsNearest) => {
+    const pipelineClaim = claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text });
+    const executionClaim = claimFinalization({ kind: "execution_result", outcome: "succeeded", text });
+    const pipelineContext = contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded"));
+    const executionContext = contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded"));
+    if (testSubjectIsNearest) {
+      expectRejection(pipelineClaim, pipelineContext, "proof_incompatible");
+      expect(validateControllerFinalization(executionClaim, executionContext)).toMatchObject({ outcome: "accepted" });
+      return;
+    }
+    expect(validateControllerFinalization(pipelineClaim, pipelineContext)).toMatchObject({ outcome: "accepted" });
+    expectRejection(executionClaim, executionContext, "proof_incompatible");
   });
 
   it("does not transfer test entitlement through a competing predicate subject", () => {
@@ -1413,12 +1464,25 @@ describe("bounded text heuristics", () => {
   it.each([
     ["negative positive state", "Production is not live.", "pipeline_outcome", "failed", "pipeline_outcome", "failed"],
     ["negative production state", "The tests passed because production is down.", "execution_result", "succeeded", "command_result", "succeeded"],
+    ["success outside production", "The release was published outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
     ["explicit no-touch", "The tests passed without accessing production.", "execution_result", "succeeded", "command_result", "succeeded"],
   ] as const)("keeps a narrow production exception: %s", (_label, text, kind, claimOutcome, proofKind, evidenceOutcome) => {
     expect(validateControllerFinalization(
       claimFinalization({ kind, outcome: claimOutcome, text }),
       contextWithEvidence(evidenceRow("evidence:1", proofKind, evidenceOutcome)),
     )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["no production failures", "The tests passed with no production failures.", "execution_result", "command_result"],
+    ["nowhere at all outside", "The release was published nowhere at all outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["not non-production", "The release was published not non-production.", "pipeline_outcome", "pipeline_outcome"],
+  ] as const)("requires production proof for ambiguous non-production wording: %s", (_label, text, kind, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
   });
 
   it("does not turn a test result that explicitly avoided production into a production claim", () => {
