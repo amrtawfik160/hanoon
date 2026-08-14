@@ -200,4 +200,13 @@ it("runs a project-less doctor with only global checks and keeps JSON strict", a
   expect(output.checks.map((check) => check.name)).not.toContain("gh repo view");
   expect(result.stderr).toBe("");
   expect(() => JSON.parse(result.stdout)).not.toThrow();
+  // The credential broker defaults to disabled and must never be the reason
+  // an otherwise-unconfigured install fails doctor differently than before
+  // this section existed (tests/credential-cli.test.ts covers the isolated,
+  // invalid, and secret-handling cases in depth).
+  expect(output.checks.find((check) => check.name === "credential broker")).toEqual({
+    name: "credential broker",
+    status: "disabled",
+    summary: "disabled",
+  });
 });

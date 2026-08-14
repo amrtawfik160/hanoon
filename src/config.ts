@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { DEFAULT_MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "./autonomy/models";
+import type { CredentialBrokerConfigResult } from "./credentials/config";
 import {
   EXTRACTION_MODELS,
   CONTROLLER_FALLBACK_MODELS,
@@ -196,4 +198,26 @@ export function capabilityRoutingSettings(config: GlobalConfig): Readonly<{
 
 export function capabilityMinimumModelPool(config: GlobalConfig): ModelPool | undefined {
   return config.capabilityModelRouting === "strong-only" ? "strong" : undefined;
+}
+
+/**
+ * A stable digest of an already-parsed `parseCredentialBrokerConfig` result,
+ * used only to detect whether a settings change is credential-relevant. The
+ * client private key feeds the hash (so rotating it is detected) but the hash
+ * itself cannot be reversed to recover it, unlike comparing the raw config.
+ */
+export function credentialBrokerConfigFingerprint(result: CredentialBrokerConfigResult): string {
+  if (result.state === "disabled") return "disabled";
+  if (result.state === "invalid") return `invalid:${result.code}`;
+  const { value } = result;
+  const canonical = JSON.stringify([
+    value.endpointOrigin,
+    value.installationId,
+    value.topologyReceiptDigest,
+    value.topologyReceiptExpiresAt,
+    value.clientCertificatePem,
+    value.clientKeyPem,
+    value.caCertificatePem,
+  ]);
+  return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
