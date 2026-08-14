@@ -46,7 +46,23 @@ export const BROKER_FAILURE_CLASSES = [
 /** The only classes a caller may retry; everything else is settled. */
 const RETRYABLE_FAILURE_CLASSES = new Set(["provider_rate_limited", "provider_unavailable"]);
 
-export const BROKER_BINDING_STATES = ["pending", "vault_verified", "active", "revoked"] as const;
+/**
+ * The binding lifecycle. `pending` is enrolled but unproven; a valid resolve
+ * proves vault access and reaches `vault_verified`; only a connector-authoritative
+ * check may later reach `active`. A deterministic invalid resolve demotes an
+ * already-verified binding to `degraded` rather than back to `pending`, so
+ * "never proven" stays distinguishable from "proven, then broken". `revoked` is
+ * a deliberate withdrawal; `compromised` is set for every binding of an
+ * installation whose client key leaked.
+ */
+export const BROKER_BINDING_STATES = [
+  "pending",
+  "vault_verified",
+  "degraded",
+  "active",
+  "revoked",
+  "compromised",
+] as const;
 export const BROKER_ADAPTER_STATES = ["ready", "degraded", "unavailable"] as const;
 export const BROKER_BINDING_RISKS = ["low", "medium", "high", "critical"] as const;
 export const BROKER_MFA_MODES = ["none", "totp", "webauthn", "push"] as const;

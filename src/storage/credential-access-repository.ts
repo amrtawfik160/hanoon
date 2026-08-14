@@ -298,15 +298,15 @@ export class CredentialAccessRepository {
     return this.db.transaction((): CredentialVerificationCompleteResult => {
       if (!this.submittedTurnFenceIsCurrent(input)) return { outcome: "stale" };
       const result = this.completeOperation(input);
-      if (
-        result.outcome === "completed" &&
-        input.response.outcome === "succeeded" &&
-        input.response.result === "valid"
-      ) {
+      if (result.outcome === "completed") {
         const bindingId = result.operation.envelope.bindingId;
         const generation = result.operation.envelope.bindingGeneration;
         if (bindingId !== null && generation !== null) {
-          this.advanceBindingAfterVerification(input.installationId, bindingId, generation, input.now);
+          if (input.response.outcome === "succeeded" && input.response.result === "valid") {
+            this.advanceBindingAfterVerification(input.installationId, bindingId, generation, input.now);
+          } else if (input.response.result === "invalid") {
+            this.demoteBindingAfterInvalidVerification(input.installationId, bindingId, generation, input.now);
+          }
         }
       }
       return result;
@@ -394,8 +394,29 @@ export class CredentialAccessRepository {
       `UPDATE credential_bindings
           SET state = 'vault_verified', last_verified_at = ?, updated_at = ?
         WHERE installation_id = ? AND binding_id = ? AND generation = ?
-          AND state IN ('pending', 'vault_verified')`,
+          AND state IN ('pending', 'vault_verified', 'degraded')`,
     ).run(now, now, installationId, bindingId, generation);
+  }
+
+  /**
+   * A deterministic invalid resolve leaves a `pending` binding where it is —
+   * it was never proven — but demotes an already-`vault_verified` one to
+   * `degraded`, so "never proven" stays distinguishable from "proven, then
+   * broken". `active`, `revoked`, and `compromised` bindings are untouched by
+   * a mere vault-resolution result.
+   */
+  private demoteBindingAfterInvalidVerification(
+    installationId: string,
+    bindingId: string,
+    generation: number,
+    now: number,
+  ): void {
+    this.db.prepare(
+      `UPDATE credential_bindings
+          SET state = 'degraded', updated_at = ?
+        WHERE installation_id = ? AND binding_id = ? AND generation = ?
+          AND state = 'vault_verified'`,
+    ).run(now, installationId, bindingId, generation);
   }
 
   private upsertHealthRow(input: CredentialHealthReconcileInput): void {

@@ -576,6 +576,80 @@ it("does not advance binding state on a deterministic invalid verification", () 
   expect(repository.getCredentialBinding("install_1", "binding_1")).toMatchObject({ state: "pending" });
 });
 
+it("round-trips a binding through vault_verified, degraded, and back to vault_verified across successive verifications", () => {
+  const { repository, turnId, fence } = credentialFixture();
+  repository.reconcileCredentialHealth({
+    installationId: "install_1",
+    health: healthSnapshot(),
+    bindings: [bindingMetadata()],
+    responseSha256: "1".repeat(64),
+    now: 1_500,
+  });
+
+  const firstVerify = verifyEnvelope(fence, turnId, { requestId: "verify-a", idempotencyKey: "verify-a", nonce: "verify-a" });
+  repository.prepareCredentialVerificationOperation({ ...fence, installationId: "install_1", turnId, envelope: firstVerify });
+  repository.completeCredentialVerificationOperation({
+    ...fence,
+    turnId,
+    installationId: "install_1",
+    requestId: firstVerify.requestId,
+    response: verifyResponse(firstVerify),
+    now: 3_000,
+  });
+  expect(repository.getCredentialBinding("install_1", "binding_1")).toMatchObject({ state: "vault_verified" });
+
+  const secondVerify = verifyEnvelope(fence, turnId, { requestId: "verify-b", idempotencyKey: "verify-b", nonce: "verify-b" });
+  repository.prepareCredentialVerificationOperation({ ...fence, installationId: "install_1", turnId, envelope: secondVerify });
+  repository.completeCredentialVerificationOperation({
+    ...fence,
+    turnId,
+    installationId: "install_1",
+    requestId: secondVerify.requestId,
+    response: verifyResponse(secondVerify, {
+      outcome: "failed",
+      result: "invalid",
+      failureClass: "credential_invalid",
+      receiptId: `receipt_${secondVerify.requestId}`,
+    }),
+    now: 6_000,
+  });
+  expect(repository.getCredentialBinding("install_1", "binding_1")).toMatchObject({ state: "degraded" });
+
+  const thirdVerify = verifyEnvelope(fence, turnId, { requestId: "verify-c", idempotencyKey: "verify-c", nonce: "verify-c" });
+  repository.prepareCredentialVerificationOperation({ ...fence, installationId: "install_1", turnId, envelope: thirdVerify });
+  repository.completeCredentialVerificationOperation({
+    ...fence,
+    turnId,
+    installationId: "install_1",
+    requestId: thirdVerify.requestId,
+    response: verifyResponse(thirdVerify),
+    now: 9_000,
+  });
+  expect(repository.getCredentialBinding("install_1", "binding_1")).toMatchObject({
+    state: "vault_verified",
+    lastVerifiedAt: 9_000,
+  });
+});
+
+it("round-trips a compromised binding through health reconciliation", () => {
+  const { repository } = credentialFixture();
+
+  repository.reconcileCredentialHealth({
+    installationId: "install_1",
+    health: healthSnapshot(),
+    bindings: [bindingMetadata({ state: "compromised", generation: 4 })],
+    responseSha256: "1".repeat(64),
+    now: 4_000,
+  });
+
+  expect(repository.getCredentialBinding("install_1", "binding_1")).toMatchObject({
+    state: "compromised",
+    generation: 4,
+  });
+  expect(repository.listCredentialBindings({ installationId: "install_1", state: "compromised", limit: 10 }))
+    .toHaveLength(1);
+});
+
 it("rejects completing a verification operation once the executor generation has moved on", () => {
   const { repository, store, turnId, fence } = credentialFixture();
   repository.reconcileCredentialHealth({

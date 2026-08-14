@@ -1501,7 +1501,7 @@ CREATE TABLE credential_bindings (
   binding_id TEXT NOT NULL,
   label TEXT NOT NULL,
   provider TEXT NOT NULL CHECK (provider = 'onepassword'),
-  state TEXT NOT NULL CHECK (state IN ('pending', 'vault_verified', 'active', 'revoked')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'vault_verified', 'degraded', 'active', 'revoked', 'compromised')),
   generation INTEGER NOT NULL CHECK (generation >= 1),
   capability_ids_json TEXT NOT NULL,
   risk TEXT NOT NULL CHECK (risk IN ('low', 'medium', 'high', 'critical')),
