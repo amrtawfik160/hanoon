@@ -17,7 +17,7 @@ From a shell:
 ```bash
 bb plugin list --json
 bb telegram-agent doctor
-bb telegram-agent doctor <project-id>
+bb telegram-agent doctor proj_7f3d2a91
 bb plugin logs telegram-agent -n 50
 ```
 
@@ -27,7 +27,7 @@ Use `--json` on Telegram Agent commands when another tool must consume the resul
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally under five manifest roots; operators do not install another runtime skill plugin. The catalog has 23 local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+Skills are committed locally under the five manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, and `skills/hanoon`; operators do not install another runtime skill plugin. The catalog has 23 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
 
 Run the deterministic integrity gate from the repository root:
 
@@ -56,6 +56,8 @@ Both are owner-facing in the chat rather than through the CLI:
 Memories are bounded per scope; when the bound is reached the weakest is dropped, so recall stays useful rather than unbounded. Credential-shaped text is refused at the write, so a pasted token never enters memory or the search index.
 
 An invalid cron expression is rejected when the monitor is created. A schedule that later cannot be advanced is marked failed and reported by `/health` rather than retried forever.
+
+Watches are not all owner-requested: a thread the agent starts or messages is watched automatically, so asking what it is watching will list those too. They retire themselves when their thread lands. Armed monitors are capped per controller, and at the cap an automatic watch is declined rather than arming — the thread still runs, but nothing wakes the agent when it finishes. The armed count in `/health` is the one to watch; the next-due time beside it covers schedules only, since a thread watch waits on its thread rather than on the clock.
 
 ## Thread notices
 
@@ -191,7 +193,8 @@ Important recovery behavior:
 - Permanent Telegram 4xx responses are dead-lettered; retryable 429/5xx failures use bounded retry accounting.
 - Restart recovery does not issue a second merge, deploy, or canary for a completed receipt.
 - A merge call with an unknown provider outcome keeps its repository and production claims held until authoritative reconciliation; capacity is not guessed free.
-- Every merge still requires current review/validation evidence and the exact unexpired one-use Telegram approval, regardless of available capacity.
+- A project paused by the failure brake admits no new jobs until `/resume`; in-flight work finishes and queued jobs stay queued.
+- Every merge still requires current review/validation evidence and a Telegram approval, regardless of available capacity: the exact unexpired one-use approval, or a standing approval the owner granted that project.
 
 ## Production failures
 
@@ -202,7 +205,7 @@ bb telegram-agent job show <job-id> --json
 bb plugin logs telegram-agent -n 50
 ```
 
-The plugin does not automatically retry production or run the policy's rollback command. A job reports `complete` after a successful canary, or earlier when production is not configured and the pull request has passed final review. Small-fix jobs complete only after the pull request passes configured validation and its quality review.
+The plugin does not automatically retry production. It does run the policy's `rollbackCommand` when one is configured, immediately after the failing deploy or canary command and before reporting the failure; the receipt is on the stage evidence. If no rollback was configured, or the rollback itself failed, any standing merge approval for that project is withdrawn. A job reports `complete` after a successful canary, or earlier when production is not configured and the pull request has passed final review. Small-fix jobs complete only after the pull request passes configured validation and its quality review.
 
 ## Remove the plugin
 

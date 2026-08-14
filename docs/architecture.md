@@ -70,7 +70,7 @@ The planner writes a bounded plan artifact. Its verification section must reprod
 
 After implementation produces a pull request, deterministic validation runs before fresh review threads are spawned in the same BB environment. Full jobs require independent quality and risk verdicts; small fixes require only the quality verdict. The group cannot advance until every required lens has durable evidence for the exact head. A reviewer never forks or resumes the implementation conversation. A changes-requested verdict returns bounded findings to the implementation thread; a new pull-request head requires new validation and another fresh review group.
 
-Documentation, final validation, and final review happen before the owner receives a one-use merge approval when production is configured. Documentation may be skipped only with a strict report and an observed clean, empty documentation diff. If production is not configured, a successful final review completes the job at the reviewed pull request. A small-fix job skips planning, critique, documentation, and final review, but still must pass deterministic validation and one independent quality review. An adopted pull request records planning and critique as honestly skipped after verifying its repository, base branch, URL, remote head, and deterministic local branch, then enters the normal full validation/review/finish path. Merge, deploy, and canary each produce separate durable receipts. A successful merge followed by a failed deploy or canary is recorded as `production_failed`; the plugin does not claim completion or run rollback automatically.
+Documentation, final validation, and final review happen before the owner receives a one-use merge approval when production is configured. Documentation may be skipped only with a strict report and an observed clean, empty documentation diff. If production is not configured, a successful final review completes the job at the reviewed pull request. A small-fix job skips planning, critique, documentation, and final review, but still must pass deterministic validation and one independent quality review. An adopted pull request records planning and critique as honestly skipped after verifying its repository, base branch, URL, remote head, and deterministic local branch, then enters the normal full validation/review/finish path. Merge, deploy, and canary each produce separate durable receipts. A successful merge followed by a failed deploy or canary is recorded as `production_failed`; the plugin does not claim completion. It runs the policy's rollback command when one is configured, in the failing stage, before reporting.
 
 ## Adaptive capability control plane
 
@@ -215,12 +215,14 @@ Restating a subject supersedes its predecessor instead of overwriting it, so cor
 
 A monitor is a durable obligation, not a reminder. It watches a BB thread for completion or failure, or fires on a cron schedule. Thread watches are event-driven: BB realtime and lifecycle events wake the executor instead of waiting for the next idle poll. Firing is claimed before it happens, so a crash mid-fire cannot double-book it; a one-shot watch retires and a schedule re-arms for its next occurrence. The agent receives its own instruction back as an ordinary turn, acts on it, and reports to the owner. Schedules are for clock time, not for polling whether a thread or job has moved.
 
+Any visible thread can be watched, whether or not the agent started it: engaging with a thread is what creates the obligation to hear how it ends. Starting a thread or messaging one arms that watch automatically, because the agent cannot be relied on to arm it itself — it says it will pick the work up and then sleeps through the thread landing. Delegated fan-outs are exempt: their members are joined rather than watched one by one. The agent holds one armed watch per thread — a second engagement reuses it, and the agent arming it deliberately replaces the wording with its own. A freshly armed thread watch holds for a settling minute before it may report the thread finished, since BB does not flip a thread out of idle the instant it is messaged. Arming alongside another action never fails that action: at the armed-monitor cap the courtesy watch is simply declined.
+
 ## Thread notices
 
 The owner drives BB from Telegram, so anything that would wait for a click in the BB app is work that waits forever. A background sweep watches every **top-level** visible thread — a sub-agent's thread is reported to its parent, not to the owner, and a Hanoon pipeline worker is already covered by the job status card — and delivers two things:
 
 - **Finished and failed.** A thread's first observation is recorded silently, so enabling the sweep does not replay a backlog. After that, only a thread that was *working* can stop working: a move into `idle` or `error` is announced when it comes from `active`, `starting`, or `stopping`. A thread marked failed after it already finished has had its say, and repeating it as a failure would contradict what the owner just read. A thread being steered turn by turn is announced at most once every ten minutes, so it does not narrate every reply.
-- **Blocked.** A thread waiting on a BB interaction is rendered into Telegram with inline buttons: the options of a question, or *Allow once* / *Allow all session* / *Deny* for a command or file-change approval. The tap is carried back through BB's interaction resolution, and delivery is recorded separately from the answer so a crash between the two re-sends rather than loses it.
+- **Blocked.** A **visible watched** thread waiting on a BB interaction is rendered into Telegram with inline buttons: the options of a question, or *Allow once* / *Allow all session* / *Deny* for a command or file-change approval. The session-wide option exists only on this visible-thread path; the hidden controller never offers it. The tap is carried back through BB's interaction resolution, and delivery is recorded separately from the answer so a crash between the two re-sends rather than loses it.
 
 Notices are written straight to the durable outbox rather than routed through the agent. They are a property of the plugin, not of the conversation, so they still arrive when the agent itself is the stuck part.
 
@@ -228,17 +230,41 @@ An interaction the plugin cannot render into buttons — an unfamiliar payload, 
 
 The sweep is paced independently of the executor loop it rides on, which polls as often as every 250ms while an answer streams. An owner's tap is delivered immediately; only the polling is paced.
 
-## Controller questions
+## Controller interactions
 
-The conversational agent can ask the owner a question mid-answer. BB raises that as a pending interaction, which is answerable only in the BB app, so the plugin bridges it: the question is detected on the event stream the reconcile loop already reads, asked in Telegram with buttons, and resolved from a tap or a plain typed reply. Multi-question interactions are asked one at a time and resolved once every question is settled. While a turn is parked on a question the typing indicator stops, because the turn is waiting on a person rather than composing.
+The conversational agent can be blocked mid-answer on a question it needs the owner to settle, or on a permission BB wants granted. Both are BB interactions, answerable only in the BB app, so the plugin bridges both.
 
-Two timeouts bound the ways an answer can go missing, and their ordering matters. A submitted turn that produces no BB event for eight minutes is treated as wedged: the turn fails with a message to the owner **and the thread is retired**, so the next message opens a fresh session. That deadline sits below the ten-minute limit on how long a queued message waits for a busy thread, so recovery happens before the queue starts failing behind it. A turn parked on a question is exempt — waiting on a person is not a stall.
+The event stream the reconcile loop already reads carries only a bounded reference — an interaction id, a kind, and a status. That reference is never authority for what the interaction says. Before anything is stored or shown, the plugin revalidates its own source against the fresh executor lease, the exact submitted turn, the active controller thread, and that thread's single open generation, then fetches the exact interaction with `threads.interactions.get` and checks the returned id, thread, and status. Only then is the payload projected into the bounded, redacted form the plugin may keep.
+
+What the owner sees:
+
+- **Questions** keep their bounded sequential options and accept a plain typed reply. Multi-question interactions are asked one at a time and resolved once every question is settled.
+- **Permission approvals** render exactly *Allow once* and *Deny*. There is no session-wide grant on the hidden controller path, and a session-wide token cannot settle one even if presented.
+- **Anything the plugin cannot represent** is reported as bounded explanatory text with no buttons, rather than guessed at.
+
+A tap is durable before BB hears anything about it: the pending-to-answered transition, the Telegram callback outcome, and the acknowledgement the owner is owed all commit in one transaction under the claimed update. The executor is nudged only after that commit. Repeated callback ids and repeated tokens are idempotent, and a wrong user, a wrong chat, or a revoked owner settles nothing.
+
+Delivering the answer to BB is the one operation allowed to run before evidence reconciliation: until BB hears a decision the owner already made, the thread cannot produce anything new. The exact interaction is fetched again before resolving, so an interaction BB already settled is adopted locally instead of resolved twice. While an interaction is pending or answered the turn is parked — no draft refresh, steering, supervisor budget, stall failure, continuation, completion, or silence — and a parked turn is never failed for elapsed time, because that time is the owner thinking. Only a thread BB has provably lost ends a parked turn.
+
+Legacy controller-question storage remains as migration history and a one-release compatibility read for in-flight messages. It is never written again.
+
+Two timeouts bound the ways an answer can go missing, and their ordering matters. A submitted turn that produces no BB event for eight minutes is treated as wedged: the turn fails with a message to the owner **and the thread is retired**, so the next message opens a fresh session. That deadline sits below the ten-minute limit on how long a queued message waits for a busy thread, so recovery happens before the queue starts failing behind it. A turn parked on an interaction is exempt — waiting on a person is not a stall.
 
 A message the owner sends while an answer is still being written is steered into the running thread rather than queued behind it, so a correction lands while it can still correct something.
 
 A controller answer may promise a later check-in only when that same turn has a completed receipt for a durable thread watch or schedule. Otherwise the settlement gate replaces the promise with an explicit statement that the work is unfinished and no follow-up is armed.
 
-While Luna is connecting, thinking, or using tools, Telegram shows a live draft instead of a blank loading state: a short status line at first, then the public thinking summary as it arrives. The private reasoning chain stays off that draft. The finished reply still comes from the completed assistant output, not the thinking preview.
+While Luna is connecting, thinking, or using tools, Telegram shows a live draft instead of a blank loading state. That draft is derived from the durable stream phase alone — never from provider text — so nothing partial or unaccepted is ever visible. The finished reply comes from the accepted finalization, not from the draft.
+
+## What can become an answer
+
+An owner-visible reply is one accepted structured finalization. There is no other path to one.
+
+- **Evidence is same-turn.** Each capability call records a bounded evidence row — its source, outcome, proof kinds, and subject refs — against the current turn. A finalization's claims must reference those rows with compatible proof kinds and an exactly matching subject, and are rejected with a stable code otherwise. Evidence is capped at 128 rows per turn and a finalization at eight revisions; exceeding either fails the turn rather than answering unprovably.
+- **Acceptance seals the boundary.** An accepted finalization records the evidence high-water mark it was validated against. If evidence advances afterwards, completion refuses and the turn is retired instead of delivering an answer that no longer matches what was observed.
+- **Obligations are durable.** A deferred answer must name a live obligation — a non-terminal job, an armed controller monitor, or a running sealed delegation — that already exists. An intention is not a follow-up. An answered reply that promises to act at a later moment — "I'll take it through the merge once it lands" — is refused for the same reason: nothing in the plugin acts on prose, so the promise has to be a deferred answer resting on a live obligation. A promise the owner's own tap gates ("after approval") is left alone, because their reply is what wakes the agent. A `needs_owner` answer requires an active owner boundary, and stays parked until the exact interaction has been delivered to BB.
+- **BB-native work is projected too.** Work the provider does natively — commands, file changes, tool calls — is reconciled into the same bounded evidence index before completion, so an answer can rest on it without the raw command or diff ever being retained.
+- **Drafts are phase-only.** The Telegram draft is derived from the durable stream phase, never from provider text, so nothing partial or unaccepted is ever visible.
 
 ## Learning from finished jobs
 
@@ -303,7 +329,7 @@ Background learning runs on its own model setting, defaulting to `inherit`. Extr
 
 ## Controller supervision
 
-The stall clock only catches a turn that goes silent. A turn that keeps producing events while getting nowhere is invisible to it, and the agent runs with full permissions, so the work itself is bounded too.
+The stall clock only catches a turn that goes silent. A turn that keeps producing events while getting nowhere is invisible to it, and the agent runs under a broad permission mode by default, so the work itself is bounded too.
 
 The reconcile loop already pages the BB event stream to redraw the Telegram draft. It now also counts what that stream reveals: tool-shaped item starts, non-zero command exits, and the cumulative token total. Those land on the turn row inside the same cursor-guarded update that advances the draft, so a replayed page cannot count twice.
 
@@ -319,7 +345,12 @@ Budgets are constants rather than settings, on the same reasoning as the stall d
 ## Safety properties
 
 - Exactly one private Telegram user/chat identity is paired. Multiple independent projects may be admitted up to the configured bound, but each project pipeline is serialized.
-- The agent runs with full permissions and may use the shell, the `bb` CLI, skills, and MCP servers; it cannot approve a merge or merge code, which stay behind a one-use Telegram approval.
+- The controller permission mode is an operator setting whose current default is `full`, carried forward from before the trust kernel. It is current residual risk rather than a safe target: it is not mechanically enforced isolation, and instruction text is not enforcement. A saved `auto` or `accept-edits` value is preserved exactly. The agent cannot approve a merge or merge code. Merging stays behind a Telegram approval the owner gives directly — a one-use approval, or a standing approval granted by button tap, never by the agent interpreting a sentence.
+- Fresh-`auto` default activation and `executor_v2` managed-job publication are **disabled**. They require versioned runtime BB attestations proving an atomic activity snapshot, an atomic expected-head-and-tree conditional commit with a deterministic request key, and mechanical denial of worker and controller native commit, ref mutation, push, GitHub write, merge, deploy, and equivalent network effects. The vendored BB thread, timeline, and interaction calls share no atomic activity revision and the commit API is unconditional, so neither protocol can be implemented safely today.
+- Every owner-visible answer is an accepted structured finalization bound to same-turn evidence. Raw provider prose reaches no draft, stored answer, digest, outbox row, finalization row, or reply; BB still owns its own provider transcript.
+- The controller runs against an enforced manifest of exactly 25 Hanoon capabilities, and that manifest bounds only Hanoon's own tools. Work the provider does natively inside BB, or through an opaque third-party tool that emits no BB interaction or evidence boundary, is outside it — there is no Hanoon policy over an action Hanoon never sees.
+- Hidden-controller questions and permission approvals bridge to Telegram with exactly *Allow once* and *Deny*, no session-wide grant, an owner tap that commits before BB is told, and recovery across restart. Legacy controller-question storage is migration history and a one-release compatibility read, never an active write path.
+- The final answer is one durable logical outbox obligation, but Telegram delivery is **at-least-once**: an ambiguous send is retained as unknown, a retry may duplicate the Telegram message, and an attempt or an enqueue is never recorded as delivered.
 - Reviewed code work goes through the job pipeline. The agent creates durable job intent through registered tools; it cannot spawn pipeline workers or touch a worktree directly.
 - A mutating tool call runs at most once per turn for identical arguments. A call interrupted mid-flight is reported to the agent as an uncertain outcome to verify, never silently retried.
 - Memory never stores credential-shaped text, and hidden threads stay unreachable from the thread tools.
@@ -327,7 +358,7 @@ Budgets are constants rather than settings, on the same reasoning as the stall d
 - Review verdicts are structured and bound to an exact full pull-request head SHA.
 - Plan verification, validation receipts, documentation disposition, and every required review lens are checked from durable structured evidence before their transition can advance.
 - Pull-request head evidence is resolved from `git ls-remote origin refs/pull/<number>/head`; cached API metadata is not the merge authority.
-- Merge requires current review and validation evidence plus an expiring, one-use owner approval. Concurrency and resource ownership never replace that approval, and GitHub repository rules still apply.
+- Merge requires current review and validation evidence plus owner approval: an expiring, one-use approval, or a standing per-project approval the owner granted by button. A standing approval replaces only the owner's signature; every other check still runs, and unusual jobs still stop to ask. Concurrency and resource ownership never replace approval, and GitHub repository rules still apply.
 - Deployment and canary commands are owner-authored policy inputs. They run only after the approved merge is confirmed and the worktree is detached at that merge commit.
 - Tokens, pairing links, callback nonces, raw private messages, and credential-like command output are excluded from normal evidence and documentation.
 

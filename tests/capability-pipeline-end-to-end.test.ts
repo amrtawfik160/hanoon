@@ -1,3 +1,4 @@
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
@@ -408,13 +409,15 @@ describe("adaptive capability pipeline fake-host acceptance", () => {
     const fixture = activeProviderFixture("direct");
     const activeProfile = fixture.store.getLatestCapabilityProfile("worker_attempt", fixture.attemptId);
     expect(activeProfile).toBeNull();
-    expect(fixture.store.completeControllerTurn({
-      turnId: fixture.controllerTurnId,
+    completeTurnThroughFinalization(fixture.store, {
       ownerId: fixture.ownerId,
       generation: fixture.generation,
-      responseText: "The active job is queued.",
       now: 700,
-    })).toBe(true);
+    }, {
+      turnId: fixture.controllerTurnId,
+      controllerKey: "owner-7-controller",
+      responseText: "The active job is queued.",
+    });
     fixture.store.appendRecipeRolloutDecision({
       recipe: "direct",
       action: "rollback",

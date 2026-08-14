@@ -3,6 +3,7 @@ import { expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 import {
   MEMORY_DEMOTION,
   MEMORY_IDLE_HALF_LIFE_MS,
@@ -47,7 +48,9 @@ function completedTurn(
   store.claimNextControllerTurn(fence);
   store.markControllerSpawned({ ...fence, turnId: turn.id, projectId: "p", hostId: "h", threadId: "thr_c" });
   store.markControllerTurnSubmitted({ ...fence, turnId: turn.id });
-  store.completeControllerTurn({ ...fence, turnId: turn.id, responseText: "an answer" });
+  completeTurnThroughFinalization(store, fence, {
+    turnId: turn.id, controllerKey: turn.controllerKey, responseText: "an answer",
+  });
   // Released so a later turn in the same test can take the singleton lease.
   store.releaseExecutorLease(fence.ownerId, fence.generation, now);
   return turn;

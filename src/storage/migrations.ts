@@ -148,13 +148,13 @@ CREATE TABLE outbox (
 );
 `] as const;
 
-export const TASK_3_MIGRATIONS = [String.raw`
+export const UPDATE_CLAIM_MIGRATIONS = [String.raw`
 ALTER TABLE telegram_updates ADD COLUMN claim_owner TEXT;
 ALTER TABLE telegram_updates ADD COLUMN claim_generation INTEGER;
 ALTER TABLE telegram_updates ADD COLUMN claim_expires_at INTEGER;
 `] as const;
 
-export const TASK_9_MIGRATIONS = [String.raw`
+export const APPROVAL_BINDING_MIGRATIONS = [String.raw`
 ALTER TABLE callbacks ADD COLUMN approval_nonce_hash TEXT;
 ALTER TABLE callbacks ADD COLUMN head_sha TEXT;
 ALTER TABLE callbacks ADD COLUMN effect_idempotency_key TEXT;
@@ -1294,10 +1294,200 @@ ALTER TABLE controller_turns ADD COLUMN model_fallback_index INTEGER NOT NULL DE
   CHECK (model_fallback_index BETWEEN 0 AND 2);
 `] as const;
 
+export const CONTROLLER_TRUST_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN evidence_event_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN completion_continuations INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE controller_turns ADD COLUMN accepted_finalization_id INTEGER;
+ALTER TABLE controller_turns ADD COLUMN evidence_limit_exceeded_at INTEGER;
+
+CREATE TABLE controller_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('hanoon_tool', 'bb_item')),
+  source_name TEXT NOT NULL,
+  source_item_id TEXT,
+  outcome TEXT NOT NULL CHECK (outcome IN ('observed', 'succeeded', 'failed', 'interrupted', 'denied')),
+  args_sha256 TEXT NOT NULL,
+  result_sha256 TEXT NOT NULL,
+  proof_kinds_json TEXT NOT NULL,
+  subject_refs_json TEXT NOT NULL,
+  observed_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX controller_evidence_native_item
+  ON controller_evidence(turn_id, source_kind, source_item_id)
+  WHERE source_kind = 'bb_item' AND source_item_id IS NOT NULL;
+CREATE INDEX controller_evidence_turn_id ON controller_evidence(turn_id, id);
+
+CREATE TABLE controller_finalizations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  revision INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  rendered_message TEXT NOT NULL,
+  evidence_high_water_id INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('accepted', 'rejected')),
+  rejection_code TEXT,
+  created_at INTEGER NOT NULL,
+  validated_at INTEGER NOT NULL,
+  consumed_at INTEGER,
+  UNIQUE(turn_id, revision),
+  CHECK (
+    (state = 'accepted' AND rejection_code IS NULL) OR
+    (state = 'rejected' AND rejection_code IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX one_accepted_controller_finalization
+  ON controller_finalizations(turn_id) WHERE state = 'accepted';
+CREATE INDEX controller_finalizations_turn
+  ON controller_finalizations(turn_id, revision);
+`] as const;
+
+export const CONTROLLER_INTERACTION_MIGRATIONS = [String.raw`
+CREATE TABLE controller_interactions (
+  interaction_id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  bb_thread_id TEXT,
+  controller_generation_id TEXT REFERENCES controller_generations(id),
+  kind TEXT NOT NULL CHECK (kind IN ('user_question', 'approval', 'unsupported')),
+  payload_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'delivered')),
+  answer_json TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  delivered_at INTEGER,
+  CHECK (state = 'delivered' OR
+    (bb_thread_id IS NOT NULL AND controller_generation_id IS NOT NULL))
+);
+CREATE INDEX controller_interactions_state
+  ON controller_interactions(controller_key, state, asked_at, interaction_id);
+
+-- Legacy pending/answered questions can only be safe if their controller has
+-- exactly one live generation. A failed guard aborts this whole migration.
+CREATE TABLE controller_interaction_migration_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO controller_interaction_migration_guard(valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+    FROM controller_questions AS question
+    JOIN controller_threads AS controller ON controller.controller_key = question.controller_key
+    JOIN controller_turns AS turn ON turn.id = question.turn_id
+   WHERE question.state IN ('pending', 'answered')
+     AND (
+       turn.controller_key <> question.controller_key OR turn.state <> 'submitted' OR
+       controller.state <> 'active' OR controller.bb_thread_id IS NULL OR
+       controller.bb_thread_id IS NULL OR
+       (SELECT COUNT(*) FROM controller_generations AS generation
+         WHERE generation.controller_key = question.controller_key
+           AND generation.thread_id = controller.bb_thread_id
+           AND generation.ended_at IS NULL) <> 1
+     )
+) THEN 0 ELSE 1 END;
+
+INSERT INTO controller_interactions (
+  interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
+  kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
+)
+SELECT
+  question.interaction_id,
+  question.turn_id,
+  question.controller_key,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE controller.bb_thread_id END,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE (
+    SELECT generation.id FROM controller_generations AS generation
+     WHERE generation.controller_key = question.controller_key
+       AND generation.thread_id = controller.bb_thread_id
+       AND generation.ended_at IS NULL
+  ) END,
+  'user_question',
+  json_object('kind', 'user_question', 'interactionId', question.interaction_id, 'questions', json(question.questions_json)),
+  question.state,
+  CASE WHEN question.answers_json = '{}' THEN NULL
+       ELSE json_object('kind', 'user_answer', 'answers', json(question.answers_json)) END,
+  question.asked_at,
+  question.answered_at,
+  CASE WHEN question.state = 'delivered' THEN COALESCE(question.answered_at, question.asked_at) ELSE NULL END
+FROM controller_questions AS question
+JOIN controller_threads AS controller ON controller.controller_key = question.controller_key;
+DROP TABLE controller_interaction_migration_guard;
+`] as const;
+
+/**
+ * A standing merge grant lets one project merge and deploy without asking the
+ * owner each time. Current state lives in one row per project; every grant and
+ * revocation is also appended to the log, because after a bad deploy the first
+ * question is who authorised unattended merging and when.
+ */
+export const MERGE_AUTHORITY_MIGRATIONS = [String.raw`
+CREATE TABLE merge_authority (
+  project_id TEXT PRIMARY KEY,
+  granted_at INTEGER NOT NULL,
+  granted_by_user_id TEXT NOT NULL,
+  granted_by_chat_id TEXT NOT NULL,
+  revoked_at INTEGER,
+  revoked_reason TEXT CHECK (revoked_reason IS NULL OR length(revoked_reason) BETWEEN 1 AND 200)
+);
+
+CREATE TABLE merge_authority_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('granted', 'revoked', 'used')),
+  job_id TEXT,
+  actor_user_id TEXT,
+  actor_chat_id TEXT,
+  reason TEXT CHECK (reason IS NULL OR length(reason) BETWEEN 1 AND 200),
+  occurred_at INTEGER NOT NULL
+);
+
+CREATE INDEX merge_authority_events_project
+  ON merge_authority_events (project_id, occurred_at);
+`] as const;
+
+/**
+ * `regression_watch` holds the confirmed-failing command set per project, not a
+ * count: a count cannot tell a new regression from a different test failing in
+ * place of a fixed one. `reported_failures` is what the owner has already been
+ * told, so a standing failure stays quiet until it changes.
+ */
+export const REGRESSION_WATCH_MIGRATIONS = [String.raw`
+CREATE TABLE regression_watch (
+  project_id TEXT PRIMARY KEY,
+  confirmed_failures TEXT NOT NULL DEFAULT '[]',
+  reported_failures TEXT NOT NULL DEFAULT '[]',
+  flaky_failures TEXT NOT NULL DEFAULT '[]',
+  last_summary TEXT,
+  last_checked_at INTEGER,
+  reported_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE failure_escalations (
+  fingerprint TEXT PRIMARY KEY,
+  project_id TEXT,
+  cluster_size INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  escalated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX failure_escalations_expiry ON failure_escalations (expires_at);
+
+CREATE TABLE project_admission_pauses (
+  project_id TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  fingerprint TEXT,
+  paused_at INTEGER NOT NULL,
+  cleared_at INTEGER
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
-  ...TASK_3_MIGRATIONS,
-  ...TASK_9_MIGRATIONS,
+  ...UPDATE_CLAIM_MIGRATIONS,
+  ...APPROVAL_BINDING_MIGRATIONS,
   ...CONTROLLER_MIGRATIONS,
   ...CONTROLLER_STREAM_MIGRATIONS,
   ...THREAD_OPERATION_MIGRATIONS,
@@ -1335,4 +1525,8 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_CAPABILITY_MIGRATIONS,
   ...PROMOTION_EVIDENCE_MIGRATIONS,
   ...CONTROLLER_MODEL_FALLBACK_MIGRATIONS,
+  ...CONTROLLER_TRUST_MIGRATIONS,
+  ...CONTROLLER_INTERACTION_MIGRATIONS,
+  ...MERGE_AUTHORITY_MIGRATIONS,
+  ...REGRESSION_WATCH_MIGRATIONS,
 ] as const;

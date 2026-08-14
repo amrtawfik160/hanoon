@@ -240,6 +240,12 @@ export class MonitorService {
       return monitor.dueAt !== null && monitor.dueAt <= now ? "its scheduled time arrived" : null;
     }
     if (!monitor.threadId) return null;
+    // A thread does not go from idle to working the instant it is messaged, so
+    // a watch armed alongside that message would otherwise fire at once and
+    // report the work finished before it started. The settling window on a
+    // thread watch only ever delays the wake-up; a thread that really has
+    // landed is still reported the moment the window passes.
+    if (monitor.dueAt !== null && monitor.dueAt > now) return null;
     const status = await this.dependencies.threads.status(monitor.threadId);
     if (status === "idle") return `the thread you were watching (${monitor.threadId}) finished`;
     if (status === "error") return `the thread you were watching (${monitor.threadId}) failed`;

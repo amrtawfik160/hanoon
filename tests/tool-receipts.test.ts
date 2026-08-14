@@ -65,8 +65,14 @@ it("runs a mutating tool once per turn and replays its result afterwards", async
     callContext(),
   );
 
-  expect(replay).toBe(first);
+  const firstResult = JSON.parse(first as string);
+  const replayResult = JSON.parse(replay as string);
+  expect(replayResult.remembered).toEqual(firstResult.remembered);
+  expect(firstResult._hanoonEvidence).toMatchObject({ ref: "evidence:1", outcome: "succeeded" });
+  expect(replayResult._hanoonEvidence).toMatchObject({ ref: "evidence:2", outcome: "observed" });
   expect(store.countMemories("owner")).toBe(1);
+  expect(store.listToolReceipts(store.getPendingControllerTurn(CONTROLLER_KEY)!.id)).toHaveLength(1);
+  expect(store.listControllerEvidence(store.getPendingControllerTurn(CONTROLLER_KEY)!.id, 10)).toHaveLength(2);
 });
 
 it("treats different arguments as a different call", async () => {

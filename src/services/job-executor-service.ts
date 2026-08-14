@@ -13,6 +13,7 @@ import {
   projectWorkerLiveness,
   type BbThreadObservation,
 } from "./worker-liveness";
+import { CONTROLLER_PHASE_TEXT } from "../controller/models";
 
 type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
@@ -63,6 +64,12 @@ export type JobExecutorDependencies = {
   };
   productionHealth?: {
     processDue(): Promise<boolean>;
+  };
+  regressionWatch?: {
+    processDue(): Promise<boolean>;
+  };
+  failureLoop?: {
+    processDue(): boolean;
   };
   systemMonitors?: {
     install(): void;
@@ -596,6 +603,14 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         if (deps.productionHealth) {
           didWork = await deps.productionHealth.processDue() || didWork;
         }
+        if (deps.regressionWatch) {
+          didWork = await deps.regressionWatch.processDue() || didWork;
+        }
+        // Scanned before the scheduler runs, so a project that just tripped the
+        // brake does not get one more job admitted into the same failure.
+        if (deps.failureLoop) {
+          didWork = deps.failureLoop.processDue() || didWork;
+        }
         // Idempotent, and deliberately not a one-shot at activation: pairing
         // can happen long after the executor starts.
         deps.systemMonitors?.install();
@@ -860,7 +875,17 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             const callback = callbackId(item.logicalKey);
             const turnId = controllerTurnId(item.logicalKey);
             const controllerTurn = turnId ? deps.store.getControllerTurn(turnId) : null;
-            if (callback && telegram.answerCallback) {
+            const terminalControllerDraft = turnId !== null &&
+              controllerTurn?.state === "submitted" &&
+              (controllerTurn.streamPhase === "complete" || controllerTurn.streamPhase === "failed");
+            if (terminalControllerDraft) {
+              // Suppress terminal placeholders before choosing draft, edit, or
+              // ordinary-send transport. A pre-cutover row can already carry a
+              // message id, and some Telegram clients do not expose drafts;
+              // neither case may turn stale stream payload into owner-visible
+              // text beside the real terminal writer's message.
+              deliveredMessageId = knownMessageId;
+            } else if (callback && telegram.answerCallback) {
               await telegram.answerCallback(callback, payloadText(item));
             } else if (
               turnId !== null &&
@@ -868,14 +893,13 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               knownMessageId === null &&
               telegram.sendMessageDraft
             ) {
+              // The draft is derived from the durable stream phase, never from
+              // a persisted raw stream_text, so provider prose can never reach
+              // Telegram as a preview.
               await telegram.sendMessageDraft(
                 item.chatId,
                 stableChatDraftId(item.chatId),
-                controllerDraftPreview({
-                  streamText: controllerTurn.streamText,
-                  streamPhase: controllerTurn.streamPhase,
-                  fallbackText: payloadText(item),
-                }),
+                CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
               );
             } else if (knownMessageId !== null) {
               await telegram.editMessage(item.chatId, knownMessageId, item.payload);

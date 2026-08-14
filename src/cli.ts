@@ -10,7 +10,7 @@ import {
   type ProjectPolicy,
 } from "./domain/models";
 import { TelegramClient } from "./telegram/client";
-import type { TelegramAgentStore } from "./storage/store";
+import { OWNER_MEMORY_SCOPE, type OwnerMemoryImportInput, type TelegramAgentStore } from "./storage/store";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { projectResourceWait } from "./storage/autonomy-repository";
 import {
@@ -64,6 +64,17 @@ class CliOperationError extends Error {}
 const JSON_FLAG: FlagSpec = { kind: "flag" };
 
 const TOP_LEVEL_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+
+const MEMORY_IMPORT_FLAGS: Record<string, FlagSpec> = {
+  json: JSON_FLAG,
+  file: { kind: "value" },
+  host: { kind: "value" },
+  scope: { kind: "value" },
+};
+
+/** Bounds one import so a malformed or runaway file cannot fill the store in a
+ *  single call. Memory eviction still applies per scope afterwards. */
+const MAX_IMPORTED_MEMORIES = 200;
 
 const PROJECT_ENABLE_FLAGS: Record<string, FlagSpec> = {
   json: JSON_FLAG,
@@ -133,6 +144,7 @@ Commands:
   capability status [recipe] [--json]
   capability inventory [--host <scope>] [--limit <1-100>] [--json]
   capability receipts <profile-id> [--limit <1-100>] [--json]
+  memory import --file <absolute-path> [--host <host-id>] [--scope <scope>] [--json]
   capability promote <recipe> [--json]
   capability rollback <recipe> [--json]
   doctor [project-id] [--json]
@@ -352,7 +364,7 @@ function policySummary(record: { policy: ProjectPolicy; version: number }): Json
   };
 }
 
-async function readRemotePolicyFile(
+async function readRemoteJsonFile(
   deps: TelegramAgentCliDependencies,
   path: string,
   explicitHostId: string | undefined,
@@ -560,7 +572,7 @@ async function enableProject(
     ? await (async () => {
         const path = parsed.values.get("policy-file");
         if (!path || !isAbsoluteHostPath(path)) throw new CliOperationError("--policy-file must be an absolute host path");
-        return readRemotePolicyFile(deps, path, parsed.values.get("host"), context);
+        return readRemoteJsonFile(deps, path, parsed.values.get("host"), context);
       })()
     : hasJson
       ? parseJsonRecord(parsed.values.get("policy-json") ?? "", "--policy-json")
@@ -607,6 +619,74 @@ async function runPair(
   return success(
     { url, username: identity.username, sensitive: true, expiresInSeconds: 600 },
     `Pairing link (sensitive; expires in 10 minutes): ${url}`,
+    json,
+  );
+}
+
+/**
+ * One entry of an owner import file. The file is external input, so its shape is
+ * checked here; lengths, kinds, and scope bounds stay the store's to enforce so
+ * there is one authority on what a memory may contain.
+ */
+function parseMemoryImportEntry(
+  value: unknown,
+  index: number,
+  defaultScope: string,
+): OwnerMemoryImportInput {
+  if (!isRecord(value)) throw new CliOperationError(`Entry ${index} must be a JSON object`);
+  const { subject, body, kind, scope, importance } = value;
+  if (typeof subject !== "string") throw new CliOperationError(`Entry ${index} needs a subject`);
+  if (typeof body !== "string") throw new CliOperationError(`Entry ${index} needs a body`);
+  if (kind !== undefined && typeof kind !== "string") {
+    throw new CliOperationError(`Entry ${index} kind must be a string`);
+  }
+  if (scope !== undefined && typeof scope !== "string") {
+    throw new CliOperationError(`Entry ${index} scope must be a string`);
+  }
+  if (importance !== undefined && typeof importance !== "number") {
+    throw new CliOperationError(`Entry ${index} importance must be a number`);
+  }
+  return {
+    scope: scope ?? defaultScope,
+    kind: (kind ?? "fact") as OwnerMemoryImportInput["kind"],
+    subject,
+    body,
+    importance,
+    now: 0,
+  };
+}
+
+/**
+ * Loads a file of standing information the owner wants the agent to have. It
+ * runs on the protected host under the owner's own identity, which is what makes
+ * it the one write allowed to carry secret-shaped text — the agent reaches these
+ * rows only by asking for them, and never writes one itself.
+ */
+async function runMemoryImport(
+  deps: TelegramAgentCliDependencies,
+  argv: readonly string[],
+  context: PluginCliContext,
+): Promise<PluginCliResult> {
+  const parsed = parseFlags(argv, MEMORY_IMPORT_FLAGS);
+  noPositionals(parsed);
+  const json = parsed.flags.has("json");
+  const path = parsed.values.get("file");
+  if (!path || !isAbsoluteHostPath(path)) {
+    throw new CliOperationError("--file must be an absolute host path");
+  }
+  const document = await readRemoteJsonFile(deps, path, parsed.values.get("host"), context);
+  if (!Array.isArray(document.entries)) throw new CliOperationError("The file needs an entries array");
+  if (document.entries.length === 0) throw new CliOperationError("The file has no entries");
+  if (document.entries.length > MAX_IMPORTED_MEMORIES) {
+    throw new CliOperationError(`The file has more than ${MAX_IMPORTED_MEMORIES} entries`);
+  }
+  const defaultScope = parsed.values.get("scope") ?? OWNER_MEMORY_SCOPE;
+  const entries = document.entries.map((entry, index) => parseMemoryImportEntry(entry, index, defaultScope));
+  const now = deps.now();
+  const imported = entries.map((entry) => deps.store.importOwnerMemory({ ...entry, now }).id);
+  return success(
+    { imported: imported.length },
+    `Imported ${imported.length} ${imported.length === 1 ? "memory" : "memories"}`,
     json,
   );
 }
@@ -1154,6 +1234,10 @@ export async function runTelegramAgentCli(
       const parsed = parseFlags(argv.slice(1), TOP_LEVEL_FLAGS);
       noPositionals(parsed);
       return runUnpair(deps, parsed.flags.has("json"));
+    }
+    if (command === "memory") {
+      if (argv[1] !== "import") throw new CliInputError("Unknown memory command");
+      return await runMemoryImport(deps, argv.slice(2), context);
     }
     if (command === "project") return await runProject(deps, argv.slice(1), context);
     if (command === "job") return await runJob(deps, argv.slice(1));

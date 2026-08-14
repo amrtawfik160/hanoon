@@ -64,6 +64,29 @@ it("wakes the agent with its own instruction once the watched thread finishes", 
   expect(store.listMonitors(CONTROLLER_KEY, true)).toMatchObject([{ state: "done", fireCount: 1 }]);
 });
 
+it("holds a freshly armed thread watch until the thread has had a moment to start", async () => {
+  const { store } = fixture();
+  // A thread does not leave idle the instant it is messaged, so a watch armed
+  // alongside that message must not read the idle it has not left yet as the
+  // work having finished.
+  store.ensureThreadWatch({
+    controllerKey: CONTROLLER_KEY,
+    threadId: "thr_work",
+    instruction: "Pick the work up when it lands.",
+    dueAt: NOW + 60_000,
+    now: NOW,
+    mode: "courtesy",
+  });
+  const stillIdle = async () => "idle" as const;
+
+  await expect(service(store, stillIdle).processDue()).resolves.toBe(false);
+  expect(store.listControllerTurns(CONTROLLER_KEY, 10)).toHaveLength(0);
+
+  await expect(service(store, stillIdle, () => NOW + 60_001).processDue()).resolves.toBe(true);
+  expect(store.listControllerTurns(CONTROLLER_KEY, 10)[0]?.inputText)
+    .toContain("Pick the work up when it lands.");
+});
+
 it("fires once and then stops, even if the loop runs again", async () => {
   const { store } = fixture();
   store.createMonitor({
@@ -218,4 +241,65 @@ it("gives each firing a fresh update id that stays clear of real Telegram update
 it("refuses a cron expression it cannot schedule", () => {
   expect(nextCronOccurrence("not a cron", NOW)).toBeNull();
   expect(nextCronOccurrence("0 9 * * *", NOW)).toBeGreaterThan(NOW);
+});
+
+it("keeps one watch per thread and lets the agent's own wording win", () => {
+  const { store } = fixture();
+  const courtesy = store.ensureThreadWatch({
+    controllerKey: CONTROLLER_KEY,
+    threadId: "thr_work",
+    instruction: "Carry on with whatever you promised.",
+    dueAt: NOW + 60_000,
+    now: NOW,
+    mode: "courtesy",
+  });
+
+  // A second engagement with the same thread must not arm a second watch, and
+  // must not overwrite an instruction the agent wrote for itself.
+  const repeated = store.ensureThreadWatch({
+    controllerKey: CONTROLLER_KEY,
+    threadId: "thr_work",
+    instruction: "Something blander.",
+    dueAt: NOW + 61_000,
+    now: NOW + 1_000,
+    mode: "courtesy",
+  });
+  const explicit = store.ensureThreadWatch({
+    controllerKey: CONTROLLER_KEY,
+    threadId: "thr_work",
+    instruction: "Merge it through the pipeline, then tell the owner it is live.",
+    dueAt: NOW + 62_000,
+    now: NOW + 2_000,
+    mode: "explicit",
+  });
+
+  expect([courtesy?.id, repeated?.id, explicit?.id]).toEqual([courtesy?.id, courtesy?.id, courtesy?.id]);
+  expect(store.listMonitors(CONTROLLER_KEY, true)).toMatchObject([{
+    id: courtesy?.id,
+    state: "armed",
+    instruction: "Merge it through the pipeline, then tell the owner it is live.",
+  }]);
+});
+
+it("declines a courtesy watch at the armed cap rather than failing the action", () => {
+  const { store } = fixture();
+  for (let index = 0; index < 20; index += 1) {
+    store.createMonitor({
+      controllerKey: CONTROLLER_KEY,
+      kind: "schedule",
+      cron: "0 9 * * 1-5",
+      instruction: `Digest ${index}.`,
+      dueAt: NOW + 86_400_000,
+      now: NOW + index,
+    });
+  }
+
+  expect(store.ensureThreadWatch({
+    controllerKey: CONTROLLER_KEY,
+    threadId: "thr_work",
+    instruction: "Carry on with whatever you promised.",
+    dueAt: NOW + 60_000,
+    now: NOW,
+    mode: "courtesy",
+  })).toBeNull();
 });

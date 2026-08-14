@@ -152,8 +152,12 @@ export function buildHealthReport(
     },
     monitors: {
       armed: count(db, "SELECT COUNT(*) AS value FROM monitors WHERE state = 'armed'"),
+      // Schedules only. A thread watch carries a due time as its settling
+      // window, not as a firing time, and reporting that as the next monitor
+      // due would tell the operator a watch fires a minute from now when what
+      // it is really waiting for is the thread.
       nextDueAt: (db.prepare(
-        "SELECT MIN(due_at) AS value FROM monitors WHERE state = 'armed' AND due_at IS NOT NULL",
+        "SELECT MIN(due_at) AS value FROM monitors WHERE state = 'armed' AND kind = 'schedule' AND due_at IS NOT NULL",
       ).get() as { value: number | null }).value,
       failed: count(db, "SELECT COUNT(*) AS value FROM monitors WHERE state = 'failed'"),
     },

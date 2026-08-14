@@ -6,15 +6,15 @@ The installed plugin and CLI namespace remain `telegram-agent`.
 
 ## Why Hanoon?
 
-- **Run BB from Telegram, not from BB.** Hanoon has the shell, the `bb` CLI, installed skills and MCP servers, and reach across every connected machine. Nothing waits for a click in the BB app.
+- **Run BB from Telegram, not from BB.** Hanoon has the shell, the `bb` CLI, installed skills and MCP servers, and reach across every connected machine. A question or permission prompt it hits reaches you in Telegram; a block it cannot render into buttons is still reported, naming the thread and saying it needs you in BB.
 - **It remembers, and keeps it honest.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall. Correcting Hanoon devalues whatever misled it, notes it never uses fade, and a correction retires the belief it contradicts.
 - **It learns from finished work.** When a job ends, Hanoon works out what is worth knowing about that repository next time — a check that always fails for a known reason, a convention it enforces — and keeps it per project.
-- **It follows up by itself.** Set a monitor to watch a thread or run on a schedule; when it fires, Hanoon does the work and messages you. It also runs its own daily and weekly upkeep, and stays quiet when nothing needs you.
+- **It follows up by itself.** Any thread Hanoon starts or messages is watched until it lands, including threads it did not open; you can also set a monitor on a schedule. When one fires, Hanoon does the work and messages you. It also runs its own daily and weekly upkeep, and stays quiet when nothing needs you.
 - **It works in parallel.** Independent questions go out to several BB threads at once and come back as one answer.
 - **Conversations survive failures.** A dead provider session retires a BB thread, not the conversation. The replacement resumes with what was said and what was already done.
 - **Pipeline workers recover safely.** Silent or missing workers are retired and the exact stage is retried only for failure signatures that have recovered before; unfamiliar failures still stop for you.
 - **Mutations happen once.** Every mutating tool call is receipted by turn and argument hash, so a recovered agent replays the result instead of repeating the action.
-- **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, approval is one-use and expiring, and GitHub repository rules still apply.
+- **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, approval is one-use and expiring unless the owner grants a project a standing approval, and GitHub repository rules still apply.
 - **Use BB's isolation model.** Threads isolate provider conversations and coordination; managed worktrees isolate branches, checkouts, and filesystem mutation.
 
 ## How it works
@@ -35,7 +35,7 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 
 | Capability | What it means in the chat |
 | --- | --- |
-| Full BB control | "Install the Linear MCP", "restart that host", "what's on machine two" — the shell and `bb` CLI, with full permissions, on any connected machine. |
+| Full BB control | "Restart that host", "what's on machine two" — the shell and `bb` CLI on any connected machine, under the configured permission mode. Installing or connecting an integration needs your decision first. |
 | Live thread insight | "Why is this taking so long?" answers from the thread's current step, todo list, running commands, and latest message — not just its status. |
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
@@ -44,9 +44,20 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Self-maintenance | A daily sweep for work needing your decision, a weekly memory audit, and a weekly scorecard of what actually happened. Off by one setting. |
 | Monitors | "Tell me when this finishes and open a PR", or "every weekday at 9, summarise the overnight runs." |
 | Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. A block it cannot render is still reported, so nothing waits on you in silence. |
+| Answers you can check | Every reply is an accepted structured finalization backed by evidence gathered in that same turn. Raw model prose never becomes an answer, and a claim without compatible evidence is rejected rather than sent. |
 | Reviewed delivery | A guarded job takes a change from plan to a reviewed pull request; merging and production still ask you in Telegram when those are set up. |
 | Self-diagnosis | `/health` reports the executor, queued work, undelivered messages, monitors, memory, and database integrity — even when the agent is the stuck part. |
 | Bounded turns | A question that runs away is nudged once to land the answer, then stopped before it burns your budget out of sight. |
+
+## What an answer is
+
+Every owner-visible reply is one accepted structured finalization, and nothing else can become one:
+
+- **Evidence in the same turn.** A claim about current state or completed work must reference evidence the agent gathered during that turn, with compatible proof kinds and a matching subject. Evidence is sealed at a high-water mark when the finalization is accepted, and an answer whose evidence advanced afterwards is refused rather than sent.
+- **Raw prose reaches nothing.** Unstructured assistant prose never becomes a Telegram draft, a stored answer, a conversation digest, an outbox row, a finalization row, or a reply. BB still owns its own provider transcript. Drafts show one of the fixed phase lines, such as "Hanoon is thinking…", never partial output. The one exception is not prose: when BB blocks on a question or an approval, the provider's own prompt, options, and command are what the owner is being asked about, so they are carried through — each field bounded and credential-screened, and the whole interaction downgraded to an unanswerable notice if any field fails the screen.
+- **A bounded capability surface.** The controller runs against an enforced manifest of exactly 25 Hanoon capabilities. Denials are decided before any effect, and a stale executor fence or a stale approval is denied rather than retried.
+- **Owner boundaries reach the phone.** A hidden-controller question or BB permission prompt is fetched from BB by exact identity, shown in Telegram, and answered by tap or plain reply. Approvals offer exactly *Allow once* and *Deny*; there is no session-wide grant on the hidden controller path. Your tap commits durably before BB is told, survives a restart, and is retried only for that exact resolution.
+- **One logical reply, at-least-once transport.** The answer is one durable outbox obligation. Telegram delivery itself is at-least-once: an ambiguous send is retained as unknown and a retry may duplicate the Telegram message. Enqueuing or attempting is never recorded as delivered.
 
 ## Architecture
 
@@ -99,7 +110,7 @@ npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
 ```
 
 > [!WARNING]
-> This is a full-trust BB plugin, and the agent runs with full permissions by design so the owner never has to approve anything inside the BB app. It can use the shell, the `bb` CLI, and installed skills and MCP servers on any connected machine. Merging a pull request and promoting to production still require a one-use Telegram approval, and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
+> This is a full-trust BB plugin. The controller permission mode is a setting whose current default is `full`, carried forward from before the trust kernel: the agent can use the shell, the `bb` CLI, and installed skills and MCP servers on any connected machine without a BB-app prompt. That default is current residual risk, not a safe target — it is not enforced isolation, and instruction text is not enforcement. A saved `auto` or `accept-edits` value is preserved exactly; a permission prompt BB raises for the hidden controller is bridged into Telegram as *Allow once* / *Deny*. Merging a pull request and promoting to production still require a Telegram approval from the owner — one-use, or standing for a project the owner explicitly granted — and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
 
 ## Quick start
 
@@ -131,8 +142,8 @@ Open the sensitive, ten-minute pairing link from the intended owner's private Te
 Create a reviewed project policy, then enable and validate it:
 
 ```bash
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json
-bb telegram-agent doctor <project-id>
+bb telegram-agent project enable proj_7f3d2a91 --policy-file /absolute/path/to/policy.json
+bb telegram-agent doctor proj_7f3d2a91
 ```
 
 The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. Projects that deploy to the same target can share `production.targetKey`, which serializes that target even when their repositories differ. See [Configuration](docs/configuration.md) for the complete verified schema and examples.
@@ -150,7 +161,7 @@ always deploy parknwash on weekday mornings
 /health
 ```
 
-Recovery commands remain available without the agent: `/status`, `/projects`, `/health`, `/retry [job-id]`, `/cancel [job-id]`. `/status` lists current jobs; replying to a job status message or supplying its id selects that exact job. Merging still requires the one-use Telegram approval.
+Recovery commands remain available without the agent: `/status`, `/projects`, `/health`, `/approvals`, `/resume`, `/retry [job-id]`, `/cancel [job-id]`. `/status` lists current jobs; replying to a job status message or supplying its id selects that exact job. `/approvals` lists the projects that merge without asking, and `/approvals off [alias]` withdraws that. `/resume [alias]` restarts a project the failure brake stopped. Merging still requires a Telegram approval: one-use, or standing where the owner granted it.
 
 ## Documentation
 

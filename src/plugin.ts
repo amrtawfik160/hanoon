@@ -40,7 +40,7 @@ import { AutonomyScheduler } from "./autonomy/scheduler";
 import { EffectRunner } from "./services/effect-runner";
 import type { EffectFence } from "./services/effect-runner";
 import { runJobExecutorService } from "./services/job-executor-service";
-import { createTask9FreshGateCollector, MergeHandler } from "./services/merge-handler";
+import { createFreshGateCollector, MergeHandler } from "./services/merge-handler";
 import type { GateInput } from "./domain/gates";
 import type { ReviewFinding } from "./domain/models";
 import { documentationRequirement } from "./domain/pipeline-graph";
@@ -65,9 +65,10 @@ import {
 } from "./services/worker-liveness";
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
-import { registerControllerTools } from "./controller/tools";
+import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
 import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
 import { BbControllerAdapter, ControllerImagePreparationError } from "./controller/bb-controller";
+import { ControllerEvidenceProjector } from "./controller/evidence-projector";
 import {
   CONTROLLER_FALLBACK_MODELS,
   CONTROLLER_MODELS,
@@ -78,6 +79,8 @@ import {
   EXTRACTION_MODELS,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
+import { ControllerInteractionService } from "./controller/interaction-service";
+import { ControllerInteractionRepository } from "./storage/controller-interaction-repository";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
@@ -86,6 +89,8 @@ import { JobMemoryService } from "./services/job-memory-service";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { installSystemMonitors } from "./services/system-monitors";
 import { ProductionHealthService } from "./services/production-health-service";
+import { RegressionWatchService } from "./services/regression-watch-service";
+import { FailureLoopService } from "./services/failure-loop-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -211,7 +216,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     readEvidence: (recipe) => promotionEvidence.read(recipe),
     now: clock,
   });
-  const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()));
+  const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()), store);
   const executorNudge = new ExecutorNudge();
   const laneSnapshots = new JobLaneSnapshotProvider();
   if (!config.ok) bb.status.needsConfiguration(config.message);
@@ -260,9 +265,16 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     pluginId: bb.pluginId,
     clock: { now: clock },
   });
+  const evidenceProjector = new ControllerEvidenceProjector({
+    sdk: bb.sdk,
+    store,
+    clock: { now: clock },
+    hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
+  });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
+    evidenceProjector,
     threadOperations,
     downloadImage: async (fileId, maxBytes, signal) => {
       if (!config.ok) throw new Error(config.message);
@@ -508,7 +520,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       },
     });
   };
-  const collectGateInput = createTask9FreshGateCollector({
+  const collectGateInput = createFreshGateCollector({
     validation: { runner: terminal, environments: bb.sdk.environments },
     runValidation: (input) => runValidation({
       runner: terminal,
@@ -620,6 +632,12 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const controller = new LunaControllerService({
     store,
+    evidenceProjector,
+    interactionService: new ControllerInteractionService({
+      store: new ControllerInteractionRepository(bb.storage.database()),
+      interactions: bb.sdk.threads.interactions,
+      clock,
+    }),
     adapter: new BbControllerAdapter({
       sdk: bb.sdk,
       pluginId: bb.pluginId,
@@ -727,6 +745,40 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         return { ok: result.exitCode === 0, summary: result.output || `exit ${result.exitCode}` };
       },
     },
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    warn: (message) => bb.log.warn(message),
+  });
+  const regressionWatch = new RegressionWatchService({
+    store,
+    commands: {
+      run: async ({ projectId, command }) => {
+        const projects = await bb.sdk.projects.list({});
+        const project = projects.find((candidate) => candidate.id === projectId);
+        const source = project?.sources.find((candidate) => candidate.isDefault) ?? project?.sources[0];
+        if (!source?.hostId) throw new Error("Project has no host to run a scheduled check on");
+        const result = await terminal.run({
+          scope: { kind: "host_path", hostId: source.hostId, cwd: source.path ?? null },
+          title: `Telegram scheduled check: ${command.name.slice(0, 40)}`,
+          command: command.command,
+          timeoutMs: command.timeoutMs,
+        });
+        if (result.outcome !== "exited") return { ok: false, summary: `check ${result.outcome}` };
+        return { ok: result.exitCode === 0, summary: result.output || `exit ${result.exitCode}` };
+      },
+    },
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    warn: (message) => bb.log.warn(message),
+  });
+  const failureLoop = new FailureLoopService({
+    store,
     clock: { now: clock },
     issueUpdateId: (now) => {
       healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
@@ -1425,6 +1477,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       jobMemory,
       memoryCuration,
       productionHealth,
+      regressionWatch,
+      failureLoop,
       systemMonitors,
       presence,
       laneSnapshots,

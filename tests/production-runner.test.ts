@@ -58,10 +58,11 @@ describe("production runner", () => {
     expect(JSON.stringify(result)).toContain("[REDACTED]");
   });
 
-  it("stops on the first failed command and never executes the configured rollback", async () => {
+  it("stops on the first failed command and rolls back rather than running the rest", async () => {
     const run = vi.fn()
       .mockResolvedValueOnce({ outcome: "exited", exitCode: 0, output: "checkout verified" })
-      .mockResolvedValueOnce({ outcome: "exited", exitCode: 1, output: "deploy failed" });
+      .mockResolvedValueOnce({ outcome: "exited", exitCode: 1, output: "deploy failed" })
+      .mockResolvedValueOnce({ outcome: "exited", exitCode: 0, output: "reverted" });
     const policy = policyFixture({
       production: {
         deployCommands: [
@@ -84,8 +85,11 @@ describe("production runner", () => {
     });
 
     expect(result).toMatchObject({ outcome: "fail", failedCommand: "release" });
-    expect(run).toHaveBeenCalledTimes(2);
-    expect(run.mock.calls[1]?.[0].command).not.toBe("./rollback");
+    // The command after the failure is skipped; the rollback is not.
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(run.mock.calls.map((call) => call[0].command)).not.toContain("./deploy second");
+    expect(run.mock.calls[2]?.[0].command).toBe("./rollback");
+    expect(result.rollback).toMatchObject({ outcome: "pass" });
   });
 
   it("requires an explicit Convex CLI deploy command when configured", () => {
@@ -126,5 +130,111 @@ describe("production runner", () => {
 
     expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(60_000);
     expect(result.commandReceipts).toHaveLength(21);
+  });
+
+  describe("automatic rollback", () => {
+    const failingPolicy = (rollback: boolean) => policyFixture({
+      production: {
+        deployCommands: [{ name: "release", command: "./deploy", timeoutMs: 60_000 }],
+        canaryCommands: [{ name: "canary", command: "./verify", timeoutMs: 60_000 }],
+        ...(rollback
+          ? { rollbackCommand: { name: "revert", command: "./rollback", timeoutMs: 60_000 } }
+          : {}),
+        convexDeployRequired: false,
+      },
+    });
+
+    it("reverts production as soon as a deploy command fails", async () => {
+      const commands: string[] = [];
+      const result = await runProductionStage({
+        runner: {
+          run: async (input: { command: string }) => {
+            commands.push(input.command);
+            return input.command === "./rollback"
+              ? { outcome: "exited" as const, exitCode: 0, output: "reverted" }
+              : { outcome: "exited" as const, exitCode: 1, output: "boom" };
+          },
+        },
+        environmentId: "env_owned",
+        expectedHeadSha: mergedHead,
+        policy: failingPolicy(true),
+        phase: "deploy",
+        now: () => 3_000,
+      });
+
+      expect(result.outcome).toBe("fail");
+      expect(commands).toContain("./rollback");
+      expect(result.rollback).toMatchObject({ name: "revert", outcome: "pass" });
+      expect(result.summary).toContain("production was rolled back");
+    });
+
+    it("reverts production when the canary fails, not only the deploy", async () => {
+      const result = await runProductionStage({
+        runner: {
+          run: async (input: { command: string }) => (input.command === "./rollback"
+            ? { outcome: "exited" as const, exitCode: 0, output: "reverted" }
+            : input.command === "./verify"
+              ? { outcome: "exited" as const, exitCode: 1, output: "unhealthy" }
+              : { outcome: "exited" as const, exitCode: 0, output: "ok" }),
+        },
+        environmentId: "env_owned",
+        expectedHeadSha: mergedHead,
+        policy: failingPolicy(true),
+        phase: "canary",
+        now: () => 3_000,
+      });
+
+      expect(result.outcome).toBe("fail");
+      expect(result.rollback?.outcome).toBe("pass");
+    });
+
+    it("says so plainly when the rollback command itself fails", async () => {
+      const result = await runProductionStage({
+        runner: { run: async () => ({ outcome: "exited" as const, exitCode: 1, output: "boom" }) },
+        environmentId: "env_owned",
+        expectedHeadSha: mergedHead,
+        policy: failingPolicy(true),
+        phase: "deploy",
+        now: () => 3_000,
+      });
+
+      expect(result.rollback?.outcome).toBe("fail");
+      expect(result.summary).toContain("the rollback command also failed");
+    });
+
+    it("does not invent a rollback when the project configured none", async () => {
+      const result = await runProductionStage({
+        runner: { run: async () => ({ outcome: "exited" as const, exitCode: 1, output: "boom" }) },
+        environmentId: "env_owned",
+        expectedHeadSha: mergedHead,
+        policy: failingPolicy(false),
+        phase: "deploy",
+        now: () => 3_000,
+      });
+
+      expect(result.rollback ?? null).toBeNull();
+      expect(result.summary).toContain("no rollback command is configured");
+    });
+
+    it("never runs a rollback after a stage that passed", async () => {
+      const commands: string[] = [];
+      const result = await runProductionStage({
+        runner: {
+          run: async (input: { command: string }) => {
+            commands.push(input.command);
+            return { outcome: "exited" as const, exitCode: 0, output: "ok" };
+          },
+        },
+        environmentId: "env_owned",
+        expectedHeadSha: mergedHead,
+        policy: failingPolicy(true),
+        phase: "deploy",
+        now: () => 3_000,
+      });
+
+      expect(result.outcome).toBe("pass");
+      expect(commands).not.toContain("./rollback");
+      expect(result.rollback ?? null).toBeNull();
+    });
   });
 });

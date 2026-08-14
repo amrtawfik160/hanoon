@@ -104,7 +104,7 @@ describe("Telegram ingress service", () => {
       serviceDeps(
         store,
         client,
-        { handleClaimed: vi.fn() },
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
         () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
@@ -129,6 +129,7 @@ describe("Telegram ingress service", () => {
       handleClaimed: vi.fn(async (update: TelegramUpdate) => {
         seen.push(update.update_id);
         expect(store.getNextTelegramOffset()).toBe(update.update_id === 10 ? 0 : update.update_id);
+        return { updateSettled: false };
       }),
     };
     const promise = runTelegramService(
@@ -238,6 +239,7 @@ describe("Telegram ingress service", () => {
       handleClaimed: vi.fn(async (update: TelegramUpdate) => {
         seen.push(update.update_id);
         if (update.update_id === 10) throw new Error("Telegram API 400");
+        return { updateSettled: false };
       }),
     };
 
@@ -269,6 +271,7 @@ describe("Telegram ingress service", () => {
     const ingress = {
       handleClaimed: vi.fn(async (update: TelegramUpdate) => {
         if (update.update_id === 10) throw new Error("Telegram API 400");
+        return { updateSettled: false };
       }),
     };
 
@@ -308,7 +311,7 @@ describe("Telegram ingress service", () => {
 
     const promise = runTelegramService(
       {
-        ...serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+        ...serviceDeps(store, client, { handleClaimed: vi.fn(async () => ({ updateSettled: false })) }, () => ({
           ok: true,
           value: { botToken: "123:secret" },
         })),
@@ -336,7 +339,7 @@ describe("Telegram ingress service", () => {
       serviceDeps(
         store,
         client,
-        { handleClaimed: vi.fn() },
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
         () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
@@ -399,7 +402,7 @@ describe("Telegram ingress service", () => {
     }) as TelegramServiceDeps["client"];
 
     const promise = runTelegramService(
-      serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+      serviceDeps(store, client, { handleClaimed: vi.fn(async () => ({ updateSettled: false })) }, () => ({
         ok: true,
         value: { botToken: token },
       })),
@@ -430,7 +433,7 @@ describe("Telegram ingress service", () => {
     })) as TelegramServiceDeps["client"];
 
     const promise = runTelegramService(
-      serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+      serviceDeps(store, client, { handleClaimed: vi.fn(async () => ({ updateSettled: false })) }, () => ({
         ok: true,
         value: { botToken: "123:secret" },
       })),

@@ -1,4 +1,5 @@
 import type { Job, ProjectPolicy } from "../domain/models";
+import { shellSingleQuote } from "./terminal-command";
 import type { CommandResult } from "./terminal-command";
 
 export type PublishCommandRunner = {
@@ -17,10 +18,6 @@ export type PublishPullRequestResult =
 
 const PR_JSON = /^\s*\{[\s\S]*\}\s*$/;
 const SAFE_TITLE = /[^A-Za-z0-9 .,_/-]+/g;
-
-function shellSingleQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : {};

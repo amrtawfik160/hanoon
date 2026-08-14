@@ -177,3 +177,60 @@ it("still remembers ordinary text that merely mentions credentials", () => {
 
   expect(stored.subject).toBe("where credentials live");
 });
+
+// The owner's own import is the one path allowed to carry secret-shaped text.
+// It arrives from the protected host under the owner's CLI identity, never from
+// provider output or a chat message, so the stored-secret screen that guards
+// `rememberMemory` would only be refusing the owner their own file.
+
+it("imports an owner entry the remember path would refuse", () => {
+  const { store } = fixture();
+  const body = "STRIPE_SECRET_KEY=sk-live-000111222333444555666";
+
+  expect(() => store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "stripe key", body, source: "owner", now: 2_000,
+  })).toThrow(/credential/);
+
+  const imported = store.importOwnerMemory({
+    scope: "owner", kind: "fact", subject: "stripe key", body, now: 2_000,
+  });
+
+  expect(imported.body).toBe(body);
+  expect(imported.source).toBe("owner");
+});
+
+it("recalls an imported secret only when asked for it", () => {
+  const { store } = fixture();
+  store.importOwnerMemory({
+    scope: "owner", kind: "fact", subject: "stripe key",
+    body: "STRIPE_SECRET_KEY=sk-live-000111222333444555666", now: 2_000,
+  });
+
+  const recalled = store.recallMemories({ scope: "owner", query: "stripe", limit: 10, now: 3_000 });
+
+  expect(recalled.map((memory) => memory.subject)).toContain("stripe key");
+});
+
+it("replaces an imported entry when the same subject is imported again", () => {
+  const { store } = fixture();
+  store.importOwnerMemory({
+    scope: "owner", kind: "fact", subject: "stripe key", body: "old value", now: 2_000,
+  });
+  store.importOwnerMemory({
+    scope: "owner", kind: "fact", subject: "stripe key", body: "new value", now: 3_000,
+  });
+
+  const live = store.recallMemories({ scope: "owner", query: "stripe", limit: 10, now: 4_000 })
+    .filter((memory) => memory.subject === "stripe key");
+
+  expect(live.map((memory) => memory.body)).toEqual(["new value"]);
+});
+
+it("still refuses an agent-written memory that carries a secret", () => {
+  const { store } = fixture();
+
+  expect(() => store.rememberMemory({
+    scope: "owner", kind: "fact", subject: "stripe key",
+    body: "STRIPE_SECRET_KEY=sk-live-000111222333444555666", source: "agent", now: 2_000,
+  })).toThrow(/credential/);
+});

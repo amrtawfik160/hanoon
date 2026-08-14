@@ -111,21 +111,72 @@ Turning self-maintenance off stops the agent installing its own monitors. It doe
 
 The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
 
+### Giving the agent standing information
+
+Facts the agent should know — account names, service URLs, conventions, and
+credentials — can be loaded from a file instead of typed into the chat one at a
+time:
+
+```bash
+bb telegram-agent memory import --file /absolute/path/to/knowledge.json
+```
+
+```json
+{
+  "entries": [
+    { "subject": "staging database", "body": "Runs on db-staging.internal, port 5432." },
+    { "subject": "deploy window", "body": "Only weekday mornings.", "kind": "preference" }
+  ]
+}
+```
+
+Each entry needs `subject` and `body`. `kind` is `fact` (the default),
+`preference`, `decision`, or `correction`; `scope` defaults to the owner and may
+name a project id instead; `importance` is optional. One file may carry at most
+200 entries, and re-importing the same subject replaces the earlier entry rather
+than stacking a duplicate. Use `--host` to name the BB host holding the file, and
+`--scope` to change the default scope for every entry in it.
+
+Imported entries are **not** added to every prompt. They sit in the same memory
+the agent already searches, so it retrieves one only when a message calls for it.
+
+This command is the one write allowed to contain credential-shaped text. It runs
+on the protected BB host under your own identity, not the agent's, and entries
+are recorded as owner-sourced. The agent can never write such a memory itself:
+anything it tries to remember is still refused if it looks like a credential.
+
+Anything you put in that file can be read back by the agent, and by whoever can
+read the plugin database. It is not a vault, and it is not a substitute for one —
+see [Security](../SECURITY.md).
+
 ### How the agent works for you
 
 How the agent should behave — terser answers, always leading with the pull-request link — is not a setting. Tell it in the chat and it records a single standing instruction that is applied to every later turn, replaced whenever you restate it, and cleared when you tell it to stop. It is layered after the fixed instructions, so it can change tone and habits but never a safety boundary.
 
-### Why the default is `full`
+### The permission mode, and what it does not do
 
-The owner works from Telegram and is not watching the BB app, so an approval prompt rendered there stalls the agent with nobody to answer it. `full` lets it use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without that dead end.
+`full` is the current default because the owner works from Telegram and is not watching the BB app: before the interaction bridge existed, an approval prompt rendered there stalled the agent with nobody to answer it. That is a **compatibility default carried forward, and current residual risk** — not a safe target architecture. It is not mechanically enforced isolation, and the agent's standing instructions are guidance, not enforcement.
 
 The limits that remain are the ones the owner can actually see and answer:
 
-- merging a pull request and promoting to production run through the job pipeline and need a one-use Telegram approval;
-- destructive or irreversible actions outside a worktree are asked about in the chat first;
-- credential-shaped text is refused before it can be stored as a memory.
+- merging a pull request and promoting to production run through the job pipeline and need a Telegram approval: a one-use approval every time, unless the owner has granted that project a standing approval (see [Standing merge approval](#standing-merge-approval));
+- installing or connecting an integration, changing a credential, spending money, a destructive external action, or an irreversible external write are asked about in the chat first;
+- credential-shaped text is refused before it can be stored as a memory;
+- a permission prompt BB does raise for the hidden controller is bridged into Telegram as *Allow once* / *Deny*, so choosing `auto` or `accept-edits` no longer means waiting on a dead end.
 
-Set `auto` or `accept-edits` if you would rather approve execution in the BB app, and expect the agent to stop and wait when it hits one.
+Set `auto` or `accept-edits` if you would rather approve execution as it happens. A value you have saved is preserved exactly and is never rewritten.
+
+#### Why the default has not changed to `auto`
+
+Changing the fresh, unset default to `auto` is **disabled**, not merely unfinished. It stays disabled until a versioned runtime BB attestation proves all three of:
+
+1. an atomic activity snapshot, or a shared-revision equivalent covering every status, activity, and interaction field used for negative or idle inference;
+2. an atomic expected-head-and-candidate-tree conditional commit with a deterministic request key;
+3. mechanical denial of worker and controller native commit, ref mutation, push, GitHub write, merge, deploy, and equivalent network effects, while authorized edit and test work still runs.
+
+The vendored BB thread, timeline, and interaction calls share no atomic activity revision, and the commit API is unconditional, so neither the idle-truth protocol nor the conditional-commit protocol can be implemented safely on this runtime. Instruction text, a mocked adapter, and a Telegram approval button are none of them proof of that boundary.
+
+`executor_v2` managed-job publication is disabled behind the same gate. The current `legacy_v1` behaviour — the worker performing its own commit, push, and pull-request creation inside its managed worktree — remains what actually runs.
 
 Planner, critic, and documentation stages pin their own execution tuple and are unaffected by this setting; implementation and review workers use the enabled project's immutable policy snapshot.
 
@@ -136,9 +187,9 @@ Only standard BB Git projects with a canonical GitHub remote and an available so
 Prepare a JSON policy, then use one of three mutually exclusive input modes:
 
 ```bash
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json
-bb telegram-agent project enable <project-id> --policy-file /absolute/path/to/policy.json --host <host-id>
-bb telegram-agent project enable <project-id> --policy-json '<policy-json>'
+bb telegram-agent project enable proj_7f3d2a91 --policy-file /absolute/path/to/policy.json
+bb telegram-agent project enable proj_7f3d2a91 --policy-file /absolute/path/to/policy.json --host host_2b91c4
+bb telegram-agent project enable proj_7f3d2a91 --policy-json "$POLICY_JSON"
 ```
 
 The `--host` flag is valid only with an absolute `--policy-file` path and selects the BB host that owns that file. A command invoked from a BB thread can otherwise resolve the invoking environment's host.
@@ -146,7 +197,7 @@ The `--host` flag is valid only with an absolute `--policy-file` path and select
 Individual flags are also supported. At minimum they require `--alias`, `--base`, and `--merge-method`:
 
 ```bash
-bb telegram-agent project enable <project-id> \
+bb telegram-agent project enable proj_7f3d2a91 \
   --alias example \
   --base main \
   --merge-method squash \
@@ -216,6 +267,16 @@ Use unmistakable placeholders and replace them with values verified for the targ
     },
     "convexDeployRequired": false
   },
+  "regression": {
+    "commands": [
+      {
+        "name": "unit",
+        "command": "npm test",
+        "timeoutMs": 600000
+      }
+    ],
+    "intervalMs": 86400000
+  },
   "requiredChecks": ["unit"],
   "outputRedactionPatterns": [],
   "workerStartGraceMs": 120000,
@@ -239,8 +300,12 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `production.targetKey` | Optional shared isolation key: 1–64 lowercase letters, numbers, `.`, `_`, or `-`, starting alphanumeric. When absent, the project id is used. |
 | `production.deployCommands` | One to 20 commands when production is configured. |
 | `production.canaryCommands` | One to 20 commands when production is configured. |
-| `production.rollbackCommand` | Optional operator guidance. It is recorded but never executed automatically. |
+| `production.healthCommands` | Optional one to five cheap, read-only commands run on a timer after production is reached, so a crash loop is noticed rather than waited out. |
+| `production.healthIntervalMs` | Optional interval for those health commands, from 60,000 ms to 86,400,000 ms. |
+| `production.rollbackCommand` | Optional. When set, it is run automatically as soon as a deploy or canary command fails, before the failure is reported. When absent, a failed deploy leaves production on the new code. |
 | `production.convexDeployRequired` | When true, a deploy command must invoke `convex deploy` through the supported CLI form. |
+| `regression.commands` | Optional one to five commands run on a timer against the project, independent of any job, so breakage between jobs is noticed. |
+| `regression.intervalMs` | Optional interval for those commands, from 3,600,000 ms to 604,800,000 ms. Defaults to daily. |
 | `requiredChecks` | Up to 50 non-empty GitHub check names. |
 | `outputRedactionPatterns` | Up to 20 valid regular expressions, each at most 200 characters. |
 | `workerStartGraceMs` | `10000`–`900000`; default `120000`. How long a newly registered worker may remain missing or silent before recovery classification. |
@@ -251,13 +316,65 @@ Use unmistakable placeholders and replace them with values verified for the targ
 
 Every command entry requires a non-empty name of at most 40 characters, a command of at most 8,000 characters, and `timeoutMs` from `1000` to `3600000`.
 
-Deploy and canary must both be present before the plugin can issue merge approval. Commands run sequentially after merge in the detached, verified worktree. They should be safe to reconcile after interruption. The plugin never runs the stored rollback command automatically.
+Deploy and canary must both be present before the plugin can issue merge approval. Commands run sequentially after merge in the detached, verified worktree. They should be safe to reconcile after interruption.
+
+When a deploy or canary command fails and `rollbackCommand` is configured, the plugin runs it immediately, in the same stage, before reporting the failure. The rollback is deliberately not cancellable: a cancelled job must still finish reverting production. Its receipt is stored on the stage evidence alongside the failed command, and the stage outcome stays `fail` whether or not the rollback worked.
+
+Configuring a `rollbackCommand` is what makes unattended merging safe, so it is effectively required for any project given a standing approval.
+
+## Scheduled checks between jobs
+
+`validationCommands` prove one job's change. Nothing proves the project still works *between* jobs, which is how a broken dependency, an expired credential, or someone else's merge stays invisible until the next time work is requested. `regression.commands` run on a timer for exactly that reason.
+
+The alerting rules exist so a message means "something is newly broken" and nothing else:
+
+- every command runs, and failures are tracked as a **set of command names** rather than a count, so a new break is distinguishable from a different command failing in place of a fixed one;
+- a command that fails and then passes an immediate re-run is recorded as flaky and never alerted on;
+- a failure the owner has already been told about stays quiet until it changes;
+- a command that could not run at all is not evidence of a regression and is ignored.
+
+The owner is messaged when a command newly starts failing, and once more when everything passes again. A steady failure produces exactly one message.
+
+## Failure brake
+
+When the same failure repeats across separate jobs, that is a fault that will keep consuming attempts until something changes. Hanoon groups recent failures by cause — a fingerprint of the failure text with commit hashes, timestamps, paths, and numbers removed, so the same fault matches itself across jobs — and treats three or more of one cause within four hours as a loop.
+
+On detecting a loop he stops admitting **new** jobs for that project, tells the owner once, and leaves everything else alone:
+
+- work already running is unaffected and finishes normally;
+- queued jobs stay queued rather than being cancelled;
+- other projects are unaffected;
+- the same cause is not escalated again for a week, so a fault the owner is already deciding about does not message them hourly.
+
+Restarting is always the owner's call, because nothing about time passing fixes a repeated failure. `/resume` lists what is paused, `/resume <alias>` starts one project, and `/resume all` starts every one. `/health` names any paused project.
+
+If the pause list cannot be read, no work is admitted that tick — an unreadable list must never look like "nothing is paused".
+
+## Standing merge approval
+
+By default the plugin asks for a one-use approval before every merge. The approval message also offers **Merge + deploy, and always from now on**, which approves that merge and records a standing approval for that project. Afterwards the plugin merges, deploys, and runs the canary without asking.
+
+A standing approval replaces the owner's signature only. Every check that produced the merge candidate still runs, and the plugin falls back to asking when:
+
+- the pull-request head is not established, or the owner has asked the job to stop;
+- the project has no production configuration;
+- the change needed two or more rounds of review fixes.
+
+The standing approval is withdrawn automatically when production fails and the rollback either was not configured or failed — recovery is exhausted, so nothing merges unattended there again until the owner re-grants it. A rollback that succeeded is a recovery, not an incident, and the standing approval survives it.
+
+Granting is only ever a button tap, so it cannot be produced by the agent misreading a sentence. Withdrawing is available by name:
+
+- `/approvals` lists the projects that merge without asking;
+- `/approvals off <alias>` withdraws one;
+- `/approvals off` withdraws all of them.
+
+Every grant, withdrawal, and unattended merge is recorded in an append-only log keyed by project.
 
 ## Validate configuration
 
 ```bash
 bb telegram-agent doctor
-bb telegram-agent doctor <project-id>
+bb telegram-agent doctor proj_7f3d2a91
 bb telegram-agent project list
 ```
 

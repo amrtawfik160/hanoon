@@ -48,6 +48,7 @@ describe("Telegram callback grammar", () => {
       { type: "retry", jobId: telegramJobId },
       { type: "review", jobId: telegramJobId },
       { type: "merge", nonce: mergeNonce },
+      { type: "merge_always", nonce: mergeNonce },
     ] as const;
 
     expect(actions.map(encodeCallbackData)).toEqual([
@@ -57,6 +58,7 @@ describe("Telegram callback grammar", () => {
       `r:${telegramJobId}`,
       `v:${telegramJobId}`,
       `m:${mergeNonce}`,
+      `a:${mergeNonce}`,
     ]);
     for (const action of actions) {
       const encoded = encodeCallbackData(action);
@@ -72,6 +74,20 @@ describe("Telegram callback grammar", () => {
     expect(() => parseCallbackData(`s:${"a".repeat(21)}`)).toThrow();
     expect(() => parseCallbackData(`m:${"a".repeat(33)}`)).toThrow();
     expect(() => parseCallbackData("x:unknown")).toThrow();
+  });
+
+  it("encodes controller interactions as i: and keeps legacy q: parse-only", () => {
+    const token = mergeNonce;
+    const encoded = encodeCallbackData({ type: "controller_interaction", token });
+
+    expect(encoded).toBe(`i:${token}`);
+    expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(64);
+    expect(parseCallbackData(encoded)).toEqual({ type: "controller_interaction", token });
+    // Migrated in-flight messages stay answerable for one release, but nothing
+    // may emit a new q: value.
+    expect(parseCallbackData(`q:${token}`)).toEqual({ type: "question", token });
+    expect(() => encodeCallbackData({ type: "question", token })).toThrow();
+    expect(() => parseCallbackData(`i:${"a".repeat(33)}`)).toThrow();
   });
 
   it("keeps merge callbacks bound to only the approval nonce", () => {
@@ -247,6 +263,7 @@ describe("deterministic Telegram views", () => {
       "Open BB",
       "Re-run Review",
       "Merge + deploy aaaaaaaa",
+      "Merge + deploy, and always from now on",
       "Cancel",
     ]);
     const buttons = rendered.reply_markup?.inline_keyboard.flat() ?? [];
@@ -255,6 +272,62 @@ describe("deterministic Telegram views", () => {
     expect(buttons.find((button) => button.text === "Merge + deploy aaaaaaaa")?.callback_data).toBe(`m:${mergeNonce}`);
     expect(rendered.text).not.toContain("/threads/");
     expect(rendered.text).not.toContain("/environments/");
+  });
+
+  describe("standing merge approval", () => {
+    const approvalJob = () => jobFixture({
+      id: telegramJobId,
+      state: "awaiting_merge_approval",
+      policy: policyFixture({ alias: "cyndra" }),
+      prHeadSha: "a".repeat(40),
+    });
+
+    it("offers to make the approval permanent while the project still asks", () => {
+      const rendered = renderJobStatus(approvalJob(), { mergeNonce });
+      const buttons = rendered.reply_markup?.inline_keyboard.flat() ?? [];
+
+      expect(buttons.find((button) => button.text === "Merge + deploy, and always from now on")?.callback_data)
+        .toBe(`a:${mergeNonce}`);
+    });
+
+    it("stops offering it once the project already merges without asking", () => {
+      const rendered = renderJobStatus(approvalJob(), { mergeNonce, mergeAuthorityGranted: true });
+      const labels = (rendered.reply_markup?.inline_keyboard.flat() ?? []).map((button) => button.text);
+
+      expect(labels).toContain("Merge + deploy aaaaaaaa");
+      expect(labels).not.toContain("Merge + deploy, and always from now on");
+    });
+
+    it("explains why it is asking despite a standing approval", () => {
+      const rendered = renderJobStatus(approvalJob(), {
+        mergeNonce,
+        mergeAuthorityGranted: true,
+        approvalReason: "the change needed 2 rounds of review fixes",
+      });
+
+      expect(rendered.text).toContain("Asking you even though this project is pre-approved");
+      expect(rendered.text).toContain("2 rounds of review fixes");
+    });
+
+    it("says plainly when a merge happened without asking", () => {
+      const rendered = renderJobStatus(jobFixture({
+        id: telegramJobId,
+        state: "merging",
+        policy: policyFixture({ alias: "cyndra" }),
+        prHeadSha: "a".repeat(40),
+      }), { autoApproved: true });
+
+      expect(rendered.text).toContain("Merging on your standing approval");
+    });
+
+    it("keeps the permanent-approval button out of storage along with the one-use one", () => {
+      const persisted = JSON.stringify(persistableJobStatusPayload(
+        renderJobStatus(approvalJob(), { mergeNonce }),
+      ));
+
+      expect(persisted).not.toContain(mergeNonce);
+      expect(persisted).not.toContain("Merge + deploy, and always from now on");
+    });
   });
 
   it("offers revise-plan for a planning block and review only when there is implementation", () => {

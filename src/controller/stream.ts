@@ -1,5 +1,5 @@
 import type { ControllerEventObservation } from "./bb-controller";
-import type { ControllerStreamPhase } from "./models";
+import { CONTROLLER_PHASE_TEXT, type ControllerStreamPhase } from "./models";
 
 export type ControllerStreamState = {
   cursor: number;
@@ -19,9 +19,9 @@ function nextStreamPhase(
 ): ControllerStreamPhase {
   if (observation.error !== null) return "failed";
   if (observation.completed) return "complete";
-  if (observation.assistantDelta.length > 0) return "responding";
-  if (observation.toolCalls > 0) return "using_tools";
-  if (observation.inputAccepted || (observation.thinkingDelta ?? "").length > 0) return "thinking";
+  if (observation.assistantOutputObserved) return "responding";
+  if (observation.toolActivityObserved) return "using_tools";
+  if (observation.inputAccepted) return "thinking";
   return prior;
 }
 
@@ -36,20 +36,16 @@ export function projectControllerStream(
   observation: ControllerEventObservation,
   prior: ControllerStreamState,
 ): ControllerStreamState {
-  if (observation.latestSeq <= prior.cursor) return prior;
-  const phase = nextStreamPhase(observation, prior.phase);
-  const thinkingDelta = observation.thinkingDelta ?? "";
-  let text = prior.text;
-  if (observation.assistantDelta.length > 0) {
-    text = prior.phase === "responding"
-      ? `${prior.text}${observation.assistantDelta}`
-      : observation.assistantDelta;
-  } else if (thinkingDelta.length > 0 && phase !== "responding") {
-    text = `${prior.text}${thinkingDelta}`;
+  if (observation.latestSeq <= prior.cursor) {
+    return { ...prior, text: CONTROLLER_PHASE_TEXT[prior.phase] };
   }
+  const phase = nextStreamPhase(observation, prior.phase);
+  // A draft is phase-only: raw assistant output and any legacy pre-cutover
+  // stream text are discarded entirely, so provider prose can never leak into
+  // the durable reply, a digest, or a completed response.
   return {
     cursor: observation.latestSeq,
-    text: clipDraft(text),
+    text: CONTROLLER_PHASE_TEXT[phase],
     phase,
   };
 }

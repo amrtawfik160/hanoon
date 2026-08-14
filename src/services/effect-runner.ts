@@ -26,6 +26,7 @@ import {
 } from "../capabilities/native-adapters";
 import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
 import { ApprovalService } from "./approval-service";
+import { decideAutoApproval } from "./merge-authority";
 import { buildWorkOrder, type CapabilityWorkOrderEnvelope } from "../bb/handoffs";
 import { buildPlanArtifact } from "../bb/pipeline-handoffs";
 import { environmentDiffText, type BbAttempt, type EnvironmentSnapshot, type PipelineThreadAttempt } from "../bb/runner";
@@ -296,6 +297,10 @@ function stageInputSha(...shaValues: string[]): string {
   return hash.digest("hex");
 }
 
+export function validationCommandIdentity(command: string): string {
+  return command.slice(0, 500);
+}
+
 function validationStageEvidence(result: ValidationSnapshot, policy: ProjectPolicy): Record<string, unknown> {
   const policyCommandReceipts = result.policyCommandReceipts ?? policy.validationCommands.flatMap((configured) => {
     const receipt = result.commandReceipts.find((candidate) => candidate.command === configured.command);
@@ -312,7 +317,7 @@ function validationStageEvidence(result: ValidationSnapshot, policy: ProjectPoli
     originRepository: result.originRepository,
     terminalIds: (result.terminalIds ?? []).slice(0, 100),
     commandReceipts: result.commandReceipts.slice(0, 50).map((receipt) => ({
-      command: receipt.command.slice(0, 500),
+      command: validationCommandIdentity(receipt.command),
       outcome: receipt.outcome,
       exitCode: receipt.exitCode,
       output: receipt.output.slice(0, 1_000),
@@ -452,7 +457,11 @@ export class EffectRunner {
       ...(nativeAdapter ? { nativeAdapter } : {}),
       ...this.executorFence(),
     });
-    if (!updated) throw new Error("executor lease was lost before job transition");
+    // The store refuses a transition for a lost lease, a stale expected version,
+    // or evidence that does not back the event. It does not say which, so this
+    // message must not claim one: `assertFence` above already ruled out the
+    // lease, and naming it here sends every diagnosis to the wrong place.
+    if (!updated) throw new Error(`executor refused the ${event.type} job transition`);
     return updated;
   }
 
@@ -1700,13 +1709,41 @@ export class EffectRunner {
     }
   }
 
+  /**
+   * The owner is asked for a one-use approval unless they have already granted
+   * this project a standing one. Auto-approval is recorded before the merge is
+   * set in motion, so an unattended merge always has an audit row explaining
+   * who authorised it — never the other way round.
+   */
   private issueApproval(job: Job): void {
     if (!job.prHeadSha) throw new PermanentEffectError("approval requires an authoritative pull-request head");
+    const grant = job.projectId === null ? null : this.dependencies.store.getMergeAuthority(job.projectId);
+    const decision = decideAutoApproval({ job, grant });
+    if (decision.outcome === "auto_approve" && job.projectId !== null) {
+      // Re-read before transitioning: the job may have drifted since this
+      // effect was dispatched, and merging a head the owner has since
+      // superseded is exactly what a standing approval must not do.
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
+      this.dependencies.store.recordMergeAuthorityUse({
+        projectId: job.projectId,
+        jobId: job.id,
+        now: this.now(),
+      });
+      const merging = this.applyEvent(current.id, current.version, {
+        type: "APPROVAL_ACCEPTED",
+        headSha: job.prHeadSha,
+      });
+      this.enqueueStatus(merging, { autoApproved: true });
+      return;
+    }
     const approvals = this.dependencies.approvals ?? new ApprovalService(this.dependencies.store, { now: this.dependencies.now });
     const issued = approvals.issue(job.id, job.prHeadSha, this.now(), this.executorFence());
     this.enqueueStatus(job, {
       mergeNonce: issued.nonce,
       approvalExpiresAt: issued.expiresAt,
+      mergeAuthorityGranted: grant !== null && grant.revokedAt === null,
+      ...(decision.outcome === "ask_owner" ? { approvalReason: decision.reason } : {}),
     });
   }
 
@@ -1719,6 +1756,19 @@ export class EffectRunner {
         ? { type: "DEPLOY_SUCCEEDED", summary: result.summary }
         : { type: "CANARY_SUCCEEDED", summary: result.summary });
       return;
+    }
+    // A rollback that worked is a recovery: production is back, so unattended
+    // merging continues. A rollback that was missing or itself failed means
+    // recovery is exhausted, and nothing should merge here unattended again
+    // until the owner has looked at it.
+    if (job.projectId !== null && result.rollback?.outcome !== "pass") {
+      this.dependencies.store.revokeMergeAuthority({
+        projectId: job.projectId,
+        reason: result.rollback
+          ? `rollback failed after a bad ${phase}`
+          : `production ${phase} failed with no rollback configured`,
+        now: this.now(),
+      });
     }
     this.applyEvent(job.id, current.version, phase === "deploy"
       ? { type: "DEPLOY_FAILED", reason: result.summary }

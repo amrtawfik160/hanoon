@@ -9,7 +9,11 @@ import {
   type ControllerStatus,
 } from "../src/controller/bb-controller";
 import { DEFAULT_CONTROLLER_EXECUTION_PROFILE } from "../src/controller/execution-profile";
-import { LunaControllerService } from "../src/controller/service";
+import {
+  LunaControllerService,
+  type ControllerInteractionReconciler,
+} from "../src/controller/service";
+import type { ControllerEvidenceReconciler } from "../src/controller/evidence-projector";
 import {
   evaluateSupervisor,
   SUPERVISOR_HARD_TOKENS,
@@ -20,6 +24,20 @@ import {
   SUPERVISOR_SOFT_TOOL_CALLS,
   type SupervisorSignals,
 } from "../src/controller/supervisor";
+
+function stubInteractionService(): ControllerInteractionReconciler {
+  return { deliverAnswered: vi.fn(async () => false), fetchPending: vi.fn(async () => ({ outcome: "invalid" as const })) };
+}
+
+const evidenceProjector: ControllerEvidenceReconciler = {
+  reconcile: vi.fn(async (_controller, turn) => ({
+    outcome: "reconciled" as const,
+    reconciliationIncomplete: null,
+    fromSeq: turn.evidenceEventSeq,
+    throughSeq: turn.evidenceEventSeq,
+    targetSeq: turn.evidenceEventSeq,
+  })),
+};
 
 const quiet: SupervisorSignals = {
   toolCalls: 0,
@@ -210,16 +228,16 @@ it("accumulates usage only when the stream cursor advances", () => {
   const at = (now: number) => ({ ...fence, now });
 
   expect(store.updateControllerStream({
-    ...at(2_001), turnId: turn.id, cursor: 5, text: "working", phase: "thinking",
+    ...at(2_001), turnId: turn.id, cursor: 5, phase: "thinking",
     toolCalls: 3, commandFailures: 1, totalTokens: 900,
   })).toBe(true);
-  // Replaying the same page must not double count what it already recorded.
+  // Replaying the same page is accepted but must not double count what it already recorded.
   expect(store.updateControllerStream({
-    ...at(2_002), turnId: turn.id, cursor: 5, text: "working", phase: "thinking",
+    ...at(2_002), turnId: turn.id, cursor: 5, phase: "thinking",
     toolCalls: 3, commandFailures: 1, totalTokens: 900,
-  })).toBe(false);
+  })).toBe(true);
   expect(store.updateControllerStream({
-    ...at(2_003), turnId: turn.id, cursor: 9, text: "working on", phase: "thinking",
+    ...at(2_003), turnId: turn.id, cursor: 9, phase: "thinking",
     toolCalls: 2, commandFailures: 0, totalTokens: 1_500,
   })).toBe(true);
 
@@ -236,10 +254,10 @@ it("keeps the highest token total when a later window reports a lower one", () =
   const at = (now: number) => ({ ...fence, now });
 
   store.updateControllerStream({
-    ...at(2_001), turnId: turn.id, cursor: 4, text: "a", phase: "thinking", totalTokens: 8_000,
+    ...at(2_001), turnId: turn.id, cursor: 4, phase: "thinking", totalTokens: 8_000,
   });
   store.updateControllerStream({
-    ...at(2_002), turnId: turn.id, cursor: 8, text: "ab", phase: "thinking", totalTokens: 0,
+    ...at(2_002), turnId: turn.id, cursor: 8, phase: "thinking", totalTokens: 0,
   });
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({ totalTokens: 8_000 });
@@ -281,10 +299,8 @@ function serviceAdapter(observation: () => Observation, status: () => Controller
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => status()),
     latestSeq: vi.fn(async () => 0),
-    output: vi.fn(async () => "unused"),
     events: vi.fn(async () => observation()),
     steer: vi.fn(async () => undefined),
-    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
     hasExecutionProfile: () => false,
   };
@@ -294,10 +310,11 @@ function observation(overrides: Partial<Observation> = {}): Observation {
   return {
     latestSeq: 1,
     inputAccepted: true,
-    assistantDelta: "",
+    assistantOutputObserved: false,
+    toolActivityObserved: false,
     completed: false,
     error: null,
-    pendingQuestion: null,
+    interactions: [],
     toolCalls: 0,
     commandFailures: 0,
     totalTokens: 0,
@@ -314,7 +331,8 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
     () => observation({ latestSeq: (seq += 1), toolCalls }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -344,7 +362,7 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
   });
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toContain("ran past its budget");
+    .toBe("I couldn't complete that controller turn safely. Please resend your request.");
 });
 
 it("stops the live provider turn before retiring a hard-budget controller", async () => {
@@ -356,7 +374,8 @@ it("stops the live provider turn before retiring a hard-budget controller", asyn
   );
   const stop = vi.fn(async () => undefined);
   Object.assign(adapter, { stop });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -367,25 +386,34 @@ it("stops the live provider turn before retiring a hard-budget controller", asyn
 it("leaves a turn parked on an owner question alone however much it has spent", async () => {
   const { store, fence } = storeFixture("parked");
   const turn = submittedTurn(store, fence);
-  expect(store.recordControllerQuestion({
+  const generation = store.getOpenControllerGeneration("owner-7-controller", "thr_controller");
+  if (!generation) throw new Error("missing open controller generation");
+  expect(store.recordControllerInteraction({
     ...fence,
     now: 2_001,
     turnId: turn.id,
-    interactionId: "int_1",
-    questions: [{
-      id: "q1",
-      prompt: "Which project?",
-      shortLabel: "Project",
-      multiSelect: false,
-      allowFreeText: false,
-      options: [{ value: "cyndra", label: "cyndra", description: "the invoice service" }],
-    }],
+    controllerKey: "owner-7-controller",
+    bbThreadId: "thr_controller",
+    controllerGenerationId: generation.id,
+    interaction: {
+      kind: "user_question",
+      interactionId: "int_1",
+      questions: [{
+        id: "q1",
+        prompt: "Which project?",
+        shortLabel: "Project",
+        multiSelect: false,
+        allowFreeText: false,
+        options: [{ value: "cyndra", label: "cyndra", description: "the invoice service" }],
+      }],
+    },
   })).toBe(true);
   const adapter = serviceAdapter(
     () => observation({ latestSeq: 9, toolCalls: SUPERVISOR_HARD_TOOL_CALLS }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -402,7 +430,8 @@ it("keeps the turn running when a budget nudge cannot be delivered", async () =>
     () => "active",
   );
   adapter.steer = vi.fn(async () => { throw new Error("steer channel is down"); });
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -424,7 +453,8 @@ it("budgets this turn's tokens, not the whole thread's history", async () => {
     () => observation({ latestSeq: (seq += 1), totalTokens: lifetime }),
     () => "active",
   );
-  const service = new LunaControllerService({ store, adapter, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
   const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
 
   await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
@@ -442,7 +472,8 @@ it("budgets this turn's tokens, not the whole thread's history", async () => {
     () => observation({ latestSeq: (seq += 1), totalTokens: spent }),
     () => "active",
   );
-  const second = new LunaControllerService({ store, adapter: busy, clock: { now: () => 2_002 } });
+  const second = new LunaControllerService({
+    interactionService: stubInteractionService(), store, adapter: busy, evidenceProjector, clock: { now: () => 2_002 } });
   await expect(second.reconcile(runFence, runFence.signal)).resolves.toBe(true);
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({

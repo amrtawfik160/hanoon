@@ -9,3 +9,7 @@ coverage/
 # Local agent planning and review artifacts
 .superpowers/
 docs/superpowers/
+
+# Multi-process test scratch dirs. They sit in the repo root because the worker
+# each test writes imports ../src, and a run killed mid-test skips its cleanup.
+.test-scratch-*/

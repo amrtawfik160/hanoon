@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ProjectPolicy } from "../domain/models";
+import { shellSingleQuote } from "../bb/terminal-command";
 import type { CommandResult, TerminalObservation } from "../bb/terminal-command";
 
 const MAX_COMMAND_LENGTH = 500;
@@ -22,6 +23,13 @@ export type ProductionStageSnapshot = {
   summary: string;
   failedCommand: string | null;
   commandReceipts: ProductionCommandReceipt[];
+  /**
+   * Present only when the stage failed and the project configured a rollback
+   * command. A failed deploy that nobody is watching is the whole risk of
+   * unattended merging, so the revert runs here, immediately, rather than
+   * waiting for a health probe to notice minutes later.
+   */
+  rollback?: ProductionCommandReceipt | null;
   terminalIds: string[];
   completedAt: string;
 };
@@ -40,6 +48,7 @@ const productionStageSnapshotSchema = z.object({
   summary: z.string().min(1).max(500),
   failedCommand: z.string().min(1).max(40).nullable(),
   commandReceipts: z.array(productionCommandReceiptSchema).min(1).max(21),
+  rollback: productionCommandReceiptSchema.nullable().optional(),
   terminalIds: z.array(z.string().min(1).max(256)).max(21),
   completedAt: z.string().datetime({ offset: true }),
 }).strict().superRefine((snapshot, context) => {
@@ -47,6 +56,9 @@ const productionStageSnapshotSchema = z.object({
   if (snapshot.outcome === "pass") {
     if (snapshot.failedCommand !== null || snapshot.commandReceipts.some((entry) => entry.outcome !== "pass")) {
       context.addIssue({ code: "custom", message: "Passing production evidence contains a failed command" });
+    }
+    if (snapshot.rollback) {
+      context.addIssue({ code: "custom", message: "Passing production evidence cannot contain a rollback" });
     }
   } else if (
     snapshot.failedCommand === null ||
@@ -89,10 +101,6 @@ function bounded(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, Math.max(0, limit - 1))}…`;
 }
 
-function shellSingleQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
 function checkoutGuard(expectedHeadSha: string): { name: string; command: string; timeoutMs: number } {
   if (!/^[0-9a-f]{40}$/.test(expectedHeadSha)) {
     throw new TypeError("production stage requires an exact merged commit SHA");
@@ -120,11 +128,24 @@ function redactor(patterns: readonly string[]): (value: string) => string {
   };
 }
 
+export function productionCommandIdentity(input: Readonly<{
+  name: string;
+  command: string;
+  outputRedactionPatterns: readonly string[];
+}>): Pick<ProductionCommandReceipt, "name" | "command"> {
+  const redact = redactor(input.outputRedactionPatterns);
+  return {
+    name: bounded(redact(input.name), 40),
+    command: bounded(redact(input.command), MAX_COMMAND_LENGTH),
+  };
+}
+
 function boundSnapshot(snapshot: ProductionStageSnapshot): ProductionStageSnapshot {
   if (Buffer.byteLength(JSON.stringify(snapshot), "utf8") <= MAX_SNAPSHOT_BYTES) return snapshot;
   const withoutOutput = {
     ...snapshot,
     commandReceipts: snapshot.commandReceipts.map((entry) => ({ ...entry, output: "[TRUNCATED]" })),
+    ...(snapshot.rollback ? { rollback: { ...snapshot.rollback, output: "[TRUNCATED]" } } : {}),
   };
   if (Buffer.byteLength(JSON.stringify(withoutOutput), "utf8") <= MAX_SNAPSHOT_BYTES) return withoutOutput;
   return {
@@ -133,18 +154,19 @@ function boundSnapshot(snapshot: ProductionStageSnapshot): ProductionStageSnapsh
       ...entry,
       command: bounded(entry.command, 100),
     })),
+    ...(withoutOutput.rollback
+      ? { rollback: { ...withoutOutput.rollback, command: bounded(withoutOutput.rollback.command, 100) } }
+      : {}),
   };
 }
 
 function receipt(
-  name: string,
-  command: string,
+  identity: Pick<ProductionCommandReceipt, "name" | "command">,
   result: CommandResult,
   redact: (value: string) => string,
 ): ProductionCommandReceipt {
   return {
-    name: bounded(redact(name), 40),
-    command: bounded(redact(command), MAX_COMMAND_LENGTH),
+    ...identity,
     outcome: result.outcome === "exited" ? (result.exitCode === 0 ? "pass" : "fail") : result.outcome,
     exitCode: result.outcome === "exited" ? result.exitCode : null,
     output: result.outcome === "exited" ? bounded(redact(result.output), MAX_OUTPUT_LENGTH) : "",
@@ -182,7 +204,12 @@ export async function runProductionStage(input: RunProductionStageInput): Promis
       const safe = redact(raw.split(entry.command).join(redact(entry.command)));
       result = { outcome: "exited", exitCode: 1, output: bounded(safe, MAX_OUTPUT_LENGTH) };
     }
-    const commandReceipt = receipt(entry.name, entry.command, result, redact);
+    const identity = productionCommandIdentity({
+      name: entry.name,
+      command: entry.command,
+      outputRedactionPatterns: input.policy.outputRedactionPatterns,
+    });
+    const commandReceipt = receipt(identity, result, redact);
     commandReceipts.push(commandReceipt);
     if (commandReceipt.outcome !== "pass") {
       failedCommand = commandReceipt.name;
@@ -190,18 +217,61 @@ export async function runProductionStage(input: RunProductionStageInput): Promis
     }
   }
 
+  const passed = failedCommand === null && commandReceipts.length === commands.length;
+
+  // The revert runs before the failure is reported, so the owner is never told
+  // production is broken while it is still broken and nobody is acting on it.
+  let rollback: ProductionCommandReceipt | null = null;
+  if (!passed && production.rollbackCommand) {
+    const entry = production.rollbackCommand;
+    const identity = productionCommandIdentity({
+      name: entry.name,
+      command: entry.command,
+      outputRedactionPatterns: input.policy.outputRedactionPatterns,
+    });
+    let result: CommandResult;
+    try {
+      result = await input.runner.run({
+        scope: { kind: "environment", environmentId: input.environmentId },
+        title: `Telegram production rollback: ${identity.name}`,
+        command: entry.command,
+        timeoutMs: entry.timeoutMs,
+        // Deliberately not passing input.signal: a cancelled job must still
+        // finish reverting production, or cancelling is what breaks the site.
+        onObservation: (observation: TerminalObservation): void => {
+          terminalIds.add(observation.id);
+          input.onTerminalObservation?.(observation);
+        },
+      });
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      result = { outcome: "exited", exitCode: 1, output: bounded(redact(raw), MAX_OUTPUT_LENGTH) };
+    }
+    rollback = receipt(identity, result, redact);
+  }
+
   const now = (input.now ?? Date.now)();
   if (!Number.isInteger(now) || now < 0) throw new TypeError("production clock must be a non-negative integer");
-  const passed = failedCommand === null && commandReceipts.length === commands.length;
   return boundSnapshot({
     phase: input.phase,
     outcome: passed ? "pass" : "fail",
-    summary: passed
-      ? `${configuredCommands.length}/${configuredCommands.length} production ${input.phase} commands passed at ${input.expectedHeadSha.slice(0, 12)}`
-      : `Production ${input.phase} command ${failedCommand ?? "unknown"} failed`,
+    summary: bounded(
+      passed
+        ? `${configuredCommands.length}/${configuredCommands.length} production ${input.phase} commands passed at ${input.expectedHeadSha.slice(0, 12)}`
+        : `Production ${input.phase} command ${failedCommand ?? "unknown"} failed${rollbackSuffix(rollback)}`,
+      500,
+    ),
     failedCommand,
     commandReceipts,
+    ...(rollback ? { rollback } : {}),
     terminalIds: [...terminalIds],
     completedAt: new Date(now).toISOString(),
   });
+}
+
+function rollbackSuffix(rollback: ProductionCommandReceipt | null): string {
+  if (!rollback) return "; no rollback command is configured";
+  return rollback.outcome === "pass"
+    ? "; production was rolled back"
+    : "; the rollback command also failed";
 }

@@ -1,3 +1,4 @@
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -371,7 +372,11 @@ describe("new-attempt kill switches", () => {
       return { turn, profile };
     };
     const finish = (turnId: string) => {
-      expect(store.completeControllerTurn({ ...fence(), turnId, responseText: "Done." })).toBe(true);
+      completeTurnThroughFinalization(store, fence(), {
+        turnId,
+        controllerKey: "owner-7-controller",
+        responseText: "Done.",
+      });
       now += 10;
     };
 

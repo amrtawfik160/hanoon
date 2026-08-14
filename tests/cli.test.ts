@@ -845,3 +845,59 @@ it("does not leak pairing secrets through JSON, human output, errors, or logs", 
   expect(`${result.stdout}\n${result.stderr}`).not.toContain("do-not-print");
   expect(harness.inspection.logEntries.map((entry) => entry.message).join("\n")).not.toContain("do-not-print");
 });
+
+function stubMemoryFile(harness: Awaited<ReturnType<typeof loadPlugin>>["harness"], entries: unknown) {
+  harness.sdk.stub("files.read", async () => ({
+    path: "/operator/knowledge.json",
+    content: JSON.stringify({ entries }),
+    contentEncoding: "utf8",
+    mimeType: "application/json",
+    sizeBytes: 10,
+    modifiedAtMs: 1,
+    sha256: "a".repeat(64),
+  }));
+}
+
+it("imports an owner knowledge file the agent could not have written itself", async () => {
+  const { harness, store } = await loadPlugin();
+  stubMemoryFile(harness, [
+    { subject: "stripe key", body: "STRIPE_SECRET_KEY=sk-live-000111222333444555666" },
+    { subject: "deploy window", body: "Only weekday mornings.", kind: "preference" },
+  ]);
+
+  const result = await harness.behavior.runCli([
+    "memory", "import", "--file", "/operator/knowledge.json", "--json",
+  ]);
+
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(result.stdout)).toEqual({ imported: 2 });
+  const recalled = store.recallMemories({ scope: "owner", query: "stripe", limit: 10, now: 2 });
+  expect(recalled.map((memory) => memory.subject)).toContain("stripe key");
+});
+
+it("reads the import through the BB host rather than the local filesystem", async () => {
+  const { harness } = await loadPlugin();
+  stubMemoryFile(harness, [{ subject: "one", body: "two" }]);
+
+  await harness.behavior.runCli(["memory", "import", "--file", "/operator/knowledge.json"]);
+
+  expect(harness.inspection.sdk.callsTo("files.read")[0]?.[0]).toMatchObject({ path: "/operator/knowledge.json" });
+});
+
+it("rejects a malformed or oversized import without storing a partial file", async () => {
+  const { harness, store } = await loadPlugin();
+  for (const entries of [[], [{ subject: "no body" }], Array.from({ length: 201 }, () => ({ subject: "s", body: "b" }))]) {
+    stubMemoryFile(harness, entries);
+    const result = await harness.behavior.runCli([
+      "memory", "import", "--file", "/operator/knowledge.json", "--json",
+    ]);
+    expect(result.exitCode).toBe(1);
+  }
+  expect(store.recallMemories({ scope: "owner", limit: 10, now: 2 })).toEqual([]);
+});
+
+it("requires an absolute import path", async () => {
+  const { harness } = await loadPlugin();
+  const result = await harness.behavior.runCli(["memory", "import", "--file", "knowledge.json", "--json"]);
+  expect(result.exitCode).toBe(1);
+});

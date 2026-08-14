@@ -72,7 +72,12 @@ function collectOutput(chunks: Array<{ seq?: number; sequence?: number; dataBase
   );
 }
 
-function shellSingleQuote(value: string): string {
+/**
+ * Single-quote a value for the shell. Exported because everything that builds a
+ * command out of untrusted text needs exactly this quoting, and a second copy is
+ * a second chance to get shell escaping subtly wrong.
+ */
+export function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 

@@ -53,6 +53,22 @@ async function runRequired(
   return result.output;
 }
 
+function jsonPayload(rawOutput: string): string {
+  const text = rawOutput.trim();
+  const end = text.lastIndexOf("}");
+  if (end === -1) return text;
+  for (let start = text.indexOf("{"); start !== -1 && start < end; start = text.indexOf("{", start + 1)) {
+    const candidate = text.slice(start, end + 1);
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      // Terminal scrollback carries the echoed command and gh's progress label, so keep scanning.
+    }
+  }
+  return text;
+}
+
 export async function adoptPullRequest(input: {
   runner: AdoptionRunner;
   scope: TerminalScope;
@@ -83,7 +99,7 @@ export async function adoptPullRequest(input: {
   );
   let metadata: z.infer<typeof prSchema>;
   try {
-    metadata = prSchema.parse(JSON.parse(metadataOutput.trim()));
+    metadata = prSchema.parse(JSON.parse(jsonPayload(metadataOutput)));
   } catch {
     throw new Error("Pull-request metadata is invalid");
   }

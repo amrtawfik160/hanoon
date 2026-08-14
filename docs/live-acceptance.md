@@ -50,7 +50,7 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | pairing Telegram message id(s) | `<message id>` |
 | task/status/review/approval/completion message ids | `<message ids only>` |
 | controller BB thread/project/host ids | `<thread id>`, `<personal project id>`, `<host id>` |
-| controller execution tuple | `codex`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
+| controller execution tuple | `<provider selected by the model>`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
 | selected job recipe and routing mode | `<recipe>@<version>`, `<shadow/active>` |
 | controller/worker capability profiles | `<profile id>`, `<revision>`, `<registry digest>`, `<graph digest>` |
 | mandatory capability outcomes | `<capability id>`, `<terminal outcome>`, `<bounded evidence references>` |
@@ -225,3 +225,36 @@ Only a future `passed` and `ready: true` result may permit `capability promote <
 Accept the base live run only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, canary, and promotion conclusions separate. The four role-specific capability rows must contain real thread ids, profiles, selected ids, bundle digest, exact model tuple, and mandatory terminal outcomes; deterministic bundle verification alone cannot satisfy them.
 
 A recipe promotion is a separate acceptance decision. It remains **incomplete** until step 13 has a resolved durable manifest and the status command reports `ready: true`. If the owner did not configure the token, production commands, disposable projects, or trusted collection harness needed for every case, report the affected live acceptance as **not run**, never successful. This release cannot create that manifest because the trusted collector is absent; do not approve a recipe for activation from local evidence.
+## Trust-kernel evidence sheet
+
+Score each row separately. Mocked/deterministic, live provider, Telegram, and external-system evidence stay in different classes, and an unavailable installation, provider, bot chat, interaction shape, or host attestation makes a row **incomplete** — never passed.
+
+| # | Evidence | Value |
+| --- | --- | --- |
+| 1 | accepted finalization id and its exact evidence refs | `<finalization id>`, `<evidence:N list>` |
+| 2 | live current-status evidence (source, proof kinds, subject refs) | `<bounded evidence row>` |
+| 3 | one process-only continuation with no leaked draft or answer | `<continuation count>`, `<draft text observed>` |
+| 4 | permission interaction id under the actually configured mode | `<interaction id>`, `<permission mode, explicit or default>` |
+| 5 | exact Allow-once resolution sent to BB | `<interaction id>`, `<resolution payload>` |
+| 6 | restart between tap persistence and BB resolution | `incomplete` unless a mechanically controlled window exists |
+| 7 | armed monitor obligation named by a deferred response | `<monitor id>`, `<obligation ref>` |
+| 8 | unsupported-success delivery count | `0` expected; record the observed count |
+| 9 | stale capability/fence denial before effect | `<denial code>`, `<unchanged durable state>` |
+| 10 | fixed report path/digest, harness identity, budgets, denominators, outcomes, and time/token/cost availability | `<report path>`, `<sha-256>`, `<passed/denominator per scenario>` |
+| 11 | proof that merge, deploy, credential, spend, destructive action, managed publication, and privilege/default activation were **not** exercised | `<explicit not-exercised statement per item>` |
+| 12 | runtime atomic-activity, conditional-commit, and native-isolation attestations | `unavailable / disabled` unless real host evidence exists |
+| 13 | Telegram delivery ambiguity and retry status, reported separately from the one logical outbox result | `<logical key>`, `<ambiguous sends>`, `<retries>` |
+
+Row 6 has no planned production fault hook for pausing exactly after tap persistence and before BB resolution, so it is **incomplete** unless a mechanically controlled window exists; the deterministic restart proof lives in `tests/controller-trust-integration.test.ts`.
+
+Row 4 may use an explicitly configured disposable `auto` profile and a harmless read-only command. If BB emits no supported interaction, mark the row incomplete. Record the actual configured permission mode and whether it was explicit.
+
+Row 12 is **disabled/unavailable** on the current runtime: the vendored BB thread, timeline, and interaction calls share no atomic activity revision and the commit API is unconditional. Because of that row, the overall live gate cannot be called passed.
+
+Row 13 records transport truth, not intent: Telegram delivery is at-least-once, an ambiguous send is retained as unknown, and a retry may duplicate the message. Never record an attempt or an enqueue as a delivery.
+
+Never exercise a live merge, deploy, credential change, spend, destructive action, ref mutation, or managed publication for this acceptance run.
+
+## Final acceptance decision
+
+Accept only when both evidence sheets are complete. The trust-kernel sheet above is scored separately, and because row 12's runtime attestations are unavailable on this runtime, **the overall live gate cannot be called passed** however well the rest scores. Beyond that, accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Until then, live provider skill-use evidence remains **pending**, not passed or complete. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the live acceptance as **not run**, not successful.

@@ -1,5 +1,6 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { BUNDLED_SKILL_IDS, buildWorkerThreadTitle, type WorkerSkillRole } from "../src/agent-skills/role-resolver";
 import {
@@ -16,6 +17,10 @@ import {
 } from "../src/controller/tools";
 import { controllerToolsForBundles } from "../src/capabilities/controller-bundles";
 import { retireLiveWorkPollingSchedules } from "../src/controller/monitor-policy";
+import { canonicalControllerJson, sha256ControllerJson } from "../src/controller/capability-executor";
+import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
+import { ControllerEvidenceProjector } from "../src/controller/evidence-projector";
+import { controllerFinalizationJsonSchema } from "../src/controller/finalization-contract";
 
 type ThreadListEntry = Awaited<ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["sdk"]["threads"]["list"]>>[number];
 
@@ -83,7 +88,28 @@ function backgroundCommand() {
 
 function parseToolJson(value: unknown): unknown {
   if (typeof value !== "string") throw new Error("controller tool did not return JSON text");
-  return JSON.parse(value);
+  const parsed = JSON.parse(value) as Record<string, unknown>;
+  delete parsed._hanoonEvidence;
+  return parsed;
+}
+
+type RuntimeEvidence = Readonly<{
+  outcome: "observed" | "succeeded" | "interrupted";
+  proofKinds: string[];
+  subjectRefs: string[];
+}>;
+
+function parseToolWithEvidence(value: unknown): Record<string, unknown> & { _hanoonEvidence: RuntimeEvidence } {
+  if (typeof value !== "string") throw new Error("controller tool did not return JSON text");
+  return JSON.parse(value) as Record<string, unknown> & { _hanoonEvidence: RuntimeEvidence };
+}
+
+function runtimeProjection(evidence: RuntimeEvidence): RuntimeEvidence {
+  return {
+    outcome: evidence.outcome,
+    proofKinds: evidence.proofKinds,
+    subjectRefs: evidence.subjectRefs,
+  };
 }
 
 function queueControllerCandidate(
@@ -128,7 +154,7 @@ function queueControllerCandidate(
 const controllerToolContext = { threadId: "thr_controller", projectId: "proj_personal" };
 
 let fixtureNumber = 0;
-function fixture() {
+function fixture(options: { active?: boolean } = {}) {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-controller-tools-${fixtureNumber++}`,
     agentSkillIds: [...BUNDLED_SKILL_IDS],
@@ -164,9 +190,444 @@ function fixture() {
     generation: lease.generation,
     now: 10_000,
   })).toBe(true);
-  expect(store.releaseExecutorLease("executor", lease.generation, 10_000)).toBe(true);
-  return { bb, harness, store, turn };
+  let activeFence = { ownerId: "executor", generation: lease.generation, now: 10_000 };
+  const deactivate = () => {
+    if (store.isExecutorLeaseCurrent(activeFence.ownerId, activeFence.generation, activeFence.now)) {
+      expect(store.releaseExecutorLease(activeFence.ownerId, activeFence.generation, activeFence.now)).toBe(true);
+    }
+  };
+  const activate = () => {
+    const acquired = store.acquireExecutorLease("executor", 10_000, 30_000);
+    if (!acquired.acquired) throw new Error("missing replacement controller lease");
+    activeFence = { ownerId: "executor", generation: acquired.generation, now: 10_000 };
+    expect(store.adoptSubmittedControllerTurnFence({ ...activeFence, turnId: turn.id })).toBe(true);
+  };
+  if (!options.active) deactivate();
+  return { bb, harness, store, turn, activate, deactivate };
 }
+
+it("preserves the exact Task 6 metadata and adds the bounded evidence-index schema", () => {
+  const { bb, harness, store } = fixture({ active: true });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+  const registrations = harness.registrations.agentTools;
+  const metadata = registrations.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    statusLabels: tool.experimentalStatusLabels,
+    schema: tool.inputSchema,
+  }));
+  const providerJson = JSON.parse(JSON.stringify(metadata));
+  const digest = createHash("sha256")
+    .update(canonicalControllerJson(providerJson.slice(0, 21)), "utf8")
+    .digest("hex");
+  // Re-pinned when the trust kernel merged with this branch's tool surface:
+  // start_job gained `path`/`separateWork`, create_thread and send_to_thread
+  // gained `attachOwnerImage`, watch refuses schedules that poll live work, and
+  // watch now states that any visible thread can be watched.
+  expect(digest).toBe("c3310a516584d3ef2858a7f5b34bd168cc3cca2f6494b952f63b7dc4588dd7b5");
+  expect(metadata[21]).toEqual({
+    name: "telegram_agent_turn_evidence",
+    description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
+    statusLabels: null,
+    schema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {
+        afterEvidenceId: {
+          default: 0,
+          type: "integer",
+          minimum: 0,
+          maximum: Number.MAX_SAFE_INTEGER,
+        },
+      },
+      additionalProperties: false,
+    },
+  });
+  expect(metadata[22]).toEqual({
+    name: "telegram_agent_respond",
+    description: "Submit one bounded evidence-backed final response for the current controller turn.",
+    statusLabels: null,
+    schema: controllerFinalizationJsonSchema,
+  });
+  // 25 manifest capabilities plus the two capability metadata tools.
+  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(27);
+
+  const byName = new Map(registrations.map((tool) => [tool.name, tool]));
+  const parsed = (name: string, params: unknown) => {
+    const result = byName.get(name)?.parse(params);
+    if (!result?.ok) throw new Error(`provider schema did not parse ${name}`);
+    return result.value;
+  };
+  expect(parsed("telegram_agent_list_threads", {})).toEqual({ status: "active", limit: 10 });
+  expect(parsed("telegram_agent_remember", { subject: "s", body: "b" })).toEqual({
+    subject: "s",
+    body: "b",
+    kind: "fact",
+  });
+  expect(parsed("telegram_agent_recall", { query: "q" })).toEqual({ query: "q", limit: 8 });
+  expect(parsed("telegram_agent_list_watches", {})).toEqual({ includeFinished: false });
+  expect(parsed("telegram_agent_scorecard", {})).toEqual({ windowDays: 7 });
+});
+
+it("matches the exact trusted 21-tool projection permission matrix", () => {
+  const expected = [
+    ["telegram_agent_list_projects", ["project_state"]],
+    ["telegram_agent_start_job", ["job_state", "obligation"]],
+    ["telegram_agent_job_status", ["job_state", "pipeline_outcome", "obligation"]],
+    ["telegram_agent_retry_job", ["job_state", "obligation"]],
+    ["telegram_agent_cancel_job", ["job_state"]],
+    ["telegram_agent_list_threads", ["thread_state"]],
+    ["telegram_agent_thread_status", ["thread_state"]],
+    ["telegram_agent_read_thread", ["thread_state"]],
+    ["telegram_agent_create_thread", ["thread_state", "external_mutation"]],
+    ["telegram_agent_send_to_thread", ["external_mutation", "thread_state"]],
+    ["telegram_agent_request_thread_operation", ["obligation"]],
+    ["telegram_agent_remember", ["memory_state"]],
+    ["telegram_agent_recall", ["memory_state"]],
+    ["telegram_agent_forget", ["memory_state"]],
+    ["telegram_agent_watch", ["monitor_state", "obligation"]],
+    ["telegram_agent_list_watches", ["monitor_state", "obligation"]],
+    ["telegram_agent_cancel_watch", ["monitor_state"]],
+    ["telegram_agent_health", ["health_snapshot"]],
+    ["telegram_agent_delegate", ["thread_state", "external_mutation", "obligation"]],
+    ["telegram_agent_scorecard", ["health_snapshot"]],
+    ["telegram_agent_set_working_style", ["memory_state"]],
+  ] as const;
+
+  expect(expected.map(([name]) => name)).toEqual(CONTROLLER_TOOL_NAMES.slice(0, 21));
+  expect(CONTROLLER_TOOL_NAMES[21]).toBe("telegram_agent_turn_evidence");
+  for (const [name, proofKinds] of expected) {
+    expect(CONTROLLER_CAPABILITIES[name].proof_kinds).toEqual(proofKinds);
+  }
+});
+
+it("emits the exact runtime projection for every registered Task 6 tool", async () => {
+  const { bb, harness, store, turn, activate, deactivate } = fixture({ active: true });
+  deactivate();
+  queueControllerCandidate(store, "job_matrix_retry", "proj_a", "failed");
+  queueControllerCandidate(store, "job_matrix_cancel", "proj_b", "awaiting_confirmation");
+  activate();
+
+  const project = {
+    id: "proj_1",
+    kind: "software" as const,
+    name: "Cyndra",
+    gitRemoteUrl: "https://github.com/acme/cyndra.git",
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [{
+      id: "source_matrix",
+      projectId: "proj_1",
+      isDefault: true,
+      createdAt: 1,
+      updatedAt: 1,
+      type: "local_path" as const,
+      hostId: "host_matrix",
+      path: "/workspace/cyndra",
+    }],
+  };
+  const spawnedProjects = new Map<string, string>();
+  let spawnNumber = 0;
+  harness.sdk.stub("projects.list", async () => [project]);
+  harness.sdk.stub("threads.list", async () => [visibleThread()]);
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread({ id: threadId, projectId: spawnedProjects.get(threadId) ?? "proj_1" }),
+    canSpawnChild: true,
+  }));
+  harness.sdk.stub("threads.spawn", async ({ projectId }) => {
+    const id = `thr_matrix_${String(++spawnNumber)}`;
+    spawnedProjects.set(id, projectId);
+    return { id, environmentId: `env_matrix_${String(spawnNumber)}` };
+  });
+  harness.sdk.stub("threads.send", async () => ({ ok: true }));
+  harness.sdk.stub("threads.timeline", async () => ({
+    rows: [],
+    activePromptMode: null,
+    activeThinking: null,
+    activeWorkflows: [],
+    activeBackgroundCommands: [],
+    pendingTodos: null,
+    goal: null,
+    modelFallback: null,
+    timelinePage: { hasMore: false, oldestSeq: null, newestSeq: null },
+    maxSeq: 0,
+  }));
+  harness.sdk.stub("threads.output", async () => ({ output: "Matrix thread output." }));
+  harness.sdk.stub("threads.interactions.list", async () => []);
+  const requestOperation = vi.fn(async (input: {
+    kind: "steer_thread" | "stop_thread" | "retry_thread";
+    threadId: string;
+    text?: string;
+  }) => {
+    store.createThreadOperation({
+      id: "operation_matrix",
+      nonceHash: "e".repeat(64),
+      ownerUserId: "7",
+      ownerChatId: "7",
+      kind: input.kind,
+      threadId: input.threadId,
+      text: input.kind === "steer_thread" ? input.text ?? "steer" : null,
+      expiresAt: 20_000,
+      now: 10_050,
+    });
+    const operation = store.markThreadOperationConfirmationSent("operation_matrix", 88, 10_051);
+    return {
+      id: operation.id,
+      kind: operation.kind,
+      threadId: operation.threadId,
+      state: operation.state,
+      expiresAt: operation.expiresAt,
+    };
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: requestOperation },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const state: {
+    startedJobId?: string;
+    memoryId?: string;
+    monitorId?: string;
+    watchedMonitorIds?: string[];
+    delegationId?: string;
+  } = {};
+  type MatrixRow = Readonly<{
+    name: typeof CONTROLLER_TOOL_NAMES[number];
+    params(): Record<string, unknown>;
+    capture?(): void;
+    expected(): RuntimeEvidence;
+  }>;
+  const rows: MatrixRow[] = [
+    {
+      name: "telegram_agent_list_projects",
+      params: () => ({}),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["project_state"],
+        subjectRefs: ["project:proj_a", "project:proj_b", "project:proj_1"],
+      }),
+    },
+    {
+      name: "telegram_agent_start_job",
+      params: () => ({ projectId: "proj_1", task: "Run the runtime projection matrix." }),
+      capture: () => {
+        const job = store.getJobBySourceUpdateId(turn.updateId);
+        if (!job) throw new Error("matrix start job was not persisted");
+        state.startedJobId = job.id;
+      },
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["job_state", "obligation"],
+        subjectRefs: [`job:${state.startedJobId!}`],
+      }),
+    },
+    {
+      name: "telegram_agent_job_status",
+      params: () => ({ jobId: state.startedJobId }),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["job_state", "obligation"],
+        subjectRefs: [`job:${state.startedJobId!}`],
+      }),
+    },
+    {
+      name: "telegram_agent_retry_job",
+      params: () => ({ jobId: "job_matrix_retry" }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["job_state", "obligation"],
+        subjectRefs: ["job:job_matrix_retry"],
+      }),
+    },
+    {
+      name: "telegram_agent_cancel_job",
+      params: () => ({ jobId: "job_matrix_cancel" }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["job_state"], subjectRefs: ["job:job_matrix_cancel"] }),
+    },
+    {
+      name: "telegram_agent_list_threads",
+      params: () => ({}),
+      expected: () => ({ outcome: "observed", proofKinds: ["thread_state"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_thread_status",
+      params: () => ({ threadId: "thr_active" }),
+      expected: () => ({ outcome: "observed", proofKinds: ["thread_state"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_read_thread",
+      params: () => ({ threadId: "thr_active" }),
+      expected: () => ({ outcome: "observed", proofKinds: ["thread_state"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_create_thread",
+      params: () => ({ projectId: "proj_1", title: "Matrix exploration", prompt: "Inspect the runtime matrix." }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["thread_state", "external_mutation"],
+        subjectRefs: ["thread:thr_matrix_1", "project:proj_1"],
+      }),
+    },
+    {
+      name: "telegram_agent_send_to_thread",
+      params: () => ({ threadId: "thr_active", text: "Continue the matrix." }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["external_mutation", "thread_state"],
+        subjectRefs: ["thread:thr_active"],
+      }),
+    },
+    {
+      name: "telegram_agent_request_thread_operation",
+      params: () => ({ kind: "stop_thread", threadId: "thr_active" }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["obligation"], subjectRefs: ["thread:thr_active"] }),
+    },
+    {
+      name: "telegram_agent_remember",
+      params: () => ({ subject: "runtime matrix", body: "Preserve exact evidence order.", kind: "fact" }),
+      capture: () => {
+        const row = bb.storage.database().prepare(
+          "SELECT id FROM memories WHERE subject = 'runtime matrix' ORDER BY created_at DESC LIMIT 1",
+        ).get() as { id: string } | undefined;
+        if (!row) throw new Error("matrix memory was not persisted");
+        state.memoryId = row.id;
+      },
+      expected: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [`memory:${state.memoryId!}`] }),
+    },
+    {
+      name: "telegram_agent_recall",
+      params: () => ({ query: "runtime matrix" }),
+      expected: () => ({ outcome: "observed", proofKinds: ["memory_state"], subjectRefs: [`memory:${state.memoryId!}`] }),
+    },
+    {
+      name: "telegram_agent_forget",
+      params: () => ({ id: state.memoryId }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [`memory:${state.memoryId!}`] }),
+    },
+    {
+      name: "telegram_agent_watch",
+      params: () => ({ kind: "thread_idle", threadId: "thr_active", instruction: "Report matrix completion." }),
+      capture: () => {
+        // Sending to the thread already armed a watch on it, and watching it
+        // explicitly reuses that one rather than arming a second.
+        const monitor = store.listMonitors(turn.controllerKey, false)
+          .find((candidate) => candidate.threadId === "thr_active");
+        if (!monitor) throw new Error("matrix monitor was not persisted");
+        state.monitorId = monitor.id;
+      },
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["monitor_state", "obligation"],
+        subjectRefs: [`monitor:${state.monitorId!}`, "thread:thr_active"],
+      }),
+    },
+    {
+      name: "telegram_agent_list_watches",
+      params: () => ({}),
+      // The thread this matrix started is watched for the agent too, so the
+      // listing reports that watch beside the one it armed itself.
+      capture: () => {
+        state.watchedMonitorIds = store.listMonitors(turn.controllerKey, false).map((monitor) => monitor.id);
+      },
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["monitor_state", "obligation"],
+        subjectRefs: state.watchedMonitorIds!.map((id) => `monitor:${id}`),
+      }),
+    },
+    {
+      name: "telegram_agent_cancel_watch",
+      params: () => ({ id: state.monitorId }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["monitor_state"], subjectRefs: [`monitor:${state.monitorId!}`] }),
+    },
+    {
+      name: "telegram_agent_health",
+      params: () => ({}),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: ["controller:owner-7-controller"],
+      }),
+    },
+    {
+      name: "telegram_agent_delegate",
+      params: () => ({
+        instruction: "Join the matrix result.",
+        tasks: [{ projectId: "proj_1", title: "Matrix delegate", prompt: "Check the matrix." }],
+      }),
+      capture: () => {
+        const row = bb.storage.database().prepare(
+          "SELECT id FROM delegations WHERE instruction = 'Join the matrix result.' ORDER BY created_at DESC LIMIT 1",
+        ).get() as { id: string } | undefined;
+        if (!row) throw new Error("matrix delegation was not persisted");
+        state.delegationId = row.id;
+      },
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["thread_state", "external_mutation", "obligation"],
+        subjectRefs: [`delegation:${state.delegationId!}`, "thread:thr_matrix_2"],
+      }),
+    },
+    {
+      name: "telegram_agent_scorecard",
+      params: () => ({}),
+      expected: () => ({
+        outcome: "observed",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: ["controller:owner-7-controller"],
+      }),
+    },
+    {
+      name: "telegram_agent_set_working_style",
+      params: () => ({ text: "Keep runtime evidence ordered." }),
+      expected: () => ({
+        outcome: "succeeded",
+        proofKinds: ["memory_state"],
+        subjectRefs: ["controller:owner-7-controller"],
+      }),
+    },
+  ];
+
+  expect(rows.map((row) => row.name)).toEqual(CONTROLLER_TOOL_NAMES.slice(0, 21));
+  for (const row of rows) {
+    const params = row.params();
+    const result = parseToolWithEvidence(await harness.behavior.callAgentTool(
+      row.name,
+      params,
+      controllerToolContext,
+    ));
+    row.capture?.();
+    expect(runtimeProjection(result._hanoonEvidence), row.name).toEqual(row.expected());
+    if (row.name === "telegram_agent_create_thread") {
+      const replay = parseToolWithEvidence(await harness.behavior.callAgentTool(
+        row.name,
+        params,
+        controllerToolContext,
+      ));
+      expect(runtimeProjection(replay._hanoonEvidence)).toEqual({ ...row.expected(), outcome: "observed" });
+      expect(spawnNumber).toBe(1);
+    }
+    if (row.name === "telegram_agent_set_working_style") {
+      const noOp = parseToolWithEvidence(await harness.behavior.callAgentTool(
+        row.name,
+        params,
+        controllerToolContext,
+      ));
+      expect(runtimeProjection(noOp._hanoonEvidence)).toEqual({ ...row.expected(), outcome: "observed" });
+    }
+  }
+});
 
 function workerContext(
   pluginId: string,
@@ -406,15 +867,27 @@ it("rejects unmapped controllers and disabled projects while allowing another qu
 });
 
 it("registers the exact controller tools and keeps them off unrelated sessions", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   const notify = vi.fn();
-  const requestThreadOperation = vi.fn(async () => ({
-    id: "operation_1",
-    kind: "stop_thread" as const,
-    threadId: "thr_active",
-    state: "awaiting_confirmation" as const,
-    expiresAt: 20_000,
-  }));
+  const requestThreadOperation = vi.fn(async (input: {
+    kind: "steer_thread" | "stop_thread" | "retry_thread";
+    threadId: string;
+    text?: string;
+  }) => {
+    store.createThreadOperation({
+      id: "operation_1",
+      nonceHash: "a".repeat(64),
+      ownerUserId: "7",
+      ownerChatId: "7",
+      kind: input.kind,
+      threadId: input.threadId,
+      text: input.kind === "steer_thread" ? input.text ?? "steer" : null,
+      expiresAt: 20_000,
+      now: 9_000,
+    });
+    const awaiting = store.markThreadOperationConfirmationSent("operation_1", 77, 9_001);
+    return { id: awaiting.id, kind: awaiting.kind, threadId: awaiting.threadId, state: awaiting.state, expiresAt: awaiting.expiresAt };
+  });
   harness.sdk.stub("projects.list", async () => [{
     id: "proj_1",
     kind: "software",
@@ -563,7 +1036,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     "telegram_agent_thread_status",
     { threadId: "thr_hidden" },
     { threadId: "thr_controller", projectId: "proj_personal" },
-  )).rejects.toThrow(/not visible/i);
+  )).rejects.toThrow(/scope|not visible/i);
 
   const operation = await harness.behavior.callAgentTool(
     "telegram_agent_request_thread_operation",
@@ -664,7 +1137,7 @@ it("exposes an approved bundle only after the persisted continuation profile is 
 });
 
 it("rejects repeating schedules that poll live work", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
@@ -956,7 +1429,7 @@ it("fails closed for forged durable worker and controller identities", async () 
 });
 
 it("returns bounded choices for ambiguous status, retry, and cancel without mutation", async () => {
-  const { bb, harness, store, turn } = fixture();
+  const { bb, harness, store, turn, activate, deactivate } = fixture({ active: true });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,
@@ -971,13 +1444,17 @@ it("returns bounded choices for ambiguous status, retry, and cancel without muta
     {},
     controllerToolContext,
   ))).toEqual({ outcome: "none", candidates: [] });
+  deactivate();
   queueControllerCandidate(store, "controller_job_a", "proj_a", "failed");
+  activate();
   expect(parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_job_status",
     {},
     controllerToolContext,
   ))).toMatchObject({ job: { id: "controller_job_a", projectId: "proj_a", state: "failed" } });
+  deactivate();
   queueControllerCandidate(store, "controller_job_b", "proj_b", "failed");
+  activate();
 
   const expected = {
     outcome: "choose_job",
@@ -993,21 +1470,24 @@ it("returns bounded choices for ambiguous status, retry, and cancel without muta
     cancelRequestedAt,
   }));
 
-  expect(parseToolJson(await harness.behavior.callAgentTool(
+  for (const toolName of [
     "telegram_agent_job_status",
-    {},
-    controllerToolContext,
-  ))).toEqual(expected);
-  expect(parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_retry_job",
-    {},
-    controllerToolContext,
-  ))).toEqual(expected);
-  expect(parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_cancel_job",
-    {},
-    controllerToolContext,
-  ))).toEqual(expected);
+  ] as const) {
+    const output = parseToolWithEvidence(await harness.behavior.callAgentTool(
+      toolName,
+      {},
+      controllerToolContext,
+    ));
+    const { _hanoonEvidence, ...domain } = output;
+    expect(domain).toEqual(expected);
+    expect(runtimeProjection(_hanoonEvidence)).toEqual({
+      outcome: "observed",
+      proofKinds: ["job_state"],
+      subjectRefs: ["job:controller_job_a", "job:controller_job_b"],
+    });
+  }
   expect(store.listJobs(10).map(({ id, state, version, cancelRequestedAt }) => ({
     id,
     state,
@@ -1030,8 +1510,189 @@ it("returns bounded choices for ambiguous status, retry, and cancel without muta
   expect(notify).toHaveBeenCalledOnce();
 });
 
+it.each([
+  "telegram_agent_job_status",
+  "telegram_agent_retry_job",
+  "telegram_agent_cancel_job",
+] as const)("denies an explicit missing job id for %s", async (toolName) => {
+  const { bb, harness, store } = fixture({ active: true });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    toolName,
+    { jobId: "missing_job" },
+    controllerToolContext,
+  )).rejects.toMatchObject({ code: "scope_denied" });
+});
+
+it.each([
+  ["telegram_agent_retry_job", "failed", "blocked"],
+  ["telegram_agent_cancel_job", "awaiting_confirmation", "cancelled"],
+] as const)("does not re-resolve an authorized no-id choice for %s", async (toolName, initialState, racedState) => {
+  const { bb, harness, store, turn } = fixture({ active: true });
+  store.releaseExecutorLease("executor", turn.leaseGeneration!, 10_000);
+  queueControllerCandidate(store, "controller_job_a", "proj_a", initialState);
+  queueControllerCandidate(store, "controller_job_b", "proj_b", initialState);
+  const reacquired = store.acquireExecutorLease("executor", 10_100, 30_000);
+  if (!reacquired.acquired) throw new Error("missing race-test lease");
+  expect(store.adoptSubmittedControllerTurnFence({
+    ownerId: "executor",
+    generation: reacquired.generation,
+    now: 10_100,
+    turnId: turn.id,
+  })).toBe(true);
+  bb.storage.database().exec(`
+    CREATE TRIGGER race_job_resolution AFTER INSERT ON tool_receipts
+    WHEN NEW.tool_name = '${toolName}'
+    BEGIN
+      UPDATE jobs SET state = '${racedState}', version = version + 1
+      WHERE id = 'controller_job_b';
+    END;
+  `);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  expect(parseToolJson(await harness.behavior.callAgentTool(
+    toolName,
+    {},
+    controllerToolContext,
+  ))).toEqual({
+    outcome: "choose_job",
+    candidates: [
+      { id: "controller_job_a", projectId: "proj_a", state: initialState },
+      { id: "controller_job_b", projectId: "proj_b", state: initialState },
+    ],
+  });
+  expect(store.getJob("controller_job_a")?.state).toBe(initialState);
+  expect(store.getJob("controller_job_b")?.state).toBe(racedState);
+});
+
+it.each([
+  ["telegram_agent_retry_job", "failed"],
+  ["telegram_agent_cancel_job", "awaiting_confirmation"],
+] as const)("rejects an exact authorized job whose version races before %s", async (toolName, initialState) => {
+  const { bb, harness, store, turn, activate, deactivate } = fixture({ active: true });
+  deactivate();
+  queueControllerCandidate(store, "controller_job_exact", "proj_exact", initialState);
+  activate();
+  const before = store.getJob("controller_job_exact");
+  if (!before) throw new Error("exact race job was not created");
+  bb.storage.database().exec(`
+    CREATE TRIGGER race_exact_job_version AFTER INSERT ON tool_receipts
+    WHEN NEW.tool_name = '${toolName}'
+    BEGIN
+      UPDATE jobs SET version = version + 1 WHERE id = 'controller_job_exact';
+    END;
+  `);
+  const notify = vi.fn();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify,
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    toolName,
+    { jobId: before.id },
+    controllerToolContext,
+  )).rejects.toThrow(/version/i);
+  expect(store.getJob(before.id)).toMatchObject({ state: initialState, version: before.version + 1 });
+  expect(notify).not.toHaveBeenCalled();
+  expect(store.listToolReceipts(turn.id)).toEqual([
+    expect.objectContaining({ toolName, state: "failed" }),
+  ]);
+});
+
+it("keeps job_state proof when an omitted job id resolves to none", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const output = JSON.parse(await harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    {},
+    controllerToolContext,
+  ) as string) as { _hanoonEvidence: { proofKinds: string[]; subjectRefs: string[] } };
+  expect(output._hanoonEvidence).toMatchObject({ proofKinds: ["job_state"], subjectRefs: [] });
+});
+
+it("does not expose a synthetic schedule scope in interrupted evidence", async () => {
+  const { bb, harness, store, turn } = fixture({ active: true });
+  const params = { kind: "schedule" as const, cron: "0 9 * * 1-5", instruction: "Review the queue." };
+  expect(store.claimToolReceipt({
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    toolName: "telegram_agent_watch",
+    argsSha256: sha256ControllerJson(params),
+    now: 10_099,
+  })).toEqual({ outcome: "fresh" });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const output = JSON.parse(await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    params,
+    controllerToolContext,
+  ) as string) as { _hanoonEvidence: { outcome: string; proofKinds: string[]; subjectRefs: string[] } };
+  expect(runtimeProjection(output._hanoonEvidence as RuntimeEvidence)).toEqual({
+    outcome: "interrupted",
+    proofKinds: [],
+    subjectRefs: [],
+  });
+});
+
+it("denies a valid enabled policy stored under a different project identity", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  const mismatched = policyFixture({ projectId: "proj_other", alias: "other" });
+  bb.storage.database().prepare(
+    "UPDATE project_policies SET policy_json = ? WHERE project_id = 'proj_1'",
+  ).run(JSON.stringify(mismatched));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_start_job",
+    { projectId: "proj_1", task: "must not cross project policy identity" },
+    controllerToolContext,
+  )).rejects.toMatchObject({ code: "scope_denied" });
+});
+
 it("reads what a thread is doing so slowness can be explained rather than deflected", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   harness.sdk.stub("threads.get", async () => ({ ...visibleThread(), canSpawnChild: true }));
   harness.sdk.stub("threads.timeline", async () => ({
     rows: [],
@@ -1096,7 +1757,7 @@ it("reads what a thread is doing so slowness can be explained rather than deflec
 });
 
 it("opens and messages visible threads, and refuses hidden ones", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   const spawn = vi.fn(async () => ({ id: "thr_new", environmentId: "env_new" }));
   const send = vi.fn(async () => ({ ok: true }));
   harness.sdk.stub("projects.list", async () => [{
@@ -1120,7 +1781,9 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
   harness.sdk.stub("threads.spawn", spawn);
   harness.sdk.stub("threads.send", send);
   harness.sdk.stub("threads.get", async ({ threadId }) => ({
-    ...visibleThread(threadId === "thr_hidden" ? { id: "thr_hidden", visibility: "hidden" } : {}),
+    ...visibleThread(threadId === "thr_hidden"
+      ? { id: "thr_hidden", visibility: "hidden" }
+      : { id: threadId }),
     canSpawnChild: true,
   }));
   registerControllerTools(bb, {
@@ -1155,15 +1818,278 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     input: [{ type: "text", text: "Use the staging database", mentions: [] }],
   }));
 
+  // Engaging with a thread is what earns the follow-up, so the thread the agent
+  // started and the one it merely messaged are both watched, and messaging the
+  // same thread again reuses the watch rather than arming a second one.
+  await harness.behavior.callAgentTool(
+    "telegram_agent_send_to_thread",
+    { threadId: "thr_active", text: "Report when the tests land" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  );
+  expect(store.listMonitors("owner-7-controller", false).map((monitor) => ({
+    kind: monitor.kind,
+    threadId: monitor.threadId,
+    state: monitor.state,
+  }))).toEqual(expect.arrayContaining([
+    { kind: "thread_idle", threadId: "thr_new", state: "armed" },
+    { kind: "thread_idle", threadId: "thr_active", state: "armed" },
+  ]));
+  expect(store.listMonitors("owner-7-controller", false)).toHaveLength(2);
+
   await expect(harness.behavior.callAgentTool(
     "telegram_agent_send_to_thread",
     { threadId: "thr_hidden", text: "leak" },
     { threadId: "thr_controller", projectId: "proj_personal" },
-  )).rejects.toThrow(/not visible/i);
+  )).rejects.toThrow(/scope|not visible/i);
+});
+
+it("uses the authorized project host once and interrupts replay after cross-project projection failure", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  let projectReads = 0;
+  harness.sdk.stub("projects.list", async () => {
+    projectReads += 1;
+    return [{
+      id: "proj_1",
+      kind: "software" as const,
+      name: "Cyndra",
+      gitRemoteUrl: null,
+      createdAt: 1,
+      updatedAt: 1,
+      sources: [{
+        id: "src_1",
+        projectId: "proj_1",
+        isDefault: true,
+        createdAt: 1,
+        updatedAt: 1,
+        type: "local_path" as const,
+        hostId: projectReads === 1 ? "host_authorized" : "host_changed",
+        path: "/repo",
+      }],
+    }];
+  });
+  const spawn = vi.fn(async () => ({ id: "thr_cross_project", environmentId: "env_other" }));
+  harness.sdk.stub("threads.spawn", spawn);
+  harness.sdk.stub("threads.get", async () => ({
+    ...visibleThread({ id: "thr_cross_project", projectId: "proj_other" }),
+    canSpawnChild: true,
+  }));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_create_thread",
+    { projectId: "proj_1", title: "Inspect", prompt: "Inspect only" },
+    controllerToolContext,
+  )).rejects.toMatchObject({ code: "evidence_projection_invalid" });
+  expect(projectReads).toBe(1);
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
+    projectId: "proj_1",
+    environment: expect.objectContaining({ type: "host", hostId: "host_authorized" }),
+  }));
+  const replay = JSON.parse(await harness.behavior.callAgentTool(
+    "telegram_agent_create_thread",
+    { projectId: "proj_1", title: "Inspect", prompt: "Inspect only" },
+    controllerToolContext,
+  ) as string) as { _hanoonEvidence: { outcome: string; proofKinds: string[]; subjectRefs: string[] } };
+  expect(runtimeProjection(replay._hanoonEvidence as RuntimeEvidence)).toEqual({
+    outcome: "interrupted",
+    proofKinds: [],
+    subjectRefs: ["project:proj_1"],
+  });
+  expect(spawn).toHaveBeenCalledOnce();
+  expect(projectReads).toBe(2);
+});
+
+it("does not promote a thread operation for a different thread, kind, or owner binding", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  harness.sdk.stub("threads.get", async () => ({ ...visibleThread({ id: "thr_active" }), canSpawnChild: true }));
+  const crossOperation = store.createThreadOperation({
+    id: "operation_cross",
+    nonceHash: "a".repeat(64),
+    ownerUserId: "7",
+    ownerChatId: "7",
+    kind: "stop_thread",
+    threadId: "thr_other",
+    text: null,
+    expiresAt: 20_000,
+    now: 9_000,
+  });
+  const awaiting = store.markThreadOperationConfirmationSent(crossOperation.id, 77, 9_001);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn(async () => awaiting) },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_request_thread_operation",
+    { kind: "retry_thread", threadId: "thr_active" },
+    controllerToolContext,
+  )).rejects.toMatchObject({ code: "evidence_projection_invalid" });
+});
+
+it("rejects replayed strong proof for a memory outside the authorized scope", async () => {
+  const { bb, harness, store, turn } = fixture({ active: true });
+  const memory = store.rememberMemory({
+    scope: "proj_other",
+    kind: "fact",
+    subject: "foreign memory",
+    body: "belongs elsewhere",
+    source: "agent",
+    now: 9_000,
+  });
+  const params = {
+    subject: "local memory",
+    body: "must stay local",
+    kind: "fact" as const,
+    projectId: "proj_1",
+  };
+  const key = {
+    turnId: turn.id,
+    toolName: "telegram_agent_remember" as const,
+    argsSha256: sha256ControllerJson(params),
+  };
+  expect(store.claimToolReceipt({ ...key, controllerKey: turn.controllerKey, now: 9_100 })).toEqual({ outcome: "fresh" });
+  store.completeToolReceipt({
+    ...key,
+    result: canonicalControllerJson({ remembered: { id: memory.id, subject: memory.subject, scope: memory.scope } }),
+    now: 9_101,
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_remember",
+    params,
+    controllerToolContext,
+  )).rejects.toMatchObject({ code: "evidence_projection_invalid" });
+});
+
+it("rejects replayed job proof for an entity outside the authorized project", async () => {
+  const { bb, harness, store, turn, activate, deactivate } = fixture({ active: true });
+  deactivate();
+  queueControllerCandidate(store, "controller_job_foreign", "proj_other", "failed");
+  activate();
+  const params = { projectId: "proj_1", task: "create the local job" };
+  const key = {
+    turnId: turn.id,
+    toolName: "telegram_agent_start_job" as const,
+    // The receipt is keyed by the parsed arguments, so schema defaults are part
+    // of the hash the executor looks up.
+    argsSha256: sha256ControllerJson({ ...params, separateWork: false }),
+  };
+  expect(store.claimToolReceipt({ ...key, controllerKey: turn.controllerKey, now: 10_099 })).toEqual({ outcome: "fresh" });
+  store.completeToolReceipt({
+    ...key,
+    result: canonicalControllerJson({ job: { id: "controller_job_foreign" } }),
+    now: 10_099,
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_start_job",
+    params,
+    controllerToolContext,
+  )).rejects.toMatchObject({ code: "evidence_projection_invalid" });
+});
+
+it("rejects replayed monitor proof for a different requested watch", async () => {
+  const { bb, harness, store, turn } = fixture({ active: true });
+  const existing = store.createMonitor({
+    controllerKey: turn.controllerKey,
+    kind: "schedule",
+    cron: "0 8 * * *",
+    instruction: "Existing instruction",
+    dueAt: 20_000,
+    now: 9_000,
+  });
+  const params = { kind: "schedule" as const, cron: "0 9 * * *", instruction: "New instruction" };
+  const key = {
+    turnId: turn.id,
+    toolName: "telegram_agent_watch" as const,
+    argsSha256: sha256ControllerJson(params),
+  };
+  expect(store.claimToolReceipt({ ...key, controllerKey: turn.controllerKey, now: 9_100 })).toEqual({ outcome: "fresh" });
+  store.completeToolReceipt({
+    ...key,
+    result: canonicalControllerJson({ watching: { id: existing.id } }),
+    now: 9_101,
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    params,
+    controllerToolContext,
+  )).rejects.toMatchObject({ code: "evidence_projection_invalid" });
+});
+
+it("scans every returned watch for obligations while capping only subject refs", async () => {
+  const { bb, harness, store, turn } = fixture({ active: true });
+  const monitorIds: string[] = [];
+  for (let index = 0; index < 17; index += 1) {
+    const monitor = store.createMonitor({
+      controllerKey: turn.controllerKey,
+      kind: "schedule",
+      cron: `0 ${String(index % 24)} * * *`,
+      instruction: `Monitor ${String(index)}`,
+      dueAt: 20_000 + index,
+      now: 9_000 + index,
+    });
+    monitorIds.push(monitor.id);
+    if (index > 0) expect(store.cancelControllerMonitor(turn.controllerKey, monitor.id, 9_100 + index)).toBe(true);
+  }
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const output = JSON.parse(await harness.behavior.callAgentTool(
+    "telegram_agent_list_watches",
+    { includeFinished: true },
+    controllerToolContext,
+  ) as string) as { _hanoonEvidence: { proofKinds: string[]; subjectRefs: string[] } };
+  expect(output._hanoonEvidence.proofKinds).toEqual(["monitor_state", "obligation"]);
+  const returnedOrder = store.listMonitors(turn.controllerKey, true).map((monitor) => monitor.id);
+  expect(returnedOrder.at(-1)).toBe(monitorIds[0]);
+  expect(output._hanoonEvidence.subjectRefs).toEqual(returnedOrder.slice(0, 16).map((id) => `monitor:${id}`));
 });
 
 it("attaches the owner's Telegram photo when starting or messaging a visible thread", async () => {
-  const { bb, harness, store, turn } = fixture();
+  const { bb, harness, store, turn } = fixture({ active: true });
   const spawn = vi.fn(async () => ({ id: "thr_new", environmentId: "env_new" }));
   const send = vi.fn(async () => ({ ok: true }));
   const upload = vi.fn(async () => ({
@@ -1193,8 +2119,8 @@ it("attaches the owner's Telegram photo when starting or messaging a visible thr
   harness.sdk.stub("projects.attachments.upload", upload);
   harness.sdk.stub("threads.spawn", spawn);
   harness.sdk.stub("threads.send", send);
-  harness.sdk.stub("threads.get", async () => ({
-    ...visibleThread(),
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread({ id: threadId }),
     canSpawnChild: true,
   }));
   bb.storage.database().prepare(
@@ -1290,13 +2216,20 @@ function delegationProjects() {
 }
 
 it("fans work out to one thread per task and records them against one delegation", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
+  for (const projectId of ["proj_a", "proj_b"]) {
+    store.upsertProjectPolicy(policyFixture({ projectId, alias: projectId.replace("_", "-") }), 10_000);
+  }
   const spawned: string[] = [];
   harness.sdk.stub("projects.list", async () => delegationProjects());
   harness.sdk.stub("threads.spawn", async ({ title }: { title: string }) => {
     spawned.push(title);
     return { id: `thr_${spawned.length}`, environmentId: "env_worker" };
   });
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread({ id: threadId, projectId: threadId === "thr_1" ? "proj_a" : "proj_b" }),
+    canSpawnChild: true,
+  }));
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
@@ -1326,8 +2259,35 @@ it("fans work out to one thread per task and records them against one delegation
   });
 });
 
+it("rejects delegation proof when a joined BB thread belongs to another project", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  store.upsertProjectPolicy(policyFixture({ projectId: "proj_a", alias: "proj-a" }), 10_000);
+  harness.sdk.stub("projects.list", async () => delegationProjects().slice(0, 1));
+  harness.sdk.stub("threads.spawn", async () => ({ id: "thr_cross_delegate", environmentId: "env_other" }));
+  harness.sdk.stub("threads.get", async () => ({
+    ...visibleThread({ id: "thr_cross_delegate", projectId: "proj_other" }),
+    canSpawnChild: true,
+  }));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
+    instruction: "report back",
+    tasks: [{ projectId: "proj_a", title: "inspect", prompt: "inspect" }],
+  }, controllerToolContext)).rejects.toMatchObject({ code: "evidence_projection_invalid" });
+});
+
 it("keeps the threads that did start when a later spawn fails", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
+  for (const projectId of ["proj_a", "proj_b"]) {
+    store.upsertProjectPolicy(policyFixture({ projectId, alias: projectId.replace("_", "-") }), 10_000);
+  }
   let spawnCount = 0;
   harness.sdk.stub("projects.list", async () => delegationProjects());
   harness.sdk.stub("threads.spawn", async () => {
@@ -1335,6 +2295,10 @@ it("keeps the threads that did start when a later spawn fails", async () => {
     if (spawnCount === 2) throw new Error("BB refused the second spawn");
     return { id: `thr_${spawnCount}`, environmentId: "env_worker" };
   });
+  harness.sdk.stub("threads.get", async ({ threadId }) => ({
+    ...visibleThread({ id: threadId, projectId: "proj_a" }),
+    canSpawnChild: true,
+  }));
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
@@ -1361,7 +2325,9 @@ it("keeps the threads that did start when a later spawn fails", async () => {
 });
 
 it("opens no delegation when the very first spawn fails", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
+  store.upsertProjectPolicy(policyFixture({ projectId: "proj_a", alias: "proj-a" }), 10_000);
+  harness.sdk.stub("projects.list", async () => delegationProjects().slice(0, 1));
   harness.sdk.stub("threads.spawn", async () => { throw new Error("BB refused the spawn"); });
   registerControllerTools(bb, {
     store,
@@ -1394,12 +2360,12 @@ it("refuses to delegate for a thread that is not the durable controller", async 
   await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
     instruction: "compare them",
     tasks: [{ projectId: "proj_a", title: "only", prompt: "only task" }],
-  }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/not authorized/);
+  }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/identity|not authorized/);
   expect(store.listOpenDelegations(10)).toEqual([]);
 });
 
 it("tells the agent a confirmed job is queued rather than waiting on the owner", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
@@ -1431,7 +2397,7 @@ it("tells the agent a confirmed job is queued rather than waiting on the owner",
 });
 
 it("returns an existing open job instead of starting a duplicate for the same task", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,
@@ -1453,12 +2419,15 @@ it("returns an existing open job instead of starting a duplicate for the same ta
     { projectId: "proj_1", task: "surface refunds in order knowledge" },
     controllerToolContext,
   )) as { job: { id: string }; existing: boolean };
-  expect(second).toMatchObject({ existing: true, job: { id: first.job.id } });
+  // Within one turn the capability layer replays the tool receipt verbatim, so
+  // the repeat returns the first result rather than reaching the open-job
+  // branch. Either way the guarantee that matters holds: exactly one job.
+  expect(second).toMatchObject({ job: { id: first.job.id } });
   expect(store.listJobs(10).filter((job) => job.requestText === "surface refunds in order knowledge")).toHaveLength(1);
 });
 
 it("refuses a distinct second job in one project unless it is explicitly separate", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,
@@ -1493,7 +2462,7 @@ it("refuses a distinct second job in one project unless it is explicitly separat
 });
 
 it("steers a clear free-text follow-up into the admitted implementation job", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store, activate, deactivate } = fixture({ active: true });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,
@@ -1503,12 +2472,16 @@ it("steers a clear free-text follow-up into the admitted implementation job", as
     notify,
     now: () => 10_260,
   });
+  // Admission takes its own executor lease, so the controller fence stands down
+  // for exactly that setup step and is re-adopted before the tool call.
+  deactivate();
   const advanced = advanceToImplementation(store, "job_free_text_steer");
   const job = store.applyJobEvent(advanced.job.id, advanced.job.version, {
     type: "IMPLEMENTATION_CREATED",
     threadId: "thr_free_text_implementation",
     environmentId: "env_worker",
   }, 10_255);
+  activate();
 
   const result = parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_steer_job",
@@ -1526,7 +2499,7 @@ it("steers a clear free-text follow-up into the admitted implementation job", as
 });
 
 it("retries a blocked plan and cancels a blocked job from the controller", async () => {
-  const { bb, harness, store } = fixture();
+  const { bb, harness, store } = fixture({ active: true });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,

@@ -1,12 +1,17 @@
-const RAW_MERGE_CALLBACK = /m:[A-Za-z0-9_-]{32}/;
-const ENCODED_MERGE_CALLBACK = /(?:m|%6d)%3a[A-Za-z0-9_-]{32}/i;
+// Both merge buttons carry a live approval nonce: `m:` merges once, `a:` merges
+// and grants the project a standing approval. Neither may ever reach storage,
+// so they are detected together — a new approval-bearing prefix must be added
+// here at the same time it is added to the keyboard.
+const RAW_MERGE_CALLBACK = /[ma]:[A-Za-z0-9_-]{32}/;
+const ENCODED_MERGE_CALLBACK = /(?:m|%6d|a|%61)%3a[A-Za-z0-9_-]{32}/i;
 const MAX_ENCODING_LAYERS = 4;
 
 function decodeCallbackEncodingLayer(value: string): string {
-  return value.replace(/%(25|6d|3a)/gi, (encoded, byte: string) => {
+  return value.replace(/%(25|6d|61|3a)/gi, (encoded, byte: string) => {
     switch (byte.toLowerCase()) {
       case "25": return "%";
       case "6d": return "m";
+      case "61": return "a";
       case "3a": return ":";
       default: return encoded;
     }

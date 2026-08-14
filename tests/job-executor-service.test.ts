@@ -2,6 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
+import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 import type { JobEffect, StoredEffect } from "../src/domain/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { EffectRunner } from "../src/services/effect-runner";
@@ -17,6 +18,7 @@ import type { WorkerLiveness } from "../src/domain/models";
 import { AutonomyRepository } from "../src/storage/autonomy-repository";
 import { AutonomyScheduler } from "../src/autonomy/scheduler";
 import { policyFixture } from "./helpers";
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -1391,7 +1393,6 @@ describe("singleton job executor", () => {
               now: 2_000,
               turnId: "controller-turn-900",
               cursor: 1,
-              text: "Luna is working live",
               phase: "responding",
             })).toBe(true);
           }
@@ -1403,8 +1404,8 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), "Connecting…");
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), "Luna is working live");
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), CONTROLLER_PHASE_TEXT.connecting);
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), CONTROLLER_PHASE_TEXT.responding);
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBeGreaterThan(0);
     expect(sendMessage).not.toHaveBeenCalled();
@@ -1412,8 +1413,131 @@ describe("singleton job executor", () => {
     expect(store.getOutbox("controller:controller-turn-900:reply")).toMatchObject({
       status: "sent",
       messageId: null,
-      payload: { text: "Luna is working live" },
+      payload: { text: CONTROLLER_PHASE_TEXT.responding },
     });
+  });
+
+  it("derives an ephemeral draft from the phase, never a legacy raw stream_text token", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    // A pre-cutover durable stream_text carrying raw provider prose must never
+    // reach Telegram as a preview: the draft is the phase literal only.
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = ? WHERE id = ?")
+      .run("pre-cutover RAW-SECRET token", "thinking", turnId);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, _text: string) => undefined);
+    const waitForWork = vi.fn(async () => abort.abort());
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1);
+    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), CONTROLLER_PHASE_TEXT.thinking);
+    expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("RAW-SECRET");
+    expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("token");
+  });
+
+  it("suppresses a pending draft send for a submitted terminal-phase turn", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    // The phase flipped to a terminal literal while a stale placeholder draft
+    // still sits in the outbox: it must be retired, never redrawn or sent.
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = ? WHERE id = ?")
+      .run("pre-cutover RAW-SECRET token", "failed", turnId);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, _text: string) => undefined);
+    const waitForWork = vi.fn(async () => abort.abort());
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessageDraft).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({
+      status: "sent",
+      messageId: null,
+    });
+  });
+
+  it("suppresses a terminal controller draft before the known-message edit path", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = 'complete' WHERE id = ?")
+      .run("pre-cutover RAW-EDIT token", turnId);
+    db.prepare("UPDATE outbox SET message_id = 808, status = 'pending' WHERE logical_key = ?")
+      .run(`controller:${turnId}:reply`);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async () => undefined);
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      waitForWork: vi.fn(async () => abort.abort()),
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessageDraft).not.toHaveBeenCalled();
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({ status: "sent", messageId: 808 });
+  });
+
+  it("suppresses a terminal controller draft when Telegram has no draft API", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = 'failed' WHERE id = ?")
+      .run("pre-cutover RAW-SEND token", turnId);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      waitForWork: vi.fn(async () => abort.abort()),
+      telegram: () => ({ sendMessage, editMessage }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({ status: "sent", messageId: null });
   });
 
   it("persists exactly one final controller message after ephemeral draft streaming", async () => {
@@ -1438,13 +1562,11 @@ describe("singleton job executor", () => {
       controller: {
         reconcile: vi.fn(async (fence) => {
           if (loop === 1) {
-            expect(store.completeControllerTurn({
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-              turnId,
-              responseText: "Final answer",
-            })).toBe(true);
+            completeTurnThroughFinalization(
+              store,
+              { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 },
+              { turnId, controllerKey: "executor-presence-controller", responseText: "Final answer" },
+            );
           }
           return true;
         }),
@@ -1454,7 +1576,7 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledOnce();
-    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "Connecting…");
+    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), CONTROLLER_PHASE_TEXT.connecting);
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage).toHaveBeenCalledWith("7", {
       text: "Final answer",
@@ -1492,13 +1614,11 @@ describe("singleton job executor", () => {
           // The owner reads the answer and immediately asks the next question,
           // while Telegram still shows the previous 30-second preview.
           if (loop === 1) {
-            expect(store.completeControllerTurn({
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-              turnId: firstTurnId,
-              responseText: "First answer",
-            })).toBe(true);
+            completeTurnThroughFinalization(
+              store,
+              { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 },
+              { turnId: firstTurnId, controllerKey: "executor-presence-controller", responseText: "First answer" },
+            );
             submitAnotherControllerTurn(store, fence, 901, 2_000);
           }
           return true;
@@ -1948,5 +2068,8 @@ describe("singleton job executor", () => {
 
     expect(store.getAdmission(jobId)?.state).toBe("released");
     expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(0);
-  });
+    // Draining a 101-deep cancellation backlog against a real SQLite store is
+    // the slowest case in this file; it needs more than the default budget
+    // without loosening the budget for every other test.
+  }, 15_000);
 });

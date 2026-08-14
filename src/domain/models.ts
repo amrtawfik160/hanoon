@@ -52,6 +52,20 @@ export const productionPolicySchema = z
     }
   });
 
+/**
+ * Validation commands prove one job's change. Nothing proves the project still
+ * works *between* jobs, which is how a broken dependency, an expired token, or
+ * someone else's merge stays invisible until the next time work is requested.
+ * These run on a timer in the project's checkout for exactly that reason.
+ */
+export const regressionPolicySchema = z
+  .object({
+    commands: z.array(policyCommandSchema).min(1).max(5),
+    /** Defaults to daily. Bounded to at least an hour so it cannot become a busy loop. */
+    intervalMs: z.number().int().min(3_600_000).max(604_800_000).optional(),
+  })
+  .strict();
+
 export const projectPolicySchema = z
   .object({
     projectId: z.string().startsWith("proj_"),
@@ -63,6 +77,7 @@ export const projectPolicySchema = z
     review: executionProfileSchema,
     validationCommands: z.array(policyCommandSchema).max(20),
     production: productionPolicySchema.optional(),
+    regression: regressionPolicySchema.optional(),
     requiredChecks: z.array(z.string().min(1)).max(50),
     outputRedactionPatterns: z.array(z.string().min(1).max(200)).max(20),
     workerStartGraceMs: z.number().int().min(10_000).max(900_000).default(120_000),
@@ -89,6 +104,7 @@ export const projectPolicySchema = z
 export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
 export type PolicyCommand = z.infer<typeof policyCommandSchema>;
 export type ProductionPolicy = z.infer<typeof productionPolicySchema>;
+export type RegressionPolicy = z.infer<typeof regressionPolicySchema>;
 export type ProjectPolicy = z.infer<typeof projectPolicySchema>;
 
 export type ReviewSeverity = "critical" | "high" | "medium" | "low";

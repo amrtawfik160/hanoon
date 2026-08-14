@@ -36,11 +36,27 @@ export type CallbackAction =
   | { type: "retry"; jobId: string }
   | { type: "review"; jobId: string }
   | { type: "merge"; nonce: string }
+  /**
+   * Approve this merge and grant the project a standing approval, so later
+   * merges on it do not stop to ask. Carries the same one-use nonce as a plain
+   * merge, so it is exactly as bound to this head as the button beside it.
+   */
+  | { type: "merge_always"; nonce: string }
   | { type: "operation"; nonce: string }
-  /** One option of a question the controller thread is blocked on. */
+  /** One decision the hidden controller thread is blocked on. */
+  | ControllerInteractionCallbackAction
+  /**
+   * A legacy controller question button. Migrated in-flight messages are still
+   * answerable for one release; no new `q:` value is ever emitted.
+   */
   | { type: "question"; token: string }
   /** One choice offered for a watched thread that is waiting on the owner. */
   | { type: "thread_interaction"; token: string };
+
+export type ControllerInteractionCallbackAction = {
+  type: "controller_interaction";
+  token: string;
+};
 
 export type ReviewView = {
   verdict?: string;
@@ -84,6 +100,12 @@ export type JobStatusContext = {
   approvalExpiresAt?: number | string | Date;
   mergeNonce?: string;
   mergeNonceHash?: string;
+  /** True when this project already merges without asking. */
+  mergeAuthorityGranted?: boolean;
+  /** Why this merge is asking despite a standing approval. */
+  approvalReason?: string;
+  /** True when a standing approval merged this job without asking. */
+  autoApproved?: boolean;
   ready?: boolean;
   workerLiveness?: WorkerLiveness | null;
   resourceWait?: readonly ResourceWaitProjection[];
@@ -323,13 +345,17 @@ export function encodeCallbackData(action: CallbackAction): string {
       if (!NONCE_PATTERN.test(action.nonce)) throw new TypeError("nonce is not valid callback data");
       encoded = `m:${action.nonce}`;
       break;
+    case "merge_always":
+      if (!NONCE_PATTERN.test(action.nonce)) throw new TypeError("nonce is not valid callback data");
+      encoded = `a:${action.nonce}`;
+      break;
     case "operation":
       if (!NONCE_PATTERN.test(action.nonce)) throw new TypeError("nonce is not valid callback data");
       encoded = `o:${action.nonce}`;
       break;
-    case "question":
+    case "controller_interaction":
       if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
-      encoded = `q:${action.token}`;
+      encoded = `i:${action.token}`;
       break;
     case "thread_interaction":
       if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
@@ -359,8 +385,13 @@ export function parseCallbackData(data: string): CallbackAction {
   if (match) return { type: "review", jobId: match[1] };
   match = /^m:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "merge", nonce: match[1] };
+  match = /^a:([A-Za-z0-9_-]{32})$/.exec(data);
+  if (match) return { type: "merge_always", nonce: match[1] };
   match = /^o:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "operation", nonce: match[1] };
+  match = /^i:([A-Za-z0-9_-]{32})$/.exec(data);
+  if (match) return { type: "controller_interaction", token: match[1] };
+  // Retained for one release so a migrated in-flight question stays answerable.
   match = /^q:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "question", token: match[1] };
   match = /^w:([A-Za-z0-9_-]{32})$/.exec(data);
@@ -521,6 +552,12 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
     if (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce)) {
       const shortSha = job.prHeadSha?.slice(0, 8) ?? "approved";
       buttons.push({ text: `Merge + deploy ${shortSha}`, callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
+      if (context.mergeAuthorityGranted !== true) {
+        buttons.push({
+          text: "Merge + deploy, and always from now on",
+          callback_data: encodeCallbackData({ type: "merge_always", nonce: context.mergeNonce }),
+        });
+      }
     }
   } else if (job.state === "awaiting_confirmation" && !queuedConfirmation && !livenessBlocked) {
     buttons.push({ text: "Start", callback_data: encodeCallbackData({ type: "start", jobId: job.id }) });
@@ -579,6 +616,11 @@ export function renderJobStatus(
     lines.push(`Model escalation: <code>${html(context.materialModelPool, 20)}</code>`);
   }
   lines.push(`Delivery: ${html(deliveryState(job), 80)}`);
+  if (context.autoApproved) {
+    lines.push("Merging on your standing approval — you were not asked.");
+  } else if (ready && context.approvalReason && context.mergeAuthorityGranted) {
+    lines.push(`Asking you even though this project is pre-approved: ${html(context.approvalReason, 200)}.`);
+  }
   lines.push(`Task: <code>${html(job.requestText, 500)}</code>`);
   if (queuedConfirmed) {
     lines.push("Queue: waiting for a free slot — starts on its own, nothing to approve");
@@ -608,7 +650,9 @@ export function renderJobStatus(
   if (job.deploymentSummary) lines.push(`Deploy: ${html(job.deploymentSummary, 500)}`);
   if (job.canarySummary) lines.push(`Canary: ${html(job.canarySummary, 500)}`);
   if (job.state === "production_failed") {
-    lines.push("The merge succeeded, but production did not pass. No automatic rollback was attempted; follow the configured operator rollback procedure.");
+    lines.push(job.policy?.production?.rollbackCommand
+      ? "The merge succeeded, but production did not pass. Your rollback command was run — the Deploy or Canary line above says whether it worked."
+      : "The merge succeeded, but production did not pass. No rollback command is configured, so production is still running the new code; follow your own rollback procedure.");
   }
   if (pullRequest || context.changedFiles !== undefined || context.diffStat) {
     const changedFiles = context.diffStat?.changedFiles ?? context.changedFiles ?? pullRequest?.changedFiles;

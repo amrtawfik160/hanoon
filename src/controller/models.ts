@@ -1,8 +1,11 @@
+import { CONTROLLER_PROOF_KINDS } from "./proof-kinds.js";
 import type { SupervisorReason } from "./supervisor";
 
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
 export type ControllerCapabilityContinuationState = "requested" | "relaunching" | "resolved" | "blocked";
+export { CONTROLLER_PROOF_KINDS } from "./proof-kinds.js";
+export type ControllerProofKind = (typeof CONTROLLER_PROOF_KINDS)[number];
 export const CONTROLLER_STILL_MIME_TYPES = [
   "image/jpeg",
   "image/png",
@@ -72,6 +75,22 @@ export type ControllerStreamPhase =
   | "complete"
   | "failed";
 
+/**
+ * The only text a live controller draft may ever carry. A draft is a progress
+ * placeholder derived from the observed phase, never raw provider prose: raw
+ * assistant output and the legacy pre-cutover `stream_text` value must never
+ * surface as a draft, digest, final-answer outbox, or completed response.
+ */
+export const CONTROLLER_PHASE_TEXT: Readonly<Record<ControllerStreamPhase, string>> = {
+  queued: "Queued…",
+  connecting: "Connecting to Hanoon…",
+  thinking: "Hanoon is thinking…",
+  using_tools: "Hanoon is checking the current state…",
+  responding: "Hanoon is preparing the answer…",
+  complete: "Hanoon finished.",
+  failed: "Hanoon could not finish safely.",
+};
+
 export type ControllerThreadRecord = {
   controllerKey: string;
   telegramUserId: string;
@@ -105,6 +124,10 @@ export type ControllerTurnRecord = {
   /** Zero is the primary model; one and two select the ordered fallback slots. */
   modelFallbackIndex: number;
   bbEventSeq: number;
+  evidenceEventSeq: number;
+  completionContinuations: number;
+  acceptedFinalizationId: number | null;
+  evidenceLimitExceededAt: number | null;
   streamText: string;
   telegramMessageId: number | null;
   streamPhase: ControllerStreamPhase;

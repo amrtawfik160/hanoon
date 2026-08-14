@@ -13,6 +13,11 @@ import type {
 } from "../src/telegram/types";
 import { encodeCallbackData, persistableJobStatusPayload, renderProjectPicker } from "../src/telegram/view";
 import { VersionConflictError, openStore, type TelegramAgentStore } from "../src/storage/store";
+import {
+  questionOptionToken,
+  threadDecisionToken,
+  type ControllerInteraction,
+} from "../src/controller/questions";
 import { admitConfirmedJob, policyFixture } from "./helpers";
 
 type SentMessage = {
@@ -66,6 +71,11 @@ type Kv = {
   delete(key: string): Promise<void>;
   list(prefix?: string): Promise<string[]>;
 };
+
+const CONTROLLER_KEY = createHash("sha256")
+  .update("telegram-controller:7:70", "utf8")
+  .digest("base64url")
+  .slice(0, 32);
 
 function memoryKv(): Kv {
   const values = new Map<string, unknown>();
@@ -1076,4 +1086,172 @@ it("steers only an admitted job with the exact status reply identity", async () 
   ]);
   expect(fixture.store.listEffectsForJob(queuedId).filter((effect) => effect.kind === "steer_implementation")).toHaveLength(0);
   expect(fixture.store.getControllerForOwner("7", "70")).not.toBeNull();
+});
+
+function parkedControllerInteraction(
+  fixture: ReturnType<typeof ingressFixture>,
+  interaction: ControllerInteraction,
+): { controllerKey: string; turnId: string } {
+  const turn = fixture.store.enqueueControllerTurn({
+    controllerKey: CONTROLLER_KEY,
+    telegramUserId: "7",
+    telegramChatId: "70",
+    updateId: 900,
+    inputText: "look at the failing build",
+    now: 3_000,
+  });
+  const lease = fixture.store.acquireExecutorLease("executor", 3_000, 60_000);
+  if (!lease.acquired) throw new Error("missing executor lease");
+  const fence = { ownerId: "executor", generation: lease.generation, now: 3_000 };
+  fixture.store.claimNextControllerTurn(fence);
+  expect(fixture.store.markControllerSpawned({
+    ...fence, turnId: turn.id, projectId: "proj_1", hostId: "host_1", threadId: "thr_ingress_controller",
+  })).toBe(true);
+  expect(fixture.store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
+  const generation = fixture.store.getOpenControllerGeneration(CONTROLLER_KEY, "thr_ingress_controller");
+  if (!generation) throw new Error("missing open controller generation");
+  expect(fixture.store.recordControllerInteraction({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: CONTROLLER_KEY,
+    bbThreadId: "thr_ingress_controller",
+    controllerGenerationId: generation.id,
+    interaction,
+  })).toBe(true);
+  return { controllerKey: CONTROLLER_KEY, turnId: turn.id };
+}
+
+const approvalFixtureInteraction: ControllerInteraction = {
+  kind: "approval",
+  interactionId: "pint_ingress_approval",
+  summary: "wants to run:\n\n`npm test`",
+  decisions: ["allow_once", "deny"],
+};
+
+const questionFixtureInteraction: ControllerInteraction = {
+  kind: "user_question",
+  interactionId: "pint_ingress_question",
+  questions: [{
+    id: "which",
+    prompt: "Which branch should I use?",
+    shortLabel: null,
+    multiSelect: false,
+    allowFreeText: true,
+    options: [{ value: "main", label: "main", description: null }],
+  }],
+};
+
+it("commits a tapped controller decision, its callback, and the acknowledgement together", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const { controllerKey } = parkedControllerInteraction(fixture, approvalFixtureInteraction);
+  const token = threadDecisionToken("pint_ingress_approval", "allow_once");
+
+  await fixture.ingress.handleClaimed(callbackUpdate(910, "cb-allow", 7, 70, `i:${token}`), 4_000);
+
+  expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toMatchObject({
+    interactionId: "pint_ingress_approval",
+    answer: { decision: "allow_once", grantedPermissions: null },
+  });
+  expect(fixture.store.getCallback("cb-allow")).toMatchObject({
+    action: "controller_interaction",
+    outcome: "accepted",
+  });
+  expect(fixture.store.getOutbox("callback:cb-allow")?.payload.text).toBe("Got it.");
+});
+
+it("answers a migrated legacy q: controller callback exactly once", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const { controllerKey } = parkedControllerInteraction(fixture, questionFixtureInteraction);
+  const token = questionOptionToken("pint_ingress_question", "which", "main");
+
+  await fixture.ingress.handleClaimed(callbackUpdate(911, "cb-legacy", 7, 70, `q:${token}`), 4_000);
+  await fixture.ingress.handleClaimed(callbackUpdate(912, "cb-legacy", 7, 70, `q:${token}`), 4_001);
+
+  expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toMatchObject({
+    answer: { kind: "user_answer", answers: { which: { selected: ["main"] } } },
+    answeredAt: 4_000,
+  });
+});
+
+it("never lets a controller callback from another user or chat decide anything", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const { controllerKey } = parkedControllerInteraction(fixture, approvalFixtureInteraction);
+  const token = threadDecisionToken("pint_ingress_approval", "deny");
+
+  await fixture.ingress.handleClaimed(callbackUpdate(913, "cb-wrong-user", 8, 70, `i:${token}`), 4_000);
+  await fixture.ingress.handleClaimed(callbackUpdate(914, "cb-wrong-chat", 7, 71, `i:${token}`), 4_001);
+
+  expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toBeNull();
+  expect(fixture.store.getPendingControllerInteraction(controllerKey)?.state).toBe("pending");
+  expect(fixture.store.getCallback("cb-wrong-user")).toBeNull();
+  expect(fixture.store.getCallback("cb-wrong-chat")).toBeNull();
+});
+
+it("reads a plain reply as the answer to an open controller question", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const { controllerKey } = parkedControllerInteraction(fixture, questionFixtureInteraction);
+  // The answer settles this update's own claim, so the claim has to exist —
+  // exactly as it does when the poller hands a claimed update to the ingress.
+  expect(fixture.store.beginTelegramUpdate(915, 3_999)).toBe("process");
+
+  const outcome = await fixture.ingress.handleClaimed(messageUpdate(915, 7, 70, "use the release branch"), 4_000);
+
+  expect(outcome).toEqual({ updateSettled: true });
+  expect(fixture.store.getAnsweredControllerInteraction(controllerKey)?.answer).toEqual({
+    kind: "user_answer",
+    answers: { which: { selected: [], freeText: "use the release branch" } },
+  });
+  expect(fixture.store.listControllerTurns(controllerKey, 10)).toHaveLength(1);
+});
+
+it("never lets a plain reply approve anything and queues it as a new turn", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const { controllerKey } = parkedControllerInteraction(fixture, approvalFixtureInteraction);
+
+  await fixture.ingress.handleClaimed(messageUpdate(916, 7, 70, "yes go ahead"), 4_000);
+
+  expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toBeNull();
+  expect(fixture.store.getPendingControllerInteraction(controllerKey)?.state).toBe("pending");
+  expect(fixture.store.listControllerTurns(controllerKey, 10)).toHaveLength(2);
+});
+
+it("lists paused projects for a bare /resume and never restarts one implicitly", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  fixture.store.pauseProjectAdmission({
+    projectId: fixture.store.listEnabledProjectPolicies()[0].policy.projectId,
+    reason: "the same failure repeated 3 times",
+    fingerprint: null,
+    now: 2_000,
+  });
+
+  await fixture.ingress.handleClaimed(messageUpdate(90, 7, 70, "/resume"), 3_000);
+
+  const reply = fixture.telegram.sent.at(-1)?.payload.text ?? "";
+  expect(reply).toContain("paused");
+  expect(reply).toContain("cyndra");
+  // The single-project case must still be a list, not a silent restart.
+  expect(fixture.store.listPausedProjectAdmissions()).toHaveLength(1);
+});
+
+it("restarts a paused project only when the owner names it", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  fixture.store.pauseProjectAdmission({
+    projectId: fixture.store.listEnabledProjectPolicies()[0].policy.projectId,
+    reason: "the same failure repeated 3 times",
+    fingerprint: null,
+    now: 2_000,
+  });
+
+  await fixture.ingress.handleClaimed(messageUpdate(91, 7, 70, "/resume cyndra"), 3_000);
+
+  expect(fixture.telegram.sent.at(-1)?.payload.text).toContain("taking work again");
+  expect(fixture.store.listPausedProjectAdmissions()).toEqual([]);
+});
+
+it("says nothing is paused when the brake has not tripped", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+
+  await fixture.ingress.handleClaimed(messageUpdate(92, 7, 70, "/resume"), 3_000);
+
+  expect(fixture.telegram.sent.at(-1)?.payload.text).toContain("Nothing is paused");
 });
