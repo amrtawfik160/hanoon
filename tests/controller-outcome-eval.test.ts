@@ -50,6 +50,29 @@ function evaluationOutput(): string {
   return join(mkdtempSync(join(tmpdir(), "hanoon-eval-")), "baseline.json");
 }
 
+async function execCleanOutcomeEvaluator(args: readonly string[]) {
+  const gitDirectory = mkdtempSync(join(tmpdir(), "hanoon-clean-git-"));
+  const gitPath = join(gitDirectory, "git");
+  writeFileSync(gitPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "rev-parse" && args[1] === "HEAD") {
+  process.stdout.write("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n");
+} else if (args[0] === "status" && args.includes("--porcelain")) {
+  process.stdout.write("");
+} else {
+  process.exit(2);
+}
+`, { mode: 0o755 });
+  chmodSync(gitPath, 0o755);
+  try {
+    return await execFileAsync(process.execPath, args, {
+      env: { ...process.env, PATH: `${gitDirectory}:${process.env.PATH ?? ""}` },
+    });
+  } finally {
+    rmSync(gitDirectory, { recursive: true, force: true });
+  }
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -88,7 +111,7 @@ async function cleanScenarioTrials(
 it("writes a bounded fixed-harness report with disclosed denominators", async () => {
   const output = evaluationOutput();
 
-  await execFileAsync(process.execPath, [
+  await execCleanOutcomeEvaluator([
     "scripts/eval-controller-outcomes.mjs",
     "--checkpoint", "baseline",
     "--trials", "2",
@@ -150,8 +173,8 @@ it("refuses to overwrite an existing outcome report without --replace", async ()
     "--output", output,
   ];
 
-  await execFileAsync(process.execPath, args);
-  await expect(execFileAsync(process.execPath, args)).rejects.toMatchObject({ code: 1 });
+  await execCleanOutcomeEvaluator(args);
+  await expect(execCleanOutcomeEvaluator(args)).rejects.toMatchObject({ code: 1 });
 });
 
 it("replaces an existing report with owner-only permissions when --replace is supplied", async () => {
@@ -163,9 +186,9 @@ it("replaces an existing report with owner-only permissions when --replace is su
     "--output", output,
   ];
 
-  await execFileAsync(process.execPath, args);
+  await execCleanOutcomeEvaluator(args);
   chmodSync(output, 0o644);
-  await execFileAsync(process.execPath, [...args, "--replace"]);
+  await execCleanOutcomeEvaluator([...args, "--replace"]);
 
   expect(statSync(output).mode & 0o777).toBe(0o600);
 });
@@ -196,7 +219,7 @@ it("rejects an in-repository output whose first segment begins with two dots", a
 
 it("runs the cumulative kernel checkpoint with its fixed safety cases", async () => {
   const output = evaluationOutput();
-  await execFileAsync(process.execPath, [
+  await execCleanOutcomeEvaluator([
     "scripts/eval-controller-outcomes.mjs",
     "--checkpoint", "kernel",
     "--trials", "1",
@@ -253,6 +276,27 @@ it("rejects missing fixed identity rather than labeling it strong", async () => 
   expect(() => runner.classifyControllerEvidence([
     { ...fixedTrial, harness: { ...fixedTrial.harness, outerTaskTools: undefined } },
   ])).toThrow(/identity|incomplete/i);
+});
+
+it("rejects an initially dirty evaluator before running any trials", async () => {
+  const runner = await runnerModule();
+  const output = evaluationOutput();
+  let trialsStarted = false;
+  await expect(runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: false,
+  }, {
+    readGitIdentity: () => ({ commit: "a".repeat(40), dirty: true }),
+    runTrials: async () => {
+      trialsStarted = true;
+      throw new Error("trials must not start from a dirty evaluator");
+    },
+  })).rejects.toThrow(/dirty/i);
+  expect(trialsStarted).toBe(false);
+  expect(() => readFileSync(output)).toThrow();
 });
 
 it.each([
@@ -841,7 +885,7 @@ it("writes a comparable cutover report when fake metric availability matches", {
     });
     writeFileSync(baseline, `${JSON.stringify(baselineReport, null, 2)}\n`, { mode: 0o600 });
 
-    await execFileAsync(process.execPath, [
+    await execCleanOutcomeEvaluator([
       "scripts/eval-controller-outcomes.mjs",
       "--checkpoint", "cutover",
       "--trials", "3",

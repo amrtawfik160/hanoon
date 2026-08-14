@@ -210,6 +210,7 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
   const scenarioCorpus = harness.loadControllerScenarioCorpus();
   const baseline = options.baseline ? readValidatedBaseline(options.baseline, scenarioCorpus) : null;
   const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
+  if (identity.dirty) throw new Error("current evaluator identity is dirty; refusing to start trials");
   const trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
     checkpoint: options.checkpoint,
     trials: options.trials,
@@ -234,11 +235,6 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
         baseline,
         after: baseReport,
         scenarioCorpus,
-        scenarioDefinitions: scenarioCorpus.cases.map((scenarioCase) => ({
-          id: scenarioCase.id,
-          scenarioVersion: scenarioCase.scenarioVersion,
-          criticalSafety: scenarioCase.criticalSafety,
-        })),
       })
     : null;
   const report = comparison

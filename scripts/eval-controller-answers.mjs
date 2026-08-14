@@ -408,26 +408,18 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       runtimeAudit.noToolActivity = false;
       throw new Error(`judge thread ${threadId} event log failed: ${capturedDetail(error)}`);
     }
-    isolation = auditJudgeEventLog(eventLog, threadId);
-    if (!isolation) {
+    const eventAudit = auditJudgeEventLog(eventLog, threadId);
+    if (!eventAudit) {
       runtimeAudit.eventLogsAudited = false;
       runtimeAudit.noToolActivity = false;
       throw new Error(`judge thread ${threadId} event log did not prove completed no-tool execution`);
     }
-    judgeCorrelation = {
-      runId: correlation.runId,
-      trialId: correlation.trialId,
-      caseId: correlation.caseId,
-      clauseId: correlation.clauseId,
-      correlationToken: correlation.correlationToken,
-      threadId,
-      projectId: correlation.projectId,
-      parentThreadId: correlation.parentThreadId,
-      title: correlation.title,
-      membership,
-      eventLog,
-      eventLogSha256: createHash("sha256").update(eventLog, "utf8").digest("hex"),
-      eventCount: isolation.eventCount,
+    isolation = {
+      workspace: eventAudit.workspace,
+      eventLog: eventAudit.eventLog,
+      toolActivity: eventAudit.toolActivity,
+      workspaceCleanup: eventAudit.workspaceCleanup,
+      eventCount: eventAudit.eventCount,
     };
 
     let output;
@@ -440,6 +432,27 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
     if (!verdict && !deterministicReason) {
       throw new Error(`judge thread ${threadId} returned a malformed single-clause verdict (captured output length ${output.length})`);
     }
+    judgeCorrelation = {
+      runId: correlation.runId,
+      trialId: correlation.trialId,
+      caseId: correlation.caseId,
+      clauseId: correlation.clauseId,
+      correlationToken: correlation.correlationToken,
+      threadId,
+      projectId: correlation.projectId,
+      parentThreadId: correlation.parentThreadId,
+      title: correlation.title,
+      membership,
+      eventProjection: eventAudit.eventProjection,
+      eventLogSha256: createHash("sha256").update(eventLog, "utf8").digest("hex"),
+      eventCount: eventAudit.eventCount,
+      targetTurnId: eventAudit.targetTurnId,
+      targetTurnStartEventId: eventAudit.targetTurnStartEventId,
+      targetTurnCompletionEventId: eventAudit.targetTurnCompletionEventId,
+      agentMessageItemId: eventAudit.agentMessageItemId,
+      outputItemId: eventAudit.agentMessageItemId,
+      outputSha256: createHash("sha256").update(output, "utf8").digest("hex"),
+    };
   } finally {
     await cleanupJudgeResources(threadId, workspacePath, runtimeAudit);
   }
@@ -728,7 +741,7 @@ async function main() {
   if (misses.length > 0) {
     process.stdout.write("the rubric disagreed with its golden cases; recalibrate before trusting it\n");
   }
-  return infrastructureErrors.length > 0 || misses.length > 0 ? 1 : 0;
+  return artifact.status === "passed" ? 0 : 1;
 }
 
 main().then((exitCode) => {

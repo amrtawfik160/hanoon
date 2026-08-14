@@ -736,13 +736,46 @@ function assertReportTrialIdentity(report: ControllerEvaluationReport, label: "b
   }
 }
 
+function expectedTrialPairsForRun(
+  corpus: ControllerScenarioCorpus,
+  run: NonNullable<ControllerEvaluationReport["run"]>,
+): Set<string> {
+  const checkpointRank = { baseline: 0, kernel: 1, cutover: 2 } as const;
+  const expected = new Set<string>();
+  for (const scenarioCase of corpus.cases) {
+    if (checkpointRank[scenarioCase.checkpoint] > checkpointRank[run.checkpoint]) continue;
+    for (let trial = 1; trial <= run.trialsPerScenario; trial += 1) {
+      expected.add(`${scenarioCase.id}:${scenarioCase.scenarioVersion}:${trial}`);
+    }
+  }
+  return expected;
+}
+
+function assertExactCorpusTrialSet(
+  report: ControllerEvaluationReport,
+  corpus: ControllerScenarioCorpus,
+  label: "baseline" | "after",
+): void {
+  if (!report.run) throw new Error(`fixed comparison ${label} report is missing run identity`);
+  const expected = expectedTrialPairsForRun(corpus, report.run);
+  const actual = new Set(report.trials.map(trialPairKey));
+  const missing = [...expected].filter((key) => !actual.has(key));
+  const extra = [...actual].filter((key) => !expected.has(key));
+  if (missing.length > 0 || extra.length > 0) {
+    throw new Error(`fixed comparison ${label} trial membership does not exactly match the selected corpus (missing=${missing.length}, extra=${extra.length})`);
+  }
+}
+
 function assertFixedRunRelationship(
   baseline: ControllerEvaluationReport,
   after: ControllerEvaluationReport,
+  corpus: ControllerScenarioCorpus,
 ): void {
   if (!baseline.run || !after.run) throw new Error("fixed comparison requires explicit run identity");
   assertReportTrialIdentity(baseline, "baseline");
   assertReportTrialIdentity(after, "after");
+  assertExactCorpusTrialSet(baseline, corpus, "baseline");
+  assertExactCorpusTrialSet(after, corpus, "after");
   if (baseline.run.seed !== after.run.seed) {
     throw new Error("fixed comparison requires matching run seeds");
   }
@@ -875,9 +908,12 @@ function scenarioKeysWithVersion(report: ControllerEvaluationReport): Array<{ sc
 export function compareControllerEvaluations(input: Readonly<{
   baseline: unknown;
   after: unknown;
-  scenarioDefinitions?: readonly ScenarioDefinition[];
-  scenarioCorpus?: ReturnType<typeof parseControllerScenarioCorpus>;
+  scenarioCorpus: ReturnType<typeof parseControllerScenarioCorpus>;
 }>): ControllerEvaluationComparison {
+  if (!input.scenarioCorpus) {
+    throw new Error("fixed comparison requires corpus-backed evidence");
+  }
+  const scenarioCorpus = parseControllerScenarioCorpus(input.scenarioCorpus);
   const baseline = parseControllerEvaluationReport(input.baseline);
   const after = parseControllerEvaluationReport(input.after);
   if (baseline.label !== "fixed" || after.label !== "fixed") {
@@ -886,23 +922,24 @@ export function compareControllerEvaluations(input: Readonly<{
   if (!baseline.run || !after.run) {
     throw new Error("fixed comparison requires explicit checkpoint, trial, and seed identity on both reports");
   }
-  assertFixedRunRelationship(baseline, after);
+  const baselineValidation = validateControllerScenarioTrialsAgainstCorpus(baseline.trials, scenarioCorpus);
+  const afterValidation = validateControllerScenarioTrialsAgainstCorpus(after.trials, scenarioCorpus);
+  baselineValidation.trials.forEach(validateControllerScenarioTrialBudget);
+  afterValidation.trials.forEach(validateControllerScenarioTrialBudget);
+  assertFixedRunRelationship(baseline, after, scenarioCorpus);
   assertCleanFixedReport(baseline, "baseline");
   assertCleanFixedReport(after, "after");
   assertFixedReportEvidence(baseline, "baseline");
   assertFixedReportEvidence(after, "after");
-  if (input.scenarioCorpus) {
-    const baselineValidation = validateControllerScenarioTrialsAgainstCorpus(baseline.trials, input.scenarioCorpus);
-    const afterValidation = validateControllerScenarioTrialsAgainstCorpus(after.trials, input.scenarioCorpus);
-    baselineValidation.trials.forEach(validateControllerScenarioTrialBudget);
-    afterValidation.trials.forEach(validateControllerScenarioTrialBudget);
-  }
   const baselineKeys = reportScenarioKeys(baseline);
   const afterKeys = reportScenarioKeys(after);
   const commonKeys = [...baselineKeys].filter((key) => afterKeys.has(key));
   if (commonKeys.length === 0) throw new Error("fixed comparison has no intersecting scenarios");
-  if (!input.scenarioDefinitions) throw new Error("fixed comparison requires definitions for every scenario");
-  const definitions = scenarioDefinitionsByKey(input.scenarioDefinitions);
+  const definitions = scenarioDefinitionsByKey(scenarioCorpus.cases.map((scenarioCase) => ({
+    id: scenarioCase.id,
+    scenarioVersion: scenarioCase.scenarioVersion,
+    criticalSafety: scenarioCase.criticalSafety,
+  })));
   for (const key of new Set([...baselineKeys, ...afterKeys])) {
     if (!definitions.has(key)) throw new Error(`fixed comparison scenario definition is missing ${key}`);
   }

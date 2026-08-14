@@ -2,11 +2,49 @@ import { describe, expect, it } from "vitest";
 import * as controllerScenarioContract from "../src/eval/controller-scenario-contract";
 import {
   aggregateControllerEvaluation as aggregateControllerEvaluationRaw,
+  controllerScenarioDefinitionSha256,
   parseControllerScenarioCorpus,
   parseControllerScenarioTrial,
   validateControllerScenarioTrialEvidence,
   type ControllerScenarioTrial,
 } from "../src/eval/controller-scenario-contract";
+
+const TEST_BUDGET = { maxTurns: 2, maxToolCalls: 8, maxTokens: 20_000, maxWallMs: 30_000, maxCostUsd: null } as const;
+const TEST_CORPUS = parseControllerScenarioCorpus({
+  schemaVersion: 1,
+  cases: [
+    {
+      id: "plain-conversation",
+      scenarioVersion: 1,
+      checkpoint: "baseline",
+      criticalSafety: false,
+      ownerMessage: "synthetic owner message",
+      budget: TEST_BUDGET,
+      requiredOutcomeAssertions: ["outcome_ok"],
+      forbiddenOutcomeAssertions: ["outcome_forbidden"],
+      requiredTraceAssertions: ["trace_ok"],
+      answerGrader: "not_applicable",
+    },
+    {
+      id: "new-safety-case",
+      scenarioVersion: 1,
+      checkpoint: "kernel",
+      criticalSafety: false,
+      ownerMessage: "synthetic safety message",
+      budget: TEST_BUDGET,
+      requiredOutcomeAssertions: ["outcome_ok"],
+      forbiddenOutcomeAssertions: ["outcome_forbidden"],
+      requiredTraceAssertions: ["trace_ok"],
+      answerGrader: "not_applicable",
+    },
+  ],
+});
+const TEST_DEFINITION_HASHES = new Map(
+  TEST_CORPUS.cases.map((scenarioCase) => [
+    scenarioCase.id,
+    controllerScenarioDefinitionSha256(scenarioCase),
+  ]),
+);
 
 function aggregateControllerEvaluation(
   input: Parameters<typeof aggregateControllerEvaluationRaw>[0],
@@ -20,7 +58,7 @@ function aggregateControllerEvaluation(
 const baseTrial: ControllerScenarioTrial = {
   schemaVersion: 1 as const,
   scenarioVersion: 1,
-  scenarioDefinitionSha256: "1".repeat(64),
+  scenarioDefinitionSha256: TEST_DEFINITION_HASHES.get("plain-conversation"),
   scenarioId: "plain-conversation",
   trial: 1,
   seed: 8122026,
@@ -42,11 +80,19 @@ const baseTrial: ControllerScenarioTrial = {
     advertisedTools: ["telegram_agent_job_status"],
     parameterSchemaSha256: { telegram_agent_job_status: "0".repeat(64) },
   },
-  budget: { maxTurns: 2, maxToolCalls: 8, maxTokens: 20_000, maxWallMs: 30_000, maxCostUsd: null },
-  outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: ["proof:plain-conversation:outcome:sha256:" + "2".repeat(64)] },
-  trace: { status: "passed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: ["proof:plain-conversation:trace:sha256:" + "3".repeat(64)] },
+  budget: TEST_BUDGET,
+  outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: [
+    "fact:plain-conversation:outcome:outcome_ok",
+    "fact:plain-conversation:outcome:outcome_forbidden",
+  ] },
+  trace: { status: "passed" as const, graderId: "typed-trace", graderVersion: 1, proofRefs: ["fact:plain-conversation:trace:trace_ok"] },
   answer: { status: "not_applicable" as const, graderId: "answer-form", graderVersion: 1, proofRefs: [] },
   metrics: { wallMs: 2, turns: 1, toolCalls: 0, tokens: 0, costUsd: null, terminalFailureClass: null },
+  evidenceRecords: [
+    { ref: "fact:plain-conversation:outcome:outcome_ok", subject: "plain-conversation", layer: "outcome" as const, assertion: "outcome_ok", observed: true, facts: { observed: true } },
+    { ref: "fact:plain-conversation:outcome:outcome_forbidden", subject: "plain-conversation", layer: "outcome" as const, assertion: "outcome_forbidden", observed: false, facts: { observed: false } },
+    { ref: "fact:plain-conversation:trace:trace_ok", subject: "plain-conversation", layer: "trace" as const, assertion: "trace_ok", observed: true, facts: { observed: true } },
+  ],
 };
 
 function trial(overrides: Partial<ControllerScenarioTrial> = {}): ControllerScenarioTrial {
@@ -57,27 +103,19 @@ function trialForScenario(scenarioId: string, overrides: Partial<ControllerScena
   const candidate = trial({ scenarioId, ...overrides });
   return {
     ...candidate,
+    scenarioDefinitionSha256: TEST_DEFINITION_HASHES.get(scenarioId),
     outcome: candidate.outcome.status === "passed"
-      ? { ...candidate.outcome, proofRefs: [`proof:${scenarioId}:outcome:sha256:${"2".repeat(64)}`] }
+      ? { ...candidate.outcome, proofRefs: [`fact:${scenarioId}:outcome:outcome_ok`, `fact:${scenarioId}:outcome:outcome_forbidden`] }
       : candidate.outcome,
     trace: candidate.trace.status === "passed"
-      ? { ...candidate.trace, proofRefs: [`proof:${scenarioId}:trace:sha256:${"3".repeat(64)}`] }
+      ? { ...candidate.trace, proofRefs: [`fact:${scenarioId}:trace:trace_ok`] }
       : candidate.trace,
+    evidenceRecords: candidate.evidenceRecords?.map((record) => ({
+      ...record,
+      subject: scenarioId,
+      ref: record.ref.replaceAll(baseTrial.scenarioId, scenarioId),
+    })),
   };
-}
-
-function scenarioDefinitionsFor(...reports: ReadonlyArray<{ trials: readonly unknown[] }>) {
-  const definitions = new Map<string, { id: string; scenarioVersion: number; criticalSafety: boolean }>();
-  for (const report of reports) {
-    for (const currentTrial of report.trials as readonly ControllerScenarioTrial[]) {
-      definitions.set(`${currentTrial.scenarioId}:${currentTrial.scenarioVersion}`, {
-        id: currentTrial.scenarioId,
-        scenarioVersion: currentTrial.scenarioVersion,
-        criticalSafety: false,
-      });
-    }
-  }
-  return [...definitions.values()];
 }
 
 describe("controller scenario contract", () => {
@@ -402,8 +440,8 @@ describe("controller scenario contract", () => {
       : { baseline: after, after: baseline };
     expect(() => (compare as (input: unknown) => unknown)({
       ...input,
-      scenarioDefinitions: scenarioDefinitionsFor(input.baseline, input.after),
-    })).toThrow(/comparable|scenario|budget|grader|tool|provider|identity/i);
+      scenarioCorpus: TEST_CORPUS,
+    })).toThrow(/comparable|scenario|budget|grader|tool|provider|identity|proof|fact/i);
   });
 
   it("rejects a dirty after report as well as a dirty baseline", () => {
@@ -414,7 +452,7 @@ describe("controller scenario contract", () => {
       generatedAt: "2026-08-12T00:00:00.000Z",
       trials: [{ ...baseTrial, harness: { ...baseTrial.harness, dirty: true } }],
     });
-    expect(() => compare({ baseline, after, scenarioDefinitions: scenarioDefinitionsFor(baseline, after) })).toThrow(/dirty/i);
+    expect(() => compare({ baseline, after, scenarioCorpus: TEST_CORPUS })).toThrow(/dirty/i);
   });
 
   it.each([
@@ -449,8 +487,29 @@ describe("controller scenario contract", () => {
     expect(() => compare({
       baseline,
       after,
-      scenarioDefinitions: scenarioDefinitionsFor(baseline, after),
+      scenarioCorpus: TEST_CORPUS,
     })).toThrow(/seed|trial|checkpoint|comparable/i);
+  });
+
+  it("rejects fixed comparison without corpus-backed evidence", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [baseTrial] });
+    const after = aggregateControllerEvaluation({ label: "fixed", trials: [baseTrial] });
+    expect(() => compare({
+      baseline,
+      after,
+    })).toThrow(/corpus/i);
+  });
+
+  it("rejects proof-only historical reports even when a corpus is supplied", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (input: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({ label: "fixed", trials: [baseTrial] });
+    const after = aggregateControllerEvaluation({ label: "fixed", trials: [baseTrial] });
+    const proofOnlyBaseline = {
+      ...baseline,
+      trials: baseline.trials.map(({ evidenceRecords: _ignored, ...currentTrial }) => currentTrial),
+    };
+    expect(() => compare({ baseline: proofOnlyBaseline, after, scenarioCorpus: TEST_CORPUS })).toThrow(/evidence|historical/i);
   });
 
   it("reports comparable denominators and new scenarios without averaging safety failures", () => {
@@ -478,7 +537,7 @@ describe("controller scenario contract", () => {
       common: Array<{ baseline: { passed: number; denominator: number }; after: { passed: number; denominator: number } }>;
       newScenarios: Array<{ scenarioId: string; denominator: number }>;
       intervention: { baseline: unknown; after: unknown };
-    })({ baseline, after, scenarioDefinitions: scenarioDefinitionsFor(baseline, after) });
+    })({ baseline, after, scenarioCorpus: TEST_CORPUS });
 
     expect(comparison).toMatchObject({
       status: "comparable",
@@ -509,7 +568,7 @@ describe("controller scenario contract", () => {
     expect(() => (compare as (input: unknown) => unknown)({
       baseline,
       after,
-      scenarioDefinitions: scenarioDefinitionsFor(baseline, after),
+      scenarioCorpus: TEST_CORPUS,
     }))
       .toThrow(/trial|denominator|comparable/i);
   });
@@ -532,7 +591,7 @@ describe("controller scenario contract", () => {
     expect(() => compare({
       baseline,
       after,
-      scenarioDefinitions: scenarioDefinitionsFor(baseline, after),
+      scenarioCorpus: TEST_CORPUS,
     })).toThrow(/trial identity|incomplete/i);
   });
 
@@ -578,7 +637,7 @@ describe("controller scenario contract", () => {
     expect(() => compare({
       baseline: invalidBaseline,
       after,
-      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+      scenarioCorpus: TEST_CORPUS,
     })).toThrow(/subject-bound|proof/i);
   });
 
@@ -598,8 +657,8 @@ describe("controller scenario contract", () => {
     expect(() => compare({
       baseline,
       after,
-      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
-    })).toThrow(/definition|criticalSafety/i);
+      scenarioCorpus: TEST_CORPUS,
+    })).toThrow(/definition|criticalSafety|membership|corpus/i);
   });
 
   it("rejects legacy summaries without a scenario version before fixed comparison", () => {
@@ -622,7 +681,7 @@ describe("controller scenario contract", () => {
     expect(() => compare({
       baseline: legacyBaseline,
       after,
-      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+      scenarioCorpus: TEST_CORPUS,
     })).toThrow(/summary|version/i);
   });
 
@@ -667,7 +726,7 @@ describe("controller scenario contract", () => {
     expect(compare({
       baseline,
       after,
-      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+      scenarioCorpus: TEST_CORPUS,
     })).toMatchObject({ status: "comparable" });
   });
 
@@ -687,7 +746,7 @@ describe("controller scenario contract", () => {
     expect(() => compare({
       baseline,
       after,
-      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+      scenarioCorpus: TEST_CORPUS,
     })).toThrow(/availability|token.*usage|comparable/i);
   });
 
@@ -709,7 +768,7 @@ describe("controller scenario contract", () => {
     expect(() => compare({
       baseline,
       after,
-      scenarioDefinitions: [{ id: "plain-conversation", scenarioVersion: 1, criticalSafety: false }],
+      scenarioCorpus: TEST_CORPUS,
     })).toThrow(/real provider|provider usage|unavailable.*real/i);
   });
 });

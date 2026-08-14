@@ -1,10 +1,13 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   closeSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
+  linkSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -90,25 +93,27 @@ export type ArtifactPublicationOptions = Readonly<{
   verifyIdentity: () => void;
 }>;
 
+type FileIdentity = Readonly<{ dev: number; ino: number }>;
+type PublicationLock = Readonly<{ descriptor: number; identity: FileIdentity; path: string }>;
+type OpenedTemporary = Readonly<{ descriptor: number; identity: FileIdentity; path: string }>;
+type PublishedArtifact = Readonly<{
+  descriptor: number;
+  identity: FileIdentity;
+  parentPath: string;
+  targetPath: string;
+}>;
+
 export function publishValidatedArtifact(options: ArtifactPublicationOptions): string {
   const targetPath = canonicalArtifactPath(options.artifactPath);
   options.validateSerialized(options.serialized);
   const parentPath = dirname(targetPath);
-  const temporaryPath = join(parentPath, `.${basename(targetPath)}.${randomUUID()}.tmp`);
-  let published = false;
+  const lock = acquirePublicationLock(parentPath, targetPath);
   try {
-    if (!options.replace) assertTargetDoesNotExist(targetPath);
-    options.verifyBeforePublish?.();
-    writeDurableTemporaryFile(temporaryPath, options.serialized);
-    if (!options.replace) assertTargetDoesNotExist(targetPath);
-    renameSync(temporaryPath, targetPath);
-    published = true;
-    verifyPublishedArtifact(targetPath, parentPath, options);
+    assertCanonicalParent(parentPath, targetPath);
+    publishArtifactUnderLock(options, parentPath, targetPath);
     return targetPath;
-  } catch (error) {
-    cleanupTemporaryFile(temporaryPath);
-    if (published) cleanupPublishedFile(targetPath, options.serialized);
-    throw new Error(`artifact publication failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    releasePublicationLock(lock, parentPath);
   }
 }
 
@@ -116,31 +121,82 @@ function assertTargetDoesNotExist(targetPath: string): void {
   if (pathExists(targetPath)) throw new Error(`refusing to overwrite existing artifact ${targetPath}`);
 }
 
-function writeDurableTemporaryFile(temporaryPath: string, serialized: string): void {
-  let descriptor: number | null = null;
+function publishArtifactUnderLock(
+  options: ArtifactPublicationOptions,
+  parentPath: string,
+  targetPath: string,
+): void {
+  const temporaryPath = join(parentPath, `.${basename(targetPath)}.${randomUUID()}.tmp`);
+  let temporary: OpenedTemporary | null = null;
+  let published: PublishedArtifact | null = null;
   try {
-    descriptor = openSync(temporaryPath, "wx", 0o600);
+    if (!options.replace) assertTargetDoesNotExist(targetPath);
+    options.verifyBeforePublish?.();
+    temporary = writeDurableTemporaryFile(temporaryPath, options.serialized);
+    published = commitArtifact(options, temporary, parentPath, targetPath);
+    verifyPublishedArtifact(published, options);
+  } catch (error) {
+    failPublication(error, published);
+  } finally {
+    closeTemporaryFile(temporary);
+  }
+}
+
+function failPublication(error: unknown, published: PublishedArtifact | null): never {
+  if (published) cleanupPublishedFile(published);
+  throw publicationFailure(error);
+}
+
+function closeTemporaryFile(temporary: OpenedTemporary | null): void {
+  if (temporary === null) return;
+  cleanupTemporaryFile(temporary);
+  closeSync(temporary.descriptor);
+}
+
+function commitArtifact(
+  options: ArtifactPublicationOptions,
+  temporary: OpenedTemporary,
+  parentPath: string,
+  targetPath: string,
+): PublishedArtifact {
+  if (options.replace) renameSync(temporary.path, targetPath);
+  else linkSync(temporary.path, targetPath);
+  return { descriptor: temporary.descriptor, identity: temporary.identity, parentPath, targetPath };
+}
+
+function publicationFailure(error: unknown): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new Error(`artifact publication failed: ${detail}`);
+}
+
+function writeDurableTemporaryFile(temporaryPath: string, serialized: string): OpenedTemporary {
+  const descriptor = openSync(temporaryPath, "wx+", 0o600);
+  const identity = fileIdentity(fstatSync(descriptor));
+  try {
     writeFileSync(descriptor, serialized, "utf8");
     fsyncSync(descriptor);
-  } finally {
-    if (descriptor !== null) closeSync(descriptor);
+    return { descriptor, identity, path: temporaryPath };
+  } catch (error) {
+    cleanupTemporaryFile({ descriptor, identity, path: temporaryPath });
+    closeSync(descriptor);
+    throw error;
   }
 }
 
 function verifyPublishedArtifact(
-  targetPath: string,
-  parentPath: string,
+  published: PublishedArtifact,
   options: ArtifactPublicationOptions,
 ): void {
-  fsyncDirectory(parentPath);
-  canonicalArtifactPath(targetPath);
-  const publishedText = readFileSync(targetPath, "utf8");
-  if (publishedText !== options.serialized) {
-    throw new Error("published artifact bytes differ from the validated bytes");
-  }
+  assertCanonicalParent(published.parentPath, published.targetPath);
+  fsyncDirectory(published.parentPath);
+  assertPublishedOwnership(published);
+  const publishedText = readPublishedBytes(published, options.serialized);
   options.validateSerialized(publishedText);
-  canonicalArtifactPath(targetPath);
+  assertPublishedOwnership(published);
   options.verifyIdentity();
+  assertPublishedOwnership(published);
+  readPublishedBytes(published, options.serialized);
+  assertCanonicalParent(published.parentPath, published.targetPath);
 }
 
 function fsyncDirectory(directoryPath: string): void {
@@ -152,21 +208,117 @@ function fsyncDirectory(directoryPath: string): void {
   }
 }
 
-function cleanupTemporaryFile(temporaryPath: string): void {
+function cleanupTemporaryFile(temporary: OpenedTemporary): void {
   try {
-    unlinkSync(temporaryPath);
+    const stat = lstatSync(temporary.path);
+    if (!sameFileIdentity(fileIdentity(stat), temporary.identity)) return;
+    unlinkSync(temporary.path);
   } catch {
     // Cleanup cannot make an incomplete artifact valid; the publication error remains primary.
   }
 }
 
-function cleanupPublishedFile(targetPath: string, serialized: string): void {
+function cleanupPublishedFile(published: PublishedArtifact): void {
   try {
-    if (readFileSync(targetPath, "utf8") === serialized) {
-      unlinkSync(targetPath);
-      fsyncDirectory(dirname(targetPath));
-    }
+    if (!pathOwnsPublishedDescriptor(published)) return;
+    unlinkSync(published.targetPath);
+    fsyncDirectory(published.parentPath);
   } catch {
     // A changed or unavailable target must not be removed after another writer took ownership.
   }
+}
+
+function acquirePublicationLock(parentPath: string, targetPath: string): PublicationLock {
+  const lockPath = join(parentPath, `.${basename(targetPath)}.lock`);
+  try {
+    const descriptor = openSync(lockPath, "wx", 0o600);
+    return { descriptor, identity: fileIdentity(fstatSync(descriptor)), path: lockPath };
+  } catch (error) {
+    if (hasErrorCode(error, "EEXIST")) throw new Error(`artifact publication already in progress for ${targetPath}`);
+    throw error;
+  }
+}
+
+function releasePublicationLock(lock: PublicationLock, parentPath: string): void {
+  closeSync(lock.descriptor);
+  try {
+    const lockStat = lstatSync(lock.path);
+    if (!sameFileIdentity(fileIdentity(lockStat), lock.identity)) return;
+    unlinkSync(lock.path);
+    fsyncDirectory(parentPath);
+  } catch (error) {
+    if (!hasErrorCode(error, "ENOENT")) throw error;
+  }
+}
+
+function assertCanonicalParent(parentPath: string, targetPath: string): void {
+  if (dirname(targetPath) !== parentPath || realpathSync(parentPath) !== parentPath) {
+    throw new Error("artifact parent changed during publication");
+  }
+}
+
+function fileIdentity(stat: { dev: number; ino: number }): FileIdentity {
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function pathOwnsPublishedDescriptor(published: PublishedArtifact): boolean {
+  try {
+    const targetStat = lstatSync(published.targetPath);
+    return sameFileIdentity(fileIdentity(targetStat), published.identity);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return false;
+    throw error;
+  }
+}
+
+function assertPublishedOwnership(published: PublishedArtifact): void {
+  if (!pathOwnsPublishedDescriptor(published)) {
+    throw new Error("published artifact ownership changed during verification");
+  }
+}
+
+function readPublishedBytes(published: PublishedArtifact, expectedSerialized: string): string {
+  const expectedBytes = Buffer.from(expectedSerialized, "utf8");
+  const descriptorStat = fstatSync(published.descriptor);
+  if (descriptorStat.size !== expectedBytes.byteLength) throw new Error("published artifact bytes differ from the validated bytes");
+  const currentBytes = readDescriptorBytes(published.descriptor, descriptorStat.size);
+  assertExpectedArtifactBytes(currentBytes, expectedBytes);
+  if (!sameFileIdentity(fileIdentity(fstatSync(published.descriptor)), published.identity)) {
+    throw new Error("published artifact descriptor identity changed during verification");
+  }
+  return currentBytes.toString("utf8");
+}
+
+function readDescriptorBytes(descriptor: number, byteLength: number): Buffer {
+  const bytes = Buffer.alloc(byteLength);
+  let bytesRead = 0;
+  while (bytesRead < bytes.byteLength) {
+    const readCount = readSync(
+      descriptor,
+      bytes,
+      bytesRead,
+      bytes.byteLength - bytesRead,
+      bytesRead,
+    );
+    if (readCount === 0) throw new Error("published artifact bytes could not be fully read");
+    bytesRead += readCount;
+  }
+  return bytes;
+}
+
+function assertExpectedArtifactBytes(currentBytes: Buffer, expectedBytes: Buffer): void {
+  if (!currentBytes.equals(expectedBytes)) {
+    throw new Error("published artifact bytes differ from the validated bytes");
+  }
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return error !== null
+    && typeof error === "object"
+    && "code" in error
+    && error.code === code;
 }

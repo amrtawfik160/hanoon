@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
@@ -79,6 +79,45 @@ it("removes a publication when post-write identity verification fails", () => {
   }
 });
 
+it("rejects in-place artifact byte drift through the owned descriptor", () => {
+  const directory = mkdtempSync(join(tmpdir(), "eval-integrity-bytes-"));
+  const artifactPath = join(directory, "artifact.json");
+  try {
+    expect(() => publishValidatedArtifact({
+      artifactPath,
+      serialized: "expected\n",
+      replace: true,
+      validateSerialized: () => undefined,
+      verifyIdentity: () => { writeFileSync(artifactPath, "tampered\n"); },
+    })).toThrow(/bytes differ/i);
+    expect(existsSync(artifactPath)).toBe(false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("preserves a replacement with identical bytes when ownership verification fails", () => {
+  const directory = mkdtempSync(join(tmpdir(), "eval-integrity-ownership-"));
+  const artifactPath = join(directory, "artifact.json");
+  const serialized = '{"status":"failed"}\n';
+  try {
+    expect(() => publishValidatedArtifact({
+      artifactPath,
+      serialized,
+      replace: true,
+      validateSerialized: () => undefined,
+      verifyIdentity: () => {
+        unlinkSync(artifactPath);
+        writeFileSync(artifactPath, serialized);
+        throw new Error("run identity changed");
+      },
+    })).toThrow(/identity changed/i);
+    expect(readFileSync(artifactPath, "utf8")).toBe(serialized);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 it("rejects a symlink target before publication", () => {
   const directory = mkdtempSync(join(tmpdir(), "eval-integrity-link-"));
   const protectedPath = join(directory, "protected.json");
@@ -95,6 +134,46 @@ it("rejects a symlink target before publication", () => {
     })).toThrow(/symbolic link|symlink/i);
     expect(readFileSync(protectedPath, "utf8")).toBe("protected\n");
     expect(existsSync(artifactPath)).toBe(true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("serializes coordinated replacement through an ownership lock", () => {
+  const directory = mkdtempSync(join(tmpdir(), "eval-integrity-lock-"));
+  const artifactPath = join(directory, "artifact.json");
+  const lockPath = join(directory, ".artifact.json.lock");
+  writeFileSync(lockPath, "active\n", { mode: 0o600 });
+  try {
+    expect(() => publishValidatedArtifact({
+      artifactPath,
+      serialized: "replacement\n",
+      replace: true,
+      validateSerialized: () => undefined,
+      verifyIdentity: () => undefined,
+    })).toThrow(/already in progress|lock/i);
+    expect(readFileSync(lockPath, "utf8")).toBe("active\n");
+    expect(existsSync(artifactPath)).toBe(false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("rejects a symlinked parent before publication", () => {
+  const directory = mkdtempSync(join(tmpdir(), "eval-integrity-parent-"));
+  const canonicalParent = join(directory, "canonical");
+  const linkedParent = join(directory, "linked");
+  mkdirSync(canonicalParent);
+  symlinkSync(canonicalParent, linkedParent);
+  try {
+    expect(() => publishValidatedArtifact({
+      artifactPath: join(linkedParent, "artifact.json"),
+      serialized: "canonical\n",
+      replace: false,
+      validateSerialized: () => undefined,
+      verifyIdentity: () => undefined,
+    })).toThrow(/parent must be a directory/i);
+    expect(readdirSync(canonicalParent)).toEqual([]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

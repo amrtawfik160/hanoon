@@ -18,6 +18,7 @@ import {
   buildClauseAssessment,
   buildClauseJudgePrompt,
   answerFinalInputSha256,
+  auditJudgeEventLog,
   detectExplicitClauseViolation,
   assertAnswerEvaluationWriteIdentity,
   parseAnswerExpectations,
@@ -97,12 +98,17 @@ if (args[0] === "thread" && args[1] === "spawn") {
   ]));
 } else if (args[0] === "thread" && args[1] === "log") {
   const threadId = args[2];
+  const turnId = "turn_fake";
+  const event = (id, seq, type, data, scope) => ({ id, threadId, seq, createdAt: seq, scope, type, data });
   process.stdout.write(JSON.stringify([
-    { threadId, type: "thread/started" },
-    { threadId, type: "item/started", data: { item: { type: "agentMessage" } } },
-    { threadId, type: "item/agentMessage/delta", data: {} },
-    { threadId, type: "item/completed", data: { item: { type: "agentMessage" } } },
-    { threadId, type: "turn/completed", data: { status: "completed" } },
+    event("event_1", 1, "thread/started", {}, { kind: "thread" }),
+    event("event_2", 2, "turn/started", {}, { kind: "turn", turnId }),
+    event("event_3", 3, "item/started", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
+    event("event_4", 4, "item/completed", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
+    event("event_5", 5, "item/started", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
+    event("event_6", 6, "item/agentMessage/delta", { itemId: "agent_1", delta: "judge output" }, { kind: "turn", turnId }),
+    event("event_7", 7, "item/completed", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
+    event("event_8", 8, "turn/completed", { status: "completed" }, { kind: "turn", turnId }),
   ]));
 } else if (args[0] === "thread" && args[1] === "output") {
   const clause = clauseFromThread(args[2]);
@@ -130,7 +136,7 @@ const args = process.argv.slice(2);
 if (args[0] === "rev-parse" && args[1] === "HEAD") {
   process.stdout.write("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n");
 } else if (args[0] === "status" && args.includes("--porcelain")) {
-  process.stdout.write("");
+  process.stdout.write(process.env.ANSWER_EVAL_FAKE_GIT_DIRTY === "1" ? " M synthetic\\n" : "");
 } else {
   process.stderr.write("unexpected fake git command");
   process.exit(2);
@@ -147,6 +153,7 @@ async function runWithFakeBb(
   mode: FakeBbMode,
   status = "idle",
   artifactPathFor?: (directory: string) => string,
+  gitDirty = false,
 ) {
   const directory = mkdtempSync(join(tmpdir(), "answer-eval-test-"));
   const logPath = join(directory, "bb-commands.jsonl");
@@ -165,6 +172,7 @@ async function runWithFakeBb(
         ANSWER_EVAL_FAKE_BB_LOG: logPath,
         ANSWER_EVAL_FAKE_BB_MODE: mode,
         ANSWER_EVAL_FAKE_BB_STATUS: status,
+        ANSWER_EVAL_FAKE_GIT_DIRTY: gitDirty ? "1" : "0",
         BB_THREAD_ID: "thr_test_origin",
       },
       maxBuffer: 2 * 1024 * 1024,
@@ -230,11 +238,25 @@ async function runWithMismatchedAnswerCorpus(
 function buildReleasePassedArtifact(): Record<string, any> {
   const runId = "11111111-1111-4111-8111-111111111111";
   const eventLogForThread = (threadId: string): string => JSON.stringify([
-    { threadId, type: "thread/started" },
-    { threadId, type: "item/started", data: { item: { type: "agentMessage" } } },
-    { threadId, type: "item/completed", data: { item: { type: "agentMessage" } } },
-    { threadId, type: "turn/completed", data: { status: "completed" } },
+    { id: "event_1", threadId, seq: 10, createdAt: 10, scope: { kind: "thread" }, type: "thread/started" },
+    { id: "event_2", threadId, seq: 11, createdAt: 11, scope: { kind: "turn", turnId: "turn_release" }, type: "turn/started", data: {} },
+    { id: "event_3", threadId, seq: 12, createdAt: 12, scope: { kind: "turn", turnId: "turn_release" }, type: "item/started", data: { item: { type: "reasoning", id: "reasoning_release" } } },
+    { id: "event_4", threadId, seq: 13, createdAt: 13, scope: { kind: "turn", turnId: "turn_release" }, type: "item/completed", data: { item: { type: "reasoning", id: "reasoning_release" } } },
+    { id: "event_5", threadId, seq: 14, createdAt: 14, scope: { kind: "turn", turnId: "turn_release" }, type: "item/started", data: { item: { type: "agentMessage", id: "agent_release" } } },
+    { id: "event_6", threadId, seq: 15, createdAt: 15, scope: { kind: "turn", turnId: "turn_release" }, type: "item/agentMessage/delta", data: { itemId: "agent_release", delta: "private fixture output" } },
+    { id: "event_7", threadId, seq: 16, createdAt: 16, scope: { kind: "turn", turnId: "turn_release" }, type: "item/completed", data: { item: { type: "agentMessage", id: "agent_release" } } },
+    { id: "event_8", threadId, seq: 17, createdAt: 17, scope: { kind: "turn", turnId: "turn_release" }, type: "turn/completed", data: { status: "completed" } },
   ]);
+  const eventProjectionForThread = (threadId: string) => [
+    { eventId: "event_1", threadId, sequence: 10, type: "thread/started", scope: "thread", turnId: null, itemId: null, itemType: null, status: null },
+    { eventId: "event_2", threadId, sequence: 11, type: "turn/started", scope: "turn", turnId: "turn_release", itemId: null, itemType: null, status: null },
+    { eventId: "event_3", threadId, sequence: 12, type: "item/started", scope: "turn", turnId: "turn_release", itemId: "reasoning_release", itemType: "reasoning", status: null },
+    { eventId: "event_4", threadId, sequence: 13, type: "item/completed", scope: "turn", turnId: "turn_release", itemId: "reasoning_release", itemType: "reasoning", status: null },
+    { eventId: "event_5", threadId, sequence: 14, type: "item/started", scope: "turn", turnId: "turn_release", itemId: "agent_release", itemType: "agentMessage", status: null },
+    { eventId: "event_6", threadId, sequence: 15, type: "item/agentMessage/delta", scope: "turn", turnId: "turn_release", itemId: "agent_release", itemType: "agentMessage", status: null },
+    { eventId: "event_7", threadId, sequence: 16, type: "item/completed", scope: "turn", turnId: "turn_release", itemId: "agent_release", itemType: "agentMessage", status: null },
+    { eventId: "event_8", threadId, sequence: 17, type: "turn/completed", scope: "turn", turnId: "turn_release", itemId: null, itemType: null, status: "completed" },
+  ];
   return {
     schemaVersion: "answer-live-gate-v2",
     rubricVersion: ANSWER_RUBRIC_VERSION,
@@ -259,6 +281,7 @@ function buildReleasePassedArtifact(): Record<string, any> {
         const threadId = `thr_${id}_${clause.id}`;
         const eventLog = eventLogForThread(threadId);
         const eventLogSha256 = createHash("sha256").update(eventLog, "utf8").digest("hex");
+        const output = JSON.stringify({ id: clause.id, holds: expected, why: "fixture reason" });
         const title = answerJudgeThreadTitle({
           runId,
           caseId: id,
@@ -282,9 +305,15 @@ function buildReleasePassedArtifact(): Record<string, any> {
             parentThreadId: "thr_release_origin",
             title,
           },
-          eventLog,
+          eventProjection: eventProjectionForThread(threadId),
           eventLogSha256,
-          eventCount: 4,
+          eventCount: 8,
+          targetTurnId: "turn_release",
+          targetTurnStartEventId: "event_2",
+          targetTurnCompletionEventId: "event_8",
+          agentMessageItemId: "agent_release",
+          outputItemId: "agent_release",
+          outputSha256: createHash("sha256").update(output, "utf8").digest("hex"),
         };
         return expected ? {
           id: clause.id,
@@ -294,7 +323,7 @@ function buildReleasePassedArtifact(): Record<string, any> {
           source: "model",
           judgeThreadId: threadId,
           isolation: {
-            eventCount: 4,
+            eventCount: 8,
             eventLog: "completed-audited",
             toolActivity: "none-observed",
             workspace: "empty-temporary",
@@ -309,7 +338,7 @@ function buildReleasePassedArtifact(): Record<string, any> {
           source: "deterministic",
           judgeThreadId: threadId,
           isolation: {
-            eventCount: 4,
+            eventCount: 8,
             eventLog: "completed-audited",
             toolActivity: "none-observed",
             workspace: "empty-temporary",
@@ -402,11 +431,25 @@ it("rejects repository or final-input drift at the artifact write boundary", () 
   expect(() => assertAnswerEvaluationWriteIdentity(initial, { ...initial, finalInputSha256: "e".repeat(64) })).toThrow(/input/i);
 });
 
+it("rejects an initially dirty answer evaluator before spawning a judge", async () => {
+  const run = await runWithFakeBb("status-good", "all-hold", "idle", undefined, true);
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
+    expect(readFileSync(run.logPath, "utf8")).toBe("");
+    expect(existsSync(run.artifactPath)).toBe(false);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+  }
+});
+
 it("binds every judged clause to one generated run and a unique captured trial", async () => {
   const run = await runWithFakeBb("status-good", "all-hold");
   try {
-    expect("error" in run).toBe(false);
-    if ("error" in run) return;
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
     const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as {
       runId?: string;
       selectedClauseCount: number;
@@ -438,25 +481,29 @@ it.each([
   ["foreign captured membership", (artifact: Record<string, any>) => {
     artifact.cases[0].clauses[0].correlation.membership.projectId = "proj_foreign";
   }],
-  ["foreign event-log thread", (artifact: Record<string, any>) => {
+  ["foreign projected event thread", (artifact: Record<string, any>) => {
     const correlation = artifact.cases[0].clauses[0].correlation;
-    correlation.eventLog = correlation.eventLog.replaceAll(correlation.threadId, "thr_foreign");
-    correlation.eventLogSha256 = createHash("sha256").update(correlation.eventLog, "utf8").digest("hex");
+    correlation.eventProjection[0].threadId = "thr_foreign";
   }],
-  ["tool-bearing event log", (artifact: Record<string, any>) => {
+  ["tool-bearing event projection", (artifact: Record<string, any>) => {
     const correlation = artifact.cases[0].clauses[0].correlation;
-    correlation.eventLog = JSON.stringify([
-      { threadId: correlation.threadId, type: "thread/started" },
-      { threadId: correlation.threadId, type: "item/started", data: { item: { type: "toolCall" } } },
-      { threadId: correlation.threadId, type: "turn/completed", data: { status: "completed" } },
-    ]);
-    correlation.eventLogSha256 = createHash("sha256").update(correlation.eventLog, "utf8").digest("hex");
-    correlation.eventCount = 3;
-    artifact.cases[0].clauses[0].isolation.eventCount = 3;
+    correlation.eventProjection[2].itemType = "toolCall";
   }],
 ] as const)("rejects a %s answer trial member", (_label, mutate) => {
   const artifact = buildReleasePassedArtifact();
   mutate(artifact);
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
+});
+
+it.each([
+  ["foreign target turn", (correlation: Record<string, any>) => { correlation.targetTurnId = "turn_foreign"; }],
+  ["foreign target start", (correlation: Record<string, any>) => { correlation.targetTurnStartEventId = "event_foreign"; }],
+  ["foreign target completion", (correlation: Record<string, any>) => { correlation.targetTurnCompletionEventId = "event_foreign"; }],
+  ["unbound output item", (correlation: Record<string, any>) => { correlation.outputItemId = "agent_foreign"; }],
+  ["unbound agent item", (correlation: Record<string, any>) => { correlation.agentMessageItemId = "agent_foreign"; }],
+] as const)("rejects output evidence with %s", (_label, mutate) => {
+  const artifact = buildReleasePassedArtifact();
+  mutate(artifact.cases[0].clauses[0].correlation);
   expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
 });
 
@@ -498,7 +545,7 @@ it.each([
   expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
 });
 
-it("keeps failed diagnostic artifacts parseable without release corpus binding", () => {
+it("rejects failed diagnostic artifacts without trusted corpus binding", () => {
   const artifact = buildReleasePassedArtifact();
   artifact.status = "failed";
   artifact.goldenSha256 = "c".repeat(64);
@@ -508,7 +555,7 @@ it("keeps failed diagnostic artifacts parseable without release corpus binding",
     expectationsSha256: artifact.expectationsSha256,
     cases: [{ id: "status-good", ownerMessage: "owner", answer: "answer" }],
   }));
-  expect(parseLiveGateArtifact(JSON.stringify(artifact))).not.toBeNull();
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
 });
 
 it.each([
@@ -828,34 +875,77 @@ it("audits a completed no-tool event log and fails closed on tool activity", asy
     auditJudgeEventLog?: (output: string) => unknown;
   }).auditJudgeEventLog;
   expect(audit).toBeTypeOf("function");
-  expect(audit?.(JSON.stringify([
-    { type: "thread/started" },
-    { type: "system/thread-provisioning", data: { status: "completed" } },
-    { type: "item/started", data: { item: { type: "reasoning" } } },
-    { type: "item/completed", data: { item: { type: "reasoning" } } },
-    { type: "item/started", data: { item: { type: "agentMessage" } } },
-    { type: "item/completed", data: { item: { type: "agentMessage" } } },
-    { type: "turn/completed", data: { status: "completed" } },
-  ]))).toEqual({
+  expect(audit?.(JSON.stringify(safeJudgeEventRows()), "thr_judge")).toMatchObject({
     workspace: "empty-temporary",
     eventLog: "completed-audited",
     toolActivity: "none-observed",
     workspaceCleanup: "complete",
-    eventCount: 7,
+    eventCount: 8,
   });
-  expect(audit?.(JSON.stringify([
-    { type: "thread/started" },
-    { type: "item/started", data: { item: { type: "commandExecution" } } },
-    { type: "turn/completed", data: { status: "completed" } },
-  ]))).toBeNull();
+  const toolEvents = safeJudgeEventRows();
+  toolEvents[2].data = { item: { type: "commandExecution", id: "command_1" } };
+  expect(audit?.(JSON.stringify(toolEvents), "thr_judge")).toBeNull();
+});
+
+function safeJudgeEventRows(threadId = "thr_judge", turnId = "turn_1") {
+  return [
+    { id: "event_1", threadId, seq: 10, createdAt: 10, scope: { kind: "thread" }, type: "thread/started" },
+    { id: "event_2", threadId, seq: 11, createdAt: 11, scope: { kind: "turn", turnId }, type: "turn/started", data: {} },
+    { id: "event_3", threadId, seq: 12, createdAt: 12, scope: { kind: "turn", turnId }, type: "item/started", data: { item: { type: "reasoning", id: "reasoning_1" } } },
+    { id: "event_4", threadId, seq: 13, createdAt: 13, scope: { kind: "turn", turnId }, type: "item/completed", data: { item: { type: "reasoning", id: "reasoning_1" } } },
+    { id: "event_5", threadId, seq: 14, createdAt: 14, scope: { kind: "turn", turnId }, type: "item/started", data: { item: { type: "agentMessage", id: "agent_1" } } },
+    { id: "event_6", threadId, seq: 15, createdAt: 15, scope: { kind: "turn", turnId }, type: "item/agentMessage/delta", data: { itemId: "agent_1", delta: "private judge output" } },
+    { id: "event_7", threadId, seq: 16, createdAt: 16, scope: { kind: "turn", turnId }, type: "item/completed", data: { item: { type: "agentMessage", id: "agent_1" } } },
+    { id: "event_8", threadId, seq: 17, createdAt: 17, scope: { kind: "turn", turnId }, type: "turn/completed", data: { status: "completed" } },
+  ];
+}
+
+it.each([
+  ["duplicate event id", (events: ReturnType<typeof safeJudgeEventRows>) => { events[3].id = events[2].id; }],
+  ["non-strict sequence", (events: ReturnType<typeof safeJudgeEventRows>) => { events[3].seq = events[2].seq + 2; }],
+  ["duplicate target start", (events: ReturnType<typeof safeJudgeEventRows>) => {
+    events.splice(2, 0, { ...events[1], id: "event_duplicate_start", seq: 12 });
+    renumberJudgeEventSequences(events);
+  }],
+  ["completion before start", (events: ReturnType<typeof safeJudgeEventRows>) => {
+    [events[1], events[7]] = [events[7], events[1]];
+    renumberJudgeEventSequences(events);
+  }],
+  ["second target completion", (events: ReturnType<typeof safeJudgeEventRows>) => {
+    events.splice(7, 0, { ...events[7], id: "event_duplicate_completion", seq: 17 });
+    renumberJudgeEventSequences(events);
+  }],
+  ["item outside target turn", (events: ReturnType<typeof safeJudgeEventRows>) => { events[2].scope = { kind: "thread" }; }],
+] as const)("rejects judge evidence with %s", (_label, mutate) => {
+  const events = safeJudgeEventRows();
+  mutate(events);
+  expect(auditJudgeEventLog(JSON.stringify(events), "thr_judge")).toBeNull();
+});
+
+function renumberJudgeEventSequences(events: ReturnType<typeof safeJudgeEventRows>): void {
+  events.forEach((event, index) => { event.seq = 10 + index; });
+}
+
+it("returns an ordered text-free projection bound to one output turn", () => {
+  const audit = auditJudgeEventLog(JSON.stringify(safeJudgeEventRows()), "thr_judge");
+  expect(audit).toMatchObject({
+    targetTurnId: "turn_1",
+    targetTurnStartEventId: "event_2",
+    targetTurnCompletionEventId: "event_8",
+    agentMessageItemId: "agent_1",
+  });
+  expect(audit?.eventProjection).toHaveLength(8);
+  expect(audit?.eventProjection.every((event) => Object.keys(event).sort().join(",") === "eventId,itemId,itemType,scope,sequence,status,threadId,turnId,type")).toBe(true);
+  expect(JSON.stringify(audit)).not.toContain("private judge output");
 });
 
 it("runs each judge with bounded cleanup and an auditable isolated workspace", async () => {
   // Catches missing subprocess timeouts, thread cleanup, event-log inspection, or workspace removal.
   const run = await runWithFakeBb("status-good", "all-hold");
   try {
-    expect("error" in run).toBe(false);
-    if ("error" in run) return;
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
     const invocations = readFileSync(run.logPath, "utf8")
       .trim()
       .split("\n")
@@ -881,8 +971,9 @@ it("runs each judge with bounded cleanup and an auditable isolated workspace", a
 it("does not stop a judge already reported as stopped", async () => {
   const run = await runWithFakeBb("status-good", "all-hold", "stopped");
   try {
-    expect("error" in run).toBe(false);
-    if ("error" in run) return;
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
     const invocations = readFileSync(run.logPath, "utf8")
       .trim()
       .split("\n")
@@ -956,8 +1047,9 @@ it.each([
 it("keeps a targeted artifact diagnostic and never reports it passed", async () => {
   const run = await runWithFakeBb("status-good", "all-hold");
   try {
-    expect("error" in run).toBe(false);
-    if ("error" in run) return;
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
     const artifactText = readFileSync(run.artifactPath, "utf8");
     const artifact = JSON.parse(artifactText) as Record<string, any>;
     expect(artifact.status).toBe("failed");
@@ -973,7 +1065,10 @@ it("keeps a targeted artifact diagnostic and never reports it passed", async () 
     expect(artifact.infrastructureErrors).toEqual([]);
     expect(artifactText).not.toContain("fixture reason");
     expect(artifactText).not.toContain("why");
-    expect(run.result.stdout).toContain("diagnostic");
+    expect(artifact.cases[0].clauses.every((clause: { correlation?: { eventLog?: unknown; eventProjection?: unknown } | null }) => (
+      clause.correlation?.eventProjection !== undefined && !Object.hasOwn(clause.correlation, "eventLog")
+    ))).toBe(true);
+    expect((run.error as { stdout?: string }).stdout ?? "").toContain("diagnostic");
     expect(parseLiveGateArtifact(artifactText)).not.toBeNull();
     const modelReasonArtifact = JSON.parse(artifactText) as Record<string, any>;
     modelReasonArtifact.cases[0].clauses[0].isolation = { eventCount: 1 };
