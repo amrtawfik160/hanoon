@@ -1230,7 +1230,7 @@ async function runExtendedScenario(input: Readonly<{
       ));
       toolResults.push(first, second);
       observedToolCalls = 2;
-      responseText = "I created the fixed replay job once.";
+      responseText = "I created the job once.";
       return 2;
     }
     if (scenarioCase.id === "durable-deferred-monitor") {
