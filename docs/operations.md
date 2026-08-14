@@ -21,9 +21,32 @@ bb telegram-agent doctor proj_7f3d2a91
 bb plugin logs telegram-agent -n 50
 ```
 
-A healthy loaded plugin reports `running` with both `telegram-ingress` and `job-executor` services running. The global doctor requires a configured token and paired owner. The project doctor reports every failing prerequisite and returns a non-zero exit code if the project is not ready.
+A healthy loaded plugin reports `running` with both `telegram-ingress` and `job-executor` services running. The global doctor requires a configured token and paired owner, and always reports the credential broker section covered below. The project doctor reports every failing prerequisite and returns a non-zero exit code if the project is not ready.
 
 Use `--json` on Telegram Agent commands when another tool must consume the result.
+
+## Credential broker
+
+`bb telegram-agent doctor` always includes credential readiness, whether or not the broker foundation is configured:
+
+```bash
+bb telegram-agent doctor --json
+```
+
+With **Credential broker mode** at its `disabled` default, this prints one `credential broker` row and nothing else attempts to reach a broker. Once isolated mode is configured, it prints `credential: <check>` rows in a fixed order — trust kernel, controller permission, isolated configuration, topology receipt, broker TLS, broker identity, protocol version, installation identity, broker audit, and the 1Password adapter — with only 3 or 4 rows when trust kernel, controller permission, isolated configuration, or a stale topology receipt already fails, and all 10 otherwise. None of these rows ever contain a certificate, endpoint, digest value, vault id, or raw broker error; see [Configuration](configuration.md#credential-broker-foundation) for the full settings shape.
+
+Inspect bindings and broker reachability without changing anything:
+
+```bash
+bb telegram-agent access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
+bb telegram-agent access status [binding-id] [--json]
+```
+
+`access list` returns only locally stored, secret-free binding metadata and never contacts the broker. `access status` runs the same diagnostic health check as the doctor and, when given a binding id, reports that one binding's state and generation. Neither command resolves or verifies a credential, and there is no CLI command that does: a live verification can only be requested by the owner from Telegram, and it can only move a binding to `vault_verified` — proof that the broker reached the configured vault item, not that the credential works for its application. It never reaches `active`.
+
+Rotating broker settings follows the same rule as the bot token: change them only in **Extensions → Plugins → Telegram Agent**, never on a command line. Changing the endpoint, installation id, certificates, private key, or topology receipt digest/expiry while already isolated rotates the connection immediately; the next `access status` or doctor call re-attempts the broker health check under the new material. Turning isolated mode on for the first time additionally needs `bb plugin reload telegram-agent` before verification becomes reachable. An endpoint change does not migrate existing bindings.
+
+If the broker client's private key may have leaked, treat it as a compromised credential: revoke the installation on the protected broker host first (see `broker/README.md`), then update the installation id, certificate, key, and topology settings here to a freshly re-enrolled installation before considering isolated mode again. This foundation cannot make credential capabilities usable on its own — it also needs the disposable 1Password account, protected broker host, and reviewed topology probes described in [Disposable live acceptance](live-acceptance.md).
 
 ## Verify the bundled skill runtime
 

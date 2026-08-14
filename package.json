@@ -35,7 +35,8 @@
     "verify:artifact": "node scripts/verify-built-artifact.mjs",
     "broker:build": "npm run build --workspace @hanoon/credential-broker",
     "broker:pack": "npm run broker:build && npm pack --workspace @hanoon/credential-broker",
-    "test:credentials": "vitest run tests/credential-*.test.ts"
+    "test:credentials": "vitest run tests/credential-*.test.ts",
+    "acceptance:credential-broker": "node scripts/record-credential-broker-acceptance.mjs"
   },
   "workspaces": [
     "broker"

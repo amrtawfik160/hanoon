@@ -180,6 +180,34 @@ The vendored BB thread, timeline, and interaction calls share no atomic activity
 
 Planner, critic, and documentation stages pin their own execution tuple and are unaffected by this setting; implementation and review workers use the enabled project's immutable policy snapshot.
 
+## Credential broker foundation
+
+This is the first slice of a separate credential broker: a protected service that this plugin never runs and that holds no application secret itself, but that can be asked to prove it can reach one exact 1Password vault field. **`credentialBrokerMode` defaults to `disabled`**, and every access command and doctor check fails closed in that state. This section documents the setting shape only — a fresh installation has no broker to point at, and turning isolated mode on for real additionally needs the disposable 1Password account, protected broker host, and reviewed topology probes covered in [Disposable live acceptance](live-acceptance.md). Full readiness also requires **Controller permission mode** to be `auto`; it is unreachable at the current `full` default.
+
+| Setting | Accepted value | Default | Purpose |
+| --- | --- | --- | --- |
+| Credential broker mode | `disabled`, `isolated` | `disabled` | `isolated` enables read-only access to a protected credential broker. |
+| Credential broker endpoint | HTTPS origin, e.g. `https://broker.internal` | Empty | Fixed broker origin; no path, query, credentials, or loopback/link-local/multicast host. Ignored while disabled. |
+| Credential broker installation id | Opaque id | Empty | Issued by the broker's protected enrollment CLI, not chosen by the operator. |
+| Credential broker topology receipt digest | SHA-256 hex | Empty | Digest of the current reviewed topology acceptance report. |
+| Credential broker topology receipt expiry | Base-10 epoch-millisecond string | Empty | Expiry from the same reviewed report. |
+| Credential broker client certificate | PEM | Empty | This installation's public mTLS client certificate. |
+| Credential broker client private key | PEM, secret setting | — | This installation's mTLS client private key. Never logged, stored in plugin SQLite, or shown in CLI/doctor output. |
+| Credential broker CA certificate | PEM | Empty | Public CA certificate that issued the broker's server certificate. |
+
+Turning isolated mode on for the first time needs `bb plugin reload telegram-agent` before verification becomes reachable, because the complete capability manifest is rebuilt at reload. Once isolated, changing the endpoint, installation id, certificates, key, or topology digest/expiry rotates the live connection immediately, without a reload — the next `access status` or doctor call re-attempts the broker health check under the new material. An endpoint change does not migrate existing bindings.
+
+The only operator commands are read-only:
+
+```bash
+bb telegram-agent access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
+bb telegram-agent access status [binding-id] [--json]
+```
+
+`access list` reads locally stored, secret-free binding metadata and never contacts the broker. `access status` runs the same diagnostic health check the doctor uses and reports one selected binding. There is deliberately no `access verify` or enrollment command here — a live verification can only be requested by the owner from Telegram, through Hanoon's guarded tool, and a pass only ever proves vault access, never that the credential works for its application. Binding enrollment happens on the protected broker host itself; see `broker/README.md`.
+
+`bb telegram-agent doctor` includes one `credential broker` row while disabled, or `credential: <check>` rows once isolated — `trust_kernel`, `controller_permission`, `isolated_configuration`, `topology_receipt`, `broker_tls`, `broker_identity`, `protocol_version`, `installation_identity`, `broker_audit`, and `onepassword_adapter`, in that order — with only 3 or 4 rows when an early check already fails and all 10 otherwise; see [Operations](operations.md#credential-broker) for exactly which. None of these rows print a certificate, endpoint, digest value, vault id, or raw broker error.
+
 ## Enable a project
 
 Only standard BB Git projects with a canonical GitHub remote and an available source can be enabled. The command verifies the live project, remote, source, and base branch before storing the policy.
@@ -378,6 +406,6 @@ bb telegram-agent doctor proj_7f3d2a91
 bb telegram-agent project list
 ```
 
-The global doctor checks token presence and owner pairing. The project form additionally checks the enabled policy, deployment/canary configuration, standard Git project/source, BB defaults, provider availability, source host/path, `gh auth status`, repository access, and merge SDK availability. It exits non-zero when any required check fails.
+The global doctor checks token presence and owner pairing, and always includes the credential broker section described above. The project form additionally checks the enabled policy, deployment/canary configuration, standard Git project/source, BB defaults, provider availability, source host/path, `gh auth status`, repository access, and merge SDK availability. It exits non-zero when any required check fails.
 
 Next: [Operations](operations.md) · [Architecture](architecture.md)
