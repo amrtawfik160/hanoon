@@ -4,8 +4,10 @@ import {
   CAPABILITY_BY_ID,
   CONTROLLER_DOMAIN_TOOL_IDS,
   CONTROLLER_METADATA_TOOL_IDS,
+  CONTROLLER_PROTOCOL_TOOL_IDS,
 } from "../src/capabilities/catalog";
 import {
+  CONTROLLER_BUNDLE_IDS,
   CONTROLLER_MANUAL_DISCOVERY_SKILLS,
   CONTROLLER_TOOL_BUNDLES,
   assessControllerCapabilityDescriptor,
@@ -30,7 +32,12 @@ function pairedStore() {
   return { bb, store };
 }
 
-it("partitions all 23 domain tools exactly once and keeps metadata separate", () => {
+const permittedBundleCombinations = Array.from(
+  { length: 2 ** CONTROLLER_BUNDLE_IDS.length },
+  (_, mask) => CONTROLLER_BUNDLE_IDS.filter((_, index) => (mask & (1 << index)) !== 0),
+);
+
+it("partitions all 23 domain tools exactly once and keeps metadata and protocol separate", () => {
   const partition = Object.values(CONTROLLER_TOOL_BUNDLES).flat();
 
   expect(partition).toHaveLength(23);
@@ -40,6 +47,11 @@ it("partitions all 23 domain tools exactly once and keeps metadata separate", ()
     "telegram_agent_capabilities",
     "telegram_agent_request_capability",
   ]);
+  expect(CONTROLLER_PROTOCOL_TOOL_IDS).toEqual([
+    "telegram_agent_turn_evidence",
+    "telegram_agent_respond",
+  ]);
+  expect(partition).not.toEqual(expect.arrayContaining([...CONTROLLER_PROTOCOL_TOOL_IDS]));
 });
 
 it.each([
@@ -53,19 +65,23 @@ it.each([
   expect(selectControllerBundles(text)).toEqual(expected);
 });
 
-it("always adds metadata tools and only the selected domain bundles", () => {
-  const selected = controllerToolsForBundles(["core-observation", "job-control"]);
-  expect(selected).toHaveLength(
-    CONTROLLER_TOOL_BUNDLES["core-observation"].length +
-    CONTROLLER_TOOL_BUNDLES["job-control"].length +
-    CONTROLLER_METADATA_TOOL_IDS.length,
-  );
-  expect(new Set(selected)).toEqual(new Set([
-    ...CONTROLLER_TOOL_BUNDLES["core-observation"],
-    ...CONTROLLER_TOOL_BUNDLES["job-control"],
-    ...CONTROLLER_METADATA_TOOL_IDS,
-  ]));
-});
+it.each(permittedBundleCombinations.map((bundleIds) => [bundleIds]))(
+  "always projects protocol tools exactly once for %j",
+  (bundleIds) => {
+    const selected = controllerToolsForBundles(bundleIds);
+    const selectedDomainTools = new Set(bundleIds.flatMap((bundleId) => CONTROLLER_TOOL_BUNDLES[bundleId]));
+    const expectedDomainTools = CONTROLLER_DOMAIN_TOOL_IDS.filter((toolId) => selectedDomainTools.has(toolId));
+
+    expect(selected).toEqual([
+      ...expectedDomainTools,
+      ...CONTROLLER_METADATA_TOOL_IDS,
+      ...CONTROLLER_PROTOCOL_TOOL_IDS,
+    ]);
+    for (const protocolToolId of CONTROLLER_PROTOCOL_TOOL_IDS) {
+      expect(selected.filter((toolId) => toolId === protocolToolId)).toHaveLength(1);
+    }
+  },
+);
 
 it("loads manual discovery skills only for an explicit slash invocation", () => {
   expect(controllerSkillsForTurn("Help me think this through")).toEqual([
@@ -152,7 +168,15 @@ it("persists one additive bundle expansion and denies a second request", () => {
     "controller-bundle-metadata",
     ...CONTROLLER_TOOL_BUNDLES["core-observation"],
     ...CONTROLLER_METADATA_TOOL_IDS,
+    ...CONTROLLER_PROTOCOL_TOOL_IDS,
   ]));
+  for (const protocolToolId of CONTROLLER_PROTOCOL_TOOL_IDS) {
+    expect(initial?.assignments).toContainEqual(expect.objectContaining({
+      capabilityId: protocolToolId,
+      capabilityKind: "tool",
+      mandatory: true,
+    }));
+  }
 
   const expanded = store.requestControllerCapabilityExpansion({
     controllerKey: turn.controllerKey,

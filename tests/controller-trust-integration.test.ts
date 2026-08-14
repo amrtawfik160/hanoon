@@ -125,6 +125,8 @@ const EXPECTED_CONTROLLER_PROFILE_TOOL_NAMES = [
   "telegram_agent_read_thread",
   "telegram_agent_health",
   "telegram_agent_scorecard",
+  "telegram_agent_turn_evidence",
+  "telegram_agent_respond",
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
 ] as const;

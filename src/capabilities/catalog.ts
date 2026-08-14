@@ -41,6 +41,11 @@ export const CONTROLLER_DOMAIN_TOOL_IDS = [
   "telegram_agent_adopt_pr",
 ] as const;
 
+export const CONTROLLER_PROTOCOL_TOOL_IDS = [
+  "telegram_agent_turn_evidence",
+  "telegram_agent_respond",
+] as const;
+
 export const CONTROLLER_METADATA_TOOL_IDS = [
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
@@ -365,10 +370,16 @@ const READ_TOOLS = new Set([
   "telegram_agent_health",
   "telegram_agent_scorecard",
   "telegram_agent_capabilities",
+  "telegram_agent_turn_evidence",
 ]);
 
-const toolDescriptors = [...CONTROLLER_DOMAIN_TOOL_IDS, ...CONTROLLER_METADATA_TOOL_IDS].map((id) => {
+const toolDescriptors = [
+  ...CONTROLLER_DOMAIN_TOOL_IDS,
+  ...CONTROLLER_METADATA_TOOL_IDS,
+  ...CONTROLLER_PROTOCOL_TOOL_IDS,
+].map((id) => {
   const readOnly = READ_TOOLS.has(id);
+  const mandatory = (CONTROLLER_PROTOCOL_TOOL_IDS as readonly string[]).includes(id) || !readOnly;
   return descriptor({
     id,
     kind: "tool",
@@ -388,7 +399,7 @@ const toolDescriptors = [...CONTROLLER_DOMAIN_TOOL_IDS, ...CONTROLLER_METADATA_T
     inputSchema: `${id}-input-v1`,
     outputSchema: `${id}-output-v1`,
     timeoutMs: 60_000,
-    evidenceRequirement: readOnly ? "optional" : "mandatory",
+    evidenceRequirement: mandatory ? "mandatory" : "optional",
     receiptType: "tool",
   });
 });

@@ -10,6 +10,7 @@ import {
   CONTROLLER_BUNDLE_TOOLS,
   CONTROLLER_DOMAIN_TOOL_IDS,
   CONTROLLER_METADATA_TOOL_IDS,
+  CONTROLLER_PROTOCOL_TOOL_IDS,
   type CapabilitySkillId,
 } from "./catalog";
 import type { CapabilityDescriptor } from "./contracts";
@@ -99,7 +100,11 @@ export function controllerSkillsForTurn(text: string): CapabilitySkillId[] {
 
 export function controllerToolsForBundles(
   rawBundleIds: readonly string[],
-): Array<(typeof CONTROLLER_TOOL_BUNDLES)[ControllerToolBundleId][number] | (typeof CONTROLLER_METADATA_TOOL_IDS)[number]> {
+): Array<
+  | (typeof CONTROLLER_TOOL_BUNDLES)[ControllerToolBundleId][number]
+  | (typeof CONTROLLER_METADATA_TOOL_IDS)[number]
+  | (typeof CONTROLLER_PROTOCOL_TOOL_IDS)[number]
+> {
   assertBundleIds(rawBundleIds);
   const selected = new Set(rawBundleIds);
   const selectedTools = new Set(
@@ -110,6 +115,7 @@ export function controllerToolsForBundles(
   return [
     ...CONTROLLER_DOMAIN_TOOL_IDS.filter((toolId) => selectedTools.has(toolId)),
     ...CONTROLLER_METADATA_TOOL_IDS,
+    ...CONTROLLER_PROTOCOL_TOOL_IDS,
   ];
 }
 

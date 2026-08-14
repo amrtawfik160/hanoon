@@ -38,6 +38,7 @@ import {
   CAPABILITY_GRAPH_DIGEST,
   CAPABILITY_REGISTRY_DIGEST,
   CONTROLLER_METADATA_TOOL_IDS,
+  CONTROLLER_PROTOCOL_TOOL_IDS,
   type CapabilitySkillId,
 } from "../capabilities/catalog";
 import { resolvePersistedWorkerProfile } from "../capabilities/profiles";
@@ -1462,7 +1463,7 @@ async function projectTrustedEvidence(
     }
     case "telegram_agent_turn_evidence":
     case "telegram_agent_respond":
-      throw new Error("telegram_agent_turn_evidence and telegram_agent_respond register directly and are not capability-projected");
+      throw new Error("telegram_agent_turn_evidence and telegram_agent_respond register directly and have no domain capability scope");
   }
 }
 
@@ -2204,6 +2205,12 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   });
 
   const registeredToolNames = pendingRegistrations.map((registration) => registration.name);
+  const assertProtocolToolsProjected = (projectedToolNames: readonly string[]): void => {
+    if (CONTROLLER_PROTOCOL_TOOL_IDS.some((toolName) =>
+      !registeredToolNames.includes(toolName) || !projectedToolNames.includes(toolName))) {
+      throw new TypeError("Controller protocol tools must be registered and projected");
+    }
+  };
   const uniqueRegisteredNames = [...new Set(registeredToolNames)].sort();
   const manifestNames = Object.keys(CONTROLLER_CAPABILITIES).sort();
   if (
@@ -2375,6 +2382,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         persisted.graphDigest === CAPABILITY_GRAPH_DIGEST
       ) {
         const bundles = controllerBundleIdsFromProfile(persisted);
+        const projectedToolNames = controllerToolsForBundles(bundles);
+        assertProtocolToolsProjected(projectedToolNames);
         const skills = persisted.assignments
           .filter((assignment) => assignment.capabilityKind === "skill")
           .map((assignment) => assignment.capabilityId)
@@ -2383,15 +2392,17 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
             return descriptor?.kind === "skill";
           });
         return {
-          tools: controllerToolsForBundles(bundles),
+          tools: projectedToolNames,
           skills,
           instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
         };
       }
       // A migrated in-flight turn has no profile. Keep its historical surface
       // until it settles; every newly enqueued turn is profile-backed.
+      const compatibilityToolNames = [...ALL_CONTROLLER_TOOL_NAMES];
+      assertProtocolToolsProjected(compatibilityToolNames);
       return {
-        tools: [...ALL_CONTROLLER_TOOL_NAMES],
+        tools: compatibilityToolNames,
         skills: [...CONTROLLER_DEFAULT_SKILLS, ...CONTROLLER_MANUAL_DISCOVERY_SKILLS],
         instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
       };

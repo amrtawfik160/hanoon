@@ -6,6 +6,7 @@ import { BUNDLED_SKILL_IDS, buildWorkerThreadTitle, type WorkerSkillRole } from 
 import {
   CAPABILITY_GRAPH_DIGEST,
   CAPABILITY_REGISTRY_DIGEST,
+  CONTROLLER_PROTOCOL_TOOL_IDS,
 } from "../src/capabilities/catalog";
 import { selectCapabilityProfile } from "../src/capabilities/profiles";
 import { hashSecret } from "../src/crypto";
@@ -15,7 +16,7 @@ import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "../src/controlle
 import {
   ALL_CONTROLLER_TOOL_NAMES,
 } from "../src/controller/tools";
-import { controllerToolsForBundles } from "../src/capabilities/controller-bundles";
+import { CONTROLLER_BUNDLE_IDS, controllerToolsForBundles } from "../src/capabilities/controller-bundles";
 import { retireLiveWorkPollingSchedules } from "../src/controller/monitor-policy";
 import { canonicalControllerJson, sha256ControllerJson } from "../src/controller/capability-executor";
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
@@ -154,12 +155,18 @@ function queueControllerCandidate(
 const controllerToolContext = { threadId: "thr_controller", projectId: "proj_personal" };
 
 let fixtureNumber = 0;
-function fixture(options: { active?: boolean } = {}) {
+function fixture(options: { active?: boolean; controllerTools?: "bundled" | "all-tools" } = {}) {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-controller-tools-${fixtureNumber++}`,
     agentSkillIds: [...BUNDLED_SKILL_IDS],
   });
-  const store = openStore(bb.storage, bb.storage.kv, () => 10_000);
+  const store = openStore(
+    bb.storage,
+    bb.storage.kv,
+    () => 10_000,
+    undefined,
+    () => ({ jobGraph: "adaptive", controllerTools: options.controllerTools ?? "bundled" }),
+  );
   store.createPairingCode(hashSecret("pair-tools"), 1_000, 20_000);
   expect(store.pairOwnerWithCode(hashSecret("pair-tools"), "7", "7", 1_001)).toEqual({ ok: true });
   store.upsertProjectPolicy(policyFixture(), 1_002);
@@ -929,16 +936,19 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   };
   const selected = await harness.behavior.resolveAgentConfiguration(context);
   const minimumTools = controllerToolsForBundles(["core-observation"]);
-  expect(selected.tools.map((tool) => tool.name)).toEqual(minimumTools);
+  expect(selected.tools.map((tool) => tool.name)).toHaveLength(minimumTools.length);
+  expect(new Set(selected.tools.map((tool) => tool.name))).toEqual(new Set(minimumTools));
   expect(selected.skills).toEqual([
     "human-friendly-coding-communication",
     "proportional-development-workflow",
   ]);
   expect(selected.instructions).toContain("You are the owner's teammate");
-  expect((await harness.behavior.resolveAgentConfiguration({
+  const aliasTools = (await harness.behavior.resolveAgentConfiguration({
     ...context,
     thread: { ...context.thread, title: "Telegram Codex controller owner-7-controller" },
-  })).tools.map((tool) => tool.name)).toEqual(minimumTools);
+  })).tools.map((tool) => tool.name);
+  expect(aliasTools).toHaveLength(minimumTools.length);
+  expect(new Set(aliasTools)).toEqual(new Set(minimumTools));
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
     thread: { ...context.thread, id: "thr_unrelated" },
@@ -1058,6 +1068,95 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   expect(notify).toHaveBeenCalledOnce();
 });
 
+it("keeps protocol tools in all-tools and old-profile compatibility configurations", async () => {
+  const register = (target: ReturnType<typeof fixture>) => {
+    registerControllerTools(target.bb, {
+      store: target.store,
+      sdk: target.bb.sdk,
+      threadOperations: { request: vi.fn() },
+      health: () => ({ ok: true }),
+      notify: vi.fn(),
+      now: () => 10_000,
+      controllerProviderId: () => "codex",
+    });
+  };
+  const context = (pluginId: string) => ({
+    thread: { id: "thr_controller", title: "Telegram Luna controller owner-7-controller", parentThreadId: null, sourceThreadId: null },
+    project: { id: "proj_personal", kind: "personal" as const, name: "Personal", gitRemoteUrl: null },
+    environment: { id: "env_personal", name: null, path: "/private/path", workspaceProvisionType: "personal" as const, branchName: null },
+    host: { id: "host_personal", name: "Host" },
+    provider: { id: "codex", model: "gpt-5.6-luna" },
+    origin: { kind: null, pluginId },
+  });
+  const names = (configuration: { tools: readonly { name: string }[] }) =>
+    configuration.tools.map((tool) => tool.name);
+
+  const allTools = fixture({ active: true, controllerTools: "all-tools" });
+  register(allTools);
+  const allToolsNames = names(await allTools.harness.behavior.resolveAgentConfiguration(context(allTools.bb.pluginId)));
+  const expectedAllTools = controllerToolsForBundles(CONTROLLER_BUNDLE_IDS);
+  expect(allToolsNames).toHaveLength(expectedAllTools.length);
+  expect(new Set(allToolsNames)).toEqual(new Set(expectedAllTools));
+
+  const stale = fixture({ active: true });
+  register(stale);
+  if (!stale.turn.capabilityProfileId) throw new Error("stale profile fixture is incomplete");
+  const currentProfile = stale.store.getCapabilityProfileById(stale.turn.capabilityProfileId);
+  if (!currentProfile) throw new Error("stale profile was not persisted");
+  const staleProfile = stale.store.createCapabilityProfile({
+    subjectKind: currentProfile.subjectKind,
+    subjectId: currentProfile.subjectId,
+    threadId: currentProfile.threadId,
+    recipeId: currentProfile.recipeId,
+    recipeVersion: currentProfile.recipeVersion,
+    registryDigest: "0".repeat(64),
+    graphDigest: currentProfile.graphDigest,
+    mode: currentProfile.mode,
+    model: currentProfile.model,
+    assignments: [...currentProfile.assignments],
+    reasonCodes: [...currentProfile.reasonCodes],
+    traits: [...currentProfile.traits],
+    expectedRevision: currentProfile.revision + 1,
+    now: 10_001,
+  });
+  stale.bb.storage.database().prepare(
+    `UPDATE controller_turns
+        SET capability_profile_id = ?, capability_profile_revision = ?,
+            capability_configured_revision = ?
+      WHERE id = ?`,
+  ).run(staleProfile.id, staleProfile.revision, staleProfile.revision, stale.turn.id);
+  stale.bb.storage.database().prepare(
+    `UPDATE controller_threads
+        SET capability_subject_id = ?, capability_profile_id = ?,
+            capability_profile_revision = ?
+      WHERE controller_key = ?`,
+  ).run(stale.turn.id, staleProfile.id, staleProfile.revision, stale.turn.controllerKey);
+  const staleNames = names(await stale.harness.behavior.resolveAgentConfiguration(context(stale.bb.pluginId)));
+  expect(staleNames).toEqual(ALL_CONTROLLER_TOOL_NAMES);
+
+  const migrated = fixture({ active: true });
+  register(migrated);
+  migrated.bb.storage.database().prepare(
+    `UPDATE controller_turns
+        SET capability_profile_id = NULL, capability_profile_revision = 0,
+            capability_configured_revision = 0
+      WHERE id = ?`,
+  ).run(migrated.turn.id);
+  migrated.bb.storage.database().prepare(
+    `UPDATE controller_threads
+        SET capability_subject_id = NULL, capability_profile_id = NULL,
+            capability_profile_revision = 0
+      WHERE controller_key = ?`,
+  ).run(migrated.turn.controllerKey);
+  const migratedNames = names(await migrated.harness.behavior.resolveAgentConfiguration(context(migrated.bb.pluginId)));
+  expect(migratedNames).toEqual(ALL_CONTROLLER_TOOL_NAMES);
+  for (const protocolToolId of CONTROLLER_PROTOCOL_TOOL_IDS) {
+    expect(allToolsNames.filter((name) => name === protocolToolId)).toHaveLength(1);
+    expect(staleNames.filter((name) => name === protocolToolId)).toHaveLength(1);
+    expect(migratedNames.filter((name) => name === protocolToolId)).toHaveLength(1);
+  }
+});
+
 it("exposes an approved bundle only after the persisted continuation profile is configured", async () => {
   const { bb, harness, store, turn } = fixture();
   let now = 10_000;
@@ -1121,8 +1220,10 @@ it("exposes an approved bundle only after the persisted continuation profile is 
     provider: { id: "codex", model: "gpt-5.6-luna" },
     origin: { kind: null, pluginId: bb.pluginId },
   };
-  expect((await harness.behavior.resolveAgentConfiguration(continuedContext)).tools.map((tool) => tool.name))
-    .toEqual(controllerToolsForBundles(["core-observation", "job-control"]));
+  const continuedTools = (await harness.behavior.resolveAgentConfiguration(continuedContext)).tools.map((tool) => tool.name);
+  const expectedContinuedTools = controllerToolsForBundles(["core-observation", "job-control"]);
+  expect(continuedTools).toHaveLength(expectedContinuedTools.length);
+  expect(new Set(continuedTools)).toEqual(new Set(expectedContinuedTools));
   expect(store.markControllerTurnSubmitted({ ...fence, now: ++now, turnId: turn.id })).toBe(true);
 
   expect(parseToolJson(await harness.behavior.callAgentTool(
