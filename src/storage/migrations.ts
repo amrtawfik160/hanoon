@@ -1484,6 +1484,112 @@ CREATE TABLE project_admission_pauses (
 );
 `] as const;
 
+/**
+ * The Hanoon-side projection of the credential broker foundation. Every row
+ * here is secret-free by construction: bindings carry only the metadata the
+ * broker already agreed to disclose, operations carry the outbound envelope
+ * (ids, digests, timestamps) rather than a resolved value, and receipts carry
+ * the broker's own outcome fields instead of its raw response body. Reconciled
+ * bindings are a projection, not a cache: a later health snapshot that omits a
+ * binding never deletes its local row, because the broker only stops listing
+ * a revoked binding once its retention window lapses, and the tombstone is
+ * what proves that binding once existed.
+ */
+export const CREDENTIAL_ACCESS_MIGRATIONS = [String.raw`
+CREATE TABLE credential_bindings (
+  installation_id TEXT NOT NULL,
+  binding_id TEXT NOT NULL,
+  label TEXT NOT NULL,
+  provider TEXT NOT NULL CHECK (provider = 'onepassword'),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'vault_verified', 'degraded', 'active', 'revoked', 'compromised')),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  capability_ids_json TEXT NOT NULL,
+  risk TEXT NOT NULL CHECK (risk IN ('low', 'medium', 'high', 'critical')),
+  mfa_mode TEXT NOT NULL CHECK (mfa_mode IN ('none', 'totp', 'webauthn', 'push')),
+  approval_mode TEXT NOT NULL CHECK (approval_mode IN ('none', 'owner_confirmation')),
+  last_verified_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (installation_id, binding_id)
+);
+
+CREATE INDEX credential_bindings_state
+  ON credential_bindings (installation_id, state, generation);
+
+CREATE TABLE credential_operations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  installation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN ('broker.health', 'vault.binding.verify')),
+  binding_id TEXT,
+  binding_generation INTEGER,
+  turn_id TEXT,
+  capability_id TEXT NOT NULL,
+  policy_digest TEXT NOT NULL,
+  fence_owner TEXT,
+  fence_generation INTEGER,
+  issued_at INTEGER NOT NULL,
+  deadline_at INTEGER NOT NULL,
+  envelope_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('prepared', 'completed', 'ambiguous')),
+  response_receipt_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (installation_id, request_id),
+  UNIQUE (installation_id, nonce),
+  UNIQUE (installation_id, idempotency_key),
+  FOREIGN KEY (installation_id, binding_id) REFERENCES credential_bindings (installation_id, binding_id)
+);
+
+CREATE INDEX credential_operations_state
+  ON credential_operations (installation_id, operation, state);
+
+CREATE INDEX credential_operations_turn
+  ON credential_operations (installation_id, turn_id);
+
+CREATE TABLE credential_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  installation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN ('broker.health', 'vault.binding.verify')),
+  turn_id TEXT,
+  binding_id TEXT,
+  binding_generation INTEGER,
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'failed')),
+  result TEXT CHECK (result IN ('ready', 'valid', 'invalid')),
+  failure_class TEXT,
+  retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+  retry_after_ms INTEGER,
+  response_sha256 TEXT NOT NULL,
+  completed_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (installation_id, binding_id) REFERENCES credential_bindings (installation_id, binding_id)
+);
+
+CREATE INDEX credential_receipts_installation
+  ON credential_receipts (installation_id, completed_at);
+
+CREATE TABLE credential_health (
+  installation_id TEXT PRIMARY KEY,
+  broker_version TEXT NOT NULL,
+  adapter TEXT NOT NULL CHECK (adapter = 'onepassword'),
+  adapter_state TEXT NOT NULL CHECK (adapter_state IN ('ready', 'degraded', 'unavailable')),
+  audit_writable INTEGER NOT NULL CHECK (audit_writable IN (0, 1)),
+  binding_count INTEGER NOT NULL,
+  topology_receipt_digest TEXT NOT NULL,
+  topology_receipt_expires_at INTEGER NOT NULL,
+  response_sha256 TEXT NOT NULL,
+  last_attempt_at INTEGER NOT NULL,
+  last_success_at INTEGER,
+  last_failure_at INTEGER,
+  last_failure_class TEXT,
+  updated_at INTEGER NOT NULL
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -1529,4 +1635,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_INTERACTION_MIGRATIONS,
   ...MERGE_AUTHORITY_MIGRATIONS,
   ...REGRESSION_WATCH_MIGRATIONS,
+  ...CREDENTIAL_ACCESS_MIGRATIONS,
 ] as const;
