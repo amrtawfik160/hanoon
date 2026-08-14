@@ -1749,6 +1749,32 @@ function legacyQuestionAnswerIsSubstantive(
   return (answer?.selected.length ?? 0) > 0 || (answer?.freeText?.trim().length ?? 0) > 0;
 }
 
+function legacyQuestionAnswerMapHasAllQuestionKeys(
+  questions: readonly ControllerQuestion[],
+  answers: ControllerQuestionAnswers,
+): boolean {
+  return questions.every((question) => Object.hasOwn(answers, question.id));
+}
+
+function legacyQuestionAnswerMapHasNonSubstantiveAnswer(
+  questions: readonly ControllerQuestion[],
+  answers: ControllerQuestionAnswers,
+): boolean {
+  return questions.some((question) => (
+    Object.hasOwn(answers, question.id) && !legacyQuestionAnswerIsSubstantive(answers[question.id])
+  ));
+}
+
+function legacyQuestionAnswersWithoutNonSubstantive(
+  answers: ControllerQuestionAnswers,
+): ControllerQuestionAnswers {
+  const normalized: ControllerQuestionAnswers = {};
+  for (const [questionId, answer] of Object.entries(answers)) {
+    if (legacyQuestionAnswerIsSubstantive(answer)) normalized[questionId] = answer;
+  }
+  return normalized;
+}
+
 function legacyQuestionAnswerMapIsComplete(
   questions: readonly ControllerQuestion[],
   answers: ControllerQuestionAnswers,
@@ -1782,13 +1808,17 @@ function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): Val
   const answers = parseLegacyJson(row.answers_json);
   const resolution = parseControllerInteractionResolution(interaction, answers, row.state);
   if (!resolution || resolution.kind !== "user_answer") return null;
+  const answerMap = resolution.answers as ControllerQuestionAnswers;
+  if (legacyQuestionAnswerMapHasAllQuestionKeys(interaction.questions, answerMap) &&
+      legacyQuestionAnswerMapHasNonSubstantiveAnswer(interaction.questions, answerMap)) return null;
+  const normalizedAnswers = legacyQuestionAnswersWithoutNonSubstantive(answerMap);
   const complete = legacyQuestionAnswerMapIsComplete(
     interaction.questions,
-    resolution.answers as ControllerQuestionAnswers,
+    normalizedAnswers,
   );
   if (!complete && nextUnansweredQuestion(
     interaction.questions,
-    resolution.answers as ControllerQuestionAnswers,
+    normalizedAnswers,
   ) === null) return null;
   if (row.state === "answered" && !complete) return null;
   const answeredAt = complete
@@ -1797,7 +1827,7 @@ function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): Val
   if (complete && answeredAt === null) return null;
   return {
     questionsJson: JSON.stringify(interaction.questions),
-    answersJson: JSON.stringify(resolution.answers),
+    answersJson: JSON.stringify(normalizedAnswers),
     state: complete ? "answered" : "pending",
     answeredAt,
   };
@@ -1966,8 +1996,11 @@ function restoreQuarantinedControllerQuestion(
   const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
     ? resolution.answers as ControllerQuestionAnswers
     : {};
-  const next = nextUnansweredQuestion(interaction.questions, answers);
-  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, answers);
+  if (legacyQuestionAnswerMapHasAllQuestionKeys(interaction.questions, answers) &&
+      legacyQuestionAnswerMapHasNonSubstantiveAnswer(interaction.questions, answers)) return false;
+  const normalizedAnswers = legacyQuestionAnswersWithoutNonSubstantive(answers);
+  const next = nextUnansweredQuestion(interaction.questions, normalizedAnswers);
+  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, normalizedAnswers);
   if (!complete && next === null) return false;
   if (row.prior_state === "answered" && !complete) return false;
   const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
@@ -1984,7 +2017,7 @@ function restoreQuarantinedControllerQuestion(
     row.controller_generation_id,
     JSON.stringify(interaction),
     restoredState,
-    resolution ? JSON.stringify(resolution) : null,
+    resolution ? JSON.stringify({ kind: "user_answer", answers: normalizedAnswers }) : null,
     restoredAnsweredAt,
     row.interaction_id,
   );
@@ -1995,7 +2028,7 @@ function restoreQuarantinedControllerQuestion(
   ).get(row.controller_key) as { telegram_chat_id: string } | undefined;
   if (!controller) return false;
   if (!next) return true;
-  const rendered = renderControllerInteraction(interaction, answers);
+  const rendered = renderControllerInteraction(interaction, normalizedAnswers);
   if (!("reply_markup" in rendered)) return true;
   persistControllerOutbox(db, {
     logicalKey: `controller-interaction:${row.interaction_id}:${next.index}`,
@@ -2025,8 +2058,11 @@ function restoreQuarantinedThreadQuestion(
   const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
     ? resolution.answers as ControllerQuestionAnswers
     : {};
-  const next = nextUnansweredQuestion(interaction.questions, answers);
-  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, answers);
+  if (legacyQuestionAnswerMapHasAllQuestionKeys(interaction.questions, answers) &&
+      legacyQuestionAnswerMapHasNonSubstantiveAnswer(interaction.questions, answers)) return false;
+  const normalizedAnswers = legacyQuestionAnswersWithoutNonSubstantive(answers);
+  const next = nextUnansweredQuestion(interaction.questions, normalizedAnswers);
+  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, normalizedAnswers);
   if (!complete && next === null) return false;
   if (row.prior_state === "answered" && !complete) return false;
   const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
@@ -2040,7 +2076,7 @@ function restoreQuarantinedThreadQuestion(
   ).run(
     JSON.stringify(interaction),
     restoredState,
-    resolution ? JSON.stringify(resolution) : null,
+    resolution ? JSON.stringify({ kind: "user_answer", answers: normalizedAnswers }) : null,
     restoredAnsweredAt,
     row.interaction_id,
   );

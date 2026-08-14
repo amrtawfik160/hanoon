@@ -243,6 +243,7 @@ function insertControllerQuestionQuarantine(
   interactionId: string,
   answerJson: string,
   priorState: "pending" | "answered",
+  questionsJson = JSON.stringify(questionPayload()),
 ): void {
   fixture.db.prepare(
     `INSERT INTO controller_interactions (
@@ -255,7 +256,7 @@ function insertControllerQuestionQuarantine(
     fixture.controllerKey,
     fixture.threadId,
     fixture.generationId,
-    JSON.stringify(questionPayload()),
+    questionsJson,
     2_000,
     2_100,
   );
@@ -271,13 +272,20 @@ function insertControllerQuestionQuarantine(
     fixture.controllerKey,
     fixture.threadId,
     fixture.generationId,
-    JSON.stringify(questionPayload()),
+    questionsJson,
     answerJson,
     priorState,
     2_000,
     priorState === "answered" ? 2_002 : null,
     2_100,
   );
+}
+
+function insertLegacyOwner(fixture: ReturnType<typeof legacyQuestionDatabaseFixture>): void {
+  fixture.db.prepare(
+    `INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at)
+     VALUES (1, '7', '70', 1_000, NULL)`,
+  ).run();
 }
 
 function expectLegacyMigrationRollback(
@@ -754,6 +762,50 @@ it("preserves and exposes a valid partial pending legacy answer", () => {
   });
 });
 
+it("removes an empty keyed legacy answer before the remaining questions and final answer flow", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  insertLegacyOwner(fixture);
+  const questions = JSON.parse(legacyQuestionsJson()) as Record<string, unknown>[];
+  questions.push({ ...questions[0], id: "question_2", prompt: "Which fallback should I use?" });
+  fixture.insertQuestion(
+    "pending",
+    "legacy_empty_first_partial",
+    JSON.stringify({ question_1: { selected: [] } }),
+    JSON.stringify(questions),
+  );
+
+  fixture.migrateRemaining();
+
+  expect(fixture.db.prepare(
+    "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get("legacy_empty_first_partial")).toEqual({
+    state: "pending",
+    answer_json: JSON.stringify({ kind: "user_answer", answers: {} }),
+  });
+  const repository = new ControllerInteractionRepository(fixture.db);
+  expect(repository.getPending(fixture.controllerKey)).toMatchObject({ answers: {} });
+  expect(repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "answer the first question",
+    now: 2_100,
+  })).toMatchObject({ ok: true, complete: false });
+  expect(repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "answer the second question",
+    now: 2_101,
+  })).toMatchObject({ ok: true, complete: true });
+  expect(repository.getAnswered(fixture.controllerKey)).toMatchObject({
+    answers: {
+      question_1: { selected: [], freeText: "answer the first question" },
+      question_2: { selected: [], freeText: "answer the second question" },
+    },
+  });
+});
+
 it("normalizes a complete legacy free-text answer with no selected option to answered", () => {
   const fixture = legacyQuestionDatabaseFixture();
   const answers = { question_1: { selected: [], freeText: "keep this answer" } };
@@ -932,6 +984,52 @@ it.each([
   expect(fixture.db.prepare(
     "SELECT consumed_at FROM controller_interaction_quarantine WHERE source = 'controller' AND interaction_id = ?",
   ).get(`quarantined_${priorState}_${expectedState}`)).toMatchObject({ consumed_at: expect.any(Number) });
+});
+
+it("removes an empty keyed answer before restoring a pending quarantine interaction and delivering its final answer", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  insertLegacyOwner(fixture);
+  const questions = JSON.parse(legacyQuestionsJson()) as Record<string, unknown>[];
+  questions.push({ ...questions[0], id: "question_2", prompt: "Which fallback should I use?" });
+  const interactionPayloadJson = JSON.stringify({ kind: "user_question", questions });
+  fixture.migrateRemaining();
+  insertControllerQuestionQuarantine(
+    fixture,
+    "quarantined_empty_first_partial",
+    JSON.stringify({ kind: "user_answer", answers: { question_1: { selected: [] } } }),
+    "pending",
+    interactionPayloadJson,
+  );
+
+  fixture.migrateRemaining();
+
+  expect(fixture.db.prepare(
+    "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get("quarantined_empty_first_partial")).toEqual({
+    state: "pending",
+    answer_json: JSON.stringify({ kind: "user_answer", answers: {} }),
+  });
+  const repository = new ControllerInteractionRepository(fixture.db);
+  expect(repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "answer the first restored question",
+    now: 2_100,
+  })).toMatchObject({ ok: true, complete: false });
+  expect(repository.answerWithText({
+    controllerKey: fixture.controllerKey,
+    userId: "7",
+    chatId: "70",
+    text: "answer the second restored question",
+    now: 2_101,
+  })).toMatchObject({ ok: true, complete: true });
+  expect(repository.getAnswered(fixture.controllerKey)).toMatchObject({
+    answers: {
+      question_1: { selected: [], freeText: "answer the first restored question" },
+      question_2: { selected: [], freeText: "answer the second restored question" },
+    },
+  });
 });
 
 it("migrates valid Unicode questions and normalizes their complete answer bytes", () => {

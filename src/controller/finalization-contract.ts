@@ -254,11 +254,11 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   },
   {
     pattern: /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
-    kinds: ["execution_result", "pipeline_outcome"],
+    kinds: ["execution_result"],
   },
   {
     pattern: /\b(?:all\s+)?tests?(?:\s+suite)?\s+(?:pass|passed|succeed|succeeded|complete|completed)\b/i,
-    kinds: ["execution_result", "pipeline_outcome"],
+    kinds: ["execution_result"],
   },
   {
     pattern: /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
@@ -664,20 +664,22 @@ function productionTargetForMatch(clause: string, match: OperationalMatch): bool
   const productionBefore = [...before.matchAll(/\bproduction\b/gi)].at(-1);
   if (productionBefore) {
     const productionIndex = productionBefore.index ?? 0;
-    const beforeProduction = before.slice(0, productionIndex);
     const afterProduction = before.slice(productionIndex + productionBefore[0].length);
-    if (!/\b(?:without|not|never|no longer|except|rather than)\s*$/i.test(beforeProduction) &&
-        !/[,:;.!?]/u.test(afterProduction) &&
-        !/\b(?:and|but|although|because|however|which|while|then|before|so|therefore|yet|despite)\b/i.test(afterProduction) &&
-        afterProduction.trim().split(/\s+/u).filter(Boolean).length <= 4) {
+    if (!/[,:;.!?]/u.test(afterProduction) &&
+        !hasExplicitlyNonPositiveProductionWording(afterProduction)) {
       return true;
     }
   }
   const productionAfter = after.search(/\bproduction\b/i);
   if (productionAfter < 0) return false;
   const beforeProduction = after.slice(0, productionAfter);
-  if (/\b(?:without|not|never|no longer|except|rather than)\b/i.test(beforeProduction)) return false;
-  return /\b(?:to|in|on|at|against|for|onto|into)\s+(?:the\s+)?$/i.test(beforeProduction);
+  if (/[,:;.!?]/u.test(beforeProduction)) return false;
+  if (hasExplicitlyNonPositiveProductionWording(beforeProduction)) return false;
+  return !hasExplicitlyNonPositiveProductionWording(after.slice(productionAfter));
+}
+
+function hasExplicitlyNonPositiveProductionWording(text: string): boolean {
+  return /\b(?:without|not|never|no longer|except|rather than|failed|failing|blocked|down|offline|unavailable)\b/i.test(text);
 }
 
 type FinalizationSegmentSpan = Readonly<{
