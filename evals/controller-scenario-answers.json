@@ -18,8 +18,8 @@
     {
       "scenarioId": "duplicate-mutation-replay",
       "kind": "text",
-      "responseText": "I created the fixed replay job once.",
-      "outboxText": "I created the fixed replay job once."
+      "responseText": "I created the job once.",
+      "outboxText": "I created the job once."
     },
     {
       "scenarioId": "telegram-allow-once",
