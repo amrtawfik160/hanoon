@@ -64,8 +64,7 @@ CREATE TABLE IF NOT EXISTS broker_requests (
   completed_receipt_id TEXT,
   started_at INTEGER NOT NULL CHECK (started_at >= 0),
   completed_at INTEGER CHECK (completed_at IS NULL OR completed_at >= 0),
-  PRIMARY KEY (installation_id, idempotency_key),
-  FOREIGN KEY (installation_id, binding_id) REFERENCES broker_bindings(installation_id, binding_id)
+  PRIMARY KEY (installation_id, idempotency_key)
 );
 
 CREATE TABLE IF NOT EXISTS broker_receipts (
