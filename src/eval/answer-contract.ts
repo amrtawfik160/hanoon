@@ -277,11 +277,20 @@ export type AnswerJudgeTrialCorrelation = Readonly<{
   projectId: string;
   parentThreadId: string | null;
   title: string;
+  execution: JudgeExecutionTuple;
   membership: Readonly<{
     id: string;
     projectId: string;
     parentThreadId: string | null;
     title: string;
+    providerId: string;
+    visibility: "hidden";
+    environmentId: string;
+    workspace: JudgeWorkspaceProof;
+    status: JudgeThreadStatus;
+    archivedAt: number;
+    deletedAt: null;
+    execution: JudgeExecutionTuple;
   }>;
   eventProjection: readonly JudgeEventProjection[];
   eventLogSha256: string;
@@ -292,7 +301,26 @@ export type AnswerJudgeTrialCorrelation = Readonly<{
   agentMessageItemId: string;
   outputItemId: string;
   outputSha256: string;
+  sealedHighWaterSequence: number;
+  highWaterSequence: number;
 }>;
+
+export type JudgeExecutionTuple = Readonly<{
+  model: string;
+  reasoningLevel: string;
+  serviceTier: string;
+  permissionMode: string;
+}>;
+
+export type JudgeWorkspaceProof = Readonly<{
+  environmentId: string;
+  path: string;
+  device: number;
+  inode: number;
+  empty: true;
+}>;
+
+export type JudgeThreadStatus = "error" | "stopping" | "idle" | "starting" | "active";
 
 export type JudgeEventProjection = Readonly<{
   eventId: string;
@@ -326,11 +354,13 @@ export type JudgeEventType =
   | "turn/completed";
 
 export type JudgeEventAudit = Readonly<JudgeIsolationEvidence & {
+  execution: JudgeExecutionTuple;
   eventProjection: readonly JudgeEventProjection[];
   targetTurnId: string;
   targetTurnStartEventId: string;
   targetTurnCompletionEventId: string;
   agentMessageItemId: string;
+  highWaterSequence: number;
 }>;
 
 export type JudgeOutputBinding = Readonly<{
@@ -728,17 +758,23 @@ export function auditJudgeEventLog(output: string, expectedThreadId?: string): J
   const projectionAudit = validateJudgeEventProjection(projection, expectedThreadId);
   if (!projectionAudit) return null;
   if (!eventRecords.every(validateRawJudgeEvent)) return null;
+  const execution = judgeExecutionFromEvents(eventRecords);
+  if (!execution) return null;
+  const highWaterSequence = projection.at(-1)?.sequence;
+  if (!isNonNegativeInteger(highWaterSequence)) return null;
   return {
     workspace: "empty-temporary",
     eventLog: "completed-audited",
     toolActivity: "none-observed",
     workspaceCleanup: "complete",
     eventCount: eventRecords.length,
+    execution,
     eventProjection: projection,
     targetTurnId: projectionAudit.targetTurnId,
     targetTurnStartEventId: projectionAudit.targetTurnStartEventId,
     targetTurnCompletionEventId: projectionAudit.targetTurnCompletionEventId,
     agentMessageItemId: projectionAudit.agentMessageItemId,
+    highWaterSequence,
   };
 }
 
@@ -753,7 +789,8 @@ export function bindJudgeOutputToEventAudit(
   const projection = eventRecords.map((event) => event.projection);
   const projectionAudit = validateJudgeEventProjection(projection, expectedThreadId);
   if (!projectionAudit || !sameJudgeEventProjection(projection, eventAudit.eventProjection)
-    || !projectionAuditMatchesAudit(projectionAudit, eventAudit)) return null;
+    || !projectionAuditMatchesAudit(projectionAudit, eventAudit)
+    || !sameJudgeExecution(judgeExecutionFromEvents(eventRecords), eventAudit.execution)) return null;
   const deltaEvents = eventRecords.filter((event) => event.projection.type === "item/agentMessage/delta"
     && event.projection.turnId === eventAudit.targetTurnId
     && event.projection.itemId === eventAudit.agentMessageItemId);
@@ -761,12 +798,41 @@ export function bindJudgeOutputToEventAudit(
   const reconstructedOutput = deltaEvents.map((event) => event.rawData.delta as string).join("");
   if (reconstructedOutput !== output) return null;
   const highWaterSequence = projection.at(-1)?.sequence;
-  if (highWaterSequence === undefined) return null;
+  if (!isNonNegativeInteger(highWaterSequence) || highWaterSequence !== eventAudit.highWaterSequence) return null;
   return {
     outputItemId: eventAudit.agentMessageItemId,
     outputSha256: createHash("sha256").update(output, "utf8").digest("hex"),
     highWaterSequence,
   };
+}
+
+function judgeExecutionFromEvents(events: readonly ParsedJudgeEvent[]): JudgeExecutionTuple | null {
+  const executionEvents = events.filter((event) => event.projection.type === "client/turn/requested");
+  if (executionEvents.length !== 1) return null;
+  return parseJudgeExecution(executionEvents[0]?.rawData.execution);
+}
+
+function parseJudgeExecution(input: unknown): JudgeExecutionTuple | null {
+  if (!isRecord(input) || !hasExactKeys(input, ["model", "permissionMode", "reasoningLevel", "serviceTier", "source"])) return null;
+  if (![input.model, input.permissionMode, input.reasoningLevel, input.serviceTier, input.source].every(isBoundedExecutionValue)) return null;
+  return {
+    model: input.model as string,
+    reasoningLevel: input.reasoningLevel as string,
+    serviceTier: input.serviceTier as string,
+    permissionMode: input.permissionMode as string,
+  };
+}
+
+function isBoundedExecutionValue(input: unknown): input is string {
+  return typeof input === "string" && input.length > 0 && input.length <= 256 && !/\s/.test(input);
+}
+
+function sameJudgeExecution(left: JudgeExecutionTuple | null, right: JudgeExecutionTuple): boolean {
+  return left !== null
+    && left.model === right.model
+    && left.reasoningLevel === right.reasoningLevel
+    && left.serviceTier === right.serviceTier
+    && left.permissionMode === right.permissionMode;
 }
 
 function sameJudgeEventProjection(
@@ -915,6 +981,7 @@ function validateRawJudgeEvent(event: ParsedJudgeEvent): boolean {
     const rawProviderEvent = event.rawData.rawEvent;
     if (event.rawData.rawType !== "warning" || !isRecord(rawProviderEvent) || rawProviderEvent.method !== "warning") return false;
   }
+  if (type === "client/turn/requested" && parseJudgeExecution(event.rawData.execution) === null) return false;
   return true;
 }
 
@@ -1188,7 +1255,9 @@ function collectLiveGateCorrelations(cases: readonly LiveGateCaseResult[]): Answ
     .map((clause) => clause.correlation)
     .filter((correlation): correlation is AnswerJudgeTrialCorrelation => correlation !== null);
   if (new Set(correlations.map((correlation) => correlation.threadId)).size !== correlations.length
-    || new Set(correlations.map((correlation) => correlation.correlationToken)).size !== correlations.length) return null;
+    || new Set(correlations.map((correlation) => correlation.correlationToken)).size !== correlations.length
+    || new Set(correlations.map((correlation) => correlation.membership.environmentId)).size !== correlations.length
+    || new Set(correlations.map((correlation) => correlation.membership.workspace.path)).size !== correlations.length) return null;
   return correlations;
 }
 
@@ -1283,7 +1352,8 @@ function hasJudgeCorrelationShape(
   if (!isRecord(input) || !hasExactKeys(input, [
     "agentMessageItemId", "caseId", "clauseId", "correlationToken", "eventCount", "eventLogSha256",
     "eventProjection", "membership", "outputItemId", "outputSha256", "parentThreadId", "projectId",
-    "runId", "targetTurnCompletionEventId", "targetTurnId", "targetTurnStartEventId", "threadId", "title", "trialId",
+    "runId", "sealedHighWaterSequence", "targetTurnCompletionEventId", "targetTurnId", "targetTurnStartEventId",
+    "threadId", "title", "trialId", "execution", "highWaterSequence",
   ])) return false;
   return hasJudgeCorrelationIdentity(input, runId, caseId, clauseId)
     && hasJudgeCorrelationMembership(input)
@@ -1301,7 +1371,8 @@ function hasJudgeCorrelationIdentity(
     || typeof input.threadId !== "string" || !isSafeEventIdentifier(input.threadId)
     || typeof input.projectId !== "string" || !isSafeEventIdentifier(input.projectId)
     || (input.parentThreadId !== null && !isSafeEventIdentifier(input.parentThreadId))
-    || typeof input.title !== "string" || input.title.length === 0 || input.title.length > 512) return false;
+    || typeof input.title !== "string" || input.title.length === 0 || input.title.length > 512
+    || !isPinnedJudgeExecution(input.execution)) return false;
   return input.title === answerJudgeThreadTitle({
     runId,
     caseId,
@@ -1316,7 +1387,13 @@ function hasJudgeCorrelationMembership(input: Record<string, unknown>): boolean 
   return input.membership.id === input.threadId
     && input.membership.projectId === input.projectId
     && input.membership.parentThreadId === input.parentThreadId
-    && input.membership.title === input.title;
+    && input.membership.title === input.title
+    && input.membership.providerId === ANSWER_JUDGE_PROFILE.provider
+    && input.membership.visibility === ANSWER_JUDGE_PROFILE.visibility
+    && input.membership.execution.model === (input.execution as JudgeExecutionTuple).model
+    && input.membership.execution.reasoningLevel === (input.execution as JudgeExecutionTuple).reasoningLevel
+    && input.membership.execution.serviceTier === (input.execution as JudgeExecutionTuple).serviceTier
+    && input.membership.execution.permissionMode === (input.execution as JudgeExecutionTuple).permissionMode;
 }
 
 function hasJudgeCorrelationEvidence(input: Record<string, unknown>): boolean {
@@ -1331,7 +1408,11 @@ function hasJudgeCorrelationEvidence(input: Record<string, unknown>): boolean {
     && isSafeEventIdentifier(input.targetTurnCompletionEventId)
     && isSafeEventIdentifier(input.agentMessageItemId)
     && isSafeEventIdentifier(input.outputItemId)
-    && input.outputItemId === input.agentMessageItemId;
+    && input.outputItemId === input.agentMessageItemId
+    && isNonNegativeInteger(input.sealedHighWaterSequence)
+    && isNonNegativeInteger(input.highWaterSequence)
+    && input.sealedHighWaterSequence === input.highWaterSequence
+    && input.highWaterSequence === input.eventProjection.at(-1)?.sequence;
 }
 
 function projectionAuditMatchesCorrelation(
@@ -1347,11 +1428,47 @@ function projectionAuditMatchesCorrelation(
 
 function isJudgeThreadMembership(input: unknown): input is AnswerJudgeTrialCorrelation["membership"] {
   return isRecord(input)
-    && hasExactKeys(input, ["id", "parentThreadId", "projectId", "title"])
+    && hasExactKeys(input, [
+      "archivedAt", "deletedAt", "environmentId", "execution", "id", "parentThreadId", "projectId",
+      "providerId", "status", "title", "visibility", "workspace",
+    ])
     && typeof input.id === "string" && /^[^\s]{1,128}$/.test(input.id)
     && typeof input.projectId === "string" && /^[^\s]{1,128}$/.test(input.projectId)
     && (input.parentThreadId === null || (typeof input.parentThreadId === "string" && /^[^\s]{1,128}$/.test(input.parentThreadId)))
-    && typeof input.title === "string" && input.title.length > 0 && input.title.length <= 512;
+    && typeof input.title === "string" && input.title.length > 0 && input.title.length <= 512
+    && input.providerId === ANSWER_JUDGE_PROFILE.provider
+    && input.visibility === ANSWER_JUDGE_PROFILE.visibility
+    && isJudgeExecution(input.execution)
+    && typeof input.environmentId === "string" && /^[^\s]{1,128}$/.test(input.environmentId)
+    && ["error", "idle"].includes(input.status as string)
+    && isNonNegativeInteger(input.archivedAt) && input.archivedAt > 0
+    && input.deletedAt === null
+    && isJudgeWorkspaceProof(input.workspace)
+    && input.workspace.environmentId === input.environmentId;
+}
+
+function isJudgeWorkspaceProof(input: unknown): input is JudgeWorkspaceProof {
+  return isRecord(input)
+    && hasExactKeys(input, ["device", "empty", "environmentId", "inode", "path"])
+    && typeof input.environmentId === "string" && /^[^\s]{1,128}$/.test(input.environmentId)
+    && typeof input.path === "string" && input.path.startsWith("/") && input.path.length <= 4096
+    && isNonNegativeInteger(input.device)
+    && isNonNegativeInteger(input.inode)
+    && input.empty === true;
+}
+
+function isJudgeExecution(input: unknown): input is JudgeExecutionTuple {
+  return isRecord(input)
+    && hasExactKeys(input, ["model", "permissionMode", "reasoningLevel", "serviceTier"])
+    && [input.model, input.permissionMode, input.reasoningLevel, input.serviceTier].every(isBoundedExecutionValue);
+}
+
+function isPinnedJudgeExecution(input: unknown): input is JudgeExecutionTuple {
+  return isJudgeExecution(input)
+    && input.model === ANSWER_JUDGE_PROFILE.model
+    && input.reasoningLevel === ANSWER_JUDGE_PROFILE.reasoningLevel
+    && input.serviceTier === ANSWER_JUDGE_PROFILE.serviceTier
+    && input.permissionMode === ANSWER_JUDGE_PROFILE.permissionMode;
 }
 
 function isJudgeIsolationEvidence(input: unknown): input is JudgeIsolationEvidence {

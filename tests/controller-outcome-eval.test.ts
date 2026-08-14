@@ -1,5 +1,16 @@
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -203,6 +214,38 @@ it("requires an absolute output path even when a relative path resolves outside 
       "--trials", "1",
       "--output", relative(process.cwd(), output),
     ])).rejects.toMatchObject({ code: 1 });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("keeps the approved output target anchored while trials run", async () => {
+  const runner = await runnerModule();
+  const trials = await cleanScenarioTrials("baseline");
+  const sourceTrial = trials[0];
+  if (!sourceTrial) throw new Error("baseline trial was not produced");
+  const directory = mkdtempSync(join(tmpdir(), "hanoon-eval-preflight-swap-"));
+  const parentPath = join(directory, "publisher");
+  const movedParentPath = join(directory, "publisher-moved");
+  const output = join(parentPath, "report.json");
+  mkdirSync(parentPath);
+  try {
+    await expect(runner.evaluateControllerOutcomes({
+      checkpoint: "baseline",
+      trials: 1,
+      seed: 8122026,
+      output,
+      replace: true,
+    }, {
+      readGitIdentity: () => ({ commit: sourceTrial.harness.hanoonCommit, dirty: false }),
+      runTrials: async () => {
+        renameSync(parentPath, movedParentPath);
+        mkdirSync(parentPath);
+        return trials;
+      },
+    })).rejects.toThrow(/parent changed/i);
+    expect(existsSync(output)).toBe(false);
+    expect(readdirSync(movedParentPath)).toEqual([]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

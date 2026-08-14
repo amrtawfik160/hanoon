@@ -9,7 +9,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const jiti = createJiti(import.meta.url);
 const contract = await jiti.import("../src/eval/controller-scenario-contract.ts");
 const harness = await jiti.import("../tests/support/controller-scenario-harness.ts");
-const { canonicalArtifactPath, publishValidatedArtifact } = await jiti.import("../src/eval/eval-integrity.ts");
+const {
+  closePreparedArtifactTarget,
+  prepareArtifactTarget,
+  publishValidatedArtifact,
+} = await jiti.import("../src/eval/eval-integrity.ts");
 
 function fail(message) {
   process.stderr.write(`controller outcome eval: ${message}\n`);
@@ -50,11 +54,18 @@ function isInsideRoot(path) {
   return relation === "" || (!relation.startsWith(`..${sep}`) && relation !== ".." && !isAbsolute(relation));
 }
 
-function allowedOutput(path) {
-  const canonicalPath = canonicalArtifactPath(path);
-  if (!isInsideRoot(canonicalPath)) return true;
-  const relation = relative(root, canonicalPath);
-  return relation === ".superpowers" || relation.startsWith(`.superpowers${sep}`);
+function prepareAllowedOutput(path) {
+  const preparedTarget = prepareArtifactTarget(path);
+  try {
+    const canonicalPath = preparedTarget.targetPath;
+    if (!isInsideRoot(canonicalPath)) return preparedTarget;
+    const relation = relative(root, canonicalPath);
+    if (relation === ".superpowers" || relation.startsWith(`.superpowers${sep}`)) return preparedTarget;
+    throw new Error("--output must be outside the repository or under .superpowers/");
+  } catch (error) {
+    closePreparedArtifactTarget(preparedTarget);
+    throw error;
+  }
 }
 
 function assertCurrentRunIdentity(identity, currentIdentity) {
@@ -74,9 +85,10 @@ function readGitIdentity() {
   };
 }
 
-function writeReport(path, content, replace, verifyIdentity) {
+function writeReport({ path, preparedTarget, content, replace, verifyIdentity }) {
   publishValidatedArtifact({
     artifactPath: path,
+    preparedTarget,
     serialized: content,
     replace,
     validateSerialized: (candidate) => {
@@ -201,62 +213,70 @@ function assertExactTrialSet(trials, scenarioCorpus, options) {
 }
 
 export async function evaluateControllerOutcomes(options, dependencies = {}) {
-  if (!allowedOutput(options.output)) {
-    throw new Error("--output must be outside the repository or under .superpowers/");
-  }
-  if (options.checkpoint === "cutover" && options.baseline === null) {
-    throw new Error("cutover evaluation requires a fixed baseline comparison");
-  }
-  const scenarioCorpus = harness.loadControllerScenarioCorpus();
-  const baseline = options.baseline ? readValidatedBaseline(options.baseline, scenarioCorpus) : null;
-  const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
-  if (identity.dirty) throw new Error("current evaluator identity is dirty; refusing to start trials");
-  const trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
-    checkpoint: options.checkpoint,
-    trials: options.trials,
-    seed: options.seed,
-    runIdentity: { commit: identity.commit, dirty: identity.dirty },
-  });
-  const currentValidation = contract.validateControllerScenarioTrialsAgainstCorpus(trials, scenarioCorpus);
-  const validatedTrials = currentValidation.trials.map(contract.validateControllerScenarioTrialBudget);
-  assertCurrentEvaluationIdentity(validatedTrials, identity);
-  assertExactTrialSet(validatedTrials, scenarioCorpus, options);
-  const baseReport = contract.aggregateControllerEvaluation({
-    label: classifyControllerEvidence(validatedTrials),
-    run: {
+  const preparedOutput = prepareAllowedOutput(options.output);
+  try {
+    if (options.checkpoint === "cutover" && options.baseline === null) {
+      throw new Error("cutover evaluation requires a fixed baseline comparison");
+    }
+    const scenarioCorpus = harness.loadControllerScenarioCorpus();
+    const baseline = options.baseline ? readValidatedBaseline(options.baseline, scenarioCorpus) : null;
+    const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
+    if (identity.dirty) throw new Error("current evaluator identity is dirty; refusing to start trials");
+    const trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
       checkpoint: options.checkpoint,
-      trialsPerScenario: options.trials,
+      trials: options.trials,
       seed: options.seed,
-    },
-    trials: validatedTrials,
-  });
-  const comparison = baseline
-    ? contract.compareControllerEvaluations({
-        baseline,
-        after: baseReport,
-        scenarioCorpus,
-      })
-    : null;
-  const report = comparison
-    ? contract.attachControllerComparison(baseReport, comparison)
-    : baseReport;
-  contract.controllerEvaluationReportSchema.parse(report);
-  const finalIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
-  assertCurrentRunIdentity(identity, finalIdentity);
-  assertCurrentEvaluationIdentity(validatedTrials, finalIdentity);
-  const verifyIdentity = () => {
-    harness.verifyControllerScenarioFixtureSnapshots();
-    const currentIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
-    assertCurrentRunIdentity(identity, currentIdentity);
-    assertCurrentEvaluationIdentity(validatedTrials, currentIdentity);
-  };
-  writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace, verifyIdentity);
-  const criticalSafetyFailed = currentValidation.criticalSafetyFailed;
-  return {
-    report,
-    criticalSafetyFailed,
-    exitCode: criticalSafetyFailed || report.status !== "passed" ? 1 : 0,
-  };
+      runIdentity: { commit: identity.commit, dirty: identity.dirty },
+    });
+    const currentValidation = contract.validateControllerScenarioTrialsAgainstCorpus(trials, scenarioCorpus);
+    const validatedTrials = currentValidation.trials.map(contract.validateControllerScenarioTrialBudget);
+    assertCurrentEvaluationIdentity(validatedTrials, identity);
+    assertExactTrialSet(validatedTrials, scenarioCorpus, options);
+    const baseReport = contract.aggregateControllerEvaluation({
+      label: classifyControllerEvidence(validatedTrials),
+      run: {
+        checkpoint: options.checkpoint,
+        trialsPerScenario: options.trials,
+        seed: options.seed,
+      },
+      trials: validatedTrials,
+    });
+    const comparison = baseline
+      ? contract.compareControllerEvaluations({
+          baseline,
+          after: baseReport,
+          scenarioCorpus,
+        })
+      : null;
+    const report = comparison
+      ? contract.attachControllerComparison(baseReport, comparison)
+      : baseReport;
+    contract.controllerEvaluationReportSchema.parse(report);
+    const finalIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
+    assertCurrentRunIdentity(identity, finalIdentity);
+    assertCurrentEvaluationIdentity(validatedTrials, finalIdentity);
+    const verifyIdentity = () => {
+      harness.verifyControllerScenarioFixtureSnapshots();
+      const currentIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
+      assertCurrentRunIdentity(identity, currentIdentity);
+      assertCurrentEvaluationIdentity(validatedTrials, currentIdentity);
+    };
+    writeReport({
+      path: options.output,
+      preparedTarget: preparedOutput,
+      content: `${JSON.stringify(report, null, 2)}\n`,
+      replace: options.replace,
+      verifyIdentity,
+    });
+    const criticalSafetyFailed = currentValidation.criticalSafetyFailed;
+    return {
+      report,
+      criticalSafetyFailed,
+      exitCode: criticalSafetyFailed || report.status !== "passed" ? 1 : 0,
+    };
+  } finally {
+    closePreparedArtifactTarget(preparedOutput);
+  }
 }
 
 async function main() {

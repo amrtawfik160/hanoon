@@ -1,5 +1,6 @@
 import {
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -45,7 +46,41 @@ vi.mock("node:fs", async () => {
   };
 });
 
-const { publishValidatedArtifact } = await import("../src/eval/eval-integrity");
+const {
+  closePreparedArtifactTarget,
+  prepareArtifactTarget,
+  publishValidatedArtifact,
+} = await import("../src/eval/eval-integrity");
+
+it("keeps preflight publication anchored to the approved parent after a path swap", () => {
+  const directory = mkdtempSync(join(tmpdir(), "eval-integrity-preflight-swap-"));
+  const parentPath = join(directory, "publisher");
+  const movedParentPath = join(directory, "publisher-moved");
+  const artifactPath = join(parentPath, "artifact.json");
+  mkdirSync(parentPath);
+  const preparedTarget = prepareArtifactTarget(artifactPath);
+  try {
+    renameSync(parentPath, movedParentPath);
+    mkdirSync(parentPath);
+    writeFileSync(artifactPath, "attacker\\n", { mode: 0o600 });
+
+    expect(() => publishValidatedArtifact({
+      artifactPath,
+      preparedTarget,
+      serialized: "winner\\n",
+      replace: true,
+      validateSerialized: () => undefined,
+      verifyIdentity: () => undefined,
+    })).toThrow(/parent changed/i);
+    expect(readFileSync(artifactPath, "utf8")).toBe("attacker\\n");
+    expect(readdirSync(movedParentPath)).toEqual([]);
+  } finally {
+    closePreparedArtifactTarget(preparedTarget);
+    expect(() => closePreparedArtifactTarget(preparedTarget)).not.toThrow();
+    expect(() => fstatSync(preparedTarget.descriptor)).toThrow();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 it("does not clobber a competitor that appears during a no-replace commit", () => {
   const directory = mkdtempSync(join(tmpdir(), "eval-integrity-no-clobber-"));

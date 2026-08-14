@@ -107,6 +107,7 @@ function canonicalArtifactLocation(artifactPath: string): CanonicalArtifactLocat
 
 export type ArtifactPublicationOptions = Readonly<{
   artifactPath: string;
+  preparedTarget?: PreparedArtifactTarget;
   serialized: string;
   replace: boolean;
   validateSerialized: (serialized: string) => void;
@@ -119,6 +120,15 @@ type PublicationParent = Readonly<{
   identity: FileIdentity;
   path: string;
   anchorPath: string;
+  close: () => void;
+}>;
+export type PreparedArtifactTarget = Readonly<{
+  descriptor: number;
+  identity: FileIdentity;
+  parentPath: string;
+  anchorPath: string;
+  targetPath: string;
+  close: () => void;
 }>;
 type PublicationLock = Readonly<{ descriptor: number; identity: FileIdentity; path: string }>;
 type OpenedTemporary = Readonly<{ descriptor: number; identity: FileIdentity; path: string }>;
@@ -130,12 +140,13 @@ type PublishedArtifact = Readonly<{
 }>;
 
 export function publishValidatedArtifact(options: ArtifactPublicationOptions): string {
-  const location = canonicalArtifactLocation(options.artifactPath);
-  const targetPath = location.targetPath;
-  options.validateSerialized(options.serialized);
-  const parent = openPublicationParent(location.parentPath, location.parentIdentity);
+  const ownsPreparedTarget = options.preparedTarget === undefined;
+  const preparedTarget = options.preparedTarget ?? prepareArtifactTarget(options.artifactPath);
+  const targetPath = preparedTarget.targetPath;
+  const parent = publicationParent(preparedTarget);
   let lock: PublicationLock | null = null;
   try {
+    options.validateSerialized(options.serialized);
     lock = acquirePublicationLock(parent, targetPath);
     assertCurrentPublicationParent(parent);
     publishArtifactUnderLock(options, parent, targetPath);
@@ -145,9 +156,36 @@ export function publishValidatedArtifact(options: ArtifactPublicationOptions): s
     try {
       if (lock) releasePublicationLock(lock, parent);
     } finally {
-      closePublicationParent(parent);
+      if (ownsPreparedTarget) closePublicationParent(parent);
     }
   }
+}
+
+export function prepareArtifactTarget(artifactPath: string): PreparedArtifactTarget {
+  const location = canonicalArtifactLocation(artifactPath);
+  const parent = openPublicationParent(location.parentPath, location.parentIdentity);
+  return Object.freeze({
+    descriptor: parent.descriptor,
+    identity: parent.identity,
+    parentPath: parent.path,
+    anchorPath: parent.anchorPath,
+    targetPath: location.targetPath,
+    close: parent.close,
+  });
+}
+
+export function closePreparedArtifactTarget(target: PreparedArtifactTarget): void {
+  target.close();
+}
+
+function publicationParent(target: PreparedArtifactTarget): PublicationParent {
+  return {
+    descriptor: target.descriptor,
+    identity: target.identity,
+    path: target.parentPath,
+    anchorPath: target.anchorPath,
+    close: target.close,
+  };
 }
 
 function openPublicationParent(parentPath: string, expectedIdentity: FileIdentity): PublicationParent {
@@ -160,12 +198,18 @@ function openPublicationParent(parentPath: string, expectedIdentity: FileIdentit
     throw new Error("artifact parent changed during publication");
   }
   const descriptor = openSync(parentPath, "r");
+  let closed = false;
   try {
     const parent: PublicationParent = {
       descriptor,
       identity: expectedIdentity,
       path: parentPath,
       anchorPath: join("/proc/self/fd", String(descriptor)),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        closeSync(descriptor);
+      },
     };
     if (!sameFileIdentity(fileIdentity(fstatSync(descriptor)), expectedIdentity)) {
       throw new Error("artifact parent changed during publication");
@@ -174,13 +218,13 @@ function openPublicationParent(parentPath: string, expectedIdentity: FileIdentit
     assertCurrentPublicationParent(parent);
     return parent;
   } catch (error) {
-    closeSync(descriptor);
+    if (!closed) closeSync(descriptor);
     throw error;
   }
 }
 
 function closePublicationParent(parent: PublicationParent): void {
-  closeSync(parent.descriptor);
+  parent.close();
 }
 
 function assertCurrentPublicationParent(parent: PublicationParent): void {

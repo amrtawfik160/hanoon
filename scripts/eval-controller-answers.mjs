@@ -9,14 +9,14 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  existsSync,
-  lstatSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -43,6 +43,8 @@ import {
   sanitizeInfrastructureDetail,
 } from "../src/eval/answer-contract.ts";
 import {
+  closePreparedArtifactTarget,
+  prepareArtifactTarget,
   publishValidatedArtifact,
   readJsonFixtureSnapshot,
   verifyFixtureSnapshotUnchanged,
@@ -185,22 +187,40 @@ function parseSpawnedThreadId(output) {
   return threadId;
 }
 
+function assertFreshJudgeWorkspace(workspacePath) {
+  let workspaceStat;
+  try {
+    workspaceStat = statSync(workspacePath);
+    if (!workspaceStat.isDirectory() || readdirSync(workspacePath).length !== 0) {
+      throw new Error("judge workspace was not a fresh empty temporary directory");
+    }
+  } catch (error) {
+    throw new Error(`judge workspace identity could not be established: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return {
+    path: workspacePath,
+    device: workspaceStat.dev,
+    inode: workspaceStat.ino,
+    empty: true,
+  };
+}
+
 function assertExternalArtifactPath(artifactPath) {
-  const resolvedPath = resolve(artifactPath);
   if (!isAbsolute(artifactPath)) {
     throw new Error("live gate artifact path must be absolute and outside the plugin worktree");
   }
-  const realPluginRoot = realpathSync(pluginRoot);
-  const realParent = realpathSync(dirname(resolvedPath));
-  const realTarget = join(realParent, basename(resolvedPath));
-  const pathFromRoot = relative(realPluginRoot, realTarget);
-  if (pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))) {
-    throw new Error("live gate artifact path must be absolute and outside the plugin worktree");
+  const preparedTarget = prepareArtifactTarget(artifactPath);
+  try {
+    const realPluginRoot = realpathSync(pluginRoot);
+    const pathFromRoot = relative(realPluginRoot, preparedTarget.targetPath);
+    if (pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))) {
+      throw new Error("live gate artifact path must be absolute and outside the plugin worktree");
+    }
+    return preparedTarget;
+  } catch (error) {
+    closePreparedArtifactTarget(preparedTarget);
+    throw error;
   }
-  if (existsSync(resolvedPath) && lstatSync(resolvedPath).isSymbolicLink()) {
-    throw new Error("live gate artifact path must not be a symbolic link");
-  }
-  return realTarget;
 }
 
 function buildJudgeCorrelation({ testCase, clause, runId, project, parentThreadId }) {
@@ -225,14 +245,17 @@ function buildJudgeCorrelation({ testCase, clause, runId, project, parentThreadI
   };
 }
 
-async function captureJudgeThreadMembership(threadId, correlation) {
+async function readJudgeThreadShow(threadId) {
   let parsed;
   try {
     parsed = JSON.parse(await bb(["thread", "show", threadId, "--json"]));
   } catch {
     throw new Error(`judge thread ${threadId} membership could not be captured`);
   }
-  const thread = parsed?.thread ?? parsed;
+  return { thread: parsed?.thread ?? parsed, environment: parsed?.environment };
+}
+
+function assertThreadCorrelation(threadId, thread, correlation) {
   if (!thread || typeof thread !== "object"
     || thread.id !== threadId
     || thread.projectId !== correlation.projectId
@@ -240,12 +263,85 @@ async function captureJudgeThreadMembership(threadId, correlation) {
     || thread.title !== correlation.title) {
     throw new Error(`judge thread ${threadId} membership does not match its run correlation`);
   }
+}
+
+function assertThreadProviderAndEnvironment({ threadId, thread, environment, correlation, workspaceProof }) {
+  if (thread.providerId !== ANSWER_JUDGE_PROFILE.provider || thread.visibility !== ANSWER_JUDGE_PROFILE.visibility) {
+    throw new Error(`judge thread ${threadId} provider or visibility does not match its run correlation`);
+  }
+  if (typeof thread.environmentId !== "string"
+    || !environment || typeof environment !== "object"
+    || environment.id !== thread.environmentId
+    || environment.projectId !== correlation.projectId
+    || environment.path !== workspaceProof.path
+    || workspaceProof.path !== resolve(workspaceProof.path)
+    || !Number.isSafeInteger(workspaceProof.device)
+    || !Number.isSafeInteger(workspaceProof.inode)) {
+    throw new Error(`judge thread ${threadId} environment identity/path does not match its fresh workspace`);
+  }
+  const approvedMembership = correlation.membership;
+  if (approvedMembership
+    && (thread.environmentId !== approvedMembership.environmentId
+      || environment.path !== approvedMembership.workspace.path
+      || workspaceProof.device !== approvedMembership.workspace.device
+      || workspaceProof.inode !== approvedMembership.workspace.inode)) {
+    throw new Error(`judge thread ${threadId} environment identity changed after audit`);
+  }
+  assertFreshJudgeWorkspaceIdentity(threadId, workspaceProof);
+}
+
+function assertFreshJudgeWorkspaceIdentity(threadId, workspaceProof) {
+  const currentWorkspace = assertFreshJudgeWorkspace(workspaceProof.path);
+  if (currentWorkspace.device !== workspaceProof.device || currentWorkspace.inode !== workspaceProof.inode) {
+    throw new Error(`judge thread ${threadId} environment workspace identity changed`);
+  }
+}
+
+function assertThreadArchiveFields(threadId, thread) {
+  if (!["error", "stopping", "idle", "starting", "active"].includes(thread.status)) {
+    throw new Error(`judge thread ${threadId} status is not a recognized identity field`);
+  }
+  if (thread.archivedAt !== null && !Number.isSafeInteger(thread.archivedAt)) {
+    throw new Error(`judge thread ${threadId} archived identity is invalid`);
+  }
+  if (thread.deletedAt !== null) throw new Error(`judge thread ${threadId} is deleted`);
+}
+
+function buildJudgeThreadMembership(thread, workspaceProof) {
   return {
     id: thread.id,
     projectId: thread.projectId,
     parentThreadId: thread.parentThreadId ?? null,
     title: thread.title,
+    providerId: thread.providerId,
+    visibility: thread.visibility,
+    environmentId: thread.environmentId,
+    workspace: {
+      environmentId: thread.environmentId,
+      path: workspaceProof.path,
+      device: workspaceProof.device,
+      inode: workspaceProof.inode,
+      empty: true,
+    },
+    status: thread.status,
+    archivedAt: thread.archivedAt,
+    deletedAt: thread.deletedAt,
+    execution: null,
   };
+}
+
+async function captureJudgeThreadMembership(threadId, correlation, workspaceProof) {
+  const shown = await readJudgeThreadShow(threadId);
+  assertThreadCorrelation(threadId, shown.thread, correlation);
+  assertThreadProviderAndEnvironment({
+    threadId,
+    thread: shown.thread,
+    environment: shown.environment,
+    correlation,
+    workspaceProof,
+  });
+  assertThreadArchiveFields(threadId, shown.thread);
+  return buildJudgeThreadMembership(shown.thread, workspaceProof);
 }
 
 function parseThreadList(output) {
@@ -263,6 +359,9 @@ function isExactCorrelatedThread(candidate, correlation, project) {
   return candidate && typeof candidate === "object" && !Array.isArray(candidate)
     && typeof candidate.id === "string"
     && candidate.projectId === project
+    && candidate.providerId === ANSWER_JUDGE_PROFILE.provider
+    && candidate.visibility === ANSWER_JUDGE_PROFILE.visibility
+    && typeof candidate.environmentId === "string"
     && candidate.title === correlation.title
     && (candidate.parentThreadId ?? null) === correlation.originThreadId
     && (candidate.archivedAt === undefined || candidate.archivedAt === null)
@@ -274,7 +373,7 @@ async function waitForReconciliationRetry() {
 }
 
 async function assertJudgeEventHighWater(threadId, eventAudit) {
-  const highWaterSequence = eventAudit.eventProjection.at(-1)?.sequence;
+  const highWaterSequence = eventAudit.highWaterSequence;
   if (!Number.isSafeInteger(highWaterSequence)) throw new Error(`judge thread ${threadId} event audit had no high-water sequence`);
   let logOutput;
   try {
@@ -312,7 +411,7 @@ async function reconcileJudgeThread(correlation, project) {
   throw new Error(lastFailure ?? "judge spawn remained ambiguous; no exact thread was reconciled");
 }
 
-async function spawnJudgeThread(spawnArgs, correlation, project) {
+async function spawnJudgeThread(spawnArgs, correlation, project, workspaceProof) {
   let failure = null;
   let spawnOutput = null;
   try {
@@ -324,7 +423,7 @@ async function spawnJudgeThread(spawnArgs, correlation, project) {
     try {
       const returnedThreadId = parseSpawnedThreadId(spawnOutput);
       try {
-        await captureJudgeThreadMembership(returnedThreadId, correlation);
+        await captureJudgeThreadMembership(returnedThreadId, correlation, workspaceProof);
         return { threadId: returnedThreadId, failure: null };
       } catch (error) {
         const detail = error instanceof Error ? error.message : "returned thread membership mismatch";
@@ -344,47 +443,66 @@ async function spawnJudgeThread(spawnArgs, correlation, project) {
   return { threadId: reconciledThreadId, failure };
 }
 
-async function authorizeJudgeCleanup(threadId, correlation, project) {
+async function authorizeJudgeCleanup(threadId, correlation, project, workspaceProof) {
   try {
-    await captureJudgeThreadMembership(threadId, correlation);
+    await captureJudgeThreadMembership(threadId, correlation, workspaceProof);
     return threadId;
   } catch {
     const reconciledThreadId = await reconcileJudgeThread(correlation, project);
-    await captureJudgeThreadMembership(reconciledThreadId, correlation);
+    await captureJudgeThreadMembership(reconciledThreadId, correlation, workspaceProof);
     return reconciledThreadId;
   }
 }
 
-async function cleanupJudgeThreadById(threadId) {
-  if (!threadId) return;
-  const failures = [];
-  let mustStop = true;
-  try {
-    const shown = JSON.parse(await bb(["thread", "show", threadId, "--json"]));
-    const status = shown?.thread?.status ?? shown?.status;
-    if (["idle", "stopped", "error", "archived"].includes(status)) mustStop = false;
-  } catch {
-    failures.push("status inspection failed");
+function assertArchivedTerminalMembership(threadId, membership) {
+  if (!Number.isSafeInteger(membership.archivedAt) || membership.archivedAt <= 0
+    || membership.deletedAt !== null || !["idle", "error"].includes(membership.status)) {
+    throw new Error(`judge thread ${threadId} did not prove an archived terminal identity`);
   }
-  if (mustStop) {
-    try {
-      await bb(["thread", "stop", threadId, "--json"]);
-    } catch {
-      failures.push("stop failed");
-    }
-  }
-  try {
-    await bb(["thread", "archive", threadId, "--json"]);
-  } catch {
-    failures.push("archive failed");
-  }
-  if (failures.length > 0) throw new Error(`judge thread ${threadId} cleanup failed`);
 }
 
-async function cleanupJudgeThread(threadId, correlation, project) {
+async function stopAndArchiveJudgeThread(threadId) {
+  await stopJudgeThread(threadId);
+  let archiveOutput;
+  try {
+    archiveOutput = JSON.parse(await bb(["thread", "archive", threadId, "--json"]));
+  } catch {
+    throw new Error(`judge thread ${threadId} archive returned invalid JSON`);
+  }
+  if (archiveOutput?.ok !== true
+    || !Array.isArray(archiveOutput.archivedThreadIds)
+    || archiveOutput.archivedThreadIds.length !== 1
+    || archiveOutput.archivedThreadIds[0] !== threadId) {
+    throw new Error(`judge thread ${threadId} archive response did not identify exactly that thread`);
+  }
+}
+
+async function stopJudgeThread(threadId) {
+  let stopOutput;
+  try {
+    stopOutput = JSON.parse(await bb(["thread", "stop", threadId, "--json"]));
+  } catch {
+    throw new Error(`judge thread ${threadId} stop returned invalid JSON`);
+  }
+  if (stopOutput?.ok !== true) throw new Error(`judge thread ${threadId} stop was not acknowledged`);
+}
+
+async function archiveJudgeThread(threadId, correlation, workspaceProof) {
+  let current = await captureJudgeThreadMembership(threadId, correlation, workspaceProof);
+  if (current.archivedAt !== null) {
+    assertArchivedTerminalMembership(threadId, current);
+    return current;
+  }
+  await stopAndArchiveJudgeThread(threadId);
+  current = await captureJudgeThreadMembership(threadId, correlation, workspaceProof);
+  assertArchivedTerminalMembership(threadId, current);
+  return current;
+}
+
+async function cleanupJudgeThread(threadId, correlation, project, workspaceProof) {
   if (!threadId || !correlation) throw new Error("judge cleanup correlation was not established");
-  const authorizedThreadId = await authorizeJudgeCleanup(threadId, correlation, project);
-  await cleanupJudgeThreadById(authorizedThreadId);
+  const authorizedThreadId = await authorizeJudgeCleanup(threadId, correlation, project, workspaceProof);
+  await archiveJudgeThread(authorizedThreadId, correlation, workspaceProof);
 }
 
 function cleanupJudgeWorkspace(workspacePath) {
@@ -395,11 +513,11 @@ function cleanupJudgeWorkspace(workspacePath) {
   }
 }
 
-async function cleanupJudgeResources(threadId, workspacePath, runtimeAudit, correlation, project) {
+async function cleanupJudgeResources({ threadId, workspacePath, runtimeAudit, correlation, project, workspaceProof }) {
   let failure = null;
   if (!threadId) runtimeAudit.judgeThreadsCleaned = false;
   try {
-    if (threadId) await cleanupJudgeThread(threadId, correlation, project);
+    if (threadId) await cleanupJudgeThread(threadId, correlation, project, workspaceProof);
   } catch (error) {
     runtimeAudit.judgeThreadsCleaned = false;
     failure = error instanceof Error ? error.message : "judge thread cleanup failed";
@@ -413,9 +531,41 @@ async function cleanupJudgeResources(threadId, workspacePath, runtimeAudit, corr
   if (failure) throw new Error(failure);
 }
 
+async function readJudgeEventLog(threadId) {
+  try {
+    return await bb(["thread", "log", threadId, "--json", "--limit", String(BB_EVENT_LOG_LIMIT)]);
+  } catch (error) {
+    throw new Error(`judge thread ${threadId} event log failed: ${capturedDetail(error)}`);
+  }
+}
+
+function assertJudgeExecution(execution, threadId) {
+  if (!execution
+    || execution.model !== ANSWER_JUDGE_PROFILE.model
+    || execution.reasoningLevel !== ANSWER_JUDGE_PROFILE.reasoningLevel
+    || execution.serviceTier !== ANSWER_JUDGE_PROFILE.serviceTier
+    || execution.permissionMode !== ANSWER_JUDGE_PROFILE.permissionMode) {
+    throw new Error(`judge thread ${threadId} resolved execution tuple does not match the pinned judge profile`);
+  }
+}
+
+function parseJudgeOutput(output, threadId) {
+  let parsed;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error(`judge thread ${threadId} output returned invalid JSON`);
+  }
+  if (!parsed || typeof parsed !== "object" || typeof parsed.output !== "string") {
+    throw new Error(`judge thread ${threadId} output response did not contain a final string output`);
+  }
+  return parsed.output;
+}
+
 async function judgeClause({ options, testCase, clause, runtimeAudit, runId, parentThreadId }) {
   const deterministicReason = detectExplicitClauseViolation(clause.id, testCase.answer);
   const workspacePath = mkdtempSync(join(tmpdir(), "telegram-answer-judge-"));
+  const workspaceProof = assertFreshJudgeWorkspace(workspacePath);
   let threadId = null;
   let correlation = null;
   let verdict = null;
@@ -436,7 +586,7 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       workspace: workspacePath,
       parentThreadId: correlation.originThreadId,
     });
-    const spawned = await spawnJudgeThread(spawnArgs, correlation, options.project);
+    const spawned = await spawnJudgeThread(spawnArgs, correlation, options.project, workspaceProof);
     threadId = spawned.threadId;
     if (spawned.failure) throw spawned.failure;
 
@@ -446,15 +596,24 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       throw new Error(`judge thread ${threadId} did not finish within ${WAIT_SECONDS}s: ${capturedDetail(error)}`);
     }
 
-    membership = await captureJudgeThreadMembership(threadId, correlation);
+    await captureJudgeThreadMembership(threadId, correlation, workspaceProof);
+    const terminalMembership = await archiveJudgeThread(threadId, correlation, workspaceProof);
 
-    let eventLog;
-    try {
-      eventLog = await bb(["thread", "log", threadId, "--json", "--limit", String(BB_EVENT_LOG_LIMIT)]);
-    } catch (error) {
+    const sealedEventLog = await readJudgeEventLog(threadId);
+    const sealedEventAudit = auditJudgeEventLog(sealedEventLog, threadId);
+    if (!sealedEventAudit) {
       runtimeAudit.eventLogsAudited = false;
       runtimeAudit.noToolActivity = false;
-      throw new Error(`judge thread ${threadId} event log failed: ${capturedDetail(error)}`);
+      throw new Error(`judge thread ${threadId} sealed event log did not prove completed no-tool execution`);
+    }
+    assertJudgeExecution(sealedEventAudit.execution, threadId);
+
+    const eventLog = await readJudgeEventLog(threadId);
+    if (createHash("sha256").update(eventLog, "utf8").digest("hex")
+      !== createHash("sha256").update(sealedEventLog, "utf8").digest("hex")) {
+      runtimeAudit.eventLogsAudited = false;
+      runtimeAudit.noToolActivity = false;
+      throw new Error(`judge thread ${threadId} changed between seal and final event capture`);
     }
     const eventAudit = auditJudgeEventLog(eventLog, threadId);
     if (!eventAudit) {
@@ -462,6 +621,7 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       runtimeAudit.noToolActivity = false;
       throw new Error(`judge thread ${threadId} event log did not prove completed no-tool execution`);
     }
+    assertJudgeExecution(eventAudit.execution, threadId);
     isolation = {
       workspace: eventAudit.workspace,
       eventLog: eventAudit.eventLog,
@@ -470,17 +630,30 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       eventCount: eventAudit.eventCount,
     };
 
-    let output;
+    let outputResponse;
     try {
-      output = await bb(["thread", "output", threadId]);
+      outputResponse = await bb(["thread", "output", threadId, "--json"]);
     } catch (error) {
       throw new Error(`judge thread ${threadId} output failed: ${capturedDetail(error)}`);
     }
+    const output = parseJudgeOutput(outputResponse, threadId);
     const outputBinding = bindJudgeOutputToEventAudit(output, eventLog, eventAudit, threadId);
     if (!outputBinding) {
       throw new Error(`judge thread ${threadId} output did not match ordered audited assistant deltas`);
     }
+    if (outputBinding.highWaterSequence !== sealedEventAudit.highWaterSequence) {
+      throw new Error(`judge thread ${threadId} final output high-water differs from the sealed capture`);
+    }
     await assertJudgeEventHighWater(threadId, eventAudit);
+    const finalMembership = await archiveJudgeThread(threadId, correlation, workspaceProof);
+    if (finalMembership.id !== terminalMembership.id
+      || finalMembership.environmentId !== terminalMembership.environmentId
+      || finalMembership.workspace.path !== terminalMembership.workspace.path
+      || finalMembership.archivedAt !== terminalMembership.archivedAt) {
+      throw new Error(`judge thread ${threadId} terminal identity changed after final capture`);
+    }
+    await assertJudgeEventHighWater(threadId, eventAudit);
+    membership = { ...finalMembership, execution: eventAudit.execution };
     verdict = parseClauseVerdict(output, clause.id);
     if (!verdict && !deterministicReason) {
       throw new Error(`judge thread ${threadId} returned a malformed single-clause verdict (captured output length ${output.length})`);
@@ -495,6 +668,7 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       projectId: correlation.projectId,
       parentThreadId: correlation.parentThreadId,
       title: correlation.title,
+      execution: eventAudit.execution,
       membership,
       eventProjection: eventAudit.eventProjection,
       eventLogSha256: createHash("sha256").update(eventLog, "utf8").digest("hex"),
@@ -505,9 +679,18 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       agentMessageItemId: eventAudit.agentMessageItemId,
       outputItemId: outputBinding.outputItemId,
       outputSha256: outputBinding.outputSha256,
+      sealedHighWaterSequence: sealedEventAudit.highWaterSequence,
+      highWaterSequence: outputBinding.highWaterSequence,
     };
   } finally {
-    await cleanupJudgeResources(threadId, workspacePath, runtimeAudit, correlation, options.project);
+    await cleanupJudgeResources({
+      threadId,
+      workspacePath,
+      runtimeAudit,
+      correlation: judgeCorrelation ?? correlation,
+      project: options.project,
+      workspaceProof,
+    });
   }
   return buildClauseAssessment({
     clauseId: clause.id,
@@ -677,10 +860,11 @@ function buildLiveGateArtifact({ runId, selected, caseResults, infrastructureErr
   };
 }
 
-function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, assertCurrentInputs) {
+function writeLiveGateArtifact(preparedTarget, artifact, forbiddenValues, assertCurrentInputs) {
   const serialized = `${JSON.stringify(artifact, null, 2)}\n`;
   publishValidatedArtifact({
-    artifactPath,
+    artifactPath: preparedTarget.targetPath,
+    preparedTarget,
     serialized,
     replace: true,
     validateSerialized: (candidate) => {
@@ -693,15 +877,16 @@ function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, assertCu
 
 async function main() {
   const options = readArguments(process.argv.slice(2));
-  const artifactPath = assertExternalArtifactPath(options.artifact);
-  const corpus = readAnswerCorpus(options.only);
-  const runId = randomUUID();
-  const initialIdentity = readGitIdentity();
-  if (initialIdentity.dirty) fail("answer evaluator repository is dirty; refusing live evaluation");
-  const { selected, expectationsById, goldenSha256, expectationsSha256, finalInputSha256 } = corpus;
-  const parentThreadId = typeof process.env.BB_THREAD_ID === "string" && process.env.BB_THREAD_ID.length > 0
-    ? process.env.BB_THREAD_ID
-    : null;
+  const preparedArtifactTarget = assertExternalArtifactPath(options.artifact);
+  try {
+    const corpus = readAnswerCorpus(options.only);
+    const runId = randomUUID();
+    const initialIdentity = readGitIdentity();
+    if (initialIdentity.dirty) fail("answer evaluator repository is dirty; refusing live evaluation");
+    const { selected, expectationsById, goldenSha256, expectationsSha256, finalInputSha256 } = corpus;
+    const parentThreadId = typeof process.env.BB_THREAD_ID === "string" && process.env.BB_THREAD_ID.length > 0
+      ? process.env.BB_THREAD_ID
+      : null;
 
   process.stdout.write(`answer judge rubric ${ANSWER_RUBRIC_VERSION}; profile ${JSON.stringify(ANSWER_JUDGE_PROFILE)}; clause concurrency ${CLAUSE_CONCURRENCY}\n`);
   const runtimeAudit = createRuntimeAudit();
@@ -762,7 +947,7 @@ async function main() {
     finalInputSha256,
   });
   const forbiddenValues = selected.flatMap((testCase) => [testCase.ownerMessage, testCase.answer]);
-  writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, () => {
+  writeLiveGateArtifact(preparedArtifactTarget, artifact, forbiddenValues, () => {
     verifyFixtureSnapshotUnchanged(corpus.goldenSnapshot, CASES_PATH);
     verifyFixtureSnapshotUnchanged(corpus.expectationsSnapshot, EXPECTATIONS_PATH);
     const finalIdentity = readGitIdentity();
@@ -795,6 +980,9 @@ async function main() {
     process.stdout.write("the rubric disagreed with its golden cases; recalibrate before trusting it\n");
   }
   return artifact.status === "passed" ? 0 : 1;
+  } finally {
+    closePreparedArtifactTarget(preparedArtifactTarget);
+  }
 }
 
 main().then((exitCode) => {

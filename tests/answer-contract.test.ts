@@ -51,7 +51,7 @@ const RELEASE_EXPECTATIONS = {
   "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
 } as const;
 
-type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "infra" | "ambiguous-spawn" | "spawn-error" | "unscoped-output" | "event-after-output" | "unrelated-spawn";
+type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "wrong-execution" | "wrong-environment-path" | "infra" | "ambiguous-spawn" | "spawn-error" | "unscoped-output" | "event-after-output" | "event-between-idle-seal" | "event-between-seal-capture" | "unrelated-spawn" | "missing-environment";
 
 function fakeBbPath(directory: string, mode: FakeBbMode): string {
   const commandPath = join(directory, "bb");
@@ -76,8 +76,13 @@ if (args[0] === "thread" && args[1] === "spawn") {
     title,
     projectId: args[args.indexOf("--project") + 1],
     environmentId: args[args.indexOf("--environment") + 1],
+    environmentPath: args[args.indexOf("--environment") + 1],
+    providerId: "codex",
+    visibility: "hidden",
     parentThreadId: args.includes("--parent-thread") ? args[args.indexOf("--parent-thread") + 1] : null,
     status: "active",
+    archivedAt: null,
+    deletedAt: null,
   };
   fs.writeFileSync(statePath, JSON.stringify(threadState));
   if (mode === "ambiguous-spawn" || mode === "spawn-error") {
@@ -91,7 +96,21 @@ if (args[0] === "thread" && args[1] === "spawn") {
 } else if (args[0] === "thread" && args[1] === "show") {
   const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
   const unrelated = mode === "unrelated-spawn" && args[2] === "thr_fake_unrelated";
-  process.stdout.write(JSON.stringify({ thread: { ...state, id: args[2], status, ...(unrelated ? { projectId: "proj_other", title: "unrelated thread" } : {}) } }));
+  const alreadyArchived = status === "archived";
+  const thread = {
+    ...state,
+    id: args[2],
+    status: alreadyArchived ? "idle" : status === "idle" ? state.status : status,
+    archivedAt: alreadyArchived ? 1234567890 : state.archivedAt,
+    ...(unrelated ? { projectId: "proj_other", title: "unrelated thread" } : {}),
+  };
+  const environment = mode === "missing-environment" ? undefined : {
+    id: state.environmentId,
+    projectId: state.projectId,
+    path: mode === "wrong-environment-path" ? state.environmentPath + "-replacement" : state.environmentPath,
+  };
+  delete thread.environmentPath;
+  process.stdout.write(JSON.stringify({ thread, ...(environment ? { environment } : {}) }));
 } else if (args[0] === "thread" && args[1] === "list") {
   const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
   process.stdout.write(JSON.stringify([
@@ -105,21 +124,29 @@ if (args[0] === "thread" && args[1] === "spawn") {
   const holds = mode === "wrong-bounded-uncertainty" ? clause !== "bounded-uncertainty" : true;
   const assistantOutput = JSON.stringify({ id: clause, holds, why: "fixture reason" });
   const event = (id, seq, type, data, scope) => ({ id, threadId, seq, createdAt: seq, scope, type, data });
+  const lateEvent = event("event_10", 10, "thread/tokenUsage/updated", {}, { kind: "thread" });
   if (args.includes("--after-seq")) {
     process.stdout.write(mode === "event-after-output"
       ? JSON.stringify([event("event_9", 9, "thread/tokenUsage/updated", {}, { kind: "thread" })])
       : "[]");
   } else {
-    process.stdout.write(JSON.stringify([
-      event("event_1", 1, "thread/started", {}, { kind: "thread" }),
-      event("event_2", 2, "turn/started", {}, { kind: "turn", turnId }),
-      event("event_3", 3, "item/started", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
-      event("event_4", 4, "item/completed", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
-      event("event_5", 5, "item/started", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
-      event("event_6", 6, "item/agentMessage/delta", { itemId: "agent_1", delta: mode === "unscoped-output" ? "foreign output" : assistantOutput }, { kind: "turn", turnId }),
-      event("event_7", 7, "item/completed", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
-      event("event_8", 8, "turn/completed", { status: "completed" }, { kind: "turn", turnId }),
-    ]));
+    const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+    state.logReads = (state.logReads ?? 0) + 1;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    const events = [
+      event("event_1", 1, "client/turn/requested", { execution: { model: mode === "wrong-execution" ? "gpt-foreign" : "gpt-5.6-sol", reasoningLevel: "max", serviceTier: "fast", permissionMode: "auto", source: "client/turn/requested" } }, { kind: "thread" }),
+      event("event_2", 2, "thread/started", {}, { kind: "thread" }),
+      event("event_3", 3, "turn/started", {}, { kind: "turn", turnId }),
+      event("event_4", 4, "item/started", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
+      event("event_5", 5, "item/completed", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
+      event("event_6", 6, "item/started", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
+      event("event_7", 7, "item/agentMessage/delta", { itemId: "agent_1", delta: mode === "unscoped-output" ? "foreign output" : assistantOutput }, { kind: "turn", turnId }),
+      event("event_8", 8, "item/completed", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
+      event("event_9", 9, "turn/completed", { status: "completed" }, { kind: "turn", turnId }),
+    ];
+    const addLateEvent = (mode === "event-between-idle-seal" && state.injectLateEvent === true)
+      || (mode === "event-between-seal-capture" && state.logReads === 2);
+    process.stdout.write(JSON.stringify(addLateEvent ? [...events, lateEvent] : events));
   }
 } else if (args[0] === "thread" && args[1] === "output") {
   const clause = clauseFromThread(args[2]);
@@ -129,14 +156,25 @@ if (args[0] === "thread" && args[1] === "spawn") {
     const holds = ${JSON.stringify(mode)} === "wrong-bounded-uncertainty"
       ? clause !== "bounded-uncertainty"
       : true;
-    process.stdout.write(JSON.stringify({
+    process.stdout.write(JSON.stringify({ output: JSON.stringify({
       id: clause,
       holds,
       why: "fixture reason",
-    }));
+    }) }));
   }
 } else if (args[0] === "thread" && (args[1] === "stop" || args[1] === "archive")) {
-  process.stdout.write(JSON.stringify({ ok: true }));
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  if (args[1] === "stop") {
+    state.status = "idle";
+    if (mode === "event-between-idle-seal") state.injectLateEvent = true;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    process.stdout.write(JSON.stringify({ ok: true }));
+  } else {
+    state.status = "idle";
+    state.archivedAt = 1234567890;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    process.stdout.write(JSON.stringify({ ok: true, archivedThreadIds: [args[2]] }));
+  }
 } else {
   process.stderr.write("unexpected fake bb command");
   process.exit(2);
@@ -249,6 +287,7 @@ async function runWithMismatchedAnswerCorpus(
 function buildReleasePassedArtifact(): Record<string, any> {
   const runId = "11111111-1111-4111-8111-111111111111";
   const eventLogForThread = (threadId: string): string => JSON.stringify([
+    { id: "event_execution", threadId, seq: 9, createdAt: 9, scope: { kind: "thread" }, type: "client/turn/requested", data: { execution: { model: "gpt-5.6-sol", reasoningLevel: "max", serviceTier: "fast", permissionMode: "auto", source: "client/turn/requested" } } },
     { id: "event_1", threadId, seq: 10, createdAt: 10, scope: { kind: "thread" }, type: "thread/started" },
     { id: "event_2", threadId, seq: 11, createdAt: 11, scope: { kind: "turn", turnId: "turn_release" }, type: "turn/started", data: {} },
     { id: "event_3", threadId, seq: 12, createdAt: 12, scope: { kind: "turn", turnId: "turn_release" }, type: "item/started", data: { item: { type: "reasoning", id: "reasoning_release" } } },
@@ -259,6 +298,7 @@ function buildReleasePassedArtifact(): Record<string, any> {
     { id: "event_8", threadId, seq: 17, createdAt: 17, scope: { kind: "turn", turnId: "turn_release" }, type: "turn/completed", data: { status: "completed" } },
   ]);
   const eventProjectionForThread = (threadId: string) => [
+    { eventId: "event_execution", threadId, sequence: 9, type: "client/turn/requested", scope: "thread", turnId: null, itemId: null, itemType: null, status: null },
     { eventId: "event_1", threadId, sequence: 10, type: "thread/started", scope: "thread", turnId: null, itemId: null, itemType: null, status: null },
     { eventId: "event_2", threadId, sequence: 11, type: "turn/started", scope: "turn", turnId: "turn_release", itemId: null, itemType: null, status: null },
     { eventId: "event_3", threadId, sequence: 12, type: "item/started", scope: "turn", turnId: "turn_release", itemId: "reasoning_release", itemType: "reasoning", status: null },
@@ -310,21 +350,48 @@ function buildReleasePassedArtifact(): Record<string, any> {
           projectId: "proj_release",
           parentThreadId: "thr_release_origin",
           title,
+          execution: {
+            model: "gpt-5.6-sol",
+            reasoningLevel: "max",
+            serviceTier: "fast",
+            permissionMode: "auto",
+          },
           membership: {
             id: threadId,
             projectId: "proj_release",
             parentThreadId: "thr_release_origin",
             title,
+            providerId: "codex",
+            visibility: "hidden",
+            environmentId: `env_release_${caseIndex}_${clauseIndex}`,
+            workspace: {
+              environmentId: `env_release_${caseIndex}_${clauseIndex}`,
+              path: `/tmp/answer-judge-release-${caseIndex}-${clauseIndex}`,
+              device: 1,
+              inode: caseIndex * ANSWER_CLAUSES.length + clauseIndex + 1,
+              empty: true,
+            },
+            status: "idle",
+            archivedAt: 1234567890,
+            deletedAt: null,
+            execution: {
+              model: "gpt-5.6-sol",
+              reasoningLevel: "max",
+              serviceTier: "fast",
+              permissionMode: "auto",
+            },
           },
           eventProjection: eventProjectionForThread(threadId),
           eventLogSha256,
-          eventCount: 8,
+          eventCount: 9,
           targetTurnId: "turn_release",
           targetTurnStartEventId: "event_2",
           targetTurnCompletionEventId: "event_8",
           agentMessageItemId: "agent_release",
           outputItemId: "agent_release",
           outputSha256: createHash("sha256").update(output, "utf8").digest("hex"),
+          sealedHighWaterSequence: 17,
+          highWaterSequence: 17,
         };
         return expected ? {
           id: clause.id,
@@ -334,7 +401,7 @@ function buildReleasePassedArtifact(): Record<string, any> {
           source: "model",
           judgeThreadId: threadId,
           isolation: {
-            eventCount: 8,
+            eventCount: 9,
             eventLog: "completed-audited",
             toolActivity: "none-observed",
             workspace: "empty-temporary",
@@ -349,7 +416,7 @@ function buildReleasePassedArtifact(): Record<string, any> {
           source: "deterministic",
           judgeThreadId: threadId,
           isolation: {
-            eventCount: 8,
+            eventCount: 9,
             eventLog: "completed-audited",
             toolActivity: "none-observed",
             workspace: "empty-temporary",
@@ -477,6 +544,24 @@ it("binds every judged clause to one generated run and a unique captured trial",
 });
 
 it.each([
+  ["missing authoritative environment", "missing-environment", /environment/i],
+  ["foreign resolved execution tuple", "wrong-execution", /execution tuple/i],
+  ["replacement environment workspace", "wrong-environment-path", /environment identity|workspace/i],
+] as const)("fails closed when judge identity has %s", async (_label, mode, detailPattern) => {
+  const run = await runWithFakeBb("status-good", mode);
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as Record<string, any>;
+    expect(artifact.infrastructureErrors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ detail: expect.stringMatching(detailPattern) }),
+    ]));
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+  }
+});
+
+it.each([
   ["missing captured correlation", (artifact: Record<string, any>) => {
     artifact.cases[0].clauses[0].correlation = null;
   }],
@@ -491,6 +576,32 @@ it.each([
   }],
   ["foreign captured membership", (artifact: Record<string, any>) => {
     artifact.cases[0].clauses[0].correlation.membership.projectId = "proj_foreign";
+  }],
+  ["foreign provider", (artifact: Record<string, any>) => {
+    artifact.cases[0].clauses[0].correlation.membership.providerId = "provider_foreign";
+  }],
+  ["wrong visibility", (artifact: Record<string, any>) => {
+    artifact.cases[0].clauses[0].correlation.membership.visibility = "visible";
+  }],
+  ["missing execution tuple", (artifact: Record<string, any>) => {
+    delete artifact.cases[0].clauses[0].correlation.execution;
+  }],
+  ["missing workspace identity proof", (artifact: Record<string, any>) => {
+    delete artifact.cases[0].clauses[0].correlation.membership.workspace;
+  }],
+  ["foreign environment identity", (artifact: Record<string, any>) => {
+    const membership = artifact.cases[0].clauses[0].correlation.membership;
+    membership.environmentId = "env_foreign";
+  }],
+  ["foreign resolved execution tuple", (artifact: Record<string, any>) => {
+    artifact.cases[0].clauses[0].correlation.execution.model = "gpt-foreign";
+  }],
+  ["duplicate environment identity", (artifact: Record<string, any>) => {
+    const first = artifact.cases[0].clauses[0].correlation.membership;
+    const second = artifact.cases[0].clauses[1].correlation.membership;
+    second.environmentId = first.environmentId;
+    second.workspace.environmentId = first.workspace.environmentId;
+    second.workspace.path = first.workspace.path;
   }],
   ["foreign projected event thread", (artifact: Record<string, any>) => {
     const correlation = artifact.cases[0].clauses[0].correlation;
@@ -891,15 +1002,17 @@ it("audits a completed no-tool event log and fails closed on tool activity", asy
     eventLog: "completed-audited",
     toolActivity: "none-observed",
     workspaceCleanup: "complete",
-    eventCount: 8,
+    eventCount: 9,
   });
   const toolEvents = safeJudgeEventRows();
-  toolEvents[2].data = { item: { type: "commandExecution", id: "command_1" } };
+  const toolItemIndex = toolEvents.findIndex((event) => event.type === "item/started");
+  toolEvents[toolItemIndex].data = { item: { type: "commandExecution", id: "command_1" } };
   expect(audit?.(JSON.stringify(toolEvents), "thr_judge")).toBeNull();
 });
 
 function safeJudgeEventRows(threadId = "thr_judge", turnId = "turn_1") {
   return [
+    { id: "event_execution", threadId, seq: 9, createdAt: 9, scope: { kind: "thread" }, type: "client/turn/requested", data: { execution: { model: "gpt-5.6-sol", reasoningLevel: "max", serviceTier: "fast", permissionMode: "auto", source: "client/turn/requested" } } },
     { id: "event_1", threadId, seq: 10, createdAt: 10, scope: { kind: "thread" }, type: "thread/started" },
     { id: "event_2", threadId, seq: 11, createdAt: 11, scope: { kind: "turn", turnId }, type: "turn/started", data: {} },
     { id: "event_3", threadId, seq: 12, createdAt: 12, scope: { kind: "turn", turnId }, type: "item/started", data: { item: { type: "reasoning", id: "reasoning_1" } } },
@@ -915,18 +1028,29 @@ it.each([
   ["duplicate event id", (events: ReturnType<typeof safeJudgeEventRows>) => { events[3].id = events[2].id; }],
   ["non-strict sequence", (events: ReturnType<typeof safeJudgeEventRows>) => { events[3].seq = events[2].seq + 2; }],
   ["duplicate target start", (events: ReturnType<typeof safeJudgeEventRows>) => {
-    events.splice(2, 0, { ...events[1], id: "event_duplicate_start", seq: 12 });
+    const targetStartIndex = events.findIndex((event) => event.type === "turn/started");
+    events.splice(targetStartIndex, 0, { ...events[targetStartIndex], id: "event_duplicate_start", seq: 12 });
     renumberJudgeEventSequences(events);
   }],
   ["completion before start", (events: ReturnType<typeof safeJudgeEventRows>) => {
-    [events[1], events[7]] = [events[7], events[1]];
+    const startIndex = events.findIndex((event) => event.type === "turn/started");
+    const completionIndex = events.findIndex((event) => event.type === "turn/completed");
+    [events[startIndex], events[completionIndex]] = [events[completionIndex], events[startIndex]];
     renumberJudgeEventSequences(events);
   }],
   ["second target completion", (events: ReturnType<typeof safeJudgeEventRows>) => {
-    events.splice(7, 0, { ...events[7], id: "event_duplicate_completion", seq: 17 });
+    const completionIndex = events.findIndex((event) => event.type === "turn/completed");
+    events.splice(completionIndex, 0, { ...events[completionIndex], id: "event_duplicate_completion", seq: 17 });
     renumberJudgeEventSequences(events);
   }],
-  ["item outside target turn", (events: ReturnType<typeof safeJudgeEventRows>) => { events[2].scope = { kind: "thread" }; }],
+  ["item outside target turn", (events: ReturnType<typeof safeJudgeEventRows>) => {
+    const itemIndex = events.findIndex((event) => event.type === "item/started");
+    events[itemIndex].scope = { kind: "thread" };
+  }],
+  ["duplicate resolved execution", (events: ReturnType<typeof safeJudgeEventRows>) => {
+    events.splice(1, 0, { ...events[0], id: "event_execution_duplicate", seq: 10 });
+    renumberJudgeEventSequences(events);
+  }],
 ] as const)("rejects judge evidence with %s", (_label, mutate) => {
   const events = safeJudgeEventRows();
   mutate(events);
@@ -945,7 +1069,7 @@ it("returns an ordered text-free projection bound to one output turn", () => {
     targetTurnCompletionEventId: "event_8",
     agentMessageItemId: "agent_1",
   });
-  expect(audit?.eventProjection).toHaveLength(8);
+  expect(audit?.eventProjection).toHaveLength(9);
   expect(audit?.eventProjection.every((event) => Object.keys(event).sort().join(",") === "eventId,itemId,itemType,scope,sequence,status,threadId,turnId,type")).toBe(true);
   expect(JSON.stringify(audit)).not.toContain("private judge output");
 });
@@ -953,7 +1077,8 @@ it("returns an ordered text-free projection bound to one output turn", () => {
 it("binds output only when it exactly reconstructs the audited assistant deltas", () => {
   const events = safeJudgeEventRows();
   const output = JSON.stringify({ id: "no-tool-narration", holds: true, why: "audited" });
-  events[5].data = { itemId: "agent_1", delta: output };
+  const deltaIndex = events.findIndex((event) => event.type === "item/agentMessage/delta");
+  events[deltaIndex].data = { itemId: "agent_1", delta: output };
   const audit = auditJudgeEventLog(JSON.stringify(events), "thr_judge");
   expect(audit).not.toBeNull();
   const binding = bindJudgeOutputToEventAudit(output, JSON.stringify(events), audit!, "thr_judge");
@@ -973,17 +1098,15 @@ it("binds output only when it exactly reconstructs the audited assistant deltas"
 
 it("hashes multiple assistant deltas in event order before binding output", () => {
   const events = safeJudgeEventRows();
-  events[5].data = { itemId: "agent_1", delta: "first" };
-  events.splice(6, 0, {
-    ...events[5],
+  const deltaIndex = events.findIndex((event) => event.type === "item/agentMessage/delta");
+  events[deltaIndex].data = { itemId: "agent_1", delta: "first" };
+  events.splice(deltaIndex + 1, 0, {
+    ...events[deltaIndex],
     id: "event_7b",
     seq: 16,
     data: { itemId: "agent_1", delta: "second" },
   } as ReturnType<typeof safeJudgeEventRows>[number]);
-  events[7].id = "event_8";
-  events[7].seq = 17;
-  events[8].id = "event_9";
-  events[8].seq = 18;
+  renumberJudgeEventSequences(events);
   const eventLog = JSON.stringify(events);
   const audit = auditJudgeEventLog(eventLog, "thr_judge");
   expect(audit).not.toBeNull();
@@ -1004,10 +1127,10 @@ it("runs each judge with bounded cleanup and an auditable isolated workspace", a
       .map((line) => JSON.parse(line) as string[]);
     const spawnCommands = invocations.filter((args) => args[0] === "thread" && args[1] === "spawn");
     expect(spawnCommands).toHaveLength(ANSWER_CLAUSES.length);
-    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log" && !args.includes("--after-seq"))).toHaveLength(ANSWER_CLAUSES.length);
-    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log" && args.includes("--after-seq"))).toHaveLength(ANSWER_CLAUSES.length);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log" && !args.includes("--after-seq"))).toHaveLength(ANSWER_CLAUSES.length * 2);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log" && args.includes("--after-seq"))).toHaveLength(ANSWER_CLAUSES.length * 2);
     expect(invocations.filter((args) => args[0] === "thread" && args[1] === "archive")).toHaveLength(ANSWER_CLAUSES.length);
-    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "stop")).toHaveLength(0);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "stop")).toHaveLength(ANSWER_CLAUSES.length);
     expect(spawnCommands.every((args) => args.includes("--environment"))).toBe(true);
     expect(spawnCommands.every((args) => args.includes("--parent-thread") && args[args.indexOf("--parent-thread") + 1] === "thr_test_origin")).toBe(true);
     for (const args of spawnCommands) {
@@ -1059,6 +1182,34 @@ it("rejects output proof when the event high-water advances before the recheck",
   }
 });
 
+it("rejects an event arriving between idle and the authoritative stop/archive seal", async () => {
+  const run = await runWithFakeBb("status-good", "event-between-idle-seal");
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as Record<string, any>;
+    expect(artifact.infrastructureErrors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ detail: expect.stringMatching(/event|seal|no-tool/i) }),
+    ]));
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+  }
+});
+
+it("rejects an event arriving between the seal proof and final capture", async () => {
+  const run = await runWithFakeBb("status-good", "event-between-seal-capture");
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as Record<string, any>;
+    expect(artifact.infrastructureErrors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ detail: expect.stringMatching(/changed|capture|event/i) }),
+    ]));
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+  }
+});
+
 it("cleans only the exact correlated judge when spawn returns an unrelated ID", async () => {
   const run = await runWithFakeBb("status-good", "unrelated-spawn");
   try {
@@ -1079,8 +1230,8 @@ it("cleans only the exact correlated judge when spawn returns an unrelated ID", 
   }
 });
 
-it("does not stop a judge already reported as stopped", async () => {
-  const run = await runWithFakeBb("status-good", "all-hold", "stopped");
+it("does not repeat stop or archive for a judge already sealed", async () => {
+  const run = await runWithFakeBb("status-good", "all-hold", "archived");
   try {
     expect("error" in run).toBe(true);
     if (!("error" in run)) return;
@@ -1090,7 +1241,7 @@ it("does not stop a judge already reported as stopped", async () => {
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
     expect(invocations.filter((args) => args[0] === "thread" && args[1] === "stop")).toHaveLength(0);
-    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "archive")).toHaveLength(ANSWER_CLAUSES.length);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "archive")).toHaveLength(0);
   } finally {
     rmSync(run.directory, { recursive: true, force: true });
     expect(existsSync(run.directory)).toBe(false);
@@ -1174,6 +1325,21 @@ it("keeps a targeted artifact diagnostic and never reports it passed", async () 
     });
     expect(artifact.cases[0].clauses).toHaveLength(ANSWER_CLAUSES.length);
     expect(artifact.infrastructureErrors).toEqual([]);
+    const correlation = artifact.cases[0].clauses[0].correlation;
+    expect(correlation).toMatchObject({
+      execution: { model: "gpt-5.6-sol", reasoningLevel: "max", serviceTier: "fast", permissionMode: "auto" },
+      membership: {
+        providerId: "codex",
+        visibility: "hidden",
+        status: "idle",
+        archivedAt: 1234567890,
+        deletedAt: null,
+        workspace: { empty: true },
+        execution: { model: "gpt-5.6-sol", reasoningLevel: "max", serviceTier: "fast", permissionMode: "auto" },
+      },
+      sealedHighWaterSequence: 9,
+      highWaterSequence: 9,
+    });
     expect(artifactText).not.toContain("fixture reason");
     expect(artifactText).not.toContain("why");
     expect(artifact.cases[0].clauses.every((clause: { correlation?: { eventLog?: unknown; eventProjection?: unknown } | null }) => (
