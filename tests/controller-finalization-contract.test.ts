@@ -1380,7 +1380,9 @@ describe("bounded text heuristics", () => {
     ["gerund test subject", "Regression testing passed.", true],
     ["compound test subject", "Unit and integration tests passed.", true],
     ["relative test subject", "The tests that were run passed.", true],
+    ["relative subject with team", "The tests that the team ran passed.", true],
     ["postposed test subject", "Passed tests.", true],
+    ["postposed quantified subject", "Passed: all tests.", true],
   ] as const)("binds success to the nearest local subject: %s", (_label, text, testSubjectIsNearest) => {
     const pipelineClaim = claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text });
     const executionClaim = claimFinalization({ kind: "execution_result", outcome: "succeeded", text });
@@ -1494,6 +1496,18 @@ describe("bounded text heuristics", () => {
       }),
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not let an outer negator create a no-touch production exception", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: "The tests passed not without touching production.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
   });
 
   it.each([

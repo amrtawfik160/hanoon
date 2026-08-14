@@ -615,8 +615,10 @@ function relativeClauseMarkerBefore(
   for (let index = endIndex - 1; index >= 0; index -= 1) {
     if (isLocalBoundaryToken(tokens[index]!.word)) return null;
     if (!LOCAL_RELATIVE_MARKER.test(tokens[index]!.word)) continue;
-    const between = tokens.slice(index + 1, endIndex);
-    if (between.some((token) => PREDICATE_CHAIN_WORDS.has(token.word))) return index;
+    const relativeClause = tokens.slice(index + 1, endIndex + 1);
+    if (relativeClause.some((token) => PREDICATE_CHAIN_WORDS.has(token.word))) return index;
+    const significantTokens = relativeClause.filter((token) => !isLocalStructuralToken(token.word));
+    if (significantTokens.length >= 2) return index;
   }
   return null;
 }
@@ -837,8 +839,8 @@ function isNoTouchProductionMention(
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
   if (mention.start <= match.end) return false;
-  const between = clause.slice(match.end, mention.start);
-  return /\b(?:without|not)\s+(?:(?:touching|using|accessing|changing|affecting|reaching)\s+|deploying\s+to\s+)(?:the\s+)?$/i.test(between);
+  const localRelation = clause.slice(match.end, mention.start).trim();
+  return /^(?:without|not)\s+(?:(?:touching|using|accessing|changing|affecting|reaching)(?:\s+the)?|deploying\s+to(?:\s+the)?)$/i.test(localRelation);
 }
 
 function isGenuineNegativeProductionPredicate(
