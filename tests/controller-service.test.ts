@@ -14,7 +14,7 @@ import {
   type ControllerExecutionProfile,
 } from "../src/controller/execution-profile";
 import { CONTROLLER_STALL_MS, LunaControllerService } from "../src/controller/service";
-import { completeAcceptedControllerTurn } from "./support/controller-trust-fixtures";
+import { completeAcceptedControllerTurn, validEvidenceInput } from "./support/controller-trust-fixtures";
 
 const evidenceProjector = {
   reconcile: vi.fn(async (...args: unknown[]) => ({
@@ -803,6 +803,75 @@ it("keeps an accepted finalization unconsumed while the provider is active", asy
   expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
   expect(store.readControllerDigest("owner-7-controller", 10)).toEqual([]);
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toBe(accepted.renderedMessage);
+});
+
+it("retires a turn when a legacy accepted envelope fails evidence revalidation", async () => {
+  const { db, store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 68, inputText: "revalidate the accepted answer" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_legacy_envelope", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const evidence = store.recordControllerEvidence({ ...validEvidenceInput(turn), ...fence, now: 2_000 });
+  if (evidence.outcome !== "recorded") throw new Error("legacy envelope evidence fixture was not recorded");
+  const accepted = store.proposeControllerFinalization({
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbEventHighWaterSeq: 0,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope finalization fixture was not accepted");
+  db.prepare(
+    "UPDATE controller_finalizations SET envelope_version = 1, payload_json = ?, rendered_message = ? WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: accepted.finalization.candidate,
+    bbEventHighWaterSeq: 0,
+  }), accepted.finalization.renderedMessage, accepted.finalization.id);
+  db.prepare(
+    "UPDATE controller_evidence SET proof_kinds_json = '[\"command_result\"]' WHERE id = ?",
+  ).run(evidence.evidence.id);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false, completed: true, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "failed",
+    lastError: "Accepted controller finalization failed semantic revalidation",
+  });
 });
 
 it.each(["source_gap", "page_cap"] as const)(

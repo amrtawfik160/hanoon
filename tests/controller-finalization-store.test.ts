@@ -118,6 +118,25 @@ try {
         "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.");
     }
     raceResult = { outcome };
+  } else if (operation === "supervisor") {
+    const outcome = store.claimControllerSupervisorSteer({
+      ...fence,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      expectedThreadId: "thread_race",
+      reason: "tool_budget",
+      inputText: "Stop searching and answer now.",
+    });
+    raceResult = { outcome };
+  } else if (operation === "supervisor-settle") {
+    const outcome = store.settleControllerSupervisorSteer({
+      ...fence,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      reason: "tool_budget",
+      outcome: "applied",
+    });
+    raceResult = { outcome };
   } else if (operation === "crash") {
     const outcome = store.claimControllerCompletionContinuation({
       ...fence,
@@ -189,7 +208,7 @@ function startRaceWorker(
   databasePath: string,
   barrierDir: string,
   label: string,
-  operation: "proposal" | "completion" | "continuation" | "crash",
+  operation: "proposal" | "completion" | "continuation" | "supervisor" | "supervisor-settle" | "crash",
 ): RaceWorker {
   const child = spawn(resolve("node_modules/.bin/vite-node"), [
     "--script",
@@ -352,6 +371,97 @@ it("accepts one evidence-bound candidate and makes it immutable", () => {
   expect(db.prepare(
     "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = ?",
   ).get(turn.id)).toEqual({ count: 1 });
+});
+
+it("revalidates a legacy accepted envelope against current evidence after restart", () => {
+  const fixture = submittedControllerFixture();
+  const evidence = fixture.store.recordControllerEvidence({
+    ...validEvidenceInput(fixture.turn),
+    ...fixture.fence,
+  });
+  if (evidence.outcome !== "recorded") throw new Error("evidence fixture was not recorded");
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope fixture was not accepted");
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: accepted.finalization.candidate,
+    bbEventHighWaterSeq: accepted.finalization.bbEventHighWaterSeq,
+  }), accepted.finalization.id);
+
+  const restarted = fixture.reopen();
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
+    id: accepted.finalization.id,
+    semanticEnvelopeVersion: 1,
+  });
+  expect(restarted.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
+  })).toBe("completed");
+});
+
+it("fails closed when a legacy accepted envelope no longer matches current evidence", () => {
+  const fixture = submittedControllerFixture();
+  const evidence = fixture.store.recordControllerEvidence({
+    ...validEvidenceInput(fixture.turn),
+    ...fixture.fence,
+  });
+  if (evidence.outcome !== "recorded") throw new Error("evidence fixture was not recorded");
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope fixture was not accepted");
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: accepted.finalization.candidate,
+    bbEventHighWaterSeq: accepted.finalization.bbEventHighWaterSeq,
+  }), accepted.finalization.id);
+  fixture.db.prepare(
+    "UPDATE controller_evidence SET proof_kinds_json = '[\"command_result\"]' WHERE id = ?",
+  ).run(evidence.evidence.id);
+
+  const restarted = fixture.reopen();
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+  expect(restarted.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
+  })).toBe("stale");
+  expect(restarted.getControllerTurn(fixture.turn.id)).toMatchObject({ state: "submitted" });
 });
 
 it("rejects finalization while a mutating invocation remains started", () => {
@@ -1216,6 +1326,86 @@ it("persists one digest, outbox row, and consumption when completion races", asy
     expect(db.prepare(
       "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = 'turn_race' AND consumed_at IS NOT NULL",
     ).get()).toEqual({ count: 1 });
+  } finally {
+    stopRaceWorkers(workers);
+    db?.close();
+    await disposeHost?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("claims one supervisor steer across SQLite workers and settles its fold", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "telegram-supervisor-race-"));
+  const barrierDir = resolve(directory, "barriers");
+  const scriptPath = resolve(directory, "race-worker.ts");
+  let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
+  const workers: RaceWorker[] = [];
+  try {
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
+    db = seeded.db;
+    db.pragma("journal_mode = WAL");
+    db.exec(`
+      CREATE TRIGGER pause_supervisor_claim
+      BEFORE INSERT ON controller_supervisor_steer_attempts
+      WHEN NEW.turn_id = 'turn_race'
+      BEGIN
+        SELECT task8_race_pause();
+      END
+    `);
+    db.close();
+    db = undefined;
+    writeFileSync(scriptPath, raceWorkerSource());
+    mkdirSync(barrierDir);
+    workers.push(
+      startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "0", "supervisor"),
+      startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "1", "supervisor"),
+    );
+
+    const results = await releaseRace(barrierDir, workers);
+    expect(results.map(({ outcome }) => outcome).sort()).toEqual(["claimed", "pending"]);
+
+    db = new Database(seeded.databasePath);
+    expect(db.prepare(
+      `SELECT state, idempotency_key FROM controller_supervisor_steer_attempts
+        WHERE turn_id = 'turn_race' AND reason = 'tool_budget'`,
+    ).get()).toEqual({
+      state: "pending",
+      idempotency_key: "controller-supervisor:turn_race:tool_budget",
+    });
+    db.close();
+    db = undefined;
+
+    const settleDirectory = mkdtempSync(join(tmpdir(), "telegram-supervisor-settle-"));
+    const settleBarrierDir = resolve(settleDirectory, "barriers");
+    mkdirSync(settleBarrierDir);
+    const settleWorker = startRaceWorker(
+      scriptPath,
+      seeded.databasePath,
+      settleBarrierDir,
+      "0",
+      "supervisor-settle",
+    );
+    try {
+      await waitForFile(resolve(settleBarrierDir, "ready-0"));
+      writeFileSync(resolve(settleBarrierDir, "go"), "go");
+      await waitForFile(resolve(settleBarrierDir, "attempting-0"));
+      await expect(settleWorker.result).resolves.toEqual({ outcome: "settled" });
+    } finally {
+      stopRaceWorkers([settleWorker]);
+      rmSync(settleDirectory, { recursive: true, force: true });
+    }
+
+    db = new Database(seeded.databasePath);
+    expect(db.prepare(
+      `SELECT state, settled_at FROM controller_supervisor_steer_attempts
+        WHERE turn_id = 'turn_race' AND reason = 'tool_budget'`,
+    ).get()).toMatchObject({ state: "applied", settled_at: 2_000 });
+    expect(db.prepare(
+      `SELECT supervisor_steers, supervisor_reasons FROM controller_turns
+        WHERE id = 'turn_race'`,
+    ).get()).toEqual({ supervisor_steers: 1, supervisor_reasons: "tool_budget" });
   } finally {
     stopRaceWorkers(workers);
     db?.close();

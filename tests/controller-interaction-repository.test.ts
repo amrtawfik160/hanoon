@@ -12,12 +12,13 @@ import {
   type ControllerInteractionAnswer,
   type ControllerInteraction,
 } from "../src/storage/controller-interaction-repository";
-import { migrateControllerInteractionStorage } from "../src/storage/store";
+import { migrateControllerInteractionStorage, openStore } from "../src/storage/store";
 import {
   controllerInteractionToken,
   parseControllerInteractionResolution,
   parseControllerInteraction,
   questionOptionToken,
+  threadDecisionToken,
 } from "../src/controller/questions";
 
 const SHIPPED_MIGRATION_COUNT = 29;
@@ -176,10 +177,10 @@ function closeCurrentFixture(fixture: CurrentFixture): void {
   rmSync(fixture.directory, { recursive: true, force: true });
 }
 
-function legacyQuestionDatabaseFixture() {
+function legacyQuestionDatabaseFixture(migrationCount = SHIPPED_MIGRATION_COUNT) {
   const { bb } = createFakePluginHost({ pluginId: "telegram-controller-interaction-migration" });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, SHIPPED_MIGRATION_COUNT));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationCount));
   const controllerKey = "owner-7-controller";
   const turnId = "turn_legacy_question";
   const threadId = "thr_legacy_controller";
@@ -256,6 +257,21 @@ function expectLegacyMigrationRollback(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
   ).get()).toBeUndefined();
   expect(fixture.legacyRows()).toEqual(originalRows);
+}
+
+function expectLegacyMigrationQuarantine(
+  fixture: ReturnType<typeof legacyQuestionDatabaseFixture>,
+): void {
+  expect(fixture.db.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: 33 });
+  expect(fixture.db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_questions WHERE state IN ('pending', 'answered')",
+  ).get()).toEqual({ count: 0 });
+  expect(fixture.db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_interactions WHERE state IN ('pending', 'answered')",
+  ).get()).toEqual({ count: 0 });
+  expect(fixture.db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_interaction_quarantine WHERE source = 'controller_questions'",
+  ).get()).toEqual({ count: 1 });
 }
 
 function controllerInteraction(
@@ -407,8 +423,8 @@ async function runInteractionRace(
   }
 }
 
-it("pins the shipped migration bytes and appends the interaction and steer migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(31);
+it("pins the shipped migration bytes and appends the runtime repair migrations", () => {
+  expect(ALL_MIGRATIONS).toHaveLength(34);
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
   );
@@ -418,6 +434,9 @@ it("pins the shipped migration bytes and appends the interaction and steer migra
   expect(ALL_MIGRATIONS[29]).toContain("CREATE TABLE controller_interactions");
   expect(ALL_MIGRATIONS[29]).toContain("CHECK (state = 'delivered'");
   expect(ALL_MIGRATIONS[30]).toContain("steer_reservation_turn_id");
+  expect(ALL_MIGRATIONS[31]).toContain("controller_supervisor_steer_attempts");
+  expect(ALL_MIGRATIONS[32]).toContain("controller_interaction_quarantine");
+  expect(ALL_MIGRATIONS[33]).toContain("envelope_version");
 });
 
 it("copies legacy questions once, preserves their table, and restores the active pointer", () => {
@@ -437,7 +456,10 @@ it("copies legacy questions once, preserves their table, and restores the active
     controller_generation_id: fixture.generationId,
     kind: "user_question",
     state: "answered",
-    answer_json: JSON.stringify({ question_1: { selected: ["first"] } }),
+    answer_json: JSON.stringify({
+      kind: "user_answer",
+      answers: { question_1: { selected: ["first"] } },
+    }),
     delivered_at: null,
   });
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_questions").get()).toEqual({ count: 1 });
@@ -446,6 +468,218 @@ it("copies legacy questions once, preserves their table, and restores the active
 
   fixture.migrateRemaining();
   expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM controller_interactions").get()).toEqual({ count: 1 });
+});
+
+it("quarantines pre-repair controller and watched-thread approvals while revalidating user questions", () => {
+  const fixture = legacyQuestionDatabaseFixture(31);
+  const { db } = fixture;
+  db.prepare(
+    `INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at)
+     VALUES (1, '7', '70', 1, NULL)`,
+  ).run();
+  db.prepare(
+    `UPDATE executor_lease SET owner_id = 'executor', generation = 1,
+       heartbeat_at = 2_000, lease_expires_at = 30_000 WHERE singleton = 1`,
+  ).run();
+
+  const insertController = db.prepare(
+    `INSERT INTO controller_interactions (
+       interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
+       kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+  );
+  const insertButtonedOutbox = db.prepare(
+    `INSERT INTO outbox (
+       logical_key, chat_id, message_id, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, '70', 17, ?, 'sent', 0, 2_000, 2_000, 2_000)`,
+  );
+  const oldButtons = JSON.stringify({
+    text: "old interaction",
+    reply_markup: { inline_keyboard: [[{ text: "Act", callback_data: "old" }]] },
+  });
+  const controllerRow = {
+    turnId: fixture.turnId,
+    key: fixture.controllerKey,
+    thread: fixture.threadId,
+    generation: fixture.generationId,
+  };
+  const validQuestionId = "current_valid_question";
+  const unsafeQuestionId = "current_unsafe_question";
+  const approvalId = "current_approval";
+  const sessionApprovalId = "current_session_approval";
+  insertController.run(
+    validQuestionId,
+    controllerRow.turnId,
+    controllerRow.key,
+    controllerRow.thread,
+    controllerRow.generation,
+    "user_question",
+    JSON.stringify(questionPayload()),
+    "pending",
+    null,
+    2_000,
+    null,
+  );
+  insertController.run(
+    unsafeQuestionId,
+    controllerRow.turnId,
+    controllerRow.key,
+    controllerRow.thread,
+    controllerRow.generation,
+    "user_question",
+    JSON.stringify({
+      kind: "user_question",
+      questions: [{
+        id: "question_1",
+        prompt: "callback https://example.test/hook",
+        options: [],
+        allowFreeText: true,
+      }],
+    }),
+    "pending",
+    null,
+    2_001,
+    null,
+  );
+  insertController.run(
+    approvalId,
+    controllerRow.turnId,
+    controllerRow.key,
+    controllerRow.thread,
+    controllerRow.generation,
+    "approval",
+    JSON.stringify(approvalPayload()),
+    "answered",
+    JSON.stringify({ decision: "deny" }),
+    2_002,
+    2_003,
+  );
+  insertController.run(
+    sessionApprovalId,
+    controllerRow.turnId,
+    controllerRow.key,
+    controllerRow.thread,
+    controllerRow.generation,
+    "approval",
+    JSON.stringify(approvalPayload({ availableDecisions: ["allow_for_session"] })),
+    "pending",
+    null,
+    2_004,
+    null,
+  );
+  for (const interactionId of [validQuestionId, unsafeQuestionId, approvalId, sessionApprovalId]) {
+    insertButtonedOutbox.run(`controller-interaction:${interactionId}:0`, oldButtons);
+  }
+  db.prepare("UPDATE controller_turns SET awaiting_interaction_id = ? WHERE id = ?")
+    .run(validQuestionId, fixture.turnId);
+
+  const threadQuestionId = "watched_valid_question";
+  const threadApprovalId = "watched_approval";
+  const threadAnsweredApprovalId = "watched_answered_approval";
+  const insertThread = db.prepare(
+    `INSERT INTO thread_interactions (
+       interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insertThread.run(
+    threadQuestionId,
+    "watched-thread",
+    "Watched question",
+    "user_question",
+    JSON.stringify(questionPayload()),
+    "pending",
+    null,
+    2_000,
+    null,
+  );
+  insertThread.run(
+    threadApprovalId,
+    "watched-thread",
+    "Watched approval",
+    "approval",
+    JSON.stringify(approvalPayload()),
+    "pending",
+    null,
+    2_001,
+    null,
+  );
+  insertThread.run(
+    threadAnsweredApprovalId,
+    "watched-thread",
+    "Watched answered approval",
+    "approval",
+    JSON.stringify(approvalPayload()),
+    "answered",
+    JSON.stringify({ decision: "deny" }),
+    2_002,
+    2_003,
+  );
+  for (const interactionId of [threadQuestionId, threadApprovalId, threadAnsweredApprovalId]) {
+    insertButtonedOutbox.run(`thread-interaction:${interactionId}`, oldButtons);
+  }
+
+  fixture.migrateRemaining();
+
+  expect(db.prepare(
+    `SELECT state, kind, answer_json FROM controller_interactions
+      WHERE interaction_id IN (?, ?, ?) ORDER BY interaction_id`,
+  ).all(unsafeQuestionId, approvalId, sessionApprovalId)).toEqual([
+    { state: "delivered", kind: "approval", answer_json: null },
+    { state: "delivered", kind: "approval", answer_json: null },
+    { state: "delivered", kind: "user_question", answer_json: null },
+  ]);
+  expect(db.prepare(
+    `SELECT state, kind FROM controller_interactions WHERE interaction_id = ?`,
+  ).get(validQuestionId)).toEqual({ state: "pending", kind: "user_question" });
+  expect(db.prepare(
+    "SELECT awaiting_interaction_id FROM controller_turns WHERE id = ?",
+  ).get(fixture.turnId)).toEqual({ awaiting_interaction_id: validQuestionId });
+  expect(db.prepare(
+    `SELECT interaction_id, state, answer_json FROM thread_interactions
+      WHERE interaction_id IN (?, ?, ?) ORDER BY interaction_id`,
+  ).all(threadApprovalId, threadAnsweredApprovalId, threadQuestionId)).toEqual([
+    { interaction_id: threadAnsweredApprovalId, state: "delivered", answer_json: null },
+    { interaction_id: threadApprovalId, state: "delivered", answer_json: null },
+    { interaction_id: threadQuestionId, state: "pending", answer_json: null },
+  ]);
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_interaction_quarantine",
+  ).get()).toEqual({ count: 7 });
+
+  for (const logicalKey of [
+    `controller-interaction:${unsafeQuestionId}:0`,
+    `controller-interaction:${approvalId}:0`,
+    `controller-interaction:${sessionApprovalId}:0`,
+    `thread-interaction:${threadApprovalId}`,
+    `thread-interaction:${threadAnsweredApprovalId}`,
+  ]) {
+    const row = db.prepare("SELECT payload_json FROM outbox WHERE logical_key = ?").get(logicalKey) as { payload_json: string };
+    expect(JSON.parse(row.payload_json)).toMatchObject({ reply_markup: { inline_keyboard: [] } });
+  }
+  expect(JSON.parse((db.prepare(
+    "SELECT payload_json FROM outbox WHERE logical_key = ?",
+  ).get(`controller-interaction:${validQuestionId}:0`) as { payload_json: string }).payload_json))
+    .toMatchObject({ reply_markup: { inline_keyboard: expect.any(Array) } });
+  expect(JSON.parse((db.prepare(
+    "SELECT payload_json FROM outbox WHERE logical_key = ?",
+  ).get(`thread-interaction:${threadQuestionId}`) as { payload_json: string }).payload_json))
+    .toMatchObject({ reply_markup: { inline_keyboard: expect.any(Array) } });
+
+  const repository = new ControllerInteractionRepository(db);
+  expect(repository.answerByToken({
+    token: controllerInteractionToken(approvalId, "deny"),
+    userId: "7",
+    chatId: "70",
+    now: 2_010,
+  })).toEqual({ ok: false, reason: "stale" });
+  const store = openStore(fixture.bb.storage, fixture.bb.storage.kv, () => 2_010);
+  expect(store.answerThreadInteraction({
+    token: threadDecisionToken(threadApprovalId, "allow_once"),
+    userId: "7",
+    chatId: "70",
+    now: 2_010,
+  })).toEqual({ ok: false, reason: "stale" });
 });
 
 it("preserves and exposes a valid partial pending legacy answer", () => {
@@ -457,7 +691,13 @@ it("preserves and exposes a valid partial pending legacy answer", () => {
 
   expect(fixture.db.prepare(
     "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
-  ).get("legacy_partial_interaction")).toEqual({ state: "pending", answer_json: partial });
+  ).get("legacy_partial_interaction")).toEqual({
+    state: "pending",
+    answer_json: JSON.stringify({
+      kind: "user_answer",
+      answers: { question_1: { selected: [], freeText: "keep this answer" } },
+    }),
+  });
   expect(new ControllerInteractionRepository(fixture.db).getPending(fixture.controllerKey)).toMatchObject({
     interactionId: "legacy_partial_interaction",
     answers: { question_1: { selected: [], freeText: "keep this answer" } },
@@ -480,7 +720,12 @@ it("migrates valid Unicode questions and preserves their pending answer bytes", 
 
   expect(fixture.db.prepare(
     "SELECT answer_json FROM controller_interactions WHERE interaction_id = ?",
-  ).get("legacy_unicode_interaction")).toEqual({ answer_json: partial });
+  ).get("legacy_unicode_interaction")).toEqual({
+    answer_json: JSON.stringify({
+      kind: "user_answer",
+      answers: { "質問一": { selected: ["第一経路"], freeText: "安全な回答" } },
+    }),
+  });
   expect(new ControllerInteractionRepository(fixture.db).getPending(fixture.controllerKey)).toMatchObject({
     answers: { "質問一": { selected: ["第一経路"], freeText: "安全な回答" } },
   });
@@ -531,14 +776,12 @@ it.each([
        VALUES ('gen_legacy_ambiguous', ?, 'thr_legacy_other', 2, NULL, NULL)`,
     ).run(fixture.controllerKey);
   }],
-] as const)("aborts atomically for %s legacy identity", (_name, changeSource) => {
+] as const)("quarantines a legacy row with %s identity", (_name, changeSource) => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("pending");
   changeSource(fixture);
-  const originalRows = fixture.legacyRows();
-
-  expect(() => fixture.migrateRemaining()).toThrow();
-  expectLegacyMigrationRollback(fixture, originalRows);
+  fixture.migrateRemaining();
+  expectLegacyMigrationQuarantine(fixture);
 });
 
 it.each([
@@ -551,27 +794,23 @@ it.each([
        VALUES ('gen_legacy_ambiguous_answered', ?, 'thr_legacy_other', 2, NULL, NULL)`,
     ).run(fixture.controllerKey);
   }],
-] as const)("rolls back an answered legacy row for %s identity", (_name, changeSource) => {
+] as const)("quarantines an answered legacy row for %s identity", (_name, changeSource) => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("answered", "legacy_answered_identity");
   changeSource(fixture);
-  const originalRows = fixture.legacyRows();
-
-  expect(() => fixture.migrateRemaining()).toThrow();
-  expectLegacyMigrationRollback(fixture, originalRows);
+  fixture.migrateRemaining();
+  expectLegacyMigrationQuarantine(fixture);
 });
 
 it.each([
   ["invalid JSON", "{not-json"],
   ["unknown question", JSON.stringify({ unknown: { selected: ["first"] } })],
   ["unknown option", JSON.stringify({ question_1: { selected: ["third"] } })],
-] as const)("rolls back a pending legacy row with %s answers", (_name, answersJson) => {
+] as const)("quarantines a pending legacy row with %s answers", (_name, answersJson) => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("pending", "legacy_invalid_partial", answersJson);
-  const originalRows = fixture.legacyRows();
-
-  expect(() => fixture.migrateRemaining()).toThrow();
-  expectLegacyMigrationRollback(fixture, originalRows);
+  fixture.migrateRemaining();
+  expectLegacyMigrationQuarantine(fixture);
 });
 
 const SHELL_ASSIGNMENT_TEXTS = [
@@ -629,7 +868,6 @@ const INVALID_LEGACY_PROJECTIONS = [
   }), "{}"],
   ["duplicate question id", "pending", legacyQuestionsJson((questions) => { questions.push({ ...questions[0] }); }), "{}"],
   ["reserved question id", "pending", legacyQuestionsJson((questions) => { questions[0]!.id = "__proto__"; }), "{}"],
-  ["missing options array", "pending", legacyQuestionsJson((questions) => { delete questions[0]!.options; }), "{}"],
   ["too many options", "pending", legacyQuestionsJson((questions) => {
     const options = questions[0]!.options as unknown[];
     options.push(...options, ...options, ...options, ...options);
@@ -701,14 +939,12 @@ const INVALID_LEGACY_PROJECTIONS = [
 ] as const;
 
 it.each(INVALID_LEGACY_PROJECTIONS)(
-  "rolls back an active legacy row with %s",
+  "quarantines an active legacy row with %s",
   (_name, state, questionsJson, answersJson) => {
     const fixture = legacyQuestionDatabaseFixture();
     fixture.insertQuestion(state, "legacy_invalid_projection", answersJson, questionsJson);
-    const originalRows = fixture.legacyRows();
-
-    expect(() => fixture.migrateRemaining()).toThrow();
-    expectLegacyMigrationRollback(fixture, originalRows);
+    fixture.migrateRemaining();
+    expectLegacyMigrationQuarantine(fixture);
   },
 );
 
@@ -721,24 +957,25 @@ const INVALID_LEGACY_INTERACTION_IDS = [
 ] as const;
 
 it.each(INVALID_LEGACY_INTERACTION_IDS)(
-  "rejects %s before creating the tail table",
+  "quarantines %s without creating callback authority",
   (_name, interactionId) => {
     const fixture = legacyQuestionDatabaseFixture();
     fixture.insertQuestion("pending", interactionId);
-    const originalRows = fixture.legacyRows();
-
-    expect(() => fixture.migrateRemaining()).toThrow();
-    expectLegacyMigrationRollback(fixture, originalRows);
+    fixture.migrateRemaining();
+    expectLegacyMigrationQuarantine(fixture);
   },
 );
 
-it("rejects an active pending legacy row without an answer map", () => {
+it("preserves a valid pending legacy row without an answer map", () => {
   const fixture = legacyQuestionDatabaseFixture();
   fixture.insertQuestion("pending", "legacy_missing_pending_answers", null);
-  const originalRows = fixture.legacyRows();
-
-  expect(() => fixture.migrateRemaining()).toThrow();
-  expectLegacyMigrationRollback(fixture, originalRows);
+  fixture.migrateRemaining();
+  expect(fixture.db.prepare(
+    "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
+  ).get("legacy_missing_pending_answers")).toEqual({ state: "pending", answer_json: null });
+  expect(fixture.db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_interaction_quarantine WHERE source = 'controller_questions'",
+  ).get()).toEqual({ count: 0 });
 });
 
 it("rolls back a nested tail failure after the exact legacy preflight", () => {

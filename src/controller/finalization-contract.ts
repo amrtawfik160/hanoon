@@ -169,13 +169,7 @@ const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|too
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
-const NON_SUCCESS_CLAUSE = [
-  /\?\s*$/,
-  /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't)\b/i,
-  /\b(?:failed|failure|unsuccessful|denied|interrupted)\b/i,
-  /\b(?:will|would|could|should|plan to|intend to|propose|after approval|later)\b/i,
-  /\b(?:may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i,
-];
+const NON_AFFIRMATIVE_OPERATIONAL_PREFIX = /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't|will|would|could|should|plan to|intend to|propose|after approval|later|may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
@@ -494,7 +488,7 @@ type OperationalMatch = Readonly<{
 }>;
 
 function operationalMatchesIn(clause: string): OperationalMatch[] {
-  if (NON_SUCCESS_CLAUSE.some((pattern) => pattern.test(clause))) return [];
+  if (/\?/.test(clause)) return [];
   const matches: OperationalMatch[] = [];
   for (const assertion of OPERATIONAL_ASSERTIONS) {
     const flags = assertion.pattern.flags.includes("g") ? assertion.pattern.flags : `${assertion.pattern.flags}g`;
@@ -509,7 +503,14 @@ function operationalMatchesIn(clause: string): OperationalMatch[] {
       match = scanner.exec(clause);
     }
   }
-  return matches;
+  return matches.filter((match) => {
+    // Keep polarity local to the predicate being matched. A negative phrase
+    // elsewhere in the same unsplit clause must not erase an affirmative
+    // assertion, while "was not deployed" and "may have succeeded" stay
+    // non-affirmative. Punctuation marks the smallest safe local boundary.
+    const localPrefix = clause.slice(0, match.start).split(/[,();:]/u).at(-1) ?? "";
+    return !NON_AFFIRMATIVE_OPERATIONAL_PREFIX.test(localPrefix);
+  });
 }
 
 function effectiveOperationalMatches(clause: string): OperationalMatch[] {
@@ -631,7 +632,11 @@ function hasIncompatibleClaimText(
       if (!onlySegment || onlySegment.type !== "claim") return true;
       if (!match.assertion.kinds.includes(onlySegment.kind) || onlySegment.outcome !== "succeeded") return true;
       const rows = evidenceRows(onlySegment, context);
-      if (match.assertion.requiredProofKinds?.some((requiredProof) => (
+      const requiredProofKinds = [
+        ...(match.assertion.requiredProofKinds ?? []),
+        ...(/\bproduction\b/i.test(clause) ? ["production_outcome" as const] : []),
+      ];
+      if (requiredProofKinds.some((requiredProof) => (
         !rows.some((row) => row.proofKinds.includes(requiredProof))
       ))) return true;
     }

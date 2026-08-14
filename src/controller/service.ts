@@ -1,4 +1,8 @@
-import type { ControllerSteerReservation, TelegramAgentStore } from "../storage/store";
+import type {
+  ControllerSteerReservation,
+  ControllerSupervisorSteerAttempt,
+  TelegramAgentStore,
+} from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
 import {
   ControllerImagePreparationError,
@@ -216,6 +220,7 @@ export class LunaControllerService {
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
 
     if (await this.reconcileReservedSteer(controller.controllerKey, fence, signal)) return true;
+    if (await this.reconcilePendingSupervisorSteer(submitted.id, fence, signal)) return true;
     turn = this.dependencies.store.getControllerTurn(submitted.id);
     controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
@@ -285,6 +290,15 @@ export class LunaControllerService {
     const accepted = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
     const parked = turn.awaitingInteractionId;
     if (parked !== null) return true;
+    if (turn.acceptedFinalizationId !== null && accepted === null) {
+      this.failAndRetire(
+        turn,
+        controller,
+        fence,
+        "Accepted controller finalization failed semantic revalidation",
+      );
+      return true;
+    }
     if (status === "active" || status === "starting" || status === "stopping") {
       if (!accepted) {
         this.dependencies.store.refreshControllerDraft({
@@ -312,9 +326,6 @@ export class LunaControllerService {
           } catch {
             // A thrown call may have reached BB; reconcile before choosing any retry.
             outcome = await this.reconcileProviderSteer({
-              controllerKey: turn.controllerKey,
-              runningTurnId: turn.id,
-              waitingTurnId: waiting.id,
               threadId: controller.threadId,
               inputText: waiting.inputText,
               idempotencyKey: `controller-steer:${turn.id}:${waiting.id}`,
@@ -393,8 +404,27 @@ export class LunaControllerService {
     return settled === "settled" || settled === "stale";
   }
 
+  private async reconcilePendingSupervisorSteer(
+    turnId: string,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const attempt = this.dependencies.store.getPendingControllerSupervisorSteer(turnId);
+    if (!attempt) return false;
+    const providerOutcome = await this.reconcileProviderSteer(attempt, signal);
+    const outcome = providerOutcome === "applied" ? "applied" : "unknown";
+    const settled = this.dependencies.store.settleControllerSupervisorSteer({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: attempt.turnId,
+      controllerKey: attempt.controllerKey,
+      reason: attempt.reason,
+      outcome,
+    });
+    return settled === "settled" || settled === "stale";
+  }
+
   private async reconcileProviderSteer(
-    reservation: ControllerSteerReservation,
+    reservation: Pick<ControllerSteerReservation | ControllerSupervisorSteerAttempt, "threadId" | "inputText" | "idempotencyKey">,
     signal: AbortSignal,
   ): Promise<ControllerSteerReconciliation> {
     const reconcile = this.dependencies.adapter.reconcileSteer;
@@ -808,6 +838,7 @@ export class LunaControllerService {
   ): Promise<boolean> {
     const turn = this.dependencies.store.getControllerTurn(turnId);
     if (!turn || turn.state !== "submitted" || controller.threadId === null ||
+        turn.acceptedFinalizationId !== null ||
         this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
     const decision = evaluateSupervisor({
       toolCalls: turn.toolCalls,
@@ -820,21 +851,40 @@ export class LunaControllerService {
     });
     if (decision.kind === "continue") return false;
     if (decision.kind === "steer") {
-      if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
-      if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
-      try {
-        await this.dependencies.adapter.steer(controller.threadId, decision.text, signal);
-      } catch {
-        // A nudge that did not land is not worth failing an answer over. The
-        // hard budget still stops the turn, and the next poll may deliver it.
-        return false;
-      }
-      if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
-      return this.dependencies.store.recordControllerSupervisorSteer({
+      const claim = this.dependencies.store.claimControllerSupervisorSteer({
         ...fenceAt(fence, this.dependencies.clock.now()),
         turnId,
+        controllerKey: turn.controllerKey,
+        expectedThreadId: controller.threadId,
         reason: decision.reason,
+        inputText: decision.text,
       });
+      if (claim === "stale" || claim === "settled") return true;
+      const attempt = this.dependencies.store.getControllerSupervisorSteerAttempt(turnId, decision.reason);
+      if (!attempt) return true;
+      if (claim === "pending") return this.reconcilePendingSupervisorSteer(turnId, fence, signal);
+
+      let outcome: "applied" | "unknown" = "unknown";
+      try {
+        if (!signal.aborted) {
+          await this.dependencies.adapter.steer(attempt.threadId, attempt.inputText, signal);
+          outcome = "applied";
+        }
+      } catch {
+        // The provider boundary is ambiguous. Reconcile once when the
+        // adapter can prove whether this idempotency key landed; otherwise
+        // settle unknown so a successor never replays it.
+        const reconciled = await this.reconcileProviderSteer(attempt, signal);
+        outcome = reconciled === "applied" ? "applied" : "unknown";
+      }
+      const settled = this.dependencies.store.settleControllerSupervisorSteer({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId,
+        controllerKey: turn.controllerKey,
+        reason: decision.reason,
+        outcome,
+      });
+      return settled === "settled" || settled === "stale";
     }
     if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
     this.failAndRetire(

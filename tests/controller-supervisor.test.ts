@@ -155,7 +155,12 @@ function storeFixture(name: string) {
   // Long enough that the stall watchdog stays out of these tests.
   const lease = store.acquireExecutorLease("executor", 2_000, 60 * 60_000);
   if (!lease.acquired) throw new Error("missing lease");
-  return { store, fence: { ownerId: "executor", generation: lease.generation } };
+  return {
+    db: bb.storage.database(),
+    store,
+    fence: { ownerId: "executor", generation: lease.generation },
+    reopen: () => openStore(bb.storage, bb.storage.kv, () => 2_000),
+  };
 }
 
 function submittedTurn(
@@ -279,9 +284,44 @@ it("records one steer per reason and refuses a duplicate", () => {
   const turn = submittedTurn(store, fence);
   const at = (now: number) => ({ ...fence, now });
 
-  expect(store.recordControllerSupervisorSteer({ ...at(2_004), turnId: turn.id, reason: "tool_budget" })).toBe(true);
-  expect(store.recordControllerSupervisorSteer({ ...at(2_005), turnId: turn.id, reason: "tool_budget" })).toBe(false);
-  expect(store.recordControllerSupervisorSteer({ ...at(2_006), turnId: turn.id, reason: "token_budget" })).toBe(true);
+  expect(store.claimControllerSupervisorSteer({
+    ...at(2_004),
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
+    reason: "tool_budget",
+    inputText: "budget nudge",
+  })).toBe("claimed");
+  expect(store.claimControllerSupervisorSteer({
+    ...at(2_005),
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
+    reason: "tool_budget",
+    inputText: "budget nudge",
+  })).toBe("pending");
+  expect(store.settleControllerSupervisorSteer({
+    ...at(2_005),
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    reason: "tool_budget",
+    outcome: "applied",
+  })).toBe("settled");
+  expect(store.claimControllerSupervisorSteer({
+    ...at(2_006),
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
+    reason: "token_budget",
+    inputText: "budget nudge",
+  })).toBe("claimed");
+  expect(store.settleControllerSupervisorSteer({
+    ...at(2_006),
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    reason: "token_budget",
+    outcome: "unknown",
+  })).toBe("settled");
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({
     supervisorSteers: 2,
@@ -289,17 +329,46 @@ it("records one steer per reason and refuses a duplicate", () => {
   });
 });
 
+it("rolls back a supervisor attempt when its durable fold is not applied", () => {
+  const { db, store, fence } = storeFixture("fold-race");
+  const turn = submittedTurn(store, fence);
+  const at = (now: number) => ({ ...fence, now });
+
+  expect(store.claimControllerSupervisorSteer({
+    ...at(2_004),
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
+    reason: "command_failures",
+    inputText: "Stop retrying and answer now.",
+  })).toBe("claimed");
+  db.prepare("UPDATE controller_turns SET supervisor_reasons = 'command_failures' WHERE id = ?").run(turn.id);
+
+  expect(() => store.settleControllerSupervisorSteer({
+    ...at(2_005),
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    reason: "command_failures",
+    outcome: "applied",
+  })).toThrow(/fold/);
+  expect(store.getControllerSupervisorSteerAttempt(turn.id, "command_failures")).toMatchObject({ state: "pending" });
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ supervisorSteers: 0, supervisorReasons: ["command_failures"] });
+});
+
 it("refuses to record a steer under a stale executor generation", () => {
   const { store, fence } = storeFixture("stale");
   const turn = submittedTurn(store, fence);
 
-  expect(store.recordControllerSupervisorSteer({
+  expect(store.claimControllerSupervisorSteer({
     ownerId: fence.ownerId,
     generation: fence.generation + 1,
     now: 2_004,
     turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
     reason: "tool_budget",
-  })).toBe(false);
+    inputText: "budget nudge",
+  })).toBe("stale");
 });
 
 type Observation = Awaited<ReturnType<ControllerAdapter["events"]>>;
@@ -406,7 +475,56 @@ it("keeps the turn running when a budget nudge cannot be delivered", async () =>
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({
     state: "submitted",
-    supervisorSteers: 0,
+    supervisorSteers: 1,
+    supervisorReasons: ["tool_budget"],
+  });
+  expect(store.getControllerSupervisorSteerAttempt(turn.id, "tool_budget")).toMatchObject({ state: "unknown" });
+});
+
+it("does not replay a budget steer after finalization loses its lease across restart", async () => {
+  const fixture = storeFixture("budget-restart");
+  const { store, fence } = fixture;
+  const turn = submittedTurn(store, fence);
+  const firstAdapter = serviceAdapter(
+    () => observation({ latestSeq: 4, toolCalls: SUPERVISOR_SOFT_TOOL_CALLS }),
+    () => "active",
+  );
+  vi.spyOn(store, "settleControllerSupervisorSteer").mockImplementation(() => {
+    throw new Error("executor lease disappeared while settling");
+  });
+  const firstService = new LunaControllerService({
+    store,
+    adapter: firstAdapter,
+    evidenceProjector: testEvidenceProjector,
+    clock: { now: () => 2_002 },
+  });
+
+  await expect(firstService.reconcile({ ...fence, signal: AbortSignal.timeout(2_000) }, AbortSignal.timeout(2_000)))
+    .rejects.toThrow("executor lease disappeared while settling");
+  expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 2_004)).toBe(true);
+
+  const restarted = fixture.reopen();
+  const successor = restarted.acquireExecutorLease("successor", 2_010, 60 * 60_000);
+  if (!successor.acquired) throw new Error("missing successor lease");
+  const successorAdapter = serviceAdapter(
+    () => observation({ latestSeq: 5, toolCalls: 0 }),
+    () => "active",
+  );
+  const successorService = new LunaControllerService({
+    store: restarted,
+    adapter: successorAdapter,
+    evidenceProjector: testEvidenceProjector,
+    clock: { now: () => 2_011 },
+  });
+
+  await expect(successorService.reconcile({ ownerId: "successor", generation: successor.generation, signal: AbortSignal.timeout(2_000) }, AbortSignal.timeout(2_000)))
+    .resolves.toBe(true);
+
+  expect(successorAdapter.steer).not.toHaveBeenCalled();
+  expect(restarted.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    supervisorSteers: 1,
+    supervisorReasons: ["tool_budget"],
   });
 });
 

@@ -50,6 +50,7 @@ export type AcceptedControllerFinalization = Readonly<{
   ref: `finalization:${number}`;
   turnId: string;
   revision: number;
+  semanticEnvelopeVersion: number;
   candidate: ControllerFinalization;
   renderedMessage: string;
   evidenceHighWaterId: number;
@@ -158,6 +159,7 @@ type ControllerFinalizationRow = {
   turn_id: string;
   revision: number;
   payload_json: string;
+  envelope_version: number;
   rendered_message: string;
   evidence_high_water_id: number;
   state: string;
@@ -173,6 +175,11 @@ type FinalizationTurnRow = FencedTurnRow & {
   telegram_user_id: string;
   telegram_chat_id: string;
 };
+
+type LegacyFinalizationTurnRow = Readonly<{
+  controller_key: string;
+  evidence_limit_exceeded_at: number | null;
+}>;
 
 type FencedTurnRow = {
   evidence_event_seq: number;
@@ -193,6 +200,7 @@ type EvidenceInsertFields = Readonly<{
 }>;
 
 const MAX_EVIDENCE_ROWS = 128;
+const CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION = 2;
 const MAX_RECEIPT_RESULT_BYTES = 8_000;
 const MAX_PROOF_KINDS = 8;
 const MAX_SUBJECT_REFS = 16;
@@ -418,6 +426,9 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     ).get(turnId, accepted.evidenceHighWaterId)) {
       throw new Error("Accepted controller finalization evidence high-water is inconsistent");
     }
+    if (accepted.semanticEnvelopeVersion < CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION) {
+      return this.revalidateLegacyAcceptedFinalization(accepted);
+    }
     return accepted;
   }
 
@@ -434,6 +445,10 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id IS NULL AND steer_reservation_turn_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM controller_supervisor_steer_attempts
+               WHERE turn_id = controller_turns.id AND state = 'pending'
+            )
             AND evidence_event_seq = ?`,
       ).get(
         input.turnId,
@@ -485,8 +500,12 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
          FROM controller_turns AS turn
          JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
         WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
-          AND turn.lease_owner = ? AND turn.lease_generation = ?
-          AND turn.steer_reservation_turn_id IS NULL`,
+            AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.steer_reservation_turn_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM controller_supervisor_steer_attempts
+             WHERE turn_id = turn.id AND state = 'pending'
+          )`,
     ).get(
       input.turnId,
       input.controllerKey,
@@ -514,23 +533,74 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     turn: FinalizationTurnRow,
     revisionCount: number,
   ): ControllerFinalizationValidationContext {
-    const evidence = this.list(input.turnId, MAX_EVIDENCE_ROWS);
-    const evidenceByRef = new Map(evidence.map((row) => [row.ref, {
-      ref: row.ref,
-      outcome: row.outcome,
-      proofKinds: row.proofKinds,
-      subjectRefs: row.subjectRefs,
-    }]));
     const ownerBoundaryPresent = this.ownerBoundaryPresent(input, turn);
     return {
       acceptedAlready: false,
       invocationInFlight: this.startedToolReceipt(input.turnId),
       revisionCount,
       evidenceLimitExceeded: turn.evidence_limit_exceeded_at !== null,
-      evidenceByRef,
+      evidenceByRef: this.evidenceByRef(input.turnId),
       ownerBoundaryPresent,
       liveObligationRefs: this.liveObligationRefs(input.controllerKey),
     };
+  }
+
+  private revalidateLegacyAcceptedFinalization(
+    accepted: AcceptedControllerFinalization,
+  ): AcceptedControllerFinalization | null {
+    const turn = this.legacyFinalizationTurn(accepted.turnId);
+    if (!turn) return null;
+    const validation = validateControllerFinalization(
+      accepted.candidate,
+      this.legacyFinalizationValidationContext(accepted, turn),
+    );
+    return validation.outcome === "accepted" &&
+      validation.renderedMessage === accepted.renderedMessage
+      ? accepted
+      : null;
+  }
+
+  private legacyFinalizationTurn(turnId: string): LegacyFinalizationTurnRow | undefined {
+    return this.db.prepare(
+      `SELECT turn.controller_key, turn.evidence_limit_exceeded_at
+         FROM controller_turns AS turn
+         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+        WHERE turn.id = ? AND controller.state = 'active'`,
+    ).get(turnId) as LegacyFinalizationTurnRow | undefined;
+  }
+
+  private legacyFinalizationValidationContext(
+    accepted: AcceptedControllerFinalization,
+    turn: LegacyFinalizationTurnRow,
+  ): ControllerFinalizationValidationContext {
+    return {
+      acceptedAlready: false,
+      invocationInFlight: this.startedToolReceipt(accepted.turnId),
+      revisionCount: Math.max(0, accepted.revision - 1),
+      evidenceLimitExceeded: turn.evidence_limit_exceeded_at !== null,
+      evidenceByRef: this.evidenceByRef(accepted.turnId),
+      ownerBoundaryPresent: accepted.candidate.disposition !== "needs_owner" ||
+        this.legacyOwnerBoundaryPresent(accepted.turnId, turn.controller_key),
+      liveObligationRefs: this.liveObligationRefs(turn.controller_key),
+    };
+  }
+
+  private legacyOwnerBoundaryPresent(turnId: string, controllerKey: string): boolean {
+    return this.db.prepare(
+      `SELECT 1 FROM controller_interactions
+        WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered')
+        LIMIT 1`,
+    ).get(turnId, controllerKey) !== undefined;
+  }
+
+  private evidenceByRef(turnId: string): ControllerFinalizationValidationContext["evidenceByRef"] {
+    const evidence = this.list(turnId, MAX_EVIDENCE_ROWS);
+    return new Map(evidence.map((row) => [row.ref, {
+      ref: row.ref,
+      outcome: row.outcome,
+      proofKinds: row.proofKinds,
+      subjectRefs: row.subjectRefs,
+    }]));
   }
 
   private startedToolReceipt(turnId: string): boolean {
@@ -615,17 +685,19 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       ? {
           _hanoonControllerFinalization: input.payload,
           bbEventHighWaterSeq: input.bbEventHighWaterSeq,
+          semanticEnvelopeVersion: CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION,
         }
       : input.payload;
     const inserted = this.db.prepare(
       `INSERT INTO controller_finalizations (
-         turn_id, revision, payload_json, rendered_message, evidence_high_water_id,
-         state, rejection_code, created_at, validated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         turn_id, revision, payload_json, envelope_version, rendered_message,
+         evidence_high_water_id, state, rejection_code, created_at, validated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.input.turnId,
       input.revision,
       JSON.stringify(payload),
+      input.state === "accepted" ? CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION : 1,
       input.renderedMessage,
       input.evidenceHighWaterId,
       input.state,
@@ -897,6 +969,10 @@ function parseAcceptedFinalization(row: ControllerFinalizationRow): AcceptedCont
   assertPositiveInteger(row.id, "persisted finalization id");
   assertBoundedString(row.turn_id, "persisted finalization turnId");
   assertPositiveInteger(row.revision, "persisted finalization revision");
+  assertPositiveInteger(row.envelope_version, "persisted finalization envelope version");
+  if (row.envelope_version > CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION) {
+    throw new Error("Accepted controller finalization envelope version is unsupported");
+  }
   assertNonNegativeInteger(row.evidence_high_water_id, "persisted finalization evidence high-water id");
   assertNonNegativeInteger(row.created_at, "persisted finalization createdAt");
   assertNonNegativeInteger(row.validated_at, "persisted finalization validatedAt");
@@ -912,12 +988,21 @@ function parseAcceptedFinalization(row: ControllerFinalizationRow): AcceptedCont
   }
   let candidateValue: unknown = parsed;
   let bbEventHighWaterSeq: number | null = null;
-  if (parsed !== null && typeof parsed === "object" &&
-      Object.hasOwn(parsed, "_hanoonControllerFinalization")) {
+  const hasEnvelope = parsed !== null && typeof parsed === "object" &&
+    Object.hasOwn(parsed, "_hanoonControllerFinalization");
+  if (row.envelope_version >= CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION && !hasEnvelope) {
+    throw new Error("Accepted controller finalization envelope is missing");
+  }
+  if (hasEnvelope) {
     const envelope = parsed as {
       _hanoonControllerFinalization?: unknown;
       bbEventHighWaterSeq?: unknown;
+      semanticEnvelopeVersion?: unknown;
     };
+    if (row.envelope_version >= CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION &&
+        envelope.semanticEnvelopeVersion !== CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION) {
+      throw new Error("Accepted controller finalization envelope version is inconsistent");
+    }
     candidateValue = envelope._hanoonControllerFinalization;
     const persistedHighWater = envelope.bbEventHighWaterSeq;
     if (typeof persistedHighWater !== "number" || !Number.isSafeInteger(persistedHighWater) || persistedHighWater < 0) {
@@ -935,6 +1020,7 @@ function parseAcceptedFinalization(row: ControllerFinalizationRow): AcceptedCont
     ref: `finalization:${row.id}`,
     turnId: row.turn_id,
     revision: row.revision,
+    semanticEnvelopeVersion: row.envelope_version,
     candidate: candidate.data,
     renderedMessage: row.rendered_message,
     evidenceHighWaterId: row.evidence_high_water_id,

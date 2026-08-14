@@ -1033,6 +1033,120 @@ export const CONTROLLER_STEER_RESERVATION_MIGRATIONS = [String.raw`
 ALTER TABLE controller_turns ADD COLUMN steer_reservation_turn_id TEXT;
 `] as const;
 
+export const CONTROLLER_SUPERVISOR_ATTEMPT_MIGRATIONS = [String.raw`
+CREATE TABLE controller_supervisor_steer_attempts (
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  reason TEXT NOT NULL CHECK (reason IN ('tool_budget', 'token_budget', 'command_failures')),
+  thread_id TEXT NOT NULL,
+  input_text TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'unknown')),
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  PRIMARY KEY (turn_id, reason),
+  CHECK ((state = 'pending' AND settled_at IS NULL) OR
+         (state IN ('applied', 'unknown') AND settled_at IS NOT NULL))
+);
+CREATE INDEX controller_supervisor_steer_attempts_pending
+  ON controller_supervisor_steer_attempts(turn_id, state);
+`] as const;
+
+export const CONTROLLER_INTERACTION_REPAIR_MIGRATIONS = [String.raw`
+CREATE TABLE controller_interaction_quarantine (
+  source TEXT NOT NULL CHECK (source IN ('controller', 'thread', 'controller_questions')),
+  interaction_id TEXT NOT NULL,
+  turn_id TEXT,
+  controller_key TEXT,
+  bb_thread_id TEXT,
+  controller_generation_id TEXT,
+  thread_id TEXT,
+  title TEXT,
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  answer_json TEXT,
+  prior_state TEXT NOT NULL CHECK (prior_state IN ('pending', 'answered')),
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  quarantined_at INTEGER NOT NULL,
+  PRIMARY KEY (source, interaction_id)
+);
+
+INSERT INTO controller_interaction_quarantine (
+  source, interaction_id, turn_id, controller_key, bb_thread_id,
+  controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+  prior_state, asked_at, answered_at, quarantined_at
+)
+SELECT
+  'controller', interaction.interaction_id, interaction.turn_id, interaction.controller_key,
+  interaction.bb_thread_id, interaction.controller_generation_id, NULL, NULL,
+  interaction.kind, interaction.payload_json, interaction.answer_json,
+  interaction.state, interaction.asked_at, interaction.answered_at, interaction.asked_at
+FROM controller_interactions AS interaction
+WHERE interaction.state IN ('pending', 'answered')
+  AND interaction.interaction_id IS NOT NULL;
+
+INSERT INTO controller_interaction_quarantine (
+  source, interaction_id, turn_id, controller_key, bb_thread_id,
+  controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+  prior_state, asked_at, answered_at, quarantined_at
+)
+SELECT
+  'thread', interaction.interaction_id, NULL, NULL, NULL, NULL,
+  interaction.thread_id, interaction.title, interaction.kind,
+  interaction.payload_json, interaction.answer_json, interaction.state,
+  interaction.asked_at, interaction.answered_at, interaction.asked_at
+FROM thread_interactions AS interaction
+WHERE interaction.state IN ('pending', 'answered');
+
+UPDATE controller_interactions
+   SET state = 'delivered', answer_json = NULL,
+       bb_thread_id = NULL, controller_generation_id = NULL,
+       delivered_at = COALESCE(answered_at, asked_at)
+ WHERE state IN ('pending', 'answered');
+
+UPDATE thread_interactions
+   SET state = 'delivered', answer_json = NULL
+ WHERE state IN ('pending', 'answered');
+
+UPDATE controller_turns
+   SET awaiting_interaction_id = NULL
+ WHERE awaiting_interaction_id IS NOT NULL;
+
+UPDATE controller_questions
+   SET state = 'delivered', answers_json = NULL,
+       answered_at = COALESCE(answered_at, asked_at)
+ WHERE state IN ('pending', 'answered');
+
+UPDATE outbox
+   SET payload_json = CASE
+         WHEN json_valid(payload_json) = 1 THEN json_set(
+           payload_json,
+           '$.reply_markup', json_object('inline_keyboard', json_array())
+         )
+         ELSE json_object('reply_markup', json_object('inline_keyboard', json_array()))
+       END,
+       status = 'pending', lease_owner = NULL, lease_generation = NULL,
+       lease_expires_at = NULL, next_attempt_at = updated_at, last_error = NULL
+ WHERE EXISTS (
+   SELECT 1 FROM controller_interaction_quarantine AS quarantine
+    WHERE (
+      quarantine.source IN ('controller', 'controller_questions')
+      AND substr(outbox.logical_key, 1, length('controller-interaction:' || quarantine.interaction_id || ':')) =
+          'controller-interaction:' || quarantine.interaction_id || ':'
+    ) OR (
+      quarantine.source = 'thread'
+      AND outbox.logical_key = 'thread-interaction:' || quarantine.interaction_id
+    )
+ );
+`] as const;
+
+export const CONTROLLER_FINALIZATION_ENVELOPE_MIGRATIONS = [String.raw`
+ALTER TABLE controller_finalizations
+  ADD COLUMN envelope_version INTEGER NOT NULL DEFAULT 1
+  CHECK (envelope_version >= 1);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -1065,4 +1179,7 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_TRUST_MIGRATIONS,
   ...CONTROLLER_INTERACTION_MIGRATIONS,
   ...CONTROLLER_STEER_RESERVATION_MIGRATIONS,
+  ...CONTROLLER_SUPERVISOR_ATTEMPT_MIGRATIONS,
+  ...CONTROLLER_INTERACTION_REPAIR_MIGRATIONS,
+  ...CONTROLLER_FINALIZATION_ENVELOPE_MIGRATIONS,
 ] as const;

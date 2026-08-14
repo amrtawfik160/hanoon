@@ -57,7 +57,9 @@ import {
   questionOptionToken,
   renderControllerInteraction,
   renderThreadInteraction,
+  parseThreadInteraction,
   threadDecisionToken,
+  type ControllerQuestionAnswers,
   type ThreadInteraction,
 } from "../controller/questions";
 import {
@@ -117,10 +119,15 @@ type PluginKv = PluginStorage["kv"];
 const CONTROLLER_INTERACTION_TAIL_ID = 29;
 
 type LegacyControllerQuestionRow = Readonly<{
+  rowid: number;
   interaction_id: unknown;
+  turn_id: unknown;
+  controller_key: unknown;
   questions_json: unknown;
   state: unknown;
   answers_json: unknown;
+  asked_at: unknown;
+  answered_at: unknown;
 }>;
 
 export type PairingResult =
@@ -449,6 +456,34 @@ export type ControllerSteerSettlementInput = ControllerLeaseFence & Readonly<{
   waitingTurnId: string;
   controllerKey: string;
   outcome: ControllerSteerSettlement;
+}>;
+
+export type ControllerSupervisorSteerState = "pending" | "applied" | "unknown";
+export type ControllerSupervisorSteerAttempt = Readonly<{
+  turnId: string;
+  controllerKey: string;
+  reason: SupervisorReason;
+  threadId: string;
+  inputText: string;
+  idempotencyKey: string;
+  state: ControllerSupervisorSteerState;
+  createdAt: number;
+  settledAt: number | null;
+}>;
+export type ControllerSupervisorSteerClaim = "claimed" | "pending" | "settled" | "stale";
+export type ControllerSupervisorSteerClaimInput = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+  expectedThreadId: string;
+  reason: SupervisorReason;
+  inputText: string;
+}>;
+export type ControllerSupervisorSteerSettlement = "applied" | "unknown";
+export type ControllerSupervisorSteerSettlementInput = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+  reason: SupervisorReason;
+  outcome: ControllerSupervisorSteerSettlement;
 }>;
 
 type ControllerSteerSettlementRow = Readonly<{
@@ -816,6 +851,17 @@ type ControllerTurnRow = {
   origin: string;
   created_at: number;
   updated_at: number;
+};
+type ControllerSupervisorSteerAttemptRow = {
+  turn_id: string;
+  controller_key: string;
+  reason: string;
+  thread_id: string;
+  input_text: string;
+  idempotency_key: string;
+  state: string;
+  created_at: number;
+  settled_at: number | null;
 };
 type ObservedThreadRow = {
   thread_id: string;
@@ -1665,50 +1711,331 @@ function ensureTask9ApprovalColumns(db: SqliteDatabase): void {
   if (!columns.has("job_version")) db.exec("ALTER TABLE approvals ADD COLUMN job_version INTEGER");
 }
 
-function parseLegacyJson(jsonText: unknown, field: string): unknown {
-  if (typeof jsonText !== "string") throw new TypeError(`${field} must be JSON text`);
+function parseLegacyJson(jsonText: unknown): unknown | null {
+  if (typeof jsonText !== "string") return null;
   try {
     return JSON.parse(jsonText) as unknown;
   } catch (error) {
-    if (error instanceof SyntaxError) throw new TypeError(`${field} is malformed JSON`);
+    if (error instanceof SyntaxError) return null;
     throw error;
   }
 }
 
-function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): [string, string] {
-  if (row.state !== "pending" && row.state !== "answered") throw new TypeError("legacy question state is invalid");
-  const questions = parseLegacyJson(row.questions_json, "legacy questions_json");
+type LegacyControllerQuestionRepair = Readonly<{
+  invalid: LegacyControllerQuestionRow[];
+}>;
+
+type ValidatedLegacyControllerQuestion = Readonly<{
+  questionsJson: string;
+  answersJson: string | null;
+}>;
+
+function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): ValidatedLegacyControllerQuestion | null {
+  if (row.state !== "pending" && row.state !== "answered") return null;
+  const questions = parseLegacyJson(row.questions_json);
   const interaction = parseControllerInteraction(row.interaction_id, { kind: "user_question", questions });
-  if (!interaction || interaction.kind !== "user_question") throw new TypeError("legacy question projection is unsupported");
-  if (row.answers_json === null) throw new TypeError("active legacy question is missing answers");
-  const answers = parseLegacyJson(row.answers_json, "legacy answers_json");
-  if (!parseControllerInteractionResolution(interaction, answers, row.state)) {
-    throw new TypeError("legacy question answers are invalid");
+  if (!interaction || interaction.kind !== "user_question") return null;
+  if (row.answers_json === null) {
+    return row.state === "pending"
+      ? {
+          questionsJson: JSON.stringify(interaction.questions),
+          answersJson: null,
+        }
+      : null;
   }
-  return [interaction.interactionId, JSON.stringify(interaction)];
+  const answers = parseLegacyJson(row.answers_json);
+  const resolution = parseControllerInteractionResolution(interaction, answers, row.state);
+  if (!resolution || resolution.kind !== "user_answer") return null;
+  return {
+    questionsJson: JSON.stringify(interaction.questions),
+    answersJson: JSON.stringify(resolution.answers),
+  };
 }
 
-function validateLegacyControllerQuestions(db: SqliteDatabase): Map<string, string> {
+function validateLegacyControllerQuestions(db: SqliteDatabase): LegacyControllerQuestionRepair {
   const rows = db.prepare(
-    `SELECT interaction_id, questions_json, state, answers_json
+    `SELECT rowid, interaction_id, turn_id, controller_key, questions_json, state,
+            answers_json, asked_at, answered_at
        FROM controller_questions
       WHERE state IN ('pending', 'answered')
       ORDER BY rowid ASC`,
   ).all() as LegacyControllerQuestionRow[];
-  return new Map(rows.map(validateLegacyControllerQuestion));
-}
-
-function persistLegacyControllerProjections(db: SqliteDatabase, projections: Map<string, string>): void {
-  const update = db.prepare(
-    `UPDATE controller_interactions
-        SET payload_json = ?
+  const invalid: LegacyControllerQuestionRow[] = [];
+  const stale = db.prepare(
+    `UPDATE controller_questions
+        SET state = 'delivered', answers_json = NULL, answered_at = COALESCE(answered_at, asked_at)
       WHERE interaction_id = ? AND state IN ('pending', 'answered')`,
   );
-  for (const [interactionId, payloadJson] of projections) {
-    if (update.run(payloadJson, interactionId).changes !== 1) {
-      throw new Error("legacy interaction projection was not copied");
+  for (const row of rows) {
+    const projection = validateLegacyControllerQuestion(row);
+    const identity = typeof row.turn_id === "string" && typeof row.controller_key === "string" &&
+      db.prepare(
+        `SELECT 1
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller
+             ON controller.controller_key = turn.controller_key
+            AND controller.state = 'active'
+            AND controller.bb_thread_id IS NOT NULL
+           JOIN controller_generations AS generation
+             ON generation.controller_key = controller.controller_key
+            AND generation.thread_id = controller.bb_thread_id
+            AND generation.ended_at IS NULL
+          WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+            AND (SELECT COUNT(*) FROM controller_generations AS open_generation
+                  WHERE open_generation.controller_key = controller.controller_key
+                    AND open_generation.ended_at IS NULL) = 1`,
+      ).get(row.turn_id, row.controller_key) !== undefined;
+    if (projection && identity) {
+      db.prepare(
+        `UPDATE controller_questions
+            SET questions_json = ?, answers_json = ?
+          WHERE rowid = ? AND state IN ('pending', 'answered')`,
+      ).run(projection.questionsJson, projection.answersJson, row.rowid);
+      continue;
     }
+    invalid.push(row);
+    const safeInteractionId = typeof row.interaction_id === "string" && row.interaction_id.length > 0
+      ? row.interaction_id
+      : `legacy-row-${row.rowid}`;
+    if (safeInteractionId !== row.interaction_id) {
+      db.prepare("UPDATE controller_questions SET interaction_id = ? WHERE rowid = ?")
+        .run(safeInteractionId, row.rowid);
+    }
+    stale.run(safeInteractionId);
   }
+  return { invalid };
+}
+
+function jsonValue(jsonText: string | null): unknown {
+  if (jsonText === null) return null;
+  try {
+    return JSON.parse(jsonText) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+type RepairQuarantineRow = Readonly<{
+  source: "controller" | "thread" | "controller_questions";
+  interaction_id: string;
+  turn_id: string | null;
+  controller_key: string | null;
+  bb_thread_id: string | null;
+  controller_generation_id: string | null;
+  thread_id: string | null;
+  title: string | null;
+  kind: string;
+  payload_json: string;
+  answer_json: string | null;
+  prior_state: "pending" | "answered";
+  asked_at: number;
+  answered_at: number | null;
+}>;
+
+function isCurrentControllerInteractionIdentity(
+  db: SqliteDatabase,
+  row: RepairQuarantineRow,
+): boolean {
+  if (row.turn_id === null || row.controller_key === null ||
+      row.bb_thread_id === null || row.controller_generation_id === null) return false;
+  return db.prepare(
+    `SELECT 1
+       FROM controller_turns AS turn
+       JOIN controller_threads AS controller
+         ON controller.controller_key = turn.controller_key
+        AND controller.state = 'active'
+        AND controller.bb_thread_id = ?
+       JOIN controller_generations AS generation
+         ON generation.id = ?
+        AND generation.controller_key = controller.controller_key
+        AND generation.thread_id = controller.bb_thread_id
+        AND generation.ended_at IS NULL
+      WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+        AND (SELECT COUNT(*) FROM controller_generations AS open_generation
+              WHERE open_generation.controller_key = controller.controller_key
+                AND open_generation.ended_at IS NULL) = 1`,
+  ).get(row.bb_thread_id, row.controller_generation_id, row.turn_id, row.controller_key) !== undefined;
+}
+
+function restoreQuarantinedControllerQuestion(
+  db: SqliteDatabase,
+  row: RepairQuarantineRow,
+): boolean {
+  if (row.source !== "controller" || row.kind !== "user_question" ||
+      !isCurrentControllerInteractionIdentity(db, row)) return false;
+  const payload = jsonValue(row.payload_json);
+  const interaction = parseControllerInteraction(row.interaction_id, payload);
+  if (!interaction || interaction.kind !== "user_question") return false;
+  const rawAnswer = jsonValue(row.answer_json);
+  const resolution = rawAnswer === null
+    ? null
+    : parseControllerInteractionResolution(interaction, rawAnswer, row.prior_state);
+  if (row.answer_json !== null && resolution === null) return false;
+  if (row.prior_state === "answered" && resolution === null) return false;
+  const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
+    ? resolution.answers as ControllerQuestionAnswers
+    : {};
+  const next = nextUnansweredQuestion(interaction.questions, answers);
+  const restored = db.prepare(
+    `UPDATE controller_interactions
+        SET bb_thread_id = ?, controller_generation_id = ?, kind = 'user_question',
+            payload_json = ?, state = ?, answer_json = ?, answered_at = ?, delivered_at = NULL
+      WHERE interaction_id = ? AND state = 'delivered'`,
+  ).run(
+    row.bb_thread_id,
+    row.controller_generation_id,
+    JSON.stringify(interaction),
+    row.prior_state,
+    resolution ? JSON.stringify(resolution) : null,
+    row.answered_at,
+    row.interaction_id,
+  );
+  if (restored.changes !== 1) return false;
+  if (row.prior_state !== "pending") return true;
+  const controller = db.prepare(
+    "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
+  ).get(row.controller_key) as { telegram_chat_id: string } | undefined;
+  if (!controller) return false;
+  if (!next) return true;
+  const rendered = renderControllerInteraction(interaction, answers);
+  if (!("reply_markup" in rendered)) return true;
+  persistControllerOutbox(db, {
+    logicalKey: `controller-interaction:${row.interaction_id}:${next.index}`,
+    chatId: controller.telegram_chat_id,
+    payload: {
+      ...formattedMessage(rendered.text),
+      reply_markup: rendered.reply_markup,
+      disable_web_page_preview: true,
+    },
+  }, row.asked_at);
+  return true;
+}
+
+function restoreQuarantinedThreadQuestion(
+  db: SqliteDatabase,
+  row: RepairQuarantineRow,
+): boolean {
+  if (row.source !== "thread" || row.kind !== "user_question") return false;
+  const interaction = parseThreadInteraction(row.interaction_id, jsonValue(row.payload_json));
+  if (!interaction || interaction.kind !== "user_question") return false;
+  const rawAnswer = jsonValue(row.answer_json);
+  const resolution = rawAnswer === null
+    ? null
+    : parseControllerInteractionResolution(interaction, rawAnswer, row.prior_state);
+  if (row.answer_json !== null && resolution === null) return false;
+  if (row.prior_state === "answered" && resolution === null) return false;
+  const restored = db.prepare(
+    `UPDATE thread_interactions
+        SET kind = 'user_question', payload_json = ?, state = ?, answer_json = ?, answered_at = ?
+      WHERE interaction_id = ? AND state = 'delivered'`,
+  ).run(
+    JSON.stringify(interaction),
+    row.prior_state,
+    resolution ? JSON.stringify(resolution) : null,
+    row.answered_at,
+    row.interaction_id,
+  );
+  if (restored.changes !== 1) return false;
+  if (row.prior_state !== "pending" || row.thread_id === null || row.title === null) return true;
+  const rendered = renderThreadInteraction(row.title, interaction);
+  if (!("reply_markup" in rendered)) return true;
+  const existing = db.prepare(
+    "SELECT chat_id FROM outbox WHERE logical_key = ?",
+  ).get(`thread-interaction:${row.interaction_id}`) as { chat_id: string } | undefined;
+  if (!existing) return true;
+  persistControllerOutbox(db, {
+    logicalKey: `thread-interaction:${row.interaction_id}`,
+    chatId: existing.chat_id,
+    payload: {
+      ...formattedMessage(rendered.text),
+      reply_markup: rendered.reply_markup,
+      disable_web_page_preview: true,
+    },
+  }, row.asked_at);
+  return true;
+}
+
+function quarantineLegacyControllerQuestions(
+  db: SqliteDatabase,
+  rows: readonly LegacyControllerQuestionRow[],
+): void {
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO controller_interaction_quarantine (
+       source, interaction_id, turn_id, controller_key, bb_thread_id,
+       controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+       prior_state, asked_at, answered_at, quarantined_at
+     ) VALUES ('controller_questions', ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const clearOutbox = db.prepare(
+    `UPDATE outbox
+        SET payload_json = CASE
+              WHEN json_valid(payload_json) = 1 THEN json_set(
+                payload_json,
+                '$.reply_markup', json_object('inline_keyboard', json_array())
+              )
+              ELSE json_object('reply_markup', json_object('inline_keyboard', json_array()))
+            END,
+            status = 'pending', lease_owner = NULL, lease_generation = NULL,
+            lease_expires_at = NULL, next_attempt_at = updated_at, last_error = NULL
+      WHERE substr(logical_key, 1, length('controller-interaction:' || ? || ':')) =
+            'controller-interaction:' || ? || ':'`,
+  );
+  for (const row of rows) {
+    const interactionId = typeof row.interaction_id === "string" && row.interaction_id.length > 0
+      ? row.interaction_id
+      : `legacy-row-${row.rowid}`;
+    const state = row.state === "answered" ? "answered" : "pending";
+    const askedAt = typeof row.asked_at === "number" && Number.isSafeInteger(row.asked_at) && row.asked_at >= 0
+      ? row.asked_at
+      : 0;
+    const answeredAt = typeof row.answered_at === "number" && Number.isSafeInteger(row.answered_at) && row.answered_at >= 0
+      ? row.answered_at
+      : null;
+    insert.run(
+      interactionId,
+      typeof row.turn_id === "string" ? row.turn_id : null,
+      typeof row.controller_key === "string" ? row.controller_key : null,
+      "user_question",
+      typeof row.questions_json === "string" ? row.questions_json : String(row.questions_json ?? ""),
+      typeof row.answers_json === "string" ? row.answers_json : null,
+      state,
+      askedAt,
+      answeredAt,
+      askedAt,
+    );
+    clearOutbox.run(interactionId, interactionId);
+  }
+}
+
+function restoreQuarantinedInteractions(db: SqliteDatabase): void {
+  const rows = db.prepare(
+    `SELECT source, interaction_id, turn_id, controller_key, bb_thread_id,
+            controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+            prior_state, asked_at, answered_at
+       FROM controller_interaction_quarantine
+      ORDER BY quarantined_at ASC, interaction_id ASC`,
+  ).all() as RepairQuarantineRow[];
+  for (const row of rows) {
+    if (row.source === "controller") restoreQuarantinedControllerQuestion(db, row);
+    else if (row.source === "thread") restoreQuarantinedThreadQuestion(db, row);
+  }
+  db.prepare(
+    `UPDATE controller_turns AS turn
+        SET awaiting_interaction_id = (
+          SELECT interaction.interaction_id
+            FROM controller_interactions AS interaction
+           WHERE interaction.turn_id = turn.id
+             AND interaction.state IN ('pending', 'answered')
+           ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC
+           LIMIT 1
+        )
+      WHERE EXISTS (
+        SELECT 1 FROM controller_interactions AS interaction
+         WHERE interaction.turn_id = turn.id
+           AND interaction.state IN ('pending', 'answered')
+      )`,
+  ).run();
 }
 
 function hasMigration(db: SqliteDatabase, migrationId: number): boolean {
@@ -1720,12 +2047,14 @@ export function migrateControllerInteractionStorage(storage: PluginStorage): voi
   storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
   if (hasMigration(db, CONTROLLER_INTERACTION_TAIL_ID)) {
     storage.migrate(db, [...ALL_MIGRATIONS]);
+    db.transaction(() => restoreQuarantinedInteractions(db)).immediate();
     return;
   }
   db.transaction(() => {
-    const projections = validateLegacyControllerQuestions(db);
+    const legacy = validateLegacyControllerQuestions(db);
     storage.migrate(db, [...ALL_MIGRATIONS]);
-    persistLegacyControllerProjections(db, projections);
+    quarantineLegacyControllerQuestions(db, legacy.invalid);
+    restoreQuarantinedInteractions(db);
   }).immediate();
 }
 
@@ -1828,10 +2157,13 @@ export interface TelegramAgentStore {
     commandFailures?: number;
     totalTokens?: number;
   } & Record<string, unknown>): boolean;
-  recordControllerSupervisorSteer(input: ControllerLeaseFence & {
-    turnId: string;
-    reason: SupervisorReason;
-  }): boolean;
+  claimControllerSupervisorSteer(input: ControllerSupervisorSteerClaimInput): ControllerSupervisorSteerClaim;
+  getControllerSupervisorSteerAttempt(
+    turnId: string,
+    reason: SupervisorReason,
+  ): ControllerSupervisorSteerAttempt | null;
+  getPendingControllerSupervisorSteer(turnId: string): ControllerSupervisorSteerAttempt | null;
+  settleControllerSupervisorSteer(input: ControllerSupervisorSteerSettlementInput): "settled" | "stale";
   refreshControllerDraft(input: ControllerLeaseFence & {
     turnId: string;
     sentBefore: number;
@@ -2463,6 +2795,36 @@ function parsePersistedControllerNullableNonNegativeInteger(value: number | null
 // JSON would only add a parse failure mode to a column that cannot grow.
 function parseSupervisorReasons(value: string): readonly SupervisorReason[] {
   return value.split(",").filter((slug): slug is SupervisorReason => SUPERVISOR_REASONS.has(slug));
+}
+
+function parseControllerSupervisorSteerAttempt(
+  row: ControllerSupervisorSteerAttemptRow,
+): ControllerSupervisorSteerAttempt {
+  assertControllerIdentifier(row.turn_id, "persisted supervisor turnId");
+  assertControllerKey(row.controller_key);
+  assertControllerIdentifier(row.thread_id, "persisted supervisor threadId");
+  assertControllerText(row.input_text, "persisted supervisor inputText");
+  assertBoundedString(row.idempotency_key, "persisted supervisor idempotencyKey");
+  assertNonNegativeInteger(row.created_at, "persisted supervisor createdAt");
+  if (row.settled_at !== null) assertNonNegativeInteger(row.settled_at, "persisted supervisor settledAt");
+  if (!SUPERVISOR_REASONS.has(row.reason)) throw new Error("Unknown persisted controller supervisor reason");
+  if (row.state !== "pending" && row.state !== "applied" && row.state !== "unknown") {
+    throw new Error("Unknown persisted controller supervisor steer state");
+  }
+  if ((row.state === "pending") !== (row.settled_at === null)) {
+    throw new Error("Persisted controller supervisor steer settlement is inconsistent");
+  }
+  return {
+    turnId: row.turn_id,
+    controllerKey: row.controller_key,
+    reason: row.reason as SupervisorReason,
+    threadId: row.thread_id,
+    inputText: row.input_text,
+    idempotencyKey: row.idempotency_key,
+    state: row.state as ControllerSupervisorSteerState,
+    createdAt: row.created_at,
+    settledAt: row.settled_at,
+  };
 }
 
 function parseControllerImage(row: ControllerTurnRow): ControllerImage | null {
@@ -3424,6 +3786,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
             AND turn.lease_owner = ? AND turn.lease_generation = ?
             AND turn.accepted_finalization_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM controller_supervisor_steer_attempts
+               WHERE turn_id = turn.id AND state = 'pending'
+            )
             AND controller.state = 'active'`,
       ).get(
         input.turnId,
@@ -3891,32 +4257,192 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
-  /**
-   * Records that the supervisor already nudged this turn for one reason. A
-   * tripped budget stays tripped on every later poll, so without this the same
-   * crossing would nudge the model forever.
-   */
-  public recordControllerSupervisorSteer(input: ControllerLeaseFence & {
-    turnId: string;
-    reason: SupervisorReason;
-  }): boolean {
+  /** Claims the durable attempt before crossing the provider boundary. */
+  public claimControllerSupervisorSteer(input: ControllerSupervisorSteerClaimInput): ControllerSupervisorSteerClaim {
     this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    assertControllerText(input.inputText, "inputText");
     if (!SUPERVISOR_REASONS.has(input.reason)) throw new TypeError("Unknown controller supervisor reason");
-    return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const updated = this.db.prepare(
-        `UPDATE controller_turns
-            SET supervisor_steers = supervisor_steers + 1,
-                supervisor_reasons = CASE
-                  WHEN supervisor_reasons = '' THEN ?
-                  ELSE supervisor_reasons || ',' || ?
-                END,
-                updated_at = ?
-          WHERE id = ? AND state = 'submitted'
-            AND instr(',' || supervisor_reasons || ',', ',' || ? || ',') = 0`,
-      ).run(input.reason, input.reason, input.now, input.turnId, input.reason);
-      return updated.changes === 1;
-    }).immediate();
+    return this.db.transaction(() => this.claimControllerSupervisorSteerInTransaction(input)).immediate();
+  }
+
+  private claimControllerSupervisorSteerInTransaction(
+    input: ControllerSupervisorSteerClaimInput,
+  ): ControllerSupervisorSteerClaim {
+    if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+    const existing = this.controllerSupervisorSteerState(input.turnId, input.reason);
+    if (existing) return existing === "pending" ? "pending" : "settled";
+    const idempotencyKey = `controller-supervisor:${input.turnId}:${input.reason}`;
+    if (this.insertControllerSupervisorSteerAttempt(input, idempotencyKey)) return "claimed";
+    const raced = this.controllerSupervisorSteerState(input.turnId, input.reason);
+    return raced ? (raced === "pending" ? "pending" : "settled") : "stale";
+  }
+
+  private controllerSupervisorSteerState(
+    turnId: string,
+    reason: SupervisorReason,
+  ): ControllerSupervisorSteerState | null {
+    const row = this.db.prepare(
+      `SELECT state FROM controller_supervisor_steer_attempts
+        WHERE turn_id = ? AND reason = ?`,
+    ).get(turnId, reason) as { state: ControllerSupervisorSteerState } | undefined;
+    return row?.state ?? null;
+  }
+
+  private insertControllerSupervisorSteerAttempt(
+    input: ControllerSupervisorSteerClaimInput,
+    idempotencyKey: string,
+  ): boolean {
+    const inserted = this.db.prepare(
+      `INSERT INTO controller_supervisor_steer_attempts (
+         turn_id, controller_key, reason, thread_id, input_text,
+         idempotency_key, state, created_at, settled_at
+       )
+       SELECT ?, ?, ?, ?, ?, ?, 'pending', ?, NULL
+         WHERE EXISTS (
+           SELECT 1 FROM controller_turns AS turn
+            JOIN controller_threads AS controller
+              ON controller.controller_key = turn.controller_key
+            WHERE turn.id = ? AND turn.controller_key = ?
+              AND turn.state = 'submitted'
+              AND turn.lease_owner = ? AND turn.lease_generation = ?
+              AND turn.accepted_finalization_id IS NULL
+              AND turn.steer_reservation_turn_id IS NULL
+              AND controller.state = 'active'
+              AND controller.bb_thread_id = ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM controller_supervisor_steer_attempts
+            WHERE turn_id = ? AND state = 'pending'
+         )`,
+    ).run(
+      input.turnId,
+      input.controllerKey,
+      input.reason,
+      input.expectedThreadId,
+      input.inputText,
+      idempotencyKey,
+      input.now,
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.expectedThreadId,
+      input.turnId,
+    );
+    return inserted.changes === 1;
+  }
+
+  public getControllerSupervisorSteerAttempt(
+    turnId: string,
+    reason: SupervisorReason,
+  ): ControllerSupervisorSteerAttempt | null {
+    assertControllerIdentifier(turnId, "turnId");
+    if (!SUPERVISOR_REASONS.has(reason)) throw new TypeError("Unknown controller supervisor reason");
+    const row = this.db.prepare(
+      `SELECT turn_id, controller_key, reason, thread_id, input_text,
+              idempotency_key, state, created_at, settled_at
+         FROM controller_supervisor_steer_attempts
+        WHERE turn_id = ? AND reason = ?`,
+    ).get(turnId, reason) as ControllerSupervisorSteerAttemptRow | undefined;
+    return row ? parseControllerSupervisorSteerAttempt(row) : null;
+  }
+
+  public getPendingControllerSupervisorSteer(turnId: string): ControllerSupervisorSteerAttempt | null {
+    assertControllerIdentifier(turnId, "turnId");
+    const row = this.db.prepare(
+      `SELECT turn_id, controller_key, reason, thread_id, input_text,
+              idempotency_key, state, created_at, settled_at
+         FROM controller_supervisor_steer_attempts
+        WHERE turn_id = ? AND state = 'pending'
+        ORDER BY created_at ASC
+        LIMIT 1`,
+    ).get(turnId) as ControllerSupervisorSteerAttemptRow | undefined;
+    return row ? parseControllerSupervisorSteerAttempt(row) : null;
+  }
+
+  /** Settles the attempt and folds the reason into the turn in one transaction. */
+  public settleControllerSupervisorSteer(
+    input: ControllerSupervisorSteerSettlementInput,
+  ): "settled" | "stale" {
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    if (!SUPERVISOR_REASONS.has(input.reason)) throw new TypeError("Unknown controller supervisor reason");
+    if (input.outcome !== "applied" && input.outcome !== "unknown") {
+      throw new TypeError("controller supervisor steer settlement outcome is invalid");
+    }
+    return this.db.transaction(() => this.settleControllerSupervisorSteerInTransaction(input)).immediate();
+  }
+
+  private settleControllerSupervisorSteerInTransaction(
+    input: ControllerSupervisorSteerSettlementInput,
+  ): "settled" | "stale" {
+    if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+    const row = this.controllerSupervisorSteerSettlementRow(input);
+    if (!row) return "stale";
+    if (row.state !== "pending") return "settled";
+    const settled = this.db.prepare(
+      `UPDATE controller_supervisor_steer_attempts
+          SET state = ?, settled_at = ?
+        WHERE turn_id = ? AND controller_key = ? AND reason = ? AND state = 'pending'`,
+    ).run(input.outcome, input.now, input.turnId, input.controllerKey, input.reason);
+    if (settled.changes !== 1) return "stale";
+    this.foldControllerSupervisorSteer(input);
+    return "settled";
+  }
+
+  private controllerSupervisorSteerSettlementRow(
+    input: ControllerSupervisorSteerSettlementInput,
+  ): { state: ControllerSupervisorSteerState } | undefined {
+    return this.db.prepare(
+      `SELECT attempt.state
+         FROM controller_supervisor_steer_attempts AS attempt
+         JOIN controller_turns AS turn ON turn.id = attempt.turn_id
+        WHERE attempt.turn_id = ? AND attempt.controller_key = ? AND attempt.reason = ?
+          AND turn.state = 'submitted'
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.accepted_finalization_id IS NULL
+          AND turn.steer_reservation_turn_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM controller_supervisor_steer_attempts AS pending
+             WHERE pending.turn_id = turn.id AND pending.state = 'pending'
+               AND pending.reason <> attempt.reason
+          )`,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.reason,
+      input.ownerId,
+      input.generation,
+    ) as { state: ControllerSupervisorSteerState } | undefined;
+  }
+
+  private foldControllerSupervisorSteer(input: ControllerSupervisorSteerSettlementInput): void {
+    const folded = this.db.prepare(
+      `UPDATE controller_turns
+          SET supervisor_steers = supervisor_steers + 1,
+              supervisor_reasons = CASE
+                WHEN supervisor_reasons = '' THEN ?
+                ELSE supervisor_reasons || ',' || ?
+              END,
+              updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'submitted'
+          AND lease_owner = ? AND lease_generation = ?
+          AND instr(',' || supervisor_reasons || ',', ',' || ? || ',') = 0`,
+    ).run(
+      input.reason,
+      input.reason,
+      input.now,
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.reason,
+    );
+    if (folded.changes !== 1) {
+      throw new Error("Controller supervisor steer fold was not applied atomically");
+    }
   }
 
   public recordControllerInteraction(input: ControllerLeaseFence & {
@@ -4152,6 +4678,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id IS NULL
             AND (steer_reservation_turn_id IS NULL OR steer_reservation_turn_id = ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM controller_supervisor_steer_attempts
+               WHERE turn_id = controller_turns.id AND state = 'pending'
+            )
             AND EXISTS (
               SELECT 1 FROM controller_threads AS controller
                WHERE controller.controller_key = controller_turns.controller_key
@@ -4565,6 +5095,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           AND turn.lease_owner = ? AND turn.lease_generation = ?
           AND turn.accepted_finalization_id IS NULL
           AND turn.steer_reservation_turn_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM controller_supervisor_steer_attempts
+             WHERE turn_id = turn.id AND state = 'pending'
+          )
           AND ((? IS NULL AND controller.bb_thread_id IS NULL) OR controller.bb_thread_id = ?)` ,
     ).get(
       input.turnId,

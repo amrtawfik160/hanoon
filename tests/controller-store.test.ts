@@ -63,7 +63,7 @@ function sha256(text: string): string {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(31);
+  expect(ALL_MIGRATIONS).toHaveLength(34);
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -103,6 +103,9 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[29]).toContain("CREATE TABLE controller_interactions");
   expect(ALL_MIGRATIONS[29]).toContain("controller_generation_id");
   expect(ALL_MIGRATIONS[30]).toContain("steer_reservation_turn_id");
+  expect(ALL_MIGRATIONS[31]).toContain("controller_supervisor_steer_attempts");
+  expect(ALL_MIGRATIONS[32]).toContain("controller_interaction_quarantine");
+  expect(ALL_MIGRATIONS[33]).toContain("envelope_version");
 });
 
 it("pins the exact shipped and controller trust migration bytes in order", () => {
@@ -120,7 +123,7 @@ it("pins the exact shipped and controller trust migration bytes in order", () =>
   );
 });
 
-it("runs the exact legacy interaction preflight during store startup", () => {
+it("runs the exact legacy interaction preflight and quarantines unsafe rows during store startup", () => {
   const { bb } = createFakePluginHost({ pluginId: "telegram-controller-store-legacy-preflight" });
   const db = bb.storage.database();
   bb.storage.migrate(db, ALL_MIGRATIONS.slice(0, 29));
@@ -149,12 +152,31 @@ it("runs the exact legacy interaction preflight during store startup", () => {
     prompt: "ＡＰＩ＿ＫＥＹ＝secret-value",
     options: [{ value: "first", label: "First", description: null }],
   }]));
+  db.prepare(
+    `INSERT INTO outbox (
+       logical_key, chat_id, message_id, payload_json, status, next_attempt_at, created_at, updated_at
+     ) VALUES ('controller-interaction:legacy_interaction:0', '70', 7, ?, 'sent', 2, 2, 2)`,
+  ).run(JSON.stringify({
+    text: "Unsafe legacy question",
+    reply_markup: { inline_keyboard: [[{ text: "Act", callback_data: "legacy" }]] },
+  }));
 
-  expect(() => openStore(bb.storage, bb.storage.kv, () => 2_000)).toThrow();
-  expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({ count: 29 });
+  expect(() => openStore(bb.storage, bb.storage.kv, () => 2_000)).not.toThrow();
+  expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({ count: 34 });
   expect(db.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
-  ).get()).toBeUndefined();
+  ).get()).toEqual({ name: "controller_interactions" });
+  expect(db.prepare(
+    "SELECT state, answers_json FROM controller_questions WHERE interaction_id = 'legacy_interaction'",
+  ).get()).toEqual({ state: "delivered", answers_json: null });
+  expect(db.prepare(
+    "SELECT source, interaction_id, prior_state FROM controller_interaction_quarantine",
+  ).get()).toEqual({ source: "controller_questions", interaction_id: "legacy_interaction", prior_state: "pending" });
+  expect(JSON.parse((db.prepare(
+    "SELECT payload_json FROM outbox WHERE logical_key = 'controller-interaction:legacy_interaction:0'",
+  ).get() as { payload_json: string }).payload_json)).toMatchObject({
+    reply_markup: { inline_keyboard: [] },
+  });
 });
 
 it("requires controller trust state on the public turn record", () => {

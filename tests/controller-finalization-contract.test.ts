@@ -942,6 +942,27 @@ describe("fail-closed operational claim binding", () => {
 
 describe("bounded text heuristics", () => {
   it.each([
+    ["deployment with an explicit negative predicate", "The deployment passed, not failed."],
+    ["deployment despite a failed test", "The deployment passed despite the test failed."],
+    ["deployment with parenthetical negation", "The deployment passed (the deployment failed)."],
+    ["canary with an explicit negative predicate", "The canary passed, not failed."],
+    ["merge with parenthetical negation", "The merge succeeded (the merge failed)."],
+    ["production with parenthetical negation", "Production is live (production failed)."],
+  ] as const)("does not let mixed-polarity %s hide a positive assertion", (_label, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "The deployment failed.",
+    "The canary did not pass.",
+    "The merge was not completed.",
+    "Production is not live.",
+  ])("keeps a wholly negative operational statement acceptable: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
     "I'll check this.",
     "Let me look into it.",
     "I will investigate.",
@@ -1146,6 +1167,23 @@ describe("bounded text heuristics", () => {
     );
     expect(validateControllerFinalization(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Production canary passed." }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["shipped", "The change shipped to production."],
+    ["merged", "The release was merged to production."],
+    ["published", "The package was published to production."],
+    ["live", "The feature is live in production."],
+  ] as const)("requires production proof for %s wording even when the verb is broadly accepted", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
   });
