@@ -1335,6 +1335,67 @@ describe("bounded text heuristics", () => {
     );
   });
 
+  it("binds a leading plain production modifier to the following execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "tests passed.",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [{ type: "text", text: "In production, " }, claim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("does not lose a production target when its word crosses a claim boundary", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed in produc",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: "tion." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("does not let an adjacent claim without production proof satisfy a production qualifier", () => {
+    const executionClaim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+      evidenceRefs: ["evidence:1"],
+    }).segments[0];
+    const productionClaim = claimFinalization({
+      kind: "pipeline_outcome",
+      outcome: "succeeded",
+      text: "The release shipped to production.",
+      evidenceRefs: ["evidence:2"],
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [executionClaim, { type: "text", text: " and " }, productionClaim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded"),
+        evidenceRow("evidence:2", "pipeline_outcome", "succeeded"),
+      ),
+      "proof_incompatible",
+    );
+  });
+
   it.each([".", "?", "!"])("allows punctuation to delimit a plain production sentence: %s", (punctuation) => {
     const claim = claimFinalization({
       kind: "execution_result",
@@ -1366,6 +1427,26 @@ describe("bounded text heuristics", () => {
   });
 
   it.each([
+    ["CI object", "CI passed every test.", "pipeline_outcome"],
+    ["review object", "The review passed all tests.", "pipeline_outcome"],
+    ["deployment object", "The deployment passed every test.", "production_outcome"],
+    ["release object", "The release passed all regression tests.", "production_outcome"],
+    ["CI before tests", "CI and tests passed.", "pipeline_outcome"],
+    ["review before tests", "The review and tests passed.", "pipeline_outcome"],
+  ] as const)("does not let a protected predicate hide test execution entitlement: %s", (_label, text, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
     ["CI before tests", "CI and tests passed.", "pipeline_outcome"],
     ["review before tests", "The review and tests passed.", "pipeline_outcome"],
     ["deployment before tests", "The deployment and tests passed.", "production_outcome"],
@@ -1374,6 +1455,26 @@ describe("bounded text heuristics", () => {
     expectRejection(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["as well as", "The tests as well as the review passed."],
+    ["reverse as well as", "The review as well as the tests passed."],
+    ["plus", "Tests plus review passed."],
+    ["reverse plus", "Review plus tests passed."],
+    ["alongside", "Tests alongside review passed."],
+    ["reverse alongside", "Review alongside tests passed."],
+  ] as const)("fails closed for structural compound connector: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
       "proof_incompatible",
     );
   });
@@ -1704,6 +1805,37 @@ describe("bounded text heuristics", () => {
     );
   });
 
+  it.each([
+    "The release was published inside as opposed to outside production.",
+    "The release was published versus outside production.",
+    "The release was published in contrast to outside production.",
+    "The release was published anywhere except outside production.",
+    "The release was published anything except non-production.",
+    "The release was published the opposite of non-production.",
+  ])("requires production proof for contrast wording: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "The release was published outside production.",
+    "The release was published only outside production.",
+    "The release was published all outside production.",
+    "The release was published non-production.",
+  ])("preserves exact non-production exceptions: %s", (text) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
   it("does not turn a test result that explicitly avoided production into a production claim", () => {
     expect(validateControllerFinalization(
       claimFinalization({
@@ -1728,6 +1860,62 @@ describe("bounded text heuristics", () => {
   });
 
   it.each([
+    "Outside production, ",
+    "In non-production, ",
+    "Without touching production, ",
+  ])("accepts a prefix non-target production qualifier: %s", (prefix) => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [{ type: "text", text: prefix }, claim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "In production, ",
+    "Using production, ",
+    "production; ",
+  ])("keeps a prefix production qualifier bound to the execution claim: %s", (prefix) => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [{ type: "text", text: prefix }, claim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each(["pipeline_outcome", "execution_result"] as const)(
+    "does not infer a typed proof from an unproven reporting clause: %s",
+    (kind) => {
+      expectRejection(
+        claimFinalization({ kind, outcome: "succeeded", text: "Tests reported that CI passed." }),
+        contextWithEvidence(evidenceRow(
+          "evidence:1",
+          kind === "pipeline_outcome" ? "pipeline_outcome" : "command_result",
+          "succeeded",
+        )),
+        "proof_incompatible",
+      );
+    },
+  );
+
+  it.each([
     "All tests are passing.",
     "tests ran successfully",
     "tests were a success",
@@ -1737,11 +1925,78 @@ describe("bounded text heuristics", () => {
   });
 
   it.each([
+    "Every test is passing.",
+    "The entire test suite is passing.",
+    "There were zero test failures.",
+  ])("requires execution proof for additional natural test results: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "None of the tests failed.",
+    "Not a single test failed.",
+    "Zero tests failed.",
+    "Tests did not fail.",
+  ])("requires typed execution evidence for an observed negative test result: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["whenever conditional", "Tests pass whenever configured.", true],
+    ["when conditional", "Tests pass when configured.", true],
+    ["bare affirmative", "Tests pass.", false],
+    ["past affirmative", "Tests passed.", false],
+  ] as const)("distinguishes conditional test prose from results: %s", (_label, text, isOrdinary) => {
+    if (isOrdinary) {
+      expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+        .toMatchObject({ outcome: "accepted" });
+      return;
+    }
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Tests may not fail.",
+    "Tests will not fail.",
+    "Tests did not fail whenever configured.",
+  ])("preserves modal and habitual negative prose: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
     "parser passed the value to next stage",
     "Use the passed value as default",
     "Pass the test fixture into helper",
     "Parser passed value downstream.",
+    "Parser passed along the value.",
   ])("keeps non-result pass grammar ordinary: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Tests pass so we can merge.",
+    "Tests pass and I will monitor them.",
+    "I can confirm tests pass.",
+  ])("rejects an unclaimed present-tense test result: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Did tests pass?",
+    "If tests passed, continue.",
+    "parser passed tests to next stage",
+    "tests pass through validation",
+  ])("keeps question, conditional, and phrasal pass prose ordinary: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
   });
@@ -1793,6 +2048,16 @@ describe("bounded text heuristics", () => {
     "Ｔｈｅ ｂｕｉｌｄ ｓｕｃｃｅｅｄｅｄ.",
     "The bui\u200Bld succeeded.",
   ])("rejects Unicode-obfuscated operational prose: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    ["unmapped Cyrillic d", "Tests p\u0430\u0455\u0455e\u0501."],
+    ["palochka", "The service is \u04cfive."],
+    ["pure-script lookalikes", "Теѕтѕ раѕѕеԁ."],
+    ["Armenian lookalike", "Production is \u0585nline."],
+    ["mapped script with hidden separators", "Теѕ\u200Bтѕ ра\u00adѕѕеԁ."],
+  ] as const)("rejects canonicalized confusable operational prose: %s", (_label, text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
 
