@@ -10,7 +10,7 @@
  * small enough to fit them; the capability executor is what enforces the
  * bound at the tool boundary.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   BROKER_MAX_DEADLINE_MS,
   BROKER_SCHEMA_VERSION,
@@ -125,21 +125,6 @@ type VerifyOutcomeFacts = Readonly<{
   receiptId: string | null;
   completedAt: number;
 }>;
-
-function sha256Hex(text: string): string {
-  return createHash("sha256").update(text, "utf8").digest("hex");
-}
-
-/**
- * A verification envelope is reconstructed from stable turn/binding identity
- * rather than minted fresh per call, so a second attempt for the exact same
- * logical operation reproduces the same request id, idempotency key, and
- * nonce byte-for-byte. That is what lets the repository's digest comparison
- * recognize a replay instead of rejecting it as a conflicting key reuse.
- */
-function deterministicId(prefix: string, parts: readonly (string | number)[]): string {
-  return `${prefix}${sha256Hex(parts.map(String).join("\u0000"))}`;
-}
 
 /** A verification receipt's `result` is never `"ready"` — that value belongs only to health receipts. */
 function verifyReceiptResult(result: "ready" | "valid" | "invalid" | null): "valid" | "invalid" | null {
@@ -281,15 +266,16 @@ export class CredentialAccessService {
         : { result: null, failureClass: null, receiptId: null, completedAt: prepared.operation.updatedAt });
     }
 
-    // "prepared" (first attempt) or "ambiguous" (recovering an unresolved
-    // earlier attempt) both dispatch the same reconstructed envelope once.
-    const callOutcome = await this.deps.client.call(envelope);
+    // A still-outstanding earlier attempt must be reconciled by resending its
+    // exact stored envelope; only a genuinely fresh state sends the new one.
+    const toSend = prepared.outcome === "reconcile_required" ? prepared.operation.envelope : envelope;
+    const callOutcome = await this.deps.client.call(toSend);
     if (callOutcome.outcome === "ambiguous") {
-      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: envelope.requestId, now: this.deps.now() });
+      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: toSend.requestId, now: this.deps.now() });
       return { outcome: "ambiguous" };
     }
     if (callOutcome.outcome === "failed") {
-      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: envelope.requestId, now: this.deps.now() });
+      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: toSend.requestId, now: this.deps.now() });
       return { outcome: "failed", failureClass: "local_error" };
     }
 
@@ -302,7 +288,7 @@ export class CredentialAccessService {
       now: this.deps.now(),
     });
     if (staticRecheck.state !== "ready") {
-      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: envelope.requestId, now: this.deps.now() });
+      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: toSend.requestId, now: this.deps.now() });
       return { outcome: "denied", reason: staticRecheck.state };
     }
 
@@ -312,7 +298,7 @@ export class CredentialAccessService {
       now: this.deps.now(),
       installationId,
       turnId: input.authorized.turn.id,
-      requestId: envelope.requestId,
+      requestId: toSend.requestId,
       response: callOutcome.response,
     });
     if (completed.outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
@@ -380,20 +366,12 @@ export class CredentialAccessService {
     binding: CredentialBindingMetadata,
     authorized: AuthorizedControllerCapability,
   ): BrokerRequestEnvelope {
-    const keyParts = [
-      installationId,
-      authorized.turn.id,
-      binding.bindingId,
-      binding.generation,
-      authorized.fence.ownerId,
-      authorized.fence.generation,
-    ];
     const issuedAt = authorized.turn.submittedAt ?? authorized.fence.now;
     return Object.freeze({
       schemaVersion: BROKER_SCHEMA_VERSION,
       installationId,
-      requestId: deterministicId("vreq_", keyParts),
-      idempotencyKey: deterministicId("videm_", keyParts),
+      requestId: `req_${randomUUID()}`,
+      idempotencyKey: `idem_${randomUUID()}`,
       operation: "vault.binding.verify",
       bindingId: binding.bindingId,
       bindingGeneration: binding.generation,
@@ -404,7 +382,7 @@ export class CredentialAccessService {
       fenceGeneration: authorized.fence.generation,
       issuedAt,
       deadlineAt: issuedAt + BROKER_MAX_DEADLINE_MS,
-      nonce: deterministicId("vnonce_", keyParts),
+      nonce: `nonce_${randomUUID()}`,
     }) as BrokerRequestEnvelope;
   }
 

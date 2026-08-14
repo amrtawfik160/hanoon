@@ -517,6 +517,49 @@ it("replays an identical verification prepare and rejects a changed envelope und
   expect(changed).toEqual({ outcome: "digest_mismatch" });
 });
 
+it("reconciles an outstanding verification before claiming a fresh idempotency key", () => {
+  const { repository, turnId, fence } = credentialFixture();
+  repository.reconcileCredentialHealth({
+    installationId: "install_1",
+    health: healthSnapshot(),
+    bindings: [bindingMetadata()],
+    responseSha256: "1".repeat(64),
+    now: 1_500,
+  });
+  const firstEnvelope = verifyEnvelope(fence, turnId, {
+    requestId: "verify-a",
+    idempotencyKey: "verify-a",
+    nonce: "verify-a",
+  });
+  const first = repository.prepareCredentialVerificationOperation({
+    ...fence,
+    installationId: "install_1",
+    turnId,
+    envelope: firstEnvelope,
+  });
+  expect(first.outcome).toBe("prepared");
+  repository.markCredentialOperationAmbiguous({
+    installationId: "install_1",
+    requestId: firstEnvelope.requestId,
+    now: 2_100,
+  });
+
+  const second = repository.prepareCredentialVerificationOperation({
+    ...fence,
+    installationId: "install_1",
+    turnId,
+    envelope: verifyEnvelope(fence, turnId, {
+      requestId: "verify-b",
+      idempotencyKey: "verify-b",
+      nonce: "verify-b",
+    }),
+  });
+
+  expect(second.outcome).toBe("reconcile_required");
+  if (second.outcome !== "reconcile_required") throw new Error("expected reconcile_required");
+  expect(second.operation.envelope).toEqual(firstEnvelope);
+});
+
 it("completes a verification operation, inserts its receipt, and advances the binding to vault_verified", () => {
   const { repository, turnId, fence } = credentialFixture();
   repository.reconcileCredentialHealth({

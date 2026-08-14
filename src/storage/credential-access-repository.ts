@@ -82,7 +82,10 @@ export type CredentialVerificationPrepareInput = ControllerLeaseFence & Readonly
   envelope: BrokerRequestEnvelope;
 }>;
 
-export type CredentialVerificationPrepareResult = CredentialOperationClaim | { outcome: "stale" };
+export type CredentialVerificationPrepareResult = CredentialOperationClaim | { outcome: "stale" } | {
+  outcome: "reconcile_required";
+  operation: CredentialOperationRecord;
+};
 
 export type CredentialOperationCompleteInput = Readonly<{
   installationId: string;
@@ -288,6 +291,14 @@ export class CredentialAccessRepository {
     assertVerifyEnvelope(input.installationId, input.turnId, input.envelope);
     return this.db.transaction((): CredentialVerificationPrepareResult => {
       if (!this.submittedTurnFenceIsCurrent(input)) return { outcome: "stale" };
+      const outstanding = this.outstandingVerification(
+        input.installationId,
+        input.turnId,
+        input.envelope.bindingId,
+        input.envelope.bindingGeneration,
+        input.envelope.idempotencyKey,
+      );
+      if (outstanding) return { outcome: "reconcile_required", operation: toOperationRecord(outstanding) };
       return this.claimOperation(input.installationId, input.envelope, input.now);
     }).immediate();
   }
@@ -481,6 +492,22 @@ export class CredentialAccessRepository {
           AND idempotency_key != ?
         ORDER BY id ASC LIMIT 1`,
     ).get(installationId, excludeIdempotencyKey) as OperationRow | undefined;
+  }
+
+  private outstandingVerification(
+    installationId: string,
+    turnId: string,
+    bindingId: string | null,
+    bindingGeneration: number | null,
+    excludeIdempotencyKey: string,
+  ): OperationRow | undefined {
+    return this.db.prepare(
+      `SELECT * FROM credential_operations
+        WHERE installation_id = ? AND operation = 'vault.binding.verify'
+          AND turn_id = ? AND binding_id = ? AND binding_generation = ?
+          AND state IN ('prepared', 'ambiguous') AND idempotency_key != ?
+        ORDER BY id ASC LIMIT 1`,
+    ).get(installationId, turnId, bindingId, bindingGeneration, excludeIdempotencyKey) as OperationRow | undefined;
   }
 
   private claimOperation(

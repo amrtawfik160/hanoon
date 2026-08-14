@@ -186,7 +186,7 @@ function serviceFixture(options: Readonly<{ origin?: "owner" | "system" }> = {})
   const service = new CredentialAccessService(deps);
 
   return {
-    store, client, service, authorized, invalidateFence,
+    store, client, service, createService: () => new CredentialAccessService(deps), authorized, invalidateFence,
     setConfig: (next: CredentialBrokerConfigResult) => { config = next; },
     setTrustKernelReady: (value: boolean) => { trustKernelReady = value; },
     setControllerPermissionMode: (value: string) => { controllerPermissionMode = value; },
@@ -474,20 +474,79 @@ describe("CredentialAccessService.verify", () => {
     expect(fixture.store.getCredentialBinding(INSTALLATION_ID, "binding_1")).toMatchObject({ state: "pending" });
   });
 
-  it("replays the identical prepared envelope after a local timeout and completes it on retry", async () => {
+  it("replays the stored verification envelope field-by-field after an unresolved attempt", async () => {
     const fixture = readyFixture();
     const authorized = fixture.authorized();
+    const authorizedWithoutSubmittedAt = {
+      ...authorized,
+      turn: { ...authorized.turn, submittedAt: null },
+    };
     fixture.client.call.mockResolvedValueOnce({ outcome: "ambiguous" } satisfies CredentialBrokerCallOutcome);
 
-    const first = await fixture.service.verify({ bindingId: "binding_1", authorized });
+    const first = await fixture.service.verify({ bindingId: "binding_1", authorized: authorizedWithoutSubmittedAt });
     expect(first).toEqual({ outcome: "ambiguous" });
 
+    fixture.setNow(3_000);
     fixture.client.call.mockImplementationOnce(async (envelope: BrokerRequestEnvelope) => ({
       outcome: "succeeded",
       response: verifyResponse(envelope, { result: "valid" }),
     } satisfies CredentialBrokerCallOutcome));
 
-    const second = await fixture.service.verify({ bindingId: "binding_1", authorized });
+    const second = await fixture.service.verify({
+      bindingId: "binding_1",
+      authorized: {
+        ...authorizedWithoutSubmittedAt,
+        fence: { ...authorizedWithoutSubmittedAt.fence, now: 3_000 },
+      },
+    });
+
+    expect(second).toMatchObject({ outcome: "verified", result: "valid" });
+    expect(fixture.client.call).toHaveBeenCalledTimes(2);
+    const [firstEnvelope] = fixture.client.call.mock.calls[0] as [BrokerRequestEnvelope];
+    const [secondEnvelope] = fixture.client.call.mock.calls[1] as [BrokerRequestEnvelope];
+    expect(secondEnvelope.schemaVersion).toBe(firstEnvelope.schemaVersion);
+    expect(secondEnvelope.installationId).toBe(firstEnvelope.installationId);
+    expect(secondEnvelope.requestId).toBe(firstEnvelope.requestId);
+    expect(secondEnvelope.idempotencyKey).toBe(firstEnvelope.idempotencyKey);
+    expect(secondEnvelope.operation).toBe(firstEnvelope.operation);
+    expect(secondEnvelope.bindingId).toBe(firstEnvelope.bindingId);
+    expect(secondEnvelope.bindingGeneration).toBe(firstEnvelope.bindingGeneration);
+    expect(secondEnvelope.turnId).toBe(firstEnvelope.turnId);
+    expect(secondEnvelope.capabilityId).toBe(firstEnvelope.capabilityId);
+    expect(secondEnvelope.policyDigest).toBe(firstEnvelope.policyDigest);
+    expect(secondEnvelope.fenceOwner).toBe(firstEnvelope.fenceOwner);
+    expect(secondEnvelope.fenceGeneration).toBe(firstEnvelope.fenceGeneration);
+    expect(secondEnvelope.issuedAt).toBe(firstEnvelope.issuedAt);
+    expect(secondEnvelope.deadlineAt).toBe(firstEnvelope.deadlineAt);
+    expect(secondEnvelope.nonce).toBe(firstEnvelope.nonce);
+  });
+
+  it("replays the stored verification envelope after a service instance restart", async () => {
+    const fixture = readyFixture();
+    const authorized = fixture.authorized();
+    const authorizedWithoutSubmittedAt = {
+      ...authorized,
+      turn: { ...authorized.turn, submittedAt: null },
+    };
+    fixture.client.call.mockResolvedValueOnce({ outcome: "ambiguous" } satisfies CredentialBrokerCallOutcome);
+
+    const first = await fixture.service.verify({ bindingId: "binding_1", authorized: authorizedWithoutSubmittedAt });
+    expect(first).toEqual({ outcome: "ambiguous" });
+
+    const restartedService = fixture.createService();
+    fixture.setNow(3_000);
+    fixture.client.call.mockImplementationOnce(async (envelope: BrokerRequestEnvelope) => ({
+      outcome: "succeeded",
+      response: verifyResponse(envelope, { result: "valid" }),
+    } satisfies CredentialBrokerCallOutcome));
+
+    const second = await restartedService.verify({
+      bindingId: "binding_1",
+      authorized: {
+        ...authorizedWithoutSubmittedAt,
+        fence: { ...authorizedWithoutSubmittedAt.fence, now: 3_000 },
+      },
+    });
 
     expect(second).toMatchObject({ outcome: "verified", result: "valid" });
     expect(fixture.client.call).toHaveBeenCalledTimes(2);
@@ -496,7 +555,7 @@ describe("CredentialAccessService.verify", () => {
     expect(secondEnvelope).toEqual(firstEnvelope);
   });
 
-  it("replays a completed verification without dispatching to the broker again", async () => {
+  it("starts a new verification after a completed operation", async () => {
     const fixture = readyFixture();
     const authorized = fixture.authorized();
     fixture.client.call.mockImplementation(async (envelope: BrokerRequestEnvelope) => ({
@@ -508,8 +567,15 @@ describe("CredentialAccessService.verify", () => {
     const second = await fixture.service.verify({ bindingId: "binding_1", authorized });
 
     expect(first).toMatchObject({ outcome: "verified", result: "valid" });
-    expect(second).toEqual(first);
-    expect(fixture.client.call).toHaveBeenCalledTimes(1);
+    expect(second).toMatchObject({ outcome: "verified", result: "valid" });
+    expect(fixture.client.call).toHaveBeenCalledTimes(2);
+    const [firstEnvelope] = fixture.client.call.mock.calls[0] as [BrokerRequestEnvelope];
+    const [secondEnvelope] = fixture.client.call.mock.calls[1] as [BrokerRequestEnvelope];
+    expect(secondEnvelope.requestId).not.toBe(firstEnvelope.requestId);
+    expect(secondEnvelope.idempotencyKey).not.toBe(firstEnvelope.idempotencyKey);
+    expect(firstEnvelope.nonce).toMatch(/^nonce_/u);
+    expect(secondEnvelope.nonce).toMatch(/^nonce_/u);
+    expect(secondEnvelope.nonce).not.toBe(firstEnvelope.nonce);
   });
 
   it("refuses to accept a broker success once the world has gone unsafe while the call was in flight", async () => {
@@ -528,8 +594,7 @@ describe("CredentialAccessService.verify", () => {
   });
 
   it("changing the target binding generation between attempts is treated as a different logical operation", async () => {
-    // Envelope identity is derived from (turn, binding, generation): a
-    // regenerated binding must not silently replay the previous generation's
+    // A regenerated binding must not silently replay the previous generation's
     // outstanding or completed operation.
     const fixture = readyFixture();
     const authorized = fixture.authorized();
@@ -549,6 +614,10 @@ describe("CredentialAccessService.verify", () => {
     const [firstEnvelope] = fixture.client.call.mock.calls[0] as [BrokerRequestEnvelope];
     const [secondEnvelope] = fixture.client.call.mock.calls[1] as [BrokerRequestEnvelope];
     expect(secondEnvelope.requestId).not.toBe(firstEnvelope.requestId);
+    expect(secondEnvelope.idempotencyKey).not.toBe(firstEnvelope.idempotencyKey);
     expect(secondEnvelope.bindingGeneration).toBe(2);
+    expect(firstEnvelope.nonce).toMatch(/^nonce_/u);
+    expect(secondEnvelope.nonce).toMatch(/^nonce_/u);
+    expect(secondEnvelope.nonce).not.toBe(firstEnvelope.nonce);
   });
 });
