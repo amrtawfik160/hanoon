@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "Protected mTLS credential broker with local administration",
   "engines": {
     "node": ">=22"
   },

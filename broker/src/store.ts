@@ -67,6 +67,25 @@ export type BrokerInstallationAttestation = Readonly<{
   now?: number;
 }>;
 
+export type BrokerInstallationRevocation = Readonly<{
+  installationId: string;
+  now?: number;
+}>;
+
+export type BrokerAdminOperation =
+  | "installation.add"
+  | "installation.attest"
+  | "installation.revoke"
+  | "binding.add"
+  | "binding.revoke";
+
+export type BrokerRejectedAdminMutation = Readonly<{
+  operation: BrokerAdminOperation;
+  installationId: string;
+  bindingId?: string;
+  now?: number;
+}>;
+
 export type BrokerBindingEnrollment = Readonly<{
   installationId: string;
   bindingId?: string;
@@ -264,7 +283,17 @@ export class BrokerStore {
   getInstallationByCertificate(fingerprint: string): BrokerInstallation | null {
     const row = this.db.prepare("SELECT * FROM broker_installations WHERE client_certificate_fingerprint = ?")
       .get(fingerprint) as DbInstallationRow | undefined;
-    return row ? installationFromRow(row) : null;
+    return row?.state === "active" ? installationFromRow(row) : null;
+  }
+
+  getInstallationCount(): number {
+    const row = this.db.prepare("SELECT count(*) AS count FROM broker_installations").get() as { count: number };
+    return row.count;
+  }
+
+  getBindingCount(): number {
+    const row = this.db.prepare("SELECT count(*) AS count FROM broker_bindings").get() as { count: number };
+    return row.count;
   }
 
   getBinding(installationId: string, bindingId: string): BrokerBinding | null {
@@ -524,6 +553,43 @@ export class BrokerStore {
     return this.getInstallation(input.installationId)!;
   }
 
+  revokeInstallation(input: BrokerInstallationRevocation): BrokerInstallation {
+    const now = nowOr(this.clock, input.now);
+    const current = this.getInstallation(input.installationId);
+    if (!current || current.state !== "active") throw stableError("broker_installation_unavailable");
+    const transaction = this.db.transaction(() => {
+      this.db.prepare(
+        "UPDATE broker_installations SET state = 'revoked', updated_at = ? WHERE installation_id = ? AND state = 'active'",
+      ).run(now, input.installationId);
+      this.db.prepare(
+        "UPDATE broker_bindings SET state = 'compromised', generation = generation + 1, updated_at = ? WHERE installation_id = ?",
+      ).run(now, input.installationId);
+      this.insertAdminEvent({
+        operation: "installation.revoke",
+        installationId: input.installationId,
+        beforeState: current.state,
+        afterState: "revoked",
+        occurredAt: now,
+      });
+    });
+    transaction();
+    return this.getInstallation(input.installationId)!;
+  }
+
+  recordRejectedAdminMutation(input: BrokerRejectedAdminMutation): void {
+    const now = nowOr(this.clock, input.now);
+    const transaction = this.db.transaction(() => {
+      this.insertAdminEvent({
+        operation: input.operation,
+        installationId: input.installationId,
+        bindingId: input.bindingId,
+        outcome: "failed",
+        occurredAt: now,
+      });
+    });
+    transaction();
+  }
+
   addBinding(input: BrokerBindingEnrollment): CredentialBindingMetadata {
     const now = nowOr(this.clock, input.now);
     if (!this.dataKey || input.reference.length === 0 || input.label.trim().length === 0 || input.label.length > 120 ||
@@ -572,9 +638,9 @@ export class BrokerStore {
     const transaction = this.db.transaction(() => {
       this.db.prepare(`
         UPDATE broker_bindings
-        SET external_reference_ciphertext = ?, state = 'revoked', generation = ?, revoked_at = ?, updated_at = ?
+        SET external_reference_ciphertext = ?, state = 'revoked', generation = ?, revoked_at = ?, tombstone_at = ?, updated_at = ?
         WHERE installation_id = ? AND binding_id = ?
-      `).run(nextCiphertext, nextGeneration, now, now, input.installationId, input.bindingId);
+      `).run(nextCiphertext, nextGeneration, now, now, now, input.installationId, input.bindingId);
       this.insertAdminEvent({
         operation: "binding.revoke",
         installationId: input.installationId,
@@ -653,7 +719,7 @@ export class BrokerStore {
   }
 
   private insertAdminEvent(input: {
-    operation: "installation.add" | "installation.attest" | "installation.revoke" | "binding.add" | "binding.revoke";
+    operation: BrokerAdminOperation;
     installationId: string;
     bindingId?: string;
     beforeTopologyDigest?: string;
@@ -664,6 +730,7 @@ export class BrokerStore {
     afterGeneration?: number;
     beforeState?: string;
     afterState?: string;
+    outcome?: "succeeded" | "failed";
     occurredAt: number;
   }): void {
     this.db.prepare(`
@@ -673,13 +740,13 @@ export class BrokerStore {
         before_topology_expires_at, after_topology_expires_at,
         before_generation, after_generation, before_state, after_state,
         outcome, occurred_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'succeeded', ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), input.operation, input.installationId, input.bindingId ?? null,
       input.beforeTopologyDigest ?? null, input.afterTopologyDigest ?? null,
       input.beforeTopologyExpiresAt ?? null, input.afterTopologyExpiresAt ?? null,
       input.beforeGeneration ?? null, input.afterGeneration ?? null,
-      input.beforeState ?? null, input.afterState ?? null, input.occurredAt,
+      input.beforeState ?? null, input.afterState ?? null, input.outcome ?? "succeeded", input.occurredAt,
     );
   }
 }

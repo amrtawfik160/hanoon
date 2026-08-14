@@ -279,4 +279,79 @@ describe("broker store", () => {
       fixture.close();
     }
   });
+
+  it("revokes an installation atomically and compromises every binding", () => {
+    const fixture = storeFixture();
+    try {
+      enrollInstallation(fixture.store);
+      for (const bindingId of ["binding-1", "binding-2"]) {
+        fixture.store.addBinding({
+          installationId: "installation-1",
+          bindingId,
+          reference: `op://vault-canary/item-${bindingId}/field-canary`,
+          label: `binding ${bindingId}`,
+          capabilityIds: ["telegram_agent_access_verify"],
+          risk: "high",
+          mfaMode: "none",
+          approvalMode: "none",
+        });
+      }
+
+      const revoked = fixture.store.revokeInstallation({ installationId: "installation-1" });
+
+      expect(revoked.state).toBe("revoked");
+      expect(fixture.store.getInstallationByCertificate("a".repeat(64))).toBeNull();
+      expect(fixture.store.getBinding("installation-1", "binding-1")).toMatchObject({ state: "compromised", generation: 2 });
+      expect(fixture.store.getBinding("installation-1", "binding-2")).toMatchObject({ state: "compromised", generation: 2 });
+      expect(fixture.db.prepare("SELECT operation, outcome FROM broker_admin_events WHERE operation = 'installation.revoke'").all())
+        .toEqual([{ operation: "installation.revoke", outcome: "succeeded" }]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rolls back installation revocation when the audit event cannot be written", () => {
+    const fixture = storeFixture();
+    try {
+      enrollInstallation(fixture.store);
+      fixture.store.addBinding({
+        installationId: "installation-1",
+        bindingId: "binding-1",
+        reference: REFERENCE,
+        label: "canary binding",
+        capabilityIds: ["telegram_agent_access_verify"],
+        risk: "high",
+        mfaMode: "none",
+        approvalMode: "none",
+      });
+      fixture.db.exec("CREATE TRIGGER reject_installation_revocation BEFORE INSERT ON broker_admin_events WHEN NEW.operation = 'installation.revoke' BEGIN SELECT RAISE(ABORT, 'audit failure'); END");
+
+      expect(() => fixture.store.revokeInstallation({ installationId: "installation-1" })).toThrow();
+      expect(fixture.store.getInstallation("installation-1")?.state).toBe("active");
+      expect(fixture.store.getBinding("installation-1", "binding-1")).toMatchObject({ state: "pending", generation: 1 });
+      expect(fixture.db.prepare("SELECT count(*) AS count FROM broker_admin_events WHERE operation = 'installation.revoke'").get())
+        .toEqual({ count: 0 });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("records a rejected admin mutation without changing broker state", () => {
+    const fixture = storeFixture();
+    try {
+      enrollInstallation(fixture.store);
+      const before = fixture.store.getInstallation("installation-1");
+
+      fixture.store.recordRejectedAdminMutation({
+        operation: "installation.revoke",
+        installationId: "installation-1",
+      });
+
+      expect(fixture.store.getInstallation("installation-1")).toEqual(before);
+      expect(fixture.db.prepare("SELECT operation, outcome FROM broker_admin_events WHERE operation = 'installation.revoke'").all())
+        .toEqual([{ operation: "installation.revoke", outcome: "failed" }]);
+    } finally {
+      fixture.close();
+    }
+  });
 });
