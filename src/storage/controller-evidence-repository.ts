@@ -178,6 +178,7 @@ type FinalizationTurnRow = FencedTurnRow & {
 
 type LegacyFinalizationTurnRow = Readonly<{
   controller_key: string;
+  evidence_event_seq: number;
   evidence_limit_exceeded_at: number | null;
   telegram_user_id: string;
   telegram_chat_id: string;
@@ -365,7 +366,8 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       const turn = this.finalizationTurn(input);
       if (!turn) return { outcome: "stale" };
       if (turn.accepted_finalization_id !== null) {
-        const accepted = this.requiredAcceptedFinalization(input.turnId);
+        const accepted = this.readAcceptedFinalization(input.turnId);
+        if (!accepted) return { outcome: "stale" };
         if (accepted.id !== turn.accepted_finalization_id) {
           throw new Error("Accepted controller finalization pointer changed during retry");
         }
@@ -416,25 +418,66 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
 
   public getAcceptedFinalization(turnId: string): AcceptedControllerFinalization | null {
     assertBoundedString(turnId, "turnId");
+    if (this.db.inTransaction) return this.readAcceptedFinalization(turnId);
+    return this.db.transaction(() => this.readAcceptedFinalization(turnId)).immediate();
+  }
+
+  private readAcceptedFinalization(turnId: string): AcceptedControllerFinalization | null {
+    const finalizationId = this.acceptedFinalizationId(turnId);
+    if (finalizationId === null) return null;
+    const row = this.acceptedFinalizationRow(turnId, finalizationId);
+    const accepted = this.parseAcceptedForRead(turnId, row);
+    if (!accepted) return null;
+    if (accepted.evidenceHighWaterId > 0 && !this.evidenceSealExists(turnId, accepted.evidenceHighWaterId)) {
+      if (row.envelope_version < CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION) {
+        this.retireLegacyAcceptedFinalization(turnId, row.id);
+        return null;
+      }
+      throw new Error("Accepted controller finalization evidence high-water is inconsistent");
+    }
+    return accepted.semanticEnvelopeVersion < CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION
+      ? this.upgradeLegacyAcceptedFinalization(accepted)
+      : accepted;
+  }
+
+  private acceptedFinalizationId(turnId: string): number | null {
     const pointer = this.db.prepare(
       "SELECT accepted_finalization_id FROM controller_turns WHERE id = ?",
     ).get(turnId) as { accepted_finalization_id: number | null } | undefined;
     if (!pointer || pointer.accepted_finalization_id === null) return null;
     assertPositiveInteger(pointer.accepted_finalization_id, "persisted accepted finalization pointer");
+    return pointer.accepted_finalization_id;
+  }
+
+  private acceptedFinalizationRow(turnId: string, finalizationId: number): ControllerFinalizationRow {
     const row = this.db.prepare(
       "SELECT * FROM controller_finalizations WHERE id = ?",
-    ).get(pointer.accepted_finalization_id) as ControllerFinalizationRow | undefined;
+    ).get(finalizationId) as ControllerFinalizationRow | undefined;
     if (!row || row.turn_id !== turnId) throw new Error("Accepted controller finalization pointer is inconsistent");
-    const accepted = parseAcceptedFinalization(row);
-    if (accepted.evidenceHighWaterId > 0 && !this.db.prepare(
-      "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id = ?",
-    ).get(turnId, accepted.evidenceHighWaterId)) {
-      throw new Error("Accepted controller finalization evidence high-water is inconsistent");
-    }
-    if (accepted.semanticEnvelopeVersion < CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION) {
-      return this.revalidateLegacyAcceptedFinalization(accepted);
+    return row;
+  }
+
+  private parseAcceptedForRead(
+    turnId: string,
+    row: ControllerFinalizationRow,
+  ): AcceptedControllerFinalization | null {
+    let accepted: AcceptedControllerFinalization;
+    try {
+      accepted = parseAcceptedFinalization(row);
+    } catch (error) {
+      if (row.envelope_version < CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION && row.state === "accepted") {
+        this.retireLegacyAcceptedFinalization(turnId, row.id);
+        return null;
+      }
+      throw error;
     }
     return accepted;
+  }
+
+  private evidenceSealExists(turnId: string, evidenceHighWaterId: number): boolean {
+    return this.db.prepare(
+      "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id = ?",
+    ).get(turnId, evidenceHighWaterId) !== undefined;
   }
 
   public claimCompletionContinuation(
@@ -550,24 +593,89 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     };
   }
 
-  private revalidateLegacyAcceptedFinalization(
+  private upgradeLegacyAcceptedFinalization(
     accepted: AcceptedControllerFinalization,
   ): AcceptedControllerFinalization | null {
     const turn = this.legacyFinalizationTurn(accepted.turnId);
-    if (!turn) return null;
+    if (!turn) {
+      this.retireLegacyAcceptedFinalization(accepted.turnId, accepted.id);
+      return null;
+    }
+    const legacyHighWater = this.legacyHighWaterForUpgrade(accepted, turn);
+    if (legacyHighWater === null) {
+      this.retireLegacyAcceptedFinalization(accepted.turnId, accepted.id);
+      return null;
+    }
+    const validatedAt = this.clock();
+    if (!this.legacyFinalizationStillValid(accepted, turn, validatedAt)) {
+      this.retireLegacyAcceptedFinalization(accepted.turnId, accepted.id);
+      return null;
+    }
+    return this.persistLegacyFinalizationUpgrade(accepted, legacyHighWater, validatedAt);
+  }
+
+  private legacyHighWaterForUpgrade(
+    accepted: AcceptedControllerFinalization,
+    turn: LegacyFinalizationTurnRow,
+  ): number | null {
+    const highWater = accepted.bbEventHighWaterSeq ?? (turn.evidence_event_seq === 0 ? 0 : null);
+    return highWater === turn.evidence_event_seq ? highWater : null;
+  }
+
+  private legacyFinalizationStillValid(
+    accepted: AcceptedControllerFinalization,
+    turn: LegacyFinalizationTurnRow,
+    validatedAt: number,
+  ): boolean {
     const validation = validateControllerFinalization(
       accepted.candidate,
-      this.legacyFinalizationValidationContext(accepted, turn),
+      this.legacyFinalizationValidationContext(accepted, turn, validatedAt),
     );
-    return validation.outcome === "accepted" &&
-      validation.renderedMessage === accepted.renderedMessage
-      ? accepted
-      : null;
+    return validation.outcome === "accepted" && validation.renderedMessage === accepted.renderedMessage;
+  }
+
+  private persistLegacyFinalizationUpgrade(
+    accepted: AcceptedControllerFinalization,
+    legacyHighWater: number,
+    validatedAt: number,
+  ): AcceptedControllerFinalization {
+    this.writeLegacyFinalizationUpgrade(accepted, legacyHighWater, validatedAt);
+    const row = this.db.prepare(
+      "SELECT * FROM controller_finalizations WHERE id = ?",
+    ).get(accepted.id) as ControllerFinalizationRow | undefined;
+    if (!row) throw new Error("Upgraded controller finalization disappeared");
+    return parseAcceptedFinalization(row);
+  }
+
+  private writeLegacyFinalizationUpgrade(
+    accepted: AcceptedControllerFinalization,
+    legacyHighWater: number,
+    validatedAt: number,
+  ): void {
+    const upgradedPayload = {
+      _hanoonControllerFinalization: accepted.candidate,
+      bbEventHighWaterSeq: legacyHighWater,
+      semanticEnvelopeVersion: CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION,
+    };
+    const upgraded = this.db.prepare(
+      `UPDATE controller_finalizations
+          SET payload_json = ?, envelope_version = ?, validated_at = ?
+        WHERE id = ? AND turn_id = ? AND state = 'accepted'
+          AND envelope_version < ?`,
+    ).run(
+      JSON.stringify(upgradedPayload),
+      CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION,
+      validatedAt,
+      accepted.id,
+      accepted.turnId,
+      CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION,
+    );
+    if (upgraded.changes !== 1) throw new Error("Legacy controller finalization upgrade raced");
   }
 
   private legacyFinalizationTurn(turnId: string): LegacyFinalizationTurnRow | undefined {
     return this.db.prepare(
-      `SELECT turn.controller_key, turn.evidence_limit_exceeded_at,
+      `SELECT turn.controller_key, turn.evidence_event_seq, turn.evidence_limit_exceeded_at,
               controller.telegram_user_id, controller.telegram_chat_id
          FROM controller_turns AS turn
          JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
@@ -578,6 +686,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
   private legacyFinalizationValidationContext(
     accepted: AcceptedControllerFinalization,
     turn: LegacyFinalizationTurnRow,
+    now = this.clock(),
   ): ControllerFinalizationValidationContext {
     return {
       acceptedAlready: false,
@@ -586,7 +695,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       evidenceLimitExceeded: turn.evidence_limit_exceeded_at !== null,
       evidenceByRef: this.evidenceByRef(accepted.turnId),
       ownerBoundaryPresent: accepted.candidate.disposition !== "needs_owner" ||
-        this.legacyOwnerBoundaryPresent(accepted.turnId, turn),
+        this.legacyOwnerBoundaryPresent(accepted.turnId, turn, now),
       liveObligationRefs: this.liveObligationRefs(turn.controller_key),
     };
   }
@@ -594,14 +703,31 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
   private legacyOwnerBoundaryPresent(
     turnId: string,
     turn: LegacyFinalizationTurnRow,
+    now = this.clock(),
   ): boolean {
     return this.ownerBoundaryPresentForContext(
       turnId,
       turn.controller_key,
       turn.telegram_user_id,
       turn.telegram_chat_id,
-      this.clock(),
+      now,
     );
+  }
+
+  private retireLegacyAcceptedFinalization(turnId: string, finalizationId: number): void {
+    const retired = this.db.prepare(
+      `UPDATE controller_finalizations
+          SET state = 'rejected', rejection_code = 'invalid_contract'
+        WHERE id = ? AND turn_id = ? AND state = 'accepted'
+          AND envelope_version < ?`,
+    ).run(finalizationId, turnId, CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION);
+    if (retired.changes !== 1) throw new Error("Legacy controller finalization retirement raced");
+    const unpointed = this.db.prepare(
+      `UPDATE controller_turns
+          SET accepted_finalization_id = NULL, updated_at = ?
+        WHERE id = ? AND accepted_finalization_id = ?`,
+    ).run(this.clock(), turnId, finalizationId);
+    if (unpointed.changes !== 1) throw new Error("Legacy controller finalization pointer changed during retirement");
   }
 
   private ownerBoundaryPresentForContext(
@@ -739,7 +865,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
   }
 
   private requiredAcceptedFinalization(turnId: string): AcceptedControllerFinalization {
-    const accepted = this.getAcceptedFinalization(turnId);
+    const accepted = this.readAcceptedFinalization(turnId);
     if (!accepted) throw new Error("Accepted controller finalization disappeared after insert");
     return accepted;
   }

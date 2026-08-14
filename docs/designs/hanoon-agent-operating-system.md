@@ -315,11 +315,11 @@ type ControllerFinalization = {
 };
 ```
 
-The owner-visible message is the exact concatenation of segment text in order. Bounds are fixed at a 4,000-character rendered message, 24 nonempty segments, 12 claim segments, 8 evidence references per claim, and 8 obligation references. Duplicate references within a claim are rejected. A rejected candidate may be followed by another bounded revision, but an accepted candidate is immutable.
+The owner-visible message is the exact concatenation of segment text in order. Bounds are fixed at a 4,000-character rendered message, 24 nonempty segments, 12 claim segments, 8 evidence references per claim, and 8 obligation references. Duplicate references within a claim are rejected. A rejected candidate may be followed by another bounded revision, while a current-envelope accepted candidate is immutable after any one-time legacy normalization.
 
 Claim segments are required for statements about current Hanoon, BB, workspace, pipeline, or external-system state and about completed work. This binds the exact delivered words to their evidence instead of keeping a detached claims inventory. General explanations, calculations, opinions, and other conversational answers that do not assert current operational state may use text segments only.
 
-`controller_finalizations` is append-only except for a one-way null-to-timestamp `consumed_at` transition. It stores one row per turn revision with its bounded JSON contract, rendered message, `evidence_high_water_id`, state (`accepted` or `rejected`), rejection code, creation time, validation time, and consumption time. A partial unique index permits at most one accepted revision per turn, and at most eight revisions may be inserted for one logical turn. It stores no raw provider output. The accepted row's evidence high-water id is an immutable seal over the evidence set against which its words were validated.
+`controller_finalizations` is append-only except for a one-way null-to-timestamp `consumed_at` transition and the one-time compatibility repair that revalidates and normalizes a legacy accepted row to the current envelope. If that legacy validation fails, the row is retired and the accepted pointer is cleared in the same transaction. It stores one row per turn revision with its bounded JSON contract, rendered message, `evidence_high_water_id`, state (`accepted` or `rejected`), rejection code, creation time, validation time, and consumption time. A partial unique index permits at most one accepted revision per turn, and at most eight revisions may be inserted for one logical turn. It stores no raw provider output. After legacy normalization, the accepted row's evidence high-water id is an immutable seal over the evidence set against which its words were validated.
 
 ### Completion validation
 
@@ -500,7 +500,7 @@ Implementation follows test-driven development. Required tests include:
 - High-impact claim segments without compatible proof are rejected.
 - A deferred answer without a live job or armed monitor is rejected.
 - A valid current-turn claim and a valid durable obligation are accepted.
-- An accepted finalization is immutable.
+- An accepted current-envelope finalization is immutable; a legacy accepted row is normalized once under full current validation or retired with its pointer cleared atomically.
 - An accepted finalization stores the current evidence high-water id and denies every later non-finalizer Hanoon capability before effect.
 - A native BB item completing beyond the accepted evidence seal prevents finalization consumption and owner-answer delivery.
 - A ninth finalization revision is rejected without inserting another row.

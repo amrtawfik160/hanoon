@@ -866,6 +866,9 @@ describe("fail-closed operational claim binding", () => {
     ["a so-clause", "The deployment was not live so the tests passed."],
     ["an earlier negation", "The deployment was not live before the tests passed."],
     ["a question", "Did the deployment succeed?"],
+    ["a so-clause after a negative predicate", "The tests did not fail so production is live."],
+    ["a therefore-clause", "The canary did not fail therefore production is live."],
+    ["a yet-clause", "The deployment was not blocked yet production is live."],
   ] as const)("keeps an affirmative assertion visible in %s", (_label, text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
@@ -965,6 +968,7 @@ describe("bounded text heuristics", () => {
     "The canary did not pass.",
     "The merge was not completed.",
     "Production is not live.",
+    "Production is not yet live.",
   ])("keeps a wholly negative operational statement acceptable: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });

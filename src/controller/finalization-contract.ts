@@ -170,6 +170,26 @@ const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\
 const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
 const NON_AFFIRMATIVE_OPERATIONAL_PREFIX = /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't|will|would|could|should|plan to|intend to|propose|after approval|later|may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?|can you confirm whether)\b/i;
+const NON_AFFIRMATIVE_QUESTION_START = /^(?:can|could|would|should|will|may|might)\b/i;
+const PREDICATE_TOKEN = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
+const PREDICATE_CHAIN_WORDS = new Set([
+  "am", "is", "are", "was", "were", "be", "been", "being",
+  "do", "does", "did", "have", "has", "had",
+  "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+  "not", "never", "no", "longer", "cannot", "can't", "don't", "doesn't", "didn't",
+  "isn't", "aren't", "wasn't", "weren't", "hasn't", "haven't", "hadn't", "won't",
+  "wouldn't", "couldn't", "shouldn't", "plan", "to", "intend", "propose",
+  "maybe", "uncertain", "unsure", "possibly", "probably", "appear", "appears", "seem", "seems", "yet",
+]);
+const NON_AFFIRMATIVE_SCOPE_VERBS = new Set([
+  "think", "believe", "expect", "assume", "suppose", "appear", "appears", "seem", "seems",
+]);
+const NON_AFFIRMATIVE_SCOPE_NEGATORS = new Set([
+  "not", "never", "don't", "doesn't", "didn't", "can't", "cannot", "won't", "wouldn't",
+  "couldn't", "shouldn't",
+]);
+const PREDICATE_DETERMINERS = new Set(["the", "a", "an"]);
+const MAX_PREDICATE_CONTEXT_CHARS = 256;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
@@ -486,7 +506,7 @@ function normalizedSentences(text: string): string[] {
 
 function textClauses(text: string): string[] {
   return normalizedSentences(text)
-    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then|before|so|despite)\b\s+|;\s*/i))
+    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then)\b\s+|;\s*/i))
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
@@ -496,6 +516,49 @@ type OperationalMatch = Readonly<{
   start: number;
   end: number;
 }>;
+
+function predicateContextBeforeMatch(clause: string, match: OperationalMatch): string {
+  return clause.slice(Math.max(0, match.start - MAX_PREDICATE_CONTEXT_CHARS), match.start);
+}
+
+function predicatePrefixBeforeMatch(clause: string, match: OperationalMatch): Readonly<{
+  context: string;
+  beforePredicate: string;
+  predicatePrefix: string;
+}> {
+  const context = predicateContextBeforeMatch(clause, match);
+  const tokens = [...context.matchAll(PREDICATE_TOKEN)];
+  let index = tokens.length - 1;
+  while (index >= 0 && PREDICATE_CHAIN_WORDS.has(tokens[index]![0]!.toLowerCase())) index -= 1;
+  const predicateStart = index >= 0 ? tokens[index]!.index ?? 0 : 0;
+  return {
+    context,
+    beforePredicate: context.slice(0, predicateStart),
+    predicatePrefix: context.slice(predicateStart),
+  };
+}
+
+function hasNonAffirmativeScope(prefix: string): boolean {
+  const tokens = [...prefix.matchAll(PREDICATE_TOKEN)];
+  let index = tokens.length - 1;
+  while (index >= 0 && PREDICATE_DETERMINERS.has(tokens[index]![0]!.toLowerCase())) index -= 1;
+  if (index < 0) return false;
+  const scopeVerb = tokens[index]![0]!.toLowerCase();
+  if (!NON_AFFIRMATIVE_SCOPE_VERBS.has(scopeVerb)) return false;
+  if (scopeVerb === "appear" || scopeVerb === "appears" || scopeVerb === "seem" || scopeVerb === "seems") {
+    return true;
+  }
+  const scopeNegator = tokens[index - 1]?.[0]?.toLowerCase();
+  return scopeNegator !== undefined && NON_AFFIRMATIVE_SCOPE_NEGATORS.has(scopeNegator);
+}
+
+function matchHasNonAffirmativePolarity(clause: string, match: OperationalMatch): boolean {
+  const { context, beforePredicate, predicatePrefix } = predicatePrefixBeforeMatch(clause, match);
+  if (NON_AFFIRMATIVE_OPERATIONAL_PREFIX.test(predicatePrefix)) return true;
+  if (hasNonAffirmativeScope(context)) return true;
+  if (hasNonAffirmativeScope(beforePredicate)) return true;
+  return NON_AFFIRMATIVE_QUESTION_START.test(clause.trim());
+}
 
 function operationalMatchesIn(clause: string): OperationalMatch[] {
   const matches: OperationalMatch[] = [];
@@ -513,12 +576,7 @@ function operationalMatchesIn(clause: string): OperationalMatch[] {
     }
   }
   return matches.filter((match) => {
-    // Keep polarity local to the predicate being matched. A negative phrase
-    // elsewhere in the same unsplit clause must not erase an affirmative
-    // assertion, while "was not deployed" and "may have succeeded" stay
-    // non-affirmative. Punctuation marks the smallest safe local boundary.
-    const localPrefix = clause.slice(0, match.start).split(/[,();:]/u).at(-1) ?? "";
-    return !NON_AFFIRMATIVE_OPERATIONAL_PREFIX.test(localPrefix);
+    return !matchHasNonAffirmativePolarity(clause, match);
   });
 }
 
@@ -558,7 +616,7 @@ function sentenceSourceSpans(text: string): SourceTextSpan[] {
 
 function splitOperationalSentence(sentence: SourceTextSpan): SourceTextSpan[] {
   const clauses: SourceTextSpan[] = [];
-  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then|before|so|despite)\b\s+|;\s*/gi;
+  const clauseSeparator = /\s*;\s*/gi;
   let cursor = 0;
   let separator = clauseSeparator.exec(sentence.text);
   while (separator !== null) {
@@ -680,7 +738,11 @@ function plainTextRuns(candidate: ControllerFinalization): string[] {
 }
 
 function hasUnclaimedHighImpactText(candidate: ControllerFinalization): boolean {
-  return plainTextRuns(candidate).some((run) => textClauses(run).some(clauseHasHighImpactSuccess));
+  return plainTextRuns(candidate).some((run) => (
+    normalizedSentences(run)
+      .flatMap((sentence) => splitOperationalSentence({ text: sentence, start: 0 }))
+      .some((span) => clauseHasHighImpactSuccess(span.text))
+  ));
 }
 
 function renderCandidate(candidate: ControllerFinalization): string | null {

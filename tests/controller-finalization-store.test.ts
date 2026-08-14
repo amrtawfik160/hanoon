@@ -457,7 +457,7 @@ it("revalidates a legacy accepted envelope against current evidence after restar
   const restarted = fixture.reopen();
   expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
     id: accepted.finalization.id,
-    semanticEnvelopeVersion: 1,
+    semanticEnvelopeVersion: 2,
   });
   expect(restarted.completeControllerTurnFromFinalization({
     ...fixture.fence,
@@ -465,6 +465,45 @@ it("revalidates a legacy accepted envelope against current evidence after restar
     controllerKey: fixture.turn.controllerKey,
     bbHighWaterSeq: 0,
   })).toBe("completed");
+});
+
+it("upgrades a legacy accepted envelope before its owner boundary can change", () => {
+  const fixture = submittedControllerFixture();
+  fixture.store.createThreadOperation({
+    id: "legacy_upgrade_operation",
+    nonceHash: "7".repeat(64),
+    ownerUserId: "7",
+    ownerChatId: "7",
+    kind: "stop_thread",
+    threadId: "thread_target",
+    text: null,
+    expiresAt: fixture.fence.now + 100,
+    now: fixture.fence.now,
+  });
+  expect(fixture.store.markThreadOperationConfirmationSent(
+    "legacy_upgrade_operation",
+    77,
+    fixture.fence.now,
+  )).toMatchObject({ state: "awaiting_confirmation" });
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: needsOwnerFinalization(),
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope fixture was not accepted");
+  downgradeAcceptedEnvelope(fixture, accepted.finalization);
+
+  const restarted = fixture.reopen();
+  const firstRead = restarted.getAcceptedControllerFinalization(fixture.turn.id);
+  expect(firstRead).toMatchObject({ id: accepted.finalization.id });
+  fixture.db.prepare("UPDATE thread_operations SET expires_at = 1 WHERE id = ?")
+    .run("legacy_upgrade_operation");
+
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toEqual(firstRead);
+  expect(fixture.db.prepare(
+    "SELECT envelope_version FROM controller_finalizations WHERE id = ?",
+  ).get(accepted.finalization.id)).toEqual({ envelope_version: 2 });
 });
 
 it("fails closed when a legacy accepted envelope no longer matches current evidence", () => {
@@ -504,6 +543,12 @@ it("fails closed when a legacy accepted envelope no longer matches current evide
 
   const restarted = fixture.reopen();
   expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+  expect(fixture.db.prepare(
+    "SELECT accepted_finalization_id FROM controller_turns WHERE id = ?",
+  ).get(fixture.turn.id)).toEqual({ accepted_finalization_id: null });
+  expect(fixture.db.prepare(
+    "SELECT state, rejection_code FROM controller_finalizations WHERE id = ?",
+  ).get(accepted.finalization.id)).toEqual({ state: "rejected", rejection_code: "invalid_contract" });
   expect(restarted.completeControllerTurnFromFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
@@ -1252,7 +1297,7 @@ it.each(LEGACY_OWNER_BOUNDARY_SETUPS)(
 
     expect(fixture.reopen().getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
       id: accepted.finalization.id,
-      semanticEnvelopeVersion: 1,
+      semanticEnvelopeVersion: 2,
     });
   },
 );
