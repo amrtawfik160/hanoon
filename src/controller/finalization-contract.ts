@@ -203,11 +203,7 @@ const NON_AFFIRMATIVE_SCOPE_NEGATORS = new Set([
   "couldn't", "shouldn't",
 ]);
 const PREDICATE_DETERMINERS = new Set(["the", "a", "an"]);
-const TEST_SUBJECT_LINK_WORDS = new Set([
-  "against", "all", "also", "already", "am", "are", "at", "be", "been", "being", "could", "did", "does",
-  "for", "from", "had", "has", "have", "in", "is", "might", "must", "of", "on", "should", "successfully",
-  "production", "the", "to", "using", "was", "were", "with", "would",
-]);
+const PREDICATE_PREPOSITION = /^(?:about|above|across|after|against|along|among|around|as|at|before|behind|below|beneath|beside|between|beyond|by|despite|during|for|from|in|inside|into|near|of|off|on|onto|over|through|throughout|to|toward|under|until|upon|via|with|within|without)$/i;
 const MAX_PREDICATE_CONTEXT_CHARS = 256;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 type OperationalAssertion = Readonly<{
@@ -588,8 +584,24 @@ function matchHasNonAffirmativePolarity(clause: string, match: OperationalMatch)
   return false;
 }
 
-function predicateWordsAreAllowed(text: string, allowedWords: ReadonlySet<string>): boolean {
-  return [...text.matchAll(PREDICATE_TOKEN)].every((token) => allowedWords.has(token[0]!.toLowerCase()));
+function predicateTokenIsPreposition(token: string): boolean {
+  return PREDICATE_PREPOSITION.test(token);
+}
+
+function hasCompetingNominalSubject(afterSubject: string): boolean {
+  const tokens = [...afterSubject.matchAll(PREDICATE_TOKEN)];
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    const determiner = tokens[index]![0]!;
+    if (!PREDICATE_DETERMINERS.has(determiner.toLowerCase())) continue;
+    const previous = tokens[index - 1];
+    if (!previous) return true;
+    const gap = afterSubject.slice(previous.index! + previous[0]!.length, tokens[index]!.index!);
+    if (/[,:;()[\]]/.test(gap)) return true;
+    if (predicateTokenIsPreposition(previous[0]!)) continue;
+    if (/ly$/i.test(previous[0]!)) continue;
+    return true;
+  }
+  return false;
 }
 
 function hasTestSubjectEntitlement(clause: string, match: OperationalMatch): boolean {
@@ -598,8 +610,9 @@ function hasTestSubjectEntitlement(clause: string, match: OperationalMatch): boo
   const subjects = [...prefix.matchAll(subject)];
   const subjectMatch = subjects.at(-1);
   if (!subjectMatch || subjectMatch.index === undefined) return false;
-  const afterSubject = prefix.slice(subjectMatch.index + subjectMatch[0].length);
-  return predicateWordsAreAllowed(afterSubject, TEST_SUBJECT_LINK_WORDS);
+  const subjectEnd = subjectMatch.index + subjectMatch[0].length;
+  const subjectToPredicate = clause.slice(subjectEnd, match.end);
+  return !hasCompetingNominalSubject(subjectToPredicate);
 }
 
 function applySubjectEntitlement(clause: string, match: OperationalMatch): OperationalMatch {

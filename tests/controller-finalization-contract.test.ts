@@ -1328,6 +1328,30 @@ describe("bounded text heuristics", () => {
     )).toMatchObject({ outcome: "accepted" });
   });
 
+  it.each([
+    ["unexpectedly", "Tests unexpectedly passed."],
+    ["finally", "Tests finally passed."],
+    ["repeatedly", "Tests repeatedly passed."],
+  ] as const)("entitles adverbial test-success predicates to execution proof: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not transfer test entitlement through a competing predicate subject", () => {
+    const text = "The tests reported the review passed.";
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
   it("keeps neighboring pipeline and test predicates locally entitled", () => {
     const pipelineClaim = claimFinalization({
       kind: "pipeline_outcome",
