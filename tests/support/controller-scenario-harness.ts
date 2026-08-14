@@ -1206,7 +1206,7 @@ async function runExtendedScenario(input: Readonly<{
   const interactionId = `interaction_${scenarioCase.id.replaceAll("-", "_")}_${seed}_${trial}`;
   const approvalPayload = {
     kind: "approval",
-    subject: { kind: "command", command: "npm test -- --run fixed", cwd: "/tmp/fixed-controller" },
+    subject: { kind: "command", command: "npm test -- --run fixed", cwd: "workspace/project" },
     availableDecisions: ["allow_once", "deny"],
   };
   let interactionStatus: "pending" | "resolved" = "pending";
