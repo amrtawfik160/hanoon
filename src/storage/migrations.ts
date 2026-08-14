@@ -148,13 +148,13 @@ CREATE TABLE outbox (
 );
 `] as const;
 
-export const TASK_3_MIGRATIONS = [String.raw`
+export const UPDATE_CLAIM_MIGRATIONS = [String.raw`
 ALTER TABLE telegram_updates ADD COLUMN claim_owner TEXT;
 ALTER TABLE telegram_updates ADD COLUMN claim_generation INTEGER;
 ALTER TABLE telegram_updates ADD COLUMN claim_expires_at INTEGER;
 `] as const;
 
-export const TASK_9_MIGRATIONS = [String.raw`
+export const APPROVAL_BINDING_MIGRATIONS = [String.raw`
 ALTER TABLE callbacks ADD COLUMN approval_nonce_hash TEXT;
 ALTER TABLE callbacks ADD COLUMN head_sha TEXT;
 ALTER TABLE callbacks ADD COLUMN effect_idempotency_key TEXT;
@@ -1892,8 +1892,8 @@ UPDATE outbox
 
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
-  ...TASK_3_MIGRATIONS,
-  ...TASK_9_MIGRATIONS,
+  ...UPDATE_CLAIM_MIGRATIONS,
+  ...APPROVAL_BINDING_MIGRATIONS,
   ...CONTROLLER_MIGRATIONS,
   ...CONTROLLER_STREAM_MIGRATIONS,
   ...THREAD_OPERATION_MIGRATIONS,
