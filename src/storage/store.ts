@@ -1743,12 +1743,18 @@ function nonNegativeLegacyTimestamp(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+function legacyQuestionAnswerIsSubstantive(
+  answer: ControllerQuestionAnswers[string] | undefined,
+): boolean {
+  return (answer?.selected.length ?? 0) > 0 || (answer?.freeText?.trim().length ?? 0) > 0;
+}
+
 function legacyQuestionAnswerMapIsComplete(
   questions: readonly ControllerQuestion[],
   answers: ControllerQuestionAnswers,
 ): boolean {
   return nextUnansweredQuestion(questions, answers) === null && questions.every((question) => (
-    (answers[question.id]?.selected.length ?? 0) > 0
+    legacyQuestionAnswerIsSubstantive(answers[question.id])
   ));
 }
 
@@ -1780,6 +1786,10 @@ function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): Val
     interaction.questions,
     resolution.answers as ControllerQuestionAnswers,
   );
+  if (!complete && nextUnansweredQuestion(
+    interaction.questions,
+    resolution.answers as ControllerQuestionAnswers,
+  ) === null) return null;
   if (row.state === "answered" && !complete) return null;
   const answeredAt = complete
     ? nonNegativeLegacyTimestamp(row.answered_at) ?? nonNegativeLegacyTimestamp(row.asked_at)
@@ -1956,9 +1966,10 @@ function restoreQuarantinedControllerQuestion(
   const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
     ? resolution.answers as ControllerQuestionAnswers
     : {};
+  const next = nextUnansweredQuestion(interaction.questions, answers);
   const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, answers);
+  if (!complete && next === null) return false;
   if (row.prior_state === "answered" && !complete) return false;
-  const next = complete ? null : nextUnansweredQuestion(interaction.questions, answers);
   const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
   const restoredAnsweredAt = restoredState === "answered"
     ? row.answered_at ?? row.asked_at
@@ -2014,9 +2025,10 @@ function restoreQuarantinedThreadQuestion(
   const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
     ? resolution.answers as ControllerQuestionAnswers
     : {};
+  const next = nextUnansweredQuestion(interaction.questions, answers);
   const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, answers);
+  if (!complete && next === null) return false;
   if (row.prior_state === "answered" && !complete) return false;
-  const next = complete ? null : nextUnansweredQuestion(interaction.questions, answers);
   const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
   const restoredAnsweredAt = restoredState === "answered"
     ? row.answered_at ?? row.asked_at

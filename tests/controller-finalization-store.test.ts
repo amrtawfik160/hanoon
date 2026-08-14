@@ -558,6 +558,76 @@ it("fails closed when a legacy accepted envelope no longer matches current evide
   expect(restarted.getControllerTurn(fixture.turn.id)).toMatchObject({ state: "submitted" });
 });
 
+it("does not use evidence recorded after the accepted high-water during legacy envelope upgrade", () => {
+  const fixture = submittedControllerFixture();
+  const evidence = fixture.store.recordControllerEvidence({
+    ...validEvidenceInput(fixture.turn),
+    ...fixture.fence,
+  });
+  if (evidence.outcome !== "recorded") throw new Error("legacy evidence-scope fixture was not recorded");
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy evidence-scope finalization was not accepted");
+  expect(fixture.store.recordControllerNativeEvidence({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 0,
+    items: [{
+      sourceName: "projectSnapshot",
+      sourceItemId: "later_project_snapshot",
+      outcome: "observed",
+      argsSha256: "c".repeat(64),
+      resultSha256: "d".repeat(64),
+      proofKinds: ["project_state"],
+      subjectRefs: ["project:proj_1"],
+    }],
+  })).toBe("recorded");
+
+  const legacyCandidate = {
+    ...accepted.finalization.candidate,
+    segments: [{
+      type: "claim" as const,
+      text: "The project is available.",
+      kind: "observed_state" as const,
+      outcome: "observed" as const,
+      subjectRef: "project:proj_1",
+      evidenceRefs: ["evidence:2" as const],
+    }],
+  };
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: legacyCandidate,
+    bbEventHighWaterSeq: accepted.finalization.bbEventHighWaterSeq,
+  }), accepted.finalization.id);
+
+  const restarted = fixture.reopen();
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+  expect(fixture.db.prepare(
+    "SELECT accepted_finalization_id FROM controller_turns WHERE id = ?",
+  ).get(fixture.turn.id)).toEqual({ accepted_finalization_id: null });
+  expect(fixture.db.prepare(
+    "SELECT state, rejection_code FROM controller_finalizations WHERE id = ?",
+  ).get(accepted.finalization.id)).toEqual({ state: "rejected", rejection_code: "invalid_contract" });
+});
+
 it("rejects finalization while a mutating invocation remains started", () => {
   const fixture = submittedControllerFixture();
   const argsSha256 = "a".repeat(64);

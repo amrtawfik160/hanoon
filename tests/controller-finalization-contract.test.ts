@@ -874,6 +874,18 @@ describe("fail-closed operational claim binding", () => {
   });
 
   it.each([
+    "Can you inspect this, and the deployment succeeded.",
+    "Could you note this: production is live.",
+    "Can you confirm whether the fix is implemented?",
+  ])("does not let a question-start suppress an operational assertion: %s", (text) => {
+    expectRejection(
+      textFinalization(text),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it.each([
     "Working on it now.",
     "I'm working on it now.",
     "The work is in progress.",
@@ -1119,7 +1131,6 @@ describe("bounded text heuristics", () => {
     "We paid attention to the details.",
     "Should the package be installed?",
     "The records were not deleted.",
-    "Can you confirm whether the fix is implemented?",
     "I don't think the fix is implemented.",
     "It seems the fix is implemented.",
   ])("does not treat non-success text as a high-impact success: %s", (text) => {
@@ -1189,6 +1200,11 @@ describe("bounded text heuristics", () => {
     ["published", "The package was published to production."],
     ["live", "The feature is live in production."],
     ["running", "The service is running in production."],
+    ["production modifier", "The production change shipped."],
+    ["production release", "The production release was published."],
+    ["production tests", "Production tests passed."],
+    ["against production", "tests passed against production."],
+    ["against preposition", "The change shipped against production."],
   ] as const)("requires production proof for %s wording even when the verb is broadly accepted", (_label, text) => {
     expectRejection(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),

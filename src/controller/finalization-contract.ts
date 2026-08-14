@@ -170,7 +170,6 @@ const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\
 const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
 const NON_AFFIRMATIVE_OPERATIONAL_PREFIX = /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't|will|would|could|should|plan to|intend to|propose|after approval|later|may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?|can you confirm whether)\b/i;
-const NON_AFFIRMATIVE_QUESTION_START = /^(?:can|could|would|should|will|may|might)\b/i;
 const PREDICATE_TOKEN = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
 const PREDICATE_CHAIN_WORDS = new Set([
   "am", "is", "are", "was", "were", "be", "been", "being",
@@ -255,11 +254,11 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   },
   {
     pattern: /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
-    kinds: ["execution_result"],
+    kinds: ["execution_result", "pipeline_outcome"],
   },
   {
     pattern: /\b(?:all\s+)?tests?(?:\s+suite)?\s+(?:pass|passed|succeed|succeeded|complete|completed)\b/i,
-    kinds: ["execution_result"],
+    kinds: ["execution_result", "pipeline_outcome"],
   },
   {
     pattern: /\b(?:the\s+)?review\s+(?:is|was|has been|had been)?\s*(?:complete|completed|passed|approved)\b/i,
@@ -557,7 +556,7 @@ function matchHasNonAffirmativePolarity(clause: string, match: OperationalMatch)
   if (NON_AFFIRMATIVE_OPERATIONAL_PREFIX.test(predicatePrefix)) return true;
   if (hasNonAffirmativeScope(context)) return true;
   if (hasNonAffirmativeScope(beforePredicate)) return true;
-  return NON_AFFIRMATIVE_QUESTION_START.test(clause.trim());
+  return false;
 }
 
 function operationalMatchesIn(clause: string): OperationalMatch[] {
@@ -662,12 +661,23 @@ function clauseHasHighImpactSuccess(clause: string): boolean {
 function productionTargetForMatch(clause: string, match: OperationalMatch): boolean {
   const before = clause.slice(0, match.start);
   const after = clause.slice(match.end);
-  if (/(?:^|\s)production\s+(?:is|was|has been|had been)\s*$/i.test(before)) return true;
+  const productionBefore = [...before.matchAll(/\bproduction\b/gi)].at(-1);
+  if (productionBefore) {
+    const productionIndex = productionBefore.index ?? 0;
+    const beforeProduction = before.slice(0, productionIndex);
+    const afterProduction = before.slice(productionIndex + productionBefore[0].length);
+    if (!/\b(?:without|not|never|no longer|except|rather than)\s*$/i.test(beforeProduction) &&
+        !/[,:;.!?]/u.test(afterProduction) &&
+        !/\b(?:and|but|although|because|however|which|while|then|before|so|therefore|yet|despite)\b/i.test(afterProduction) &&
+        afterProduction.trim().split(/\s+/u).filter(Boolean).length <= 4) {
+      return true;
+    }
+  }
   const productionAfter = after.search(/\bproduction\b/i);
   if (productionAfter < 0) return false;
   const beforeProduction = after.slice(0, productionAfter);
   if (/\b(?:without|not|never|no longer|except|rather than)\b/i.test(beforeProduction)) return false;
-  return /\b(?:to|in|on|at)\s+(?:the\s+)?$/i.test(beforeProduction);
+  return /\b(?:to|in|on|at|against|for|onto|into)\s+(?:the\s+)?$/i.test(beforeProduction);
 }
 
 type FinalizationSegmentSpan = Readonly<{

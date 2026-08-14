@@ -693,7 +693,7 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       invocationInFlight: this.startedToolReceipt(accepted.turnId),
       revisionCount: Math.max(0, accepted.revision - 1),
       evidenceLimitExceeded: turn.evidence_limit_exceeded_at !== null,
-      evidenceByRef: this.evidenceByRef(accepted.turnId),
+      evidenceByRef: this.evidenceByRef(accepted.turnId, accepted.evidenceHighWaterId),
       ownerBoundaryPresent: accepted.candidate.disposition !== "needs_owner" ||
         this.legacyOwnerBoundaryPresent(accepted.turnId, turn, now),
       liveObligationRefs: this.liveObligationRefs(turn.controller_key),
@@ -771,8 +771,20 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     ).get(now, telegramUserId, telegramChatId) !== undefined;
   }
 
-  private evidenceByRef(turnId: string): ControllerFinalizationValidationContext["evidenceByRef"] {
-    const evidence = this.list(turnId, MAX_EVIDENCE_ROWS);
+  private evidenceByRef(
+    turnId: string,
+    maxEvidenceId: number | null = null,
+  ): ControllerFinalizationValidationContext["evidenceByRef"] {
+    const rows = maxEvidenceId === null
+      ? this.db.prepare(
+        `SELECT * FROM controller_evidence
+          WHERE turn_id = ? ORDER BY id ASC LIMIT ?`,
+      ).all(turnId, MAX_EVIDENCE_ROWS)
+      : this.db.prepare(
+        `SELECT * FROM controller_evidence
+          WHERE turn_id = ? AND id <= ? ORDER BY id ASC LIMIT ?`,
+      ).all(turnId, maxEvidenceId, MAX_EVIDENCE_ROWS);
+    const evidence = (rows as ControllerEvidenceRow[]).map(parseEvidenceRow);
     return new Map(evidence.map((row) => [row.ref, {
       ref: row.ref,
       outcome: row.outcome,
