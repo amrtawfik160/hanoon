@@ -19,6 +19,9 @@ import {
   type RecipePromotionService,
 } from "./capabilities/promotion";
 import { TASK_RECIPES, type TaskRecipe } from "./domain/recipes";
+import { BROKER_BINDING_STATES, type BrokerBindingState } from "./credentials/protocol";
+import type { CredentialReadinessCheck } from "./credentials/topology";
+import type { CredentialAccessService } from "./credentials/service";
 
 type BbSdk = BbPluginApi["sdk"];
 
@@ -39,6 +42,7 @@ export type TelegramAgentCliDependencies = {
     controllerTools: "bundled" | "all-tools";
     modelRouting: "adaptive" | "strong-only";
   }>;
+  credentialAccess: Pick<CredentialAccessService, "list" | "status">;
   notify?: () => void;
 };
 
@@ -125,8 +129,16 @@ const CAPABILITY_RECEIPT_FLAGS: Record<string, FlagSpec> = {
   limit: { kind: "value" },
 };
 const CAPABILITY_RECIPE_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+const ACCESS_LIST_FLAGS: Record<string, FlagSpec> = {
+  json: JSON_FLAG,
+  state: { kind: "value" },
+  after: { kind: "value" },
+  limit: { kind: "value" },
+};
+const ACCESS_STATUS_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
 
 const MAX_COLLECTION_SIZE = 100;
+const MAX_ACCESS_LIST_LIMIT = 10;
 const PAIRING_TTL_MS = 10 * 60 * 1_000;
 const MAX_ERROR_LENGTH = 240;
 const CLI_HELP = `Usage: bb telegram-agent <command> [options]
@@ -147,6 +159,8 @@ Commands:
   memory import --file <absolute-path> [--host <host-id>] [--scope <scope>] [--json]
   capability promote <recipe> [--json]
   capability rollback <recipe> [--json]
+  access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
+  access status [binding-id] [--json]
   doctor [project-id] [--json]
 `;
 const CREDENTIAL_TEXT = [
@@ -803,7 +817,7 @@ function jobCancel(
 
 type DoctorCheck = {
   name: string;
-  status: "pass" | "fail";
+  status: "pass" | "fail" | "disabled";
   summary: string;
 };
 
@@ -815,6 +829,39 @@ function addCheck(
   failSummary: string,
 ): void {
   checks.push({ name, status: passed ? "pass" : "fail", summary: passed ? passSummary : failSummary });
+}
+
+/** Bounded, secret-free labels only — never the configured endpoint, cert, or a raw broker error. */
+const CREDENTIAL_CHECK_LABELS: Record<CredentialReadinessCheck, string> = {
+  trust_kernel: "credential: trust kernel",
+  controller_permission: "credential: controller permission",
+  isolated_configuration: "credential: isolated configuration",
+  topology_receipt: "credential: topology receipt",
+  broker_tls: "credential: broker tls",
+  broker_identity: "credential: broker identity",
+  protocol_version: "credential: protocol version",
+  installation_identity: "credential: installation identity",
+  broker_audit: "credential: broker audit",
+  onepassword_adapter: "credential: onepassword adapter",
+};
+
+/**
+ * Runs the diagnostic status check (never a vault resolve) and adds one
+ * "disabled" row when credential mode is off, or one row per readiness check
+ * the frozen readiness evaluator actually reached otherwise. A short-circuited
+ * evaluation legitimately reports fewer rows than the full ten — that is the
+ * evaluator declining to claim it checked something it never reached, not a
+ * bug here.
+ */
+async function addCredentialChecks(deps: TelegramAgentCliDependencies, checks: DoctorCheck[]): Promise<void> {
+  const status = await deps.credentialAccess.status({});
+  if (status.readiness.state === "disabled") {
+    checks.push({ name: "credential broker", status: "disabled", summary: "disabled" });
+    return;
+  }
+  for (const check of status.readiness.checks) {
+    addCheck(checks, CREDENTIAL_CHECK_LABELS[check.check], check.passed, "ready", "not ready");
+  }
 }
 
 async function doctor(
@@ -844,12 +891,15 @@ async function doctor(
         "missing; merge approval is blocked",
       );
     }
+    await addCredentialChecks(deps, checks);
     const output = success(
       { checks },
       checks.map((check) => `${check.name}: ${check.status} (${check.summary})`).join("\n"),
       json,
     );
-    return checks.every((check) => check.status === "pass") ? output : { ...output, exitCode: 1 };
+    return checks.every((check) => check.status === "pass" || check.status === "disabled")
+      ? output
+      : { ...output, exitCode: 1 };
   }
 
   const policyRecord = deps.store.getProjectPolicy(projectId);
@@ -993,6 +1043,84 @@ async function runProject(
     return runProjectDisable(deps, parsed, parsed.flags.has("json"));
   }
   throw new CliInputError(`Unknown project subcommand ${subcommand}`);
+}
+
+function accessBindingState(value: string, label: string): BrokerBindingState {
+  if (!(BROKER_BINDING_STATES as readonly string[]).includes(value)) {
+    throw new CliInputError(`${label} must be one of ${BROKER_BINDING_STATES.join(", ")}`);
+  }
+  return value as BrokerBindingState;
+}
+
+/** Local, secret-free projections only — never dispatches to the broker. */
+function accessList(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): PluginCliResult {
+  noPositionals(parsed);
+  const state = parsed.values.has("state")
+    ? accessBindingState(parsed.values.get("state") ?? "", "--state")
+    : undefined;
+  const limit = readOptionalInteger(parsed, "limit", "--limit", 1, MAX_ACCESS_LIST_LIMIT) ?? MAX_ACCESS_LIST_LIMIT;
+  const result = deps.credentialAccess.list({ state, afterBindingId: parsed.values.get("after"), limit });
+  const summaryLine = result.available
+    ? `${result.bindings.length} binding(s)${result.truncated ? " (truncated)" : ""}`
+    : "credential broker disabled";
+  return success(
+    result,
+    [
+      summaryLine,
+      ...result.bindings.map((binding) =>
+        `${binding.bindingId}\t${binding.label}\t${binding.state}\tgeneration=${binding.generation}\trisk=${binding.risk}`),
+    ].join("\n"),
+    json,
+  );
+}
+
+/**
+ * Runs the same allowed diagnostic `broker.health` the doctor uses, plus one
+ * selected binding's secret-free metadata. Never resolves or verifies a
+ * credential — that stays out of the operator CLI by design.
+ */
+async function accessStatus(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): Promise<PluginCliResult> {
+  if (parsed.positionals.length > 1) throw new CliInputError("access status accepts at most one binding-id");
+  const bindingId = parsed.positionals[0];
+  const result = await deps.credentialAccess.status({ bindingId });
+  const lines = [
+    `readiness: ${result.readiness.state}`,
+    ...result.readiness.checks.map((check) => `  ${check.check}: ${check.passed ? "pass" : "fail"}`),
+  ];
+  if (result.health) {
+    lines.push(`broker: adapter=${result.health.adapterState} bindings=${result.health.bindingCount} auditWritable=${result.health.auditWritable}`);
+  }
+  if (result.binding) {
+    lines.push(`binding: ${result.binding.bindingId} state=${result.binding.state} generation=${result.binding.generation}`);
+  } else if (bindingId) {
+    lines.push(`binding: ${bindingId} not found`);
+  }
+  return success(result, lines.join("\n"), json);
+}
+
+async function runAccess(
+  deps: TelegramAgentCliDependencies,
+  argv: readonly string[],
+): Promise<PluginCliResult> {
+  if (argv.length === 0) throw new CliInputError("access requires a subcommand");
+  const subcommand = argv[0];
+  if (subcommand === "list") {
+    const parsed = parseFlags(argv.slice(1), ACCESS_LIST_FLAGS);
+    return accessList(deps, parsed, parsed.flags.has("json"));
+  }
+  if (subcommand === "status") {
+    const parsed = parseFlags(argv.slice(1), ACCESS_STATUS_FLAGS);
+    return accessStatus(deps, parsed, parsed.flags.has("json"));
+  }
+  throw new CliInputError(`Unknown access subcommand ${subcommand}`);
 }
 
 function capabilityRecipe(value: string, label: string): TaskRecipe {
@@ -1242,6 +1370,7 @@ export async function runTelegramAgentCli(
     if (command === "project") return await runProject(deps, argv.slice(1), context);
     if (command === "job") return await runJob(deps, argv.slice(1));
     if (command === "capability") return await runCapability(deps, argv.slice(1));
+    if (command === "access") return await runAccess(deps, argv.slice(1));
     if (command === "doctor") {
       const parsed = parseFlags(argv.slice(1), DOCTOR_FLAGS);
       if (parsed.positionals.length > 1) throw new CliInputError("doctor accepts at most one project-id");

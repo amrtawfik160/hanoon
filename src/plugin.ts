@@ -15,9 +15,13 @@ import {
   capabilityRoutingSettings,
   controllerCapabilityModelRoute,
   controllerExecutionProfiles,
+  credentialBrokerConfigFingerprint,
   parseGlobalConfig,
   systemUpkeepEnabled,
 } from "./config";
+import { parseCredentialBrokerConfig, type CredentialBrokerConfigResult } from "./credentials/config";
+import { CredentialBrokerClient } from "./credentials/broker-client";
+import { CredentialAccessService } from "./credentials/service";
 import {
   RecipePromotionService,
 } from "./capabilities/promotion";
@@ -194,6 +198,55 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       options: ["adaptive", "strong-only"],
       default: "adaptive",
     },
+    credentialBrokerMode: {
+      type: "select",
+      label: "Credential broker mode",
+      description: "Isolated enables read-only access to a protected credential broker. Disabled (default) keeps every access command and doctor check failing closed.",
+      options: ["disabled", "isolated"],
+      default: "disabled",
+    },
+    credentialBrokerEndpoint: {
+      type: "string",
+      label: "Credential broker endpoint",
+      description: "Fixed HTTPS origin of the protected broker, e.g. https://broker.internal. Ignored while the mode is disabled.",
+      default: "",
+    },
+    credentialBrokerInstallationId: {
+      type: "string",
+      label: "Credential broker installation id",
+      description: "Opaque installation id issued by the broker's protected enrollment CLI.",
+      default: "",
+    },
+    credentialBrokerTopologyReceiptDigest: {
+      type: "string",
+      label: "Credential broker topology receipt digest",
+      description: "SHA-256 of the current reviewed topology acceptance report, installed after the protected negative probes pass.",
+      default: "",
+    },
+    credentialBrokerTopologyReceiptExpiresAt: {
+      type: "string",
+      label: "Credential broker topology receipt expiry",
+      description: "Epoch-millisecond expiry from the same reviewed report, as a base-10 integer string.",
+      default: "",
+    },
+    credentialBrokerClientCertificate: {
+      type: "string",
+      label: "Credential broker client certificate",
+      description: "This installation's public mTLS client certificate (PEM).",
+      default: "",
+    },
+    credentialBrokerClientKey: {
+      type: "string",
+      label: "Credential broker client private key",
+      description: "This installation's mTLS client private key (PEM). Never logged, stored in plugin SQLite, or shown in CLI/doctor output.",
+      secret: true,
+    },
+    credentialBrokerCaCertificate: {
+      type: "string",
+      label: "Credential broker CA certificate",
+      description: "Public CA certificate (PEM) that issued the broker's server certificate.",
+      default: "",
+    },
   });
   let config = parseGlobalConfig(await settings.get());
   const store = openStore(
@@ -221,11 +274,32 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const laneSnapshots = new JobLaneSnapshotProvider();
   if (!config.ok) bb.status.needsConfiguration(config.message);
 
-  settings.onChange((next) => {
-    const parsed = parseGlobalConfig(next);
-    config = parsed;
-    if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
-    executorNudge.notify();
+  let credentialConfig: CredentialBrokerConfigResult = parseCredentialBrokerConfig(await settings.get());
+  let credentialFingerprint = credentialBrokerConfigFingerprint(credentialConfig);
+  let credentialClient: CredentialBrokerClient | null = credentialConfig.state === "isolated"
+    ? new CredentialBrokerClient(credentialConfig.value)
+    : null;
+  const buildCredentialAccessService = (): CredentialAccessService => new CredentialAccessService({
+    store,
+    client: credentialClient,
+    config: () => credentialConfig,
+    // The trust-kernel manifest is validated once at module load
+    // (capability-policy.ts's validateManifest) and throws before this
+    // factory could ever run, so by the time the plugin is live that
+    // structural invariant already holds — there is no separate runtime
+    // signal to poll for here.
+    trustKernelReady: () => true,
+    controllerPermissionMode: () => config.ok
+      ? config.value.controllerPermissionMode
+      : DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
+    now: clock,
+  });
+  let credentialAccessService = buildCredentialAccessService();
+  bb.onDispose(() => {
+    // CredentialBrokerClient exposes rotate(config) but no bare close, so
+    // this can only drop the reference rather than force-close its
+    // keep-alive TLS agent.
+    credentialClient = null;
   });
 
   const capabilityInventory = new CapabilityInventoryService({
@@ -271,7 +345,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     clock: { now: clock },
     hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
   });
-  registerControllerTools(bb, {
+  const toolDependencies: Parameters<typeof registerControllerTools>[1] = {
     store,
     sdk: bb.sdk,
     evidenceProjector,
@@ -292,6 +366,40 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     ),
     notify: () => executorNudge.notify(),
     now: clock,
+    credentialAccess: credentialAccessService,
+  };
+  registerControllerTools(bb, toolDependencies);
+
+  settings.onChange((next) => {
+    const parsed = parseGlobalConfig(next);
+    config = parsed;
+    if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
+    executorNudge.notify();
+
+    const nextCredentialConfig = parseCredentialBrokerConfig(next);
+    const nextFingerprint = credentialBrokerConfigFingerprint(nextCredentialConfig);
+    if (nextFingerprint === credentialFingerprint) return;
+    credentialFingerprint = nextFingerprint;
+    credentialConfig = nextCredentialConfig;
+
+    if (credentialConfig.state === "isolated" && credentialClient) {
+      // Same broker relationship, rotated material: client identity is
+      // preserved in place (rotate() destroys and rebuilds its own agent),
+      // so the already-registered service — which reads credentialConfig
+      // live through its config() closure — keeps working unrebuilt.
+      credentialClient.rotate(credentialConfig.value);
+      return;
+    }
+
+    // Every other transition changes whether a live client exists at all:
+    // newly isolated stays pending until an explicit plugin reload rebuilds
+    // the capability manifest from scratch (design: "enabling isolated mode
+    // requires a plugin reload"), and leaving isolated drops the client.
+    // Either way `client` — captured by value, not by closure — is now
+    // stale, so the service must be rebuilt and re-published.
+    credentialClient = null;
+    credentialAccessService = buildCredentialAccessService();
+    toolDependencies.credentialAccess = credentialAccessService;
   });
 
   const terminal = new TerminalCommandRunner(bb.sdk);
@@ -304,7 +412,8 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
       { name: "capability", summary: "Inspect capability evidence and control recipe rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
-      { name: "doctor", summary: "Check Telegram, BB, host, provider, and GitHub readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
+      { name: "access", summary: "Inspect read-only credential broker bindings and status", usage: "bb telegram-agent access <list|status> [binding-id] [--json]" },
+      { name: "doctor", summary: "Check Telegram, BB, host, provider, GitHub, and credential broker readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
     ],
     run: (argv, context) => runTelegramAgentCli({
       store,
@@ -319,6 +428,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         controllerTools: "bundled",
         modelRouting: "adaptive",
       },
+      credentialAccess: credentialAccessService,
       revokeAllApprovals: (now) => {
         const db = bb.storage.database();
         const revoke = db.transaction(() => {

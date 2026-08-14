@@ -1,5 +1,10 @@
 import { expect, it } from "vitest";
-import { controllerExecutionProfiles, parseGlobalConfig } from "../src/config";
+import { controllerExecutionProfiles, credentialBrokerConfigFingerprint, parseGlobalConfig } from "../src/config";
+import {
+  parseCredentialBrokerConfig,
+  type CredentialBrokerConfigResult,
+  type CredentialBrokerSettingsInput,
+} from "../src/credentials/config";
 
 function globalValues(overrides: Record<string, string | undefined> = {}) {
   return {
@@ -8,6 +13,91 @@ function globalValues(overrides: Record<string, string | undefined> = {}) {
     ...overrides,
   };
 }
+
+const VALID_PEM_CERT = `-----BEGIN CERTIFICATE-----
+MIIBgzCCASmgAwIBAgIUW1L4gC6MeV+Ud+wNnC7kU0bN+s0wCgYIKoZIzj0EAwIw
+FzEVMBMGA1UEAwwMdGVzdC1maXh0dXJlMB4XDTI2MDgxNDEwMjgxM1oXDTM2MDgx
+MTEwMjgxM1owFzEVMBMGA1UEAwwMdGVzdC1maXh0dXJlMFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAE8lgFiCsSPUTzcud3u5as3wowffShCJSevZVfHPT+spDqbRZJ
+fAzqwAu69fjGsYzIcwKZYzvJUDcZBC5qSgN+W6NTMFEwHQYDVR0OBBYEFF2WLMZE
+SeS3kyKKUuEBBoycc7noMB8GA1UdIwQYMBaAFF2WLMZESeS3kyKKUuEBBoycc7no
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgYXNP228YLyxkgGok
+1Xlri/3ef+vGvZVkHplqiULz634CIQCNkG7RoRpzRaKQVkMZiZ/E8PdOmJuzCLhx
+ydSY0UJMrA==
+-----END CERTIFICATE-----`;
+const VALID_KEY_PEM = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgkiiRRwUsXJ7S1v9d
+bcXTZYgtaanNlGvgyK86g4TddduhRANCAATyWAWIKxI9RPNy53e7lqzfCjB99KEI
+lJ69lV8c9P6ykOptFkl8DOrAC7r1+MaxjMhzApljO8lQNxkELmpKA35b
+-----END PRIVATE KEY-----`;
+const KEY_CANARY = "kiiRRwUsXJ7S1v9dbcXTZYg";
+
+function isolatedSettings(overrides: Partial<CredentialBrokerSettingsInput> = {}): CredentialBrokerSettingsInput {
+  return {
+    credentialBrokerMode: "isolated",
+    credentialBrokerEndpoint: "https://broker.example.com",
+    credentialBrokerInstallationId: "install_1",
+    credentialBrokerTopologyReceiptDigest: "a".repeat(64),
+    credentialBrokerTopologyReceiptExpiresAt: "9999999999999",
+    credentialBrokerClientCertificate: VALID_PEM_CERT,
+    credentialBrokerClientKey: VALID_KEY_PEM,
+    credentialBrokerCaCertificate: VALID_PEM_CERT,
+    ...overrides,
+  };
+}
+
+it("fingerprints the disabled state as a stable sentinel", () => {
+  const result = parseCredentialBrokerConfig({});
+  expect(credentialBrokerConfigFingerprint(result)).toBe("disabled");
+  expect(credentialBrokerConfigFingerprint(result)).toBe(credentialBrokerConfigFingerprint(result));
+});
+
+it("distinguishes invalid reasons from each other and from disabled", () => {
+  const missingSetting = parseCredentialBrokerConfig({ credentialBrokerMode: "isolated" });
+  const badPem = parseCredentialBrokerConfig(isolatedSettings({ credentialBrokerClientCertificate: "not-a-cert" }));
+  const disabled = parseCredentialBrokerConfig({});
+
+  expect(missingSetting.state).toBe("invalid");
+  expect(badPem.state).toBe("invalid");
+  const missingFingerprint = credentialBrokerConfigFingerprint(missingSetting);
+  const badPemFingerprint = credentialBrokerConfigFingerprint(badPem);
+  expect(missingFingerprint).not.toBe(badPemFingerprint);
+  expect(missingFingerprint).not.toBe(credentialBrokerConfigFingerprint(disabled));
+});
+
+it("is stable for identical isolated settings and changes when any field changes", () => {
+  const base = parseCredentialBrokerConfig(isolatedSettings());
+  const same = parseCredentialBrokerConfig(isolatedSettings());
+  const differentEndpoint = parseCredentialBrokerConfig(
+    isolatedSettings({ credentialBrokerEndpoint: "https://broker-2.example.com" }),
+  );
+
+  expect(base.state).toBe("isolated");
+  expect(credentialBrokerConfigFingerprint(base)).toBe(credentialBrokerConfigFingerprint(same));
+  expect(credentialBrokerConfigFingerprint(base)).not.toBe(credentialBrokerConfigFingerprint(differentEndpoint));
+});
+
+it("detects a client key rotation even when every other field is unchanged", () => {
+  const original = parseCredentialBrokerConfig(isolatedSettings());
+  if (original.state !== "isolated") throw new Error("fixture must parse as isolated");
+  // Fingerprinting operates on the already-parsed result, so the "rotated"
+  // fixture only needs a different key string, not a second real keypair.
+  const rotated: CredentialBrokerConfigResult = {
+    state: "isolated",
+    value: { ...original.value, clientKeyPem: `${VALID_KEY_PEM}\n` },
+  };
+
+  expect(credentialBrokerConfigFingerprint(original)).not.toBe(credentialBrokerConfigFingerprint(rotated));
+});
+
+it("never embeds the raw client key in the fingerprint", () => {
+  const result = parseCredentialBrokerConfig(isolatedSettings());
+  const fingerprint = credentialBrokerConfigFingerprint(result);
+
+  expect(fingerprint).not.toContain(KEY_CANARY);
+  expect(fingerprint).not.toContain("PRIVATE KEY");
+  expect(fingerprint).toMatch(/^[a-f0-9]{64}$/);
+});
 
 it("defaults controller execution when only public connection settings are present", () => {
   const parsed = parseGlobalConfig(globalValues({ maxConcurrentJobs: undefined }));
