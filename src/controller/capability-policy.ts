@@ -30,6 +30,9 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_respond",
   "telegram_agent_steer_job",
   "telegram_agent_adopt_pr",
+  "telegram_agent_access_list",
+  "telegram_agent_access_status",
+  "telegram_agent_access_verify",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -41,6 +44,8 @@ export const CONTROLLER_DATA_CLASSES = Object.freeze([
   "health_metrics",
   "controller_evidence",
   "controller_finalization",
+  "credential_metadata",
+  "credential_health",
 ] as const);
 
 export type ControllerToolName = (typeof CONTROLLER_TOOL_NAMES)[number];
@@ -62,10 +67,10 @@ export type ControllerCapabilityDescriptor = Readonly<{
   allowed_roles: readonly ["controller"];
   project_scope: "controller_global" | "current_project" | "exact_entity";
   credential_scope: Readonly<{
-    credential: "none" | "bb" | "telegram" | "github";
+    credential: "none" | "bb" | "telegram" | "github" | "credential_broker";
     audience: string;
   }>;
-  egress: readonly ("none" | "bb" | "telegram" | "github")[];
+  egress: readonly ("none" | "bb" | "telegram" | "github" | "credential_broker")[];
   proof_kinds: readonly ControllerProofKind[];
   receipt_kind: "observation" | "tool_receipt" | "domain_effect" | "finalization" | "none";
   result_limit: number;
@@ -516,6 +521,61 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     receipt_kind: "tool_receipt",
     result_limit: 8_000,
   }),
+  // The three foundation credential-broker capabilities. All are reads that
+  // never resolve or reveal a credential value: list is local-only, status
+  // dispatches only the broker's diagnostic health check, and verify proves
+  // vault resolution only — it can never move a binding to `active`.
+  telegram_agent_access_list: capability({
+    capability_id: "telegram_agent_access_list",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["credential_metadata"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 8_000,
+  }),
+  telegram_agent_access_status: capability({
+    capability_id: "telegram_agent_access_status",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["credential_health"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "credential_broker", audience: "hanoon-credential-broker:v1" },
+    egress: ["credential_broker"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 4_000,
+  }),
+  telegram_agent_access_verify: capability({
+    capability_id: "telegram_agent_access_verify",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "medium",
+    data_class: ["credential_metadata"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "exact_entity",
+    credential_scope: { credential: "credential_broker", audience: "hanoon-credential-broker:v1" },
+    egress: ["credential_broker"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 2_000,
+  }),
 });
 
 const EFFECT_CLASSES = new Set([
@@ -544,8 +604,8 @@ const APPROVAL_KINDS = new Set([
   "pipeline_approval",
 ]);
 const PROJECT_SCOPES = new Set(["controller_global", "current_project", "exact_entity"]);
-const CREDENTIAL_KINDS = new Set(["none", "bb", "telegram", "github"]);
-const EGRESS_KINDS = new Set(["none", "bb", "telegram", "github"]);
+const CREDENTIAL_KINDS = new Set(["none", "bb", "telegram", "github", "credential_broker"]);
+const EGRESS_KINDS = new Set(["none", "bb", "telegram", "github", "credential_broker"]);
 const DATA_CLASSES: ReadonlySet<string> = new Set(CONTROLLER_DATA_CLASSES);
 const PROOF_KINDS: ReadonlySet<string> = new Set(CONTROLLER_PROOF_KINDS);
 const RECEIPT_KINDS = new Set([

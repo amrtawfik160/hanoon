@@ -250,7 +250,7 @@ it("answers one owner turn end to end through the registered trust path", async 
     ...CONTROLLER_TOOL_NAMES,
     ...CONTROLLER_METADATA_TOOL_NAMES,
   ]);
-  expect(CONTROLLER_TOOL_NAMES).toHaveLength(25);
+  expect(CONTROLLER_TOOL_NAMES).toHaveLength(28);
 
   const projects = JSON.parse(await callTool(fixture, "telegram_agent_list_projects", {}) as string);
   expect(projects.projects).toHaveLength(1);

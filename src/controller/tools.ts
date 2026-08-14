@@ -98,6 +98,8 @@ import {
   controllerFinalizationCorrection,
   controllerFinalizationJsonSchema,
 } from "./finalization-contract";
+import { BROKER_BINDING_STATES, OPAQUE_ID_PATTERN } from "../credentials/protocol";
+import type { CredentialAccessService } from "../credentials/service";
 
 export { CONTROLLER_TOOL_NAMES } from "./capability-policy";
 export const CONTROLLER_METADATA_TOOL_NAMES = CONTROLLER_METADATA_TOOL_IDS;
@@ -115,6 +117,8 @@ type ToolDependencies = {
   health(now: number): unknown;
   notify(): void;
   now(): number;
+  /** Absent exactly when credential mode is disabled; the three access tools fail closed. */
+  credentialAccess?: CredentialAccessService;
 };
 
 type EvidenceIndexDescriptor = Readonly<{
@@ -817,6 +821,14 @@ async function resolveTrustedScope(
         beforeJob: dependencies.store.getJobBySourceUpdateId(authorized.turn.updateId),
       });
     }
+    case "telegram_agent_access_list":
+    case "telegram_agent_access_status":
+      return globalScope();
+    case "telegram_agent_access_verify":
+      // Existence is a domain question the service answers with a typed
+      // denial, not an authorization boundary: an unknown binding id carries
+      // no cross-tenant information the scope check needs to protect.
+      return exactScope([`credential-binding:${String(params.bindingId)}`], true);
     case "telegram_agent_turn_evidence":
     case "telegram_agent_respond":
       throw new Error("telegram_agent_turn_evidence and telegram_agent_respond register directly and have no capability scope");
@@ -1366,6 +1378,27 @@ async function projectTrustedEvidence(
       if (!TERMINAL_JOB_STATES.has(job.state)) proofKinds.push("obligation");
       return { outcome: "succeeded", proofKinds, subjectRefs: refs };
     }
+    case "telegram_agent_access_list":
+      return { outcome: "observed", proofKinds: ["health_snapshot"], subjectRefs: [] };
+    case "telegram_agent_access_status": {
+      const bindingId = typeof params.bindingId === "string" ? params.bindingId : undefined;
+      return {
+        outcome: "observed",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: bindingId ? [`credential-binding:${bindingId}`] : [],
+      };
+    }
+    case "telegram_agent_access_verify": {
+      const receiptId = typeof domain.receiptId === "string" ? domain.receiptId : null;
+      return {
+        outcome: "observed",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: [
+          ...resolution.scope.entityRefs,
+          ...(receiptId ? [`credential-receipt:${receiptId}`] : []),
+        ].slice(0, 16),
+      };
+    }
     case "telegram_agent_turn_evidence":
     case "telegram_agent_respond":
       throw new Error("telegram_agent_turn_evidence and telegram_agent_respond register directly and are not capability-projected");
@@ -1383,6 +1416,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       params: z.output<Schema>,
       context: PluginAgentToolContext,
       resolution: ControllerCapabilityScopeResolution,
+      authorized: AuthorizedControllerCapability,
     ): unknown | Promise<unknown>;
   }>): void => {
     const descriptor = CONTROLLER_CAPABILITIES[registration.name];
@@ -1394,7 +1428,9 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         now: dependencies.now,
         credential: descriptor.credential_scope.credential === "bb"
           ? { credential: "bb", audience: "bb-plugin-sdk" }
-          : { credential: "none", audience: "none" },
+          : descriptor.credential_scope.credential === "credential_broker"
+            ? { credential: "credential_broker", audience: "hanoon-credential-broker:v1" }
+            : { credential: "none", audience: "none" },
       }, {
         ...registration,
         descriptor,
@@ -1408,7 +1444,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           });
           return { ...resolved, state: { ...trustedState(resolved), authorized } };
         },
-        execute: (params, context, resolution) => registration.execute(params, context, resolution),
+        execute: (params, context, resolution, authorized) =>
+          registration.execute(params, context, resolution, authorized),
         projectEvidence: (_params, context, domain, resolution) => projectTrustedEvidence({
           dependencies,
           name: registration.name,
@@ -2064,6 +2101,44 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         });
         dependencies.notify();
       return { ...jobProjection(job, dependencies.store.getAdmission(job.id)), adopted: true };
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[25],
+    description: "List bounded credential-binding metadata for the current broker installation: label, provider, state, generation, allowed future capability ids, risk, MFA mode, approval mode, and last verification time. Metadata only — this never resolves or reveals a credential value.",
+    parameters: z.object({
+      state: z.enum(BROKER_BINDING_STATES).optional(),
+      afterBindingId: z.string().regex(OPAQUE_ID_PATTERN).max(128).optional(),
+      limit: z.number().int().min(1).max(10).default(10),
+    }).strict(),
+    execute: (params) => {
+      if (!dependencies.credentialAccess) return { available: false, bindings: [], truncated: false };
+      return dependencies.credentialAccess.list(params);
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[26],
+    description: "Inspect broker reachability, authenticated installation identity, schema compatibility, and external-vault adapter health, plus one selected binding when bindingId is given. Never resolves or reveals a credential value.",
+    parameters: z.object({
+      bindingId: z.string().regex(OPAQUE_ID_PATTERN).max(128).optional(),
+    }).strict(),
+    execute: async (params) => {
+      if (!dependencies.credentialAccess) return { readiness: { state: "disabled", checks: [] }, health: null, binding: null };
+      return await dependencies.credentialAccess.status(params);
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[27],
+    description: "Request one live vault-resolution proof for an exact known binding id from telegram_agent_access_list. The broker resolves the configured field in memory, checks it is present and nonempty, discards the value immediately, and returns only valid, invalid, or a stable failure class. This proves the broker can reach the vault item — it does NOT prove the credential works for its application, and it can never make a binding active. Owner-originated turns only.",
+    parameters: z.object({
+      bindingId: z.string().regex(OPAQUE_ID_PATTERN).max(128),
+    }).strict(),
+    execute: async (params, _context, _resolution, authorized) => {
+      if (!dependencies.credentialAccess) return { outcome: "denied", reason: "disabled" };
+      return await dependencies.credentialAccess.verify({ bindingId: params.bindingId, authorized });
     },
   });
 
