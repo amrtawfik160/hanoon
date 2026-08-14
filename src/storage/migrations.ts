@@ -1147,6 +1147,30 @@ ALTER TABLE controller_finalizations
   CHECK (envelope_version >= 1);
 `] as const;
 
+export const CONTROLLER_INTERACTION_FINAL_REPAIR_MIGRATIONS = [String.raw`
+ALTER TABLE controller_interaction_quarantine ADD COLUMN consumed_at INTEGER;
+
+UPDATE outbox
+   SET payload_json = json_object(
+         'text', 'This interaction is no longer available. Open BB to review it.',
+         'reply_markup', json_object('inline_keyboard', json_array()),
+         'disable_web_page_preview', json('true')
+       ),
+       status = 'pending', lease_owner = NULL, lease_generation = NULL,
+       lease_expires_at = NULL, next_attempt_at = updated_at, last_error = NULL
+ WHERE EXISTS (
+   SELECT 1 FROM controller_interaction_quarantine AS quarantine
+    WHERE (
+      quarantine.source IN ('controller', 'controller_questions')
+      AND substr(outbox.logical_key, 1, length('controller-interaction:' || quarantine.interaction_id || ':')) =
+          'controller-interaction:' || quarantine.interaction_id || ':'
+    ) OR (
+      quarantine.source = 'thread'
+      AND outbox.logical_key = 'thread-interaction:' || quarantine.interaction_id
+    )
+ );
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...TASK_3_MIGRATIONS,
@@ -1182,4 +1206,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_SUPERVISOR_ATTEMPT_MIGRATIONS,
   ...CONTROLLER_INTERACTION_REPAIR_MIGRATIONS,
   ...CONTROLLER_FINALIZATION_ENVELOPE_MIGRATIONS,
+  ...CONTROLLER_INTERACTION_FINAL_REPAIR_MIGRATIONS,
 ] as const;

@@ -262,7 +262,7 @@ function expectLegacyMigrationRollback(
 function expectLegacyMigrationQuarantine(
   fixture: ReturnType<typeof legacyQuestionDatabaseFixture>,
 ): void {
-  expect(fixture.db.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: 33 });
+  expect(fixture.db.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: 34 });
   expect(fixture.db.prepare(
     "SELECT COUNT(*) AS count FROM controller_questions WHERE state IN ('pending', 'answered')",
   ).get()).toEqual({ count: 0 });
@@ -424,7 +424,7 @@ async function runInteractionRace(
 }
 
 it("pins the shipped migration bytes and appends the runtime repair migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(34);
+  expect(ALL_MIGRATIONS).toHaveLength(35);
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
   );
@@ -437,6 +437,7 @@ it("pins the shipped migration bytes and appends the runtime repair migrations",
   expect(ALL_MIGRATIONS[31]).toContain("controller_supervisor_steer_attempts");
   expect(ALL_MIGRATIONS[32]).toContain("controller_interaction_quarantine");
   expect(ALL_MIGRATIONS[33]).toContain("envelope_version");
+  expect(ALL_MIGRATIONS[34]).toContain("consumed_at");
 });
 
 it("copies legacy questions once, preserves their table, and restores the active pointer", () => {
@@ -655,7 +656,12 @@ it("quarantines pre-repair controller and watched-thread approvals while revalid
     `thread-interaction:${threadAnsweredApprovalId}`,
   ]) {
     const row = db.prepare("SELECT payload_json FROM outbox WHERE logical_key = ?").get(logicalKey) as { payload_json: string };
-    expect(JSON.parse(row.payload_json)).toMatchObject({ reply_markup: { inline_keyboard: [] } });
+    expect(JSON.parse(row.payload_json)).toEqual({
+      text: "This interaction is no longer available. Open BB to review it.",
+      reply_markup: { inline_keyboard: [] },
+      disable_web_page_preview: true,
+    });
+    expect(row.payload_json).not.toContain("old interaction");
   }
   expect(JSON.parse((db.prepare(
     "SELECT payload_json FROM outbox WHERE logical_key = ?",
@@ -704,7 +710,108 @@ it("preserves and exposes a valid partial pending legacy answer", () => {
   });
 });
 
-it("migrates valid Unicode questions and preserves their pending answer bytes", () => {
+it("normalizes a complete pending legacy answer map to answered", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion(
+    "pending",
+    "legacy_complete_pending",
+    JSON.stringify({ question_1: { selected: ["first"] } }),
+  );
+
+  fixture.migrateRemaining();
+
+  expect(fixture.db.prepare(
+    "SELECT state, answer_json, answered_at FROM controller_interactions WHERE interaction_id = ?",
+  ).get("legacy_complete_pending")).toEqual({
+    state: "answered",
+    answer_json: JSON.stringify({
+      kind: "user_answer",
+      answers: { question_1: { selected: ["first"] } },
+    }),
+    answered_at: 2_000,
+  });
+  expect(new ControllerInteractionRepository(fixture.db).getPending(fixture.controllerKey)).toBeNull();
+});
+
+it("sanitizes malformed legacy JSON before migration SQL evaluates it and quarantines the original bytes", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion("pending", "legacy_malformed_questions", "{}", "{not-json");
+  fixture.db.prepare(
+    `INSERT INTO outbox (
+       logical_key, chat_id, message_id, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, '70', NULL, ?, 'sent', 0, 2_000, 2_000, 2_000)`,
+  ).run(
+    "controller-interaction:legacy_malformed_questions:0",
+    JSON.stringify({
+      text: "unsafe legacy text",
+      reply_markup: { inline_keyboard: [[{ text: "unsafe", callback_data: "unsafe" }]] },
+    }),
+  );
+
+  expect(() => fixture.migrateRemaining()).not.toThrow();
+  expect(fixture.db.prepare(
+    "SELECT state, questions_json, answers_json FROM controller_questions WHERE interaction_id = ?",
+  ).get("legacy_malformed_questions")).toEqual({
+    state: "delivered",
+    questions_json: "[]",
+    answers_json: null,
+  });
+  expect(fixture.db.prepare(
+    "SELECT payload_json FROM controller_interaction_quarantine WHERE source = 'controller_questions' AND interaction_id = ?",
+  ).get("legacy_malformed_questions")).toEqual({ payload_json: "{not-json" });
+  expect(JSON.parse((fixture.db.prepare(
+    "SELECT payload_json FROM outbox WHERE logical_key = ?",
+  ).get("controller-interaction:legacy_malformed_questions:0") as { payload_json: string }).payload_json)).toEqual({
+    text: "This interaction is no longer available. Open BB to review it.",
+    reply_markup: { inline_keyboard: [] },
+    disable_web_page_preview: true,
+  });
+});
+
+it("sanitizes structurally malformed legacy questions and quarantines the original bytes", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  const malformedQuestions = JSON.stringify({ questions: "not-an-array" });
+  fixture.insertQuestion("pending", "legacy_structurally_malformed", "{}", malformedQuestions);
+
+  fixture.migrateRemaining();
+
+  expect(fixture.db.prepare(
+    "SELECT state, questions_json FROM controller_questions WHERE interaction_id = ?",
+  ).get("legacy_structurally_malformed")).toEqual({ state: "delivered", questions_json: "[]" });
+  expect(fixture.db.prepare(
+    "SELECT payload_json FROM controller_interaction_quarantine WHERE source = 'controller_questions' AND interaction_id = ?",
+  ).get("legacy_structurally_malformed")).toEqual({ payload_json: malformedQuestions });
+});
+
+it("consumes quarantine restoration once and does not resurrect a delivered interaction after restart", () => {
+  const fixture = legacyQuestionDatabaseFixture();
+  fixture.insertQuestion("pending", "legacy_one_shot_restore");
+
+  fixture.migrateRemaining();
+  fixture.db.prepare(
+    `UPDATE controller_interactions
+        SET state = 'delivered', answer_json = NULL, delivered_at = 2_100
+      WHERE interaction_id = ?`,
+  ).run("legacy_one_shot_restore");
+  fixture.db.prepare(
+    "UPDATE outbox SET status = 'sent', updated_at = 2_100 WHERE logical_key = ?",
+  ).run("controller-interaction:legacy_one_shot_restore:0");
+
+  fixture.migrateRemaining();
+
+  expect(fixture.db.prepare(
+    "SELECT state, delivered_at FROM controller_interactions WHERE interaction_id = ?",
+  ).get("legacy_one_shot_restore")).toEqual({ state: "delivered", delivered_at: 2_100 });
+  expect(fixture.db.prepare(
+    "SELECT consumed_at FROM controller_interaction_quarantine WHERE source = 'controller' AND interaction_id = ?",
+  ).get("legacy_one_shot_restore")).toMatchObject({ consumed_at: expect.any(Number) });
+  expect(fixture.db.prepare(
+    "SELECT status FROM outbox WHERE logical_key = ?",
+  ).get("controller-interaction:legacy_one_shot_restore:0")).toEqual({ status: "sent" });
+});
+
+it("migrates valid Unicode questions and normalizes their complete answer bytes", () => {
   const fixture = legacyQuestionDatabaseFixture();
   const questions = JSON.parse(JSON.stringify(questionPayload().questions)) as Record<string, unknown>[];
   const question = questions[0]!;
@@ -719,14 +826,15 @@ it("migrates valid Unicode questions and preserves their pending answer bytes", 
   fixture.migrateRemaining();
 
   expect(fixture.db.prepare(
-    "SELECT answer_json FROM controller_interactions WHERE interaction_id = ?",
+    "SELECT state, answer_json FROM controller_interactions WHERE interaction_id = ?",
   ).get("legacy_unicode_interaction")).toEqual({
+    state: "answered",
     answer_json: JSON.stringify({
       kind: "user_answer",
       answers: { "質問一": { selected: ["第一経路"], freeText: "安全な回答" } },
     }),
   });
-  expect(new ControllerInteractionRepository(fixture.db).getPending(fixture.controllerKey)).toMatchObject({
+  expect(new ControllerInteractionRepository(fixture.db).getAnswered(fixture.controllerKey)).toMatchObject({
     answers: { "質問一": { selected: ["第一経路"], freeText: "安全な回答" } },
   });
 });
@@ -980,7 +1088,7 @@ it("preserves a valid pending legacy row without an answer map", () => {
 
 it("rolls back a nested tail failure after the exact legacy preflight", () => {
   const fixture = legacyQuestionDatabaseFixture();
-  fixture.insertQuestion("pending", "legacy_nested_failure");
+  fixture.insertQuestion("pending", "legacy_nested_failure", "{}", "{not-json");
   const originalRows = fixture.legacyRows();
   const originalMigrate = fixture.bb.storage.migrate.bind(fixture.bb.storage);
   fixture.bb.storage.migrate = (database, statements) => {
@@ -1001,6 +1109,31 @@ it("projects only safe controller approval decisions", () => {
     summary: "wants to run:\n\n`npm test`\n\nin project",
     decisions: ["allow_once", "deny"],
   });
+});
+
+it("fails closed for the provider-shaped absolute approval paths without an authoritative project root", () => {
+  const payload = {
+    kind: "approval",
+    subject: {
+      kind: "command",
+      itemId: "bb-item-absolute-path",
+      command: "git status",
+      cwd: "/srv/bb/projects/controller",
+      actions: [{
+        type: "read",
+        command: "cat /srv/bb/projects/controller/README.md",
+        name: "README.md",
+        path: "/srv/bb/projects/controller/README.md",
+      }],
+      sessionGrant: null,
+    },
+    reason: "provider approval request",
+    availableDecisions: ["allow_once", "deny"],
+  };
+
+  const projection = parseControllerInteraction("provider_absolute_path", payload);
+  expect(projection).toEqual({ kind: "unsupported", interactionId: "provider_absolute_path" });
+  expect(JSON.stringify(projection)).not.toContain("/srv/bb/projects/controller");
 });
 
 it.each([

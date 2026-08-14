@@ -179,6 +179,8 @@ type FinalizationTurnRow = FencedTurnRow & {
 type LegacyFinalizationTurnRow = Readonly<{
   controller_key: string;
   evidence_limit_exceeded_at: number | null;
+  telegram_user_id: string;
+  telegram_chat_id: string;
 }>;
 
 type FencedTurnRow = {
@@ -215,7 +217,10 @@ const EVIDENCE_OUTCOMES: ReadonlySet<string> = new Set([
 ]);
 
 export class ControllerEvidenceRepository implements ControllerNativeEvidenceWriter {
-  public constructor(private readonly db: SqliteDatabase) {}
+  public constructor(
+    private readonly db: SqliteDatabase,
+    private readonly clock: () => number = Date.now,
+  ) {}
 
   public adoptSubmittedTurnFence(
     input: ControllerLeaseFence & Readonly<{ turnId: string }>,
@@ -562,7 +567,8 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
 
   private legacyFinalizationTurn(turnId: string): LegacyFinalizationTurnRow | undefined {
     return this.db.prepare(
-      `SELECT turn.controller_key, turn.evidence_limit_exceeded_at
+      `SELECT turn.controller_key, turn.evidence_limit_exceeded_at,
+              controller.telegram_user_id, controller.telegram_chat_id
          FROM controller_turns AS turn
          JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
         WHERE turn.id = ? AND controller.state = 'active'`,
@@ -580,17 +586,63 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       evidenceLimitExceeded: turn.evidence_limit_exceeded_at !== null,
       evidenceByRef: this.evidenceByRef(accepted.turnId),
       ownerBoundaryPresent: accepted.candidate.disposition !== "needs_owner" ||
-        this.legacyOwnerBoundaryPresent(accepted.turnId, turn.controller_key),
+        this.legacyOwnerBoundaryPresent(accepted.turnId, turn),
       liveObligationRefs: this.liveObligationRefs(turn.controller_key),
     };
   }
 
-  private legacyOwnerBoundaryPresent(turnId: string, controllerKey: string): boolean {
-    return this.db.prepare(
+  private legacyOwnerBoundaryPresent(
+    turnId: string,
+    turn: LegacyFinalizationTurnRow,
+  ): boolean {
+    return this.ownerBoundaryPresentForContext(
+      turnId,
+      turn.controller_key,
+      turn.telegram_user_id,
+      turn.telegram_chat_id,
+      this.clock(),
+    );
+  }
+
+  private ownerBoundaryPresentForContext(
+    turnId: string,
+    controllerKey: string,
+    telegramUserId: string,
+    telegramChatId: string,
+    now: number,
+  ): boolean {
+    const question = this.db.prepare(
       `SELECT 1 FROM controller_interactions
         WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered')
         LIMIT 1`,
-    ).get(turnId, controllerKey) !== undefined;
+    ).get(turnId, controllerKey);
+    if (question) return true;
+    const operation = this.db.prepare(
+      `SELECT 1 FROM thread_operations
+        WHERE owner_user_id = ? AND owner_chat_id = ?
+          AND state = 'awaiting_confirmation' AND expires_at > ? LIMIT 1`,
+    ).get(telegramUserId, telegramChatId, now);
+    if (operation) return true;
+    const awaitingJob = this.db.prepare(
+      `SELECT 1 FROM jobs AS job
+        WHERE job.state = 'awaiting_confirmation'
+          AND NOT EXISTS (
+            SELECT 1 FROM job_admissions AS admission
+             WHERE admission.job_id = job.id
+          )
+        LIMIT 1`,
+    ).get();
+    if (awaitingJob) return true;
+    return this.db.prepare(
+      `SELECT 1 FROM approvals AS approval
+         JOIN jobs AS job ON job.id = approval.job_id
+        WHERE job.state = 'awaiting_merge_approval'
+          AND job.pr_head_sha = approval.head_sha
+          AND approval.job_version = job.version
+          AND approval.consumed_at IS NULL AND approval.expires_at > ?
+          AND approval.owner_user_id = ? AND approval.owner_chat_id = ?
+        LIMIT 1`,
+    ).get(now, telegramUserId, telegramChatId) !== undefined;
   }
 
   private evidenceByRef(turnId: string): ControllerFinalizationValidationContext["evidenceByRef"] {
@@ -613,37 +665,13 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
     input: ControllerFinalizationProposalInput,
     turn: FinalizationTurnRow,
   ): boolean {
-    const question = this.db.prepare(
-      `SELECT 1 FROM controller_interactions
-        WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered') LIMIT 1`,
-    ).get(input.turnId, input.controllerKey);
-    if (question) return true;
-    const operation = this.db.prepare(
-      `SELECT 1 FROM thread_operations
-        WHERE owner_user_id = ? AND owner_chat_id = ?
-          AND state = 'awaiting_confirmation' AND expires_at > ? LIMIT 1`,
-    ).get(turn.telegram_user_id, turn.telegram_chat_id, input.now);
-    if (operation) return true;
-    const awaitingJob = this.db.prepare(
-      `SELECT 1 FROM jobs AS job
-        WHERE job.state = 'awaiting_confirmation'
-          AND NOT EXISTS (
-            SELECT 1 FROM job_admissions AS admission
-             WHERE admission.job_id = job.id
-          )
-        LIMIT 1`,
-    ).get();
-    if (awaitingJob) return true;
-    return this.db.prepare(
-      `SELECT 1 FROM approvals AS approval
-         JOIN jobs AS job ON job.id = approval.job_id
-        WHERE job.state = 'awaiting_merge_approval'
-          AND job.pr_head_sha = approval.head_sha
-          AND approval.job_version = job.version
-          AND approval.consumed_at IS NULL AND approval.expires_at > ?
-          AND approval.owner_user_id = ? AND approval.owner_chat_id = ?
-        LIMIT 1`,
-    ).get(input.now, turn.telegram_user_id, turn.telegram_chat_id) !== undefined;
+    return this.ownerBoundaryPresentForContext(
+      input.turnId,
+      input.controllerKey,
+      turn.telegram_user_id,
+      turn.telegram_chat_id,
+      input.now,
+    );
   }
 
   private liveObligationRefs(controllerKey: string): ReadonlySet<string> {

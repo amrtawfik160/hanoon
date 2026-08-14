@@ -79,12 +79,12 @@ db.function("task8_race_pause", () => {
   }
 });
 const repository = new ControllerEvidenceRepository(db);
-const store = openStore(storage as Parameters<typeof openStore>[0], kv as Parameters<typeof openStore>[1]);
 writeFileSync(join(barrierDir, "ready-" + label), "ready");
 while (!existsSync(join(barrierDir, "go"))) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 }
 writeFileSync(join(barrierDir, "attempting-" + label), "attempting");
+const store = openStore(storage as Parameters<typeof openStore>[0], kv as Parameters<typeof openStore>[1]);
 try {
   const fence = { ownerId: "executor", generation: 1, now: 2_000 };
   let raceResult;
@@ -149,6 +149,17 @@ try {
       process.exit(42);
     }
     raceResult = { outcome };
+  } else if (operation === "record") {
+    raceResult = {
+      outcome: store.recordControllerInteraction({
+        ...fence,
+        turnId: "turn_race",
+        controllerKey: "controller_race",
+        bbThreadId: "thread_race",
+        controllerGenerationId: "generation_race",
+        interaction: { kind: "unsupported", interactionId: "race_interaction" },
+      }),
+    };
   } else {
     raceResult = {
       outcome: store.completeControllerTurnFromFinalization({
@@ -193,6 +204,10 @@ function seededRaceDatabase(): SeededRaceDatabase {
        'executor', 1, 1, 1, 1)`,
   ).run();
   db.prepare(
+    `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+     VALUES ('generation_race', 'controller_race', 'thread_race', 1, NULL, NULL)`,
+  ).run();
+  db.prepare(
     `UPDATE executor_lease SET owner_id = 'executor', generation = 1,
        heartbeat_at = 1, lease_expires_at = 10000 WHERE singleton = 1`,
   ).run();
@@ -208,7 +223,7 @@ function startRaceWorker(
   databasePath: string,
   barrierDir: string,
   label: string,
-  operation: "proposal" | "completion" | "continuation" | "supervisor" | "supervisor-settle" | "crash",
+  operation: "proposal" | "completion" | "continuation" | "supervisor" | "supervisor-settle" | "crash" | "record",
 ): RaceWorker {
   const child = spawn(resolve("node_modules/.bin/vite-node"), [
     "--script",
@@ -298,6 +313,18 @@ function acceptPlainFinalization(
   return accepted.finalization;
 }
 
+function downgradeAcceptedEnvelope(
+  fixture: ReturnType<typeof submittedControllerFixture>,
+  finalization: ReturnType<typeof acceptPlainFinalization>,
+): void {
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: finalization.candidate,
+    bbEventHighWaterSeq: finalization.bbEventHighWaterSeq,
+  }), finalization.id);
+}
+
 function nativeEvidenceCandidate(sourceItemId: string) {
   return {
     sourceName: "commandExecution",
@@ -325,6 +352,28 @@ it("does not permit a controller mutation after finalization is accepted", () =>
   expect(fixture.store.canMutateControllerTurn(mutationFence)).toBe(true);
   acceptPlainFinalization(fixture);
   expect(fixture.store.canMutateControllerTurn(mutationFence)).toBe(false);
+});
+
+it("rejects recording a new interaction after finalization is accepted", () => {
+  const fixture = submittedControllerFixture();
+  const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+  const controller = fixture.db.prepare(
+    "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  if (!generation) throw new Error("missing controller generation");
+  acceptPlainFinalization(fixture);
+
+  expect(fixture.store.recordControllerInteraction({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbThreadId: controller.bb_thread_id,
+    controllerGenerationId: generation.id,
+    interaction: { kind: "unsupported", interactionId: "interaction_after_finalization" },
+  })).toBe("stale");
+  expect(fixture.db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_interactions WHERE interaction_id = ?",
+  ).get("interaction_after_finalization")).toEqual({ count: 0 });
 });
 
 it("accepts one evidence-bound candidate and makes it immutable", () => {
@@ -1090,6 +1139,156 @@ it("does not complete an accepted needs-owner turn while its exact interaction i
   });
 });
 
+it.each(["answered", "needs_owner", "deferred"] as const)(
+  "fails completion closed for a pending interaction with a %s finalization",
+  (disposition) => {
+    const fixture = submittedControllerFixture();
+    const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+    const controller = fixture.db.prepare(
+      "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+    ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+    if (!generation) throw new Error("missing controller generation");
+    expect(fixture.store.recordControllerInteraction({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      bbThreadId: controller.bb_thread_id,
+      controllerGenerationId: generation.id,
+      interaction: { kind: "unsupported", interactionId: `interaction_${disposition}_completion_guard` },
+    })).toBe("recorded");
+
+    if (disposition === "deferred") {
+      insertControllerTestJob(fixture.db, { id: "job_completion_guard", state: "implementing" });
+    }
+    const candidate = disposition === "needs_owner"
+      ? needsOwnerFinalization()
+      : disposition === "deferred"
+        ? deferredFinalization("job:job_completion_guard")
+        : plainFinalization();
+    const accepted = fixture.store.proposeControllerFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      candidate,
+    });
+    if (accepted.outcome !== "accepted") throw new Error(`${disposition} fixture was not accepted`);
+
+    expect(fixture.store.completeControllerTurnFromFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      bbHighWaterSeq: 0,
+    })).toBe("stale");
+    expect(fixture.store.getControllerTurn(fixture.turn.id)?.state).toBe("submitted");
+  },
+);
+
+const LEGACY_OWNER_BOUNDARY_SETUPS = [
+  ["controller interaction", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+    const controller = fixture.db.prepare(
+      "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+    ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+    if (!generation) throw new Error("missing controller generation");
+    expect(fixture.store.recordControllerInteraction({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      bbThreadId: controller.bb_thread_id,
+      controllerGenerationId: generation.id,
+      interaction: { kind: "unsupported", interactionId: "legacy_owner_interaction" },
+    })).toBe("recorded");
+  }],
+  ["thread operation", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    fixture.store.createThreadOperation({
+      id: "legacy_owner_operation",
+      nonceHash: "7".repeat(64),
+      ownerUserId: "7",
+      ownerChatId: "7",
+      kind: "stop_thread",
+      threadId: "thread_target",
+      text: null,
+      expiresAt: fixture.fence.now + 100,
+      now: fixture.fence.now,
+    });
+    expect(fixture.store.markThreadOperationConfirmationSent(
+      "legacy_owner_operation",
+      77,
+      fixture.fence.now,
+    )).toMatchObject({ state: "awaiting_confirmation" });
+  }],
+  ["awaiting-confirmation job", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    insertControllerTestJob(fixture.db, { id: "legacy_owner_job", state: "awaiting_confirmation" });
+  }],
+  ["merge approval", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    insertControllerTestJob(fixture.db, {
+      id: "legacy_owner_merge",
+      state: "awaiting_merge_approval",
+      version: 4,
+      prHeadSha: "a".repeat(40),
+    });
+    fixture.db.prepare(
+      `INSERT INTO approvals (
+         nonce_hash, job_id, head_sha, expires_at, consumed_at, outcome,
+         owner_user_id, owner_chat_id, job_version
+       ) VALUES (?, 'legacy_owner_merge', ?, ?, NULL, NULL, '7', '7', 4)`,
+    ).run("8".repeat(64), "a".repeat(40), fixture.fence.now + 100);
+  }],
+] as const;
+
+it.each(LEGACY_OWNER_BOUNDARY_SETUPS)(
+  "revalidates a legacy needs-owner envelope against the complete %s owner boundary",
+  (_label, setup) => {
+    const fixture = submittedControllerFixture();
+    setup(fixture);
+    const accepted = fixture.store.proposeControllerFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      candidate: needsOwnerFinalization(),
+    });
+    if (accepted.outcome !== "accepted") throw new Error("owner boundary fixture was not accepted");
+    downgradeAcceptedEnvelope(fixture, accepted.finalization);
+
+    expect(fixture.reopen().getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
+      id: accepted.finalization.id,
+      semanticEnvelopeVersion: 1,
+    });
+  },
+);
+
+it("fails closed when a legacy needs-owner envelope has an expired boundary", () => {
+  const fixture = submittedControllerFixture();
+  fixture.store.createThreadOperation({
+    id: "legacy_expired_operation",
+    nonceHash: "9".repeat(64),
+    ownerUserId: "7",
+    ownerChatId: "7",
+    kind: "stop_thread",
+    threadId: "thread_target",
+    text: null,
+    expiresAt: fixture.fence.now + 100,
+    now: fixture.fence.now,
+  });
+  expect(fixture.store.markThreadOperationConfirmationSent(
+    "legacy_expired_operation",
+    77,
+    fixture.fence.now,
+  )).toMatchObject({ state: "awaiting_confirmation" });
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: needsOwnerFinalization(),
+  });
+  if (accepted.outcome !== "accepted") throw new Error("expired owner boundary fixture was not accepted");
+  downgradeAcceptedEnvelope(fixture, accepted.finalization);
+  fixture.db.prepare("UPDATE thread_operations SET expires_at = 1 WHERE id = ?")
+    .run("legacy_expired_operation");
+
+  expect(fixture.reopen().getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+});
+
 it("accepts needs-owner for an unexpired one-use confirmation bound to the paired owner", () => {
   const fixture = submittedControllerFixture();
   fixture.store.createThreadOperation({
@@ -1269,6 +1468,59 @@ it("persists one accepted row when two SQLite processes race", async () => {
         AND finalization.turn_id = turn.id
        WHERE turn.id = 'turn_race'`,
     ).get()).toEqual({ count: 1 });
+  } finally {
+    stopRaceWorkers(workers);
+    db?.close();
+    await disposeHost?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("serializes record-before-finalization in SQLite and leaves the accepted turn uncompletable", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "telegram-controller-interaction-finalization-race-"));
+  const barrierDir = resolve(directory, "barriers");
+  const scriptPath = resolve(directory, "race-worker.ts");
+  let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
+  const workers: RaceWorker[] = [];
+  try {
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
+    db = seeded.db;
+    db.exec(`
+      CREATE TRIGGER pause_interaction_record
+      BEFORE INSERT ON controller_interactions
+      WHEN NEW.interaction_id = 'race_interaction'
+      BEGIN
+        SELECT task8_race_pause();
+      END
+    `);
+    db.close();
+    db = undefined;
+    writeFileSync(scriptPath, raceWorkerSource());
+    mkdirSync(barrierDir);
+    workers.push(startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "0", "record"));
+    await waitForFile(resolve(barrierDir, "ready-0"));
+    writeFileSync(resolve(barrierDir, "go"), "go");
+    await waitForFile(resolve(barrierDir, "attempting-0"));
+    await waitForFile(resolve(barrierDir, "entered-0"));
+    workers.push(startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "1", "proposal"));
+    await waitForFile(resolve(barrierDir, "ready-1"));
+    await waitForFile(resolve(barrierDir, "attempting-1"));
+    writeFileSync(resolve(barrierDir, "release"), "release");
+    const results = await Promise.all(workers.map((worker) => worker.result));
+    expect(results.map(({ outcome }) => outcome).sort()).toEqual(["accepted", "recorded"]);
+
+    db = new Database(seeded.databasePath);
+    expect(db.prepare(
+      "SELECT state FROM controller_interactions WHERE interaction_id = 'race_interaction'",
+    ).get()).toEqual({ state: "pending" });
+    expect(db.prepare(
+      "SELECT accepted_finalization_id FROM controller_turns WHERE id = 'turn_race'",
+    ).get()).toMatchObject({ accepted_finalization_id: expect.any(Number) });
+    expect(db.prepare(
+      "SELECT state FROM controller_turns WHERE id = 'turn_race'",
+    ).get()).toEqual({ state: "submitted" });
   } finally {
     stopRaceWorkers(workers);
     db?.close();

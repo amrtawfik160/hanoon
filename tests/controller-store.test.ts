@@ -63,7 +63,7 @@ function sha256(text: string): string {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(34);
+  expect(ALL_MIGRATIONS).toHaveLength(35);
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -106,6 +106,7 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[31]).toContain("controller_supervisor_steer_attempts");
   expect(ALL_MIGRATIONS[32]).toContain("controller_interaction_quarantine");
   expect(ALL_MIGRATIONS[33]).toContain("envelope_version");
+  expect(ALL_MIGRATIONS[34]).toContain("consumed_at");
 });
 
 it("pins the exact shipped and controller trust migration bytes in order", () => {
@@ -162,7 +163,7 @@ it("runs the exact legacy interaction preflight and quarantines unsafe rows duri
   }));
 
   expect(() => openStore(bb.storage, bb.storage.kv, () => 2_000)).not.toThrow();
-  expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({ count: 34 });
+  expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({ count: 35 });
   expect(db.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'controller_interactions'",
   ).get()).toEqual({ name: "controller_interactions" });

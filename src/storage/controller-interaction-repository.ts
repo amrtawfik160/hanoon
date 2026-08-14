@@ -106,6 +106,7 @@ type FencedTurn = {
   controller_key: string;
   bb_thread_id: string;
   controller_generation_id: string;
+  accepted_finalization_id: number | null;
 };
 
 type FencedTurnQuery = Readonly<{
@@ -385,7 +386,7 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
         bbThreadId: input.bbThreadId,
         generationId: input.controllerGenerationId,
       });
-      if (!turn) return "stale";
+      if (!turn || turn.accepted_finalization_id !== null) return "stale";
       const existing = this.db.prepare(
         "SELECT * FROM controller_interactions WHERE interaction_id = ?",
       ).get(interaction.interactionId) as InteractionRow | undefined;
@@ -555,7 +556,8 @@ export class ControllerInteractionRepository implements ControllerInteractionSto
   ): FencedTurn | undefined {
     return this.db.prepare(
       `SELECT controller.controller_key, controller.bb_thread_id,
-              generation.id AS controller_generation_id
+              generation.id AS controller_generation_id,
+              turn.accepted_finalization_id
          FROM controller_turns AS turn
          JOIN executor_lease AS lease
            ON lease.singleton = 1

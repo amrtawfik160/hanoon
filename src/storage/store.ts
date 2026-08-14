@@ -60,6 +60,7 @@ import {
   parseThreadInteraction,
   threadDecisionToken,
   type ControllerQuestionAnswers,
+  type ControllerQuestion,
   type ThreadInteraction,
 } from "../controller/questions";
 import {
@@ -117,6 +118,12 @@ type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
 type PluginKv = PluginStorage["kv"];
 const CONTROLLER_INTERACTION_TAIL_ID = 29;
+const RETIRED_CONTROLLER_INTERACTION_NOTICE = "This interaction is no longer available. Open BB to review it.";
+const RETIRED_CONTROLLER_INTERACTION_PAYLOAD = JSON.stringify({
+  text: RETIRED_CONTROLLER_INTERACTION_NOTICE,
+  reply_markup: { inline_keyboard: [] },
+  disable_web_page_preview: true,
+});
 
 type LegacyControllerQuestionRow = Readonly<{
   rowid: number;
@@ -1728,7 +1735,28 @@ type LegacyControllerQuestionRepair = Readonly<{
 type ValidatedLegacyControllerQuestion = Readonly<{
   questionsJson: string;
   answersJson: string | null;
+  state: "pending" | "answered";
+  answeredAt: number | null;
 }>;
+
+function nonNegativeLegacyTimestamp(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function legacyQuestionAnswerMapIsComplete(
+  questions: readonly ControllerQuestion[],
+  answers: ControllerQuestionAnswers,
+): boolean {
+  return nextUnansweredQuestion(questions, answers) === null && questions.every((question) => (
+    (answers[question.id]?.selected.length ?? 0) > 0
+  ));
+}
+
+function sanitizedLegacyQuestionsJson(interactionId: string, jsonText: unknown): string {
+  const questions = parseLegacyJson(jsonText);
+  const interaction = parseControllerInteraction(interactionId, { kind: "user_question", questions });
+  return interaction?.kind === "user_question" ? JSON.stringify(interaction.questions) : "[]";
+}
 
 function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): ValidatedLegacyControllerQuestion | null {
   if (row.state !== "pending" && row.state !== "answered") return null;
@@ -1740,16 +1768,59 @@ function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): Val
       ? {
           questionsJson: JSON.stringify(interaction.questions),
           answersJson: null,
+          state: "pending",
+          answeredAt: null,
         }
       : null;
   }
   const answers = parseLegacyJson(row.answers_json);
   const resolution = parseControllerInteractionResolution(interaction, answers, row.state);
   if (!resolution || resolution.kind !== "user_answer") return null;
+  const complete = legacyQuestionAnswerMapIsComplete(
+    interaction.questions,
+    resolution.answers as ControllerQuestionAnswers,
+  );
+  if (row.state === "answered" && !complete) return null;
+  const answeredAt = complete
+    ? nonNegativeLegacyTimestamp(row.answered_at) ?? nonNegativeLegacyTimestamp(row.asked_at)
+    : null;
+  if (complete && answeredAt === null) return null;
   return {
     questionsJson: JSON.stringify(interaction.questions),
     answersJson: JSON.stringify(resolution.answers),
+    state: complete ? "answered" : "pending",
+    answeredAt,
   };
+}
+
+function sanitizeLegacyControllerQuestionSources(db: SqliteDatabase): void {
+  const rows = db.prepare(
+    `SELECT rowid, interaction_id, questions_json, answers_json
+       FROM controller_questions
+      ORDER BY rowid ASC`,
+  ).all() as Array<{
+    rowid: number;
+    interaction_id: unknown;
+    questions_json: unknown;
+    answers_json: unknown;
+  }>;
+  const update = db.prepare(
+    `UPDATE controller_questions
+        SET interaction_id = ?, questions_json = ?, answers_json = ?
+      WHERE rowid = ?`,
+  );
+  for (const row of rows) {
+    const interactionId = typeof row.interaction_id === "string" && row.interaction_id.length > 0
+      ? row.interaction_id
+      : `legacy-row-${row.rowid}`;
+    const questionsJson = sanitizedLegacyQuestionsJson(interactionId, row.questions_json);
+    const answersJson = row.answers_json === null || parseLegacyJson(row.answers_json) !== null
+      ? row.answers_json
+      : null;
+    if (interactionId !== row.interaction_id || questionsJson !== row.questions_json || answersJson !== row.answers_json) {
+      update.run(interactionId, questionsJson, answersJson, row.rowid);
+    }
+  }
 }
 
 function validateLegacyControllerQuestions(db: SqliteDatabase): LegacyControllerQuestionRepair {
@@ -1788,9 +1859,15 @@ function validateLegacyControllerQuestions(db: SqliteDatabase): LegacyController
     if (projection && identity) {
       db.prepare(
         `UPDATE controller_questions
-            SET questions_json = ?, answers_json = ?
+            SET questions_json = ?, answers_json = ?, state = ?, answered_at = ?
           WHERE rowid = ? AND state IN ('pending', 'answered')`,
-      ).run(projection.questionsJson, projection.answersJson, row.rowid);
+      ).run(
+        projection.questionsJson,
+        projection.answersJson,
+        projection.state,
+        projection.answeredAt,
+        row.rowid,
+      );
       continue;
     }
     invalid.push(row);
@@ -1803,6 +1880,7 @@ function validateLegacyControllerQuestions(db: SqliteDatabase): LegacyController
     }
     stale.run(safeInteractionId);
   }
+  sanitizeLegacyControllerQuestionSources(db);
   return { invalid };
 }
 
@@ -1831,6 +1909,8 @@ type RepairQuarantineRow = Readonly<{
   prior_state: "pending" | "answered";
   asked_at: number;
   answered_at: number | null;
+  quarantined_at: number;
+  consumed_at: number | null;
 }>;
 
 function isCurrentControllerInteractionIdentity(
@@ -1876,7 +1956,13 @@ function restoreQuarantinedControllerQuestion(
   const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
     ? resolution.answers as ControllerQuestionAnswers
     : {};
-  const next = nextUnansweredQuestion(interaction.questions, answers);
+  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, answers);
+  if (row.prior_state === "answered" && !complete) return false;
+  const next = complete ? null : nextUnansweredQuestion(interaction.questions, answers);
+  const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
+  const restoredAnsweredAt = restoredState === "answered"
+    ? row.answered_at ?? row.asked_at
+    : null;
   const restored = db.prepare(
     `UPDATE controller_interactions
         SET bb_thread_id = ?, controller_generation_id = ?, kind = 'user_question',
@@ -1886,13 +1972,13 @@ function restoreQuarantinedControllerQuestion(
     row.bb_thread_id,
     row.controller_generation_id,
     JSON.stringify(interaction),
-    row.prior_state,
+    restoredState,
     resolution ? JSON.stringify(resolution) : null,
-    row.answered_at,
+    restoredAnsweredAt,
     row.interaction_id,
   );
   if (restored.changes !== 1) return false;
-  if (row.prior_state !== "pending") return true;
+  if (restoredState !== "pending") return true;
   const controller = db.prepare(
     "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
   ).get(row.controller_key) as { telegram_chat_id: string } | undefined;
@@ -1925,19 +2011,29 @@ function restoreQuarantinedThreadQuestion(
     : parseControllerInteractionResolution(interaction, rawAnswer, row.prior_state);
   if (row.answer_json !== null && resolution === null) return false;
   if (row.prior_state === "answered" && resolution === null) return false;
+  const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
+    ? resolution.answers as ControllerQuestionAnswers
+    : {};
+  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, answers);
+  if (row.prior_state === "answered" && !complete) return false;
+  const next = complete ? null : nextUnansweredQuestion(interaction.questions, answers);
+  const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
+  const restoredAnsweredAt = restoredState === "answered"
+    ? row.answered_at ?? row.asked_at
+    : null;
   const restored = db.prepare(
     `UPDATE thread_interactions
         SET kind = 'user_question', payload_json = ?, state = ?, answer_json = ?, answered_at = ?
       WHERE interaction_id = ? AND state = 'delivered'`,
   ).run(
     JSON.stringify(interaction),
-    row.prior_state,
+    restoredState,
     resolution ? JSON.stringify(resolution) : null,
-    row.answered_at,
+    restoredAnsweredAt,
     row.interaction_id,
   );
   if (restored.changes !== 1) return false;
-  if (row.prior_state !== "pending" || row.thread_id === null || row.title === null) return true;
+  if (restoredState !== "pending" || row.thread_id === null || row.title === null) return true;
   const rendered = renderThreadInteraction(row.title, interaction);
   if (!("reply_markup" in rendered)) return true;
   const existing = db.prepare(
@@ -1969,13 +2065,7 @@ function quarantineLegacyControllerQuestions(
   );
   const clearOutbox = db.prepare(
     `UPDATE outbox
-        SET payload_json = CASE
-              WHEN json_valid(payload_json) = 1 THEN json_set(
-                payload_json,
-                '$.reply_markup', json_object('inline_keyboard', json_array())
-              )
-              ELSE json_object('reply_markup', json_object('inline_keyboard', json_array()))
-            END,
+        SET payload_json = ?,
             status = 'pending', lease_owner = NULL, lease_generation = NULL,
             lease_expires_at = NULL, next_attempt_at = updated_at, last_error = NULL
       WHERE substr(logical_key, 1, length('controller-interaction:' || ? || ':')) =
@@ -2004,7 +2094,7 @@ function quarantineLegacyControllerQuestions(
       answeredAt,
       askedAt,
     );
-    clearOutbox.run(interactionId, interactionId);
+    clearOutbox.run(RETIRED_CONTROLLER_INTERACTION_PAYLOAD, interactionId, interactionId);
   }
 }
 
@@ -2012,13 +2102,20 @@ function restoreQuarantinedInteractions(db: SqliteDatabase): void {
   const rows = db.prepare(
     `SELECT source, interaction_id, turn_id, controller_key, bb_thread_id,
             controller_generation_id, thread_id, title, kind, payload_json, answer_json,
-            prior_state, asked_at, answered_at
+            prior_state, asked_at, answered_at, quarantined_at, consumed_at
        FROM controller_interaction_quarantine
+      WHERE consumed_at IS NULL
       ORDER BY quarantined_at ASC, interaction_id ASC`,
   ).all() as RepairQuarantineRow[];
+  const consume = db.prepare(
+    `UPDATE controller_interaction_quarantine
+        SET consumed_at = ?
+      WHERE source = ? AND interaction_id = ? AND consumed_at IS NULL`,
+  );
   for (const row of rows) {
     if (row.source === "controller") restoreQuarantinedControllerQuestion(db, row);
     else if (row.source === "thread") restoreQuarantinedThreadQuestion(db, row);
+    consume.run(row.quarantined_at, row.source, row.interaction_id);
   }
   db.prepare(
     `UPDATE controller_turns AS turn
@@ -3424,7 +3521,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     private readonly clock: () => number,
   ) {
     this.autonomyRepository = new AutonomyRepository(db);
-    this.controllerEvidenceRepository = new ControllerEvidenceRepository(db);
+    this.controllerEvidenceRepository = new ControllerEvidenceRepository(db, clock);
     this.controllerInteractionRepository = new ControllerInteractionRepository(db);
   }
 
@@ -3810,7 +3907,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!accepted || accepted.id !== turn.accepted_finalization_id || accepted.consumedAt !== null) {
         return "stale" as const;
       }
-      if (accepted.candidate.disposition === "needs_owner" && this.db.prepare(
+      if (this.db.prepare(
         `SELECT 1 FROM controller_interactions
           WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered')
           LIMIT 1`,

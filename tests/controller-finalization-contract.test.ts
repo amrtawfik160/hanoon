@@ -863,6 +863,14 @@ describe("fail-closed operational claim binding", () => {
   });
 
   it.each([
+    ["a so-clause", "The deployment was not live so the tests passed."],
+    ["an earlier negation", "The deployment was not live before the tests passed."],
+    ["a question", "Did the deployment succeed?"],
+  ] as const)("keeps an affirmative assertion visible in %s", (_label, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
     "Working on it now.",
     "I'm working on it now.",
     "The work is in progress.",
@@ -1176,6 +1184,7 @@ describe("bounded text heuristics", () => {
     ["merged", "The release was merged to production."],
     ["published", "The package was published to production."],
     ["live", "The feature is live in production."],
+    ["running", "The service is running in production."],
   ] as const)("requires production proof for %s wording even when the verb is broadly accepted", (_label, text) => {
     expectRejection(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
@@ -1185,6 +1194,17 @@ describe("bounded text heuristics", () => {
     expect(validateControllerFinalization(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
       contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not turn a test result that explicitly avoided production into a production claim", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: "The tests passed without touching production.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
   });
 

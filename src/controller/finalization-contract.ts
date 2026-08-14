@@ -169,7 +169,7 @@ const PURCHASE_OBJECT = "(?:packages?|dependencies|plugins?|skills?|software|too
 const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\\s+){0,3}(?:dollars?|euros?|pounds?))";
 const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
-const NON_AFFIRMATIVE_OPERATIONAL_PREFIX = /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't|will|would|could|should|plan to|intend to|propose|after approval|later|may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?)\b/i;
+const NON_AFFIRMATIVE_OPERATIONAL_PREFIX = /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't|will|would|could|should|plan to|intend to|propose|after approval|later|may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?|can you confirm whether)\b/i;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
@@ -177,7 +177,7 @@ type OperationalAssertion = Readonly<{
   requiredProofKinds?: readonly ControllerProofKind[];
 }>;
 
-const OPERATIONAL_SUCCESS_STATE = "(?:done|complete|completed|finished|successful|succeeded|passed|green|live|healthy|verified|ready|all\\s+set)";
+const OPERATIONAL_SUCCESS_STATE = "(?:done|complete|completed|finished|successful|succeed|succeeded|passed|green|live|healthy|verified|ready|all\\s+set)";
 const OPERATIONAL_STATE_LINK = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)?";
 const GENERIC_COMPLETION_SUBJECT = "(?:everything|all(?:\\s+(?:the\\s+)?(?:work|tasks?|items?))?|the\\s+(?:work|task|job|operation))";
 
@@ -205,6 +205,16 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   {
     pattern: /\b(?:deployed|released|rolled\s+out|promoted|provisioned)\b/i,
     kinds: ["external_mutation", "pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
+  },
+  {
+    pattern: /\brunning\s+(?:in|on)\s+production\b/i,
+    kinds: ["pipeline_outcome"],
+    requiredProofKinds: ["production_outcome"],
+  },
+  {
+    pattern: /\bproduction\s+(?:is|was|has been|had been)\s+running\b/i,
+    kinds: ["pipeline_outcome"],
     requiredProofKinds: ["production_outcome"],
   },
   {
@@ -294,7 +304,7 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     kinds: ["external_mutation"],
   },
   {
-    pattern: /\b(?:the\s+)?(?:deployment|release)\s+(?:succeeded|passed|completed|finished)\b/i,
+    pattern: /\b(?:the\s+)?(?:deployment|release)\s+(?:succeed|succeeded|passed|completed|finished)\b/i,
     kinds: ["pipeline_outcome"],
     requiredProofKinds: ["production_outcome"],
   },
@@ -476,7 +486,7 @@ function normalizedSentences(text: string): string[] {
 
 function textClauses(text: string): string[] {
   return normalizedSentences(text)
-    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then)\b\s+|;\s*/i))
+    .flatMap((sentence) => sentence.split(/\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then|before|so|despite)\b\s+|;\s*/i))
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
@@ -488,7 +498,6 @@ type OperationalMatch = Readonly<{
 }>;
 
 function operationalMatchesIn(clause: string): OperationalMatch[] {
-  if (/\?/.test(clause)) return [];
   const matches: OperationalMatch[] = [];
   for (const assertion of OPERATIONAL_ASSERTIONS) {
     const flags = assertion.pattern.flags.includes("g") ? assertion.pattern.flags : `${assertion.pattern.flags}g`;
@@ -549,7 +558,7 @@ function sentenceSourceSpans(text: string): SourceTextSpan[] {
 
 function splitOperationalSentence(sentence: SourceTextSpan): SourceTextSpan[] {
   const clauses: SourceTextSpan[] = [];
-  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then)\b\s+|;\s*/gi;
+  const clauseSeparator = /\s*(?:,\s*)?\b(?:and|but|although|because|however|which|while|then|before|so|despite)\b\s+|;\s*/gi;
   let cursor = 0;
   let separator = clauseSeparator.exec(sentence.text);
   while (separator !== null) {
@@ -590,6 +599,17 @@ function isProcessOnly(candidate: ControllerFinalization, renderedMessage: strin
 
 function clauseHasHighImpactSuccess(clause: string): boolean {
   return operationalMatchesIn(clause).length > 0;
+}
+
+function productionTargetForMatch(clause: string, match: OperationalMatch): boolean {
+  const before = clause.slice(0, match.start);
+  const after = clause.slice(match.end);
+  if (/(?:^|\s)production\s+(?:is|was|has been|had been)\s*$/i.test(before)) return true;
+  const productionAfter = after.search(/\bproduction\b/i);
+  if (productionAfter < 0) return false;
+  const beforeProduction = after.slice(0, productionAfter);
+  if (/\b(?:without|not|never|no longer|except|rather than)\b/i.test(beforeProduction)) return false;
+  return /\b(?:to|in|on|at)\s+(?:the\s+)?$/i.test(beforeProduction);
 }
 
 type FinalizationSegmentSpan = Readonly<{
@@ -634,7 +654,7 @@ function hasIncompatibleClaimText(
       const rows = evidenceRows(onlySegment, context);
       const requiredProofKinds = [
         ...(match.assertion.requiredProofKinds ?? []),
-        ...(/\bproduction\b/i.test(clause) ? ["production_outcome" as const] : []),
+        ...(productionTargetForMatch(clause, match) ? ["production_outcome" as const] : []),
       ];
       if (requiredProofKinds.some((requiredProof) => (
         !rows.some((row) => row.proofKinds.includes(requiredProof))
