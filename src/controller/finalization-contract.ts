@@ -116,6 +116,10 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, ReadonlySet<ControllerProofKind>
   health_assessment: new Set(["health_snapshot"]),
   uncertainty: new Set(CONTROLLER_PROOF_KINDS),
 };
+const PRIMARY_EXECUTION_PROOF_KINDS: ReadonlySet<ControllerProofKind> = new Set([
+  "command_result",
+  "tool_result",
+]);
 
 const CURRENT_OBSERVATION_SUCCESS_KINDS: ReadonlySet<ControllerClaimKind> = new Set([
   "observed_state",
@@ -253,11 +257,7 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     kinds: ["workspace_change"],
   },
   {
-    pattern: /\b(?:the\s+)?tests?(?:\s+suite)?\s+(?:is|are|was|were|has been|have been|had been)?\s*(?:passed|succeeded|completed)\b/i,
-    kinds: ["execution_result"],
-  },
-  {
-    pattern: /\b(?:all\s+)?tests?(?:\s+suite)?\s+(?:pass|passed|succeed|succeeded|complete|completed)\b/i,
+    pattern: /\b(?:(?:the|all)\s+)?(?:production\s+)?(?:tests?(?:\s+suite)?|test\s+cases?)\s+(?:all\s+)?(?:is|are|was|were|has been|have been|had been)?\s*(?:pass|passed|succeed|succeeded|complete|completed|finished)\b/i,
     kinds: ["execution_result"],
   },
   {
@@ -480,9 +480,22 @@ function evidenceOutcomesSupportClaim(claim: ControllerClaim, rows: readonly Evi
   return hasOnlyCurrentOrSucceeded && (hasSucceeded || CURRENT_OBSERVATION_SUCCESS_KINDS.has(claim.kind));
 }
 
-function evidenceSupportsClaim(claim: ControllerClaim, rows: readonly EvidenceRow[]): boolean {
+function evidenceProofsSupportClaim(claim: ControllerClaim, rows: readonly EvidenceRow[]): boolean {
   const compatibleProofs = CLAIM_PROOFS[claim.kind];
-  if (rows.some((row) => !row.proofKinds.some((proofKind) => compatibleProofs.has(proofKind)))) return false;
+  if (claim.kind !== "execution_result") {
+    return rows.every((row) => row.proofKinds.some((proofKind) => compatibleProofs.has(proofKind)));
+  }
+  const hasPrimaryExecutionProof = rows.some((row) => (
+    row.proofKinds.some((proofKind) => PRIMARY_EXECUTION_PROOF_KINDS.has(proofKind))
+  ));
+  const rowsHaveCompatibleProof = rows.every((row) => row.proofKinds.some((proofKind) => (
+    compatibleProofs.has(proofKind) || proofKind === "production_outcome"
+  )));
+  return hasPrimaryExecutionProof && rowsHaveCompatibleProof;
+}
+
+function evidenceSupportsClaim(claim: ControllerClaim, rows: readonly EvidenceRow[]): boolean {
+  if (!evidenceProofsSupportClaim(claim, rows)) return false;
   if (!evidenceOutcomesSupportClaim(claim, rows)) return false;
   if (claim.kind !== "uncertainty") return true;
   return claim.outcome === "uncertain" || rows.some((row) => NEGATIVE_EVIDENCE_OUTCOMES.has(row.outcome));
@@ -693,7 +706,7 @@ function isNegativeProductionPredicate(
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
   const after = clause.slice(mention.end);
-  return /^\s+(?:(?:is|are|was|were|has been|have been|had been|does|did|has|have|had|can|will|would|could|should|must)\s+)?(?:(?:not|never)(?!\s+only\b)|no\s+longer|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|doesn't|didn't|can't|cannot|won't|wouldn't|couldn't|shouldn't|failed|failing|blocked|down|offline|unavailable|unhealthy)\b/i.test(after);
+  return /^\s+(?:(?:is|are|was|were|has been|have been|had been|does|did|has|have|had|can|will|would|could|should|must)\s+)?(?:(?:not|never|no\s+longer)(?!\s+(?:only|down|blocked|failed|failing|offline|unavailable|unhealthy)\b)|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|doesn't|didn't|can't|cannot|won't|wouldn't|couldn't|shouldn't|failed|failing|blocked|down|offline|unavailable|unhealthy)\b/i.test(after);
 }
 
 function isExplicitlyNonProductionMention(
@@ -701,6 +714,7 @@ function isExplicitlyNonProductionMention(
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
   const before = clause.slice(0, mention.start);
+  if (/\bnowhere\s+outside\s+(?:the\s+)?$/i.test(before)) return false;
   return /\bnon[-\s]$|\b(?:outside|away from|rather than|not|never|no)(?:\s+to)?\s+(?:the\s+)?$/i.test(before);
 }
 

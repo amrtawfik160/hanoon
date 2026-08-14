@@ -51,15 +51,6 @@ function evidenceRow(
   return { ref, outcome, proofKinds: [proofKind], subjectRefs: [subjectRef] };
 }
 
-function evidenceRowWithProofKinds(
-  ref: `evidence:${number}`,
-  proofKinds: readonly ControllerProofKind[],
-  outcome: EvidenceRow["outcome"] = "observed",
-  subjectRef = "job:job_1",
-): EvidenceRow {
-  return { ref, outcome, proofKinds, subjectRefs: [subjectRef] };
-}
-
 function contextWithEvidence(
   ...rows: readonly EvidenceRow[]
 ): ControllerFinalizationValidationContext {
@@ -1238,6 +1229,7 @@ describe("bounded text heuristics", () => {
   it.each([
     ["production tests", "Production tests passed."],
     ["production smoke and regression tests", "Production smoke and regression tests passed."],
+    ["production tests all passed", "Production tests all passed."],
     ["tests using production", "Tests passed using production."],
     ["production label tests", "Production: tests passed."],
   ] as const)("requires execution and production proof for %s wording", (_label, text) => {
@@ -1252,13 +1244,87 @@ describe("bounded text heuristics", () => {
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
       "proof_incompatible",
     );
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    const claimWithSeparateEvidence = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text,
+      evidenceRefs: ["evidence:1", "evidence:2"],
+    });
+    expect(validateControllerFinalization(
+      claimWithSeparateEvidence,
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded"),
+        evidenceRow("evidence:2", "production_outcome", "succeeded"),
+      ),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("keeps production proof auxiliary to execution claims only", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "pipeline_outcome",
+        outcome: "succeeded",
+        text: "The deployment succeeded in production.",
+        evidenceRefs: ["evidence:1", "evidence:2"],
+      }),
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded"),
+        evidenceRow("evidence:2", "production_outcome", "succeeded"),
+      ),
+      "proof_incompatible",
+    );
+  });
+
+  it("does not let production-only evidence carry production test success", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "pipeline_outcome",
+        outcome: "succeeded",
+        text: "Production tests all passed.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["tests all passed", "The tests all passed."],
+    ["test cases passed", "The test cases passed."],
+  ] as const)("binds natural test-success wording to execution evidence: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["never down", "Production was never down: the release was published."],
+    ["nowhere outside", "The release was published nowhere outside production."],
+  ] as const)("requires production proof for affirmative production polarity: %s", (_label, text) => {
+    const claim = claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text });
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
     expect(validateControllerFinalization(
       claim,
-      contextWithEvidence(evidenceRowWithProofKinds(
-        "evidence:1",
-        ["command_result", "production_outcome"],
-        "succeeded",
-      )),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
     )).toMatchObject({ outcome: "accepted" });
   });
 
