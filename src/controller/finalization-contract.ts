@@ -204,7 +204,7 @@ const TEST_SUBJECT_TOKEN = /^test(?:s|ing|ed)?$/i;
 const LOCAL_SUBJECT_BOUNDARY_WORD = /^(?:and|although|because|but|however|or|so|therefore|then|while|yet)$/i;
 const LOCAL_SUBJECT_QUANTIFIER_WORD = /^(?:all|another|any|both|each|either|enough|every|few|less|many|more|most|neither|no|several|some)$/i;
 const LOCAL_RELATIVE_MARKER = /^(?:that|which|who|whom|whose)$/i;
-const LOCAL_RELATIVE_PRONOUN = /^(?:i|we|you|he|she|they|it)$/i;
+const LOCAL_REPORTING_SUBJECT_WORDS = new Set(["ci", "pipeline", "review"]);
 const LOCAL_SUCCESS_VERB_WORD = /^(?:pass(?:ed)?|succeed(?:ed)?|complete(?:d)?|finish(?:ed)?|fail(?:ed)?|live|green)$/i;
 const NON_RESULT_TEST_SCOPE_WORD = /^(?:can|could|may|might|will|would|shall|should|must|if|when|unless|to)$/i;
 const MAX_PREDICATE_CONTEXT_CHARS = 256;
@@ -689,6 +689,18 @@ function matchSubjectTokens(clause: string, match: OperationalMatch): LocalPredi
     .filter((token) => !LOCAL_SUCCESS_VERB_WORD.test(token.word));
 }
 
+function isReportingSubjectHandoff(
+  relation: readonly LocalPredicateToken[],
+  matchedSubjectTokens: readonly LocalPredicateToken[],
+): boolean {
+  const handoffWords = [...relation, ...matchedSubjectTokens].map((token) => token.word);
+  if (handoffWords.shift() !== "reported") return false;
+  const subjectWords = handoffWords.filter((word) => !PREDICATE_DETERMINERS.has(word));
+  return subjectWords.length === 1
+    ? LOCAL_REPORTING_SUBJECT_WORDS.has(subjectWords[0]!)
+    : subjectWords.join(" ") === "continuous integration";
+}
+
 function testParticipantBeforeMatch(
   tokens: readonly LocalPredicateToken[],
   testIndex: number,
@@ -696,15 +708,7 @@ function testParticipantBeforeMatch(
 ): LocalTestSubjectEntitlement {
   if (hasCompoundAroundTest(tokens, testIndex, [], matchedSubjectTokens)) return "ambiguous";
   const relation = tokens.slice(testIndex + 1);
-  const significant = [...localSignificantTokens(relation), ...matchedSubjectTokens];
-  const hasRelativeStructure = relation.some((token) => (
-    LOCAL_RELATIVE_MARKER.test(token.word) || predicateTokenIsPreposition(token.word)
-  ));
-  if (significant.length >= 2 && !hasRelativeStructure) {
-    if (LOCAL_RELATIVE_PRONOUN.test(significant[0]!.word)) return "execution";
-    return "none";
-  }
-  return "execution";
+  return isReportingSubjectHandoff(relation, matchedSubjectTokens) ? "none" : "execution";
 }
 
 function testParticipantAfterMatch(

@@ -1488,10 +1488,14 @@ describe("bounded text heuristics", () => {
   });
 
   it.each([
-    ["nearer non-test subject", "Tests reported CI passed.", false],
+    ["reporting handoff to CI", "Tests reported CI passed.", false],
     ["auxiliary and adverbial chain", "Tests did ultimately pass.", true],
     ["relative test participant", "The tests that ran passed.", true],
     ["relative pronoun participant", "The tests I ran passed.", true],
+    ["named relative participant", "The tests Alice ran passed.", true],
+    ["possessive relative participant", "The tests my team ran passed.", true],
+    ["reduced overnight relative", "The tests run overnight passed.", true],
+    ["possessive named subject", "Alice's tests passed.", true],
     ["focus modifier", "Tests even passed.", true],
     ["temporal modifier", "Tests have now passed.", true],
     ["gerund test subject", "Regression testing passed.", true],
