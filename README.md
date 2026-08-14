@@ -55,9 +55,19 @@ Every owner-visible reply is one accepted structured finalization, and nothing e
 
 - **Evidence in the same turn.** A claim about current state or completed work must reference evidence the agent gathered during that turn, with compatible proof kinds and a matching subject. Evidence is sealed at a high-water mark when the finalization is accepted, and an answer whose evidence advanced afterwards is refused rather than sent.
 - **Raw prose reaches nothing.** Unstructured assistant prose never becomes a Telegram draft, a stored answer, a conversation digest, an outbox row, a finalization row, or a reply. BB still owns its own provider transcript. Drafts show one of the fixed phase lines, such as "Hanoon is thinking…", never partial output. The one exception is not prose: when BB blocks on a question or an approval, the provider's own prompt, options, and command are what the owner is being asked about, so they are carried through — each field bounded and credential-screened, and the whole interaction downgraded to an unanswerable notice if any field fails the screen.
-- **A bounded capability surface.** The controller runs against an enforced manifest of exactly 25 Hanoon capabilities. Denials are decided before any effect, and a stale executor fence or a stale approval is denied rather than retried.
+- **A bounded capability surface.** The controller runs against an enforced manifest of exactly 28 Hanoon capabilities. Denials are decided before any effect, and a stale executor fence or a stale approval is denied rather than retried.
 - **Owner boundaries reach the phone.** A hidden-controller question or BB permission prompt is fetched from BB by exact identity, shown in Telegram, and answered by tap or plain reply. Approvals offer exactly *Allow once* and *Deny*; there is no session-wide grant on the hidden controller path. Your tap commits durably before BB is told, survives a restart, and is retried only for that exact resolution.
 - **One logical reply, at-least-once transport.** The answer is one durable outbox obligation. Telegram delivery itself is at-least-once: an ambiguous send is retained as unknown and a retry may duplicate the Telegram message. Enqueuing or attempting is never recorded as delivered.
+
+## Credential broker foundation (disabled by default)
+
+Hanoon carries the first slice of a separate credential broker: a protected service, run outside this plugin, that can hold a 1Password service-account token and answer only two fixed operations — a health check and a single vault-item resolve. **Credential broker mode defaults to `disabled`**, and the subsystem cannot be safely turned on until a real disposable 1Password account, a protected broker host, and the live acceptance run in [Disposable live acceptance](docs/live-acceptance.md) exist.
+
+While it applies, this foundation only ever proves that the broker can reach a configured vault item — never that the resulting credential works for its application:
+
+- `bb telegram-agent access list` and `bb telegram-agent access status [binding-id]` are the only operator commands, and they read local, secret-free metadata; there is deliberately no `access verify` or enrollment command in this CLI.
+- The owner can ask Hanoon in Telegram to run a live verification of one known binding; a pass moves that binding to `vault_verified`, never `active`, and Hanoon never claims an application login succeeded from it.
+- `bb telegram-agent doctor` reports one `credential broker` row, `disabled`, until isolated mode is configured, and one row per readiness check afterwards; see [Configuration](docs/configuration.md#credential-broker-foundation) and [Operations](docs/operations.md#credential-broker).
 
 ## Architecture
 

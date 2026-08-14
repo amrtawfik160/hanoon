@@ -258,3 +258,40 @@ Never exercise a live merge, deploy, credential change, spend, destructive actio
 ## Final acceptance decision
 
 Accept only when both evidence sheets are complete. The trust-kernel sheet above is scored separately, and because row 12's runtime attestations are unavailable on this runtime, **the overall live gate cannot be called passed** however well the rest scores. Beyond that, accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Until then, live provider skill-use evidence remains **pending**, not passed or complete. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the live acceptance as **not run**, not successful.
+
+## Credential broker evidence sheet
+
+The credential broker foundation (see [Configuration](configuration.md#credential-broker-foundation) and [Operations](operations.md#credential-broker)) has its own versioned acceptance contract, separate from the two sheets above: a fixed case catalog in `evals/credential-broker-cases.json`, a schema and aggregation rule in `src/eval/credential-broker-acceptance.ts`, and a secret-free recorder/validator at `scripts/record-credential-broker-acceptance.mjs`. **This repository defines that contract; it does not run it.** `credentialBrokerMode` remains `disabled`, no case in the catalog has been executed against a real broker, provider, or protected host, and this foundation cannot be exercised live until a disposable 1Password account and a protected broker host exist. Treat every case below as **not run** until that live pass completes and this section is updated with its result.
+
+The catalog fixes four case categories — `deterministic` and `contract` (covered by the focused `credential-*.test.ts` suite runnable with `npm run test:credentials`), `live`, and `red_state` — and every case in it is mandatory. The 14 mandatory live ids and 8 mandatory red-state ids are:
+
+```text
+live-broker-noninteractive-start           live-admin-interface-unreachable
+live-service-account-single-vault-scope    live-bb-admin-negative-probes
+live-exact-binding-valid                   live-topology-reattest
+live-out-of-scope-item-denied              live-disposable-teardown
+live-missing-field-invalid                 red-secret-log-canary
+live-revoked-service-token-closed          red-unknown-protocol-field
+live-broker-restart-receipt-replay         red-stale-binding-generation
+live-hanoon-restart-no-credential-transfer red-redirect-endpoint
+live-secret-canary-zero-findings           red-unsafe-topology
+live-doctor-all-gates                      red-expired-topology-receipt
+                                            red-audit-persistence-failure
+                                            red-idempotency-digest-change
+```
+
+Each red-state case names, in the catalog, the exact other case whose fail-closed guarantee it adversarially proves. The overall report status the recorder computes is `passed` only when every mandatory case is recorded `passed` and cleaned — closed out with `cleanupStatus: "complete"` whenever it touched a disposable resource — **and** every red-state case that another case depends on is itself `passed` and cleaned. A case that is missing, `failed`, still `incomplete`, or whose required red-state counterpart is unmet leaves the aggregate `incomplete` or `failed`, never `passed`; the recorder recomputes this from the recorded cases every time, so a hand-edited `"status": "passed"` in the report file is rejected rather than trusted. Evidence references in the report are opaque ids and paths only — never a secret, a `op://` vault reference, PEM material, or a token — and the schema refuses any value shaped like one.
+
+The report itself is not part of this repository: it is generated outside Git, under `$BB_THREAD_STORAGE` or another path the operator explicitly confirms is protected.
+
+```bash
+npm run acceptance:credential-broker -- init --output "$BB_THREAD_STORAGE/credential-broker-acceptance-v1.json"
+npm run acceptance:credential-broker -- record --input "$BB_THREAD_STORAGE/credential-broker-acceptance-v1.json" \
+  --case <case-id> --status <passed|failed|incomplete> --cleanup <not_applicable|pending|complete> \
+  --procedure-revision <n> --started-at <epoch-ms> --completed-at <epoch-ms> \
+  --actor <who> --reviewer <who> --actual-result <stable-label> \
+  --evidence <opaque-ref> --resource <disposable-resource-id>
+npm run acceptance:credential-broker -- validate --input "$BB_THREAD_STORAGE/credential-broker-acceptance-v1.json"
+```
+
+`init` writes one `incomplete` entry per catalog case and exits `0`; running `validate` against that untouched file exits nonzero with status `incomplete` by design, since nothing has been proven yet. `record` re-validates the whole report before writing and refuses a write that would make it invalid — for example a `passed` case with no cleanup, no evidence, or a secret-shaped value — so the file on disk can never silently drift into a false `passed`. Do not call this "100% real" testing until `validate` exits `0`: that specific claim means every mandatory case in the catalog is `passed` and cleaned, its evidence reference exists, and no red-state proof was skipped — not that every website, credential type, or future provider works.
