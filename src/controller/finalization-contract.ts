@@ -659,27 +659,49 @@ function clauseHasHighImpactSuccess(clause: string): boolean {
 }
 
 function productionTargetForMatch(clause: string, match: OperationalMatch): boolean {
-  const before = clause.slice(0, match.start);
-  const after = clause.slice(match.end);
-  const productionBefore = [...before.matchAll(/\bproduction\b/gi)].at(-1);
-  if (productionBefore) {
-    const productionIndex = productionBefore.index ?? 0;
-    const afterProduction = before.slice(productionIndex + productionBefore[0].length);
-    if (!/[,:;.!?]/u.test(afterProduction) &&
-        !hasExplicitlyNonPositiveProductionWording(afterProduction)) {
-      return true;
-    }
-  }
-  const productionAfter = after.search(/\bproduction\b/i);
-  if (productionAfter < 0) return false;
-  const beforeProduction = after.slice(0, productionAfter);
-  if (/[,:;.!?]/u.test(beforeProduction)) return false;
-  if (hasExplicitlyNonPositiveProductionWording(beforeProduction)) return false;
-  return !hasExplicitlyNonPositiveProductionWording(after.slice(productionAfter));
+  const productionMentions = [...clause.matchAll(/\bproduction\b/gi)].map((mention) => ({
+    start: mention.index ?? 0,
+    end: (mention.index ?? 0) + mention[0].length,
+  }));
+  return productionMentions.some((mention) => (
+    !productionMentionIsExplicitlyNonTarget(clause, match, mention)
+  ));
 }
 
-function hasExplicitlyNonPositiveProductionWording(text: string): boolean {
-  return /\b(?:without|not|never|no longer|except|rather than|failed|failing|blocked|down|offline|unavailable)\b/i.test(text);
+function productionMentionIsExplicitlyNonTarget(
+  clause: string,
+  match: OperationalMatch,
+  mention: Readonly<{ start: number; end: number }>,
+): boolean {
+  return isNoTouchProductionMention(clause, match, mention)
+    || isNegativeProductionPredicate(clause, mention)
+    || isExplicitlyNonProductionMention(clause, mention);
+}
+
+function isNoTouchProductionMention(
+  clause: string,
+  match: OperationalMatch,
+  mention: Readonly<{ start: number; end: number }>,
+): boolean {
+  if (mention.start <= match.end) return false;
+  const between = clause.slice(match.end, mention.start);
+  return /\b(?:without|not)\s+(?:(?:touching|using|accessing|changing|affecting|reaching)\s+|deploying\s+to\s+)(?:the\s+)?$/i.test(between);
+}
+
+function isNegativeProductionPredicate(
+  clause: string,
+  mention: Readonly<{ start: number; end: number }>,
+): boolean {
+  const after = clause.slice(mention.end);
+  return /^\s+(?:(?:is|are|was|were|has been|have been|had been|does|did|has|have|had|can|will|would|could|should|must)\s+)?(?:(?:not|never)(?!\s+only\b)|no\s+longer|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|doesn't|didn't|can't|cannot|won't|wouldn't|couldn't|shouldn't|failed|failing|blocked|down|offline|unavailable|unhealthy)\b/i.test(after);
+}
+
+function isExplicitlyNonProductionMention(
+  clause: string,
+  mention: Readonly<{ start: number; end: number }>,
+): boolean {
+  const before = clause.slice(0, mention.start);
+  return /\bnon[-\s]$|\b(?:outside|away from|rather than|not|never|no)(?:\s+to)?\s+(?:the\s+)?$/i.test(before);
 }
 
 type FinalizationSegmentSpan = Readonly<{

@@ -1219,6 +1219,7 @@ describe("bounded text heuristics", () => {
     ["running", "The service is running in production."],
     ["production modifier", "The production change shipped."],
     ["production release", "The production release was published."],
+    ["not-only production", "The package was published not only to production."],
     ["against preposition", "The change shipped against production."],
     ["published across production", "The release was published across production."],
     ["published throughout production", "The release was published throughout production."],
@@ -1238,11 +1239,17 @@ describe("bounded text heuristics", () => {
     ["production tests", "Production tests passed."],
     ["production smoke and regression tests", "Production smoke and regression tests passed."],
     ["tests using production", "Tests passed using production."],
+    ["production label tests", "Production: tests passed."],
   ] as const)("requires execution and production proof for %s wording", (_label, text) => {
     const claim = claimFinalization({ kind: "execution_result", outcome: "succeeded", text });
     expectRejection(
       claim,
       contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
       "proof_incompatible",
     );
     expect(validateControllerFinalization(
