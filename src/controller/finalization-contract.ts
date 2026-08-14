@@ -174,6 +174,17 @@ const MONEY_AMOUNT = "(?:[$€£]\\s*[0-9]+|(?:usd|eur|gbp)\\s+[0-9]+|(?:[a-z]+\
 const PASSIVE_AUXILIARY = "(?:is|are|was|were|has\\s+been|have\\s+been|had\\s+been)";
 const CREDENTIAL_OBJECT = "(?:credentials?|passwords?|secrets?|tokens?|api[_ -]?keys?)";
 const NON_AFFIRMATIVE_OPERATIONAL_PREFIX = /\b(?:not|never|no longer|cannot|can't|don't|doesn't|didn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't|will|would|could|should|plan to|intend to|propose|after approval|later|may|might|maybe|uncertain|unsure|possibly|probably|appears?|seems?|can you confirm whether)\b/i;
+const PRODUCTION_PREDICATE_AUXILIARY = "(?:is|are|was|were|has been|have been|had been)";
+const PRODUCTION_POSITIVE_STATE = "(?:live|running|healthy|ready|up|online|available|operational|reachable|accessible|deployed|released|configured|enabled|active)";
+const PRODUCTION_NEGATIVE_STATE = "(?:failed|failing|blocked|down|offline|unavailable|unhealthy)";
+const NEGATED_POSITIVE_PRODUCTION_PREDICATE = new RegExp(
+  `^\\s+(?:(?:(?:${PRODUCTION_PREDICATE_AUXILIARY})\\s+)?(?:not|never|no\\s+longer)\\s+(?:yet\\s+)?${PRODUCTION_POSITIVE_STATE}|(?:isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't)\\s+${PRODUCTION_POSITIVE_STATE})\\s*[.!?)]*\\s*$`,
+  "i",
+);
+const DIRECT_NEGATIVE_PRODUCTION_PREDICATE = new RegExp(
+  `^\\s+(?:(?:${PRODUCTION_PREDICATE_AUXILIARY})\\s+)?${PRODUCTION_NEGATIVE_STATE}\\s*[.!?)]*\\s*$`,
+  "i",
+);
 const PREDICATE_TOKEN = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
 const PREDICATE_CHAIN_WORDS = new Set([
   "am", "is", "are", "was", "were", "be", "been", "being",
@@ -192,6 +203,11 @@ const NON_AFFIRMATIVE_SCOPE_NEGATORS = new Set([
   "couldn't", "shouldn't",
 ]);
 const PREDICATE_DETERMINERS = new Set(["the", "a", "an"]);
+const TEST_SUBJECT_LINK_WORDS = new Set([
+  "against", "all", "also", "already", "am", "are", "at", "be", "been", "being", "could", "did", "does",
+  "for", "from", "had", "has", "have", "in", "is", "might", "must", "of", "on", "should", "successfully",
+  "production", "the", "to", "using", "was", "were", "with", "would",
+]);
 const MAX_PREDICATE_CONTEXT_CHARS = 256;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 type OperationalAssertion = Readonly<{
@@ -572,6 +588,30 @@ function matchHasNonAffirmativePolarity(clause: string, match: OperationalMatch)
   return false;
 }
 
+function predicateWordsAreAllowed(text: string, allowedWords: ReadonlySet<string>): boolean {
+  return [...text.matchAll(PREDICATE_TOKEN)].every((token) => allowedWords.has(token[0]!.toLowerCase()));
+}
+
+function hasTestSubjectEntitlement(clause: string, match: OperationalMatch): boolean {
+  const prefix = predicateContextBeforeMatch(clause, match);
+  const subject = /\b(?:test\s+(?:cases?|suites?)|tests?)\b/gi;
+  const subjects = [...prefix.matchAll(subject)];
+  const subjectMatch = subjects.at(-1);
+  if (!subjectMatch || subjectMatch.index === undefined) return false;
+  const afterSubject = prefix.slice(subjectMatch.index + subjectMatch[0].length);
+  return predicateWordsAreAllowed(afterSubject, TEST_SUBJECT_LINK_WORDS);
+}
+
+function applySubjectEntitlement(clause: string, match: OperationalMatch): OperationalMatch {
+  if (!match.assertion.kinds.includes("pipeline_outcome") || !hasTestSubjectEntitlement(clause, match)) {
+    return match;
+  }
+  return {
+    ...match,
+    assertion: { ...match.assertion, kinds: ["execution_result"] },
+  };
+}
+
 function operationalMatchesIn(clause: string): OperationalMatch[] {
   const matches: OperationalMatch[] = [];
   for (const assertion of OPERATIONAL_ASSERTIONS) {
@@ -587,7 +627,7 @@ function operationalMatchesIn(clause: string): OperationalMatch[] {
       match = scanner.exec(clause);
     }
   }
-  return matches.filter((match) => {
+  return matches.map((match) => applySubjectEntitlement(clause, match)).filter((match) => {
     return !matchHasNonAffirmativePolarity(clause, match);
   });
 }
@@ -687,7 +727,7 @@ function productionMentionIsExplicitlyNonTarget(
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
   return isNoTouchProductionMention(clause, match, mention)
-    || isNegativeProductionPredicate(clause, mention)
+    || isGenuineNegativeProductionPredicate(clause, mention)
     || isExplicitlyNonProductionMention(clause, mention);
 }
 
@@ -701,12 +741,13 @@ function isNoTouchProductionMention(
   return /\b(?:without|not)\s+(?:(?:touching|using|accessing|changing|affecting|reaching)\s+|deploying\s+to\s+)(?:the\s+)?$/i.test(between);
 }
 
-function isNegativeProductionPredicate(
+function isGenuineNegativeProductionPredicate(
   clause: string,
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
   const after = clause.slice(mention.end);
-  return /^\s+(?:(?:is|are|was|were|has been|have been|had been|does|did|has|have|had|can|will|would|could|should|must)\s+)?(?:(?:not|never|no\s+longer)(?!\s+(?:only|down|blocked|failed|failing|offline|unavailable|unhealthy)\b)|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|doesn't|didn't|can't|cannot|won't|wouldn't|couldn't|shouldn't|failed|failing|blocked|down|offline|unavailable|unhealthy)\b/i.test(after);
+  return NEGATED_POSITIVE_PRODUCTION_PREDICATE.test(after)
+    || DIRECT_NEGATIVE_PRODUCTION_PREDICATE.test(after);
 }
 
 function isExplicitlyNonProductionMention(
@@ -714,8 +755,8 @@ function isExplicitlyNonProductionMention(
   mention: Readonly<{ start: number; end: number }>,
 ): boolean {
   const before = clause.slice(0, mention.start);
-  if (/\bnowhere\s+outside\s+(?:the\s+)?$/i.test(before)) return false;
-  return /\bnon[-\s]$|\b(?:outside|away from|rather than|not|never|no)(?:\s+to)?\s+(?:the\s+)?$/i.test(before);
+  if (/\b(?:not|never|no(?:where)?)\s+(?:outside|away from|rather than)\s+(?:the\s+)?$/i.test(before)) return false;
+  return /\bnon[-\s]$|\b(?:outside|away from|rather than)\s+(?:the\s+)?$|\b(?:not|never|no)(?:\s+to)?\s+(?:the\s+)?$/i.test(before);
 }
 
 type FinalizationSegmentSpan = Readonly<{

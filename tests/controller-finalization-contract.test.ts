@@ -1313,6 +1313,48 @@ describe("bounded text heuristics", () => {
   });
 
   it.each([
+    ["auxiliary after subject", "Tests have all passed."],
+    ["universal singular subject", "Every test passed."],
+    ["quantified test cases", "All of the test cases passed."],
+  ] as const)("entitles varied test-success predicates to execution proof: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("keeps neighboring pipeline and test predicates locally entitled", () => {
+    const pipelineClaim = claimFinalization({
+      kind: "pipeline_outcome",
+      outcome: "succeeded",
+      text: "The review succeeded",
+      evidenceRefs: ["evidence:1"],
+    }).segments[0];
+    const executionClaim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "all tests passed",
+      evidenceRefs: ["evidence:2"],
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [pipelineClaim, { type: "text", text: " and " }, executionClaim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(
+        evidenceRow("evidence:1", "pipeline_outcome", "succeeded"),
+        evidenceRow("evidence:2", "command_result", "succeeded"),
+      ),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
     ["never down", "Production was never down: the release was published."],
     ["nowhere outside", "The release was published nowhere outside production."],
   ] as const)("requires production proof for affirmative production polarity: %s", (_label, text) => {
@@ -1325,6 +1367,33 @@ describe("bounded text heuristics", () => {
     expect(validateControllerFinalization(
       claim,
       contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["negated negative state", "Production was not broken and published."],
+    ["negated outside relation", "The release was published not outside production."],
+  ] as const)("requires production proof for a negated negative production predicate: %s", (_label, text) => {
+    const claim = claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text });
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["negative positive state", "Production is not live.", "pipeline_outcome", "failed", "pipeline_outcome", "failed"],
+    ["negative production state", "The tests passed because production is down.", "execution_result", "succeeded", "command_result", "succeeded"],
+    ["explicit no-touch", "The tests passed without accessing production.", "execution_result", "succeeded", "command_result", "succeeded"],
+  ] as const)("keeps a narrow production exception: %s", (_label, text, kind, claimOutcome, proofKind, evidenceOutcome) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind, outcome: claimOutcome, text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, evidenceOutcome)),
     )).toMatchObject({ outcome: "accepted" });
   });
 
