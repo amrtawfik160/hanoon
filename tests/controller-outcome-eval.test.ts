@@ -13,6 +13,7 @@ import {
   controllerScenarioResourceStats,
   loadControllerScenarioCorpus,
   runControllerScenarioTrials,
+  type ControllerScenarioRunOptions,
   validateControllerAssertionRegistry,
 } from "./support/controller-scenario-harness";
 import {
@@ -33,7 +34,7 @@ type RunnerModule = {
     },
     dependencies: {
       readGitIdentity(): { commit: string; dirty: boolean };
-      runTrials(): Promise<Awaited<ReturnType<typeof runControllerScenarioTrials>>>;
+      runTrials(options: ControllerScenarioRunOptions): Promise<Awaited<ReturnType<typeof runControllerScenarioTrials>>>;
     },
   ): Promise<{ exitCode: number; criticalSafetyFailed: boolean; report: { status: string } }>;
 };
@@ -526,19 +527,72 @@ it("requires an explicit cleanup contract on shared controller trust fixtures", 
 
 it("disposes the current resource when trial construction throws", async () => {
   const before = controllerScenarioResourceStats();
-  const priorCommit = process.env.HANOON_EVAL_COMMIT;
-  process.env.HANOON_EVAL_COMMIT = "f".repeat(40);
-  try {
-    await expect(runControllerScenarioTrials({ checkpoint: "baseline", trials: 1, seed: 8122026 }))
-      .rejects.toThrow(/configured Hanoon commit/i);
-  } finally {
-    if (priorCommit === undefined) delete process.env.HANOON_EVAL_COMMIT;
-    else process.env.HANOON_EVAL_COMMIT = priorCommit;
-  }
+  await expect(runControllerScenarioTrials({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    runIdentity: { commit: "not-a-commit", dirty: false },
+  })).rejects.toThrow(/invalid commit/i);
   const after = controllerScenarioResourceStats();
   expect(after.created - before.created).toBe(1);
   expect(after.disposed - before.disposed).toBe(1);
   expect(after.active).toBe(0);
+});
+
+it("disposes the fake host when production plugin initialization throws", async () => {
+  const before = controllerScenarioResourceStats();
+  await expect(runControllerScenarioTrials(
+    { checkpoint: "baseline", trials: 1, seed: 8122026 },
+    { initializePlugin: async () => { throw new Error("production initialization failed"); } },
+  )).rejects.toThrow(/production initialization failed/i);
+  const after = controllerScenarioResourceStats();
+  expect(after.created - before.created).toBe(1);
+  expect(after.disposed - before.disposed).toBe(1);
+  expect(after.active).toBe(0);
+});
+
+it("keeps overlapping programmatic evaluations bound to their explicit run identity", async () => {
+  const runner = await runnerModule();
+  const trials = await cleanScenarioTrials("baseline");
+  const outputOne = evaluationOutput();
+  const outputTwo = evaluationOutput();
+  const identityOne = { commit: "a".repeat(40), dirty: false };
+  const identityTwo = { commit: "b".repeat(40), dirty: false };
+  let started = 0;
+  let markStarted!: () => void;
+  const bothStarted = new Promise<void>((resolve) => {
+    markStarted = () => {
+      started += 1;
+      if (started === 2) resolve();
+    };
+  });
+  let releaseRuns!: () => void;
+  const runsReleased = new Promise<void>((resolve) => { releaseRuns = resolve; });
+  const runTrials = async (options: ControllerScenarioRunOptions) => {
+    markStarted();
+    await runsReleased;
+    const commit = options.runIdentity?.commit;
+    if (!commit) throw new Error("run identity was not passed to scenario evaluation");
+    return trials.map((trial) => ({ ...trial, harness: { ...trial.harness, hanoonCommit: commit } }));
+  };
+
+  const evaluate = (identity: { commit: string; dirty: boolean }, output: string) => runner.evaluateControllerOutcomes({
+    checkpoint: "baseline",
+    trials: 1,
+    seed: 8122026,
+    output,
+    replace: false,
+  }, {
+    readGitIdentity: () => identity,
+    runTrials,
+  });
+  const first = evaluate(identityOne, outputOne);
+  const second = evaluate(identityTwo, outputTwo);
+  await bothStarted;
+  releaseRuns();
+  await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+  expect(JSON.parse(readFileSync(outputOne, "utf8")).trials[0].harness.hanoonCommit).toBe(identityOne.commit);
+  expect(JSON.parse(readFileSync(outputTwo, "utf8")).trials[0].harness.hanoonCommit).toBe(identityTwo.commit);
 });
 
 it("discloses the registered controller tool surface deterministically", async () => {

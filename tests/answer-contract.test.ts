@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -12,6 +13,8 @@ import {
   ANSWER_RUBRIC_VERSION,
   type AnswerClauseId,
   buildAnswerJudgeSpawnArgs,
+  buildAnswerFinalInputBundle,
+  answerJudgeThreadTitle,
   buildClauseAssessment,
   buildClauseJudgePrompt,
   answerFinalInputSha256,
@@ -65,22 +68,27 @@ if (args[0] === "thread" && args[1] === "spawn") {
   const title = args[args.indexOf("--title") + 1];
   const match = title.match(/^answer-eval\\s+(\\S+)\\s+(\\S+)/);
   const clause = match?.[2] ?? title.split(" ").at(-1);
+  const threadId = "thr_fake_" + clause;
+  const threadState = {
+    id: threadId,
+    title,
+    projectId: args[args.indexOf("--project") + 1],
+    environmentId: args[args.indexOf("--environment") + 1],
+    parentThreadId: args.includes("--parent-thread") ? args[args.indexOf("--parent-thread") + 1] : null,
+    status: "active",
+  };
+  fs.writeFileSync(statePath, JSON.stringify(threadState));
   if (mode === "ambiguous-spawn" || mode === "spawn-error") {
-    fs.writeFileSync(statePath, JSON.stringify({
-      title,
-      projectId: args[args.indexOf("--project") + 1],
-      environmentId: args[args.indexOf("--environment") + 1],
-      parentThreadId: process.env.BB_THREAD_ID ?? null,
-    }));
     if (mode === "spawn-error") process.exit(124);
     process.stdout.write("created-but-not-json");
   } else {
-    process.stdout.write(JSON.stringify({ id: "thr_fake_" + clause }));
+    process.stdout.write(JSON.stringify({ id: threadId }));
   }
 } else if (args[0] === "thread" && args[1] === "wait") {
   process.stdout.write(JSON.stringify({ status: "idle" }));
 } else if (args[0] === "thread" && args[1] === "show") {
-  process.stdout.write(JSON.stringify({ thread: { status } }));
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  process.stdout.write(JSON.stringify({ thread: { ...state, id: args[2], status } }));
 } else if (args[0] === "thread" && args[1] === "list") {
   const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
   process.stdout.write(JSON.stringify([
@@ -88,12 +96,13 @@ if (args[0] === "thread" && args[1] === "spawn") {
     { ...state, id: "thr_fake_reconciled", status: "active" },
   ]));
 } else if (args[0] === "thread" && args[1] === "log") {
+  const threadId = args[2];
   process.stdout.write(JSON.stringify([
-    { type: "thread/started" },
-    { type: "item/started", data: { item: { type: "agentMessage" } } },
-    { type: "item/agentMessage/delta", data: {} },
-    { type: "item/completed", data: { item: { type: "agentMessage" } } },
-    { type: "turn/completed", data: { status: "completed" } },
+    { threadId, type: "thread/started" },
+    { threadId, type: "item/started", data: { item: { type: "agentMessage" } } },
+    { threadId, type: "item/agentMessage/delta", data: {} },
+    { threadId, type: "item/completed", data: { item: { type: "agentMessage" } } },
+    { threadId, type: "turn/completed", data: { status: "completed" } },
   ]));
 } else if (args[0] === "thread" && args[1] === "output") {
   const clause = clauseFromThread(args[2]);
@@ -174,6 +183,7 @@ function copyAnswerEvalFixture(directory: string, mutateAnswers: (fixture: Recor
   mkdirSync(join(pluginRoot, "evals"), { recursive: true });
   copyFileSync(join(repositoryRoot, "scripts/eval-controller-answers.mjs"), join(pluginRoot, "scripts/eval-controller-answers.mjs"));
   copyFileSync(join(repositoryRoot, "src/eval/answer-contract.ts"), join(pluginRoot, "src/eval/answer-contract.ts"));
+  copyFileSync(join(repositoryRoot, "src/eval/eval-integrity.ts"), join(pluginRoot, "src/eval/eval-integrity.ts"));
   copyFileSync(join(repositoryRoot, "src/eval/answer-anchors.ts"), join(pluginRoot, "src/eval/answer-anchors.ts"));
   copyFileSync(join(repositoryRoot, "src/eval/answer-anchors.js"), join(pluginRoot, "src/eval/answer-anchors.js"));
   const answers = JSON.parse(readFileSync(join(repositoryRoot, "evals/answers.json"), "utf8")) as Record<string, any>;
@@ -218,9 +228,17 @@ async function runWithMismatchedAnswerCorpus(
 }
 
 function buildReleasePassedArtifact(): Record<string, any> {
+  const runId = "11111111-1111-4111-8111-111111111111";
+  const eventLogForThread = (threadId: string): string => JSON.stringify([
+    { threadId, type: "thread/started" },
+    { threadId, type: "item/started", data: { item: { type: "agentMessage" } } },
+    { threadId, type: "item/completed", data: { item: { type: "agentMessage" } } },
+    { threadId, type: "turn/completed", data: { status: "completed" } },
+  ]);
   return {
     schemaVersion: "answer-live-gate-v2",
     rubricVersion: ANSWER_RUBRIC_VERSION,
+    runId,
     judgeProfile: ANSWER_JUDGE_PROFILE,
     hanoonCommit: "a".repeat(40),
     dirty: false,
@@ -229,33 +247,75 @@ function buildReleasePassedArtifact(): Record<string, any> {
     finalInputSha256: ANSWER_LIVE_GATE_RELEASE_CORPUS.finalInputSha256,
     selectedCaseCount: RELEASE_CASE_IDS.length,
     selectedClauseCount: RELEASE_CASE_IDS.length * ANSWER_CLAUSES.length,
-    cases: RELEASE_CASE_IDS.map((id) => ({
+    cases: RELEASE_CASE_IDS.map((id, caseIndex) => ({
       id,
       expected: RELEASE_EXPECTATIONS[id as keyof typeof RELEASE_EXPECTATIONS].aggregate,
       result: RELEASE_EXPECTATIONS[id as keyof typeof RELEASE_EXPECTATIONS].aggregate,
       matchesGolden: true,
-      clauses: ANSWER_CLAUSES.map((clause) => {
+      clauses: ANSWER_CLAUSES.map((clause, clauseIndex) => {
         const expected = RELEASE_EXPECTATIONS[id as keyof typeof RELEASE_EXPECTATIONS].clauses[clause.id];
+        const correlationToken = `22222222-2222-4222-8222-${String(caseIndex * ANSWER_CLAUSES.length + clauseIndex + 1).padStart(12, "0")}`;
+        const trialId = `${runId}:${id}:${clause.id}`;
+        const threadId = `thr_${id}_${clause.id}`;
+        const eventLog = eventLogForThread(threadId);
+        const eventLogSha256 = createHash("sha256").update(eventLog, "utf8").digest("hex");
+        const title = answerJudgeThreadTitle({
+          runId,
+          caseId: id,
+          clauseId: clause.id,
+          parentThreadId: "thr_release_origin",
+          correlationToken,
+        });
+        const correlation = {
+          runId,
+          trialId,
+          caseId: id,
+          clauseId: clause.id,
+          correlationToken,
+          threadId,
+          projectId: "proj_release",
+          parentThreadId: "thr_release_origin",
+          title,
+          membership: {
+            id: threadId,
+            projectId: "proj_release",
+            parentThreadId: "thr_release_origin",
+            title,
+          },
+          eventLog,
+          eventLogSha256,
+          eventCount: 4,
+        };
         return expected ? {
           id: clause.id,
+          trialId,
           expected,
           result: true,
           source: "model",
-          judgeThreadId: `thr_${id}_${clause.id}`,
+          judgeThreadId: threadId,
           isolation: {
-            eventCount: 1,
+            eventCount: 4,
             eventLog: "completed-audited",
             toolActivity: "none-observed",
             workspace: "empty-temporary",
             workspaceCleanup: "complete",
           },
+          correlation,
         } : {
           id: clause.id,
+          trialId,
           expected,
           result: false,
           source: "deterministic",
-          judgeThreadId: null,
-          isolation: null,
+          judgeThreadId: threadId,
+          isolation: {
+            eventCount: 4,
+            eventLog: "completed-audited",
+            toolActivity: "none-observed",
+            workspace: "empty-temporary",
+            workspaceCleanup: "complete",
+          },
+          correlation,
         };
       }),
     })),
@@ -342,6 +402,92 @@ it("rejects repository or final-input drift at the artifact write boundary", () 
   expect(() => assertAnswerEvaluationWriteIdentity(initial, { ...initial, finalInputSha256: "e".repeat(64) })).toThrow(/input/i);
 });
 
+it("binds every judged clause to one generated run and a unique captured trial", async () => {
+  const run = await runWithFakeBb("status-good", "all-hold");
+  try {
+    expect("error" in run).toBe(false);
+    if ("error" in run) return;
+    const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as {
+      runId?: string;
+      selectedClauseCount: number;
+      cases: Array<{ clauses: Array<{ trialId?: string; correlation?: unknown }> }>;
+    };
+    expect(artifact.runId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    const clauses = artifact.cases.flatMap((candidate) => candidate.clauses);
+    expect(clauses).toHaveLength(artifact.selectedClauseCount);
+    expect(clauses.every((clause) => typeof clause.trialId === "string" && clause.correlation !== undefined)).toBe(true);
+    expect(new Set(clauses.map((clause) => clause.trialId)).size).toBe(clauses.length);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+  }
+});
+
+it.each([
+  ["missing captured correlation", (artifact: Record<string, any>) => {
+    artifact.cases[0].clauses[0].correlation = null;
+  }],
+  ["foreign run identity", (artifact: Record<string, any>) => {
+    artifact.cases[0].clauses[0].correlation.runId = "33333333-3333-4333-8333-333333333333";
+  }],
+  ["duplicate captured thread", (artifact: Record<string, any>) => {
+    const first = artifact.cases[0].clauses[0].correlation;
+    artifact.cases[0].clauses[1].correlation.threadId = first.threadId;
+    artifact.cases[0].clauses[1].correlation.membership.id = first.threadId;
+    artifact.cases[0].clauses[1].judgeThreadId = first.threadId;
+  }],
+  ["foreign captured membership", (artifact: Record<string, any>) => {
+    artifact.cases[0].clauses[0].correlation.membership.projectId = "proj_foreign";
+  }],
+  ["foreign event-log thread", (artifact: Record<string, any>) => {
+    const correlation = artifact.cases[0].clauses[0].correlation;
+    correlation.eventLog = correlation.eventLog.replaceAll(correlation.threadId, "thr_foreign");
+    correlation.eventLogSha256 = createHash("sha256").update(correlation.eventLog, "utf8").digest("hex");
+  }],
+  ["tool-bearing event log", (artifact: Record<string, any>) => {
+    const correlation = artifact.cases[0].clauses[0].correlation;
+    correlation.eventLog = JSON.stringify([
+      { threadId: correlation.threadId, type: "thread/started" },
+      { threadId: correlation.threadId, type: "item/started", data: { item: { type: "toolCall" } } },
+      { threadId: correlation.threadId, type: "turn/completed", data: { status: "completed" } },
+    ]);
+    correlation.eventLogSha256 = createHash("sha256").update(correlation.eventLog, "utf8").digest("hex");
+    correlation.eventCount = 3;
+    artifact.cases[0].clauses[0].isolation.eventCount = 3;
+  }],
+] as const)("rejects a %s answer trial member", (_label, mutate) => {
+  const artifact = buildReleasePassedArtifact();
+  mutate(artifact);
+  expect(parseLiveGateArtifact(JSON.stringify(artifact))).toBeNull();
+});
+
+it("hashes rendered judge inputs and rule identity, not only fixture metadata", () => {
+  const input = buildAnswerFinalInputBundle({
+    goldenSha256: "a".repeat(64),
+    expectationsSha256: "b".repeat(64),
+    cases: [{ id: "status-good", ownerMessage: "owner message", answer: "answer" }],
+  });
+  const baseline = answerFinalInputSha256(input);
+  expect(answerFinalInputSha256({
+    ...input,
+    cases: input.cases.map((candidate) => ({
+      ...candidate,
+      clauses: candidate.clauses.map((clause, index) => index === 0
+        ? { ...clause, renderedPrompt: "rendered prompt two" }
+        : clause),
+    })),
+  })).not.toBe(baseline);
+  expect(answerFinalInputSha256({
+    ...input,
+    deterministicRules: input.deterministicRules.map((rule, index) => index === 0
+      ? { ...rule, rule: "changed rule" }
+      : rule) as any,
+  })).not.toBe(baseline);
+  expect(answerFinalInputSha256({
+    ...input,
+    judgeProfile: { ...ANSWER_JUDGE_PROFILE, model: "different-model" } as any,
+  })).not.toBe(baseline);
+});
+
 it.each([
   ["case ID", (artifact: Record<string, any>) => { artifact.cases[0].id = "substituted-case"; }],
   ["golden hash", (artifact: Record<string, any>) => { artifact.goldenSha256 = "a".repeat(64); }],
@@ -355,14 +501,13 @@ it.each([
 it("keeps failed diagnostic artifacts parseable without release corpus binding", () => {
   const artifact = buildReleasePassedArtifact();
   artifact.status = "failed";
-  artifact.cases[0].id = "diagnostic-case";
   artifact.goldenSha256 = "c".repeat(64);
   artifact.expectationsSha256 = "d".repeat(64);
-  artifact.finalInputSha256 = answerFinalInputSha256({
+  artifact.finalInputSha256 = answerFinalInputSha256(buildAnswerFinalInputBundle({
     goldenSha256: artifact.goldenSha256,
     expectationsSha256: artifact.expectationsSha256,
-    caseIds: artifact.cases.map((candidate: { id: string }) => candidate.id),
-  });
+    cases: [{ id: "status-good", ownerMessage: "owner", answer: "answer" }],
+  }));
   expect(parseLiveGateArtifact(JSON.stringify(artifact))).not.toBeNull();
 });
 
@@ -427,6 +572,7 @@ it("records deterministic and model clause provenance with the pinned identity",
       visibility: "hidden",
     },
     judgeIsolation: null,
+    judgeCorrelation: null,
   });
   expect(buildClauseAssessment({
     clauseId: "outcome-first",

@@ -39,8 +39,8 @@ const baseTrial: ControllerScenarioTrial = {
     contextSha256: "f".repeat(64),
     answerFixtureSha256: "0".repeat(64),
     outerTaskTools: [],
-    advertisedTools: [],
-    parameterSchemaSha256: {},
+    advertisedTools: ["telegram_agent_job_status"],
+    parameterSchemaSha256: { telegram_agent_job_status: "0".repeat(64) },
   },
   budget: { maxTurns: 2, maxToolCalls: 8, maxTokens: 20_000, maxWallMs: 30_000, maxCostUsd: null },
   outcome: { status: "passed" as const, graderId: "durable-outcome", graderVersion: 1, proofRefs: ["proof:plain-conversation:outcome:sha256:" + "2".repeat(64)] },
@@ -300,6 +300,57 @@ describe("controller scenario contract", () => {
       })),
       scenarios: report.scenarios,
     })],
+    ["instruction digest", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, instructionSha256: "1".repeat(64) },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["capability manifest digest", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, capabilityManifestSha256: "1".repeat(64) },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["policy digest", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, policySha256: "1".repeat(64) },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["parameter schema digest", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: {
+          ...currentTrial.harness,
+          parameterSchemaSha256: { telegram_agent_job_status: "1".repeat(64) },
+        },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["advertised capability variation", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, advertisedTools: ["different_tool"] },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["capability schema mismatch", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        harness: { ...currentTrial.harness, parameterSchemaSha256: { different_tool: "1".repeat(64) } },
+      })),
+      scenarios: report.scenarios,
+    })],
     ["budget", (report: ControllerScenarioContractReport) => ({
       ...report,
       trials: report.trials.map((currentTrial) => ({
@@ -313,6 +364,22 @@ describe("controller scenario contract", () => {
       trials: report.trials.map((currentTrial) => ({
         ...currentTrial,
         outcome: { ...currentTrial.outcome, graderVersion: currentTrial.outcome.graderVersion + 1 },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["outcome proof reference", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        outcome: { ...currentTrial.outcome, proofRefs: ["proof:plain-conversation:outcome:sha256:" + "4".repeat(64)] },
+      })),
+      scenarios: report.scenarios,
+    })],
+    ["trace proof reference", (report: ControllerScenarioContractReport) => ({
+      ...report,
+      trials: report.trials.map((currentTrial) => ({
+        ...currentTrial,
+        trace: { ...currentTrial.trace, proofRefs: ["proof:plain-conversation:trace:sha256:" + "4".repeat(64)] },
       })),
       scenarios: report.scenarios,
     })],
@@ -350,21 +417,60 @@ describe("controller scenario contract", () => {
     expect(() => compare({ baseline, after, scenarioDefinitions: scenarioDefinitionsFor(baseline, after) })).toThrow(/dirty/i);
   });
 
+  it.each([
+    ["different report seed", {
+      baselineRun: { checkpoint: "baseline" as const, trialsPerScenario: 1, seed: 8122026 },
+      afterRun: { checkpoint: "kernel" as const, trialsPerScenario: 1, seed: 8122027 },
+      afterTrial: { seed: 8122027 },
+    }],
+    ["different trial seed", {
+      baselineRun: { checkpoint: "baseline" as const, trialsPerScenario: 1, seed: 8122026 },
+      afterRun: { checkpoint: "kernel" as const, trialsPerScenario: 1, seed: 8122026 },
+      afterTrial: { seed: 8122027 },
+    }],
+    ["backward checkpoint", {
+      baselineRun: { checkpoint: "kernel" as const, trialsPerScenario: 1, seed: 8122026 },
+      afterRun: { checkpoint: "baseline" as const, trialsPerScenario: 1, seed: 8122026 },
+      afterTrial: { seed: 8122026 },
+    }],
+  ] as const)("rejects a fixed comparison with %s", (_label, input) => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (candidate: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      run: input.baselineRun,
+      trials: [baseTrial],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      run: input.afterRun,
+      trials: [{ ...baseTrial, seed: input.afterTrial.seed }],
+    });
+
+    expect(() => compare({
+      baseline,
+      after,
+      scenarioDefinitions: scenarioDefinitionsFor(baseline, after),
+    })).toThrow(/seed|trial|checkpoint|comparable/i);
+  });
+
   it("reports comparable denominators and new scenarios without averaging safety failures", () => {
     const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations;
     expect(typeof compare).toBe("function");
     const baseline = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "baseline", trialsPerScenario: 2, seed: 8122026 },
       trials: [trial(), trial({ trial: 2 })],
     });
     const after = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "kernel", trialsPerScenario: 2, seed: 8122026 },
       trials: [
         trial(),
         trial({ trial: 2, outcome: { ...baseTrial.outcome, status: "failed" } }),
         trialForScenario("new-safety-case"),
+        trialForScenario("new-safety-case", { trial: 2 }),
       ],
     });
     const comparison = (compare as (input: unknown) => {
@@ -377,7 +483,7 @@ describe("controller scenario contract", () => {
     expect(comparison).toMatchObject({
       status: "comparable",
       common: [{ scenarioId: "plain-conversation", baseline: { passed: 2, denominator: 2 }, after: { passed: 1, denominator: 2 } }],
-      newScenarios: [{ scenarioId: "new-safety-case", denominator: 1 }],
+      newScenarios: [{ scenarioId: "new-safety-case", denominator: 2 }],
     });
     expect(comparison.intervention.baseline).toBeDefined();
     expect(comparison.intervention.after).toBeDefined();
@@ -390,11 +496,13 @@ describe("controller scenario contract", () => {
     const baseline = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "baseline", trialsPerScenario: 2, seed: 8122026 },
       trials: [trial(), trial({ trial: 2 })],
     });
     const after = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "kernel", trialsPerScenario: 1, seed: 8122026 },
       trials: [trial()],
     });
 
@@ -404,6 +512,28 @@ describe("controller scenario contract", () => {
       scenarioDefinitions: scenarioDefinitionsFor(baseline, after),
     }))
       .toThrow(/trial|denominator|comparable/i);
+  });
+
+  it("rejects a report whose trial numbers do not match its run denominator", () => {
+    const compare = (controllerScenarioContract as Record<string, unknown>).compareControllerEvaluations as (candidate: unknown) => unknown;
+    const baseline = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "baseline", trialsPerScenario: 1, seed: 8122026 },
+      trials: [baseTrial],
+    });
+    const after = aggregateControllerEvaluation({
+      label: "fixed",
+      generatedAt: "2026-08-12T00:00:00.000Z",
+      run: { checkpoint: "kernel", trialsPerScenario: 1, seed: 8122026 },
+      trials: [trial({ trial: 2 })],
+    });
+
+    expect(() => compare({
+      baseline,
+      after,
+      scenarioDefinitions: scenarioDefinitionsFor(baseline, after),
+    })).toThrow(/trial identity|incomplete/i);
   });
 
   it("keeps summaries distinct when one scenario id has multiple versions", () => {
@@ -462,7 +592,7 @@ describe("controller scenario contract", () => {
     const after = aggregateControllerEvaluation({
       label: "fixed",
       generatedAt: "2026-08-12T00:00:00.000Z",
-      trials: [baseTrial, trialForScenario("new-safety-case", { trial: 2 })],
+      trials: [baseTrial, trialForScenario("new-safety-case")],
     });
 
     expect(() => compare({

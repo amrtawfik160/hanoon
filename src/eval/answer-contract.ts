@@ -17,6 +17,7 @@ export type AnswerClause = Readonly<{
 
 export const ANSWER_RUBRIC_VERSION = "answer-contract-hybrid-v1" as const;
 export const ANSWER_LIVE_GATE_SCHEMA_VERSION = "answer-live-gate-v2" as const;
+export const ANSWER_FINAL_INPUT_SCHEMA_VERSION = "answer-final-input-v1" as const;
 
 export const ANSWER_JUDGE_PROFILE = Object.freeze({
   provider: "codex",
@@ -54,6 +55,15 @@ export const ANSWER_CLAUSES: readonly AnswerClause[] = Object.freeze([
   }),
 ]);
 
+export const ANSWER_DETERMINISTIC_RULES = Object.freeze([
+  Object.freeze({ id: "outcome-first", version: 1, rule: "judge-only; no deterministic rejection" }),
+  Object.freeze({ id: "no-tool-narration", version: 1, rule: "reject explicit first-person tool or capability narration" }),
+  Object.freeze({ id: "no-invented-progress", version: 1, rule: "reject unqualified completion forecasts and percentages; allow qualified or reported forecasts" }),
+  Object.freeze({ id: "bounded-uncertainty", version: 1, rule: "judge-only; no deterministic rejection" }),
+  Object.freeze({ id: "no-dead-end-referral", version: 1, rule: "reject explicit owner delegation of a routine BB operation" }),
+  Object.freeze({ id: "not-process-only", version: 1, rule: "reject an answer that only promises future investigation" }),
+] as const);
+
 export const ANSWER_CLAUSE_IDS: readonly AnswerClauseId[] = Object.freeze(
   ANSWER_CLAUSES.map((clause) => clause.id),
 );
@@ -82,18 +92,75 @@ const ANSWER_RELEASE_EXPECTATIONS: Readonly<Record<string, Readonly<{
   "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
 });
 
-export function answerFinalInputSha256(input: {
+export type AnswerFinalInputBundle = Readonly<{
+  schemaVersion: typeof ANSWER_FINAL_INPUT_SCHEMA_VERSION;
   goldenSha256: string;
   expectationsSha256: string;
   caseIds: readonly string[];
-}): string {
+  rubricVersion: typeof ANSWER_RUBRIC_VERSION;
+  judgeProfile: typeof ANSWER_JUDGE_PROFILE;
+  clauses: readonly Readonly<{
+    id: AnswerClauseId;
+    question: string;
+    anchors: Readonly<{ definition: string; positive: string; negative: string }>;
+  }>[];
+  deterministicRules: typeof ANSWER_DETERMINISTIC_RULES;
+  cases: readonly Readonly<{
+    id: string;
+    clauses: readonly Readonly<{ id: AnswerClauseId; renderedPrompt: string }>[];
+  }>[];
+}>;
+
+function canonicalAnswerInput(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("answer final input contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalAnswerInput).join(",")}]`;
+  if (typeof value !== "object") throw new TypeError("answer final input contains a non-JSON value");
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalAnswerInput(entry)}`)
+    .join(",")}}`;
+}
+
+export function answerFinalInputSha256(input: AnswerFinalInputBundle): string {
   return createHash("sha256")
-    .update(JSON.stringify({
-      goldenSha256: input.goldenSha256,
-      expectationsSha256: input.expectationsSha256,
-      caseIds: input.caseIds,
-    }), "utf8")
+    .update(canonicalAnswerInput(input), "utf8")
     .digest("hex");
+}
+
+export function buildAnswerFinalInputBundle(input: Readonly<{
+  goldenSha256: string;
+  expectationsSha256: string;
+  cases: readonly Readonly<{ id: string; ownerMessage: string; answer: string }>[];
+}>): AnswerFinalInputBundle {
+  return {
+    schemaVersion: ANSWER_FINAL_INPUT_SCHEMA_VERSION,
+    goldenSha256: input.goldenSha256,
+    expectationsSha256: input.expectationsSha256,
+    caseIds: input.cases.map((testCase) => testCase.id),
+    rubricVersion: ANSWER_RUBRIC_VERSION,
+    judgeProfile: ANSWER_JUDGE_PROFILE,
+    clauses: ANSWER_CLAUSES.map((clause) => ({
+      id: clause.id,
+      question: clause.question,
+      anchors: ANSWER_CLAUSE_ANCHORS[clause.id],
+    })),
+    deterministicRules: ANSWER_DETERMINISTIC_RULES,
+    cases: input.cases.map((testCase) => ({
+      id: testCase.id,
+      clauses: ANSWER_CLAUSES.map((clause) => ({
+        id: clause.id,
+        renderedPrompt: buildClauseJudgePrompt({
+          clauseId: clause.id,
+          ownerMessage: testCase.ownerMessage,
+          answer: testCase.answer,
+        }),
+      })),
+    })),
+  };
 }
 
 export type AnswerEvaluationWriteIdentity = Readonly<{
@@ -128,7 +195,7 @@ export const ANSWER_LIVE_GATE_RELEASE_CORPUS = Object.freeze({
   caseIds: ANSWER_RELEASE_CASE_IDS,
   goldenSha256: ANSWER_RELEASE_GOLDEN_SHA256,
   expectationsSha256: ANSWER_RELEASE_EXPECTATIONS_SHA256,
-  finalInputSha256: "cd859f7937bf5214d1be38adc3d284d49352ab5a1f666ffe887e573a752ebfb2",
+  finalInputSha256: "6c12073920db9f216509dbc4ea6f058bea59d175cfb9aeb9af93d92f27ea9ad6",
 } as const);
 
 export function isExactAnswerReleaseCorpus(input: {
@@ -178,6 +245,27 @@ export type ClauseVerdict = Readonly<{
   why: string;
 }>;
 
+export type AnswerJudgeTrialCorrelation = Readonly<{
+  runId: string;
+  trialId: string;
+  caseId: string;
+  clauseId: AnswerClauseId;
+  correlationToken: string;
+  threadId: string;
+  projectId: string;
+  parentThreadId: string | null;
+  title: string;
+  membership: Readonly<{
+    id: string;
+    projectId: string;
+    parentThreadId: string | null;
+    title: string;
+  }>;
+  eventLog: string;
+  eventLogSha256: string;
+  eventCount: number;
+}>;
+
 export type ClauseAssessment = Readonly<{
   id: AnswerClauseId;
   holds: boolean;
@@ -187,6 +275,7 @@ export type ClauseAssessment = Readonly<{
   rubricVersion: typeof ANSWER_RUBRIC_VERSION;
   judgeProfile: typeof ANSWER_JUDGE_PROFILE;
   judgeIsolation: JudgeIsolationEvidence | null;
+  judgeCorrelation: AnswerJudgeTrialCorrelation | null;
 }>;
 
 export type JudgeIsolationEvidence = Readonly<{
@@ -210,11 +299,13 @@ export type AnswerExpectationArtifact = Readonly<{
 
 export type LiveGateClauseResult = Readonly<{
   id: AnswerClauseId;
+  trialId: string;
   expected: boolean;
   result: boolean | null;
   source: "deterministic" | "model" | "infrastructure";
   judgeThreadId: string | null;
   isolation: JudgeIsolationEvidence | null;
+  correlation: AnswerJudgeTrialCorrelation | null;
 }>;
 
 export type LiveGateCaseResult = Readonly<{
@@ -228,6 +319,7 @@ export type LiveGateCaseResult = Readonly<{
 export type LiveGateArtifact = Readonly<{
   schemaVersion: typeof ANSWER_LIVE_GATE_SCHEMA_VERSION;
   rubricVersion: typeof ANSWER_RUBRIC_VERSION;
+  runId: string;
   hanoonCommit: string;
   dirty: boolean;
   finalInputSha256: string;
@@ -255,6 +347,25 @@ export type LiveGateArtifact = Readonly<{
   status: "passed" | "failed";
 }>;
 
+export function answerJudgeTrialId(
+  runId: string,
+  caseId: string,
+  clauseId: AnswerClauseId,
+): string {
+  return `${runId}:${caseId}:${clauseId}`;
+}
+
+export function answerJudgeThreadTitle(input: Readonly<{
+  runId: string;
+  caseId: string;
+  clauseId: AnswerClauseId;
+  parentThreadId: string | null;
+  correlationToken: string;
+}>): string {
+  const trialId = answerJudgeTrialId(input.runId, input.caseId, input.clauseId);
+  return `answer-eval ${input.caseId} ${input.clauseId} run=${input.runId} trial=${trialId} origin=${input.parentThreadId ?? "standalone"} correlation=${input.correlationToken}`;
+}
+
 export function buildClauseAssessment(input: {
   clauseId: AnswerClauseId;
   holds: boolean;
@@ -262,6 +373,7 @@ export function buildClauseAssessment(input: {
   reason: string;
   judgeThreadId: string | null;
   judgeIsolation?: JudgeIsolationEvidence | null;
+  judgeCorrelation?: AnswerJudgeTrialCorrelation | null;
 }): ClauseAssessment {
   return {
     id: input.clauseId,
@@ -272,6 +384,7 @@ export function buildClauseAssessment(input: {
     rubricVersion: ANSWER_RUBRIC_VERSION,
     judgeProfile: ANSWER_JUDGE_PROFILE,
     judgeIsolation: input.judgeIsolation ?? null,
+    judgeCorrelation: input.judgeCorrelation ?? null,
   };
 }
 
@@ -499,7 +612,7 @@ const ALLOWED_NO_TOOL_EVENT_TYPES = new Set([
   "turn/completed",
 ]);
 
-export function auditJudgeEventLog(output: string): JudgeIsolationEvidence | null {
+export function auditJudgeEventLog(output: string, expectedThreadId?: string): JudgeIsolationEvidence | null {
   let events: unknown;
   try {
     events = JSON.parse(output);
@@ -513,6 +626,8 @@ export function auditJudgeEventLog(output: string): JudgeIsolationEvidence | nul
     if (typeof event !== "object" || event === null || Array.isArray(event)) return null;
     const record = event as Record<string, unknown>;
     if (typeof record.type !== "string" || !ALLOWED_NO_TOOL_EVENT_TYPES.has(record.type)) return null;
+    if (expectedThreadId !== undefined
+      && (typeof record.threadId !== "string" || record.threadId !== expectedThreadId)) return null;
     if (record.type === "thread/started") started = true;
     if (record.type === "turn/completed") {
       const eventData = record.data;
@@ -592,7 +707,7 @@ export function parseLiveGateArtifact(
   if (!hasExactKeys(parsed, [
     "aggregate", "audit", "cases", "expectationsSha256", "goldenSha256",
     "finalInputSha256", "hanoonCommit", "dirty", "infrastructureErrors", "judgeProfile", "rubricVersion", "schemaVersion",
-    "selectedCaseCount", "selectedClauseCount", "status",
+    "runId", "selectedCaseCount", "selectedClauseCount", "status",
   ])) return null;
   if (parsed.schemaVersion !== ANSWER_LIVE_GATE_SCHEMA_VERSION || parsed.rubricVersion !== ANSWER_RUBRIC_VERSION) return null;
   if (!isPinnedJudgeProfile(parsed.judgeProfile)
@@ -600,19 +715,22 @@ export function parseLiveGateArtifact(
     || !isSha256(parsed.expectationsSha256)
     || !isSha256(parsed.finalInputSha256)
     || !isCommitSha(parsed.hanoonCommit)
+    || !isRunId(parsed.runId)
     || typeof parsed.dirty !== "boolean") return null;
   if (!isNonNegativeInteger(parsed.selectedCaseCount) || !isNonNegativeInteger(parsed.selectedClauseCount) || parsed.selectedClauseCount !== parsed.selectedCaseCount * ANSWER_CLAUSES.length) return null;
   if (parsed.selectedCaseCount === 0) return null;
   if (!Array.isArray(parsed.cases) || parsed.cases.length !== parsed.selectedCaseCount) return null;
-  const cases = parsed.cases.map((candidate) => parseLiveGateCase(candidate));
+  const cases = parsed.cases.map((candidate) => parseLiveGateCase(candidate, parsed.runId as string));
   if (cases.some((candidate) => candidate === null)) return null;
   const parsedCases = cases as LiveGateCaseResult[];
   if (new Set(parsedCases.map((candidate) => candidate.id)).size !== parsedCases.length) return null;
-  if (parsed.finalInputSha256 !== answerFinalInputSha256({
-    goldenSha256: parsed.goldenSha256 as string,
-    expectationsSha256: parsed.expectationsSha256 as string,
-    caseIds: parsedCases.map((candidate) => candidate.id),
-  })) return null;
+  const trialIds = parsedCases.flatMap((candidate) => candidate.clauses.map((clause) => clause.trialId));
+  if (new Set(trialIds).size !== trialIds.length) return null;
+  const correlations = parsedCases.flatMap((candidate) => candidate.clauses)
+    .map((clause) => clause.correlation)
+    .filter((correlation): correlation is AnswerJudgeTrialCorrelation => correlation !== null);
+  if (new Set(correlations.map((correlation) => correlation.threadId)).size !== correlations.length) return null;
+  if (new Set(correlations.map((correlation) => correlation.correlationToken)).size !== correlations.length) return null;
   if (!Array.isArray(parsed.infrastructureErrors) || parsed.infrastructureErrors.some((candidate) => !isInfrastructureError(candidate))) return null;
   const audit = parseLiveGateAudit(parsed.audit);
   const aggregate = parseLiveGateAggregate(parsed.aggregate, parsed.selectedCaseCount, parsed.selectedClauseCount);
@@ -628,6 +746,7 @@ export function parseLiveGateArtifact(
     })
     || parsed.dirty !== false
     || parsed.infrastructureErrors.length > 0
+    || correlations.length !== parsed.selectedClauseCount
     || aggregate.cases.agreed !== aggregate.cases.total
     || aggregate.clauses.agreed !== aggregate.clauses.total
     || parsedCases.some((candidate) => !candidate.matchesGolden)
@@ -642,9 +761,9 @@ export function parseLiveGateArtifact(
   return { ...parsed, cases: parsedCases, infrastructureErrors: parsed.infrastructureErrors, audit, aggregate } as unknown as LiveGateArtifact;
 }
 
-function parseLiveGateCase(input: unknown): LiveGateCaseResult | null {
+function parseLiveGateCase(input: unknown, runId: string): LiveGateCaseResult | null {
   if (!isRecord(input) || !hasExactKeys(input, ["clauses", "expected", "id", "matchesGolden", "result"]) || typeof input.id !== "string" || !/^[a-z0-9-]{1,80}$/.test(input.id) || !["pass", "fail"].includes(input.expected as string) || !["pass", "fail", "infrastructure-error"].includes(input.result as string) || typeof input.matchesGolden !== "boolean" || !Array.isArray(input.clauses) || input.clauses.length !== ANSWER_CLAUSES.length) return null;
-  const clauses = input.clauses.map((candidate) => parseLiveGateClause(candidate));
+  const clauses = input.clauses.map((candidate) => parseLiveGateClause(candidate, runId, input.id as string));
   if (clauses.some((candidate) => candidate === null)) return null;
   const parsedClauses = clauses as LiveGateClauseResult[];
   if (new Set(parsedClauses.map((candidate) => candidate.id)).size !== parsedClauses.length || new Set(ANSWER_CLAUSE_IDS).size !== parsedClauses.length || parsedClauses.some((candidate) => !ANSWER_CLAUSE_IDS.includes(candidate.id))) return null;
@@ -659,14 +778,64 @@ function parseLiveGateCase(input: unknown): LiveGateCaseResult | null {
   return { ...input, clauses: parsedClauses } as unknown as LiveGateCaseResult;
 }
 
-function parseLiveGateClause(input: unknown): LiveGateClauseResult | null {
-  if (!isRecord(input) || !hasExactKeys(input, ["expected", "id", "isolation", "judgeThreadId", "result", "source"]) || !ANSWER_CLAUSE_IDS.includes(input.id as AnswerClauseId) || typeof input.expected !== "boolean" || (input.result !== null && typeof input.result !== "boolean") || !["deterministic", "model", "infrastructure"].includes(input.source as string) || (input.judgeThreadId !== null && typeof input.judgeThreadId !== "string") || (input.isolation !== null && !isJudgeIsolationEvidence(input.isolation))) return null;
-  if (input.source === "infrastructure" && (input.result !== null || input.judgeThreadId !== null || input.isolation !== null)) return null;
-  if (input.source === "deterministic" && (input.judgeThreadId !== null || input.isolation !== null)) return null;
+function parseLiveGateClause(input: unknown, runId: string, caseId: string): LiveGateClauseResult | null {
+  if (!isRecord(input) || !hasExactKeys(input, ["correlation", "expected", "id", "isolation", "judgeThreadId", "result", "source", "trialId"]) || !ANSWER_CLAUSE_IDS.includes(input.id as AnswerClauseId) || typeof input.trialId !== "string" || input.trialId !== answerJudgeTrialId(runId, caseId, input.id as AnswerClauseId) || typeof input.expected !== "boolean" || (input.result !== null && typeof input.result !== "boolean") || !["deterministic", "model", "infrastructure"].includes(input.source as string) || (input.judgeThreadId !== null && typeof input.judgeThreadId !== "string") || (input.isolation !== null && !isJudgeIsolationEvidence(input.isolation))) return null;
+  if (input.source === "infrastructure" && (input.result !== null || input.judgeThreadId !== null || input.isolation !== null || input.correlation !== null)) return null;
   if (input.source === "deterministic" && input.result !== false) return null;
-  if (input.source === "model" && (typeof input.judgeThreadId !== "string" || !input.judgeThreadId || !isJudgeIsolationEvidence(input.isolation))) return null;
+  if (["deterministic", "model"].includes(input.source as string)
+    && (!isJudgeTrialCorrelation(input.correlation, runId, caseId, input.id as AnswerClauseId)
+      || input.judgeThreadId !== (input.correlation as AnswerJudgeTrialCorrelation).threadId
+      || !isJudgeIsolationEvidence(input.isolation))) return null;
   if (["deterministic", "model"].includes(input.source as string) && typeof input.result !== "boolean") return null;
+  if (["deterministic", "model"].includes(input.source as string)
+    && (input.isolation as JudgeIsolationEvidence).eventCount !== (input.correlation as AnswerJudgeTrialCorrelation).eventCount) return null;
   return input as LiveGateClauseResult;
+}
+
+function isJudgeTrialCorrelation(
+  input: unknown,
+  runId: string,
+  caseId: string,
+  clauseId: AnswerClauseId,
+): input is AnswerJudgeTrialCorrelation {
+  return isRecord(input)
+    && hasExactKeys(input, ["caseId", "clauseId", "correlationToken", "eventCount", "eventLog", "eventLogSha256", "membership", "parentThreadId", "projectId", "runId", "threadId", "title", "trialId"])
+    && input.runId === runId
+    && input.trialId === answerJudgeTrialId(runId, caseId, clauseId)
+    && input.caseId === caseId
+    && input.clauseId === clauseId
+    && isRunId(input.correlationToken)
+    && typeof input.threadId === "string" && /^[^\s]{1,128}$/.test(input.threadId)
+    && typeof input.projectId === "string" && /^[^\s]{1,128}$/.test(input.projectId)
+    && (input.parentThreadId === null || (typeof input.parentThreadId === "string" && /^[^\s]{1,128}$/.test(input.parentThreadId)))
+    && typeof input.title === "string" && input.title.length > 0 && input.title.length <= 512
+    && input.title === answerJudgeThreadTitle({
+      runId,
+      caseId,
+      clauseId,
+      parentThreadId: input.parentThreadId as string | null,
+      correlationToken: input.correlationToken as string,
+    })
+    && isJudgeThreadMembership(input.membership)
+    && input.membership.id === input.threadId
+    && input.membership.projectId === input.projectId
+    && input.membership.parentThreadId === input.parentThreadId
+    && input.membership.title === input.title
+    && typeof input.eventLog === "string" && input.eventLog.length > 0 && input.eventLog.length <= 262_144
+    && isSha256(input.eventLogSha256)
+    && createHash("sha256").update(input.eventLog, "utf8").digest("hex") === input.eventLogSha256
+    && isNonNegativeInteger(input.eventCount)
+    && input.eventCount > 0
+    && auditJudgeEventLog(input.eventLog, input.threadId)?.eventCount === input.eventCount;
+}
+
+function isJudgeThreadMembership(input: unknown): input is AnswerJudgeTrialCorrelation["membership"] {
+  return isRecord(input)
+    && hasExactKeys(input, ["id", "parentThreadId", "projectId", "title"])
+    && typeof input.id === "string" && /^[^\s]{1,128}$/.test(input.id)
+    && typeof input.projectId === "string" && /^[^\s]{1,128}$/.test(input.projectId)
+    && (input.parentThreadId === null || (typeof input.parentThreadId === "string" && /^[^\s]{1,128}$/.test(input.parentThreadId)))
+    && typeof input.title === "string" && input.title.length > 0 && input.title.length <= 512;
 }
 
 function isJudgeIsolationEvidence(input: unknown): input is JudgeIsolationEvidence {
@@ -711,6 +880,10 @@ function isPinnedJudgeProfile(input: unknown): input is typeof ANSWER_JUDGE_PROF
 
 function isSha256(input: unknown): input is string {
   return typeof input === "string" && /^[a-f0-9]{64}$/.test(input);
+}
+
+function isRunId(input: unknown): input is string {
+  return typeof input === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input);
 }
 
 function isCommitSha(input: unknown): input is string {

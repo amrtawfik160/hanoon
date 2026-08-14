@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
@@ -44,6 +43,11 @@ import {
   renderControllerInteraction,
   type RenderedQuestion,
 } from "../../src/controller/questions";
+import {
+  readJsonFixtureSnapshot,
+  verifyFixtureSnapshotUnchanged,
+  type JsonFixtureSnapshot,
+} from "../../src/eval/eval-integrity";
 import { hashSecret } from "../../src/crypto";
 import { openStore } from "../../src/storage/store";
 import { TelegramIngress } from "../../src/telegram/ingress";
@@ -92,14 +96,23 @@ export function controllerScenarioResourceStats(): Readonly<{
   };
 }
 
-async function createScenarioPluginHost(pluginId: string) {
+async function createScenarioPluginHost(
+  pluginId: string,
+  initializePlugin: ControllerScenarioRunDependencies["initializePlugin"] = plugin,
+) {
   const host = createFakePluginHost({
     pluginId,
     settings: SCENARIO_PLUGIN_SETTINGS,
   });
-  await plugin(host.bb);
-  scenarioProductionPluginInitializations += 1;
-  return host;
+  beginScenarioResources();
+  try {
+    await initializePlugin(host.bb);
+    scenarioProductionPluginInitializations += 1;
+    return host;
+  } catch (error) {
+    await disposeScenarioResources(host.harness);
+    throw error;
+  }
 }
 
 function beginScenarioResources(): void {
@@ -141,17 +154,32 @@ function fixedProjectPolicy(): ProjectPolicy {
 
 type ScenarioCase = ReturnType<typeof parseControllerScenarioCorpus>["cases"][number];
 
+const CONTROLLER_SCENARIO_ANSWER_FIXTURE_PATH = fileURLToPath(new URL("../../evals/controller-scenario-answers.json", import.meta.url));
+const CONTROLLER_SCENARIO_CORPUS_PATH = fileURLToPath(new URL("../../evals/controller-scenarios.json", import.meta.url));
+
+const CONTROLLER_SCENARIO_ANSWER_FIXTURE_SNAPSHOT: JsonFixtureSnapshot<ControllerScenarioAnswerFixture> = readJsonFixtureSnapshot(
+  CONTROLLER_SCENARIO_ANSWER_FIXTURE_PATH,
+  parseControllerScenarioAnswerFixture,
+);
+const CONTROLLER_SCENARIO_CORPUS_SNAPSHOT: JsonFixtureSnapshot<ReturnType<typeof parseControllerScenarioCorpus>> = readJsonFixtureSnapshot(
+  CONTROLLER_SCENARIO_CORPUS_PATH,
+  parseControllerScenarioCorpus,
+);
+
 export function loadControllerScenarioAnswerFixture(): ControllerScenarioAnswerFixture {
-  const path = fileURLToPath(new URL("../../evals/controller-scenario-answers.json", import.meta.url));
-  return parseControllerScenarioAnswerFixture(JSON.parse(readFileSync(path, "utf8")));
+  return CONTROLLER_SCENARIO_ANSWER_FIXTURE_SNAPSHOT.value;
 }
 
 function controllerScenarioAnswerFixtureSha256(): string {
-  const path = fileURLToPath(new URL("../../evals/controller-scenario-answers.json", import.meta.url));
-  return sha256(readFileSync(path, "utf8"));
+  return CONTROLLER_SCENARIO_ANSWER_FIXTURE_SNAPSHOT.sha256;
 }
 
-const CONTROLLER_SCENARIO_ANSWER_FIXTURE = loadControllerScenarioAnswerFixture();
+const CONTROLLER_SCENARIO_ANSWER_FIXTURE = CONTROLLER_SCENARIO_ANSWER_FIXTURE_SNAPSHOT.value;
+
+export function verifyControllerScenarioFixtureSnapshots(): void {
+  verifyFixtureSnapshotUnchanged(CONTROLLER_SCENARIO_ANSWER_FIXTURE_SNAPSHOT, CONTROLLER_SCENARIO_ANSWER_FIXTURE_PATH);
+  verifyFixtureSnapshotUnchanged(CONTROLLER_SCENARIO_CORPUS_SNAPSHOT, CONTROLLER_SCENARIO_CORPUS_PATH);
+}
 
 type ScenarioGrade = Readonly<{
   assertionFacts?: ScenarioAssertionFacts;
@@ -166,6 +194,7 @@ type ScenarioTrialInput = Readonly<{
   trustInputs: ScenarioTrustInputs;
   grade: ScenarioGrade;
   executionCounters: ScenarioExecutionCounters;
+  runIdentity: ControllerScenarioRunIdentity | undefined;
   effectivePolicy?: unknown | null;
 }>;
 
@@ -298,6 +327,7 @@ function scenarioTrial(input: ScenarioTrialInput): ControllerScenarioTrial {
     grade,
     executionCounters,
     effectivePolicy = null,
+    runIdentity,
   } = input;
   if (!grade.assertionFacts) throw new Error(`scenario ${scenarioCase.id} has no durable assertion facts`);
   const assertions = evaluateDeclaredAssertions(scenarioCase, grade.assertionFacts);
@@ -315,7 +345,7 @@ function scenarioTrial(input: ScenarioTrialInput): ControllerScenarioTrial {
     scenarioId: scenarioCase.id,
     trial,
     seed,
-    harness: harnessIdentity(toolSurface, trustInputs, effectivePolicy),
+    harness: harnessIdentity(toolSurface, trustInputs, effectivePolicy, runIdentity),
     budget: scenarioCase.budget,
     outcome: {
       status: outcomePassed ? "passed" : "failed",
@@ -375,6 +405,16 @@ export type ControllerScenarioRunOptions = Readonly<{
   checkpoint: "baseline" | "kernel" | "cutover";
   trials: number;
   seed: number;
+  runIdentity?: ControllerScenarioRunIdentity;
+}>;
+
+export type ControllerScenarioRunIdentity = Readonly<{
+  commit: string;
+  dirty: boolean;
+}>;
+
+export type ControllerScenarioRunDependencies = Readonly<{
+  initializePlugin?: (bb: ReturnType<typeof createFakePluginHost>["bb"]) => Promise<void>;
 }>;
 
 function sha256(value: string): string {
@@ -436,8 +476,7 @@ function registeredToolSurface(agentTools: ReadonlyArray<{
 }
 
 export function loadControllerScenarioCorpus(): ReturnType<typeof parseControllerScenarioCorpus> {
-  const path = fileURLToPath(new URL("../../evals/controller-scenarios.json", import.meta.url));
-  return parseControllerScenarioCorpus(JSON.parse(readFileSync(path, "utf8")));
+  return CONTROLLER_SCENARIO_CORPUS_SNAPSHOT.value;
 }
 
 type ScriptedAdapterOptions = Readonly<{
@@ -876,18 +915,14 @@ function harnessIdentity(
   toolSurface: ReturnType<typeof registeredToolSurface>,
   trustInputs: ScenarioTrustInputs,
   effectivePolicy: unknown | null,
+  runIdentity: ControllerScenarioRunIdentity | undefined,
 ): ControllerScenarioTrial["harness"] {
   const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
-  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
-  const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: repositoryRoot, encoding: "utf8" }).trim() !== "";
-  const configuredCommit = process.env.HANOON_EVAL_COMMIT;
-  const configuredDirty = process.env.HANOON_EVAL_DIRTY;
-  if (configuredCommit !== undefined && configuredCommit !== commit) {
-    throw new Error("configured Hanoon commit does not match the evaluated source tree");
-  }
-  if (configuredDirty !== undefined && configuredDirty !== String(dirty)) {
-    throw new Error("configured dirty state does not match the evaluated source tree");
-  }
+  const commit = runIdentity?.commit
+    ?? execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+  const dirty = runIdentity?.dirty
+    ?? execFileSync("git", ["status", "--porcelain"], { cwd: repositoryRoot, encoding: "utf8" }).trim() !== "";
+  if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("scenario run identity has an invalid commit");
   return {
     hanoonCommit: commit,
     dirty,
@@ -912,18 +947,29 @@ export function controllerScenarioPolicySha256(effectivePolicy: unknown | null):
   return sha256(effectivePolicy === null ? "baseline-no-project-policy" : canonicalJson(effectivePolicy));
 }
 
-async function runScenario(
-  scenarioCase: ScenarioCase,
-  trial: number,
-  seed: number,
-): Promise<ControllerScenarioTrial> {
+async function runScenario(input: Readonly<{
+  scenarioCase: ScenarioCase;
+  trial: number;
+  seed: number;
+  runIdentity: ControllerScenarioRunIdentity | undefined;
+  dependencies: ControllerScenarioRunDependencies;
+}>): Promise<ControllerScenarioTrial> {
+  const {
+    scenarioCase,
+    trial,
+    seed,
+    runIdentity,
+    dependencies,
+  } = input;
   const startedAt = performance.now();
   if (scenarioCase.checkpoint !== "baseline") {
-    return runExtendedScenario(scenarioCase, trial, seed, startedAt);
+    return runExtendedScenario({ scenarioCase, trial, seed, startedAt, runIdentity, dependencies });
   }
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
-  const { bb, harness } = await createScenarioPluginHost(`telegram-controller-eval-${fixtureId}`);
-  beginScenarioResources();
+  const { bb, harness } = await createScenarioPluginHost(
+    `telegram-controller-eval-${fixtureId}`,
+    dependencies.initializePlugin,
+  );
   try {
     const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
   store.createPairingCode(hashSecret(`pair:${fixtureId}`), 1, 10_000);
@@ -1056,22 +1102,35 @@ async function runScenario(
         observedJobStatus: observed.jobStatus,
       }),
       executionCounters,
+      runIdentity,
     });
   } finally {
     await disposeScenarioResources(harness);
   }
 }
 
-async function runExtendedScenario(
-  scenarioCase: ScenarioCase,
-  trial: number,
-  seed: number,
-  startedAt: number,
-): Promise<ControllerScenarioTrial> {
+async function runExtendedScenario(input: Readonly<{
+  scenarioCase: ScenarioCase;
+  trial: number;
+  seed: number;
+  startedAt: number;
+  runIdentity: ControllerScenarioRunIdentity | undefined;
+  dependencies: ControllerScenarioRunDependencies;
+}>): Promise<ControllerScenarioTrial> {
+  const {
+    scenarioCase,
+    trial,
+    seed,
+    startedAt,
+    runIdentity,
+    dependencies,
+  } = input;
   const fixtureId = `${scenarioCase.id}-${seed}-${trial}`;
-  const { bb, harness } = await createScenarioPluginHost(`telegram-controller-eval-${fixtureId}`);
+  const { bb, harness } = await createScenarioPluginHost(
+    `telegram-controller-eval-${fixtureId}`,
+    dependencies.initializePlugin,
+  );
   let activeHarness = harness;
-  beginScenarioResources();
   try {
     const store = openStore(bb.storage, bb.storage.kv, () => FIXTURE_NOW);
   let activeBb = bb;
@@ -1456,6 +1515,7 @@ async function runExtendedScenario(
         staleApprovalOutboxCountAfter,
       }),
       executionCounters,
+      runIdentity,
       effectivePolicy,
     });
   }
@@ -1610,6 +1670,7 @@ async function runExtendedScenario(
         providerContinuationTexts,
       }),
       executionCounters,
+      runIdentity,
       effectivePolicy,
     });
   }
@@ -1655,6 +1716,7 @@ async function runExtendedScenario(
     trustInputs,
     grade: factfulGrade,
     executionCounters,
+    runIdentity,
     effectivePolicy,
   });
   } finally {
@@ -1664,6 +1726,7 @@ async function runExtendedScenario(
 
 export async function runControllerScenarioTrials(
   options: ControllerScenarioRunOptions,
+  dependencies: ControllerScenarioRunDependencies = {},
 ): Promise<ControllerScenarioTrial[]> {
   if (!Number.isInteger(options.trials) || options.trials < 1 || options.trials > 512) {
     throw new TypeError("trials must be an integer between 1 and 512");
@@ -1684,7 +1747,13 @@ export async function runControllerScenarioTrials(
   const trials: ControllerScenarioTrial[] = [];
   for (const scenarioCase of compatible) {
     for (let trial = 1; trial <= options.trials; trial += 1) {
-      trials.push(await runScenario(scenarioCase, trial, options.seed));
+      trials.push(await runScenario({
+        scenarioCase,
+        trial,
+        seed: options.seed,
+        runIdentity: options.runIdentity,
+        dependencies,
+      }));
     }
   }
   return trials;

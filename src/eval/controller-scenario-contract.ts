@@ -208,7 +208,7 @@ export type ControllerEvaluationReport = z.infer<typeof controllerEvaluationRepo
 export type ControllerEvaluationComparison = z.infer<typeof controllerEvaluationComparisonSchema>;
 
 function trialPairKey(trial: ControllerScenarioTrial): string {
-  return `${trial.scenarioId}:${trial.trial}`;
+  return `${trial.scenarioId}:${trial.scenarioVersion}:${trial.trial}`;
 }
 
 function hasDuplicateTrialPairs(trials: readonly ControllerScenarioTrial[]): boolean {
@@ -370,14 +370,19 @@ type ComparableTrialSignature = Readonly<{
   reasoningLevel: string;
   serviceTier: string;
   permissionMode: "auto" | "accept-edits" | "full";
+  instructionSha256: string;
   overlaySha256: string;
+  capabilityManifestSha256: string;
+  policySha256: string;
   contextSha256: string;
   answerFixtureSha256: string;
+  advertisedTools: readonly string[];
+  parameterSchemaSha256: Readonly<Record<string, string>>;
   budget: ControllerScenarioTrial["budget"];
   graders: Readonly<{
-    outcome: Readonly<{ graderId: string; graderVersion: number }>;
-    trace: Readonly<{ graderId: string; graderVersion: number }>;
-    answer: Readonly<{ graderId: string; graderVersion: number }>;
+    outcome: Readonly<{ graderId: string; graderVersion: number; proofRefs: readonly string[] }>;
+    trace: Readonly<{ graderId: string; graderVersion: number; proofRefs: readonly string[] }>;
+    answer: Readonly<{ graderId: string; graderVersion: number; proofRefs: readonly string[] }>;
   }>;
 }>;
 
@@ -424,6 +429,26 @@ function assertCurrentTrialIdentity(trial: ControllerScenarioTrial): void {
   }
   if (trial.evidenceRecords === undefined) {
     throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing redacted evidence records; historical reports may remain incomplete`);
+  }
+  if (trial.harness.instructionSha256.length === 0
+    || trial.harness.capabilityManifestSha256.length === 0
+    || trial.harness.policySha256.length === 0
+    || trial.harness.parameterSchemaSha256 === undefined
+    || Object.keys(trial.harness.parameterSchemaSha256).length === 0
+    || trial.harness.advertisedTools.length === 0) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is missing per-run capability or policy identity`);
+  }
+  assertTrialCapabilityIdentity(trial);
+}
+
+function assertTrialCapabilityIdentity(trial: ControllerScenarioTrial): void {
+  const advertisedTools = [...trial.harness.advertisedTools].sort();
+  const parameterSchemaTools = Object.keys(trial.harness.parameterSchemaSha256).sort();
+  if (JSON.stringify(advertisedTools) !== JSON.stringify(parameterSchemaTools)) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} capability tools and parameter schemas do not match`);
+  }
+  if (new Set(trial.harness.advertisedTools).size !== trial.harness.advertisedTools.length) {
+    throw new Error(`current trial ${trial.scenarioId}:${trial.trial} capability manifest contains duplicate tools`);
   }
 }
 
@@ -612,14 +637,19 @@ function trialSignature(trial: ControllerScenarioTrial): ComparableTrialSignatur
     reasoningLevel: trial.harness.reasoningLevel,
     serviceTier: trial.harness.serviceTier,
     permissionMode: trial.harness.permissionMode,
+    instructionSha256: trial.harness.instructionSha256,
     overlaySha256: trial.harness.overlaySha256,
+    capabilityManifestSha256: trial.harness.capabilityManifestSha256,
+    policySha256: trial.harness.policySha256,
     contextSha256: trial.harness.contextSha256,
     answerFixtureSha256: trial.harness.answerFixtureSha256,
+    advertisedTools: trial.harness.advertisedTools,
+    parameterSchemaSha256: trial.harness.parameterSchemaSha256,
     budget: trial.budget,
     graders: {
-      outcome: { graderId: trial.outcome.graderId, graderVersion: trial.outcome.graderVersion },
-      trace: { graderId: trial.trace.graderId, graderVersion: trial.trace.graderVersion },
-      answer: { graderId: trial.answer.graderId, graderVersion: trial.answer.graderVersion },
+      outcome: { graderId: trial.outcome.graderId, graderVersion: trial.outcome.graderVersion, proofRefs: trial.outcome.proofRefs },
+      trace: { graderId: trial.trace.graderId, graderVersion: trial.trace.graderVersion, proofRefs: trial.trace.proofRefs },
+      answer: { graderId: trial.answer.graderId, graderVersion: trial.answer.graderVersion, proofRefs: trial.answer.proofRefs },
     },
   };
 }
@@ -681,6 +711,55 @@ function assertFixedReportEvidence(report: ControllerEvaluationReport, label: "b
   }
 }
 
+function assertReportTrialIdentity(report: ControllerEvaluationReport, label: "baseline" | "after"): void {
+  const run = report.run;
+  if (!run) throw new Error(`fixed comparison ${label} report is missing run identity`);
+  if (hasDuplicateTrialPairs(report.trials)) {
+    throw new Error(`fixed comparison ${label} report contains duplicate trial identity`);
+  }
+  if (report.trials.some((trial) => trial.seed !== run.seed)) {
+    throw new Error(`fixed comparison ${label} trial identity does not match the report seed`);
+  }
+  const trialNumbersByScenario = new Map<string, number[]>();
+  for (const trial of report.trials) {
+    const key = comparisonScenarioKey(trial.scenarioId, trial.scenarioVersion);
+    const trialNumbers = trialNumbersByScenario.get(key) ?? [];
+    trialNumbers.push(trial.trial);
+    trialNumbersByScenario.set(key, trialNumbers);
+  }
+  const expectedTrialNumbers = Array.from({ length: run.trialsPerScenario }, (_, index) => index + 1);
+  for (const [key, trialNumbers] of trialNumbersByScenario) {
+    trialNumbers.sort((left, right) => left - right);
+    if (JSON.stringify(trialNumbers) !== JSON.stringify(expectedTrialNumbers)) {
+      throw new Error(`fixed comparison ${label} report trial identity is incomplete for ${key}`);
+    }
+  }
+}
+
+function assertFixedRunRelationship(
+  baseline: ControllerEvaluationReport,
+  after: ControllerEvaluationReport,
+): void {
+  if (!baseline.run || !after.run) throw new Error("fixed comparison requires explicit run identity");
+  assertReportTrialIdentity(baseline, "baseline");
+  assertReportTrialIdentity(after, "after");
+  if (baseline.run.seed !== after.run.seed) {
+    throw new Error("fixed comparison requires matching run seeds");
+  }
+  if (baseline.run.trialsPerScenario !== after.run.trialsPerScenario) {
+    throw new Error("fixed comparison requires matching trial identity denominators");
+  }
+  const checkpointRank = { baseline: 0, kernel: 1, cutover: 2 } as const;
+  if (checkpointRank[after.run.checkpoint] < checkpointRank[baseline.run.checkpoint]) {
+    throw new Error("fixed comparison requires an after checkpoint at or after the baseline checkpoint");
+  }
+  const baselinePairs = new Set(baseline.trials.map(trialPairKey));
+  const afterPairs = new Set(after.trials.map(trialPairKey));
+  if ([...baselinePairs].some((pair) => !afterPairs.has(pair))) {
+    throw new Error("fixed comparison requires matching trial identities");
+  }
+}
+
 function assertComparableTrialBudgetEvidence(
   baselineTrial: ControllerScenarioTrial,
   afterTrial: ControllerScenarioTrial,
@@ -724,6 +803,15 @@ function requiredFixedIdentity(
   if (trial.harness.answerFixtureSha256 === undefined) {
     throw new Error(`fixed comparison ${side} trial ${key} ${trial.trial} is missing answer fixture identity`);
   }
+  if (trial.harness.instructionSha256.length === 0
+    || trial.harness.capabilityManifestSha256.length === 0
+    || trial.harness.policySha256.length === 0
+    || trial.harness.parameterSchemaSha256 === undefined
+    || Object.keys(trial.harness.parameterSchemaSha256).length === 0
+    || trial.harness.advertisedTools.length === 0) {
+    throw new Error(`fixed comparison ${side} trial ${key} ${trial.trial} is missing per-run capability or policy identity`);
+  }
+  assertTrialCapabilityIdentity(trial);
   return {
     scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
     outerTaskTools: trial.harness.outerTaskTools,
@@ -798,6 +886,7 @@ export function compareControllerEvaluations(input: Readonly<{
   if (!baseline.run || !after.run) {
     throw new Error("fixed comparison requires explicit checkpoint, trial, and seed identity on both reports");
   }
+  assertFixedRunRelationship(baseline, after);
   assertCleanFixedReport(baseline, "baseline");
   assertCleanFixedReport(after, "after");
   assertFixedReportEvidence(baseline, "baseline");

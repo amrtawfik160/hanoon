@@ -9,19 +9,11 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmodSync,
-  closeSync,
   existsSync,
-  fsyncSync,
   lstatSync,
   mkdtempSync,
-  openSync,
-  readFileSync,
   realpathSync,
-  renameSync,
   rmSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -35,8 +27,11 @@ import {
   ANSWER_RUBRIC_VERSION,
   auditJudgeEventLog,
   answerFinalInputSha256,
+  answerJudgeTrialId,
+  answerJudgeThreadTitle,
   assertAnswerEvaluationWriteIdentity,
   buildAnswerJudgeSpawnArgs,
+  buildAnswerFinalInputBundle,
   buildClauseAssessment,
   buildClauseJudgePrompt,
   detectExplicitClauseViolation,
@@ -46,6 +41,11 @@ import {
   parseLiveGateArtifact,
   sanitizeInfrastructureDetail,
 } from "../src/eval/answer-contract.ts";
+import {
+  publishValidatedArtifact,
+  readJsonFixtureSnapshot,
+  verifyFixtureSnapshotUnchanged,
+} from "../src/eval/eval-integrity.ts";
 
 const run = promisify(execFile);
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -71,30 +71,47 @@ function readGitIdentity() {
 }
 
 function readAnswerCorpusFiles() {
-  const { cases } = JSON.parse(readFileSync(CASES_PATH, "utf8"));
-  const expectations = parseAnswerExpectations(JSON.parse(readFileSync(EXPECTATIONS_PATH, "utf8")));
+  const goldenSnapshot = readJsonFixtureSnapshot(CASES_PATH, (candidate) => {
+    if (!candidate || typeof candidate !== "object" || !Array.isArray(candidate.cases)) {
+      throw new Error("invalid answer golden fixture");
+    }
+    return candidate;
+  });
+  const expectationsSnapshot = readJsonFixtureSnapshot(EXPECTATIONS_PATH, parseAnswerExpectations);
+  const { cases } = goldenSnapshot.value;
+  const expectations = expectationsSnapshot.value;
   return {
     cases,
     expectationsById: new Map(expectations.cases.map((each) => [each.id, each])),
     expectationsCaseIds: expectations.cases.map((testCase) => testCase.id),
-    goldenSha256: sha256File(CASES_PATH),
-    expectationsSha256: sha256File(EXPECTATIONS_PATH),
+    goldenSha256: goldenSnapshot.sha256,
+    expectationsSha256: expectationsSnapshot.sha256,
+    goldenSnapshot,
+    expectationsSnapshot,
   };
 }
 
-function releaseCorpusMatches(caseIds, goldenSha256, expectationsSha256) {
-  return isExactAnswerReleaseCorpus({
-    caseIds,
-    goldenSha256,
-    expectationsSha256,
-    finalInputSha256: answerFinalInputSha256({ goldenSha256, expectationsSha256, caseIds }),
-  });
+function finalInputSha256For(corpus, cases) {
+  return answerFinalInputSha256(buildAnswerFinalInputBundle({
+    goldenSha256: corpus.goldenSha256,
+    expectationsSha256: corpus.expectationsSha256,
+    cases: cases.map((testCase) => ({
+      id: testCase.id,
+      ownerMessage: testCase.ownerMessage,
+      answer: testCase.answer,
+    })),
+  }));
 }
 
 function assertPinnedAnswerCorpus(corpus) {
   const caseIds = corpus.cases.map((testCase) => testCase.id);
-  if (!releaseCorpusMatches(caseIds, corpus.goldenSha256, corpus.expectationsSha256)
-    || !releaseCorpusMatches(corpus.expectationsCaseIds, corpus.goldenSha256, corpus.expectationsSha256)) {
+  const finalInputSha256 = finalInputSha256For(corpus, corpus.cases);
+  if (!isExactAnswerReleaseCorpus({
+    caseIds,
+    goldenSha256: corpus.goldenSha256,
+    expectationsSha256: corpus.expectationsSha256,
+    finalInputSha256,
+  }) || JSON.stringify(corpus.expectationsCaseIds) !== JSON.stringify(caseIds)) {
     fail("checked-in answer corpus does not match the pinned release corpus");
   }
   if (corpus.expectationsById.size !== corpus.cases.length || corpus.cases.some((testCase) => !corpus.expectationsById.has(testCase.id))) {
@@ -112,11 +129,7 @@ function selectAnswerCorpus(corpus, only) {
   return {
     ...corpus,
     selected,
-    finalInputSha256: answerFinalInputSha256({
-      goldenSha256: corpus.goldenSha256,
-      expectationsSha256: corpus.expectationsSha256,
-      caseIds: selected.map((testCase) => testCase.id),
-    }),
+    finalInputSha256: finalInputSha256For(corpus, selected),
   };
 }
 
@@ -189,14 +202,48 @@ function assertExternalArtifactPath(artifactPath) {
   return realTarget;
 }
 
-function buildJudgeCorrelation(testCase, clause) {
-  const originThreadId = typeof process.env.BB_THREAD_ID === "string" && process.env.BB_THREAD_ID.length > 0
-    ? process.env.BB_THREAD_ID
-    : null;
+function buildJudgeCorrelation({ testCase, clause, runId, project, parentThreadId }) {
   const correlationToken = randomUUID();
+  const trialId = answerJudgeTrialId(runId, testCase.id, clause.id);
   return {
-    originThreadId,
-    title: `answer-eval ${testCase.id} ${clause.id} origin=${originThreadId ?? "standalone"} correlation=${correlationToken}`,
+    runId,
+    trialId,
+    caseId: testCase.id,
+    clauseId: clause.id,
+    originThreadId: parentThreadId,
+    correlationToken,
+    projectId: project,
+    parentThreadId,
+    title: answerJudgeThreadTitle({
+      runId,
+      caseId: testCase.id,
+      clauseId: clause.id,
+      parentThreadId,
+      correlationToken,
+    }),
+  };
+}
+
+async function captureJudgeThreadMembership(threadId, correlation) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await bb(["thread", "show", threadId, "--json"]));
+  } catch {
+    throw new Error(`judge thread ${threadId} membership could not be captured`);
+  }
+  const thread = parsed?.thread ?? parsed;
+  if (!thread || typeof thread !== "object"
+    || thread.id !== threadId
+    || thread.projectId !== correlation.projectId
+    || (thread.parentThreadId ?? null) !== correlation.parentThreadId
+    || thread.title !== correlation.title) {
+    throw new Error(`judge thread ${threadId} membership does not match its run correlation`);
+  }
+  return {
+    id: thread.id,
+    projectId: thread.projectId,
+    parentThreadId: thread.parentThreadId ?? null,
+    title: thread.title,
   };
 }
 
@@ -319,29 +366,21 @@ async function cleanupJudgeResources(threadId, workspacePath, runtimeAudit) {
   if (failure) throw new Error(failure);
 }
 
-async function judgeClause(options, testCase, clause, runtimeAudit) {
+async function judgeClause({ options, testCase, clause, runtimeAudit, runId, parentThreadId }) {
   const deterministicReason = detectExplicitClauseViolation(clause.id, testCase.answer);
-  if (deterministicReason) {
-    return buildClauseAssessment({
-      clauseId: clause.id,
-      holds: false,
-      source: "deterministic",
-      reason: deterministicReason,
-      judgeThreadId: null,
-    });
-  }
-
   const workspacePath = mkdtempSync(join(tmpdir(), "telegram-answer-judge-"));
   let threadId = null;
   let verdict = null;
   let isolation = null;
+  let judgeCorrelation = null;
+  let membership = null;
   try {
     const prompt = buildClauseJudgePrompt({
       clauseId: clause.id,
       ownerMessage: testCase.ownerMessage,
       answer: testCase.answer,
     });
-    const correlation = buildJudgeCorrelation(testCase, clause);
+    const correlation = buildJudgeCorrelation({ testCase, clause, runId, project: options.project, parentThreadId });
     const spawnArgs = buildAnswerJudgeSpawnArgs({
       project: options.project,
       title: correlation.title,
@@ -359,6 +398,8 @@ async function judgeClause(options, testCase, clause, runtimeAudit) {
       throw new Error(`judge thread ${threadId} did not finish within ${WAIT_SECONDS}s: ${capturedDetail(error)}`);
     }
 
+    membership = await captureJudgeThreadMembership(threadId, correlation);
+
     let eventLog;
     try {
       eventLog = await bb(["thread", "log", threadId, "--json", "--limit", String(BB_EVENT_LOG_LIMIT)]);
@@ -367,12 +408,27 @@ async function judgeClause(options, testCase, clause, runtimeAudit) {
       runtimeAudit.noToolActivity = false;
       throw new Error(`judge thread ${threadId} event log failed: ${capturedDetail(error)}`);
     }
-    isolation = auditJudgeEventLog(eventLog);
+    isolation = auditJudgeEventLog(eventLog, threadId);
     if (!isolation) {
       runtimeAudit.eventLogsAudited = false;
       runtimeAudit.noToolActivity = false;
       throw new Error(`judge thread ${threadId} event log did not prove completed no-tool execution`);
     }
+    judgeCorrelation = {
+      runId: correlation.runId,
+      trialId: correlation.trialId,
+      caseId: correlation.caseId,
+      clauseId: correlation.clauseId,
+      correlationToken: correlation.correlationToken,
+      threadId,
+      projectId: correlation.projectId,
+      parentThreadId: correlation.parentThreadId,
+      title: correlation.title,
+      membership,
+      eventLog,
+      eventLogSha256: createHash("sha256").update(eventLog, "utf8").digest("hex"),
+      eventCount: isolation.eventCount,
+    };
 
     let output;
     try {
@@ -381,19 +437,20 @@ async function judgeClause(options, testCase, clause, runtimeAudit) {
       throw new Error(`judge thread ${threadId} output failed: ${capturedDetail(error)}`);
     }
     verdict = parseClauseVerdict(output, clause.id);
-    if (!verdict) {
+    if (!verdict && !deterministicReason) {
       throw new Error(`judge thread ${threadId} returned a malformed single-clause verdict (captured output length ${output.length})`);
     }
   } finally {
     await cleanupJudgeResources(threadId, workspacePath, runtimeAudit);
   }
   return buildClauseAssessment({
-    clauseId: verdict.id,
-    holds: verdict.holds,
-    source: "model",
-    reason: verdict.holds ? "Model verdict recorded: clause holds." : "Model verdict recorded: clause fails.",
+    clauseId: clause.id,
+    holds: deterministicReason ? false : verdict.holds,
+    source: deterministicReason ? "deterministic" : "model",
+    reason: deterministicReason ?? (verdict.holds ? "Model verdict recorded: clause holds." : "Model verdict recorded: clause fails."),
     judgeThreadId: threadId,
     judgeIsolation: isolation,
+    judgeCorrelation,
   });
 }
 
@@ -414,10 +471,10 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
-async function gradeCase(options, testCase, runtimeAudit) {
+async function gradeCase({ options, testCase, runtimeAudit, runId, parentThreadId }) {
   const outcomes = await mapWithConcurrency(ANSWER_CLAUSES, CLAUSE_CONCURRENCY, async (clause) => {
     try {
-      return { assessment: await judgeClause(options, testCase, clause, runtimeAudit) };
+      return { assessment: await judgeClause({ options, testCase, clause, runtimeAudit, runId, parentThreadId }) };
     } catch (error) {
       const detail = error instanceof Error ? error.message : "judge failed";
       return {
@@ -467,11 +524,7 @@ function hasCompleteRuntimeAudit(runtimeAudit) {
     && runtimeAudit.judgeThreadsCleaned;
 }
 
-function sha256File(path) {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
-}
-
-function buildLiveGateCaseResult(testCase, expectation, result) {
+function buildLiveGateCaseResult(runId, testCase, expectation, result) {
   if (!result) {
     return {
       id: testCase.id,
@@ -480,11 +533,13 @@ function buildLiveGateCaseResult(testCase, expectation, result) {
       matchesGolden: false,
       clauses: ANSWER_CLAUSES.map((clause) => ({
         id: clause.id,
+        trialId: answerJudgeTrialId(runId, testCase.id, clause.id),
         expected: expectation.clauses[clause.id],
         result: null,
         source: "infrastructure",
         judgeThreadId: null,
         isolation: null,
+        correlation: null,
       })),
     };
   }
@@ -492,11 +547,13 @@ function buildLiveGateCaseResult(testCase, expectation, result) {
     const assessment = result.assessments.find((candidate) => candidate.id === clause.id);
     return {
       id: clause.id,
+      trialId: answerJudgeTrialId(runId, testCase.id, clause.id),
       expected: expectation.clauses[clause.id],
       result: assessment?.holds ?? null,
       source: assessment?.source ?? "infrastructure",
       judgeThreadId: assessment?.judgeThreadId ?? null,
       isolation: assessment?.judgeIsolation ?? null,
+      correlation: assessment?.judgeCorrelation ?? null,
     };
   });
   const actual = result.passed ? "pass" : "fail";
@@ -512,13 +569,14 @@ function buildLiveGateCaseResult(testCase, expectation, result) {
   };
 }
 
-function buildLiveGateArtifact({ selected, caseResults, infrastructureErrors, runtimeAudit, hanoonCommit, dirty, goldenSha256, expectationsSha256, finalInputSha256 }) {
+function buildLiveGateArtifact({ runId, selected, caseResults, infrastructureErrors, runtimeAudit, hanoonCommit, dirty, goldenSha256, expectationsSha256, finalInputSha256 }) {
   const selectedClauseCount = selected.length * ANSWER_CLAUSES.length;
   const clauseAgreed = caseResults.reduce((total, caseResult) => total + caseResult.clauses.filter((clause) => clause.result !== null && clause.result === clause.expected).length, 0);
   const caseAgreed = caseResults.filter((caseResult) => caseResult.matchesGolden).length;
   return {
     schemaVersion: ANSWER_LIVE_GATE_SCHEMA_VERSION,
     rubricVersion: ANSWER_RUBRIC_VERSION,
+    runId,
     judgeProfile: ANSWER_JUDGE_PROFILE,
     hanoonCommit,
     dirty,
@@ -554,40 +612,30 @@ function buildLiveGateArtifact({ selected, caseResults, infrastructureErrors, ru
 }
 
 function writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, assertCurrentInputs) {
-  assertCurrentInputs?.();
   const serialized = `${JSON.stringify(artifact, null, 2)}\n`;
-  if (!parseLiveGateArtifact(serialized, forbiddenValues)) throw new Error("live gate artifact failed schema or secret validation");
-  const temporaryPath = `${artifactPath}.${process.pid}.${randomUUID()}.tmp`;
-  let descriptor = null;
-  let published = false;
-  try {
-    descriptor = openSync(temporaryPath, "wx", 0o600);
-    writeFileSync(descriptor, serialized, "utf8");
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = null;
-    chmodSync(temporaryPath, 0o600);
-    renameSync(temporaryPath, artifactPath);
-    published = true;
-    chmodSync(artifactPath, 0o600);
-    assertCurrentInputs?.();
-  } catch (error) {
-    if (descriptor !== null) closeSync(descriptor);
-    try { unlinkSync(temporaryPath); } catch { /* best effort for an incomplete atomic write */ }
-    if (published) {
-      try { unlinkSync(artifactPath); } catch { /* fail closed even if cleanup itself is unavailable */ }
-    }
-    throw new Error(`live gate artifact write failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  publishValidatedArtifact({
+    artifactPath,
+    serialized,
+    replace: true,
+    validateSerialized: (candidate) => {
+      if (!parseLiveGateArtifact(candidate, forbiddenValues)) throw new Error("live gate artifact failed schema or secret validation");
+    },
+    verifyBeforePublish: assertCurrentInputs,
+    verifyIdentity: () => assertCurrentInputs?.(),
+  });
 }
 
 async function main() {
   const options = readArguments(process.argv.slice(2));
   const artifactPath = assertExternalArtifactPath(options.artifact);
   const corpus = readAnswerCorpus(options.only);
+  const runId = randomUUID();
   const initialIdentity = readGitIdentity();
   if (initialIdentity.dirty) fail("answer evaluator repository is dirty; refusing live evaluation");
   const { selected, expectationsById, goldenSha256, expectationsSha256, finalInputSha256 } = corpus;
+  const parentThreadId = typeof process.env.BB_THREAD_ID === "string" && process.env.BB_THREAD_ID.length > 0
+    ? process.env.BB_THREAD_ID
+    : null;
 
   process.stdout.write(`answer judge rubric ${ANSWER_RUBRIC_VERSION}; profile ${JSON.stringify(ANSWER_JUDGE_PROFILE)}; clause concurrency ${CLAUSE_CONCURRENCY}\n`);
   const runtimeAudit = createRuntimeAudit();
@@ -598,11 +646,11 @@ async function main() {
     const expectation = expectationsById.get(testCase.id);
     let result;
     try {
-      result = await gradeCase(options, testCase, runtimeAudit);
+      result = await gradeCase({ options, testCase, runtimeAudit, runId, parentThreadId });
     } catch (error) {
       const detail = sanitizeInfrastructureDetail(error instanceof Error ? error.message : "judge failed", [testCase.ownerMessage, testCase.answer]);
       infrastructureErrors.push({ id: testCase.id, detail });
-      caseResults.push(buildLiveGateCaseResult(testCase, expectation, null));
+      caseResults.push(buildLiveGateCaseResult(runId, testCase, expectation, null));
       process.stdout.write(`  ERROR  ${testCase.id}: ${detail}\n`);
       break;
     }
@@ -611,7 +659,7 @@ async function main() {
     const clauseMismatches = result.assessments
       .filter((clause) => clause.holds !== expectation.clauses[clause.id])
       .map((clause) => clause.id);
-    const caseResult = buildLiveGateCaseResult(testCase, expectation, result, null);
+    const caseResult = buildLiveGateCaseResult(runId, testCase, expectation, result);
     caseResults.push(caseResult);
     if (actual === testCase.expect && actual === expectation.aggregate && clauseMismatches.length === 0) {
       process.stdout.write(`  ok     ${testCase.id} (${actual})${broken.length ? ` [${broken.join(", ")}]` : ""}\n`);
@@ -631,11 +679,12 @@ async function main() {
     for (const testCase of selected.slice(caseResults.length)) {
       const expectation = expectationsById.get(testCase.id);
       infrastructureErrors.push({ id: testCase.id, detail: stopDetail });
-      caseResults.push(buildLiveGateCaseResult(testCase, expectation, null, stopDetail));
+      caseResults.push(buildLiveGateCaseResult(runId, testCase, expectation, null));
     }
   }
 
   const artifact = buildLiveGateArtifact({
+    runId,
     selected,
     caseResults,
     infrastructureErrors,
@@ -648,8 +697,9 @@ async function main() {
   });
   const forbiddenValues = selected.flatMap((testCase) => [testCase.ownerMessage, testCase.answer]);
   writeLiveGateArtifact(artifactPath, artifact, forbiddenValues, () => {
+    verifyFixtureSnapshotUnchanged(corpus.goldenSnapshot, CASES_PATH);
+    verifyFixtureSnapshotUnchanged(corpus.expectationsSnapshot, EXPECTATIONS_PATH);
     const finalIdentity = readGitIdentity();
-    const finalCorpus = readAnswerCorpus(options.only);
     assertAnswerEvaluationWriteIdentity(
       {
         ...initialIdentity,
@@ -659,9 +709,9 @@ async function main() {
       },
       {
         ...finalIdentity,
-        goldenSha256: finalCorpus.goldenSha256,
-        expectationsSha256: finalCorpus.expectationsSha256,
-        finalInputSha256: finalCorpus.finalInputSha256,
+        goldenSha256,
+        expectationsSha256,
+        finalInputSha256,
       },
     );
   });

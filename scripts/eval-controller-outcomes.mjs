@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
@@ -9,6 +9,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const jiti = createJiti(import.meta.url);
 const contract = await jiti.import("../src/eval/controller-scenario-contract.ts");
 const harness = await jiti.import("../tests/support/controller-scenario-harness.ts");
+const { canonicalArtifactPath, publishValidatedArtifact } = await jiti.import("../src/eval/eval-integrity.ts");
 
 function fail(message) {
   process.stderr.write(`controller outcome eval: ${message}\n`);
@@ -50,9 +51,16 @@ function isInsideRoot(path) {
 }
 
 function allowedOutput(path) {
-  if (!isInsideRoot(path)) return true;
-  const relation = relative(root, path);
+  const canonicalPath = canonicalArtifactPath(path);
+  if (!isInsideRoot(canonicalPath)) return true;
+  const relation = relative(root, canonicalPath);
   return relation === ".superpowers" || relation.startsWith(`.superpowers${sep}`);
+}
+
+function assertCurrentRunIdentity(identity, currentIdentity) {
+  if (currentIdentity.commit !== identity.commit || currentIdentity.dirty || identity.dirty) {
+    throw new Error("current evaluator identity is dirty or changed before report write");
+  }
 }
 
 function git(args) {
@@ -66,30 +74,17 @@ function readGitIdentity() {
   };
 }
 
-function writeReport(path, content, replace) {
-  const mode = 0o600;
-  if (!replace) {
-    let descriptor;
-    try {
-      descriptor = openSync(path, "wx", mode);
-    } catch (error) {
-      if (error && typeof error === "object" && error.code === "EEXIST") {
-        throw new Error(`refusing to overwrite existing report ${path}; pass --replace`);
-      }
-      throw error;
-    }
-    try {
-      writeFileSync(descriptor, content, { encoding: "utf8" });
-    } finally {
-      closeSync(descriptor);
-    }
-    chmodSync(path, mode);
-    return;
-  }
-  const temporary = `${path}.tmp-${process.pid}`;
-  writeFileSync(temporary, content, { encoding: "utf8", mode, flag: "w" });
-  renameSync(temporary, path);
-  chmodSync(path, mode);
+function writeReport(path, content, replace, verifyIdentity) {
+  publishValidatedArtifact({
+    artifactPath: path,
+    serialized: content,
+    replace,
+    validateSerialized: (candidate) => {
+      contract.controllerEvaluationReportSchema.parse(JSON.parse(candidate));
+    },
+    verifyBeforePublish: verifyIdentity,
+    verifyIdentity,
+  });
 }
 
 function readValidatedBaseline(path, scenarioCorpus) {
@@ -119,16 +114,23 @@ function fixedScenarioIdentity(trial) {
     scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
     outerTaskTools: trial.harness.outerTaskTools,
     answerFixtureSha256: trial.harness.answerFixtureSha256,
+    instructionSha256: trial.harness.instructionSha256,
     provider: trial.harness.provider,
     model: trial.harness.model,
     reasoningLevel: trial.harness.reasoningLevel,
     serviceTier: trial.harness.serviceTier,
     permissionMode: trial.harness.permissionMode,
+    overlaySha256: trial.harness.overlaySha256,
+    capabilityManifestSha256: trial.harness.capabilityManifestSha256,
+    policySha256: trial.harness.policySha256,
+    contextSha256: trial.harness.contextSha256,
+    advertisedTools: trial.harness.advertisedTools,
+    parameterSchemaSha256: trial.harness.parameterSchemaSha256,
     budget: trial.budget,
     graders: {
-      outcome: [trial.outcome.graderId, trial.outcome.graderVersion],
-      trace: [trial.trace.graderId, trial.trace.graderVersion],
-      answer: [trial.answer.graderId, trial.answer.graderVersion],
+      outcome: [trial.outcome.graderId, trial.outcome.graderVersion, trial.outcome.proofRefs],
+      trace: [trial.trace.graderId, trial.trace.graderVersion, trial.trace.proofRefs],
+      answer: [trial.answer.graderId, trial.answer.graderVersion, trial.answer.proofRefs],
     },
   });
 }
@@ -147,7 +149,12 @@ function hasFixedScenarioIdentityVariation(trials) {
 export function classifyControllerEvidence(trials) {
   const identityIncomplete = trials.some((trial) => (
     trial.scenarioDefinitionSha256 === undefined || trial.harness.outerTaskTools === undefined ||
-    trial.harness.answerFixtureSha256 === undefined
+    trial.harness.answerFixtureSha256 === undefined ||
+    trial.harness.instructionSha256.length === 0 ||
+    trial.harness.capabilityManifestSha256.length === 0 ||
+    trial.harness.policySha256.length === 0 ||
+    trial.harness.advertisedTools.length === 0 ||
+    Object.keys(trial.harness.parameterSchemaSha256).length === 0
   ));
   if (identityIncomplete) throw new Error("current evaluation identity is incomplete; refusing to label it strong");
   const nonFixedTrials = trials.filter((trial) => (
@@ -203,23 +210,12 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
   const scenarioCorpus = harness.loadControllerScenarioCorpus();
   const baseline = options.baseline ? readValidatedBaseline(options.baseline, scenarioCorpus) : null;
   const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
-  const priorCommit = process.env.HANOON_EVAL_COMMIT;
-  const priorDirty = process.env.HANOON_EVAL_DIRTY;
-  process.env.HANOON_EVAL_COMMIT = identity.commit;
-  process.env.HANOON_EVAL_DIRTY = String(identity.dirty);
-  let trials;
-  try {
-    trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
-      checkpoint: options.checkpoint,
-      trials: options.trials,
-      seed: options.seed,
-    });
-  } finally {
-    if (priorCommit === undefined) delete process.env.HANOON_EVAL_COMMIT;
-    else process.env.HANOON_EVAL_COMMIT = priorCommit;
-    if (priorDirty === undefined) delete process.env.HANOON_EVAL_DIRTY;
-    else process.env.HANOON_EVAL_DIRTY = priorDirty;
-  }
+  const trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
+    checkpoint: options.checkpoint,
+    trials: options.trials,
+    seed: options.seed,
+    runIdentity: { commit: identity.commit, dirty: identity.dirty },
+  });
   const currentValidation = contract.validateControllerScenarioTrialsAgainstCorpus(trials, scenarioCorpus);
   const validatedTrials = currentValidation.trials.map(contract.validateControllerScenarioTrialBudget);
   assertCurrentEvaluationIdentity(validatedTrials, identity);
@@ -250,11 +246,15 @@ export async function evaluateControllerOutcomes(options, dependencies = {}) {
     : baseReport;
   contract.controllerEvaluationReportSchema.parse(report);
   const finalIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
-  if (finalIdentity.commit !== identity.commit || finalIdentity.dirty || identity.dirty) {
-    throw new Error("current evaluator identity changed before report write");
-  }
+  assertCurrentRunIdentity(identity, finalIdentity);
   assertCurrentEvaluationIdentity(validatedTrials, finalIdentity);
-  writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace);
+  const verifyIdentity = () => {
+    harness.verifyControllerScenarioFixtureSnapshots();
+    const currentIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
+    assertCurrentRunIdentity(identity, currentIdentity);
+    assertCurrentEvaluationIdentity(validatedTrials, currentIdentity);
+  };
+  writeReport(options.output, `${JSON.stringify(report, null, 2)}\n`, options.replace, verifyIdentity);
   const criticalSafetyFailed = currentValidation.criticalSafetyFailed;
   return {
     report,
