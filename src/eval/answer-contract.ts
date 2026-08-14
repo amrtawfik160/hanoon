@@ -333,6 +333,12 @@ export type JudgeEventAudit = Readonly<JudgeIsolationEvidence & {
   agentMessageItemId: string;
 }>;
 
+export type JudgeOutputBinding = Readonly<{
+  outputItemId: string;
+  outputSha256: string;
+  highWaterSequence: number;
+}>;
+
 export type ClauseAssessment = Readonly<{
   id: AnswerClauseId;
   holds: boolean;
@@ -734,6 +740,67 @@ export function auditJudgeEventLog(output: string, expectedThreadId?: string): J
     targetTurnCompletionEventId: projectionAudit.targetTurnCompletionEventId,
     agentMessageItemId: projectionAudit.agentMessageItemId,
   };
+}
+
+export function bindJudgeOutputToEventAudit(
+  output: string,
+  eventLog: string,
+  eventAudit: JudgeEventAudit,
+  expectedThreadId?: string,
+): JudgeOutputBinding | null {
+  const eventRecords = parseJudgeEvents(eventLog, expectedThreadId);
+  if (!eventRecords || !eventRecords.every(validateRawJudgeEvent)) return null;
+  const projection = eventRecords.map((event) => event.projection);
+  const projectionAudit = validateJudgeEventProjection(projection, expectedThreadId);
+  if (!projectionAudit || !sameJudgeEventProjection(projection, eventAudit.eventProjection)
+    || !projectionAuditMatchesAudit(projectionAudit, eventAudit)) return null;
+  const deltaEvents = eventRecords.filter((event) => event.projection.type === "item/agentMessage/delta"
+    && event.projection.turnId === eventAudit.targetTurnId
+    && event.projection.itemId === eventAudit.agentMessageItemId);
+  if (deltaEvents.length === 0 || deltaEvents.some((event) => typeof event.rawData.delta !== "string")) return null;
+  const reconstructedOutput = deltaEvents.map((event) => event.rawData.delta as string).join("");
+  if (reconstructedOutput !== output) return null;
+  const highWaterSequence = projection.at(-1)?.sequence;
+  if (highWaterSequence === undefined) return null;
+  return {
+    outputItemId: eventAudit.agentMessageItemId,
+    outputSha256: createHash("sha256").update(output, "utf8").digest("hex"),
+    highWaterSequence,
+  };
+}
+
+function sameJudgeEventProjection(
+  left: readonly JudgeEventProjection[],
+  right: readonly JudgeEventProjection[],
+): boolean {
+  return left.length === right.length && left.every((event, index) => sameJudgeEvent(event, right[index]!));
+}
+
+function sameJudgeEvent(left: JudgeEventProjection, right: JudgeEventProjection): boolean {
+  return left.eventId === right.eventId
+    && left.threadId === right.threadId
+    && left.sequence === right.sequence
+    && left.type === right.type
+    && left.scope === right.scope
+    && left.turnId === right.turnId
+    && left.itemId === right.itemId
+    && left.itemType === right.itemType
+    && left.status === right.status;
+}
+
+function projectionAuditMatchesAudit(
+  projectionAudit: Readonly<{
+    targetTurnId: string;
+    targetTurnStartEventId: string;
+    targetTurnCompletionEventId: string;
+    agentMessageItemId: string;
+  }>,
+  eventAudit: JudgeEventAudit,
+): boolean {
+  return projectionAudit.targetTurnId === eventAudit.targetTurnId
+    && projectionAudit.targetTurnStartEventId === eventAudit.targetTurnStartEventId
+    && projectionAudit.targetTurnCompletionEventId === eventAudit.targetTurnCompletionEventId
+    && projectionAudit.agentMessageItemId === eventAudit.agentMessageItemId;
 }
 
 function parseJudgeEvents(output: string, expectedThreadId?: string): ParsedJudgeEvent[] | null {

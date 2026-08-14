@@ -30,6 +30,7 @@ import {
   answerJudgeTrialId,
   answerJudgeThreadTitle,
   assertAnswerEvaluationWriteIdentity,
+  bindJudgeOutputToEventAudit,
   buildAnswerJudgeSpawnArgs,
   buildAnswerFinalInputBundle,
   buildClauseAssessment,
@@ -272,6 +273,28 @@ async function waitForReconciliationRetry() {
   await new Promise((resolvePromise) => setTimeout(resolvePromise, RECONCILIATION_DELAY_MS));
 }
 
+async function assertJudgeEventHighWater(threadId, eventAudit) {
+  const highWaterSequence = eventAudit.eventProjection.at(-1)?.sequence;
+  if (!Number.isSafeInteger(highWaterSequence)) throw new Error(`judge thread ${threadId} event audit had no high-water sequence`);
+  let logOutput;
+  try {
+    logOutput = await bb([
+      "thread", "log", threadId, "--json", "--after-seq", String(highWaterSequence), "--limit", "1",
+    ]);
+  } catch (error) {
+    throw new Error(`judge thread ${threadId} event high-water recheck failed: ${capturedDetail(error)}`);
+  }
+  let newEvents;
+  try {
+    newEvents = JSON.parse(logOutput);
+  } catch {
+    throw new Error(`judge thread ${threadId} event high-water recheck returned invalid JSON`);
+  }
+  if (!Array.isArray(newEvents) || newEvents.length !== 0) {
+    throw new Error(`judge thread ${threadId} changed after output proof`);
+  }
+}
+
 async function reconcileJudgeThread(correlation, project) {
   let lastFailure = null;
   for (let attempt = 0; attempt < RECONCILIATION_ATTEMPTS; attempt += 1) {
@@ -299,7 +322,14 @@ async function spawnJudgeThread(spawnArgs, correlation, project) {
   }
   if (!failure) {
     try {
-      return { threadId: parseSpawnedThreadId(spawnOutput), failure: null };
+      const returnedThreadId = parseSpawnedThreadId(spawnOutput);
+      try {
+        await captureJudgeThreadMembership(returnedThreadId, correlation);
+        return { threadId: returnedThreadId, failure: null };
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "returned thread membership mismatch";
+        failure = new Error(`bb thread spawn returned an uncorrelated thread: ${detail}`);
+      }
     } catch (error) {
       failure = error instanceof Error ? error : new Error("bb thread spawn returned invalid JSON");
     }
@@ -314,7 +344,18 @@ async function spawnJudgeThread(spawnArgs, correlation, project) {
   return { threadId: reconciledThreadId, failure };
 }
 
-async function cleanupJudgeThread(threadId) {
+async function authorizeJudgeCleanup(threadId, correlation, project) {
+  try {
+    await captureJudgeThreadMembership(threadId, correlation);
+    return threadId;
+  } catch {
+    const reconciledThreadId = await reconcileJudgeThread(correlation, project);
+    await captureJudgeThreadMembership(reconciledThreadId, correlation);
+    return reconciledThreadId;
+  }
+}
+
+async function cleanupJudgeThreadById(threadId) {
   if (!threadId) return;
   const failures = [];
   let mustStop = true;
@@ -340,6 +381,12 @@ async function cleanupJudgeThread(threadId) {
   if (failures.length > 0) throw new Error(`judge thread ${threadId} cleanup failed`);
 }
 
+async function cleanupJudgeThread(threadId, correlation, project) {
+  if (!threadId || !correlation) throw new Error("judge cleanup correlation was not established");
+  const authorizedThreadId = await authorizeJudgeCleanup(threadId, correlation, project);
+  await cleanupJudgeThreadById(authorizedThreadId);
+}
+
 function cleanupJudgeWorkspace(workspacePath) {
   try {
     rmSync(workspacePath, { recursive: true, force: true });
@@ -348,11 +395,11 @@ function cleanupJudgeWorkspace(workspacePath) {
   }
 }
 
-async function cleanupJudgeResources(threadId, workspacePath, runtimeAudit) {
+async function cleanupJudgeResources(threadId, workspacePath, runtimeAudit, correlation, project) {
   let failure = null;
   if (!threadId) runtimeAudit.judgeThreadsCleaned = false;
   try {
-    await cleanupJudgeThread(threadId);
+    if (threadId) await cleanupJudgeThread(threadId, correlation, project);
   } catch (error) {
     runtimeAudit.judgeThreadsCleaned = false;
     failure = error instanceof Error ? error.message : "judge thread cleanup failed";
@@ -370,6 +417,7 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
   const deterministicReason = detectExplicitClauseViolation(clause.id, testCase.answer);
   const workspacePath = mkdtempSync(join(tmpdir(), "telegram-answer-judge-"));
   let threadId = null;
+  let correlation = null;
   let verdict = null;
   let isolation = null;
   let judgeCorrelation = null;
@@ -380,7 +428,7 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       ownerMessage: testCase.ownerMessage,
       answer: testCase.answer,
     });
-    const correlation = buildJudgeCorrelation({ testCase, clause, runId, project: options.project, parentThreadId });
+    correlation = buildJudgeCorrelation({ testCase, clause, runId, project: options.project, parentThreadId });
     const spawnArgs = buildAnswerJudgeSpawnArgs({
       project: options.project,
       title: correlation.title,
@@ -428,6 +476,11 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
     } catch (error) {
       throw new Error(`judge thread ${threadId} output failed: ${capturedDetail(error)}`);
     }
+    const outputBinding = bindJudgeOutputToEventAudit(output, eventLog, eventAudit, threadId);
+    if (!outputBinding) {
+      throw new Error(`judge thread ${threadId} output did not match ordered audited assistant deltas`);
+    }
+    await assertJudgeEventHighWater(threadId, eventAudit);
     verdict = parseClauseVerdict(output, clause.id);
     if (!verdict && !deterministicReason) {
       throw new Error(`judge thread ${threadId} returned a malformed single-clause verdict (captured output length ${output.length})`);
@@ -450,11 +503,11 @@ async function judgeClause({ options, testCase, clause, runtimeAudit, runId, par
       targetTurnStartEventId: eventAudit.targetTurnStartEventId,
       targetTurnCompletionEventId: eventAudit.targetTurnCompletionEventId,
       agentMessageItemId: eventAudit.agentMessageItemId,
-      outputItemId: eventAudit.agentMessageItemId,
-      outputSha256: createHash("sha256").update(output, "utf8").digest("hex"),
+      outputItemId: outputBinding.outputItemId,
+      outputSha256: outputBinding.outputSha256,
     };
   } finally {
-    await cleanupJudgeResources(threadId, workspacePath, runtimeAudit);
+    await cleanupJudgeResources(threadId, workspacePath, runtimeAudit, correlation, options.project);
   }
   return buildClauseAssessment({
     clauseId: clause.id,

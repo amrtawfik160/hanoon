@@ -12,6 +12,7 @@ import {
   ANSWER_JUDGE_PROFILE,
   ANSWER_RUBRIC_VERSION,
   type AnswerClauseId,
+  bindJudgeOutputToEventAudit,
   buildAnswerJudgeSpawnArgs,
   buildAnswerFinalInputBundle,
   answerJudgeThreadTitle,
@@ -50,7 +51,7 @@ const RELEASE_EXPECTATIONS = {
   "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
 } as const;
 
-type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "infra" | "ambiguous-spawn" | "spawn-error";
+type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "infra" | "ambiguous-spawn" | "spawn-error" | "unscoped-output" | "event-after-output" | "unrelated-spawn";
 
 function fakeBbPath(directory: string, mode: FakeBbMode): string {
   const commandPath = join(directory, "bb");
@@ -69,7 +70,7 @@ if (args[0] === "thread" && args[1] === "spawn") {
   const title = args[args.indexOf("--title") + 1];
   const match = title.match(/^answer-eval\\s+(\\S+)\\s+(\\S+)/);
   const clause = match?.[2] ?? title.split(" ").at(-1);
-  const threadId = "thr_fake_" + clause;
+  const threadId = mode === "unrelated-spawn" ? "thr_fake_unrelated" : "thr_fake_" + clause;
   const threadState = {
     id: threadId,
     title,
@@ -89,7 +90,8 @@ if (args[0] === "thread" && args[1] === "spawn") {
   process.stdout.write(JSON.stringify({ status: "idle" }));
 } else if (args[0] === "thread" && args[1] === "show") {
   const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
-  process.stdout.write(JSON.stringify({ thread: { ...state, id: args[2], status } }));
+  const unrelated = mode === "unrelated-spawn" && args[2] === "thr_fake_unrelated";
+  process.stdout.write(JSON.stringify({ thread: { ...state, id: args[2], status, ...(unrelated ? { projectId: "proj_other", title: "unrelated thread" } : {}) } }));
 } else if (args[0] === "thread" && args[1] === "list") {
   const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
   process.stdout.write(JSON.stringify([
@@ -98,31 +100,40 @@ if (args[0] === "thread" && args[1] === "spawn") {
   ]));
 } else if (args[0] === "thread" && args[1] === "log") {
   const threadId = args[2];
+  const clause = clauseFromThread(threadId);
   const turnId = "turn_fake";
+  const holds = mode === "wrong-bounded-uncertainty" ? clause !== "bounded-uncertainty" : true;
+  const assistantOutput = JSON.stringify({ id: clause, holds, why: "fixture reason" });
   const event = (id, seq, type, data, scope) => ({ id, threadId, seq, createdAt: seq, scope, type, data });
-  process.stdout.write(JSON.stringify([
-    event("event_1", 1, "thread/started", {}, { kind: "thread" }),
-    event("event_2", 2, "turn/started", {}, { kind: "turn", turnId }),
-    event("event_3", 3, "item/started", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
-    event("event_4", 4, "item/completed", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
-    event("event_5", 5, "item/started", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
-    event("event_6", 6, "item/agentMessage/delta", { itemId: "agent_1", delta: "judge output" }, { kind: "turn", turnId }),
-    event("event_7", 7, "item/completed", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
-    event("event_8", 8, "turn/completed", { status: "completed" }, { kind: "turn", turnId }),
-  ]));
+  if (args.includes("--after-seq")) {
+    process.stdout.write(mode === "event-after-output"
+      ? JSON.stringify([event("event_9", 9, "thread/tokenUsage/updated", {}, { kind: "thread" })])
+      : "[]");
+  } else {
+    process.stdout.write(JSON.stringify([
+      event("event_1", 1, "thread/started", {}, { kind: "thread" }),
+      event("event_2", 2, "turn/started", {}, { kind: "turn", turnId }),
+      event("event_3", 3, "item/started", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
+      event("event_4", 4, "item/completed", { item: { type: "reasoning", id: "reasoning_1" } }, { kind: "turn", turnId }),
+      event("event_5", 5, "item/started", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
+      event("event_6", 6, "item/agentMessage/delta", { itemId: "agent_1", delta: mode === "unscoped-output" ? "foreign output" : assistantOutput }, { kind: "turn", turnId }),
+      event("event_7", 7, "item/completed", { item: { type: "agentMessage", id: "agent_1" } }, { kind: "turn", turnId }),
+      event("event_8", 8, "turn/completed", { status: "completed" }, { kind: "turn", turnId }),
+    ]));
+  }
 } else if (args[0] === "thread" && args[1] === "output") {
   const clause = clauseFromThread(args[2]);
   if (mode === "infra" && clause === "outcome-first") {
     process.stdout.write("malformed verdict");
   } else {
-  const holds = ${JSON.stringify(mode)} === "wrong-bounded-uncertainty"
-    ? clause !== "bounded-uncertainty"
-    : true;
-  process.stdout.write(JSON.stringify({
-    id: clause,
-    holds,
-    why: "fixture reason",
-  }));
+    const holds = ${JSON.stringify(mode)} === "wrong-bounded-uncertainty"
+      ? clause !== "bounded-uncertainty"
+      : true;
+    process.stdout.write(JSON.stringify({
+      id: clause,
+      holds,
+      why: "fixture reason",
+    }));
   }
 } else if (args[0] === "thread" && (args[1] === "stop" || args[1] === "archive")) {
   process.stdout.write(JSON.stringify({ ok: true }));
@@ -939,6 +950,47 @@ it("returns an ordered text-free projection bound to one output turn", () => {
   expect(JSON.stringify(audit)).not.toContain("private judge output");
 });
 
+it("binds output only when it exactly reconstructs the audited assistant deltas", () => {
+  const events = safeJudgeEventRows();
+  const output = JSON.stringify({ id: "no-tool-narration", holds: true, why: "audited" });
+  events[5].data = { itemId: "agent_1", delta: output };
+  const audit = auditJudgeEventLog(JSON.stringify(events), "thr_judge");
+  expect(audit).not.toBeNull();
+  const binding = bindJudgeOutputToEventAudit(output, JSON.stringify(events), audit!, "thr_judge");
+  expect(binding).toEqual({
+    outputItemId: "agent_1",
+    outputSha256: createHash("sha256").update(output, "utf8").digest("hex"),
+    highWaterSequence: 17,
+  });
+  expect(JSON.stringify(binding)).not.toContain(output);
+  expect(bindJudgeOutputToEventAudit(
+    JSON.stringify({ id: "no-tool-narration", holds: true, why: "unscoped" }),
+    JSON.stringify(events),
+    audit!,
+    "thr_judge",
+  )).toBeNull();
+});
+
+it("hashes multiple assistant deltas in event order before binding output", () => {
+  const events = safeJudgeEventRows();
+  events[5].data = { itemId: "agent_1", delta: "first" };
+  events.splice(6, 0, {
+    ...events[5],
+    id: "event_7b",
+    seq: 16,
+    data: { itemId: "agent_1", delta: "second" },
+  } as ReturnType<typeof safeJudgeEventRows>[number]);
+  events[7].id = "event_8";
+  events[7].seq = 17;
+  events[8].id = "event_9";
+  events[8].seq = 18;
+  const eventLog = JSON.stringify(events);
+  const audit = auditJudgeEventLog(eventLog, "thr_judge");
+  expect(audit).not.toBeNull();
+  expect(bindJudgeOutputToEventAudit("firstsecond", eventLog, audit!, "thr_judge")?.outputItemId).toBe("agent_1");
+  expect(bindJudgeOutputToEventAudit("secondfirst", eventLog, audit!, "thr_judge")).toBeNull();
+});
+
 it("runs each judge with bounded cleanup and an auditable isolated workspace", async () => {
   // Catches missing subprocess timeouts, thread cleanup, event-log inspection, or workspace removal.
   const run = await runWithFakeBb("status-good", "all-hold");
@@ -952,7 +1004,8 @@ it("runs each judge with bounded cleanup and an auditable isolated workspace", a
       .map((line) => JSON.parse(line) as string[]);
     const spawnCommands = invocations.filter((args) => args[0] === "thread" && args[1] === "spawn");
     expect(spawnCommands).toHaveLength(ANSWER_CLAUSES.length);
-    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log")).toHaveLength(ANSWER_CLAUSES.length);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log" && !args.includes("--after-seq"))).toHaveLength(ANSWER_CLAUSES.length);
+    expect(invocations.filter((args) => args[0] === "thread" && args[1] === "log" && args.includes("--after-seq"))).toHaveLength(ANSWER_CLAUSES.length);
     expect(invocations.filter((args) => args[0] === "thread" && args[1] === "archive")).toHaveLength(ANSWER_CLAUSES.length);
     expect(invocations.filter((args) => args[0] === "thread" && args[1] === "stop")).toHaveLength(0);
     expect(spawnCommands.every((args) => args.includes("--environment"))).toBe(true);
@@ -965,6 +1018,64 @@ it("runs each judge with bounded cleanup and an auditable isolated workspace", a
   } finally {
     rmSync(run.directory, { recursive: true, force: true });
     expect(existsSync(run.directory)).toBe(false);
+  }
+});
+
+it("does not assign an audited item ID to output that the event stream cannot prove", async () => {
+  const run = await runWithFakeBb("status-good", "unscoped-output");
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
+    const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as Record<string, any>;
+    expect(artifact.infrastructureErrors.length).toBeGreaterThan(0);
+    expect(artifact.cases[0].clauses[0]).toMatchObject({
+      source: "infrastructure",
+      judgeThreadId: null,
+      correlation: null,
+      result: null,
+    });
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+  }
+});
+
+it("rejects output proof when the event high-water advances before the recheck", async () => {
+  const run = await runWithFakeBb("status-good", "event-after-output");
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
+    const artifact = JSON.parse(readFileSync(run.artifactPath, "utf8")) as Record<string, any>;
+    expect(artifact.infrastructureErrors.length).toBeGreaterThan(0);
+    expect(artifact.cases[0].clauses[0]).toMatchObject({ source: "infrastructure", correlation: null });
+    const invocations = readFileSync(run.logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(invocations.some((args) => args[0] === "thread" && args[1] === "log" && args.includes("--after-seq"))).toBe(true);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
+  }
+});
+
+it("cleans only the exact correlated judge when spawn returns an unrelated ID", async () => {
+  const run = await runWithFakeBb("status-good", "unrelated-spawn");
+  try {
+    expect("error" in run).toBe(true);
+    if (!("error" in run)) return;
+    expect(run.error).toMatchObject({ code: 1 });
+    const invocations = readFileSync(run.logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const archives = invocations.filter((args) => args[0] === "thread" && args[1] === "archive");
+    const stops = invocations.filter((args) => args[0] === "thread" && args[1] === "stop");
+    expect(archives.every((args) => args[2] === "thr_fake_reconciled")).toBe(true);
+    expect(stops.every((args) => args[2] === "thr_fake_reconciled")).toBe(true);
+    expect(invocations.some((args) => (args[1] === "stop" || args[1] === "archive") && args[2] === "thr_fake_unrelated")).toBe(false);
+  } finally {
+    rmSync(run.directory, { recursive: true, force: true });
   }
 });
 

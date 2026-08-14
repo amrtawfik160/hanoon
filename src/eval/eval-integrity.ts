@@ -15,6 +15,8 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+type FileIdentity = Readonly<{ dev: number; ino: number }>;
+
 export type JsonFixtureSnapshot<T> = Readonly<{
   path: string;
   bytes: ReadonlyArray<number>;
@@ -70,18 +72,37 @@ export function verifyFixtureSnapshotUnchanged<T>(
 }
 
 export function canonicalArtifactPath(artifactPath: string): string {
+  return canonicalArtifactLocation(artifactPath).targetPath;
+}
+
+type CanonicalArtifactLocation = Readonly<{
+  targetPath: string;
+  parentPath: string;
+  parentIdentity: FileIdentity;
+}>;
+
+function canonicalArtifactLocation(artifactPath: string): CanonicalArtifactLocation {
   if (!isAbsolute(artifactPath)) throw new Error("artifact path must be absolute");
   const requestedPath = resolve(artifactPath);
   const parentPath = dirname(requestedPath);
   const parentStat = lstatSync(parentPath);
   if (!parentStat.isDirectory()) throw new Error("artifact parent must be a directory");
   const canonicalParent = realpathSync(parentPath);
+  const canonicalParentStat = lstatSync(canonicalParent);
+  if (!canonicalParentStat.isDirectory()
+    || !sameFileIdentity(fileIdentity(parentStat), fileIdentity(canonicalParentStat))) {
+    throw new Error("artifact parent changed during publication");
+  }
   if (pathExists(requestedPath)) {
     const targetStat = lstatSync(requestedPath);
     if (targetStat.isSymbolicLink()) throw new Error("artifact target must not be a symbolic link");
     if (!targetStat.isFile()) throw new Error("artifact target must be a regular file");
   }
-  return join(canonicalParent, basename(requestedPath));
+  return {
+    targetPath: join(canonicalParent, basename(requestedPath)),
+    parentPath: canonicalParent,
+    parentIdentity: fileIdentity(canonicalParentStat),
+  };
 }
 
 export type ArtifactPublicationOptions = Readonly<{
@@ -93,47 +114,116 @@ export type ArtifactPublicationOptions = Readonly<{
   verifyIdentity: () => void;
 }>;
 
-type FileIdentity = Readonly<{ dev: number; ino: number }>;
+type PublicationParent = Readonly<{
+  descriptor: number;
+  identity: FileIdentity;
+  path: string;
+  anchorPath: string;
+}>;
 type PublicationLock = Readonly<{ descriptor: number; identity: FileIdentity; path: string }>;
 type OpenedTemporary = Readonly<{ descriptor: number; identity: FileIdentity; path: string }>;
 type PublishedArtifact = Readonly<{
   descriptor: number;
   identity: FileIdentity;
-  parentPath: string;
+  parent: PublicationParent;
   targetPath: string;
 }>;
 
 export function publishValidatedArtifact(options: ArtifactPublicationOptions): string {
-  const targetPath = canonicalArtifactPath(options.artifactPath);
+  const location = canonicalArtifactLocation(options.artifactPath);
+  const targetPath = location.targetPath;
   options.validateSerialized(options.serialized);
-  const parentPath = dirname(targetPath);
-  const lock = acquirePublicationLock(parentPath, targetPath);
+  const parent = openPublicationParent(location.parentPath, location.parentIdentity);
+  let lock: PublicationLock | null = null;
   try {
-    assertCanonicalParent(parentPath, targetPath);
-    publishArtifactUnderLock(options, parentPath, targetPath);
+    lock = acquirePublicationLock(parent, targetPath);
+    assertCurrentPublicationParent(parent);
+    publishArtifactUnderLock(options, parent, targetPath);
+    assertCurrentPublicationParent(parent);
     return targetPath;
   } finally {
-    releasePublicationLock(lock, parentPath);
+    try {
+      if (lock) releasePublicationLock(lock, parent);
+    } finally {
+      closePublicationParent(parent);
+    }
   }
 }
 
-function assertTargetDoesNotExist(targetPath: string): void {
-  if (pathExists(targetPath)) throw new Error(`refusing to overwrite existing artifact ${targetPath}`);
+function openPublicationParent(parentPath: string, expectedIdentity: FileIdentity): PublicationParent {
+  if (process.platform !== "linux") {
+    throw new Error("artifact publication requires Linux directory descriptor anchoring");
+  }
+  const parentStat = lstatSync(parentPath);
+  if (!parentStat.isDirectory()) throw new Error("artifact parent must be a directory");
+  if (!sameFileIdentity(fileIdentity(parentStat), expectedIdentity)) {
+    throw new Error("artifact parent changed during publication");
+  }
+  const descriptor = openSync(parentPath, "r");
+  try {
+    const parent: PublicationParent = {
+      descriptor,
+      identity: expectedIdentity,
+      path: parentPath,
+      anchorPath: join("/proc/self/fd", String(descriptor)),
+    };
+    if (!sameFileIdentity(fileIdentity(fstatSync(descriptor)), expectedIdentity)) {
+      throw new Error("artifact parent changed during publication");
+    }
+    realpathSync(parent.anchorPath);
+    assertCurrentPublicationParent(parent);
+    return parent;
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
+function closePublicationParent(parent: PublicationParent): void {
+  closeSync(parent.descriptor);
+}
+
+function assertCurrentPublicationParent(parent: PublicationParent): void {
+  try {
+    const currentStat = lstatSync(parent.path);
+    const descriptorIdentity = fileIdentity(fstatSync(parent.descriptor));
+    if (!currentStat.isDirectory()
+      || !sameFileIdentity(fileIdentity(currentStat), parent.identity)
+      || !sameFileIdentity(descriptorIdentity, parent.identity)) {
+      throw new Error("artifact parent changed during publication");
+    }
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR") || hasErrorCode(error, "ELOOP")) {
+      throw new Error("artifact parent changed during publication");
+    }
+    throw error;
+  }
+}
+
+function anchoredPath(parent: PublicationParent, displayPath: string): string {
+  return join(parent.anchorPath, basename(displayPath));
+}
+
+function assertTargetDoesNotExist(targetPath: string, displayTargetPath: string): void {
+  if (pathExists(targetPath)) throw new Error(`refusing to overwrite existing artifact ${displayTargetPath}`);
 }
 
 function publishArtifactUnderLock(
   options: ArtifactPublicationOptions,
-  parentPath: string,
+  parent: PublicationParent,
   targetPath: string,
 ): void {
-  const temporaryPath = join(parentPath, `.${basename(targetPath)}.${randomUUID()}.tmp`);
+  const anchoredTargetPath = anchoredPath(parent, targetPath);
+  const temporaryPath = join(parent.anchorPath, `.${basename(targetPath)}.${randomUUID()}.tmp`);
   let temporary: OpenedTemporary | null = null;
   let published: PublishedArtifact | null = null;
   try {
-    if (!options.replace) assertTargetDoesNotExist(targetPath);
+    assertCurrentPublicationParent(parent);
+    if (!options.replace) assertTargetDoesNotExist(anchoredTargetPath, targetPath);
     options.verifyBeforePublish?.();
-    temporary = writeDurableTemporaryFile(temporaryPath, options.serialized);
-    published = commitArtifact(options, temporary, parentPath, targetPath);
+    assertCurrentPublicationParent(parent);
+    temporary = writeDurableTemporaryFile(temporaryPath, options.serialized, parent);
+    published = commitArtifact(options, temporary, parent, targetPath);
     verifyPublishedArtifact(published, options);
   } catch (error) {
     failPublication(error, published);
@@ -156,12 +246,26 @@ function closeTemporaryFile(temporary: OpenedTemporary | null): void {
 function commitArtifact(
   options: ArtifactPublicationOptions,
   temporary: OpenedTemporary,
-  parentPath: string,
+  parent: PublicationParent,
   targetPath: string,
 ): PublishedArtifact {
-  if (options.replace) renameSync(temporary.path, targetPath);
-  else linkSync(temporary.path, targetPath);
-  return { descriptor: temporary.descriptor, identity: temporary.identity, parentPath, targetPath };
+  const anchoredTargetPath = anchoredPath(parent, targetPath);
+  assertCurrentPublicationParent(parent);
+  if (options.replace) renameSync(temporary.path, anchoredTargetPath);
+  else linkSync(temporary.path, anchoredTargetPath);
+  const published: PublishedArtifact = {
+    descriptor: temporary.descriptor,
+    identity: temporary.identity,
+    parent,
+    targetPath: anchoredTargetPath,
+  };
+  try {
+    assertCurrentPublicationParent(parent);
+    return published;
+  } catch (error) {
+    cleanupPublishedFile(published);
+    throw error;
+  }
 }
 
 function publicationFailure(error: unknown): Error {
@@ -169,15 +273,23 @@ function publicationFailure(error: unknown): Error {
   return new Error(`artifact publication failed: ${detail}`);
 }
 
-function writeDurableTemporaryFile(temporaryPath: string, serialized: string): OpenedTemporary {
+function writeDurableTemporaryFile(
+  temporaryPath: string,
+  serialized: string,
+  parent: PublicationParent,
+): OpenedTemporary {
+  assertCurrentPublicationParent(parent);
   const descriptor = openSync(temporaryPath, "wx+", 0o600);
   const identity = fileIdentity(fstatSync(descriptor));
+  const temporary = { descriptor, identity, path: temporaryPath };
   try {
+    assertCurrentPublicationParent(parent);
     writeFileSync(descriptor, serialized, "utf8");
     fsyncSync(descriptor);
-    return { descriptor, identity, path: temporaryPath };
+    assertCurrentPublicationParent(parent);
+    return temporary;
   } catch (error) {
-    cleanupTemporaryFile({ descriptor, identity, path: temporaryPath });
+    cleanupTemporaryFile(temporary);
     closeSync(descriptor);
     throw error;
   }
@@ -187,20 +299,21 @@ function verifyPublishedArtifact(
   published: PublishedArtifact,
   options: ArtifactPublicationOptions,
 ): void {
-  assertCanonicalParent(published.parentPath, published.targetPath);
-  fsyncDirectory(published.parentPath);
+  assertCurrentPublicationParent(published.parent);
+  fsyncDirectory(published.parent.anchorPath);
   assertPublishedOwnership(published);
   const publishedText = readPublishedBytes(published, options.serialized);
   options.validateSerialized(publishedText);
   assertPublishedOwnership(published);
   options.verifyIdentity();
+  assertCurrentPublicationParent(published.parent);
   assertPublishedOwnership(published);
   readPublishedBytes(published, options.serialized);
-  assertCanonicalParent(published.parentPath, published.targetPath);
+  assertCurrentPublicationParent(published.parent);
 }
 
-function fsyncDirectory(directoryPath: string): void {
-  const descriptor = openSync(directoryPath, "r");
+function fsyncDirectory(directoryAnchorPath: string): void {
+  const descriptor = openSync(directoryAnchorPath, "r");
   try {
     fsyncSync(descriptor);
   } finally {
@@ -222,38 +335,47 @@ function cleanupPublishedFile(published: PublishedArtifact): void {
   try {
     if (!pathOwnsPublishedDescriptor(published)) return;
     unlinkSync(published.targetPath);
-    fsyncDirectory(published.parentPath);
+    fsyncDirectory(published.parent.anchorPath);
   } catch {
     // A changed or unavailable target must not be removed after another writer took ownership.
   }
 }
 
-function acquirePublicationLock(parentPath: string, targetPath: string): PublicationLock {
-  const lockPath = join(parentPath, `.${basename(targetPath)}.lock`);
+function acquirePublicationLock(parent: PublicationParent, targetPath: string): PublicationLock {
+  const lockPath = join(parent.anchorPath, `.${basename(targetPath)}.lock`);
+  assertCurrentPublicationParent(parent);
+  let descriptor: number;
   try {
-    const descriptor = openSync(lockPath, "wx", 0o600);
-    return { descriptor, identity: fileIdentity(fstatSync(descriptor)), path: lockPath };
+    descriptor = openSync(lockPath, "wx", 0o600);
   } catch (error) {
     if (hasErrorCode(error, "EEXIST")) throw new Error(`artifact publication already in progress for ${targetPath}`);
     throw error;
   }
+  let lock: PublicationLock;
+  try {
+    lock = { descriptor, identity: fileIdentity(fstatSync(descriptor)), path: lockPath };
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+  try {
+    assertCurrentPublicationParent(parent);
+    return lock;
+  } catch (error) {
+    releasePublicationLock(lock, parent);
+    throw error;
+  }
 }
 
-function releasePublicationLock(lock: PublicationLock, parentPath: string): void {
+function releasePublicationLock(lock: PublicationLock, parent: PublicationParent): void {
   closeSync(lock.descriptor);
   try {
     const lockStat = lstatSync(lock.path);
     if (!sameFileIdentity(fileIdentity(lockStat), lock.identity)) return;
     unlinkSync(lock.path);
-    fsyncDirectory(parentPath);
+    fsyncDirectory(parent.anchorPath);
   } catch (error) {
     if (!hasErrorCode(error, "ENOENT")) throw error;
-  }
-}
-
-function assertCanonicalParent(parentPath: string, targetPath: string): void {
-  if (dirname(targetPath) !== parentPath || realpathSync(parentPath) !== parentPath) {
-    throw new Error("artifact parent changed during publication");
   }
 }
 
