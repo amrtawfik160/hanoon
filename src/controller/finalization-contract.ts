@@ -210,9 +210,16 @@ const NON_RESULT_TEST_SCOPE_WORD = /^(?:can|could|may|might|will|would|shall|sho
 const MAX_PREDICATE_CONTEXT_CHARS = 256;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 const MIXED_SCRIPT_CONFUSABLES: ReadonlyMap<string, string> = new Map([
-  ["а", "a"], ["А", "A"], ["е", "e"], ["Е", "E"], ["о", "o"], ["О", "O"],
-  ["р", "p"], ["Р", "P"], ["с", "c"], ["С", "C"], ["х", "x"], ["Х", "X"],
-  ["ѕ", "s"], ["Ѕ", "S"], ["і", "i"], ["І", "I"], ["ј", "j"], ["Ј", "J"],
+  ["а", "a"], ["А", "A"], ["в", "b"], ["В", "B"], ["е", "e"], ["Е", "E"],
+  ["і", "i"], ["І", "I"], ["ј", "j"], ["Ј", "J"], ["к", "k"], ["К", "K"],
+  ["м", "m"], ["М", "M"], ["н", "h"], ["Н", "H"], ["о", "o"], ["О", "O"],
+  ["р", "p"], ["Р", "P"], ["с", "c"], ["С", "C"], ["т", "t"], ["Т", "T"],
+  ["у", "y"], ["У", "Y"], ["х", "x"], ["Х", "X"], ["ѕ", "s"], ["Ѕ", "S"],
+  ["Α", "A"], ["α", "a"], ["Β", "B"], ["β", "b"], ["Ε", "E"], ["ε", "e"],
+  ["Ι", "I"], ["ι", "i"], ["Κ", "K"], ["κ", "k"], ["Μ", "M"], ["μ", "m"],
+  ["Ν", "N"], ["ν", "n"], ["Ο", "O"], ["ο", "o"], ["Ρ", "P"], ["ρ", "p"],
+  ["Τ", "T"], ["τ", "t"], ["Υ", "Y"], ["υ", "y"], ["Χ", "X"], ["χ", "x"],
+  ["Ϲ", "C"], ["ϲ", "c"], ["ϵ", "e"], ["ϱ", "p"],
 ]);
 type OperationalAssertion = Readonly<{
   pattern: RegExp;
@@ -760,9 +767,10 @@ function genericSuccessMatchIsResult(
   const previous = before.at(-1)?.word;
   if (previous && PREDICATE_DETERMINERS.has(previous)) return false;
   const after = localPredicateTokens(clause.slice(match.end, match.end + MAX_PREDICATE_CONTEXT_CHARS));
-  const next = after[0]?.word;
-  return next === undefined
-    || (!PREDICATE_DETERMINERS.has(next) && !LOCAL_SUBJECT_QUANTIFIER_WORD.test(next));
+  const directObjectToken = after[0]?.word;
+  if (directObjectToken && !isLocalStructuralToken(directObjectToken)) return false;
+  return directObjectToken === undefined
+    || (!PREDICATE_DETERMINERS.has(directObjectToken) && !LOCAL_SUBJECT_QUANTIFIER_WORD.test(directObjectToken));
 }
 
 function applySubjectEntitlement(clause: string, match: OperationalMatch): OperationalMatch | null {
@@ -867,7 +875,7 @@ function hasObfuscatedOperationalAssertion(text: string): boolean {
 }
 
 function repairedMixedScriptText(text: string): string {
-  if (!/\p{Script=Latin}/u.test(text) || !/\p{Script=Cyrillic}/u.test(text)) return text;
+  if (!/\p{Script=Latin}/u.test(text) || !/[\p{Script=Cyrillic}\p{Script=Greek}]/u.test(text)) return text;
   return Array.from(text, (character) => MIXED_SCRIPT_CONFUSABLES.get(character) ?? character).join("");
 }
 
@@ -936,7 +944,7 @@ function productionMentionContinuesPlainText(
   mention: Readonly<{ start: number; end: number }>,
   segmentSpans: readonly FinalizationSegmentSpan[],
 ): boolean {
-  if (mention.start <= match.end || /[.!?;]/.test(renderedMessage.slice(match.end, mention.start))) return false;
+  if (mention.start <= match.end || /[.!?]/.test(renderedMessage.slice(match.end, mention.start))) return false;
   const owningSpan = segmentSpans.find((span) => mention.start >= span.start && mention.end <= span.end);
   return owningSpan?.segment.type === "text";
 }

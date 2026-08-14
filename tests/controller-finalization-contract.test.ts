@@ -1301,6 +1301,23 @@ describe("bounded text heuristics", () => {
     );
   });
 
+  it("keeps a semicolon plain qualifier bound to the preceding execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed;",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: " they ran against production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
   it("keeps a plain-segment production qualifier bound to the execution claim", () => {
     const claim = claimFinalization({
       kind: "execution_result",
@@ -1316,6 +1333,22 @@ describe("bounded text heuristics", () => {
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
       "proof_incompatible",
     );
+  });
+
+  it.each([".", "?", "!"])("allows punctuation to delimit a plain production sentence: %s", (punctuation) => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: `Tests passed${punctuation}`,
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: " they ran against production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
   });
 
   it.each([
@@ -1703,9 +1736,21 @@ describe("bounded text heuristics", () => {
     "parser passed the value to next stage",
     "Use the passed value as default",
     "Pass the test fixture into helper",
+    "Parser passed value downstream.",
   ])("keeps non-result pass grammar ordinary: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
+  });
+
+  it("keeps a protected CI predicate when generic passed is transitive prose", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "pipeline_outcome",
+        outcome: "succeeded",
+        text: "CI passed value downstream.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
   });
 
   it("rejects a Cyrillic confusable in a plain operational result", () => {
@@ -1724,6 +1769,22 @@ describe("bounded text heuristics", () => {
     );
   });
 
+  it("rejects a Greek confusable in a plain operational result", () => {
+    expectRejection(
+      textFinalization("Tests p\u03b1ssed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it.each(["\u0422ests passed.", "\u0442ests passed."])("rejects a Cyrillic T confusable in a pipeline-only test claim: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
   it.each([
     "Ｔｈｅ ｂｕｉｌｄ ｓｕｃｃｅｅｄｅｄ.",
     "The bui\u200Bld succeeded.",
@@ -1731,9 +1792,12 @@ describe("bounded text heuristics", () => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
 
-  it("does not reject ordinary prose merely because it uses Unicode text", () => {
+  it.each([
+    "Full-width typography is fine for this note.",
+    "The α symbol is ordinary Unicode.",
+  ])("does not reject ordinary prose merely because it uses Unicode text: %s", (text) => {
     expect(validateControllerFinalization(
-      textFinalization("Full-width typography is fine for this note."),
+      textFinalization(text),
       emptyFinalizationContext(),
     )).toMatchObject({ outcome: "accepted" });
   });
