@@ -169,6 +169,23 @@ export type {
   ControllerInteractionStore,
 } from "./controller-interaction-repository";
 
+import {
+  CredentialAccessRepository,
+  type CredentialDiagnosticPrepareResult,
+  type CredentialHealthReconcileInput,
+  type CredentialHealthReconcileResult,
+  type CredentialHealthRecord,
+  type CredentialOperationCompleteInput,
+  type CredentialOperationCompleteResult,
+  type CredentialOperationRecord,
+  type CredentialReceiptRecord,
+  type CredentialVerificationCompleteInput,
+  type CredentialVerificationCompleteResult,
+  type CredentialVerificationPrepareInput,
+  type CredentialVerificationPrepareResult,
+} from "./credential-access-repository";
+import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
+
 /**
  * A tapped controller button. `replayed` is a Telegram redelivery of a callback
  * that was already settled, so it must neither answer again nor acknowledge
@@ -2653,6 +2670,33 @@ export interface TelegramAgentStore {
   enqueueReconcileForEnvironment(environmentId: string, now: number): boolean;
   shouldWakeForThread(threadId: string): boolean;
   shouldWakeForEnvironment(environmentId: string): boolean;
+  reconcileCredentialHealth(input: CredentialHealthReconcileInput): CredentialHealthReconcileResult;
+  listCredentialBindings(input: Readonly<{
+    installationId: string;
+    state?: BrokerBindingState;
+    afterBindingId?: string;
+    limit: number;
+  }>): readonly CredentialBindingMetadata[];
+  getCredentialBinding(installationId: string, bindingId: string): CredentialBindingMetadata | null;
+  prepareCredentialDiagnosticOperation(input: Readonly<{
+    installationId: string;
+    envelope: BrokerRequestEnvelope;
+    now: number;
+  }>): CredentialDiagnosticPrepareResult;
+  prepareCredentialVerificationOperation(
+    input: CredentialVerificationPrepareInput,
+  ): CredentialVerificationPrepareResult;
+  markCredentialOperationAmbiguous(input: Readonly<{
+    installationId: string;
+    requestId: string;
+    now: number;
+  }>): CredentialOperationRecord | null;
+  completeCredentialDiagnosticOperation(input: CredentialOperationCompleteInput): CredentialOperationCompleteResult;
+  completeCredentialVerificationOperation(
+    input: CredentialVerificationCompleteInput,
+  ): CredentialVerificationCompleteResult;
+  getCredentialReceipt(installationId: string, receiptId: string): CredentialReceiptRecord | null;
+  getCredentialHealth(installationId: string): CredentialHealthRecord | null;
 }
 
 export type TelegramStatusOutboxStore = TelegramAgentStore & {
@@ -3478,6 +3522,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly capabilityRepository: CapabilityRepository;
   private readonly controllerEvidenceRepository: ControllerEvidenceRepository;
   private readonly controllerInteractionRepository: ControllerInteractionRepository;
+  private readonly credentialAccessRepository: CredentialAccessRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -3495,6 +3540,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       db,
       this.controllerInteractionRepository,
     );
+    this.credentialAccessRepository = new CredentialAccessRepository(db);
+  }
+
+  public reconcileCredentialHealth(input: CredentialHealthReconcileInput): CredentialHealthReconcileResult {
+    return this.credentialAccessRepository.reconcileCredentialHealth(input);
+  }
+
+  public listCredentialBindings(input: Readonly<{
+    installationId: string;
+    state?: BrokerBindingState;
+    afterBindingId?: string;
+    limit: number;
+  }>): readonly CredentialBindingMetadata[] {
+    return this.credentialAccessRepository.listCredentialBindings(input);
+  }
+
+  public getCredentialBinding(installationId: string, bindingId: string): CredentialBindingMetadata | null {
+    return this.credentialAccessRepository.getCredentialBinding(installationId, bindingId);
+  }
+
+  public prepareCredentialDiagnosticOperation(input: Readonly<{
+    installationId: string;
+    envelope: BrokerRequestEnvelope;
+    now: number;
+  }>): CredentialDiagnosticPrepareResult {
+    return this.credentialAccessRepository.prepareCredentialDiagnosticOperation(input);
+  }
+
+  public prepareCredentialVerificationOperation(
+    input: CredentialVerificationPrepareInput,
+  ): CredentialVerificationPrepareResult {
+    return this.credentialAccessRepository.prepareCredentialVerificationOperation(input);
+  }
+
+  public markCredentialOperationAmbiguous(input: Readonly<{
+    installationId: string;
+    requestId: string;
+    now: number;
+  }>): CredentialOperationRecord | null {
+    return this.credentialAccessRepository.markCredentialOperationAmbiguous(input);
+  }
+
+  public completeCredentialDiagnosticOperation(
+    input: CredentialOperationCompleteInput,
+  ): CredentialOperationCompleteResult {
+    return this.credentialAccessRepository.completeCredentialDiagnosticOperation(input);
+  }
+
+  public completeCredentialVerificationOperation(
+    input: CredentialVerificationCompleteInput,
+  ): CredentialVerificationCompleteResult {
+    return this.credentialAccessRepository.completeCredentialVerificationOperation(input);
+  }
+
+  public getCredentialReceipt(installationId: string, receiptId: string): CredentialReceiptRecord | null {
+    return this.credentialAccessRepository.getCredentialReceipt(installationId, receiptId);
+  }
+
+  public getCredentialHealth(installationId: string): CredentialHealthRecord | null {
+    return this.credentialAccessRepository.getCredentialHealth(installationId);
   }
 
   public createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile {

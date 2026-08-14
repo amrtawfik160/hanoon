@@ -54,9 +54,10 @@ function nativeEvidenceCandidate(sourceItemId: string) {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(44);
-  expect(ALL_MIGRATIONS.at(-2)).toContain("CREATE TABLE merge_authority");
-  expect(ALL_MIGRATIONS.at(-1)).toContain("CREATE TABLE regression_watch");
+  expect(ALL_MIGRATIONS).toHaveLength(45);
+  expect(ALL_MIGRATIONS.at(-3)).toContain("CREATE TABLE merge_authority");
+  expect(ALL_MIGRATIONS.at(-2)).toContain("CREATE TABLE regression_watch");
+  expect(ALL_MIGRATIONS.at(-1)).toContain("CREATE TABLE credential_bindings");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
