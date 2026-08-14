@@ -32,8 +32,14 @@
     "eval:controller": "node scripts/eval-controller-outcomes.mjs",
     "eval:answers": "node scripts/eval-controller-answers.mjs",
     "check": "npm run typecheck && npm test && npm run build",
-    "verify:artifact": "node scripts/verify-built-artifact.mjs"
+    "verify:artifact": "node scripts/verify-built-artifact.mjs",
+    "broker:build": "npm run build --workspace @hanoon/credential-broker",
+    "broker:pack": "npm run broker:build && npm pack --workspace @hanoon/credential-broker",
+    "test:credentials": "vitest run tests/credential-*.test.ts"
   },
+  "workspaces": [
+    "broker"
+  ],
   "devDependencies": {
     "@bb/plugin-sdk": "file:vendor/bb-plugin-sdk-0.4.1.tgz",
     "@types/better-sqlite3": "^7.6.12",

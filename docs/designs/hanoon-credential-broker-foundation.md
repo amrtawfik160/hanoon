@@ -177,6 +177,33 @@ export type BrokerResponseEnvelope = Readonly<{
 }>;
 ```
 
+`CredentialBindingMetadata` is the secret-free projection of one enrolled
+binding. Earlier revisions named these fields only in prose, which left the wire
+shape, the broker table, and Hanoon's projection free to disagree; it is spelled
+out here so they cannot. It carries no external reference, vault id, item id, or
+field id — those stay broker-side.
+
+```ts
+export type CredentialBindingMetadata = Readonly<{
+  bindingId: string;
+  label: string;
+  provider: "onepassword";
+  state: "pending" | "vault_verified" | "active" | "revoked";
+  generation: number;
+  capabilityIds: readonly string[];
+  risk: "low" | "medium" | "high" | "critical";
+  mfaMode: "none" | "totp" | "webauthn" | "push";
+  approvalMode: "none" | "owner_confirmation";
+  lastVerifiedAt: number | null;
+}>;
+```
+
+`risk` reuses the trust kernel's `risk_class` vocabulary. `mfaMode` names the
+mechanisms the platform design defers to later specifications, so a binding can
+record what it will eventually need without this foundation claiming to satisfy
+it. `capabilityIds` holds at most eight future capability ids, all inactive in
+this phase.
+
 Unknown fields, schema versions, operations, result values, failure classes, health fields, or binding fields fail response validation. A successful `broker.health` response has `outcome: "succeeded"`, `result: "ready"`, one health snapshot, a non-null receipt, and every secret-free binding for the authenticated installation. The foundation caps an installation at 100 bindings, so reconciliation is complete rather than silently truncated. The broker reads those bindings from its policy store; it does not search or list the external vault. Hanoon reconciles the returned metadata into its local projection.
 
 A valid verification has `outcome: "succeeded"`, `result: "valid"`, and a non-null receipt. A missing item or field, empty value, or value outside the configured bound has `outcome: "failed"`, `result: "invalid"`, `failureClass: "credential_invalid"`, `retryable: false`, and a non-null audit receipt. Transport, policy, provider, authentication, and persistence failures have `result: null`. `retryAfterMs` is non-null only for a retryable provider rate limit or outage, and is bounded from 1,000 through 300,000 milliseconds. Every non-health response carries `health: null` and `bindings: []`; a failed health response does too. An active duplicate may return `result_ambiguous` without a receipt; a startup-reconciled interrupted claim returns it with an audit receipt. A local timeout or unparseable response is also treated as ambiguous, but is not itself a broker receipt. Hanoon never retries it blindly under a new idempotency key.
