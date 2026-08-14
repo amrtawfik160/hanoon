@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   BROKER_FAILURE_CLASSES,
   BROKER_MAX_DEADLINE_MS,
+  BROKER_BINDING_STATES,
   BROKER_MAX_BINDINGS,
   BROKER_SCHEMA_VERSION,
   FOUNDATION_BROKER_POLICY,
@@ -339,6 +340,24 @@ describe("parseBrokerResponse cross-field matrix", () => {
 });
 
 describe("protocol surface", () => {
+  it("pins the complete binding lifecycle both documents require", () => {
+    // The design names pending/vault_verified/active/revoked/compromised and the
+    // plan's verification transition names degraded. Missing one of these is not
+    // cosmetic: the broker could not record a demotion the plan mandates.
+    expect(BROKER_BINDING_STATES).toEqual([
+      "pending", "vault_verified", "degraded", "active", "revoked", "compromised",
+    ]);
+  });
+
+  it.each(["degraded", "compromised", "active", "revoked"] as const)(
+    "accepts a binding in the %s state",
+    (state) => {
+      expect(parseBrokerResponse(healthResponse({
+        bindings: [binding({ state })],
+      }))).toMatchObject({ ok: true });
+    },
+  );
+
   it("exposes every stable failure class exactly once", () => {
     expect(new Set(BROKER_FAILURE_CLASSES).size).toBe(BROKER_FAILURE_CLASSES.length);
     expect(BROKER_FAILURE_CLASSES).toContain("result_ambiguous");

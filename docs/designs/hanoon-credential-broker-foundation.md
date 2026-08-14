@@ -188,7 +188,7 @@ export type CredentialBindingMetadata = Readonly<{
   bindingId: string;
   label: string;
   provider: "onepassword";
-  state: "pending" | "vault_verified" | "active" | "revoked";
+  state: "pending" | "vault_verified" | "degraded" | "active" | "revoked" | "compromised";
   generation: number;
   capabilityIds: readonly string[];
   risk: "low" | "medium" | "high" | "critical";
@@ -203,6 +203,15 @@ mechanisms the platform design defers to later specifications, so a binding can
 record what it will eventually need without this foundation claiming to satisfy
 it. `capabilityIds` holds at most eight future capability ids, all inactive in
 this phase.
+
+The state lifecycle is: `pending` on enrolment; `vault_verified` once a resolve
+proves vault access; `active` only once a connector-authoritative check proves
+the credential works for its application. A deterministic invalid resolve leaves
+a `pending` binding where it is and demotes a `vault_verified` one to `degraded`,
+which keeps "never proven" distinguishable from "proven, then broken". `revoked`
+is a deliberate withdrawal that increments the generation. `compromised` is set
+across every binding of an installation whose client key leaked, and requires
+protected-host reenrolment.
 
 Unknown fields, schema versions, operations, result values, failure classes, health fields, or binding fields fail response validation. A successful `broker.health` response has `outcome: "succeeded"`, `result: "ready"`, one health snapshot, a non-null receipt, and every secret-free binding for the authenticated installation. The foundation caps an installation at 100 bindings, so reconciliation is complete rather than silently truncated. The broker reads those bindings from its policy store; it does not search or list the external vault. Hanoon reconciles the returned metadata into its local projection.
 
