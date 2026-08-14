@@ -25,7 +25,11 @@ const workflowIds = [
 const guardIds = ["clean-code-guard", "test-guard", "docs-guard"] as const;
 const deliveryIds = ["pr-writer"] as const;
 const discoveryIds = ["domain-modeling", "grill-with-docs", "grilling"] as const;
-const hanoonIds = ["human-friendly-coding-communication", "proportional-development-workflow"] as const;
+const hanoonIds = [
+  "durable-boundary-audit",
+  "human-friendly-coding-communication",
+  "proportional-development-workflow",
+] as const;
 const allIds = [...workflowIds, ...guardIds, ...deliveryIds, ...discoveryIds, ...hanoonIds].sort();
 const skillRoots = [
   "skills/workflow-kit",
@@ -222,7 +226,7 @@ describe("committed agent skill bundle", () => {
     const selected = Object.values(ROLE_SKILLS).flat();
     for (const id of selected) expect(allIds, `${id} is registered in the manifest`).toContain(id);
     expect(new Set(ROLE_SKILLS.implementation).size).toBe(ROLE_SKILLS.implementation.length);
-    expect(ROLE_SKILLS.planner).toEqual(["human-friendly-coding-communication"]);
+    expect(ROLE_SKILLS.planner).toEqual(["human-friendly-coding-communication", "docs-guard"]);
     expect(ROLE_SKILLS.critic).toEqual(["human-friendly-coding-communication"]);
   });
 });

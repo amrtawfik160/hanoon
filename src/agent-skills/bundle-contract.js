@@ -48,7 +48,11 @@ const workflowSkillIds = [
 const guardSkillIds = ["clean-code-guard", "docs-guard", "test-guard"];
 const deliverySkillIds = ["pr-writer"];
 const discoverySkillIds = ["domain-modeling", "grill-with-docs", "grilling"];
-const hanoonSkillIds = ["human-friendly-coding-communication", "proportional-development-workflow"];
+const hanoonSkillIds = [
+  "durable-boundary-audit",
+  "human-friendly-coding-communication",
+  "proportional-development-workflow",
+];
 
 export const WORKFLOW_KIT = Object.freeze({
   version: "6.3.0",

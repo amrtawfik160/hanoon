@@ -32,7 +32,11 @@ export const BUNDLED_SKILL_IDS = CAPABILITY_SKILL_IDS;
 export type BundledSkillId = CapabilitySkillId;
 
 export const ROLE_SKILLS = {
-  planner: [COMMUNICATION_SKILL_ID],
+  // The plan is a document that must reproduce the policy's exact verification
+  // commands, so its claims are checkable against the repository the same way a
+  // README's are. That is docs-guard's job, and a wrong command here is only
+  // discovered much later, when the verification it promised does not run.
+  planner: [COMMUNICATION_SKILL_ID, "docs-guard"],
   critic: [COMMUNICATION_SKILL_ID],
   implementation: [
     COMMUNICATION_SKILL_ID,
@@ -41,13 +45,23 @@ export const ROLE_SKILLS = {
     "verification-before-completion",
     "clean-code-guard",
     "test-guard",
+    // The generic guards judge whether code is clean and tested. This one judges
+    // it against the boundaries that make the plugin safe to run unattended, and
+    // requires a new guard to be shown failing before it is trusted.
+    "durable-boundary-audit",
     // The implementation attempt is the one that opens the pull request the
     // reviewer then reads, so it owns writing a reviewer-facing description.
     "pr-writer",
   ],
-  review: [COMMUNICATION_SKILL_ID, "clean-code-guard", "test-guard"],
+  review: [COMMUNICATION_SKILL_ID, "clean-code-guard", "test-guard", "durable-boundary-audit"],
   documentation: [COMMUNICATION_SKILL_ID, "docs-guard", "verification-before-completion"],
-  "final-review": [COMMUNICATION_SKILL_ID, "clean-code-guard", "test-guard", "docs-guard"],
+  "final-review": [
+    COMMUNICATION_SKILL_ID,
+    "clean-code-guard",
+    "test-guard",
+    "docs-guard",
+    "durable-boundary-audit",
+  ],
 } as const satisfies Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>>;
 
 export type WorkerTitleIdentity = Readonly<{

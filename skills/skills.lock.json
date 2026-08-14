@@ -60,6 +60,12 @@
       "license": "MIT"
     },
     {
+      "id": "durable-boundary-audit",
+      "skillPath": "skills/hanoon/durable-boundary-audit/SKILL.md",
+      "source": "first-party",
+      "license": "first-party"
+    },
+    {
       "id": "executing-plans",
       "skillPath": "skills/workflow-kit/executing-plans/SKILL.md",
       "source": "https://github.com/obra/superpowers",
@@ -304,6 +310,10 @@
     {
       "path": "skills/guards/test-guard/SKILL.md",
       "sha256": "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0"
+    },
+    {
+      "path": "skills/hanoon/durable-boundary-audit/SKILL.md",
+      "sha256": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f"
     },
     {
       "path": "skills/hanoon/human-friendly-coding-communication/SKILL.md",

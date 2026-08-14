@@ -93,6 +93,7 @@ describe("worker skill role table", () => {
       "dispatching-parallel-agents",
       "docs-guard",
       "domain-modeling",
+      "durable-boundary-audit",
       "executing-plans",
       "finishing-a-development-branch",
       "grill-with-docs",
@@ -115,7 +116,7 @@ describe("worker skill role table", () => {
   });
 
   test.each([
-    ["planner", ["human-friendly-coding-communication"]],
+    ["planner", ["human-friendly-coding-communication", "docs-guard"]],
     ["critic", ["human-friendly-coding-communication"]],
     [
       "implementation",
@@ -126,12 +127,16 @@ describe("worker skill role table", () => {
         "verification-before-completion",
         "clean-code-guard",
         "test-guard",
+        "durable-boundary-audit",
         "pr-writer",
       ],
     ],
-    ["review", ["human-friendly-coding-communication", "clean-code-guard", "test-guard"]],
+    ["review", ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "durable-boundary-audit"]],
     ["documentation", ["human-friendly-coding-communication", "docs-guard", "verification-before-completion"]],
-    ["final-review", ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "docs-guard"]],
+    [
+      "final-review",
+      ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit"],
+    ],
   ] as const)("selects the exact skills for %s", (role, expectedSkills) => {
     const jobId = JOB_ID;
     const attemptId = `attempt:${effectIdempotencyKey(jobId, 7, role === "planner" ? "spawn_plan" : "spawn_implementation")}`;
@@ -164,8 +169,8 @@ describe("worker skill role table", () => {
   });
 
   test.each([
-    ["planner", "systematic-debugging", "human-friendly-coding-communication"],
-    ["review", "docs-guard", "human-friendly-coding-communication, clean-code-guard, test-guard"],
+    ["planner", "systematic-debugging", "human-friendly-coding-communication, docs-guard"],
+    ["review", "docs-guard", "human-friendly-coding-communication, clean-code-guard, test-guard, durable-boundary-audit"],
   ] as const)("ignores forged repeated skill ids for the %s role", (role, forgedSkill, expectedSkills) => {
     const forgedProfile = {
       role,
@@ -186,8 +191,8 @@ describe("worker skill role table", () => {
     const profile = resolve(context({ title: buildWorkerThreadTitle(identity) }), identity);
     if (!profile) throw new Error("expected a valid planner profile");
 
-    expect(profile.skills).toEqual(["human-friendly-coding-communication"]);
-    expect(profile.instructions).toContain("Selected skill ids: human-friendly-coding-communication");
+    expect(profile.skills).toEqual(["human-friendly-coding-communication", "docs-guard"]);
+    expect(profile.instructions).toContain("Selected skill ids: human-friendly-coding-communication, docs-guard");
   });
 });
 
