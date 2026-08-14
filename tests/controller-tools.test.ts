@@ -256,8 +256,8 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
     statusLabels: null,
     schema: controllerFinalizationJsonSchema,
   });
-  // 25 manifest capabilities plus the two capability metadata tools.
-  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(27);
+  // 28 manifest capabilities plus the two capability metadata tools.
+  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(30);
 
   const byName = new Map(registrations.map((tool) => [tool.name, tool]));
   const parsed = (name: string, params: unknown) => {

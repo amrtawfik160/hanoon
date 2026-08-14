@@ -439,6 +439,57 @@ const EXPECTED_CAPABILITIES = {
     receipt_kind: "tool_receipt",
     result_limit: 8_000,
   },
+  telegram_agent_access_list: {
+    capability_id: "telegram_agent_access_list",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["credential_metadata"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 8_000,
+  },
+  telegram_agent_access_status: {
+    capability_id: "telegram_agent_access_status",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["credential_health"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "credential_broker", audience: "hanoon-credential-broker:v1" },
+    egress: ["credential_broker"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 4_000,
+  },
+  telegram_agent_access_verify: {
+    capability_id: "telegram_agent_access_verify",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "medium",
+    data_class: ["credential_metadata"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "exact_entity",
+    credential_scope: { credential: "credential_broker", audience: "hanoon-credential-broker:v1" },
+    egress: ["credential_broker"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 2_000,
+  },
 } as const satisfies Readonly<Record<ControllerToolName, ControllerCapabilityDescriptor>>;
 
 const SAFE_AUTHORITY: ControllerCapabilityAuthority = {
@@ -546,6 +597,9 @@ describe("controller capability manifest", () => {
       "telegram_agent_respond",
       "telegram_agent_steer_job",
       "telegram_agent_adopt_pr",
+      "telegram_agent_access_list",
+      "telegram_agent_access_status",
+      "telegram_agent_access_verify",
     ]);
     expect(CONTROLLER_DATA_CLASSES).toEqual([
       "project_metadata",
@@ -556,10 +610,12 @@ describe("controller capability manifest", () => {
       "health_metrics",
       "controller_evidence",
       "controller_finalization",
+      "credential_metadata",
+      "credential_health",
     ]);
   });
 
-  it("pins every descriptor field and proof order for all 25 tools", () => {
+  it("pins every descriptor field and proof order for all 28 tools", () => {
     expect(CONTROLLER_CAPABILITIES).toEqual(EXPECTED_CAPABILITIES);
     expect(Object.keys(CONTROLLER_CAPABILITIES)).toEqual([...CONTROLLER_TOOL_NAMES]);
   });

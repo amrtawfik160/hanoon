@@ -21,7 +21,8 @@ import type {
 import type { TelegramAgentStore } from "../storage/store";
 
 const MAX_SAFE_SUBJECTS = 16;
-const SAFE_SUBJECT_REF = /^(?:project|job|thread|monitor|memory|delegation|controller):[^\s:]{1,248}$/;
+const SAFE_SUBJECT_REF =
+  /^(?:project|job|thread|monitor|memory|delegation|controller|credential-binding|credential-receipt):[^\s:]{1,248}$/;
 const INTERRUPTED_DOMAIN_RESULT = Object.freeze({
   outcome: "uncertain",
   detail: "An identical call was already started and its outcome is unknown. Check current state before acting again.",
@@ -41,8 +42,8 @@ export type ControllerCapabilityDependencies = Readonly<{
   store: TelegramAgentStore;
   now(): number;
   credential: Readonly<{
-    credential: "none" | "bb";
-    audience: "none" | "bb-plugin-sdk";
+    credential: "none" | "bb" | "credential_broker";
+    audience: "none" | "bb-plugin-sdk" | "hanoon-credential-broker:v1";
   }>;
   sdk?: BbPluginApi["sdk"];
 }>;
@@ -87,7 +88,10 @@ export type ExecuteControllerCapabilityInput = Omit<ControllerCapabilityAuthoriz
   scope?: ControllerCapabilityScope;
   resolveScope?(authorized: AuthorizedControllerCapability):
     ControllerCapabilityScopeResolution | Promise<ControllerCapabilityScopeResolution>;
-  run(resolution: ControllerCapabilityScopeResolution): unknown | Promise<unknown>;
+  run(
+    resolution: ControllerCapabilityScopeResolution,
+    authorized: AuthorizedControllerCapability,
+  ): unknown | Promise<unknown>;
   projectEvidence(
     domainResult: Readonly<ControllerJsonObject>,
     resolution: ControllerCapabilityScopeResolution,
@@ -371,7 +375,7 @@ async function domainResultForExecution(
     ? receiptKey(authorized, input.descriptor, input.params)
     : null;
   if (key === null) {
-    const rawDomainValue = await input.run(resolution);
+    const rawDomainValue = await input.run(resolution, authorized);
     try {
       return { domainResult: normalizedDomainObject(rawDomainValue), replay: false, interrupted: false, key };
     } catch {
@@ -391,7 +395,7 @@ async function domainResultForExecution(
   }
   let rawDomainValue: unknown;
   try {
-    rawDomainValue = await input.run(resolution);
+    rawDomainValue = await input.run(resolution, authorized);
   } catch (error) {
     if (input.descriptor.effect_class === "durable_local_write") {
       dependencies.store.failToolReceipt({ ...key, error: "domain_operation_failed", now: dependencies.now() });
@@ -514,6 +518,7 @@ export type ControllerCapabilityToolRegistration<Schema extends z.ZodType> = Rea
     params: z.output<Schema>,
     context: PluginAgentToolContext,
     resolution: ControllerCapabilityScopeResolution,
+    authorized: AuthorizedControllerCapability,
   ): unknown | Promise<unknown>;
   projectEvidence(
     params: z.output<Schema>,
@@ -557,7 +562,7 @@ export function registerControllerCapabilityTool<Schema extends z.ZodType>(
       context,
       approval: "not_required",
       resolveScope: (authorized) => registration.resolveScope(params, context, authorized),
-      run: (resolution) => registration.execute(params, context, resolution),
+      run: (resolution, authorized) => registration.execute(params, context, resolution, authorized),
       projectEvidence: (domainResult, resolution) =>
         registration.projectEvidence(params, context, domainResult, resolution),
     }),
