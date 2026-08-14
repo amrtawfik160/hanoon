@@ -119,8 +119,7 @@ it("reports isolated configuration as failing — never disabled — when the sa
   expect(rows.some((row) => row.status === "disabled")).toBe(false);
 });
 
-it("stops at the controller-permission short circuit instead of inventing broker checks it never reached", async () => {
-  // controllerPermissionMode defaults to "full", not "auto".
+it("uses the auto controller-permission default when reporting credential readiness", async () => {
   const { harness } = await loadPlugin(isolatedSettings());
 
   const doctorResult = await harness.behavior.runCli(["doctor", "--json"]);
@@ -129,8 +128,15 @@ it("stops at the controller-permission short circuit instead of inventing broker
     "credential: trust kernel",
     "credential: controller permission",
     "credential: isolated configuration",
+    "credential: topology receipt",
+    "credential: broker tls",
+    "credential: broker identity",
+    "credential: protocol version",
+    "credential: installation identity",
+    "credential: broker audit",
+    "credential: onepassword adapter",
   ]);
-  expect(rows.find((row) => row.name === "credential: controller permission")?.status).toBe("fail");
+  expect(rows.find((row) => row.name === "credential: controller permission")?.status).toBe("pass");
   expect(rows.find((row) => row.name === "credential: isolated configuration")?.status).toBe("pass");
 });
 

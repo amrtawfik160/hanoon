@@ -4,50 +4,29 @@ import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import {
-  CONTROLLER_PHASE_TEXT,
-} from "../src/controller/models";
-import {
   BbControllerAdapter,
   ControllerImagePreparationError,
+  controllerSpawnTitle,
   type ControllerAdapter,
 } from "../src/controller/bb-controller";
 import {
   DEFAULT_CONTROLLER_EXECUTION_PROFILE,
   type ControllerExecutionProfile,
 } from "../src/controller/execution-profile";
-import { CONTROLLER_UNWATCHED_PROMISE_RESPONSE } from "../src/controller/promise-gate";
-import {
-  CONTROLLER_STALL_MS,
-  LunaControllerService,
-  type ControllerInteractionReconciler,
-} from "../src/controller/service";
-import { CONTROLLER_INSTRUCTION_SENTINEL } from "../src/controller/instructions";
-import { ControllerInteractionService } from "../src/controller/interaction-service";
-import { ControllerInteractionRepository } from "../src/storage/controller-interaction-repository";
-import {
-  ControllerEvidenceProjectorError,
-  type ControllerEvidenceReconciler,
-  type ControllerEvidenceReconciliation,
-} from "../src/controller/evidence-projector";
+import { CONTROLLER_STALL_MS, LunaControllerService } from "../src/controller/service";
+import { completeAcceptedControllerTurn, validEvidenceInput } from "./support/controller-trust-fixtures";
 
-
-function stubInteractionService(
-  overrides: Partial<ControllerInteractionReconciler> = {},
-): ControllerInteractionReconciler {
-  return {
-    deliverAnswered: vi.fn(async () => false),
-    fetchPending: vi.fn(async () => ({ outcome: "invalid" as const })),
-    ...overrides,
-  };
-}
-
-const evidenceProjector = { reconcile: vi.fn(async () => ({
-  outcome: "reconciled" as const,
-  reconciliationIncomplete: null,
-  fromSeq: 0,
-  throughSeq: 0,
-  targetSeq: 0,
-})) };
+const evidenceProjector = {
+  reconcile: vi.fn(async (...args: unknown[]) => ({
+    outcome: "reconciled" as const,
+    reconciliationIncomplete: null,
+    fromSeq: 0,
+    throughSeq: Number(args[1] && typeof args[1] === "object" && "evidenceEventSeq" in args[1]
+      ? (args[1] as { evidenceEventSeq: number }).evidenceEventSeq
+      : 0),
+    targetSeq: typeof args[4] === "number" ? args[4] : 0,
+  })),
+};
 
 function personalProject(overrides: Record<string, unknown> = {}) {
   return {
@@ -145,17 +124,9 @@ function sdkFixture(options: {
   maxSeq?: number;
   threadProvider?: string;
   executionProfile?: ControllerExecutionProfile;
-  executionProfiles?: readonly ControllerExecutionProfile[];
   downloadImage?: (fileId: string, maxBytes: number, signal: AbortSignal) => Promise<Uint8Array>;
-  sampleMotionFrames?: (input: {
-    bytes: Uint8Array;
-    fileName: string;
-    signal: AbortSignal;
-  }) => Promise<readonly { fileName: string; mimeType: "image/jpeg"; bytes: Uint8Array }[]>;
 } = {}) {
-  const spawn = vi.fn(async (
-    _input: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0],
-  ) => ({ id: "thr_controller", environmentId: "env_personal" }));
+  const spawn = vi.fn(async () => ({ id: "thr_controller", environmentId: "env_personal" }));
   const send = vi.fn(async () => ({ ok: true }));
   const upload = vi.fn(async (input: {
     clientFile: Uint8Array;
@@ -192,11 +163,10 @@ function sdkFixture(options: {
   const dependencies = {
     sdk,
     pluginId: "telegram-agent",
-    executionProfiles: () => options.executionProfiles ?? [
-      options.executionProfile ?? DEFAULT_CONTROLLER_EXECUTION_PROFILE,
-    ],
+    executionProfile: () => options.executionProfile ?? DEFAULT_CONTROLLER_EXECUTION_PROFILE,
+    now: () => 2_000,
+    reserveSpawn: () => true,
     downloadImage: options.downloadImage,
-    sampleMotionFrames: options.sampleMotionFrames,
   };
   return { adapter: new BbControllerAdapter(dependencies), spawn, send, upload, list, eventsList, timeline };
 }
@@ -215,15 +185,16 @@ function agentDelta(seq: number, delta: string) {
 
 it("spawns the hidden personal controller on the configured model and provider", async () => {
   const { adapter, spawn } = sdkFixture();
+  const turn = turnRecord();
 
-  await adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000));
+  await adapter.spawn(turn, controllerRecord(), AbortSignal.timeout(1_000));
 
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
     projectId: "proj_personal",
     providerId: "claude-code",
     model: "claude-opus-5[1m]",
     reasoningLevel: "xhigh",
-    permissionMode: "full",
+    permissionMode: "auto",
     visibility: "hidden",
     environment: {
       type: "host",
@@ -236,7 +207,7 @@ it("spawns the hidden personal controller on the configured model and provider",
       reasoningLevel: "explicit",
       permissionMode: "explicit",
     },
-    input: [{ type: "text", text: expect.stringContaining("What projects can you work on?"), mentions: [] }],
+    input: [{ type: "text", text: turn.inputText, mentions: [] }],
   }));
 });
 
@@ -250,7 +221,7 @@ it("keeps the configured execution tuple on later controller turns", async () =>
     mode: "start",
     model: "claude-opus-5[1m]",
     reasoningLevel: "xhigh",
-    permissionMode: "full",
+    permissionMode: "auto",
     executionInputSources: {
       model: "explicit",
       reasoningLevel: "explicit",
@@ -299,82 +270,6 @@ it("uses BB's active-steer mode for a text correction", async () => {
   }));
 });
 
-it("samples a Telegram video into ordered stills the controller can see", async () => {
-  const videoBytes = new Uint8Array([9, 9, 9]);
-  const frameA = new Uint8Array([1]);
-  const frameB = new Uint8Array([2]);
-  const downloadImage = vi.fn(async (fileId: string) => {
-    if (fileId === "video-file-id") return videoBytes;
-    throw new Error(`unexpected file ${fileId}`);
-  });
-  const sampleMotionFrames = vi.fn(async () => [
-    { fileName: "telegram-clip-frame-01.jpg", mimeType: "image/jpeg" as const, bytes: frameA },
-    { fileName: "telegram-clip-frame-02.jpg", mimeType: "image/jpeg" as const, bytes: frameB },
-  ]);
-  const { adapter, send, upload } = sdkFixture({ downloadImage, sampleMotionFrames });
-
-  await adapter.send("thr_controller", "What is on this screen?", AbortSignal.timeout(1_000), {
-    fileId: "video-file-id",
-    fileName: "telegram-clip.mp4",
-    mimeType: "video/mp4",
-    sizeBytes: 3,
-    kind: "video",
-    durationSeconds: 8,
-    thumbnail: {
-      fileId: "thumb-file-id",
-      fileName: "telegram-clip-thumb.jpg",
-      sizeBytes: 1,
-    },
-  });
-
-  expect(downloadImage).toHaveBeenCalledWith("video-file-id", 20 * 1024 * 1024, expect.any(AbortSignal));
-  expect(upload).toHaveBeenCalledTimes(2);
-  expect(send).toHaveBeenCalledWith(expect.objectContaining({
-    input: [
-      {
-        type: "text",
-        text: expect.stringContaining("The owner sent a video. These 2 stills are sampled in order"),
-        mentions: [],
-      },
-      { type: "localImage", path: "/attachments/telegram-clip-frame-01.jpg" },
-      { type: "localImage", path: "/attachments/telegram-clip-frame-02.jpg" },
-    ],
-  }));
-});
-
-it("falls back to the Telegram preview still when a clip cannot be sampled", async () => {
-  const downloadImage = vi.fn(async (fileId: string) => {
-    if (fileId === "thumb-file-id") return new Uint8Array([3]);
-    return new Uint8Array([9, 9, 9]);
-  });
-  const { adapter, send, upload } = sdkFixture({
-    downloadImage,
-    sampleMotionFrames: async () => [],
-  });
-
-  await adapter.send("thr_controller", "Look at this", AbortSignal.timeout(1_000), {
-    fileId: "video-file-id",
-    fileName: "telegram-clip.mp4",
-    mimeType: "video/mp4",
-    sizeBytes: 3,
-    kind: "video",
-    durationSeconds: 5,
-    thumbnail: {
-      fileId: "thumb-file-id",
-      fileName: "telegram-clip-thumb.jpg",
-      sizeBytes: 1,
-    },
-  });
-
-  expect(upload).toHaveBeenCalledTimes(1);
-  expect(send).toHaveBeenCalledWith(expect.objectContaining({
-    input: [
-      { type: "text", text: expect.stringContaining("preview still"), mentions: [] },
-      { type: "localImage", path: "/attachments/telegram-clip-thumb.jpg" },
-    ],
-  }));
-});
-
 it("classifies a pre-submit image download failure as retryable", async () => {
   const downloadImage = vi.fn(async () => { throw new Error("temporary Telegram outage"); });
   const { adapter, send } = sdkFixture({ downloadImage });
@@ -392,7 +287,6 @@ it("reduces BB controller events after the durable sequence without exposing rea
   const events = [
     { id: "e11", threadId: "thr_controller", seq: 11, createdAt: 11, scope: { kind: "thread" }, type: "turn/input/accepted", data: {} },
     { id: "e12", threadId: "thr_controller", seq: 12, createdAt: 12, scope: { kind: "thread" }, type: "item/reasoning/textDelta", data: { delta: "private chain" } },
-    { id: "e12b", threadId: "thr_controller", seq: 12.5, createdAt: 12, scope: { kind: "thread" }, type: "item/reasoning/summaryTextDelta", data: { delta: "Checking the webhook" } },
     { id: "e13", threadId: "thr_controller", seq: 13, createdAt: 13, scope: { kind: "thread" }, type: "item/agentMessage/delta", data: { delta: "Hello" } },
     { id: "e14", threadId: "thr_controller", seq: 14, createdAt: 14, scope: { kind: "thread" }, type: "turn/completed", data: {} },
   ];
@@ -402,35 +296,17 @@ it("reduces BB controller events after the durable sequence without exposing rea
   await expect(adapter.events("thr_controller", 10, signal)).resolves.toEqual({
     latestSeq: 14,
     inputAccepted: true,
-    assistantOutputObserved: true, toolActivityObserved: false,
+    assistantOutputObserved: true,
+    toolActivityObserved: false,
     completed: true,
     error: null,
-    interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
+    interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
   });
   expect(eventsList).toHaveBeenCalledWith({
     threadId: "thr_controller",
     afterSeq: "10",
     limit: "100",
     signal,
-  });
-});
-
-it.each(["webFetch", "imageView"] as const)("counts %s as observed tool activity", async (itemType) => {
-  const events = [{
-    id: `e-${itemType}`,
-    threadId: "thr_controller",
-    seq: 11,
-    createdAt: 11,
-    scope: { kind: "thread" },
-    type: "item/started",
-    data: { item: { type: itemType } },
-  }];
-  const { adapter } = sdkFixture({ events });
-
-  await expect(adapter.events("thr_controller", 10, AbortSignal.timeout(1_000))).resolves.toMatchObject({
-    latestSeq: 11,
-    toolActivityObserved: true,
-    toolCalls: 1,
   });
 });
 
@@ -442,7 +318,7 @@ it("reads every page of BB controller events rather than the first hundred", asy
 
   await expect(adapter.events("thr_controller", 0, AbortSignal.timeout(1_000))).resolves.toMatchObject({
     latestSeq: 102,
-    assistantOutputObserved: true, toolActivityObserved: false,
+    assistantOutputObserved: true,
     completed: true,
   });
   expect(eventsList).toHaveBeenCalledTimes(2);
@@ -494,7 +370,7 @@ it("uses the configured execution profile for initial and later controller turns
 
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
     providerId: "codex",
-    title: "Telegram Codex controller owner-7-controller",
+    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal", "host_personal", "codex"),
     ...executionProfile,
     executionInputSources: {
       providerId: "explicit",
@@ -516,47 +392,20 @@ it("uses the configured execution profile for initial and later controller turns
   }));
 });
 
-it("selects each configured fallback profile from the turn's durable fallback index", async () => {
-  const executionProfiles: readonly ControllerExecutionProfile[] = [
-    DEFAULT_CONTROLLER_EXECUTION_PROFILE,
-    {
-      model: "gpt-5.6-terra",
-      reasoningLevel: "high",
-      serviceTier: "fast",
-      permissionMode: "accept-edits",
-    },
-    {
-      model: "gpt-5.6-sol",
-      reasoningLevel: "high",
-      serviceTier: "fast",
-      permissionMode: "accept-edits",
-    },
-  ];
-  const { adapter, spawn } = sdkFixture({ executionProfiles, threadProvider: "codex" });
+it("preserves an explicitly configured full permission mode on spawn and send", async () => {
+  const executionProfile: ControllerExecutionProfile = {
+    model: "claude-opus-5[1m]",
+    reasoningLevel: "xhigh",
+    serviceTier: "default",
+    permissionMode: "full",
+  };
+  const { adapter, spawn, send } = sdkFixture({ executionProfile });
 
-  await adapter.spawn(
-    turnRecord({ modelFallbackIndex: 1 }),
-    controllerRecord(),
-    AbortSignal.timeout(1_000),
-  );
-  await adapter.spawn(
-    turnRecord({ modelFallbackIndex: 2 }),
-    controllerRecord(),
-    AbortSignal.timeout(1_000),
-  );
+  await adapter.spawn(turnRecord(), controllerRecord(), AbortSignal.timeout(1_000));
+  await adapter.send("thr_controller", "Show active threads", AbortSignal.timeout(1_000));
 
-  expect(spawn.mock.calls.map(([input]) => ({
-    providerId: input.providerId,
-    model: input.model,
-  }))).toEqual([
-    { providerId: "codex", model: "gpt-5.6-terra" },
-    { providerId: "codex", model: "gpt-5.6-sol" },
-  ]);
-  expect(adapter.hasExecutionProfile(0)).toBe(true);
-  expect(adapter.hasExecutionProfile(2)).toBe(true);
-  expect(adapter.hasExecutionProfile(3)).toBe(false);
-  await expect(adapter.status("thr_controller", AbortSignal.timeout(1_000), 1)).resolves.toBe("idle");
-  await expect(adapter.status("thr_controller", AbortSignal.timeout(1_000), 0)).resolves.toBe("incompatible");
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: "full" }));
+  expect(send).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: "full" }));
 });
 
 it("fails closed when an unbound personal project has multiple connected hosts", async () => {
@@ -592,21 +441,22 @@ it("adopts only one exact plugin-origin hidden spawn candidate", async () => {
     projectId: "proj_personal",
     providerId: "claude-code",
     status: "idle",
-    title: "Telegram Luna controller owner-7-controller",
+    title: controllerSpawnTitle("owner-7-controller", "controller-turn-1", "proj_personal", "host_personal", "claude-code"),
     visibility: "hidden",
     originPluginId: "telegram-agent",
+    environmentHostId: "host_personal",
     archivedAt: null,
     deletedAt: null,
   };
   const one = sdkFixture({ threads: [candidate] });
-  await expect(one.adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toMatchObject({
+  await expect(one.adapter.findSpawnCandidate("owner-7-controller", "controller-turn-1", AbortSignal.timeout(1_000))).resolves.toMatchObject({
     threadId: "thr_candidate",
     projectId: "proj_personal",
     hostId: "host_personal",
   });
 
   const ambiguous = sdkFixture({ threads: [candidate, { ...candidate, id: "thr_other" }] });
-  await expect(ambiguous.adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).rejects.toThrow(/multiple|ambiguous/i);
+  await expect(ambiguous.adapter.findSpawnCandidate("owner-7-controller", "controller-turn-1", AbortSignal.timeout(1_000))).rejects.toThrow(/multiple|ambiguous/i);
 });
 
 it("does not re-adopt the errored production controller during recovery", async () => {
@@ -623,7 +473,115 @@ it("does not re-adopt the errored production controller during recovery", async 
   };
   const { adapter } = sdkFixture({ threads: [poisoned] });
 
-  await expect(adapter.findSpawnCandidate("owner-7-controller", AbortSignal.timeout(1_000))).resolves.toBeNull();
+  await expect(adapter.findSpawnCandidate("owner-7-controller", "controller-turn-1", AbortSignal.timeout(1_000))).resolves.toBeNull();
+});
+
+it("passes the current pending token to adoption so a stale title yields a fresh spawn", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 77, inputText: "start fresh" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const findSpawnCandidate = vi.fn(async (controllerKey: string, pendingSpawnToken: string) => {
+    expect(controllerKey).toBe("owner-7-controller");
+    expect(pendingSpawnToken).toBe(turn.id);
+    // The adapter has already ignored a stale T1 title; only the current T2
+    // token may participate in adoption.
+    return null;
+  });
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_000,
+    })).toBe(true);
+    return {
+      threadId: "thr_fresh_token",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: spawnTurn.id,
+    };
+  });
+  const adapter: ControllerAdapter = {
+    spawn,
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate,
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(findSpawnCandidate).toHaveBeenCalledWith("owner-7-controller", turn.id, fence.signal);
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: "thr_fresh_token", state: "active" });
+});
+
+it("adopts an exact image spawn candidate before preparing the image again", async () => {
+  const { store, fence } = serviceFixture();
+  const image = {
+    fileId: "telegram-image-before-map",
+    fileName: "telegram-screenshot.png",
+    mimeType: "image/png" as const,
+    sizeBytes: 12,
+  };
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 78, inputText: "Read this screenshot", image }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const findSpawnCandidate = vi.fn(async (controllerKey: string, pendingSpawnToken: string) => {
+    expect(controllerKey).toBe("owner-7-controller");
+    expect(pendingSpawnToken).toBe(turn.id);
+    return {
+      threadId: "thr_image_recovered",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: turn.id,
+    };
+  });
+  const spawn = vi.fn(async () => {
+    throw new Error("image spawn should not be repeated after adoption");
+  });
+  const adapter: ControllerAdapter = {
+    spawn,
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: false,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate,
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(findSpawnCandidate).toHaveBeenCalledTimes(1);
+  expect(spawn).not.toHaveBeenCalled();
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    threadId: "thr_image_recovered",
+    state: "active",
+  });
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", image });
 });
 
 let serviceFixtureNumber = 0;
@@ -635,137 +593,1261 @@ function serviceFixture() {
   const lease = store.acquireExecutorLease("executor", 2_000, 30_000);
   if (!lease.acquired) throw new Error("missing lease");
   const fence = { ownerId: "executor", generation: lease.generation, signal: AbortSignal.timeout(2_000) };
-  return { store, fence, db: bb.storage.database() };
+  return { db: bb.storage.database(), store, fence, reopen: () => openStore(bb.storage, bb.storage.kv, () => 2_000) };
 }
 
-it("dispatches FIFO and never completes an idle turn from raw provider output", async () => {
-  evidenceProjector.reconcile.mockClear();
-  const { store, fence } = serviceFixture();
-  store.enqueueControllerTurn({ ...turnRecord({ updateId: 11, inputText: "first" }), telegramUserId: "7", telegramChatId: "7", now: 2_000 });
-  store.enqueueControllerTurn({ ...turnRecord({ updateId: 12, inputText: "second" }), telegramUserId: "7", telegramChatId: "7", now: 2_001 });
-  let status: "active" | "idle" = "active";
-  const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
-    send: vi.fn(async () => undefined),
-    status: async () => status,
-    latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
-    steer: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
-  };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+function reserveControllerSpawnForTest(
+  store: ReturnType<typeof serviceFixture>["store"],
+  turnId: string,
+  now = 2_000,
+  projectId = "proj_personal",
+  hostId = "host_personal",
+): void {
+  const turn = store.getControllerTurn(turnId);
+  if (!turn) throw new Error("missing controller turn for spawn reservation");
+  if (!store.reserveControllerSpawn({
+    controllerKey: turn.controllerKey,
+    turnId,
+    projectId,
+    hostId,
+    now,
+  })) {
+    throw new Error("controller spawn reservation failed");
+  }
+}
 
-  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-  await expect(service.processOne(fence, fence.signal)).resolves.toBe(false);
-  expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["submitted", "queued"]);
+function recordServiceQuestion(
+  store: ReturnType<typeof serviceFixture>["store"],
+  fence: { ownerId: string; generation: number; now?: number },
+  turnId: string,
+  interactionId: string,
+): string {
+  const turn = store.getControllerTurn(turnId);
+  if (!turn) throw new Error("missing service turn");
+  const generation = store.listControllerGenerations(turn.controllerKey, 1)[0];
+  if (!generation) throw new Error("missing service generation");
+  return store.recordControllerInteraction({
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: fence.now ?? 2_000,
+    turnId,
+    controllerKey: turn.controllerKey,
+    bbThreadId: generation.threadId,
+    controllerGenerationId: generation.id,
+    interaction: {
+      kind: "user_question",
+      interactionId,
+      questions: [{
+        id: "question-needs-owner-restart",
+        prompt: "Should I continue?",
+        shortLabel: "Continue",
+        multiSelect: false,
+        allowFreeText: true,
+        options: [{ value: "yes", label: "Yes", description: "Continue" }],
+      }],
+    },
+  });
+}
 
-  status = "idle";
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  // The pre-terminal reconcile boundary runs the evidence projector on every
-  // pass for the submitted turn before any legacy/terminal work.
-  expect(evidenceProjector.reconcile).toHaveBeenCalled();
-  // Raw provider output and stream_text never become an answer: with no
-  // accepted finalization the first turn stays submitted and durable, and the
-  // outbox carries only the phase placeholder, never "First answer.".
-  const turned = store.listControllerTurns("owner-7-controller", 10);
-  expect(turned[0]?.state).toBe("submitted");
-  expect(turned[0]?.responseText).toBeNull();
-  expect(store.getOutbox("controller:controller-turn-11:reply")?.payload.text).toBe(CONTROLLER_PHASE_TEXT.connecting);
-});
+function acceptControllerFinalization(
+  store: ReturnType<typeof serviceFixture>["store"],
+  turnId: string,
+  text = "Durable accepted answer.",
+  bbEventHighWaterSeq = 0,
+) {
+  const current = store.getControllerTurn(turnId);
+  if (!current) throw new Error("controller finalization fixture turn disappeared");
+  if (bbEventHighWaterSeq > current.evidenceEventSeq) {
+    expect(store.recordControllerNativeEvidence({
+      ownerId: "executor",
+      generation: 1,
+      now: 2_000,
+      turnId,
+      controllerKey: current.controllerKey,
+      fromSeq: current.evidenceEventSeq,
+      throughSeq: bbEventHighWaterSeq,
+      items: [],
+    })).toBe("recorded");
+  }
+  const accepted = store.proposeControllerFinalization({
+    ownerId: "executor",
+    generation: 1,
+    now: 2_000,
+    turnId,
+    controllerKey: "owner-7-controller",
+    bbEventHighWaterSeq,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("controller finalization fixture was not accepted");
+  return accepted.finalization;
+}
 
-it("relaunches once at an idle capability boundary before exposing the expanded profile", async () => {
+function acceptNeedsOwnerFinalization(
+  store: ReturnType<typeof serviceFixture>["store"],
+  turnId: string,
+) {
+  const accepted = store.proposeControllerFinalization({
+    ownerId: "executor",
+    generation: 1,
+    now: 2_000,
+    turnId,
+    controllerKey: "owner-7-controller",
+    bbEventHighWaterSeq: 0,
+    candidate: {
+      disposition: "needs_owner",
+      segments: [{ type: "text", text: "Please choose one option." }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("needs-owner finalization fixture was not accepted");
+  return accepted.finalization;
+}
+
+it("ignores raw provider output and completes only from the accepted finalization", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
-    controllerKey: "owner-7-controller",
+    ...turnRecord({ updateId: 66, inputText: "answer from evidence" }),
     telegramUserId: "7",
     telegramChatId: "7",
-    updateId: 120,
-    inputText: "show job status",
     now: 2_000,
   });
-  let spawnCount = 0;
-  const spawn = vi.fn(async (_turn: Parameters<ControllerAdapter["spawn"]>[0]) => ({
-    threadId: `thr_capability_${++spawnCount}`,
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
     projectId: "proj_personal",
     hostId: "host_personal",
-  }));
-  const stop = vi.fn(async () => undefined);
-  const output = vi.fn(async () => "This partial answer must not be delivered.");
-  const findSpawnCandidate = vi.fn(async () => null);
+    threadId: "thr_accepted_only",
+    spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+  })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  const rawOutput = vi.fn(async () => "RAW PROVIDER OUTPUT MUST NOT SHIP");
   const adapter: ControllerAdapter = {
-    spawn,
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
     events: vi.fn(async () => ({
       latestSeq: 1,
       inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: true,
+      error: null,
+      pendingQuestion: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "completed",
+    responseText: accepted.renderedMessage,
+    streamText: "Hanoon finished.",
+  });
+  expect(rawOutput).not.toHaveBeenCalled();
+  expect(store.readControllerDigest("owner-7-controller", 10)[0]?.agentText)
+    .toBe(accepted.renderedMessage);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe(accepted.renderedMessage);
+});
+
+it("keeps an accepted finalization unconsumed while the provider is active", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 67, inputText: "wait for terminal" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_active_accepted", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  expect(store.renewExecutorLease(
+    fence.ownerId,
+    fence.generation,
+    2_001,
+    CONTROLLER_STALL_MS + 10_000,
+  )).toBe(true);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false, completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
+  expect(store.readControllerDigest("owner-7-controller", 10)).toEqual([]);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toBe(accepted.renderedMessage);
+});
+
+it("retires a turn when a legacy accepted envelope fails evidence revalidation", async () => {
+  const { db, store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 68, inputText: "revalidate the accepted answer" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_legacy_envelope", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const evidence = store.recordControllerEvidence({ ...validEvidenceInput(turn), ...fence, now: 2_000 });
+  if (evidence.outcome !== "recorded") throw new Error("legacy envelope evidence fixture was not recorded");
+  const accepted = store.proposeControllerFinalization({
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbEventHighWaterSeq: 0,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope finalization fixture was not accepted");
+  db.prepare(
+    "UPDATE controller_finalizations SET envelope_version = 1, payload_json = ?, rendered_message = ? WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: accepted.finalization.candidate,
+    bbEventHighWaterSeq: 0,
+  }), accepted.finalization.renderedMessage, accepted.finalization.id);
+  db.prepare(
+    "UPDATE controller_evidence SET proof_kinds_json = '[\"command_result\"]' WHERE id = ?",
+  ).run(evidence.evidence.id);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false, completed: true, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "failed",
+    lastError: "Accepted controller finalization failed semantic revalidation",
+  });
+});
+
+it.each(["source_gap", "page_cap"] as const)(
+  "retries an accepted turn after a transient evidence %s",
+  async (reconciliationIncomplete) => {
+    const { store, fence } = serviceFixture();
+    const turn = store.enqueueControllerTurn({
+      ...turnRecord({ updateId: 670, inputText: "retry evidence safely" }),
+      telegramUserId: "7",
+      telegramChatId: "7",
+      now: 2_000,
+    });
+    expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+      .toBe(turn.id);
+    reserveControllerSpawnForTest(store, turn.id);
+    expect(store.markControllerSpawned({
+      turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+      projectId: "proj_personal", hostId: "host_personal", threadId: `thr_gap_${reconciliationIncomplete}`,
+      spawnToken: turn.id,
+    })).toBe(true);
+    expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+    const accepted = acceptControllerFinalization(store, turn.id);
+    const projector = {
+      reconcile: vi.fn(async () => ({
+        outcome: "reconciled" as const,
+        reconciliationIncomplete,
+        fromSeq: 0,
+        throughSeq: 0,
+        targetSeq: 0,
+      })),
+    };
+    const adapter: ControllerAdapter = {
+      spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+      send: vi.fn(async () => undefined),
+      status: vi.fn(async () => "active" as const),
+      latestSeq: vi.fn(async () => 0),
+      events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false, completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+      steer: vi.fn(async () => undefined),
+      answerQuestion: vi.fn(async () => undefined),
+      findSpawnCandidate: vi.fn(async () => null),
+    };
+    const service = new LunaControllerService({
+      store,
+      adapter,
+      evidenceProjector: projector,
+      clock: { now: () => 2_002 },
+    });
+
+    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
+    expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+    expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  },
+);
+
+it("does not steer or fail an active accepted turn at ordinary budgets", async () => {
+  const { store, fence, db } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 674, inputText: "keep accepted answer alive" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_accepted_budget", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  db.prepare(
+    "UPDATE controller_turns SET tool_calls = 120, total_tokens = 600000, command_failures = 5 WHERE id = ?",
+  ).run(turn.id);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false, completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+});
+
+it("does not let an accepted active turn bypass the stall boundary", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 671, inputText: "bound the accepted turn" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_active_accepted_stalled", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  expect(store.renewExecutorLease(
+    fence.ownerId,
+    fence.generation,
+    2_001,
+    CONTROLLER_STALL_MS + 10_000,
+  )).toBe(true);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => 2_000 + CONTROLLER_STALL_MS + 1 },
+  });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+});
+
+it("accepts finalizer completion and ordinary lifecycle events after acceptance", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 672, inputText: "finish after the finalizer" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_finalizer_lifecycle", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 4,
+    items: [],
+  })).toBe("recorded");
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 4),
+    events: vi.fn(async () => ({
+      latestSeq: 4,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: true,
+      completed: true,
+      error: null,
+      interactionReferences: [],
+      toolCalls: 1,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_004 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: accepted.renderedMessage });
+  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(2_004);
+});
+
+it("waits for the exact projected high-water before retiring a late evidence turn", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 673, inputText: "project before completing" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_project_gap", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id);
+  let projectEvidence = false;
+  const projectedEvidence = {
+    sourceName: "commandExecution",
+    sourceItemId: "late-native",
+    outcome: "succeeded" as const,
+    argsSha256: "c".repeat(64),
+    resultSha256: "d".repeat(64),
+    proofKinds: ["command_result"] as const,
+    subjectRefs: ["bb-item:late-native"] as const,
+  };
+  const projector = {
+    reconcile: vi.fn(async (...args: unknown[]) => {
+      const projectedTurn = args[1] as { evidenceEventSeq: number };
+      const targetSeq = args[4] as number;
+      if (targetSeq > projectedTurn.evidenceEventSeq) {
+        expect(store.recordControllerNativeEvidence({
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: 2_000,
+          turnId: turn.id,
+          controllerKey: turn.controllerKey,
+          fromSeq: projectedTurn.evidenceEventSeq,
+          throughSeq: targetSeq,
+          items: projectEvidence ? [projectedEvidence] : [],
+        })).toBe("recorded");
+      }
+      return {
+        outcome: "reconciled" as const,
+        reconciliationIncomplete: null,
+        fromSeq: projectedTurn.evidenceEventSeq,
+        throughSeq: targetSeq,
+        targetSeq,
+      };
+    }),
+  };
+  const latestSequences = [0, 1, 1, 1];
+  const eventSequences = [0, 1];
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => latestSequences.shift() ?? 1),
+    events: vi.fn(async () => ({
+      latestSeq: eventSequences.shift() ?? 1,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: true,
+      completed: true,
+      error: null,
+      interactionReferences: [],
+      toolCalls: 1,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector: projector,
+    clock: { now: () => 2_004 },
+  });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", evidenceEventSeq: 0 });
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+
+  projectEvidence = true;
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  expect(store.listControllerEvidence(turn.id, 10)).toMatchObject([
+    { sourceKind: "bb_item", sourceItemId: "late-native" },
+  ]);
+});
+
+it("does not continue from a stale provider cursor", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 68, inputText: "wait for cursor repair" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_stale_cursor", spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
+  expect(store.updateControllerStream({
+    ...fence, now: 2_000, turnId: turn.id, cursor: 5, phase: "thinking",
+  })).toBe(true);
+  const highWater = 4;
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => highWater),
+    events: vi.fn(async () => ({ latestSeq: highWater, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false, completed: true, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(adapter.send).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", completionContinuations: 0 });
+
+});
+
+it("dispatches FIFO, waits for idle output, and then sends the next turn with mode start", async () => {
+  evidenceProjector.reconcile.mockClear();
+  const { store, fence } = serviceFixture();
+  store.enqueueControllerTurn({ ...turnRecord({ updateId: 11, inputText: "first" }), telegramUserId: "7", telegramChatId: "7", now: 2_000 });
+  store.enqueueControllerTurn({ ...turnRecord({ updateId: 12, inputText: "second" }), telegramUserId: "7", telegramChatId: "7", now: 2_001 });
+  let status: "active" | "idle" = "active";
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => {
+      expect(store.reserveControllerSpawn({
+        controllerKey: "owner-7-controller",
+        turnId: spawnTurn.id,
+        projectId: "proj_personal",
+        hostId: "host_personal",
+        now: 2_000,
+      })).toBe(true);
+      return { threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id };
+    }),
+    send: vi.fn(async () => undefined),
+    status: async () => status,
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(false);
+  expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["submitted", "queued"]);
+
+  status = "idle";
+  acceptControllerFinalization(store, "controller-turn-11");
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(evidenceProjector.reconcile).toHaveBeenCalled();
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(adapter.send).toHaveBeenCalledWith("thr_controller", "second", fence.signal);
+  expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["completed", "submitted"]);
+});
+
+it("reserves a steer before the provider call so finalization cannot win the race", async () => {
+  const { store, fence } = serviceFixture();
+  const running = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 68, inputText: "first" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const waiting = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 69, inputText: "second" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: running.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_steer_race",
+    spawnToken: running.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: running.id })).toBe(true);
+
+  let finalizationDuringSteer: ReturnType<typeof store.proposeControllerFinalization> | null = null;
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({
+      threadId: "unused",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: spawnTurn.id,
+    })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      pendingQuestion: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => {
+      finalizationDuringSteer = store.proposeControllerFinalization({
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: 2_003,
+        turnId: running.id,
+        controllerKey: running.controllerKey,
+        candidate: {
+          disposition: "answered",
+          segments: [{ type: "text", text: "A raced final answer." }],
+          obligationRefs: [],
+        },
+      });
+    }),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(finalizationDuringSteer).toMatchObject({ outcome: "stale" });
+  expect(store.getAcceptedControllerFinalization(running.id)).toBeNull();
+  expect(adapter.steer).toHaveBeenCalledWith("thr_steer_race", "second", fence.signal);
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "completed" });
+  expect(store.proposeControllerFinalization({
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 2_004,
+    turnId: running.id,
+    controllerKey: running.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "The steer was folded." }],
+      obligationRefs: [],
+    },
+  })).toMatchObject({ outcome: "accepted" });
+});
+
+it("does not steer a queued owner message after the executor lease is lost", async () => {
+  const { store, fence } = serviceFixture();
+  const running = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 70, inputText: "first" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const waiting = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 71, inputText: "second" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: running.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_lease_fence",
+    spawnToken: running.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: running.id })).toBe(true);
+
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => {
+      expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 2_003)).toBe(true);
+      return "active" as const;
+    }),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      pendingQuestion: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(waiting.id)?.state).toBe("queued");
+});
+
+it("does not replay a reserved steer after a SQLite restart with no provider authority", async () => {
+  const fixture = serviceFixture();
+  const { store, fence } = fixture;
+  const running = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 170, inputText: "first" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const waiting = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 171, inputText: "second" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: running.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_steer_restart",
+    spawnToken: running.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: running.id })).toBe(true);
+  expect(store.reserveControllerSteer({
+    ...fence,
+    now: 2_002,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    expectedThreadId: "thr_steer_restart",
+  })).toBe(true);
+
+  const restarted = fixture.reopen();
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store: restarted, adapter, evidenceProjector, clock: { now: () => 2_010 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(restarted.getControllerTurn(waiting.id)).toMatchObject({ state: "failed" });
+  expect(restarted.getOutbox(`controller:${waiting.id}:reply`)).toMatchObject({
+    status: "pending",
+    payload: { text: "I couldn't complete that controller turn safely. Please resend your request." },
+  });
+  expect(fixture.db.prepare("SELECT steer_reservation_turn_id FROM controller_turns WHERE id = ?")
+    .get(running.id)).toEqual({ steer_reservation_turn_id: null });
+});
+
+it.each([
+  ["authoritative application", "applied", "completed", 0],
+  ["authoritative non-application", "not_applied", "queued", 1],
+] as const)("settles a restart reservation from %s without replay", async (_label, outcome, state, retryCount) => {
+  const fixture = serviceFixture();
+  const { store, fence } = fixture;
+  const running = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 174, inputText: "first" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const waiting = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 175, inputText: "second" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: running.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_steer_authority",
+    spawnToken: running.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: running.id })).toBe(true);
+  expect(store.reserveControllerSteer({
+    ...fence,
+    now: 2_002,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    expectedThreadId: "thr_steer_authority",
+  })).toBe(true);
+
+  const reconcileSteer = vi.fn(async (input: {
+    threadId: string;
+    text: string;
+    idempotencyKey: string;
+    signal: AbortSignal;
+  }) => {
+    expect(input).toMatchObject({
+      threadId: "thr_steer_authority",
+      text: "second",
+      idempotencyKey: `controller-steer:${running.id}:${waiting.id}`,
+    });
+    return outcome;
+  });
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    reconcileSteer,
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_010 } });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(reconcileSteer).toHaveBeenCalledTimes(1);
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state, retryCount });
+  expect(fixture.db.prepare("SELECT steer_reservation_turn_id FROM controller_turns WHERE id = ?")
+    .get(running.id)).toEqual({ steer_reservation_turn_id: null });
+});
+
+it("does not replay a steer whose provider result became ambiguous during lease loss", async () => {
+  const fixture = serviceFixture();
+  const { store, fence } = fixture;
+  const running = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 172, inputText: "first" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const waiting = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 173, inputText: "second" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: running.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_steer_ambiguous",
+    spawnToken: running.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: running.id })).toBe(true);
+
+  const firstAdapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => {
+      expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 2_003)).toBe(true);
+      throw new Error("provider result is ambiguous");
+    }),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const firstService = new LunaControllerService({ store, adapter: firstAdapter, evidenceProjector, clock: { now: () => 2_002 } });
+  await expect(firstService.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  const restarted = fixture.reopen();
+  const successorLease = restarted.acquireExecutorLease("successor", 2_010, 30_000);
+  if (!successorLease.acquired) throw new Error("successor lease was not acquired");
+  const successorFence = { ownerId: "successor", generation: successorLease.generation, signal: AbortSignal.timeout(2_000) };
+  const successorAdapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const successorService = new LunaControllerService({
+    store: restarted,
+    adapter: successorAdapter,
+    evidenceProjector,
+    clock: { now: () => 2_010 },
+  });
+
+  await expect(successorService.reconcile(successorFence, successorFence.signal)).resolves.toBe(true);
+
+  expect(successorAdapter.steer).not.toHaveBeenCalled();
+  expect(restarted.getControllerTurn(waiting.id)).toMatchObject({ state: "failed" });
+  expect(restarted.getOutbox(`controller:${waiting.id}:reply`)).toMatchObject({
+    status: "pending",
+    payload: { text: "I couldn't complete that controller turn safely. Please resend your request." },
+  });
+  expect(fixture.db.prepare("SELECT steer_reservation_turn_id FROM controller_turns WHERE id = ?")
+    .get(running.id)).toEqual({ steer_reservation_turn_id: null });
+});
+
+it("fail-retires a continuation when the post-claim send is aborted", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 72, inputText: "recover" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_continuation_abort",
+    spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
+  const aborted = new AbortController();
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => {
+      aborted.abort();
+      throw new Error("send outcome is ambiguous");
+    }),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
       assistantOutputObserved: false,
       toolActivityObserved: false,
       completed: true,
       error: null,
-      interactions: [],
-      toolCalls: 1,
+      pendingQuestion: null,
+      toolCalls: 0,
       commandFailures: 0,
-      totalTokens: 100,
+      totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
-    stop,
-    findSpawnCandidate,
-    hasExecutionProfile: () => false,
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
   };
-  let now = 2_000;
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, interactionService: stubInteractionService(), clock: { now: () => now } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
-  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-  const initial = store.getActiveCapabilityProfile("controller_turn", turn.id);
-  if (!initial) throw new Error("missing initial controller capability profile");
-  const expanded = store.requestControllerCapabilityExpansion({
-    controllerKey: turn.controllerKey,
-    turnId: turn.id,
-    expectedProfileId: initial.id,
-    bundleIds: ["job-control"],
-    now: ++now,
+  await expect(service.reconcile({ ...fence, signal: aborted.signal }, aborted.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "failed",
+    completionContinuations: 1,
   });
-  expect(expanded).toMatchObject({ outcome: "resume_required", profile: { revision: 2 } });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+});
+
+it("fail-retires when the lease is lost immediately after a continuation claim", async () => {
+  const fixture = serviceFixture();
+  const { store, fence } = fixture;
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 73, inputText: "recover after the claim" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_continuation_refence",
+    spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
+  const aborted = new AbortController();
+  fixture.db.function("task9_abort_after_continuation_claim", () => { aborted.abort(); });
+  fixture.db.exec(`
+    CREATE TRIGGER abort_after_continuation_claim
+    AFTER UPDATE OF completion_continuations ON controller_turns
+    WHEN NEW.id = '${turn.id}' AND NEW.completion_continuations = 1
+    BEGIN
+      SELECT task9_abort_after_continuation_claim();
+    END
+  `);
+  const send = vi.fn(async () => undefined);
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send,
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: true,
+      error: null,
+      pendingQuestion: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.reconcile({ ...fence, signal: aborted.signal }, aborted.signal)).resolves.toBe(true);
+
+  expect(send).not.toHaveBeenCalled();
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed", completionContinuations: 1 });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
+});
+
+it("keeps a needs-owner finalization parked and answerable across restart", async () => {
+  const fixture = serviceFixture();
+  const { store, fence } = fixture;
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 74, inputText: "ask me before proceeding" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_needs_owner_restart",
+    spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: turn.id })).toBe(true);
+  expect(recordServiceQuestion(store, fence, turn.id, "interaction_needs_owner_restart")).toBe("recorded");
+  const accepted = acceptNeedsOwnerFinalization(store, turn.id);
+  const restarted = fixture.reopen();
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: true,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: true,
+      error: null,
+      pendingQuestion: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    getInteraction: vi.fn(async () => ({
+      id: "interaction_needs_owner_restart",
+      threadId: "thr_needs_owner_restart",
+      status: "resolved",
+      payload: null,
+      resolution: restarted.getAnsweredControllerInteraction(turn.controllerKey)?.resolution ?? null,
+    })),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store: restarted,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => 2_002 },
+  });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(stop).toHaveBeenCalledWith("thr_capability_1", fence.signal);
-  expect(output).not.toHaveBeenCalled();
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "queued",
-    capabilityContinuationCount: 1,
-    capabilityContinuationState: "relaunching",
-    capabilityConfiguredRevision: 1,
-  });
+  expect(restarted.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", awaitingInteractionId: "interaction_needs_owner_restart" });
+  expect(restarted.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  expect(adapter.answerQuestion).not.toHaveBeenCalled();
 
-  now += 1;
-  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-  expect(spawn).toHaveBeenCalledTimes(2);
-  expect(findSpawnCandidate).not.toHaveBeenCalled();
-  expect(spawn.mock.calls[1]?.[0].inputText).toContain("Resume the same owner request");
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "submitted",
-    capabilityProfileRevision: 2,
-    capabilityConfiguredRevision: 2,
-    capabilityContinuationState: "resolved",
-  });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({
-    threadId: "thr_capability_2",
-    capabilitySubjectId: turn.id,
-    capabilityProfileRevision: 2,
-  });
-
-  if (expanded.outcome !== "resume_required") throw new Error("capability expansion was denied");
-  expect(store.requestControllerCapabilityExpansion({
+  expect(restarted.answerControllerInteractionWithText({
     controllerKey: turn.controllerKey,
+    userId: "7",
+    chatId: "7",
+    text: "Yes, continue.",
+    now: 2_003,
+  })).toMatchObject({ ok: true, complete: true, turnId: turn.id });
+  expect(restarted.getAnsweredControllerInteraction(turn.controllerKey)).toMatchObject({
+    interactionId: "interaction_needs_owner_restart",
     turnId: turn.id,
-    expectedProfileId: expanded.profile.id,
-    bundleIds: ["memory"],
-    now: ++now,
-  })).toEqual({ outcome: "denied", reasonCode: "expansion_limit" });
+  });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(adapter.answerQuestion).toHaveBeenCalledTimes(1);
+  expect(fixture.db.prepare(
+    "SELECT state FROM controller_interactions WHERE interaction_id = ?",
+  ).get("interaction_needs_owner_restart")).toEqual({ state: "delivered" });
+  expect(restarted.getControllerTurn(turn.id)?.state).toBe("submitted");
+  expect(restarted.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(restarted.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: accepted.renderedMessage });
+  expect(restarted.getAcceptedControllerFinalization(turn.id)?.consumedAt).not.toBeNull();
 });
 
 it("keeps a queued image durable until the active turn finishes", async () => {
@@ -778,12 +1860,14 @@ it("keeps a queued image durable until the active turn finishes", async () => {
   });
   const leaseFence = { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 };
   expect(store.claimNextControllerTurn(leaseFence)?.id).toBe(running.id);
+  reserveControllerSpawnForTest(store, running.id, leaseFence.now);
   expect(store.markControllerSpawned({
     ...leaseFence,
     turnId: running.id,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: running.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...leaseFence, turnId: running.id })).toBe(true);
   const image = {
@@ -791,6 +1875,9 @@ it("keeps a queued image durable until the active turn finishes", async () => {
     fileName: "telegram-replacement.webp",
     mimeType: "image/webp" as const,
     sizeBytes: 8,
+    kind: "image" as const,
+    durationSeconds: null,
+    thumbnail: null,
   };
   const waiting = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 16, inputText: "Use this screenshot instead", image }),
@@ -800,51 +1887,29 @@ it("keeps a queued image durable until the active turn finishes", async () => {
   });
   let status: "active" | "idle" = "active";
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => status),
     latestSeq: vi.fn(async () => 1),
-    events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 1, inputAccepted: true, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  expect(store.recordControllerNativeEvidence({
-    ...leaseFence,
-    turnId: running.id,
-    controllerKey: running.controllerKey,
-    fromSeq: 0,
-    throughSeq: 1,
-    items: [],
-  })).toBe("recorded");
-  const projector = makeProjector(async () => ({
-    outcome: "reconciled" as const,
-    reconciliationIncomplete: null,
-    fromSeq: 1,
-    throughSeq: 1,
-    targetSeq: 1,
-  }));
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector: projector, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.steer).not.toHaveBeenCalled();
   expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "queued", image });
 
   status = "idle";
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  acceptAnswer(store, fence, running, "Finished.");
+  acceptControllerFinalization(store, running.id, "Durable accepted answer.", 1);
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-  expect(adapter.send).toHaveBeenCalledWith(
-    "thr_controller",
-    "Use this screenshot instead",
-    fence.signal,
-    expect.objectContaining(image),
-  );
+  expect(adapter.send).toHaveBeenCalledWith("thr_controller", "Use this screenshot instead", fence.signal, image);
 });
 
-it("requeues a transient image preparation failure without adopting a late spawn candidate", async () => {
+it("requeues a transient image preparation failure when no exact candidate exists", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({
@@ -861,31 +1926,24 @@ it("requeues a transient image preparation failure without adopting a late spawn
     telegramChatId: "7",
     now: 2_000,
   });
-  const findSpawnCandidate = vi.fn()
-    .mockResolvedValueOnce(null)
-    .mockResolvedValueOnce({ threadId: "thr_unrelated", projectId: "proj_personal", hostId: "host_personal" });
+  const findSpawnCandidate = vi.fn(async () => null);
   const adapter: ControllerAdapter = {
     spawn: vi.fn(async () => { throw new ControllerImagePreparationError(true); }),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate,
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
-  expect(findSpawnCandidate).not.toHaveBeenCalled();
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "queued",
-    retryCount: 2,
-    modelFallbackIndex: 0,
-  });
+  expect(findSpawnCandidate).toHaveBeenCalledTimes(2);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "queued", retryCount: 2 });
   expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
 });
 
@@ -912,19 +1970,19 @@ it("requeues an aborted image preparation without consuming a retry", async () =
     threadId: "thr_unrelated",
     projectId: "proj_personal",
     hostId: "host_personal",
+    spawnToken: turn.id,
   }));
   const adapter: ControllerAdapter = {
     spawn: vi.fn(async () => { throw new ControllerImagePreparationError(true); }),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate,
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, aborted.signal)).resolves.toBe(true);
@@ -957,6 +2015,7 @@ it("requeues a turn while the controller thread is still busy instead of failing
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -965,6 +2024,7 @@ it("requeues a turn while the controller thread is still busy instead of failing
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_busy",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: turn.id,
@@ -981,17 +2041,16 @@ it("requeues a turn while the controller thread is still busy instead of failing
   });
   let status: "active" | "idle" = "active";
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => status),
     latestSeq: vi.fn(async () => 4),
-    events: vi.fn(async () => ({ latestSeq: 4, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 4, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
@@ -1014,6 +2073,7 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1022,6 +2082,7 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_wedged",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: turn.id,
@@ -1037,19 +2098,18 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     now: 2_001,
   });
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
   const wedgedAt = 2_001 + 15 * 60_000;
   expect(store.renewExecutorLease(fence.ownerId, fence.generation, 2_100, 30 * 60_000)).toBe(true);
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => wedgedAt } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => wedgedAt } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
@@ -1060,7 +2120,7 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
   expect(store.getOutbox(`controller:${stranded.id}:reply`)?.status).toBe("pending");
 });
 
-it("never completes an errored controller turn from raw provider output", async () => {
+it("delivers a completed answer even when the controller thread ends in error", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 65, inputText: "answer then break" }),
@@ -1070,6 +2130,7 @@ it("never completes an errored controller turn from raw provider output", async 
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1078,6 +2139,7 @@ it("never completes an errored controller turn from raw provider output", async 
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_answered_then_errored",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1085,8 +2147,9 @@ it("never completes an errored controller turn from raw provider output", async 
     generation: fence.generation,
     now: 2_000,
   })).toBe(true);
+  const accepted = acceptControllerFinalization(store, turn.id, "Here is the answer.", 12);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "error" as const),
     latestSeq: vi.fn(async () => 12),
@@ -1097,41 +2160,37 @@ it("never completes an errored controller turn from raw provider output", async 
       toolActivityObserved: false,
       completed: true,
       error: null,
-      interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
-  // Raw provider prose can never become a completed response, digest, or
-  // final-answer outbox — the turn fails and the generation is retired.
   expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "failed",
-    responseText: null,
+    state: "completed",
+    responseText: accepted.renderedMessage,
   });
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toBe("Here is the answer.");
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe(accepted.renderedMessage);
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
 });
 
 it("reports a streaming turn only while its answer is still arriving", async () => {
   const { store, fence } = serviceFixture();
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
   expect(service.isStreaming()).toBe(false);
 
   const turn = store.enqueueControllerTurn({
@@ -1144,18 +2203,19 @@ it("reports a streaming turn only while its answer is still arriving", async () 
 
   const claim = { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 };
   expect(store.claimNextControllerTurn(claim)?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id, claim.now);
   expect(store.markControllerSpawned({
     ...claim,
     turnId: turn.id,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...claim, turnId: turn.id })).toBe(true);
   expect(service.isStreaming()).toBe(true);
 
-  acceptAnswer(store, fence, turn, "Answered.");
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  completeAcceptedControllerTurn(store, turn, claim, "Answered.");
   expect(service.isStreaming()).toBe(false);
 });
 
@@ -1163,18 +2223,18 @@ it("fails an uncertain send closed and never submits it twice", async () => {
   const { store, fence } = serviceFixture();
   store.enqueueControllerTurn({ ...turnRecord({ updateId: 21, inputText: "send once" }), telegramUserId: "7", telegramChatId: "7", now: 2_000 });
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => { throw new Error("uncertain send"); }),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: "Controller provider turn failed", interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal" })),
-    hasExecutionProfile: () => false,
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: "controller-turn-21" })),
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).not.toBeNull();
+  reserveControllerSpawnForTest(store, "controller-turn-21");
   expect(store.markControllerSpawned({
     turnId: "controller-turn-21",
     ownerId: fence.ownerId,
@@ -1183,6 +2243,7 @@ it("fails an uncertain send closed and never submits it twice", async () => {
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: "controller-turn-21",
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: "controller-turn-21",
@@ -1199,7 +2260,7 @@ it("fails an uncertain send closed and never submits it twice", async () => {
   expect(store.listControllerTurns("owner-7-controller", 10).at(-1)?.state).toBe("failed");
 });
 
-it("keeps an idle submitted turn durable when no accepted finalization exists", async () => {
+it("keeps an idle submitted turn durable when BB output retrieval fails transiently", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 31, inputText: "answer after retry" }),
@@ -1208,6 +2269,7 @@ it("keeps an idle submitted turn durable when no accepted finalization exists", 
     now: 2_000,
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1216,6 +2278,7 @@ it("keeps an idle submitted turn durable when no accepted finalization exists", 
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1224,30 +2287,27 @@ it("keeps an idle submitted turn durable when no accepted finalization exists", 
     now: 2_000,
   })).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "idle" as const),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => { throw new Error("temporary BB event failure"); }),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
 
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
 
-  // No raw output is read at idle: the turn stays submitted and durable, and
-  // only the phase placeholder reaches the outbox.
   expect(store.listControllerTurns("owner-7-controller", 10)[0]?.state).toBe("submitted");
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     status: "pending",
-    payload: { text: CONTROLLER_PHASE_TEXT.connecting },
+    payload: { text: "Connecting to Hanoon…" },
   });
 });
 
-it("projects active assistant output into a phase-only durable controller draft", async () => {
+it("projects active Luna assistant deltas into the durable controller reply", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 36, inputText: "stream answer" }),
@@ -1257,6 +2317,7 @@ it("projects active assistant output into a phase-only durable controller draft"
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1265,6 +2326,7 @@ it("projects active assistant output into a phase-only durable controller draft"
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_streaming",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1274,7 +2336,7 @@ it("projects active assistant output into a phase-only durable controller draft"
     now: 2_000,
   })).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
@@ -1285,77 +2347,26 @@ it("projects active assistant output into a phase-only durable controller draft"
       toolActivityObserved: false,
       completed: false,
       error: null,
-      interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
   expect(adapter.events).toHaveBeenCalledWith("thr_streaming", 8, fence.signal);
-  // The raw "Working on it" prose never reaches the durable stream_text or the
-  // outbox: only the phase-derived placeholder does.
   expect(store.listControllerTurns("owner-7-controller", 10)[0]).toMatchObject({
     bbEventSeq: 10,
-    streamText: CONTROLLER_PHASE_TEXT.responding,
+    streamText: "Hanoon is preparing the answer…",
     streamPhase: "responding",
   });
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     status: "pending",
-    payload: { text: CONTROLLER_PHASE_TEXT.responding },
+    payload: { text: "Hanoon is preparing the answer…" },
   });
-});
-
-it("never leaks pre-cutover raw stream_text into a draft or outbox", async () => {
-  const { store, fence, db } = serviceFixture();
-  const turn = store.enqueueControllerTurn({
-    ...turnRecord({ updateId: 38, inputText: "migrate me" }),
-    telegramUserId: "7",
-    telegramChatId: "7",
-    now: 2_000,
-  });
-  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id).toBe(turn.id);
-  expect(store.markControllerSpawned({
-    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
-    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_cutover",
-  })).toBe(true);
-  expect(store.markControllerTurnSubmitted({
-    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000, dispatchAfterSeq: 3,
-  })).toBe(true);
-  // A pre-cutover row already holding raw provider prose must never surface.
-  db.prepare("UPDATE controller_turns SET stream_text = ? WHERE id = ?").run("pre-cutover RAWSECRET prose", turn.id);
-  const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
-    send: vi.fn(async () => undefined),
-    status: vi.fn(async () => "active" as const),
-    latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({
-      latestSeq: 5, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false,
-      completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
-    })),
-    steer: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
-  };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  const stored = store.listControllerTurns("owner-7-controller", 10)[0];
-  expect(stored?.streamText).toBe(CONTROLLER_PHASE_TEXT.responding);
-  expect(stored?.streamText).not.toContain("RAWSECRET");
-  const outbox = store.getOutbox(`controller:${turn.id}:reply`);
-  expect(outbox?.payload.text).toBe(CONTROLLER_PHASE_TEXT.responding);
-  expect(outbox?.payload.text).not.toContain("RAWSECRET");
-  // The turn stays submitted and unfinished, so raw prose became no completed
-  // response, digest, or final-answer outbox.
-  expect(stored?.state).toBe("submitted");
-  expect(stored?.responseText).toBeNull();
 });
 
 it("refreshes an unchanged active Luna draft before Telegram expires it", async () => {
@@ -1368,6 +2379,7 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1376,6 +2388,7 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_thinking",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1386,24 +2399,23 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
   const [draft] = store.leaseOutbox(fence.ownerId, fence.generation, 2_000, 1, 30_000);
   expect(store.completeOutbox(draft!.logicalKey, fence.ownerId, fence.generation, null, 2_000)).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
     events: vi.fn(async () => ({
       latestSeq: 0,
       inputAccepted: true,
-      assistantOutputObserved: false, toolActivityObserved: false,
+      assistantDelta: "",
       completed: false,
       error: null,
-      interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 22_000 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 22_000 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
@@ -1413,14 +2425,7 @@ it("refreshes an unchanged active Luna draft before Telegram expires it", async 
   });
 });
 
-it.each([
-  ["accepted the input", true, 0],
-  ["started a tool", false, 1],
-] as const)("does not use a fallback after the provider %s", async (
-  _scenario,
-  inputAccepted,
-  toolCalls,
-) => {
+it("retires an errored controller so a later queued message can start a fresh generation", async () => {
   const { store, fence } = serviceFixture();
   const failed = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 41, inputText: "show active threads" }),
@@ -1436,6 +2441,7 @@ it.each([
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(failed.id);
+  reserveControllerSpawnForTest(store, failed.id);
   expect(store.markControllerSpawned({
     turnId: failed.id,
     ownerId: fence.ownerId,
@@ -1444,6 +2450,7 @@ it.each([
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_poisoned",
+    spawnToken: failed.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: failed.id,
@@ -1451,35 +2458,43 @@ it.each([
     generation: fence.generation,
     now: 2_000,
   })).toBe(true);
-  const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_000,
+    })).toBe(true);
+    return {
       threadId: "thr_fresh",
       projectId: "proj_personal",
       hostId: "host_personal",
-    })),
+      spawnToken: spawnTurn.id,
+    };
+  });
+  const adapter: ControllerAdapter = {
+    spawn,
     send: vi.fn(async () => undefined),
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: "Controller provider turn failed", interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => true,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
   expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state))
     .toEqual(["failed", "queued"]);
-  expect(store.getOutbox(`controller:${failed.id}:reply`)?.payload.text).toBe(
-    "I couldn't complete that controller turn safely. Please resend your request.",
-  );
   expect(store.getControllerForOwner("7", "7")).toMatchObject({
     threadId: null,
     state: "pending_spawn",
   });
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(spawn).toHaveBeenCalledTimes(1);
   expect(store.getControllerForOwner("7", "7")?.threadId).toBe("thr_fresh");
 });
 
@@ -1493,6 +2508,7 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(previous.id);
+  reserveControllerSpawnForTest(store, previous.id);
   expect(store.markControllerSpawned({
     turnId: previous.id,
     ownerId: fence.ownerId,
@@ -1501,6 +2517,7 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_poisoned_idle",
+    spawnToken: previous.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: previous.id,
@@ -1515,23 +2532,32 @@ it("recovers from the 2026-08-10 poisoned controller before dispatching the next
     telegramChatId: "7",
     now: 2_002,
   });
-  const spawn = vi.fn(async () => ({
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_003,
+    })).toBe(true);
+    return {
     threadId: "thr_fresh_after_poison",
     projectId: "proj_personal",
     hostId: "host_personal",
-  }));
+    spawnToken: spawnTurn.id,
+    };
+  });
   const adapter: ControllerAdapter = {
     spawn,
     send: vi.fn(async () => undefined),
     status: vi.fn(async (threadId: string) => threadId === "thr_poisoned_idle" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_003 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_003 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
@@ -1553,6 +2579,7 @@ it("retires an errored controller generation even when no turn remains submitted
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(previous.id);
+  reserveControllerSpawnForTest(store, previous.id);
   expect(store.markControllerSpawned({
     turnId: previous.id,
     ownerId: fence.ownerId,
@@ -1561,6 +2588,7 @@ it("retires an errored controller generation even when no turn remains submitted
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_initialize_timeout",
+    spawnToken: previous.id,
   })).toBe(true);
   expect(store.failControllerTurn({
     turnId: previous.id,
@@ -1570,17 +2598,16 @@ it("retires an errored controller generation even when no turn remains submitted
     error: "Controller send outcome is uncertain",
   })).toBe(true);
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "error" as const),
     latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantOutputObserved: false, toolActivityObserved: false, completed: false, error: null, interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: false, assistantDelta: "", completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
@@ -1590,7 +2617,7 @@ it("retires an errored controller generation even when no turn remains submitted
   });
 });
 
-it("retries one unaccepted generation, then fails and retires the second provider error", async () => {
+it("retries one controller generation when BB proves the input was never accepted", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 51, inputText: "show active threads" }),
@@ -1600,6 +2627,7 @@ it("retries one unaccepted generation, then fails and retires the second provide
   });
   expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
     .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: fence.ownerId,
@@ -1608,6 +2636,7 @@ it("retries one unaccepted generation, then fails and retires the second provide
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_never_accepted",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({
     turnId: turn.id,
@@ -1616,1070 +2645,52 @@ it("retries one unaccepted generation, then fails and retires the second provide
     dispatchAfterSeq: 9,
     now: 2_000,
   })).toBe(true);
-  const spawn = vi.fn(async () => ({
-    threadId: "thr_retry",
-    projectId: "proj_personal",
-    hostId: "host_personal",
-  }));
-  let retryErrored = false;
-  const adapter: ControllerAdapter = {
-    spawn: vi.fn(async () => ({
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    expect(store.reserveControllerSpawn({
+      controllerKey: "owner-7-controller",
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: 2_000,
+    })).toBe(true);
+    return {
       threadId: "thr_retry",
       projectId: "proj_personal",
       hostId: "host_personal",
-    })),
+      spawnToken: spawnTurn.id,
+    };
+  });
+  const adapter: ControllerAdapter = {
+    spawn,
     send: vi.fn(async () => undefined),
-    status: vi.fn(async (threadId: string) =>
-      threadId === "thr_never_accepted" || retryErrored ? "error" : "active"),
+    status: vi.fn(async (threadId: string) => threadId === "thr_never_accepted" ? "error" : "active"),
     latestSeq: vi.fn(async () => 0),
     events: vi.fn(async () => ({
       latestSeq: 11,
       inputAccepted: false,
-      assistantOutputObserved: false, toolActivityObserved: false,
+      assistantDelta: "",
       completed: false,
       error: "Controller provider turn failed",
-      interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
     })),
     steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: vi.fn((index: number) => index <= 1),
   };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
   expect(store.listControllerTurns("owner-7-controller", 10)[0]).toMatchObject({
     state: "queued",
     retryCount: 1,
-    modelFallbackIndex: 1,
     dispatchAfterSeq: 0,
   });
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
     status: "pending",
-    payload: { text: CONTROLLER_PHASE_TEXT.connecting },
+    payload: { text: "Connecting to Hanoon…" },
   });
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "submitted",
-    modelFallbackIndex: 1,
-  });
+  expect(spawn).toHaveBeenCalledTimes(1);
   expect(store.getControllerForOwner("7", "7")?.threadId).toBe("thr_retry");
-
-  retryErrored = true;
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed", retryCount: 1 });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-// ===== B2a: pre-terminal reconcile boundary + projection outcome routing =====
-
-function makeProjector(impl?: () => Promise<ControllerEvidenceReconciliation>): ControllerEvidenceReconciler {
-  return {
-    reconcile: impl
-      ? vi.fn(async () => impl())
-      : vi.fn(async () => ({
-        outcome: "reconciled" as const,
-        reconciliationIncomplete: null,
-        fromSeq: 0,
-        throughSeq: 0,
-        targetSeq: 0,
-      })),
-  };
-}
-
-function makeSubmittedServiceTurn(
-  store: ReturnType<typeof openStore>,
-  fence: { ownerId: string; generation: number },
-  updateId: number,
-  threadId: string,
-): ReturnType<typeof store.enqueueControllerTurn> {
-  const turn = store.enqueueControllerTurn({
-    ...turnRecord({ updateId, inputText: "evidence work" }),
-    telegramUserId: "7",
-    telegramChatId: "7",
-    now: 2_000,
-  });
-  const now = 2_000;
-  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now })?.id).toBe(turn.id);
-  expect(store.markControllerSpawned({
-    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now,
-    projectId: "proj_personal", hostId: "host_personal", threadId,
-  })).toBe(true);
-  expect(store.markControllerTurnSubmitted({
-    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now, dispatchAfterSeq: 4,
-  })).toBe(true);
-  return turn;
-}
-
-function adapterForSubmitted(): ControllerAdapter {
-  return {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
-    send: vi.fn(async () => undefined),
-    status: vi.fn(async () => "active" as const),
-    latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({
-      latestSeq: 4, inputAccepted: true, assistantOutputObserved: false,
-      toolActivityObserved: false, completed: false, error: null,
-      interactions: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
-    })),
-    steer: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
-  };
-}
-
-it("runs the evidence projector every pass and writes no terminal state when it reports stale", async () => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 301, "thr_stale_recon");
-  const projector = makeProjector(async () => ({
-    outcome: "stale" as const,
-    reconciliationIncomplete: null,
-    fromSeq: 4, throughSeq: 4, targetSeq: 4,
-  }));
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter: adapterForSubmitted(), evidenceProjector: projector, clock: { now: () => 2_001 } });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-  expect(projector.reconcile).toHaveBeenCalledTimes(1);
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active", threadId: "thr_stale_recon" });
-});
-
-it("fails and retires atomically when reconciliation is limit-exceeded", async () => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 302, "thr_limit_recon");
-  const projector = makeProjector(async () => ({
-    outcome: "limit_exceeded" as const,
-    reconciliationIncomplete: null,
-    fromSeq: 4, throughSeq: 4, targetSeq: 4,
-  }));
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter: adapterForSubmitted(), evidenceProjector: projector, clock: { now: () => 2_001 } });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  const t = store.getControllerTurn(turn.id);
-  expect(t?.state).toBe("failed");
-  expect(t?.lastError).toBe("Controller evidence limit exceeded during reconciliation");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-  // The notice is the fixed safe message, never any raw or accepted text.
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toBe("I couldn't complete that controller turn safely. Please resend your request.");
-});
-
-it.each([
-  ["page cap", { outcome: "reconciled" as const, reconciliationIncomplete: "page_cap" as const, fromSeq: 4, throughSeq: 10, targetSeq: 40 }],
-  ["source gap", { outcome: "reconciled" as const, reconciliationIncomplete: "source_gap" as const, fromSeq: 4, throughSeq: 10, targetSeq: 40 }],
-])("fails and retires deterministically on an incomplete %s reconciliation", async (_label, result) => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 303 + Math.floor(Math.random() * 100), "thr_gap_recon");
-  const projector = makeProjector(async () => result);
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter: adapterForSubmitted(), evidenceProjector: projector, clock: { now: () => 2_001 } });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it("fails and retires on a deterministic projector error code", async () => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 304, "thr_det_recon");
-  const projector = makeProjector(async () => {
-    throw new ControllerEvidenceProjectorError("native_identity_conflict");
-  });
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter: adapterForSubmitted(), evidenceProjector: projector, clock: { now: () => 2_001 } });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it("propagates generation invariant corruption instead of reporting deterministic failure handled", async () => {
-  const { store, fence, db } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 442, "thr_corrupt_failure_generation");
-  db.prepare(
-    "UPDATE controller_generations SET ended_at = 1, end_reason = 'corrupt' WHERE controller_key = ? AND thread_id = ?",
-  ).run(turn.controllerKey, "thr_corrupt_failure_generation");
-  const projector = makeProjector(async () => {
-    throw new ControllerEvidenceProjectorError("native_identity_conflict");
-  });
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store,
-    adapter: adapterForSubmitted(),
-    evidenceProjector: projector,
-    clock: { now: () => 2_001 },
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).rejects.toThrow(/generation/i);
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({
-    state: "active",
-    threadId: "thr_corrupt_failure_generation",
-  });
-});
-
-it("leaves a submitted turn durable on a transient projector read failure", async () => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 305, "thr_transient_recon");
-  const projector = makeProjector(async () => { throw new Error("temporary boundary read failure"); });
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter: adapterForSubmitted(), evidenceProjector: projector, clock: { now: () => 2_001 } });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active", threadId: "thr_transient_recon" });
-});
-
-it("bounds a persistent untyped projector failure by the durable stall clock", async () => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 325, "thr_projector_stalled");
-  const projector = makeProjector(async () => { throw new Error("persistent boundary defect"); });
-  expect(store.renewExecutorLease(fence.ownerId, fence.generation, 2_100, CONTROLLER_STALL_MS * 2)).toBe(true);
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store,
-    adapter: adapterForSubmitted(),
-    evidenceProjector: projector,
-    clock: { now: () => 2_000 + CONTROLLER_STALL_MS },
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it.each(["status", "events"] as const)("bounds a persistent %s boundary failure by the durable stall clock", async (boundary) => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, boundary === "status" ? 326 : 327, `thr_${boundary}_stalled`);
-  const adapter = adapterForSubmitted();
-  if (boundary === "status") vi.mocked(adapter.status).mockRejectedValue(new Error("persistent status defect"));
-  else {
-    vi.mocked(adapter.status).mockResolvedValue("idle");
-    vi.mocked(adapter.events).mockRejectedValue(new Error("persistent event defect"));
-  }
-  expect(store.renewExecutorLease(fence.ownerId, fence.generation, 2_100, CONTROLLER_STALL_MS * 2)).toBe(true);
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store,
-    adapter,
-    evidenceProjector: makeProjector(),
-    clock: { now: () => 2_000 + CONTROLLER_STALL_MS },
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it("fails and retires when a cap marker is observed on the re-read turn", async () => {
-  const { store, fence, db } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(store, fence, 306, "thr_cap_recon");
-  db.prepare("UPDATE controller_turns SET evidence_limit_exceeded_at = ? WHERE id = ?").run(2_000, turn.id);
-  const projector = makeProjector(); // reconciled; the re-read cap marker must still fail-and-retire
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter: adapterForSubmitted(), evidenceProjector: projector, clock: { now: () => 2_001 } });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it.each(["active", "starting", "stopping"] as const)("does not consume a finalization while the controller is %s", async (status) => {
-  const { store, fence } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(
-    store,
-    fence,
-    status === "active" ? 307 : status === "starting" ? 308 : 309,
-    `thr_${status}_finalize`,
-  );
-  expect(store.proposeControllerFinalization({
-    ownerId: fence.ownerId,
-    generation: fence.generation,
-    now: 2_000,
-    turnId: turn.id,
-    controllerKey: turn.controllerKey,
-    candidate: {
-      disposition: "answered",
-      segments: [{ type: "text", text: "The job is queued." }],
-      obligationRefs: [],
-    },
-  })).toMatchObject({ outcome: "accepted" });
-  const adapter: ControllerAdapter = {
-    ...adapterForSubmitted(),
-    status: vi.fn(async () => status),
-  };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted" });
-  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ consumedAt: null });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active" });
-});
-
-// ===== B2b: terminal finalization + one durable continuation =====
-
-const RECOVERY_PROMPT =
-  "Your previous turn ended without an accepted telegram_agent_respond call. " +
-  "Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. " +
-  "Do not repeat a side effect.";
-
-type TerminalStatus = "idle" | "active" | "starting" | "stopping" | "error" | "missing" | "incompatible";
-
-function terminalAdapter(options: {
-  status?: TerminalStatus;
-  latestSeq?: number;
-  completed?: boolean;
-  inputAccepted?: boolean;
-  send?: () => Promise<void>;
-} = {}): ControllerAdapter {
-  const latestSeq = options.latestSeq ?? 0;
-  return {
-    spawn: vi.fn(async () => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal" })),
-    send: vi.fn(options.send ?? (async () => undefined)),
-    status: vi.fn(async () => options.status ?? "idle"),
-    latestSeq: vi.fn(async () => latestSeq),
-    events: vi.fn(async () => ({
-      latestSeq,
-      inputAccepted: options.inputAccepted ?? true,
-      assistantOutputObserved: false,
-      toolActivityObserved: false,
-      completed: options.completed ?? false,
-      error: options.status === "error" ? "provider error" : null,
-      interactions: [],
-      toolCalls: 0,
-      commandFailures: 0,
-      totalTokens: 0,
-    })),
-    steer: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
-  };
-}
-
-function acceptAnswer(
-  store: ReturnType<typeof openStore>,
-  fence: { ownerId: string; generation: number },
-  turn: ReturnType<typeof store.enqueueControllerTurn>,
-  text = "The exact accepted answer.",
-) {
-  const result = store.proposeControllerFinalization({
-    ...fence,
-    now: 2_000,
-    turnId: turn.id,
-    controllerKey: turn.controllerKey,
-    candidate: {
-      disposition: "answered",
-      segments: [{ type: "text", text }],
-      obligationRefs: [],
-    },
-  });
-  expect(result).toMatchObject({ outcome: "accepted" });
-  return result;
-}
-
-function terminalServiceFixture(options: {
-  updateId: number;
-  threadId: string;
-  status?: TerminalStatus;
-  latestSeq?: number;
-  completed?: boolean;
-  inputAccepted?: boolean;
-  send?: () => Promise<void>;
-}) {
-  const fixture = serviceFixture();
-  const turn = makeSubmittedServiceTurn(fixture.store, fixture.fence, options.updateId, options.threadId);
-  const adapter = terminalAdapter(options);
-  const projector = makeProjector(async () => ({
-    outcome: "reconciled" as const,
-    reconciliationIncomplete: null,
-    fromSeq: 0,
-    throughSeq: options.latestSeq ?? 0,
-    targetSeq: options.latestSeq ?? 0,
-  }));
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store: fixture.store,
-    adapter,
-    evidenceProjector: projector,
-    clock: { now: () => 2_001 },
-  });
-  return { ...fixture, turn, adapter, projector, service };
-}
-
-type TerminalReadFailure = "accepted_latest" | "continuation_latest" | "provider_error_baseline";
-
-function terminalReadFailureFixture(boundary: TerminalReadFailure, updateId: number) {
-  const status = boundary === "provider_error_baseline" ? "error" as const : "idle" as const;
-  const fixture = terminalServiceFixture({
-    updateId,
-    threadId: `thr_${boundary}_${updateId}`,
-    status,
-    latestSeq: boundary === "provider_error_baseline" ? 5 : 0,
-    inputAccepted: true,
-  });
-  fixture.db.prepare(
-    "UPDATE controller_turns SET stream_phase = 'thinking', stream_text = ?, updated_at = 2000 WHERE id = ?",
-  ).run(CONTROLLER_PHASE_TEXT.thinking, fixture.turn.id);
-  if (boundary === "accepted_latest") {
-    acceptAnswer(fixture.store, fixture.fence, fixture.turn, "Accepted before the latest-sequence read failed.");
-    vi.mocked(fixture.adapter.latestSeq).mockRejectedValue(new Error("latest sequence unavailable"));
-  } else if (boundary === "continuation_latest") {
-    vi.mocked(fixture.adapter.latestSeq).mockRejectedValue(new Error("latest sequence unavailable"));
-  } else {
-    fixture.db.prepare("UPDATE controller_turns SET bb_event_seq = 5 WHERE id = ?").run(fixture.turn.id);
-    vi.mocked(fixture.adapter.events)
-      .mockResolvedValueOnce({
-        latestSeq: 5,
-        inputAccepted: true,
-        assistantOutputObserved: false,
-        toolActivityObserved: false,
-        completed: false,
-        error: "provider error",
-        interactions: [],
-        toolCalls: 0,
-        commandFailures: 0,
-        totalTokens: 0,
-      })
-      .mockRejectedValueOnce(new Error("provider error baseline unavailable"));
-  }
-  return fixture;
-}
-
-it.each([
-  ["idle", false],
-  ["idle", true],
-] as const)("completes an accepted finalization exactly once at the %s terminal boundary (completed=%s)", async (status, completed) => {
-  const { store, fence, turn, service } = terminalServiceFixture({
-    updateId: completed ? 402 : 401,
-    threadId: completed ? "thr_completed_final" : "thr_idle_final",
-    status,
-    completed,
-  });
-  acceptAnswer(store, fence, turn);
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "completed",
-    responseText: "The exact accepted answer.",
-    streamText: "",
-  });
-  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ consumedAt: 2_001 });
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe("The exact accepted answer.");
-});
-
-it("completes an accepted finalization after provider error and retires only its generation", async () => {
-  const { store, fence, turn, service } = terminalServiceFixture({
-    updateId: 403,
-    threadId: "thr_error_after_final",
-    status: "error",
-  });
-  acceptAnswer(store, fence, turn, "Durably accepted before the provider failed.");
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "completed",
-    responseText: "Durably accepted before the provider failed.",
-    lastError: null,
-  });
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(2_001);
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it("keeps accepted completion durable when error-generation retirement loses its lease and retries retirement later", async () => {
-  const { store, fence, db, turn, adapter, projector, service } = terminalServiceFixture({
-    updateId: 441,
-    threadId: "thr_error_retirement_retry",
-    status: "error",
-  });
-  acceptAnswer(store, fence, turn, "The accepted answer survives retirement arbitration.");
-  db.exec(`
-    CREATE TRIGGER expire_lease_after_final_completion
-    AFTER UPDATE OF state ON controller_turns
-    WHEN NEW.id = '${turn.id}' AND NEW.state = 'completed'
-    BEGIN
-      UPDATE executor_lease SET lease_expires_at = 0 WHERE singleton = 1;
-    END
-  `);
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "completed",
-    responseText: "The accepted answer survives retirement arbitration.",
-  });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({
-    state: "active",
-    threadId: "thr_error_retirement_retry",
-  });
-
-  const nextLease = store.acquireExecutorLease("executor-next", 2_002, 30_000);
-  if (!nextLease.acquired) throw new Error("successor lease was not acquired");
-  const nextFence = {
-    ownerId: "executor-next",
-    generation: nextLease.generation,
-    signal: AbortSignal.timeout(2_000),
-  };
-  const restarted = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store,
-    adapter,
-    evidenceProjector: projector,
-    clock: { now: () => 2_003 },
-  });
-  await expect(restarted.reconcile(nextFence, nextFence.signal)).resolves.toBe(true);
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it("defers accepted completion when the BB high-water advances past the projected target", async () => {
-  const { store, fence, turn, adapter, service } = terminalServiceFixture({
-    updateId: 404,
-    threadId: "thr_target_race",
-    status: "idle",
-  });
-  acceptAnswer(store, fence, turn);
-  vi.mocked(adapter.latestSeq).mockResolvedValueOnce(1);
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-});
-
-it("leaves an accepted idle turn submitted when its terminal event boundary cannot be read", async () => {
-  const { store, fence, turn, adapter, service } = terminalServiceFixture({
-    updateId: 420,
-    threadId: "thr_terminal_event_read_failure",
-    status: "idle",
-  });
-  acceptAnswer(store, fence, turn);
-  vi.mocked(adapter.events).mockRejectedValueOnce(new Error("temporary event boundary outage"));
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-  expect(adapter.send).not.toHaveBeenCalled();
-});
-
-it.each([
-  "accepted_latest",
-  "continuation_latest",
-  "provider_error_baseline",
-] as const)("defers a transient %s read failure without a terminal write", async (boundary) => {
-  const fixture = terminalReadFailureFixture(
-    boundary,
-    boundary === "accepted_latest" ? 432 : boundary === "continuation_latest" ? 433 : 434,
-  );
-
-  await expect(fixture.service.reconcile(fixture.fence, fixture.fence.signal)).resolves.toBe(false);
-
-  expect(fixture.store.getControllerTurn(fixture.turn.id)?.state).toBe("submitted");
-  expect(fixture.store.getControllerForOwner("7", "7")).toMatchObject({
-    state: "active",
-    threadId: `thr_${boundary}_${boundary === "accepted_latest" ? 432 : boundary === "continuation_latest" ? 433 : 434}`,
-  });
-});
-
-it.each([
-  "accepted_latest",
-  "continuation_latest",
-  "provider_error_baseline",
-] as const)("fails and retires after a persistent %s read failure reaches the durable stall", async (boundary) => {
-  const updateId = boundary === "accepted_latest" ? 435 : boundary === "continuation_latest" ? 436 : 437;
-  const fixture = terminalReadFailureFixture(boundary, updateId);
-  expect(fixture.store.renewExecutorLease(
-    fixture.fence.ownerId,
-    fixture.fence.generation,
-    2_100,
-    CONTROLLER_STALL_MS * 2,
-  )).toBe(true);
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store: fixture.store,
-    adapter: fixture.adapter,
-    evidenceProjector: fixture.projector,
-    clock: { now: () => 2_000 + CONTROLLER_STALL_MS },
-  });
-
-  await expect(service.reconcile(fixture.fence, fixture.fence.signal)).resolves.toBe(true);
-
-  expect(fixture.store.getControllerTurn(fixture.turn.id)?.state).toBe("failed");
-  expect(fixture.store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-  if (boundary === "accepted_latest") {
-    expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)?.consumedAt).toBeNull();
-  }
-});
-
-it.each([
-  "accepted_latest",
-  "continuation_latest",
-  "provider_error_baseline",
-] as const)("does not write for an aborted %s read failure", async (boundary) => {
-  const updateId = boundary === "accepted_latest" ? 438 : boundary === "continuation_latest" ? 439 : 440;
-  const fixture = terminalReadFailureFixture(boundary, updateId);
-  const abort = new AbortController();
-  abort.abort();
-
-  await expect(fixture.service.reconcile(fixture.fence, abort.signal)).resolves.toBe(false);
-
-  expect(fixture.store.getControllerTurn(fixture.turn.id)?.state).toBe("submitted");
-  expect(fixture.store.getControllerForOwner("7", "7")).toMatchObject({ state: "active" });
-});
-
-it("fails and retires without delivering accepted words when evidence advances past the seal", async () => {
-  const { store, fence, turn, service } = terminalServiceFixture({
-    updateId: 405,
-    threadId: "thr_late_evidence",
-    status: "idle",
-    latestSeq: 1,
-  });
-  acceptAnswer(store, fence, turn, "Never deliver these accepted words.");
-  expect(store.recordControllerNativeEvidence({
-    ...fence,
-    now: 2_000,
-    turnId: turn.id,
-    controllerKey: turn.controllerKey,
-    fromSeq: 0,
-    throughSeq: 1,
-    items: [{
-      sourceName: "commandExecution",
-      sourceItemId: "command-after-finalization",
-      outcome: "failed",
-      argsSha256: "a".repeat(64),
-      resultSha256: "b".repeat(64),
-      proofKinds: ["command_result"],
-      subjectRefs: ["bb-item:command-after-finalization"],
-    }],
-  })).toBe("recorded");
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed", responseText: null });
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toBe("I couldn't complete that controller turn safely. Please resend your request.");
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .not.toContain("Never deliver these accepted words.");
-});
-
-it("fails closed through the atomic aggregate when accepted payload storage is corrupt", async () => {
-  const { store, fence, db, turn, service } = terminalServiceFixture({
-    updateId: 406,
-    threadId: "thr_corrupt_final",
-    status: "idle",
-  });
-  const accepted = acceptAnswer(store, fence, turn);
-  if (accepted.outcome !== "accepted") throw new Error("missing accepted finalization");
-  db.prepare("UPDATE controller_finalizations SET payload_json = ? WHERE id = ?")
-    .run("{}", accepted.finalization.id);
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-function ownerQuestionInteraction(interactionId: string) {
-  return {
-    kind: "user_question" as const,
-    interactionId,
-    questions: [{
-      id: "choice",
-      prompt: "What should I use?",
-      shortLabel: null,
-      multiSelect: false,
-      allowFreeText: true,
-      options: [],
-    }],
-  };
-}
-
-function parkOwnerInteraction(
-  fixture: ReturnType<typeof terminalServiceFixture>,
-  threadId: string,
-  interactionId: string,
-): void {
-  const generation = fixture.store.getOpenControllerGeneration(fixture.turn.controllerKey, threadId);
-  if (!generation) throw new Error("missing open controller generation");
-  expect(fixture.store.recordControllerInteraction({
-    ...fixture.fence,
-    now: 2_000,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-    bbThreadId: threadId,
-    controllerGenerationId: generation.id,
-    interaction: ownerQuestionInteraction(interactionId),
-  })).toBe(true);
-  expect(fixture.store.proposeControllerFinalization({
-    ...fixture.fence,
-    now: 2_000,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-    candidate: {
-      disposition: "needs_owner",
-      segments: [{ type: "text", text: "I need your answer." }],
-      obligationRefs: [],
-    },
-  })).toMatchObject({ outcome: "accepted" });
-}
-
-function deliveringInteractionService(
-  fixture: ReturnType<typeof terminalServiceFixture>,
-  threadId: string,
-  interactionId: string,
-) {
-  const resolve = vi.fn(async () => ({ id: interactionId, threadId, status: "resolved" }));
-  const get = vi.fn(async () => ({ id: interactionId, threadId, status: "pending", payload: null }));
-  const service = new ControllerInteractionService({
-    store: new ControllerInteractionRepository(fixture.db),
-    interactions: { get, resolve } as never,
-    clock: () => 2_001,
-  });
-  return { interactionService: service, resolve };
-}
-
-it("parks an accepted needs_owner finalization on its exact pending interaction across restart", async () => {
-  const fixture = terminalServiceFixture({
-    updateId: 407,
-    threadId: "thr_pending_owner",
-    status: "idle",
-  });
-  const { store, fence, turn, adapter, projector } = fixture;
-  parkOwnerInteraction(fixture, "thr_pending_owner", "interaction-pending-owner");
-
-  const first = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store, adapter, evidenceProjector: projector, clock: { now: () => 2_001 },
-  });
-  await expect(first.reconcile(fence, fence.signal)).resolves.toBe(true);
-  const restarted = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store, adapter, evidenceProjector: projector, clock: { now: () => 2_002 },
-  });
-  await expect(restarted.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-  expect(adapter.send).not.toHaveBeenCalled();
-});
-
-it("delivers an answered interaction only for the exact adopted turn before terminal work", async () => {
-  const fixture = terminalServiceFixture({
-    updateId: 408,
-    threadId: "thr_answered_owner",
-    status: "idle",
-  });
-  const { store, fence, turn, adapter, projector } = fixture;
-  parkOwnerInteraction(fixture, "thr_answered_owner", "interaction-answered-owner");
-  expect(store.answerControllerInteractionWithText({
-    controllerKey: turn.controllerKey,
-    userId: "7",
-    chatId: "7",
-    text: "Use the safer option",
-    now: 2_000,
-  })).toMatchObject({ ok: true, turnId: turn.id });
-  const { interactionService, resolve } = deliveringInteractionService(
-    fixture, "thr_answered_owner", "interaction-answered-owner",
-  );
-  const service = new LunaControllerService({
-    interactionService, store, adapter, evidenceProjector: projector, clock: { now: () => 2_001 },
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(resolve).toHaveBeenCalledWith({
-    threadId: "thr_answered_owner",
-    interactionId: "interaction-answered-owner",
-    resolution: { kind: "user_answer", answers: { choice: { selected: [], freeText: "Use the safer option" } } },
-  });
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-  expect(adapter.send).not.toHaveBeenCalled();
-});
-
-it("consumes an accepted needs_owner finalization only on the pass after its answer is delivered", async () => {
-  const fixture = terminalServiceFixture({
-    updateId: 443,
-    threadId: "thr_delivered_owner",
-    status: "idle",
-  });
-  const { store, fence, turn, adapter, projector } = fixture;
-  parkOwnerInteraction(fixture, "thr_delivered_owner", "interaction-delivered-owner");
-  expect(store.answerControllerInteractionWithText({
-    controllerKey: turn.controllerKey,
-    userId: "7",
-    chatId: "7",
-    text: "Use the safer option",
-    now: 2_000,
-  })).toMatchObject({ ok: true, turnId: turn.id });
-  const { interactionService, resolve } = deliveringInteractionService(
-    fixture, "thr_delivered_owner", "interaction-delivered-owner",
-  );
-  const service = new LunaControllerService({
-    interactionService, store, adapter, evidenceProjector: projector, clock: { now: () => 2_001 },
-  });
-
-  // Pass 1 delivers the owner's exact answer and transitions answered ->
-  // delivered; it consumes nothing. Only pass 2 may complete the turn.
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", responseText: null });
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(resolve).toHaveBeenCalledOnce();
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "completed",
-    responseText: "I need your answer.",
-  });
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(2_001);
-});
-
-it("claims and sends the fixed completion recovery prompt exactly once", async () => {
-  const { store, fence, turn, adapter, service } = terminalServiceFixture({
-    updateId: 409,
-    threadId: "thr_one_continuation",
-    status: "idle",
-    completed: true,
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "submitted",
-    completionContinuations: 1,
-  });
-  expect(adapter.send).toHaveBeenCalledOnce();
-  expect(adapter.send).toHaveBeenCalledWith("thr_one_continuation", RECOVERY_PROMPT, fence.signal);
-});
-
-it("retires after a claimed continuation ends without a finalization and never resends", async () => {
-  const { store, fence, turn, adapter, service } = terminalServiceFixture({
-    updateId: 410,
-    threadId: "thr_continuation_omission",
-    status: "idle",
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(adapter.send).toHaveBeenCalledTimes(1);
-  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it("does not resend after a crash between durable continuation claim and send", async () => {
-  const { store, fence, turn, adapter, service } = terminalServiceFixture({
-    updateId: 411,
-    threadId: "thr_claim_crash",
-    status: "idle",
-  });
-  expect(store.claimControllerCompletionContinuation({
-    ...fence,
-    now: 2_000,
-    turnId: turn.id,
-    controllerKey: turn.controllerKey,
-    bbHighWaterSeq: 0,
-  })).toBe("claimed");
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(adapter.send).not.toHaveBeenCalled();
-  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
-});
-
-it("fails and retires after an ambiguous continuation send without retrying it", async () => {
-  const { store, fence, turn, adapter, service } = terminalServiceFixture({
-    updateId: 412,
-    threadId: "thr_ambiguous_continuation",
-    status: "idle",
-    send: async () => { throw new Error("send outcome ambiguous"); },
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-
-  expect(adapter.send).toHaveBeenCalledTimes(1);
-  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
-});
-
-it("sends no continuation on a cursor race and succeeds after evidence reconciliation", async () => {
-  const fixture = terminalServiceFixture({
-    updateId: 413,
-    threadId: "thr_cursor_stale",
-    status: "idle",
-  });
-  const { store, fence, turn, adapter, projector, service } = fixture;
-  vi.mocked(adapter.latestSeq).mockResolvedValueOnce(1);
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-  expect(adapter.send).not.toHaveBeenCalled();
-  expect(store.getControllerTurn(turn.id)?.completionContinuations).toBe(0);
-
-  expect(store.recordControllerNativeEvidence({
-    ...fence,
-    now: 2_002,
-    turnId: turn.id,
-    controllerKey: turn.controllerKey,
-    fromSeq: 0,
-    throughSeq: 1,
-    items: [],
-  })).toBe("recorded");
-  vi.mocked(adapter.latestSeq).mockResolvedValue(1);
-  vi.mocked(adapter.events).mockResolvedValue({
-    latestSeq: 1,
-    inputAccepted: true,
-    assistantOutputObserved: false,
-    toolActivityObserved: false,
-    completed: false,
-    error: null,
-    interactions: [],
-    toolCalls: 0,
-    commandFailures: 0,
-    totalTokens: 0,
-  });
-  vi.mocked(projector.reconcile).mockResolvedValue({
-    outcome: "reconciled",
-    reconciliationIncomplete: null,
-    fromSeq: 1,
-    throughSeq: 1,
-    targetSeq: 1,
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(adapter.send).toHaveBeenCalledOnce();
-  expect(store.getControllerTurn(turn.id)?.completionContinuations).toBe(1);
-});
-
-it("returns stale without consuming when the adopted fence changes at final completion", async () => {
-  const { store, fence, db, turn, adapter, service } = terminalServiceFixture({
-    updateId: 417,
-    threadId: "thr_stale_completion",
-    status: "idle",
-  });
-  acceptAnswer(store, fence, turn);
-  vi.mocked(adapter.latestSeq).mockImplementationOnce(async () => {
-    db.prepare("UPDATE controller_turns SET lease_generation = ? WHERE id = ?")
-      .run(fence.generation + 1, turn.id);
-    return 0;
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-});
-
-it.each(["stall", "supervisor"] as const)("uses one rollback boundary for the %s fail-and-retire path", async (mode) => {
-  const { store, fence, db } = serviceFixture();
-  const turn = makeSubmittedServiceTurn(
-    store,
-    fence,
-    mode === "stall" ? 418 : 419,
-    `thr_${mode}_aggregate`,
-  );
-  if (mode === "supervisor") {
-    db.prepare("UPDATE controller_turns SET tool_calls = 120 WHERE id = ?").run(turn.id);
-    expect(store.getControllerTurn(turn.id)?.toolCalls).toBe(120);
-  }
-  db.exec(`CREATE TRIGGER reject_${mode}_failure_outbox
-    BEFORE UPDATE ON outbox
-    WHEN OLD.logical_key = 'controller:${turn.id}:reply'
-    BEGIN SELECT RAISE(ABORT, 'injected aggregate rollback'); END`);
-  const adapter = terminalAdapter({ status: "active", latestSeq: 4, inputAccepted: false });
-  const projector = makeProjector(async () => ({
-    outcome: "reconciled" as const,
-    reconciliationIncomplete: null,
-    fromSeq: 0,
-    throughSeq: 0,
-    targetSeq: 0,
-  }));
-  const now = mode === "stall" ? 2_001 + CONTROLLER_STALL_MS : 2_001;
-  if (mode === "stall") {
-    expect(store.renewExecutorLease(fence.ownerId, fence.generation, 2_100, CONTROLLER_STALL_MS * 2)).toBe(true);
-  }
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(), store, adapter, evidenceProjector: projector, clock: { now: () => now } });
-
-  await expect(service.reconcile(fence, fence.signal)).rejects.toThrow("injected aggregate rollback");
-
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({
-    state: "active",
-    threadId: `thr_${mode}_aggregate`,
-  });
-});
-
-it.each(["missing", "incompatible"] as const)("fails and retires a submitted turn atomically when its provider is %s", async (status) => {
-  const { store, fence, turn, service } = terminalServiceFixture({
-    updateId: status === "missing" ? 415 : 416,
-    threadId: `thr_${status}_terminal`,
-    status,
-  });
-
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-
-  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-});
-
-it("sends the owner's first message byte-for-byte, with no standing instruction block", async () => {
-  const { adapter, spawn } = sdkFixture();
-  const inputText = "What projects can you work on?";
-
-  await adapter.spawn(turnRecord({ inputText }), controllerRecord(), AbortSignal.timeout(1_000));
-
-  const sent = spawn.mock.calls.at(0)?.at(0) as unknown as { input: { type: string; text?: string }[] };
-  expect(sent.input).toEqual([{ type: "text", text: inputText, mentions: [] }]);
-  // `bb.agents.configure` is the only standing-instruction source now, so the
-  // spawn payload must carry none of it.
-  expect(JSON.stringify(sent.input)).not.toContain(CONTROLLER_INSTRUCTION_SENTINEL);
-  expect(JSON.stringify(sent.input)).not.toContain("You are the owner's teammate");
-});
-
-it("composes the replacement digest once and never as a standing block", async () => {
-  const { store, fence } = serviceFixture();
-  const earlier = store.enqueueControllerTurn({
-    ...turnRecord({ updateId: 71, inputText: "what changed in cyndra?" }),
-    telegramUserId: "7", telegramChatId: "7", now: 1_900,
-  });
-  store.claimNextControllerTurn({ ...fence, now: 1_900 });
-  store.markControllerSpawned({
-    ...fence, now: 1_901, turnId: earlier.id, projectId: "proj_personal", hostId: "host_personal", threadId: "thr_gone",
-  });
-  store.markControllerTurnSubmitted({ ...fence, now: 1_902, turnId: earlier.id });
-  store.failControllerTurn({ ...fence, now: 1_903, turnId: earlier.id, error: "Provider turn failed" });
-  expect(store.resetControllerThread({
-    ...fence, now: 1_904, controllerKey: earlier.controllerKey,
-    expectedThreadId: "thr_gone", reason: "Provider session ended in error",
-  })).toBe(true);
-  store.enqueueControllerTurn({
-    ...turnRecord({ updateId: 72, inputText: "and now?" }),
-    telegramUserId: "7", telegramChatId: "7", now: 2_000,
-  });
-  const spawn = vi.fn(async () => ({ threadId: "thr_replacement", projectId: "proj_personal", hostId: "host_personal" }));
-  const adapter: ControllerAdapter = {
-    ...adapterForSubmitted(),
-    spawn: spawn as unknown as ControllerAdapter["spawn"],
-    findSpawnCandidate: vi.fn(async () => null),
-    hasExecutionProfile: () => false,
-  };
-  const service = new LunaControllerService({
-    interactionService: stubInteractionService(),
-    store, adapter, evidenceProjector, clock: { now: () => 2_001 },
-  });
-
-  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
-
-  const seeded = spawn.mock.calls.at(0)?.at(0) as unknown as { inputText: string };
-  // The digest is composed exactly once, by the service, and carries no
-  // standing-instruction block of its own.
-  expect(seeded.inputText).toContain("and now?");
-  expect(seeded.inputText).not.toContain(CONTROLLER_INSTRUCTION_SENTINEL);
-  expect(seeded.inputText).not.toContain("You are the owner's teammate");
 });

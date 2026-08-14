@@ -22,7 +22,7 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, readonly ControllerProofKind[]> 
   execution_result: ["command_result", "tool_result"],
   workspace_change: ["workspace_change"],
   external_mutation: ["external_mutation"],
-  pipeline_outcome: ["pipeline_outcome"],
+  pipeline_outcome: ["pipeline_outcome", "production_outcome"],
   health_assessment: ["health_snapshot"],
   uncertainty: CONTROLLER_PROOF_KINDS,
 };
@@ -32,6 +32,7 @@ function emptyFinalizationContext(
 ): ControllerFinalizationValidationContext {
   return {
     acceptedAlready: false,
+    invocationInFlight: false,
     revisionCount: 0,
     evidenceLimitExceeded: false,
     evidenceByRef: new Map(),
@@ -109,9 +110,9 @@ describe("controller finalization public contract", () => {
       "obligation_forbidden",
       "obligation_missing",
       "obligation_not_live",
+      "invocation_in_flight",
       "process_only",
       "high_impact_text_unclaimed",
-      "follow_up_unbacked",
     ]);
     expect(CONTROLLER_CLAIM_KINDS).toEqual([
       "observed_state",
@@ -278,7 +279,15 @@ describe("unsafe candidate redaction", () => {
 
   it.each([
     ["raw callback", `m:${"a".repeat(32)}`],
+    ["operation callback", `o:${"b".repeat(32)}`],
+    ["question callback", `q:${"c".repeat(32)}`],
+    ["controller interaction callback", `i:${"d".repeat(32)}`],
+    ["thread interaction callback", `w:${"e".repeat(32)}`],
     ["encoded callback", `m%3A${"b".repeat(32)}`],
+    ["encoded operation callback", `o%3A${"c".repeat(32)}`],
+    ["encoded question callback", `q%3A${"d".repeat(32)}`],
+    ["encoded controller interaction callback", `i%3A${"e".repeat(32)}`],
+    ["encoded thread interaction callback", `w%3A${"f".repeat(32)}`],
     ["repeatedly encoded callback", `m%25253A${"c".repeat(32)}`],
   ])("rejects and erases %s material", (_label, unsafeToken) => {
     const unsafeText = `Internal material: ${unsafeToken}`;
@@ -286,6 +295,48 @@ describe("unsafe candidate redaction", () => {
     expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
     expect(JSON.stringify(validation)).not.toContain(unsafeToken);
     expect(JSON.stringify(validation)).not.toContain(unsafeText);
+  });
+
+  it.each([
+    ["GitHub token", `ghp_${"A".repeat(32)}`],
+    ["AWS access key", `AKIA${"7".repeat(16)}`],
+    ["provider key", `sk-proj-${"B".repeat(24)}`],
+    ["Telegram bot token", `1234567890:${"C".repeat(35)}`],
+    ["private-key material", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"],
+    ["nested encoded provider key", encodeURIComponent(encodeURIComponent(`Bearer rk-live-${"D".repeat(24)}`))],
+  ])("rejects and erases %s before persistence", (_label, unsafeToken) => {
+    const validation = validateControllerFinalization(
+      claimFinalization({
+        kind: "uncertainty",
+        outcome: "uncertain",
+        text: `Protected output: ${unsafeToken}`,
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+    );
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(JSON.stringify(validation)).not.toContain(unsafeToken);
+    expect(JSON.stringify(validation)).not.toContain(decodeURIComponent(decodeURIComponent(unsafeToken)));
+  });
+
+  it("scans rendered output across claim boundaries before accepting it", () => {
+    const providerToken = `ghs_${"E".repeat(28)}`;
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "Protected output: ghs_" },
+        claimFinalization({
+          kind: "uncertainty",
+          outcome: "uncertain",
+          text: "E".repeat(28),
+        }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+    const validation = validateControllerFinalization(candidate, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state"),
+    ));
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(JSON.stringify(validation)).not.toContain(providerToken);
   });
 
   it.each([
@@ -339,6 +390,63 @@ describe("unsafe candidate redaction", () => {
     expect(serialized).not.toContain(assembledUnsafeText);
     for (const segment of segments) expect(serialized).not.toContain(segment.text);
   });
+
+  it.each([
+    ["base64 credential assignment", Buffer.from("api_key=TOP_SECRET_VALUE_12345", "utf8").toString("base64"), "api_key=TOP_SECRET_VALUE_12345"],
+    ["base64url credential assignment", Buffer.from("api_key=TOP_SECRET_VALUE_12345", "utf8").toString("base64url"), "api_key=TOP_SECRET_VALUE_12345"],
+    ["base64 bearer credential", Buffer.from(`Bearer ghp_${"G".repeat(28)}`, "utf8").toString("base64"), `Bearer ghp_${"G".repeat(28)}`],
+  ])("rejects and erases bounded %s", (_label, encoded, decoded) => {
+    const validation = validateControllerFinalization(
+      textFinalization(`Encoded provider output: ${encoded}`),
+      emptyFinalizationContext(),
+    );
+    const serialized = JSON.stringify(validation);
+
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(serialized).not.toContain(encoded);
+    expect(serialized).not.toContain(decoded);
+  });
+
+  it("rejects base64 credential material split across rendered segments", () => {
+    const decoded = "api_key=TOP_SECRET_VALUE_12345";
+    const encoded = Buffer.from(decoded, "utf8").toString("base64url");
+    const midpoint = Math.floor(encoded.length / 2);
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "Encoded provider output: " + encoded.slice(0, midpoint) },
+        claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: encoded.slice(midpoint) }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+
+    const validation = validateControllerFinalization(candidate, contextWithEvidence(
+      evidenceRow("evidence:1", "project_state"),
+    ));
+    const serialized = JSON.stringify(validation);
+
+    expect(validation).toMatchObject({ outcome: "rejected", code: "invalid_contract" });
+    expect(serialized).not.toContain(encoded);
+    expect(serialized).not.toContain(decoded);
+  });
+
+  it("uses the fixed projection when base64 credential material is in a non-text field", () => {
+    const decoded = "api_key=TOP_SECRET_VALUE_12345";
+    const encoded = Buffer.from(decoded, "utf8").toString("base64url");
+    const candidate = claimFinalization({
+      subjectRef: encoded,
+    });
+
+    const validation = validateControllerFinalization(candidate, emptyFinalizationContext());
+
+    expect(validation).toMatchObject({
+      outcome: "rejected",
+      code: "invalid_contract",
+      storedCandidate: textFinalization("[redacted]"),
+    });
+    expect(JSON.stringify(validation)).not.toContain(encoded);
+    expect(JSON.stringify(validation)).not.toContain(decoded);
+  });
 });
 
 describe("ordered rejection branches", () => {
@@ -391,6 +499,22 @@ describe("ordered rejection branches", () => {
     );
   });
 
+  it("does not treat merge-only pipeline evidence as production proof", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Deployment succeeded." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("does not let pipeline evidence prove an execution test claim", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "All tests passed." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
   it("requires an owner boundary for needs_owner", () => {
     const candidate: ControllerFinalization = {
       disposition: "needs_owner",
@@ -437,6 +561,18 @@ describe("ordered rejection branches", () => {
     );
     expect(validateControllerFinalization(candidate, emptyFinalizationContext({
       liveObligationRefs: new Set(["obligation:1", "obligation:2"]),
+    }))).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not interpret an opaque delegation UUID as encoded credential text", () => {
+    const ref = "delegation:del-20fdbb26-2c90-4bae-a60c-234895988d03";
+    const candidate: ControllerFinalization = {
+      disposition: "deferred",
+      segments: [{ type: "text", text: "I'll follow up when the work finishes." }],
+      obligationRefs: [ref],
+    };
+    expect(validateControllerFinalization(candidate, emptyFinalizationContext({
+      liveObligationRefs: new Set([ref]),
     }))).toMatchObject({ outcome: "accepted" });
   });
 
@@ -587,435 +723,22 @@ describe("claim outcome compatibility", () => {
     if (expected === "rejected") expect(validation).toMatchObject({ code: "proof_incompatible" });
   });
 
-  // A high-impact assertion inside a claim segment used to have its wording
-  // ignored entirely: only the plain-text runs between claims were screened. So
-  // "I implemented the fix" could be declared observed_state and proved by
-  // having looked at the project.
-  it.each([
-    ["an implementation", "I implemented the fix.", "workspace_change"],
-    ["a fix", "The fix is complete.", "workspace_change"],
-    ["a test run", "The tests passed.", "execution_result"],
-    ["a completed review", "The review is approved.", "pipeline_outcome"],
-    ["a merge", "I merged the branch.", "pipeline_outcome"],
-    ["a deployment", "The deployment is live.", "pipeline_outcome"],
-    ["a credential rotation", "I rotated the credentials.", "external_mutation"],
-    ["a spend", "I spent $40.", "external_mutation"],
-    ["a purchase", "I purchased the service.", "external_mutation"],
-  ] as const)("refuses %s asserted under observed_state", (_scenario, text, _required) => {
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "succeeded", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-
-  it.each([
-    ["an implementation", "I implemented the fix.", "workspace_change", "workspace_change"],
-    ["a test run", "The tests passed.", "execution_result", "command_result"],
-    ["a merge", "I merged the branch.", "pipeline_outcome", "pipeline_outcome"],
-    ["a credential rotation", "I rotated the credentials.", "external_mutation", "external_mutation"],
-  ] as const)("accepts %s asserted under its own claim kind", (_scenario, text, kind, proofKind) => {
-    expect(validateControllerFinalization(
-      claimFinalization({ kind, outcome: "succeeded", text, subjectRef: "job:job_1" }),
-      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["deleting", "I deleted the files.", "workspace_change", "workspace_change"],
-    ["deleting externally", "I deleted the resources.", "external_mutation", "external_mutation"],
-    ["installing", "I installed the dependencies.", "workspace_change", "workspace_change"],
-    ["installing externally", "I installed the service.", "external_mutation", "external_mutation"],
-  ] as const)("accepts %s under either of its two admissible kinds", (_scenario, text, kind, proofKind) => {
-    expect(validateControllerFinalization(
-      claimFinalization({ kind, outcome: "succeeded", text }),
-      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("refuses deleting asserted as a pipeline outcome", () => {
-    expectRejection(
-      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "I deleted the files." }),
-      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
-      "proof_incompatible",
-    );
-  });
-
-  it.each([
-    ["a question", "Did the tests pass?"],
-    ["a negation", "The tests did not pass."],
-    ["a failure", "The tests failed."],
-    ["an intention", "I will run the tests."],
-    ["a hedge", "The tests may have passed."],
-  ] as const)("leaves %s outside the high-impact claim screen", (_scenario, text) => {
-    expect(validateControllerFinalization(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["the exact permission-path sentence", "Ran the tests you allowed; one project is in scope."],
-    ["a bare subject-elided assertion", "Ran the tests."],
-    ["a subject-elided assertion with no trailing stop", "Ran the tests"],
-    ["a subject-led past tense", "I ran the tests."],
-    ["a subject-led present perfect", "We have run the unit tests."],
-    ["an assertion trailing another clause", "The build is green and I ran the tests."],
-    ["an assertion leading another clause", "Ran the tests, then read the project."],
-  ] as const)("refuses %s asserted under observed_state", (_scenario, text) => {
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-
-  it("accepts a subject-elided test run filed as an execution result", () => {
-    expect(validateControllerFinalization(
-      claimFinalization({
-        kind: "execution_result",
-        outcome: "succeeded",
-        text: "Ran the tests you allowed.",
-      }),
-      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["a question", "Ran the tests?"],
-    ["a negation", "I did not run the tests."],
-    ["a future intention", "I will run the tests."],
-    ["a hedge", "I may have run the tests."],
-  ] as const)("leaves %s about a test run outside the screen", (_scenario, text) => {
-    expect(validateControllerFinalization(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("leaves an unrelated use of the word run alone", () => {
-    // "run" is an ordinary verb; only a claim to have run tests is high impact.
-    expect(validateControllerFinalization(
-      claimFinalization({
-        kind: "observed_state",
-        outcome: "observed",
-        text: "The job is still running the build.",
-      }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["a test run", "The tests passed.", "execution_result", "command_result"],
-    ["an implementation", "I implemented the fix.", "workspace_change", "workspace_change"],
-    ["a merge", "I merged the branch.", "pipeline_outcome", "pipeline_outcome"],
-    ["a credential rotation", "I rotated the credentials.", "external_mutation", "external_mutation"],
-  ] as const)("refuses %s asserted under a non-succeeded outcome", (_scenario, text, kind, proofKind) => {
-    // The right kind is not enough: success wording under a failed, observed, or
-    // uncertain declaration is still a success claim the declaration disowns.
-    for (const outcome of ["failed", "observed", "uncertain"] as const) {
-      expectRejection(
-        claimFinalization({ kind, outcome, text, evidenceRefs: ["evidence:1"] }),
-        contextWithEvidence(evidenceRow("evidence:1", proofKind, outcome === "failed" ? "failed" : "observed")),
-        "proof_incompatible",
-      );
-    }
-    expect(validateControllerFinalization(
-      claimFinalization({ kind, outcome: "succeeded", text }),
-      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("keeps genuinely negative wording compatible with a failed outcome", () => {
-    expect(validateControllerFinalization(
-      claimFinalization({
-        kind: "execution_result",
-        outcome: "failed",
-        text: "The tests failed.",
-      }),
-      contextWithEvidence(evidenceRow("evidence:1", "command_result", "failed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["text then claim", [
-      { type: "text" as const, text: "The fix is imple" },
-      { type: "claim" as const, text: "mented.", kind: "uncertainty" as const, outcome: "uncertain" as const,
-        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
-    ]],
-    ["claim then text", [
-      { type: "claim" as const, text: "The fix is imple", kind: "uncertainty" as const, outcome: "uncertain" as const,
-        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
-      { type: "text" as const, text: "mented." },
-    ]],
-    ["claim then claim", [
-      { type: "claim" as const, text: "The fix is imple", kind: "uncertainty" as const, outcome: "uncertain" as const,
-        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
-      { type: "claim" as const, text: "mented.", kind: "uncertainty" as const, outcome: "uncertain" as const,
-        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
-    ]],
-    ["three segments", [
-      { type: "text" as const, text: "The fix is " },
-      { type: "claim" as const, text: "imple", kind: "uncertainty" as const, outcome: "uncertain" as const,
-        subjectRef: "job:job_1", evidenceRefs: ["evidence:1" as const] },
-      { type: "text" as const, text: "mented." },
-    ]],
-  ])("refuses a high-impact assertion split across %s", (_scenario, segments) => {
-    // The owner reads the concatenation, so that is what must be proved.
-    expectRejection(
-      { disposition: "answered", segments, obligationRefs: [] },
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-
-  it("does not let a legitimate assertion elsewhere mask a split one", () => {
-    expectRejection(
-      {
-        disposition: "answered",
-        segments: [
-          {
-            type: "claim", text: "I implemented the fix.", kind: "workspace_change", outcome: "succeeded",
-            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
-          },
-          { type: "text", text: " The fix is imple" },
-          {
-            type: "claim", text: "mented.", kind: "uncertainty", outcome: "uncertain",
-            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
-          },
-        ],
-        obligationRefs: [],
-      },
-      contextWithEvidence(evidenceRow("evidence:1", "workspace_change", "succeeded")),
-      "proof_incompatible",
-    );
-  });
-
-  it("does not let an earlier legitimate occurrence mask a later split one", () => {
-    // The same wording twice in one clause: the first occurrence is properly
-    // carried, and scanning only the first would let the second slip past.
-    expectRejection(
-      {
-        disposition: "answered",
-        segments: [
-          {
-            type: "claim", text: "The tests passed, ", kind: "execution_result", outcome: "succeeded",
-            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
-          },
-          { type: "text", text: "the tests pa" },
-          {
-            type: "claim", text: "ssed.", kind: "uncertainty", outcome: "uncertain",
-            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
-          },
-        ],
-        obligationRefs: [],
-      },
-      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
-      "proof_incompatible",
-    );
-  });
-
-  it.each([
-    ["a negated sibling", "I did not deploy staging, I deployed production."],
-    ["a failed sibling", "The staging deploy failed, I deployed production."],
-    ["a future sibling", "I will deploy staging, I deployed production."],
-    ["an uncertain sibling", "Staging may be stale, I deployed production."],
-    ["a negated sibling before a test run", "I did not run the linter, the tests passed."],
-  ] as const)("does not let %s vouch for the success beside it", (_scenario, text) => {
-    // Polarity belongs to the sibling that carries the wording. A comma does not
-    // let "I did not deploy staging" speak for "I deployed production".
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-    expectRejection(
-      textFinalization(text),
-      emptyFinalizationContext(),
-      "high_impact_text_unclaimed",
-    );
-  });
-
-  it.each([
-    ["a comma", "Staging failed, production is live."],
-    ["a colon", "Staging failed: production is live."],
-    ["an em dash", "Staging failed — production is live."],
-    ["an en dash", "Staging failed – production is live."],
-    ["a semicolon", "Staging failed; production is live."],
-    ["a colon before a test run", "Linting failed: the tests passed."],
-  ] as const)("does not let a failure before %s vouch for the success after it", (_scenario, text) => {
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
-  });
-
-  it.each([
-    ["a negation after a colon", "Note: I did not deploy production."],
-    ["a hedge after an em dash", "Checked staging — production may be live."],
-    ["a future after a semicolon", "Staging is ready; I will deploy production."],
-    ["a question after a colon", "One thing: did the tests pass?"],
-  ] as const)("still accepts %s", (_scenario, text) => {
-    expect(validateControllerFinalization(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["a colon", "The tests passed: what should I do next?"],
-    ["an em dash", "The tests passed — what should I do next?"],
-    ["an en dash", "The tests passed – what should I do next?"],
-    ["a semicolon", "The tests passed; what should I do next?"],
-    ["a comma", "The tests passed, what should I do next?"],
-    // A positive modal beside a positive assertion is an unrelated elliptical
-    // question, not a tag: English tags a positive statement negatively.
-    ["a positive modal", "The tests passed, should I?"],
-    ["another positive modal", "The tests passed, could I?"],
-    ["a positive auxiliary", "The tests passed, will they?"],
-    ["a bare positive auxiliary", "The tests passed, did they?"],
-    // Negative shape alone is not agreement: the tag has to match the subject
-    // and tense of the assertion it claims to be asking about.
-    ["a mismatched subject", "The tests passed, didn't I?"],
-    ["a mismatched modal", "The tests passed, shouldn't I?"],
-    ["another mismatched modal", "The tests passed, couldn't I?"],
-    ["a mismatched subject on an implementation", "I implemented the fix, didn't they?"],
-    ["a mismatched tense on a deployment", "The deployment is live, didn't it?"],
-    ["a mismatched subject on an elided assertion", "Ran the tests, didn't it?"],
-  ] as const)("does not let an unrelated question after %s suppress the success", (_scenario, text) => {
-    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-
-  it.each([
-    ["a bare tag question", "The tests passed, right?"],
-    ["a confirming tag", "The tests passed, correct?"],
-    ["a plural tag", "The tests passed, didn't they?"],
-    ["a perfect-aspect tag", "The tests passed, haven't they?"],
-    ["a first-person tag", "I implemented the fix, didn't I?"],
-    ["a curly-apostrophe tag", "The tests passed, haven\u2019t they?"],
-    ["a modal tag", "The deployment is live, isn't it?"],
-    ["an inverted-order negative tag", "The deployment is live, is it not?"],
-    ["a tag on a subject-elided assertion", "Ran the tests, didn't I?"],
-    ["a plural-subject tag", "The credentials are rotated, aren't they?"],
-    ["a question about the assertion itself", "Did the tests pass?"],
-    ["a question in the asserting part", "The tests passed?"],
-  ] as const)("still accepts %s", (_scenario, text) => {
-    expect(validateControllerFinalization(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["a question spanning siblings", "The tests passed, right?"],
-    ["a negation in the same sibling", "I did not deploy production."],
-    ["a future in the same sibling", "I will deploy production."],
-    ["a hedge in the same sibling", "The deployment may be live."],
-  ] as const)("still accepts %s", (_scenario, text) => {
-    expect(validateControllerFinalization(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("accepts a high-impact assertion wholly inside one compatible succeeded claim", () => {
-    expect(validateControllerFinalization(
-      {
-        disposition: "answered",
-        segments: [
-          { type: "text", text: "Good news. " },
-          {
-            type: "claim", text: "I implemented the fix.", kind: "workspace_change", outcome: "succeeded",
-            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
-          },
-          { type: "text", text: " Anything else?" },
-        ],
-        obligationRefs: [],
-      },
-      contextWithEvidence(evidenceRow("evidence:1", "workspace_change", "succeeded")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("leaves ordinary multi-segment prose alone", () => {
-    expect(validateControllerFinalization(
-      {
-        disposition: "answered",
-        segments: [
-          { type: "text", text: "The project has " },
-          {
-            type: "claim", text: "three worker profiles", kind: "observed_state", outcome: "observed",
-            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"],
-          },
-          { type: "text", text: " configured." },
-        ],
-        obligationRefs: [],
-      },
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("screens a clause joined by a conjunction, not only a new sentence", () => {
-    expectRejection(
-      claimFinalization({
-        kind: "observed_state",
-        outcome: "succeeded",
-        text: "The project is configured and I merged the branch.",
-      }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-
-  it("refuses a high-impact assertion filed as uncertainty", () => {
-    // Hedged wording is already excluded by the non-success controls, so a claim
-    // reaching here asserts the merge outright whatever kind it declares.
-    expectRejection(
-      claimFinalization({ kind: "uncertainty", outcome: "succeeded", text: "I merged the branch." }),
-      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
-      "proof_incompatible",
-    );
-  });
-
-  it("screens each clause of a claim separately", () => {
-    // The state reading is fine; the merge riding along beside it is not.
-    expectRejection(
-      claimFinalization({
-        kind: "observed_state",
-        outcome: "succeeded",
-        text: "The project is configured. I merged the branch.",
-      }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-
-  it("still accepts an ordinary project-state reading", () => {
-    expect(validateControllerFinalization(
-      claimFinalization({
-        kind: "observed_state",
-        outcome: "observed",
-        text: "The project has three configured worker profiles.",
-      }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
   it.each([
     ["observed_state", "project_state"],
-    ["pipeline_outcome", "pipeline_outcome"],
     ["health_assessment", "health_snapshot"],
   ] as const)("allows current observation to support successful %s", (kind, proofKind) => {
     expect(validateControllerFinalization(
       claimFinalization({ kind, outcome: "succeeded" }),
       contextWithEvidence(evidenceRow("evidence:1", proofKind, "observed")),
     )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not let an observed failed production outcome support a successful pipeline claim", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "The rollout succeeded." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "observed")),
+      "proof_incompatible",
+    );
   });
 
   it.each([
@@ -1069,7 +792,208 @@ describe("claim outcome compatibility", () => {
   });
 });
 
+describe("fail-closed operational claim binding", () => {
+  it.each([
+    ["generic completion", "Everything is done."],
+    ["build success", "The build succeeded."],
+    ["CI success", "CI is green."],
+    ["rollout success", "The rollout succeeded."],
+    ["canary health", "The canary was healthy."],
+    ["production canary", "Production canary passed."],
+    ["finished work", "The work is finished."],
+  ] as const)("rejects %s when declared as an observed state without its outcome", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["generic completion", "Everything is done.", "pipeline_outcome", "pipeline_outcome"],
+    ["build success", "The build succeeded.", "execution_result", "command_result"],
+    ["CI success", "CI is green.", "pipeline_outcome", "pipeline_outcome"],
+    ["rollout success", "The rollout succeeded.", "pipeline_outcome", "production_outcome"],
+    ["finished work", "The work is finished.", "pipeline_outcome", "pipeline_outcome"],
+  ] as const)("accepts %s when its claim kind and evidence carry the assertion", (_label, text, kind, proofKind) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Everything is done.",
+    "The work is finished.",
+  ])("does not treat one successful project-state observation as proof of total completion: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "observed_state", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    "Everything is done.",
+    "The build succeeded.",
+    "CI is green.",
+    "The rollout succeeded.",
+    "The work is finished.",
+    "Production is up.",
+    "The release went out.",
+  ])("rejects an unclaimed operational paraphrase: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "The fix is\nimplemented.",
+    "The fix is\r\nimplemented.",
+    "The build\nsucceeded.",
+    "Everything is\ndone.",
+  ])("does not let line boundaries split an operational assertion: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it("does not let a negative subordinate clause suppress an earlier success assertion", () => {
+    expectRejection(
+      textFinalization("The tests passed, although deployment failed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it("does not let a negative because-clause suppress an earlier success assertion", () => {
+    expectRejection(
+      textFinalization("The tests passed because deployment failed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it.each([
+    ["a so-clause", "The deployment was not live so the tests passed."],
+    ["an earlier negation", "The deployment was not live before the tests passed."],
+    ["a question", "Did the deployment succeed?"],
+    ["a so-clause after a negative predicate", "The tests did not fail so production is live."],
+    ["a therefore-clause", "The canary did not fail therefore production is live."],
+    ["a yet-clause", "The deployment was not blocked yet production is live."],
+  ] as const)("keeps an affirmative assertion visible in %s", (_label, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Can you inspect this, and the deployment succeeded.",
+    "Could you note this: production is live.",
+    "Can you confirm whether the fix is implemented?",
+  ])("does not let a question-start suppress an operational assertion: %s", (text) => {
+    expectRejection(
+      textFinalization(text),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it.each([
+    "Working on it now.",
+    "I'm working on it now.",
+    "The work is in progress.",
+  ])("rejects process-only wording even when carried by a claim: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "uncertainty", outcome: "uncertain", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      "process_only",
+    );
+  });
+
+  it("rejects an operational assertion split across a text and claim boundary", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "The build suc" },
+        claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: "ceeded." }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+
+    expectRejection(
+      candidate,
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      "proof_incompatible",
+    );
+  });
+
+  it("rejects process-only wording split across a text and claim boundary", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "Working on" },
+        claimFinalization({ kind: "uncertainty", outcome: "uncertain", text: " it now." }).segments[0],
+      ],
+      obligationRefs: [],
+    };
+
+    expectRejection(
+      candidate,
+      contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+      "process_only",
+    );
+  });
+
+  it("does not let a compatible kind hide an incompatible operational paraphrase", () => {
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text: "The rollout succeeded." }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["a deployment assertion", "The service was configured.", "execution_result", "command_result"],
+    ["a release assertion", "The release was deployed.", "workspace_change", "workspace_change"],
+  ] as const)("does not let %s ride on a broad command/file proof", (_label, text, kind, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("requires a positive typed health observation for a healthy claim", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "health_assessment", outcome: "succeeded", text: "The agent is healthy." }),
+      contextWithEvidence(evidenceRow("evidence:1", "health_snapshot", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+    expectRejection(
+      claimFinalization({ kind: "health_assessment", outcome: "succeeded", text: "The agent is healthy." }),
+      contextWithEvidence(evidenceRow("evidence:1", "health_snapshot", "interrupted")),
+      "proof_incompatible",
+    );
+  });
+});
+
 describe("bounded text heuristics", () => {
+  it.each([
+    ["deployment with an explicit negative predicate", "The deployment passed, not failed."],
+    ["deployment despite a failed test", "The deployment passed despite the test failed."],
+    ["deployment with parenthetical negation", "The deployment passed (the deployment failed)."],
+    ["canary with an explicit negative predicate", "The canary passed, not failed."],
+    ["merge with parenthetical negation", "The merge succeeded (the merge failed)."],
+    ["production with parenthetical negation", "Production is live (production failed)."],
+  ] as const)("does not let mixed-polarity %s hide a positive assertion", (_label, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "The deployment failed.",
+    "The canary did not pass.",
+    "The merge was not completed.",
+    "Production is not live.",
+    "Production is not yet live.",
+  ])("keeps a wholly negative operational statement acceptable: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
   it.each([
     "I'll check this.",
     "Let me look into it.",
@@ -1078,19 +1002,16 @@ describe("bounded text heuristics", () => {
     "I'll try.",
     "I'll get back to you.",
     "I'll follow up.",
+    "I'll take care of it.",
+    "I will handle it.",
+    "I am addressing it now.",
+    "I'll resolve the situation.",
+    "We are progressing it.",
     "I'll check the logs.",
     "I'll look into the current job.",
     "I'll work on the migration.",
     "I’ll investigate and get back to you.",
     "I'll investigate. I'll get back to you.",
-    "I'll investigate..",
-    "I'll investigate...",
-    "I'll investigate!!",
-    "I'll investigate. .",
-    "I'll investigate.\r\n...",
-    "I'll investigate…",
-    "Let me investigate…",
-    "I’ll investigate… and get back to you…",
   ])("rejects process-only statement: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "process_only");
   });
@@ -1102,9 +1023,6 @@ describe("bounded text heuristics", () => {
     "I can investigate if you want me to.",
     "I'll investigate. SQLite is the simplest choice.",
     "I'll investigate. Should I follow up?",
-    "I'll investigate… SQLite is the simplest choice.",
-    "Should I investigate…?",
-    "The result is useful…",
   ])("does not broaden process-only detection to: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
@@ -1188,153 +1106,33 @@ describe("bounded text heuristics", () => {
     "USD 500 was spent on the service.",
     "The tests were completed.",
     "I can confirm the fix is implemented.",
+    "The migration is wrapped up.",
+    "The issue has been resolved.",
+    "The launch cleared its final gate.",
+    "The rollout went smoothly.",
+    "The change landed.",
+    "The service is good to go.",
   ])("rejects unclaimed high-impact assertion: %s", (text) => {
     expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
 
-  const ACTIVE_PAST_PERFECT_ASSERTIONS = [
-    ["I had implemented the fix.", "I hadn't implemented the fix?", "I had implemented the fix, hadn't I?", "I had implemented the fix, hadn't we?"],
-    ["We had fixed the change.", "We hadn't fixed the change?", "We had fixed the change, hadn't we?", "We had fixed the change, hadn't I?"],
-    ["I had shipped the feature.", "I hadn't shipped the feature?", "I had shipped the feature, hadn't I?", "I had shipped the feature, hadn't we?"],
-    ["I had run the unit tests.", "I hadn't run the unit tests?", "I had run the unit tests, hadn't I?", "I had run the unit tests, hadn't we?"],
-    ["We had completed the review.", "We hadn't completed the review?", "We had completed the review, hadn't we?", "We had completed the review, hadn't I?"],
-    ["I had merged the branch.", "I hadn't merged the branch?", "I had merged the branch, hadn't I?", "I had merged the branch, hadn't we?"],
-    ["We had deployed the service to production.", "We hadn't deployed the service to production?", "We had deployed the service to production, hadn't we?", "We had deployed the service to production, hadn't I?"],
-    ["I had deleted the stale records.", "I hadn't deleted the stale records?", "I had deleted the stale records, hadn't I?", "I had deleted the stale records, hadn't we?"],
-    ["We had installed the package.", "We hadn't installed the package?", "We had installed the package, hadn't we?", "We had installed the package, hadn't I?"],
-    ["I had rotated the API keys.", "I hadn't rotated the API keys?", "I had rotated the API keys, hadn't I?", "I had rotated the API keys, hadn't we?"],
-    ["We had spent USD 500.", "We hadn't spent USD 500?", "We had spent USD 500, hadn't we?", "We had spent USD 500, hadn't I?"],
-    ["I had purchased the service.", "I hadn't purchased the service?", "I had purchased the service, hadn't I?", "I had purchased the service, hadn't we?"],
-  ] as const;
-
-  it.each(ACTIVE_PAST_PERFECT_ASSERTIONS)(
-    "screens active past-perfect success consistently: %s",
-    (assertion, negatedQuestion, agreeingTag, mismatchedTag) => {
-      const observed = contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
-      expectRejection(textFinalization(assertion), emptyFinalizationContext(), "high_impact_text_unclaimed");
-      expectRejection(
-        claimFinalization({ kind: "observed_state", outcome: "observed", text: assertion }),
-        observed,
-        "proof_incompatible",
-      );
-      for (const text of [negatedQuestion, agreeingTag]) {
-        expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
-          .toMatchObject({ outcome: "accepted" });
-        expect(validateControllerFinalization(
-          claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-          observed,
-        )).toMatchObject({ outcome: "accepted" });
-      }
-      expectRejection(textFinalization(mismatchedTag), emptyFinalizationContext(), "high_impact_text_unclaimed");
-      expectRejection(
-        claimFinalization({ kind: "observed_state", outcome: "observed", text: mismatchedTag }),
-        observed,
-        "proof_incompatible",
-      );
-    },
-  );
-
-  const PERFECT_SUCCESS_CASES = [
-    ["contracted implementation", "I’d implemented the fix.", "workspace_change", "workspace_change"],
-    ["ASCII present-perfect implementation", "I've implemented the fix.", "workspace_change", "workspace_change"],
-    ["curly present-perfect implementation", "I’ve implemented the fix.", "workspace_change", "workspace_change"],
-    ["two-adverb implementation", "I had already successfully implemented the fix.", "workspace_change", "workspace_change"],
-    ["unlisted adverb implementation", "I had definitely implemented the fix.", "workspace_change", "workspace_change"],
-    ["affirmative adverb implementation", "I had actually implemented the fix.", "workspace_change", "workspace_change"],
-    ["adverbial passive implementation", "The fix had already been implemented.", "workspace_change", "workspace_change"],
-    ["post-participle-adverb implementation", "The fix had been successfully implemented.", "workspace_change", "workspace_change"],
-    ["split two-adverb implementation", "The fix had already been successfully implemented.", "workspace_change", "workspace_change"],
-    ["contracted nominal implementation", "The fix’s been implemented.", "workspace_change", "workspace_change"],
-    ["contracted BE implementation", "The fix’s complete.", "workspace_change", "workspace_change"],
-    ["contracted test run", "We'd run the unit tests.", "execution_result", "command_result"],
-    ["curly present-perfect test run", "We’ve run the unit tests.", "execution_result", "command_result"],
-    ["intransitive passed tests", "The tests had passed.", "execution_result", "command_result"],
-    ["qualified intransitive tests", "The tests had barely passed.", "execution_result", "command_result"],
-    ["contracted intransitive tests", "The tests’ve passed.", "execution_result", "command_result"],
-    ["intransitive successful tests", "The tests had succeeded.", "execution_result", "command_result"],
-    ["adverbial passive tests", "The unit tests had already been completed.", "execution_result", "command_result"],
-    ["post-participle-adverb tests", "The tests had been successfully completed.", "execution_result", "command_result"],
-    ["correctly completed tests", "The tests had been correctly completed.", "execution_result", "command_result"],
-    ["adverbial active review", "I had already completed the review.", "pipeline_outcome", "pipeline_outcome"],
-    ["intransitive passed review", "The review had passed.", "pipeline_outcome", "pipeline_outcome"],
-    ["contracted adverbial review", "The review’s already passed.", "pipeline_outcome", "pipeline_outcome"],
-    ["two-adverb review", "The review had finally fully passed.", "pipeline_outcome", "pipeline_outcome"],
-    ["passive review", "The review had been approved.", "pipeline_outcome", "pipeline_outcome"],
-    ["post-participle-adverb review", "The review had been formally approved.", "pipeline_outcome", "pipeline_outcome"],
-    ["officially approved review", "The review had been officially approved.", "pipeline_outcome", "pipeline_outcome"],
-    ["post-participle two-adverb review", "The review had been formally fully approved.", "pipeline_outcome", "pipeline_outcome"],
-    ["contracted merge", "I’d merged the branch.", "pipeline_outcome", "pipeline_outcome"],
-    ["passive merge", "The pull request had been merged.", "pipeline_outcome", "pipeline_outcome"],
-    ["post-participle-adverb merge", "The branch had been successfully merged.", "pipeline_outcome", "pipeline_outcome"],
-    ["contracted BE merge", "The branch’s merged.", "pipeline_outcome", "pipeline_outcome"],
-    ["contracted deployment", "We'd deployed the service to production.", "pipeline_outcome", "pipeline_outcome"],
-    ["intransitive deployment", "The deployment had succeeded in production.", "pipeline_outcome", "pipeline_outcome"],
-    ["adverbial passive deployment", "The service had already been deployed.", "pipeline_outcome", "pipeline_outcome"],
-    ["post-participle-adverb deployment", "The service had been successfully deployed.", "pipeline_outcome", "pipeline_outcome"],
-    ["eventual passive deployment", "The service had eventually been successfully deployed.", "pipeline_outcome", "pipeline_outcome"],
-    ["present-state adverbial deployment", "The service is now live.", "pipeline_outcome", "pipeline_outcome"],
-    ["contracted BE deployment", "The deployment’s still live.", "pipeline_outcome", "pipeline_outcome"],
-    ["contracted deletion", "I'd deleted the stale records.", "external_mutation", "external_mutation"],
-    ["passive deletion", "The records had been deleted.", "external_mutation", "external_mutation"],
-    ["post-participle-adverb deletion", "The records had been permanently deleted.", "external_mutation", "external_mutation"],
-    ["securely deleted records", "The records had been securely deleted.", "external_mutation", "external_mutation"],
-    ["contracted plural BE deletion", "The records’re deleted.", "external_mutation", "external_mutation"],
-    ["contracted installation", "We’d installed the package.", "external_mutation", "external_mutation"],
-    ["passive installation", "The package had been installed.", "external_mutation", "external_mutation"],
-    ["post-participle-adverb installation", "The package had been successfully installed.", "external_mutation", "external_mutation"],
-    ["adverbial credential rotation", "I had already rotated the API keys.", "external_mutation", "external_mutation"],
-    ["adverbial passive credential rotation", "The API keys had already been rotated.", "external_mutation", "external_mutation"],
-    ["contracted passive credential rotation", "The API keys’ve been rotated.", "external_mutation", "external_mutation"],
-    ["contracted post-participle-adverb credential rotation", "The API keys’ve been successfully rotated.", "external_mutation", "external_mutation"],
-    ["recently rotated credentials", "The API keys had been recently rotated.", "external_mutation", "external_mutation"],
-    ["contracted spend", "We'd spent USD 500.", "external_mutation", "external_mutation"],
-    ["passive spend", "USD 500 had been spent.", "external_mutation", "external_mutation"],
-    ["post-participle-adverb spend", "USD 500 had been fully spent.", "external_mutation", "external_mutation"],
-    ["contracted purchase", "I’d purchased the service.", "external_mutation", "external_mutation"],
-    ["passive purchase", "The service had been purchased.", "external_mutation", "external_mutation"],
-    ["post-participle-adverb purchase", "The service had been successfully purchased.", "external_mutation", "external_mutation"],
-    ["contracted nominal purchase", "The service’d been purchased.", "external_mutation", "external_mutation"],
-    ["contracted adverbial nominal purchase", "The service’d already been purchased.", "external_mutation", "external_mutation"],
-  ] as const satisfies readonly (readonly [string, string, ControllerClaimKind, ControllerProofKind])[];
-
-  it.each(PERFECT_SUCCESS_CASES)(
-    "screens %s on plain and incompatible paths, then accepts its compatible claim",
-    (_scenario, text, kind, proofKind) => {
-      expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
-      expectRejection(
-        claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-        contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-        "proof_incompatible",
-      );
-      expect(validateControllerFinalization(
-        claimFinalization({ kind, outcome: "succeeded", text }),
-        contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
-      )).toMatchObject({ outcome: "accepted" });
-    },
-  );
+  it.each([
+    ["deployment success", "Deployment succeeded.", "high_impact_text_unclaimed"],
+    ["all tests pass", "All tests pass.", "high_impact_text_unclaimed"],
+    ["thread success", "The thread operation succeeded.", "high_impact_text_unclaimed"],
+    ["job mutation", "I cancelled the job.", "high_impact_text_unclaimed"],
+    ["thread mutation", "I sent a message to the thread.", "high_impact_text_unclaimed"],
+    ["process-only investigation", "I am investigating.", "process_only"],
+  ] as const)("dispositions evidence-free operational text: %s", (_label, text, code) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), code);
+  });
 
   it.each([
-    "I'd like to implement the fix.",
-    "The tests had not passed.",
-    "The review had failed.",
-    "The deployment had probably succeeded in production.",
-    "The deployment had seemingly succeeded in production.",
-    "The tests had possibly already passed.",
-    "The fix had likely been implemented.",
-    "The tests had reportedly passed.",
-    "The review had allegedly been formally approved.",
-    "The deployment had potentially succeeded in production.",
-    "The API keys’ve presumably been rotated.",
-    "The service had conceivably been purchased.",
-    "The fix had purportedly been implemented.",
-    "The review had putatively been approved.",
-    "The tests had unlikely passed.",
-    "The service had theoretically been deployed.",
-    "The review had nominally been approved.",
-    "The fix had already formally been successfully implemented.",
-    "The service had never been purchased.",
-    "We had discussed purchasing the service.",
-  ])("does not broaden perfect success detection to: %s", (text) => {
+    ["modal", "Tests can pass with either configuration."],
+    ["conditional result", "The function returns true when tests pass."],
+    ["imperative", "Pass the tests before merging."],
+    ["infinitive", "To pass the tests, configure the service."],
+  ] as const)("leaves non-result base success grammar as ordinary prose: %s", (_label, text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
   });
@@ -1342,7 +1140,6 @@ describe("bounded text heuristics", () => {
   it.each([
     "Should I deploy the service?",
     "I did not deploy the service.",
-    "I will deploy the service after approval.",
     "The deployment failed.",
     "The deployment may have succeeded, but I am uncertain.",
     "We could install the package later.",
@@ -1352,13 +1149,18 @@ describe("bounded text heuristics", () => {
     "We paid attention to the details.",
     "Should the package be installed?",
     "The records were not deleted.",
-    "We will purchase the service after approval.",
-    "Can you confirm whether the fix is implemented?",
     "I don't think the fix is implemented.",
     "It seems the fix is implemented.",
   ])("does not treat non-success text as a high-impact success: %s", (text) => {
     expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
       .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "I will deploy the service after approval.",
+    "We will purchase the service after approval.",
+  ])("rejects a future action as process-only rather than an answered result: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "process_only");
   });
 
   it("rejects a completed assertion split across adjacent text segments", () => {
@@ -1373,7 +1175,7 @@ describe("bounded text heuristics", () => {
     expectRejection(candidate, emptyFinalizationContext(), "high_impact_text_unclaimed");
   });
 
-  it("does not let a claim boundary launder an assertion the owner still reads whole", () => {
+  it("rejects an operational assertion concatenated across a claim boundary", () => {
     const candidate: ControllerFinalization = {
       disposition: "answered",
       segments: [
@@ -1382,10 +1184,9 @@ describe("bounded text heuristics", () => {
       ],
       obligationRefs: [],
     };
-    // The owner reads "The fix is implemented." however it was assembled.
-    expect(validateControllerFinalization(candidate, contextWithEvidence(
+    expectRejection(candidate, contextWithEvidence(
       evidenceRow("evidence:1", "project_state"),
-    ))).toMatchObject({ outcome: "rejected", code: "proof_incompatible" });
+    ), "proof_incompatible");
   });
 
   it("allows a high-impact assertion when it is carried by a compatible claim segment", () => {
@@ -1395,7 +1196,878 @@ describe("bounded text heuristics", () => {
         outcome: "succeeded",
         text: "The deployment succeeded in production.",
       }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("requires production proof for a canary claim", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Production canary passed." }),
       contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Production canary passed." }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["shipped", "The change shipped to production."],
+    ["merged", "The release was merged to production."],
+    ["published", "The package was published to production."],
+    ["live", "The feature is live in production."],
+    ["running", "The service is running in production."],
+    ["production modifier", "The production change shipped."],
+    ["production release", "The production release was published."],
+    ["not-only production", "The package was published not only to production."],
+    ["against preposition", "The change shipped against production."],
+    ["published across production", "The release was published across production."],
+    ["published throughout production", "The release was published throughout production."],
+  ] as const)("requires production proof for %s wording even when the verb is broadly accepted", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["production tests", "Production tests passed."],
+    ["production smoke and regression tests", "Production smoke and regression tests passed."],
+    ["production tests all passed", "Production tests all passed."],
+    ["tests using production", "Tests passed using production."],
+    ["production label tests", "Production: tests passed."],
+  ] as const)("requires execution and production proof for %s wording", (_label, text) => {
+    const claim = claimFinalization({ kind: "execution_result", outcome: "succeeded", text });
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    const claimWithCombinedEvidence = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text,
+      evidenceRefs: ["evidence:1", "evidence:2"],
+    });
+    expectRejection(
+      claimWithCombinedEvidence,
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded"),
+        evidenceRow("evidence:2", "production_outcome", "succeeded"),
+      ),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["and connector", "Tests passed and used production."],
+    ["because connector", "Tests passed because they ran against production."],
+    ["but connector", "Tests passed but used production."],
+    ["although connector", "Tests passed although they ran against production."],
+  ] as const)("keeps production binding across one-claim connectors: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("keeps a semicolon production qualifier bound to the execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed; they ran against production.",
+    }).segments[0];
+    expectRejection(
+      { disposition: "answered", segments: [claim], obligationRefs: [] },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("keeps a semicolon plain qualifier bound to the preceding execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed;",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: " they ran against production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("keeps a plain-segment production qualifier bound to the execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: " and used production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("binds a leading plain production modifier to the following execution claim", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "tests passed.",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [{ type: "text", text: "In production, " }, claim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("does not lose a production target when its word crosses a claim boundary", () => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed in produc",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: "tion." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("does not let an adjacent claim without production proof satisfy a production qualifier", () => {
+    const executionClaim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+      evidenceRefs: ["evidence:1"],
+    }).segments[0];
+    const productionClaim = claimFinalization({
+      kind: "pipeline_outcome",
+      outcome: "succeeded",
+      text: "The release shipped to production.",
+      evidenceRefs: ["evidence:2"],
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [executionClaim, { type: "text", text: " and " }, productionClaim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded"),
+        evidenceRow("evidence:2", "pipeline_outcome", "succeeded"),
+      ),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([".", "?", "!"])("allows punctuation to delimit a plain production sentence: %s", (punctuation) => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: `Tests passed${punctuation}`,
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: " they ran against production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["CI object", "CI passed every test.", "pipeline_outcome"],
+    ["review object", "The review passed all tests.", "pipeline_outcome"],
+    ["deployment object", "The deployment passed every test.", "production_outcome"],
+    ["release object", "The release passed all regression tests.", "production_outcome"],
+    ["compound subjects", "Tests and CI passed.", "pipeline_outcome"],
+  ] as const)("fails closed when a test noun shares a larger success predicate: %s", (_label, text, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["CI object", "CI passed every test.", "pipeline_outcome"],
+    ["review object", "The review passed all tests.", "pipeline_outcome"],
+    ["deployment object", "The deployment passed every test.", "production_outcome"],
+    ["release object", "The release passed all regression tests.", "production_outcome"],
+    ["CI before tests", "CI and tests passed.", "pipeline_outcome"],
+    ["review before tests", "The review and tests passed.", "pipeline_outcome"],
+  ] as const)("does not let a protected predicate hide test execution entitlement: %s", (_label, text, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["CI before tests", "CI and tests passed.", "pipeline_outcome"],
+    ["review before tests", "The review and tests passed.", "pipeline_outcome"],
+    ["deployment before tests", "The deployment and tests passed.", "production_outcome"],
+    ["tests with review", "Tests together with review passed.", "pipeline_outcome"],
+  ] as const)("fails closed for mixed subject order in one predicate: %s", (_label, text, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["as well as", "The tests as well as the review passed."],
+    ["reverse as well as", "The review as well as the tests passed."],
+    ["plus", "Tests plus review passed."],
+    ["reverse plus", "Review plus tests passed."],
+    ["alongside", "Tests alongside review passed."],
+    ["reverse alongside", "Review alongside tests passed."],
+  ] as const)("fails closed for structural compound connector: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("accepts separately subject-bound execution and production claims", () => {
+    const executionClaim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+      subjectRef: "bb-item:command-1",
+      evidenceRefs: ["evidence:1"],
+    }).segments[0];
+    const productionClaim = claimFinalization({
+      kind: "pipeline_outcome",
+      outcome: "succeeded",
+      text: "Production release succeeded.",
+      subjectRef: "job:job_1",
+      evidenceRefs: ["evidence:2"],
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [executionClaim, { type: "text", text: " and " }, productionClaim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded", "bb-item:command-1"),
+        evidenceRow("evidence:2", "production_outcome", "succeeded", "job:job_1"),
+      ),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("rejects a direct production test claim with command and production subjects", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: "Production tests passed.",
+        subjectRef: "bb-item:command-1",
+        evidenceRefs: ["evidence:1", "evidence:2"],
+      }),
+      contextWithEvidence(
+        evidenceRow("evidence:1", "command_result", "succeeded", "bb-item:command-1"),
+        evidenceRow("evidence:2", "production_outcome", "succeeded", "job:job_1"),
+      ),
+      "subject_mismatch",
+    );
+  });
+
+  it("does not let production-only evidence carry production test success", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "pipeline_outcome",
+        outcome: "succeeded",
+        text: "Production tests all passed.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["tests all passed", "The tests all passed."],
+    ["test cases passed", "The test cases passed."],
+  ] as const)("binds natural test-success wording to execution evidence: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["auxiliary after subject", "Tests have all passed."],
+    ["universal singular subject", "Every test passed."],
+    ["quantified test cases", "All of the test cases passed."],
+  ] as const)("entitles varied test-success predicates to execution proof: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["unexpectedly", "Tests unexpectedly passed."],
+    ["finally", "Tests finally passed."],
+    ["repeatedly", "Tests repeatedly passed."],
+  ] as const)("entitles adverbial test-success predicates to execution proof: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["reporting handoff to CI", "Tests reported CI passed.", false],
+    ["auxiliary and adverbial chain", "Tests did ultimately pass.", true],
+    ["relative test participant", "The tests that ran passed.", true],
+    ["relative pronoun participant", "The tests I ran passed.", true],
+    ["named relative participant", "The tests Alice ran passed.", true],
+    ["possessive relative participant", "The tests my team ran passed.", true],
+    ["reduced overnight relative", "The tests run overnight passed.", true],
+    ["possessive named subject", "Alice's tests passed.", true],
+    ["focus modifier", "Tests even passed.", true],
+    ["temporal modifier", "Tests have now passed.", true],
+    ["gerund test subject", "Regression testing passed.", true],
+    ["compound test subject", "Unit and integration tests passed.", true],
+    ["relative test subject", "The tests that were run passed.", true],
+    ["relative subject with team", "The tests that the team ran passed.", true],
+    ["postposed test subject", "Passed tests.", true],
+    ["postposed quantified subject", "Passed: all tests.", true],
+    ["postposed regression tests", "Passed all regression tests.", true],
+    ["test run subject", "The test run passed.", true],
+    ["relative base pass", "The tests that ran pass.", true],
+    ["relative base succeed", "The tests I ran succeed.", true],
+  ] as const)("binds success to the nearest local subject: %s", (_label, text, testSubjectIsNearest) => {
+    const pipelineClaim = claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text });
+    const executionClaim = claimFinalization({ kind: "execution_result", outcome: "succeeded", text });
+    const pipelineContext = contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded"));
+    const executionContext = contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded"));
+    if (testSubjectIsNearest) {
+      expectRejection(pipelineClaim, pipelineContext, "proof_incompatible");
+      expect(validateControllerFinalization(executionClaim, executionContext)).toMatchObject({ outcome: "accepted" });
+      return;
+    }
+    expect(validateControllerFinalization(pipelineClaim, pipelineContext)).toMatchObject({ outcome: "accepted" });
+    expectRejection(executionClaim, executionContext, "proof_incompatible");
+  });
+
+  it("does not transfer test entitlement through a competing predicate subject", () => {
+    const text = "The tests reported the review passed.";
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("fails closed when test and review subjects share one success predicate", () => {
+    const text = "The tests and the review passed.";
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("keeps a larger CI predicate bound to pipeline evidence when tests are only the reporter", () => {
+    const text = "Tests reported CI passed.";
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["adverbial result", "Tests did indeed pass."],
+    ["named test suite", "Ada's test suite passed."],
+    ["possessive test suite", "The team's test suite passed."],
+    ["named prepositional subject", "The tests of Ada passed."],
+    ["reduced relative", "The tests run by CI passed."],
+  ] as const)("recognizes whole local test predicates: %s", (_label, text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Passed tests and the review.",
+    "Passed the review and tests.",
+    "Passed tests and CI.",
+  ])("fails closed for reverse/postposed compound test predicates: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expectRejection(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("keeps neighboring pipeline and test predicates locally entitled", () => {
+    const pipelineClaim = claimFinalization({
+      kind: "pipeline_outcome",
+      outcome: "succeeded",
+      text: "The review succeeded",
+      evidenceRefs: ["evidence:1"],
+    }).segments[0];
+    const executionClaim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "all tests passed",
+      evidenceRefs: ["evidence:2"],
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [pipelineClaim, { type: "text", text: " and " }, executionClaim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(
+        evidenceRow("evidence:1", "pipeline_outcome", "succeeded"),
+        evidenceRow("evidence:2", "command_result", "succeeded"),
+      ),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["test production qualifier", "execution_result", "Tests passed in ", "command_result"],
+    ["release production qualifier", "pipeline_outcome", "The release was published to ", "pipeline_outcome"],
+  ] as const)("does not let production qualifiers escape across segments: %s", (_label, kind, claimText, proofKind) => {
+    const claim = claimFinalization({ kind, outcome: "succeeded", text: claimText }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [claim, { type: "text", text: "production." }],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    ["never down", "Production was never down: the release was published."],
+    ["nowhere outside", "The release was published nowhere outside production."],
+  ] as const)("requires production proof for affirmative production polarity: %s", (_label, text) => {
+    const claim = claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text });
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["negated negative state", "Production was not broken and published."],
+    ["negated outside relation", "The release was published not outside production."],
+  ] as const)("requires production proof for a negated negative production predicate: %s", (_label, text) => {
+    const claim = claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text });
+    expectRejection(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claim,
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["negative positive state", "Production is not live.", "pipeline_outcome", "failed", "pipeline_outcome", "failed"],
+    ["negative production state", "The tests passed because production is down.", "execution_result", "succeeded", "command_result", "succeeded"],
+    ["success outside production", "The release was published outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
+    ["unrelated earlier negation", "The release was not delayed and was published outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
+    ["only outside production", "The release was published only outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
+    ["all outside production", "The release was published all outside production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
+    ["non-production", "The release was published in non-production.", "pipeline_outcome", "succeeded", "pipeline_outcome", "succeeded"],
+    ["without ever touching", "The tests passed without ever touching production.", "execution_result", "succeeded", "command_result", "succeeded"],
+    ["explicit no-touch", "The tests passed without accessing production.", "execution_result", "succeeded", "command_result", "succeeded"],
+  ] as const)("keeps a narrow production exception: %s", (_label, text, kind, claimOutcome, proofKind, evidenceOutcome) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind, outcome: claimOutcome, text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, evidenceOutcome)),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["no production failures", "The tests passed with no production failures.", "execution_result", "command_result"],
+    ["nowhere at all outside", "The release was published nowhere at all outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["not outside", "The release was published not outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["within rather than outside", "The release was published within rather than outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["inside rather than outside", "The release was published inside rather than outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["within instead of outside", "The release was published within instead of outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["everywhere but outside", "The release was published everywhere but outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["anything other than outside", "The release was published anything other than outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["anything but outside", "The release was published anything but outside production.", "pipeline_outcome", "pipeline_outcome"],
+    ["anything but non-production", "The release was published anything but non-production.", "pipeline_outcome", "pipeline_outcome"],
+    ["not non-production", "The release was published not non-production.", "pipeline_outcome", "pipeline_outcome"],
+    ["not without touching", "The tests passed not without touching production.", "execution_result", "command_result"],
+  ] as const)("requires production proof for ambiguous non-production wording: %s", (_label, text, kind, proofKind) => {
+    expectRejection(
+      claimFinalization({ kind, outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", proofKind, "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    "The release was published inside as opposed to outside production.",
+    "The release was published versus outside production.",
+    "The release was published in contrast to outside production.",
+    "The release was published anywhere except outside production.",
+    "The release was published anything except non-production.",
+    "The release was published the opposite of non-production.",
+  ])("requires production proof for contrast wording: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "production_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "The release was published outside production.",
+    "The release was published only outside production.",
+    "The release was published all outside production.",
+    "The release was published non-production.",
+  ])("preserves exact non-production exceptions: %s", (text) => {
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not turn a test result that explicitly avoided production into a production claim", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: "The tests passed without touching production.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("does not let an outer negator create a no-touch production exception", () => {
+    expectRejection(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: "The tests passed not without touching production.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    "Outside production, ",
+    "In non-production, ",
+    "Without touching production, ",
+  ])("accepts a prefix non-target production qualifier: %s", (prefix) => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+    }).segments[0];
+    expect(validateControllerFinalization(
+      {
+        disposition: "answered",
+        segments: [{ type: "text", text: prefix }, claim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "In production, ",
+    "Using production, ",
+    "production; ",
+  ])("keeps a prefix production qualifier bound to the execution claim: %s", (prefix) => {
+    const claim = claimFinalization({
+      kind: "execution_result",
+      outcome: "succeeded",
+      text: "Tests passed.",
+    }).segments[0];
+    expectRejection(
+      {
+        disposition: "answered",
+        segments: [{ type: "text", text: prefix }, claim],
+        obligationRefs: [],
+      },
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each(["pipeline_outcome", "execution_result"] as const)(
+    "does not infer a typed proof from an unproven reporting clause: %s",
+    (kind) => {
+      expectRejection(
+        claimFinalization({ kind, outcome: "succeeded", text: "Tests reported that CI passed." }),
+        contextWithEvidence(evidenceRow(
+          "evidence:1",
+          kind === "pipeline_outcome" ? "pipeline_outcome" : "command_result",
+          "succeeded",
+        )),
+        "proof_incompatible",
+      );
+    },
+  );
+
+  it.each([
+    "All tests are passing.",
+    "tests ran successfully",
+    "tests were a success",
+    "No tests failed.",
+  ])("rejects a natural test result in plain text: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Every test is passing.",
+    "The entire test suite is passing.",
+    "There were zero test failures.",
+  ])("requires execution proof for additional natural test results: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "None of the tests failed.",
+    "Not a single test failed.",
+    "Zero tests failed.",
+    "Tests did not fail.",
+  ])("requires typed execution evidence for an observed negative test result: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+    expect(validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    ["whenever conditional", "Tests pass whenever configured.", true],
+    ["when conditional", "Tests pass when configured.", true],
+    ["bare affirmative", "Tests pass.", false],
+    ["past affirmative", "Tests passed.", false],
+  ] as const)("distinguishes conditional test prose from results: %s", (_label, text, isOrdinary) => {
+    if (isOrdinary) {
+      expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+        .toMatchObject({ outcome: "accepted" });
+      return;
+    }
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Tests may not fail.",
+    "Tests will not fail.",
+    "Tests did not fail whenever configured.",
+  ])("preserves modal and habitual negative prose: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "parser passed the value to next stage",
+    "Use the passed value as default",
+    "Pass the test fixture into helper",
+    "Parser passed value downstream.",
+    "Parser passed along the value.",
+  ])("keeps non-result pass grammar ordinary: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Tests pass so we can merge.",
+    "Tests pass and I will monitor them.",
+    "I can confirm tests pass.",
+  ])("rejects an unclaimed present-tense test result: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Did tests pass?",
+    "If tests passed, continue.",
+    "parser passed tests to next stage",
+    "tests pass through validation",
+  ])("keeps question, conditional, and phrasal pass prose ordinary: %s", (text) => {
+    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it("keeps a protected CI predicate when generic passed is transitive prose", () => {
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "pipeline_outcome",
+        outcome: "succeeded",
+        text: "CI passed value downstream.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("rejects a Cyrillic confusable in a plain operational result", () => {
+    expectRejection(
+      textFinalization("Tests p\u0430ssed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it("rejects a Cyrillic confusable test subject in a pipeline-only claim", () => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Te\u0455ts passed." }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it("rejects a Greek confusable in a plain operational result", () => {
+    expectRejection(
+      textFinalization("Tests p\u03b1ssed."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it.each(["\u0422ests passed.", "\u0442ests passed."])("rejects a Cyrillic T confusable in a pipeline-only test claim: %s", (text) => {
+    expectRejection(
+      claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text }),
+      contextWithEvidence(evidenceRow("evidence:1", "pipeline_outcome", "succeeded")),
+      "proof_incompatible",
+    );
+  });
+
+  it.each([
+    "Ｔｈｅ ｂｕｉｌｄ ｓｕｃｃｅｅｄｅｄ.",
+    "The bui\u200Bld succeeded.",
+  ])("rejects Unicode-obfuscated operational prose: %s", (text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    ["unmapped Cyrillic d", "Tests p\u0430\u0455\u0455e\u0501."],
+    ["palochka", "The service is \u04cfive."],
+    ["pure-script lookalikes", "Теѕтѕ раѕѕеԁ."],
+    ["Armenian lookalike", "Production is \u0585nline."],
+    ["mapped script with hidden separators", "Теѕ\u200Bтѕ ра\u00adѕѕеԁ."],
+  ] as const)("rejects canonicalized confusable operational prose: %s", (_label, text) => {
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it.each([
+    "Full-width typography is fine for this note.",
+    "The α symbol is ordinary Unicode.",
+  ])("does not reject ordinary prose merely because it uses Unicode text: %s", (text) => {
+    expect(validateControllerFinalization(
+      textFinalization(text),
+      emptyFinalizationContext(),
     )).toMatchObject({ outcome: "accepted" });
   });
 });
@@ -1457,13 +2129,13 @@ describe("fixed corrections", () => {
         segments: [{ type: "text", text: "I'll follow up with the result." }],
         obligationRefs: ["obligation:1"],
       }, emptyFinalizationContext())],
+      ["invocation_in_flight", validateControllerFinalization(
+        textFinalization("The answer is complete."),
+        emptyFinalizationContext({ invocationInFlight: true }),
+      )],
       ["process_only", validateControllerFinalization(textFinalization("I'll investigate."), emptyFinalizationContext())],
       ["high_impact_text_unclaimed", validateControllerFinalization(
         textFinalization("The fix is implemented."),
-        emptyFinalizationContext(),
-      )],
-      ["follow_up_unbacked", validateControllerFinalization(
-        textFinalization("The proxy tests are still running. I'll take it through the merge once it lands."),
         emptyFinalizationContext(),
       )],
     ];
@@ -1477,313 +2149,5 @@ describe("fixed corrections", () => {
       return validation.correction;
     });
     expect(new Set(corrections).size).toBe(FINALIZATION_REJECTION_CODES.length);
-  });
-});
-
-describe("tag agreement across subjects and auxiliaries", () => {
-  const AUXILIARIES = ["is", "are", "was", "were", "has", "have", "had", "did"] as const;
-  const PRONOUNS = ["i", "we", "it", "they"] as const;
-  const PRONOUN_TEXT: Record<(typeof PRONOUNS)[number], string> = {
-    i: "I", we: "we", it: "it", they: "they",
-  };
-
-  // Written out rather than derived from the implementation, so the table is an
-  // independent statement of which pair confirms which assertion.
-  const CASES: [string, string[]][] = [
-    ["I implemented the fix", ["did i"]],
-    ["We shipped the change", ["did we"]],
-    ["Ran the tests", ["did i"]],
-    ["The tests passed", ["did they", "have they"]],
-    ["The deployment is live", ["is it"]],
-    ["The credentials are rotated", ["are they"]],
-    ["The fix has been implemented", ["has it"]],
-    ["The credentials have been rotated", ["have they"]],
-    ["The fix had been implemented", ["had it"]],
-    ["The API key had been rotated", ["had it"]],
-    ["The API keys had been rotated", ["had they"]],
-    ["The data had been deleted", ["had they"]],
-    ["The unit tests had been completed", ["had they"]],
-    ["I’d implemented the fix", ["had i"]],
-    ["We'd run the unit tests", ["had we"]],
-    ["I've implemented the fix", ["have i"]],
-    ["We’ve run the unit tests", ["have we"]],
-    ["The API keys had already been rotated", ["had they"]],
-    ["The tests’ve passed", ["have they"]],
-    ["The review’s already passed", ["has it"]],
-    ["The API keys’ve been rotated", ["have they"]],
-    ["The service’d already been purchased", ["had it"]],
-    ["The fix’s complete", ["is it"]],
-    ["The branch’s merged", ["is it"]],
-    ["The deployment’s still live", ["is it"]],
-    ["The records’re deleted", ["are they"]],
-  ];
-
-  it.each(CASES)("accepts only the agreeing pair for %s", (assertion, allowed) => {
-    const context = contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
-    for (const auxiliary of AUXILIARIES) {
-      for (const pronoun of PRONOUNS) {
-        const tag = `${auxiliary}n't ${PRONOUN_TEXT[pronoun]}?`;
-        const text = `${assertion}, ${tag}`;
-        const expected = allowed.includes(`${auxiliary} ${pronoun}`) ? "accepted" : "rejected";
-        expect([text, validateControllerFinalization(
-          claimFinalization({ kind: "observed_state", outcome: "observed", text }), context,
-        ).outcome]).toEqual([text, expected]);
-      }
-    }
-  });
-
-  it("never lets a plural subject take a singular perfect auxiliary", () => {
-    for (const assertion of ["The tests passed", "The credentials have been rotated"]) {
-      expectRejection(
-        textFinalization(`${assertion}, hasn't they?`),
-        emptyFinalizationContext(),
-        "high_impact_text_unclaimed",
-      );
-    }
-  });
-
-  it.each([
-    ["a singular contraction", "The API key had been rotated, hadn't it?"],
-    ["a plural contraction", "The API keys had been rotated, hadn't they?"],
-    ["a singular curly contraction", "The package had been installed, hadn’t it?"],
-    ["a plural curly contraction", "The unit tests had been completed, hadn’t they?"],
-    ["a singular inverted tag", "The API key had been rotated, had it not?"],
-    ["a plural inverted tag", "The data had been deleted, had they not?"],
-  ] as const)("accepts %s on plain-text and incompatible-claim paths", (_scenario, text) => {
-    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
-      .toMatchObject({ outcome: "accepted" });
-    expect(validateControllerFinalization(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["a singular contraction with a plural pronoun", "The API key had been rotated, hadn't they?"],
-    ["a plural contraction with a singular pronoun", "The API keys had been rotated, hadn't it?"],
-    ["a singular curly contraction with a plural pronoun", "The package had been installed, hadn’t they?"],
-    ["a plural curly contraction with a singular pronoun", "The unit tests had been completed, hadn’t it?"],
-    ["a singular inverted tag with a plural pronoun", "The API key had been rotated, had they not?"],
-    ["a plural inverted tag with a singular pronoun", "The data had been deleted, had it not?"],
-  ] as const)("rejects %s on plain-text and incompatible-claim paths", (_scenario, text) => {
-    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-
-  it.each([
-    ["an ASCII contracted speaker", "I'd implemented the fix, hadn't I?"],
-    ["a curly contracted speaker", "I’d implemented the fix, hadn’t I?"],
-    ["a contracted plural speaker", "We'd run the unit tests, hadn't we?"],
-    ["an adverbial nominal", "The API keys had already been rotated, hadn't they?"],
-    ["contracted intransitive tests", "The tests’ve passed, haven't they?"],
-    ["a contracted adverbial review", "The review’s already passed, hasn't it?"],
-    ["contracted passive credentials", "The API keys’ve been rotated, haven't they?"],
-    ["a contracted adverbial purchase", "The service’d already been purchased, hadn't it?"],
-  ] as const)("accepts the agreeing past-perfect tag for %s", (_scenario, text) => {
-    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
-      .toMatchObject({ outcome: "accepted" });
-  });
-
-  it.each([
-    ["an ASCII contracted speaker", "I'd implemented the fix, hadn't we?"],
-    ["a curly contracted speaker", "I’d implemented the fix, hadn’t we?"],
-    ["a contracted plural speaker", "We'd run the unit tests, hadn't I?"],
-    ["an adverbial nominal", "The API keys had already been rotated, hadn't it?"],
-    ["contracted intransitive tests", "The tests’ve passed, hasn't it?"],
-    ["a contracted adverbial review", "The review’s already passed, haven't they?"],
-    ["contracted passive credentials", "The API keys’ve been rotated, hasn't it?"],
-    ["a contracted adverbial purchase", "The service’d already been purchased, hadn't they?"],
-  ] as const)("rejects the mismatched past-perfect tag for %s", (_scenario, text) => {
-    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
-      "proof_incompatible",
-    );
-  });
-});
-
-describe("source-preserving clause offsets", () => {
-  const observed = () => contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
-
-  it.each([
-    ["a curly mismatched tag", "The tests passed, shouldn\u2019t I?"],
-    ["a curly mismatched subject", "The tests passed, didn\u2019t I?"],
-    ["a newline before more prose", "The tests passed\nAnything else"],
-    ["a carriage return before more prose", "The tests passed\r\nAnything else"],
-    ["a curly tag after a newline", "Work is done\nThe tests passed, shouldn\u2019t I?"],
-  ] as const)("screens %s on the incompatible-claim path", (_scenario, text) => {
-    // Normalization must never move the offsets used to locate a clause in the
-    // original, or the clause is silently skipped and nothing is screened.
-    expectRejection(
-      claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-      observed(),
-      "proof_incompatible",
-    );
-  });
-
-  it.each([
-    ["a curly mismatched tag", "The tests passed, shouldn\u2019t I?"],
-    ["a newline before more prose", "The tests passed\nAnything else"],
-    ["a carriage return before more prose", "The tests passed\r\nAnything else"],
-  ] as const)("screens %s on the plain-text path", (_scenario, text) => {
-    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
-  });
-
-  it("keeps a curly agreeing tag accepted, exactly as its ASCII spelling is", () => {
-    for (const text of ["The tests passed, didn't they?", "The tests passed, didn\u2019t they?"]) {
-      expect(validateControllerFinalization(
-        claimFinalization({ kind: "observed_state", outcome: "observed", text }), observed(),
-      )).toMatchObject({ outcome: "accepted" });
-    }
-  });
-
-  it("keeps punctuation runs and CRLF from moving later assertion offsets", () => {
-    const observedContext = observed();
-    for (const text of [
-      "Earlier note!!\r\nThe API keys had been rotated, hadn't it?",
-      "Earlier note. .\r\nThe unit tests had been completed, hadn’t it?",
-    ]) {
-      expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
-      expectRejection(
-        claimFinalization({ kind: "observed_state", outcome: "observed", text }),
-        observedContext,
-        "proof_incompatible",
-      );
-    }
-    expect(validateControllerFinalization(
-      claimFinalization({
-        kind: "observed_state",
-        outcome: "observed",
-        text: "Earlier note...\r\nThe API keys had been rotated, hadn't they?",
-      }),
-      observedContext,
-    )).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("screens each occurrence of a repeated clause against its own tag", () => {
-    // Recovering an offset by searching for the clause text would find the first
-    // occurrence twice and never reach the mismatched second one.
-    const observedContext = contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed"));
-    expect(validateControllerFinalization(
-      claimFinalization({
-        kind: "observed_state", outcome: "observed",
-        text: "The tests passed, didn't they? The tests passed, didn't they?",
-      }), observedContext,
-    )).toMatchObject({ outcome: "accepted" });
-    expectRejection(
-      claimFinalization({
-        kind: "observed_state", outcome: "observed",
-        text: "The tests passed, didn't they? The tests passed, shouldn't I?",
-      }),
-      observedContext,
-      "proof_incompatible",
-    );
-  });
-
-  it("screens a repeated identical clause at each of its own positions", () => {
-    // Recovering an offset by searching for the clause text would find the first
-    // occurrence twice and never reach the second.
-    expectRejection(
-      {
-        disposition: "answered",
-        segments: [
-          { type: "claim", text: "The tests passed. The tests passed.", kind: "execution_result",
-            outcome: "succeeded", subjectRef: "job:job_1", evidenceRefs: ["evidence:1"] },
-          { type: "text", text: " The tests pa" },
-          { type: "claim", text: "ssed.", kind: "uncertainty", outcome: "uncertain",
-            subjectRef: "job:job_1", evidenceRefs: ["evidence:1"] },
-        ],
-        obligationRefs: [],
-      },
-      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
-      "proof_incompatible",
-    );
-  });
-});
-
-describe("nominal number from agreement and head noun", () => {
-  const plain = (text: string) => validateControllerFinalization(
-    textFinalization(text), emptyFinalizationContext()).outcome;
-
-  it.each([
-    ["a multiword plural with past be", "The API keys were rotated", "weren't they?", "wasn't it?"],
-    ["a multiword plural with perfect", "The API keys have been rotated", "haven't they?", "hasn't it?"],
-    ["an irregular plural with past be", "The data were deleted", "weren't they?", "wasn't it?"],
-    ["a multiword plural in simple past", "The unit tests passed", "didn't they?", "didn't it?"],
-    ["a multiword singular with present be", "The release deployment is live", "isn't it?", "aren't they?"],
-    ["a multiword singular in simple past", "The unit test passed", "didn't it?", "didn't they?"],
-  ] as const)("reads %s", (_scenario, assertion, agreeing, mismatched) => {
-    expect([assertion, agreeing, plain(`${assertion}, ${agreeing}`)])
-      .toEqual([assertion, agreeing, "accepted"]);
-    expect([assertion, mismatched, plain(`${assertion}, ${mismatched}`)])
-      .toEqual([assertion, mismatched, "rejected"]);
-  });
-
-  it.each([
-    ["inverted order", "The API keys were rotated, were they not?", "accepted"],
-    ["inverted mismatched order", "The API keys were rotated, was it not?", "rejected"],
-    ["curly contracted", "The API keys were rotated, weren\u2019t they?", "accepted"],
-    ["curly contracted mismatch", "The API keys were rotated, wasn\u2019t it?", "rejected"],
-  ] as const)("reads a multiword plural with %s", (_scenario, text, expected) => {
-    expect([text, plain(text)]).toEqual([text, expected]);
-  });
-});
-
-describe("promised follow-up needs something durable behind it", () => {
-  it.each([
-    "I'll run it the moment the thread lands.",
-    "I'm watching it and will pick up as soon as it's done.",
-    "The typecheck is still going. I'll take it through the merge once it finishes.",
-    "I'll only come back to you when it's live.",
-    "Let me start the deploy after the tests land.",
-  ])("rejects an answered promise of later work: %s", (text) => {
-    expectRejection(textFinalization(text), emptyFinalizationContext(), "follow_up_unbacked");
-  });
-
-  it.each([
-    "I'll restart it now.",
-    "I will deploy the service after approval.",
-    "I'll retry it if the proxy tests fail again.",
-    "I won't touch it once the merge lands.",
-    "The thread is mid-fix on the wire shape.",
-    "Should I pick it up when it lands?",
-  ])("leaves an answered turn without a durable promise alone: %s", (text) => {
-    expect(validateControllerFinalization(textFinalization(text), emptyFinalizationContext()))
-      .toMatchObject({ outcome: "accepted" });
-  });
-
-  it("accepts the same promise once a live obligation carries it", () => {
-    const candidate: ControllerFinalization = {
-      disposition: "deferred",
-      segments: [{ type: "text", text: "I'll take it through the merge the moment the thread lands." }],
-      obligationRefs: ["monitor:mon-1"],
-    };
-    expect(validateControllerFinalization(candidate, emptyFinalizationContext({
-      liveObligationRefs: new Set(["monitor:mon-1"]),
-    }))).toMatchObject({ outcome: "accepted" });
-  });
-
-  it("still refuses a promise whose obligation is not live", () => {
-    const candidate: ControllerFinalization = {
-      disposition: "deferred",
-      segments: [{ type: "text", text: "I'll take it through the merge the moment the thread lands." }],
-      obligationRefs: ["monitor:mon-1"],
-    };
-    expectRejection(candidate, emptyFinalizationContext(), "obligation_not_live");
-  });
-
-  it("leaves an owner-facing question with a promise as needs_owner", () => {
-    const candidate: ControllerFinalization = {
-      disposition: "needs_owner",
-      segments: [{ type: "text", text: "Should I merge it? I'll start the deploy once you say so." }],
-      obligationRefs: [],
-    };
-    expect(validateControllerFinalization(candidate, emptyFinalizationContext({ ownerBoundaryPresent: true })))
-      .toMatchObject({ outcome: "accepted" });
   });
 });

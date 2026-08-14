@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
@@ -9,6 +9,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const jiti = createJiti(import.meta.url);
 const contract = await jiti.import("../src/eval/controller-scenario-contract.ts");
 const harness = await jiti.import("../tests/support/controller-scenario-harness.ts");
+const {
+  closePreparedArtifactTarget,
+  prepareArtifactTarget,
+  publishValidatedArtifact,
+} = await jiti.import("../src/eval/eval-integrity.ts");
 
 function fail(message) {
   process.stderr.write(`controller outcome eval: ${message}\n`);
@@ -16,33 +21,32 @@ function fail(message) {
 }
 
 function valueAfter(argv, index, flag) {
-  const value = argv[index + 1];
-  if (!value || value.startsWith("--")) fail(`${flag} requires a value`);
-  return value;
+  const argumentValue = argv[index + 1];
+  if (!argumentValue || argumentValue.startsWith("--")) fail(`${flag} requires a value`);
+  return argumentValue;
 }
 
 function parseArguments(argv) {
-  const options = { checkpoint: null, trials: null, seed: 8122026, output: null, replace: false, baseline: null };
+  const options = { checkpoint: null, trials: null, seed: 8122026, baseline: null, output: null, replace: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--replace") { options.replace = true; continue; }
     if (flag === "--checkpoint") { options.checkpoint = valueAfter(argv, index, flag); index += 1; continue; }
     if (flag === "--trials") { options.trials = Number(valueAfter(argv, index, flag)); index += 1; continue; }
     if (flag === "--seed") { options.seed = Number(valueAfter(argv, index, flag)); index += 1; continue; }
-    if (flag === "--output") { options.output = valueAfter(argv, index, flag); index += 1; continue; }
     if (flag === "--baseline") { options.baseline = valueAfter(argv, index, flag); index += 1; continue; }
+    if (flag === "--output") { options.output = valueAfter(argv, index, flag); index += 1; continue; }
     fail(`unknown argument ${flag}`);
   }
   if (!options.checkpoint || !["baseline", "kernel", "cutover"].includes(options.checkpoint)) fail("--checkpoint must be baseline, kernel, or cutover");
   if (!Number.isInteger(options.trials) || options.trials < 1 || options.trials > 512) fail("--trials must be an integer between 1 and 512");
   if (!Number.isInteger(options.seed) || options.seed < 0 || options.seed > 2147483647) fail("--seed must be a non-negative 32-bit integer");
-  if (!options.output || !isAbsolute(options.output)) fail("--output must be an absolute path");
   if (options.baseline !== null && !isAbsolute(options.baseline)) fail("--baseline must be an absolute path");
-  return {
-    ...options,
-    output: resolve(options.output),
-    baseline: options.baseline === null ? null : resolve(options.baseline),
-  };
+  if (!options.output || !isAbsolute(options.output)) fail("--output must be an absolute path");
+  const output = resolve(options.output);
+  const baseline = options.baseline === null ? null : resolve(options.baseline);
+  if (baseline !== null && baseline === output) fail("--baseline and --output must be different paths");
+  return { ...options, baseline, output };
 }
 
 function isInsideRoot(path) {
@@ -50,14 +54,24 @@ function isInsideRoot(path) {
   return relation === "" || (!relation.startsWith(`..${sep}`) && relation !== ".." && !isAbsolute(relation));
 }
 
-function allowedOutput(path) {
-  if (!isInsideRoot(path)) return true;
-  const relation = relative(root, path);
-  return relation === ".superpowers" || relation.startsWith(`.superpowers${sep}`);
+function prepareAllowedOutput(path) {
+  const preparedTarget = prepareArtifactTarget(path);
+  try {
+    const canonicalPath = preparedTarget.targetPath;
+    if (!isInsideRoot(canonicalPath)) return preparedTarget;
+    const relation = relative(root, canonicalPath);
+    if (relation === ".superpowers" || relation.startsWith(`.superpowers${sep}`)) return preparedTarget;
+    throw new Error("--output must be outside the repository or under .superpowers/");
+  } catch (error) {
+    closePreparedArtifactTarget(preparedTarget);
+    throw error;
+  }
 }
 
-function readBaselineReport(path) {
-  return readFileSync(path, "utf8");
+function assertCurrentRunIdentity(identity, currentIdentity) {
+  if (currentIdentity.commit !== identity.commit || currentIdentity.dirty || identity.dirty) {
+    throw new Error("current evaluator identity is dirty or changed before report write");
+  }
 }
 
 function git(args) {
@@ -71,162 +85,198 @@ function readGitIdentity() {
   };
 }
 
-function writeReport(path, content, replace) {
-  const mode = 0o600;
-  if (!replace) {
-    let descriptor;
-    try {
-      descriptor = openSync(path, "wx", mode);
-    } catch (error) {
-      if (error && typeof error === "object" && error.code === "EEXIST") {
-        throw new Error(`refusing to overwrite existing report ${path}; pass --replace`);
-      }
-      throw error;
-    }
-    try {
-      writeFileSync(descriptor, content, { encoding: "utf8" });
-    } finally {
-      closeSync(descriptor);
-    }
-    chmodSync(path, mode);
-    return;
-  }
-  const temporary = `${path}.tmp-${process.pid}`;
-  writeFileSync(temporary, content, { encoding: "utf8", mode, flag: "w" });
-  renameSync(temporary, path);
-  chmodSync(path, mode);
+function writeReport({ path, preparedTarget, content, replace, verifyIdentity }) {
+  publishValidatedArtifact({
+    artifactPath: path,
+    preparedTarget,
+    serialized: content,
+    replace,
+    validateSerialized: (candidate) => {
+      contract.controllerEvaluationReportSchema.parse(JSON.parse(candidate));
+    },
+    verifyBeforePublish: verifyIdentity,
+    verifyIdentity,
+  });
 }
 
-export function classifyControllerEvidence(trials) {
-  const nonFixedTrials = trials.filter((trial) => (
-    trial.harness.provider !== "fake-bb" || trial.harness.model !== "scripted-controller"
-  )).length;
-  if (nonFixedTrials === 0) return "fixed";
-  return nonFixedTrials === 1 ? "smoke" : "strong";
-}
-
-export async function evaluateControllerOutcomes(options, dependencies = {}) {
-  if (!allowedOutput(options.output)) {
-    throw new Error("--output must be outside the repository or under .superpowers/");
-  }
-  const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
-  const priorCommit = process.env.HANOON_EVAL_COMMIT;
-  const priorDirty = process.env.HANOON_EVAL_DIRTY;
-  process.env.HANOON_EVAL_COMMIT = identity.commit;
-  process.env.HANOON_EVAL_DIRTY = String(identity.dirty);
-  let trials;
+function readValidatedBaseline(path, scenarioCorpus) {
+  if (!isAbsolute(path)) throw new Error("--baseline must be an absolute path");
+  let report;
   try {
-    trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
-      checkpoint: options.checkpoint,
-      trials: options.trials,
-      seed: options.seed,
-    });
-  } finally {
-    if (priorCommit === undefined) delete process.env.HANOON_EVAL_COMMIT;
-    else process.env.HANOON_EVAL_COMMIT = priorCommit;
-    if (priorDirty === undefined) delete process.env.HANOON_EVAL_DIRTY;
-    else process.env.HANOON_EVAL_DIRTY = priorDirty;
+    if (!statSync(path).isFile()) throw new Error("baseline is not a regular file");
+    report = contract.parseControllerEvaluationReport(JSON.parse(readFileSync(path, "utf8")));
+  } catch (error) {
+    throw new Error(`baseline report is not valid: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const validatedTrials = trials.map(contract.parseControllerScenarioTrial);
-  const report = contract.aggregateControllerEvaluation({
-    label: classifyControllerEvidence(validatedTrials),
-    trials: validatedTrials,
+  if (report.label !== "fixed") throw new Error("baseline report must have fixed label");
+  if (!report.run) throw new Error("baseline report lacks checkpoint, trial, and seed identity");
+  if (report.trials.some((trial) => trial.harness.dirty)) throw new Error("baseline report contains dirty trials");
+  const validation = contract.validateControllerScenarioTrialsAgainstCorpus(report.trials, scenarioCorpus);
+  for (const trial of validation.trials) contract.validateControllerScenarioTrialBudget(trial);
+  assertExactTrialSet(validation.trials, scenarioCorpus, {
+    checkpoint: report.run.checkpoint,
+    trials: report.run.trialsPerScenario,
+    seed: report.run.seed,
   });
-  contract.controllerEvaluationReportSchema.parse(report);
-  // Both reports are validated before anything is compared: an unvalidated
-  // baseline could otherwise make a regression look like a schema difference.
-  const comparison = options.baseline === null || options.baseline === undefined
-    ? null
-    : contract.compareControllerEvaluations({
-      current: report,
-      baseline: contract.controllerEvaluationReportSchema.parse(
-        JSON.parse((dependencies.readBaseline ?? readBaselineReport)(options.baseline)),
-      ),
-    });
-  writeReport(options.output, `${JSON.stringify({ ...report, comparison }, null, 2)}\n`, options.replace);
-  if (comparison !== null) {
-    process.stdout.write(`comparison ${comparison.status}\n`);
-    for (const scenario of comparison.scenarios) {
-      process.stdout.write(
-        `${scenario.scenarioId} baseline ${contract.formatControllerRate(scenario.baseline)}` +
-        ` current ${contract.formatControllerRate(scenario.current)}` +
-        // Printed rates read as a result unless the line says otherwise, so a
-        // pair that cannot be compared says so on the same line as its numbers.
-        `${scenario.comparable ? "" : " NOT-COMPARABLE"}` +
-        `${scenario.regressed ? " REGRESSED" : ""}\n`,
-      );
-    }
-    for (const reason of comparison.incomparableReasons) {
-      process.stdout.write(`reason ${reason}\n`);
-    }
-    if (comparison.currentOnly.length > 0) {
-      process.stdout.write(`current-only ${comparison.currentOnly.join(",")}\n`);
-    }
-  }
-  const scenarios = new Map(harness.loadControllerScenarioCorpus().cases.map((scenarioCase) => [
-    scenarioCase.id,
-    scenarioCase,
-  ]));
-  const criticalSafetyFailed = validatedTrials.some((trial) => {
-    const scenarioCase = scenarios.get(trial.scenarioId);
-    if (!scenarioCase) throw new Error(`trial references an unknown scenario ${trial.scenarioId}`);
-    return scenarioCase.criticalSafety && trial.outcome.status === "failed";
-  });
-  const regressed = comparison !== null && comparison.regressions.length > 0;
-  // A trial that only finished by running past its budget did not pass, and one
-  // whose metrics could not be established did not prove anything either. Both
-  // are gates in their own right rather than something a summary can average.
-  const budgetExceeded = validatedTrials.some((trial) => trial.metrics.terminalFailureClass === "budget_exceeded");
-  const metricsUnavailable = validatedTrials.some((trial) => (
-    trial.metrics.terminalFailureClass !== null && trial.metrics.terminalFailureClass !== "budget_exceeded"
-  ));
-  // A placeholder identity would let a report claim conditions nobody recorded,
-  // and an identity that varies within one report means its trials did not all
-  // run under the same thing the report says they did.
-  const placeholderIdentity = validatedTrials.some((trial) => (
-    trial.harness.hanoonCommit === "0".repeat(40)
-  ));
-  const identitySpread = new Set(validatedTrials.map((trial) => JSON.stringify({
-    hanoonCommit: trial.harness.hanoonCommit,
+  return report;
+}
+
+function fixedScenarioIdentity(trial) {
+  return JSON.stringify({
+    scenarioDefinitionSha256: trial.scenarioDefinitionSha256,
+    outerTaskTools: trial.harness.outerTaskTools,
+    answerFixtureSha256: trial.harness.answerFixtureSha256,
+    instructionSha256: trial.harness.instructionSha256,
     provider: trial.harness.provider,
     model: trial.harness.model,
     reasoningLevel: trial.harness.reasoningLevel,
     serviceTier: trial.harness.serviceTier,
     permissionMode: trial.harness.permissionMode,
-    // A report whose trials disagree about the outer task surface did not run
-    // one experiment, so it cannot describe itself as one.
-    outerTaskTools: [...trial.harness.outerTaskTools].sort(),
-    evaluatorSha256: trial.harness.evaluatorSha256,
-    instructionSha256: trial.harness.instructionSha256,
     overlaySha256: trial.harness.overlaySha256,
     capabilityManifestSha256: trial.harness.capabilityManifestSha256,
-  })));
-  const identityInconsistent = identitySpread.size > 1;
-  const identityGateFailed = placeholderIdentity || identityInconsistent;
-  // Every gate the brief names is machine-enforced for a release report, which
-  // is the run that supplies a --baseline: it must be passed, comparable, and
-  // generated from a clean tree. A plain generation run stays usable while the
-  // tree is dirty, and discloses `dirty` in the report either way.
-  const dirtyHarness = validatedTrials.some((trial) => trial.harness.dirty);
-  // Comparability is read off the comparison, never asserted onto it: a run that
-  // is not like for like fails here rather than being relabelled as one.
-  const notComparable = comparison !== null && comparison.status !== "comparable";
-  const releaseGateFailed = comparison !== null &&
-    (dirtyHarness || notComparable || report.status === "incomplete");
-  const failed = criticalSafetyFailed || regressed || releaseGateFailed ||
-    budgetExceeded || metricsUnavailable || identityGateFailed ||
-    report.status === "failed";
-  return {
-    report,
-    comparison,
-    criticalSafetyFailed,
-    regressed,
-    dirtyHarness,
-    budgetExceeded,
-    metricsUnavailable,
-    identityGateFailed,
-    exitCode: failed ? 1 : 0,
-  };
+    policySha256: trial.harness.policySha256,
+    contextSha256: trial.harness.contextSha256,
+    advertisedTools: trial.harness.advertisedTools,
+    parameterSchemaSha256: trial.harness.parameterSchemaSha256,
+    budget: trial.budget,
+    graders: {
+      outcome: [trial.outcome.graderId, trial.outcome.graderVersion, trial.outcome.proofRefs],
+      trace: [trial.trace.graderId, trial.trace.graderVersion, trial.trace.proofRefs],
+      answer: [trial.answer.graderId, trial.answer.graderVersion, trial.answer.proofRefs],
+    },
+  });
+}
+
+function hasFixedScenarioIdentityVariation(trials) {
+  const identitiesByScenario = new Map();
+  for (const trial of trials) {
+    const key = `${trial.scenarioId}:${trial.scenarioVersion}`;
+    const identities = identitiesByScenario.get(key) ?? new Set();
+    identities.add(fixedScenarioIdentity(trial));
+    identitiesByScenario.set(key, identities);
+  }
+  return [...identitiesByScenario.values()].some((identities) => identities.size > 1);
+}
+
+export function classifyControllerEvidence(trials) {
+  const identityIncomplete = trials.some((trial) => (
+    trial.scenarioDefinitionSha256 === undefined || trial.harness.outerTaskTools === undefined ||
+    trial.harness.answerFixtureSha256 === undefined ||
+    trial.harness.instructionSha256.length === 0 ||
+    trial.harness.capabilityManifestSha256.length === 0 ||
+    trial.harness.policySha256.length === 0 ||
+    trial.harness.advertisedTools.length === 0 ||
+    Object.keys(trial.harness.parameterSchemaSha256).length === 0
+  ));
+  if (identityIncomplete) throw new Error("current evaluation identity is incomplete; refusing to label it strong");
+  const nonFixedTrials = trials.filter((trial) => (
+    trial.harness.provider !== "fake-bb" || trial.harness.model !== "scripted-controller"
+  )).length;
+  if (nonFixedTrials > 0) return nonFixedTrials === 1 ? "smoke" : "strong";
+  return hasFixedScenarioIdentityVariation(trials) ? "strong" : "fixed";
+}
+
+function assertCurrentEvaluationIdentity(trials, identity) {
+  if (identity.dirty) throw new Error("current evaluator identity is dirty; refusing to write a passed artifact");
+  for (const trial of trials) {
+    if (trial.harness.dirty) throw new Error(`current trial ${trial.scenarioId}:${trial.trial} is dirty`);
+    if (trial.harness.hanoonCommit !== identity.commit) {
+      throw new Error(`current trial ${trial.scenarioId}:${trial.trial} has an unproven Hanoon commit`);
+    }
+  }
+}
+
+function assertExactTrialSet(trials, scenarioCorpus, options) {
+  const checkpointRank = { baseline: 0, kernel: 1, cutover: 2 };
+  const expectedCases = scenarioCorpus.cases.filter((scenarioCase) =>
+    checkpointRank[scenarioCase.checkpoint] <= checkpointRank[options.checkpoint]);
+  const expected = new Set();
+  for (const scenarioCase of expectedCases) {
+    for (let trial = 1; trial <= options.trials; trial += 1) {
+      expected.add(`${scenarioCase.id}:${scenarioCase.scenarioVersion}:${trial}`);
+    }
+  }
+  const actual = new Set();
+  for (const trial of trials) {
+    if (trial.seed !== options.seed) {
+      throw new Error(`trial ${trial.scenarioId}:${trial.trial} has an unexpected seed`);
+    }
+    const key = `${trial.scenarioId}:${trial.scenarioVersion}:${trial.trial}`;
+    if (actual.has(key)) throw new Error(`duplicate trial ${key}`);
+    actual.add(key);
+  }
+  const missing = [...expected].filter((key) => !actual.has(key));
+  const extra = [...actual].filter((key) => !expected.has(key));
+  if (missing.length > 0 || extra.length > 0) {
+    throw new Error(`evaluation trial set is incomplete or unexpected (missing=${missing.length}, extra=${extra.length})`);
+  }
+}
+
+export async function evaluateControllerOutcomes(options, dependencies = {}) {
+  const preparedOutput = prepareAllowedOutput(options.output);
+  try {
+    if (options.checkpoint === "cutover" && options.baseline === null) {
+      throw new Error("cutover evaluation requires a fixed baseline comparison");
+    }
+    const scenarioCorpus = harness.loadControllerScenarioCorpus();
+    const baseline = options.baseline ? readValidatedBaseline(options.baseline, scenarioCorpus) : null;
+    const identity = (dependencies.readGitIdentity ?? readGitIdentity)();
+    if (identity.dirty) throw new Error("current evaluator identity is dirty; refusing to start trials");
+    const trials = await (dependencies.runTrials ?? harness.runControllerScenarioTrials)({
+      checkpoint: options.checkpoint,
+      trials: options.trials,
+      seed: options.seed,
+      runIdentity: { commit: identity.commit, dirty: identity.dirty },
+    });
+    const currentValidation = contract.validateControllerScenarioTrialsAgainstCorpus(trials, scenarioCorpus);
+    const validatedTrials = currentValidation.trials.map(contract.validateControllerScenarioTrialBudget);
+    assertCurrentEvaluationIdentity(validatedTrials, identity);
+    assertExactTrialSet(validatedTrials, scenarioCorpus, options);
+    const baseReport = contract.aggregateControllerEvaluation({
+      label: classifyControllerEvidence(validatedTrials),
+      run: {
+        checkpoint: options.checkpoint,
+        trialsPerScenario: options.trials,
+        seed: options.seed,
+      },
+      trials: validatedTrials,
+    });
+    const comparison = baseline
+      ? contract.compareControllerEvaluations({
+          baseline,
+          after: baseReport,
+          scenarioCorpus,
+        })
+      : null;
+    const report = comparison
+      ? contract.attachControllerComparison(baseReport, comparison)
+      : baseReport;
+    contract.controllerEvaluationReportSchema.parse(report);
+    const finalIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
+    assertCurrentRunIdentity(identity, finalIdentity);
+    assertCurrentEvaluationIdentity(validatedTrials, finalIdentity);
+    const verifyIdentity = () => {
+      harness.verifyControllerScenarioFixtureSnapshots();
+      const currentIdentity = (dependencies.readGitIdentity ?? readGitIdentity)();
+      assertCurrentRunIdentity(identity, currentIdentity);
+      assertCurrentEvaluationIdentity(validatedTrials, currentIdentity);
+    };
+    writeReport({
+      path: options.output,
+      preparedTarget: preparedOutput,
+      content: `${JSON.stringify(report, null, 2)}\n`,
+      replace: options.replace,
+      verifyIdentity,
+    });
+    const criticalSafetyFailed = currentValidation.criticalSafetyFailed;
+    return {
+      report,
+      criticalSafetyFailed,
+      exitCode: criticalSafetyFailed || report.status !== "passed" ? 1 : 0,
+    };
+  } finally {
+    closePreparedArtifactTarget(preparedOutput);
+  }
 }
 
 async function main() {

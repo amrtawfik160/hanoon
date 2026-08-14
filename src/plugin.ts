@@ -14,7 +14,7 @@ import {
   capabilityMinimumModelPool,
   capabilityRoutingSettings,
   controllerCapabilityModelRoute,
-  controllerExecutionProfiles,
+  controllerExecutionProfile,
   credentialBrokerConfigFingerprint,
   parseGlobalConfig,
   systemUpkeepEnabled,
@@ -71,7 +71,11 @@ import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
 import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
-import { BbControllerAdapter, ControllerImagePreparationError } from "./controller/bb-controller";
+import {
+  BbControllerAdapter,
+  ControllerImagePreparationError,
+  parseControllerInteractionResolution,
+} from "./controller/bb-controller";
 import { ControllerEvidenceProjector } from "./controller/evidence-projector";
 import {
   CONTROLLER_FALLBACK_MODELS,
@@ -81,10 +85,10 @@ import {
   CONTROLLER_SERVICE_TIERS,
   DEFAULT_CONTROLLER_EXECUTION_PROFILE,
   EXTRACTION_MODELS,
+  controllerProviderFor,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
 import { ControllerInteractionService } from "./controller/interaction-service";
-import { ControllerInteractionRepository } from "./storage/controller-interaction-repository";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
@@ -318,6 +322,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   await capabilityInventory.refresh();
 
   const telegramForToken = (token: string): TelegramClient => new TelegramClient(token);
+  let verifiedBotToken: string | null = null;
+  const verifiedTelegramClient = (): TelegramClient => {
+    if (verifiedBotToken === null) throw new Error("Telegram bot token is not verified.");
+    return telegramForToken(verifiedBotToken);
+  };
   const telegramTransport = {
     sendMessage: (chatId: string, payload: Parameters<TelegramClient["sendMessage"]>[1]) => {
       if (!config.ok) throw new Error(config.message);
@@ -367,12 +376,18 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     notify: () => executorNudge.notify(),
     now: clock,
     credentialAccess: credentialAccessService,
+    controllerProviderId: () => config.ok
+      ? controllerProviderFor(controllerExecutionProfile(config.value).model)
+      : undefined,
   };
   registerControllerTools(bb, toolDependencies);
 
   settings.onChange((next) => {
     const parsed = parseGlobalConfig(next);
     config = parsed;
+    if (!parsed.ok || parsed.value.botToken !== verifiedBotToken) {
+      verifiedBotToken = null;
+    }
     if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
     executorNudge.notify();
 
@@ -740,33 +755,62 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     onWorkAvailable: () => executorNudge.notify(),
     health,
   });
+  const controllerAdapter = new BbControllerAdapter({
+    sdk: bb.sdk,
+    pluginId: bb.pluginId,
+    now: clock,
+    reserveSpawn: (input) => store.reserveControllerSpawn(input),
+    executionProfile: () => {
+      if (!config.ok) throw new Error(config.message);
+      return controllerExecutionProfile(config.value);
+    },
+    downloadImage: async (fileId, maxBytes, signal) => {
+      try {
+        return await verifiedTelegramClient().downloadFile(fileId, maxBytes, signal);
+      } catch (error) {
+        if (error instanceof TelegramFileTooLargeError) {
+          throw new ControllerImagePreparationError(false);
+        }
+        throw error;
+      }
+    },
+  });
+  const controllerInteractionService = new ControllerInteractionService({
+    store: {
+      isControllerInteractionDeliveryFenceCurrent: (input) =>
+        store.isControllerInteractionDeliveryFenceCurrent(input),
+      record: (input) => store.recordControllerInteraction(input),
+      markResolved: (input) => store.markControllerInteractionResolved(input),
+      answerByToken: (input) => store.answerControllerInteractionByToken(input),
+      answerWithText: (input) => store.answerControllerInteractionWithText(input),
+      getPending: (controllerKey) => store.getPendingControllerInteraction(controllerKey),
+      getAnswered: (controllerKey) => store.getAnsweredControllerInteraction(controllerKey),
+      markDelivered: (input) => store.markControllerInteractionDelivered(input),
+    },
+    clock: { now: clock },
+    interactions: {
+      get: async (threadId, interactionId, signal) => controllerAdapter.getInteraction(
+        threadId,
+        interactionId,
+        signal ?? AbortSignal.timeout(30_000),
+      ),
+      resolve: async (input, signal) => {
+        const effectiveSignal = signal ?? AbortSignal.timeout(30_000);
+        await controllerAdapter.resolveInteraction(
+          input.threadId,
+          input.interactionId,
+          parseControllerInteractionResolution(input.resolution),
+          effectiveSignal,
+        );
+        return controllerAdapter.getInteraction(input.threadId, input.interactionId, effectiveSignal);
+      },
+    },
+  });
   const controller = new LunaControllerService({
     store,
     evidenceProjector,
-    interactionService: new ControllerInteractionService({
-      store: new ControllerInteractionRepository(bb.storage.database()),
-      interactions: bb.sdk.threads.interactions,
-      clock,
-    }),
-    adapter: new BbControllerAdapter({
-      sdk: bb.sdk,
-      pluginId: bb.pluginId,
-      executionProfiles: () => {
-        if (!config.ok) throw new Error(config.message);
-        return controllerExecutionProfiles(config.value);
-      },
-      downloadImage: async (fileId, maxBytes, signal) => {
-        if (!config.ok) throw new Error(config.message);
-        try {
-          return await telegramForToken(config.value.botToken).downloadFile(fileId, maxBytes, signal);
-        } catch (error) {
-          if (error instanceof TelegramFileTooLargeError) {
-            throw new ControllerImagePreparationError(false);
-          }
-          throw error;
-        }
-      },
-    }),
+    adapter: controllerAdapter,
+    interactionService: controllerInteractionService,
     clock: { now: clock },
   });
   const monitors = new MonitorService({
@@ -1552,6 +1596,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       ingress,
       getConfig: () => config,
       clock: { now: clock },
+      onTokenVerified: (token) => {
+        if (config.ok && config.value.botToken === token) verifiedBotToken = token;
+      },
       warn: (message) => bb.log.warn(message),
     }, signal),
   });
@@ -1610,7 +1657,25 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   bb.events.on("thread.failed", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.archived", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.deleted", ({ thread }) => queueThreadReconcile(thread.id));
-  const unsubscribeThreadChanges = bb.sdk.subscribe({
+  // Older hosts do not expose SDK subscriptions. The event bus above remains
+  // the baseline wake-up path, so optional SDK subscriptions should not make
+  // plugin startup fail on those hosts.
+  type SdkSubscribe = NonNullable<BbPluginApi["sdk"]["subscribe"]>;
+  const sdkSubscribe = (
+    subscription: Parameters<SdkSubscribe>[0],
+  ): (() => void) | undefined => {
+    if (typeof bb.sdk.subscribe !== "function") return undefined;
+    try {
+      return bb.sdk.subscribe(subscription);
+    } catch (error) {
+      // The SDK test host exposes an explicit throwing stub for capabilities it
+      // does not implement. Treat that the same as an older host with no
+      // subscription API, while preserving real subscription failures.
+      if (error instanceof Error && /not stubbed/i.test(error.message)) return undefined;
+      throw error;
+    }
+  };
+  const unsubscribeThreadChanges = sdkSubscribe({
     event: "thread:changed",
     callback: (event) => {
       if (!event.id || !threadChangeShouldWake(event.changes)) return;
@@ -1620,13 +1685,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       queueThreadReconcile(event.id);
     },
   });
-  const unsubscribeEnvironmentChanges = bb.sdk.subscribe({
+  const unsubscribeEnvironmentChanges = sdkSubscribe({
     event: "environment:changed",
     callback: (event) => {
       if (!event.id || !environmentChangeShouldWake(event.changes)) return;
       queueEnvironmentReconcile(event.id);
     },
   });
-  bb.onDispose(unsubscribeThreadChanges);
-  bb.onDispose(unsubscribeEnvironmentChanges);
+  if (unsubscribeThreadChanges) bb.onDispose(unsubscribeThreadChanges);
+  if (unsubscribeEnvironmentChanges) bb.onDispose(unsubscribeEnvironmentChanges);
 }

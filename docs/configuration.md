@@ -72,7 +72,7 @@ The same plugin settings page controls subsequent turns in the hidden conversati
 | Fallback model 2 | `disabled` or any controller model | `disabled` |
 | Controller reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` |
 | Controller service tier | `fast`, `default` | `default` |
-| Controller permission mode | `auto`, `accept-edits`, `full` | `full` |
+| Controller permission mode | `auto`, `accept-edits`, `full` | `auto` |
 
 The model selects its provider: `claude-*` models run on Claude Code, `gpt-*` models on Codex. Service tier is a Codex-only input and is not sent for Claude models.
 
@@ -155,7 +155,7 @@ How the agent should behave — terser answers, always leading with the pull-req
 
 ### The permission mode, and what it does not do
 
-`full` is the current default because the owner works from Telegram and is not watching the BB app: before the interaction bridge existed, an approval prompt rendered there stalled the agent with nobody to answer it. That is a **compatibility default carried forward, and current residual risk** — not a safe target architecture. It is not mechanically enforced isolation, and the agent's standing instructions are guidance, not enforcement.
+`auto` is the default. The owner can choose `accept-edits` or `full` explicitly, and a saved value is preserved for later turns. The permission mode is not mechanically enforced isolation, and the agent's standing instructions are guidance, not enforcement.
 
 The limits that remain are the ones the owner can actually see and answer:
 
@@ -164,25 +164,13 @@ The limits that remain are the ones the owner can actually see and answer:
 - credential-shaped text is refused before it can be stored as a memory;
 - a permission prompt BB does raise for the hidden controller is bridged into Telegram as *Allow once* / *Deny*, so choosing `auto` or `accept-edits` no longer means waiting on a dead end.
 
-Set `auto` or `accept-edits` if you would rather approve execution as it happens. A value you have saved is preserved exactly and is never rewritten.
-
-#### Why the default has not changed to `auto`
-
-Changing the fresh, unset default to `auto` is **disabled**, not merely unfinished. It stays disabled until a versioned runtime BB attestation proves all three of:
-
-1. an atomic activity snapshot, or a shared-revision equivalent covering every status, activity, and interaction field used for negative or idle inference;
-2. an atomic expected-head-and-candidate-tree conditional commit with a deterministic request key;
-3. mechanical denial of worker and controller native commit, ref mutation, push, GitHub write, merge, deploy, and equivalent network effects, while authorized edit and test work still runs.
-
-The vendored BB thread, timeline, and interaction calls share no atomic activity revision, and the commit API is unconditional, so neither the idle-truth protocol nor the conditional-commit protocol can be implemented safely on this runtime. Instruction text, a mocked adapter, and a Telegram approval button are none of them proof of that boundary.
-
-`executor_v2` managed-job publication is disabled behind the same gate. The current `legacy_v1` behaviour — the worker performing its own commit, push, and pull-request creation inside its managed worktree — remains what actually runs.
+A BB permission prompt for the hidden controller can be bridged into Telegram as *Allow once* / *Deny*, so choosing `auto` no longer leaves the owner at a dead end. This does not authorize connector installation, credential mutation, spending, destructive external action, or irreversible external writes through Hanoon's manifest.
 
 Planner, critic, and documentation stages pin their own execution tuple and are unaffected by this setting; implementation and review workers use the enabled project's immutable policy snapshot.
 
 ## Credential broker foundation
 
-This is the first slice of a separate credential broker: a protected service that this plugin never runs and that holds no application secret itself, but that can be asked to prove it can reach one exact 1Password vault field. **`credentialBrokerMode` defaults to `disabled`**, and every access command and doctor check fails closed in that state. This section documents the setting shape only — a fresh installation has no broker to point at, and turning isolated mode on for real additionally needs the disposable 1Password account, protected broker host, and reviewed topology probes covered in [Disposable live acceptance](live-acceptance.md). Full readiness also requires **Controller permission mode** to be `auto`; it is unreachable at the current `full` default.
+This is the first slice of a separate credential broker: a protected service that this plugin never runs and that holds no application secret itself, but that can be asked to prove it can reach one exact 1Password vault field. **`credentialBrokerMode` defaults to `disabled`**, and every access command and doctor check fails closed in that state. This section documents the setting shape only — a fresh installation has no broker to point at, and turning isolated mode on for real additionally needs the disposable 1Password account, protected broker host, and reviewed topology probes covered in [Disposable live acceptance](live-acceptance.md). Full readiness also requires an explicitly approved controller permission mode.
 
 | Setting | Accepted value | Default | Purpose |
 | --- | --- | --- | --- |

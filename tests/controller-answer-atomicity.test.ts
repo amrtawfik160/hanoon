@@ -82,7 +82,7 @@ function answerFixture(questions: { id: string; prompt: string }[]) {
     controllerGenerationId: generation.id,
     interaction,
     now: 2_100,
-  })).toBe(true);
+  })).toBe("recorded");
 
   return {
     store, turn, fence, storage,
@@ -197,7 +197,7 @@ it("replays a crashed multi-question answer without advancing to the next questi
   const restarted = fixture.reopen();
   const pendingBefore = restarted.getPendingControllerInteraction(CONTROLLER_KEY);
   // The first question is answered and the second is the one now being asked.
-  expect(pendingBefore?.answer).toMatchObject({ answers: { q1: { freeText: "main" } } });
+  expect(pendingBefore?.answers).toMatchObject({ q1: { freeText: "main" } });
   const outboxBefore = restarted.listOutbox(50);
   expect(outboxBefore.some((item) => item.logicalKey.endsWith(":1"))).toBe(true);
 
@@ -207,26 +207,27 @@ it("replays a crashed multi-question answer without advancing to the next questi
   await pumpService(restarted, replayIngress, [textUpdate(201, "main")]);
 
   // A replay must not silently answer the second question with the first one's words.
-  expect(restarted.getPendingControllerInteraction(CONTROLLER_KEY)?.answer)
-    .toEqual(pendingBefore?.answer);
+  expect(restarted.getPendingControllerInteraction(CONTROLLER_KEY)?.answers)
+    .toEqual(pendingBefore?.answers);
   expect(controllerTurns(restarted)).toHaveLength(1);
   expect(restarted.listOutbox(50)).toHaveLength(outboxBefore.length);
 });
 
-it("rolls the whole answer back when the update claim does not match", async () => {
+it("claims and commits a direct answer when the caller has not claimed the update", async () => {
   const fixture = answerFixture([{ id: "q1", prompt: "Which branch?" }]);
   const telegram = new FakeTelegram();
   const ingress = new TelegramIngress({ store: fixture.store, telegram, onWorkAvailable: () => undefined });
 
-  // No claim was ever taken for this update, so settling it must fail and take
-  // the answer down with it rather than leaving a half-written commit.
-  await expect(ingress.handleClaimed(textUpdate(202, "main"), 3_000)).rejects.toThrow();
+  // Direct callers are allowed to hand an unclaimed update to the atomic answer
+  // path; it creates the claim in the same transaction as the answer.
+  await expect(ingress.handleClaimed(textUpdate(202, "main"), 3_000))
+    .resolves.toEqual({ updateSettled: true });
 
   const restarted = fixture.reopen();
-  expect(restarted.getAnsweredControllerInteraction(CONTROLLER_KEY)).toBeNull();
-  expect(restarted.getPendingControllerInteraction(CONTROLLER_KEY)).toMatchObject({
-    state: "pending", answer: null,
+  expect(restarted.getAnsweredControllerInteraction(CONTROLLER_KEY)).toMatchObject({
+    interactionId: INTERACTION_ID,
   });
+  expect(restarted.getPendingControllerInteraction(CONTROLLER_KEY)).toBeNull();
   expect(controllerTurns(restarted)).toHaveLength(1);
 });
 

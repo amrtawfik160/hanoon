@@ -1,12 +1,15 @@
 import { containsCredentialLikeText } from "../domain/state-machine";
 import { assertNoRawMergeCallback } from "../storage/job-persistence";
 
+const INTERNAL_CALLBACK_MATERIAL = /(?:m|a|o|q|i|w):[A-Za-z0-9_-]{32}/u;
+
 /**
  * True when a merge callback's raw material appears in the text. The assertion
  * is the authority on what that material looks like, so this reads its verdict
  * rather than restating the rule.
  */
 function hasUnsafeCallbackMaterial(text: string): boolean {
+  if (INTERNAL_CALLBACK_MATERIAL.test(text)) return true;
   try {
     assertNoRawMergeCallback(text, "provider text");
     return false;

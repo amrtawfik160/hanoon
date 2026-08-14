@@ -1,100 +1,166 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
 import type { ControllerLeaseFence } from "./models";
-import type { ControllerInteractionStore } from "../storage/controller-interaction-repository";
-import { parseControllerInteraction, type ControllerInteraction } from "./questions";
+import { canonicalControllerJson } from "./capability-executor";
+import {
+  type ControllerInteractionDelivery,
+  type ControllerInteractionDeliveryFence,
+  type ControllerInteractionStore,
+} from "../storage/controller-interaction-repository";
 
-type Interactions = BbPluginApi["sdk"]["threads"]["interactions"];
+export type ControllerInteractionRemote = Readonly<{
+  id: string;
+  threadId: string;
+  status: string;
+  resolution?: unknown;
+}>;
 
-/**
- * What an authoritative read of one lifecycle reference established. These are
- * kept apart because they call for opposite handling: a projection is durable
- * progress, a settlement closes the block, and an invalid read is a reason to
- * come back rather than to move on.
- */
-export type ControllerInteractionFetch =
-  /** BB confirmed the exact interaction is open, with the safe projection of it. */
-  | { outcome: "pending"; interaction: ControllerInteraction }
-  /** BB itself says the block is over, whatever the event stream still claims. */
-  | { outcome: "settled" }
-  /** BB answered about something else, or with something unreadable. */
-  | { outcome: "invalid" };
+export function controllerInteractionResolutionMatches(
+  observed: unknown,
+  expected: Record<string, unknown>,
+): boolean {
+  if (observed === null || observed === undefined) return false;
+  try {
+    return canonicalControllerJson(observed) === canonicalControllerJson(expected);
+  } catch {
+    return false;
+  }
+}
 
-/**
- * Delivers a durable owner decision only after BB proves the exact interaction
- * still belongs to the persisted hidden-controller generation.
- */
+type ControllerInteractionApi = Readonly<{
+  get(
+    threadId: string,
+    interactionId: string,
+    signal?: AbortSignal,
+  ): Promise<ControllerInteractionRemote | null>;
+  resolve(
+    input: {
+      threadId: string;
+      interactionId: string;
+      resolution: Record<string, unknown>;
+    },
+    signal?: AbortSignal,
+  ): Promise<ControllerInteractionRemote | null>;
+}>;
+
+type FencedInteractionStore = ControllerInteractionStore & Readonly<{
+  isControllerInteractionDeliveryFenceCurrent: (input: ControllerInteractionDeliveryFence) => boolean;
+}>;
+
 export class ControllerInteractionService {
-  public constructor(private readonly dependencies: {
-    store: ControllerInteractionStore;
-    interactions: Interactions;
-    clock: () => number;
-  }) {}
+  private readonly store: FencedInteractionStore;
+  private readonly interactions: ControllerInteractionApi;
+  private readonly clock: { now(): number };
 
-  /**
-   * The authoritative reading of a lifecycle reference. The event that named it
-   * is only a hint, so the interaction is fetched, its identity and status are
-   * checked against what was observed, and only then is it projected.
-   */
-  public async fetchPending(input: {
-    bbThreadId: string;
-    interactionId: string;
-    signal?: AbortSignal;
-  }): Promise<ControllerInteractionFetch> {
-    const current = await this.dependencies.interactions.get({
-      threadId: input.bbThreadId,
-      interactionId: input.interactionId,
-      signal: input.signal,
-    });
-    // An answer about a different interaction, or on a different thread, says
-    // nothing at all about the one that was asked for.
-    if (current.id !== input.interactionId || current.threadId !== input.bbThreadId) {
-      return { outcome: "invalid" };
-    }
-    if (current.status === "resolved" || current.status === "interrupted") return { outcome: "settled" };
-    // `resolving` is in flight: neither open to record nor closed to settle, so
-    // the reference is read again on a later pass.
-    if (current.status !== "pending") return { outcome: "invalid" };
-    const interaction = parseControllerInteraction(input.interactionId, current.payload);
-    return interaction ? { outcome: "pending", interaction } : { outcome: "invalid" };
+  public constructor(input: {
+    store: FencedInteractionStore;
+    interactions: ControllerInteractionApi;
+    clock: { now(): number };
+  }) {
+    this.store = input.store;
+    this.interactions = input.interactions;
+    this.clock = input.clock;
   }
 
-  public async deliverAnswered(input: ControllerLeaseFence & { controllerKey: string; signal?: AbortSignal }): Promise<boolean> {
-    const delivery = this.dependencies.store.getAnswered(input.controllerKey);
-    if (!delivery) return false;
-    if (!this.dependencies.store.sourceIsActive({
-      ...input, now: this.dependencies.clock(), interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
-    })) return false;
-    const current = await this.dependencies.interactions.get({
-      threadId: delivery.bbThreadId,
-      interactionId: delivery.interactionId,
-      signal: input.signal,
-    });
-    if (current.threadId !== delivery.bbThreadId || current.id !== delivery.interactionId) return false;
-    if (current.status === "resolved" || current.status === "interrupted") {
-      return this.dependencies.store.markResolved({
-        ...input,
-        now: this.dependencies.clock(),
-        interactionId: delivery.interactionId,
-        turnId: delivery.turnId,
-        bbThreadId: delivery.bbThreadId,
-      });
+  /**
+   * Resolves one durable owner answer, retaining it until BB has returned an
+   * exact terminal interaction. A lost fence or an ambiguous provider result
+   * leaves the answer available for the next executor generation.
+   */
+  public async deliverAnswered(
+    controllerKey: string,
+    fence: ControllerLeaseFence,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (this.isAborted(signal)) return false;
+    const answered = this.store.getAnswered(controllerKey);
+    if (!answered || !this.freshFenceIfCurrent(answered, fence, signal)) return false;
+
+    const observed = await this.authoritativeGet(answered, signal);
+    if (!observed || this.isAborted(signal)) return false;
+
+    if (this.isResolvedWithExactAnswer(observed, answered.resolution)) {
+      return this.markDelivered(answered, fence, signal);
     }
-    if (current.status !== "pending") return false;
-    if (!this.dependencies.store.sourceIsActive({
-      ...input, now: this.dependencies.clock(), interactionId: delivery.interactionId, turnId: delivery.turnId, bbThreadId: delivery.bbThreadId,
-    })) return false;
-    const resolved = await this.dependencies.interactions.resolve({
-      threadId: delivery.bbThreadId,
-      interactionId: delivery.interactionId,
-      resolution: delivery.answer,
-    });
-    if (resolved.id !== delivery.interactionId || resolved.threadId !== delivery.bbThreadId || resolved.status !== "resolved") return false;
-    return this.dependencies.store.markDelivered({
-      ...input,
-      now: this.dependencies.clock(),
-      interactionId: delivery.interactionId,
-      turnId: delivery.turnId,
-      bbThreadId: delivery.bbThreadId,
-    });
+    if (observed.status !== "pending") return false;
+    if (!this.freshFenceIfCurrent(answered, fence, signal)) return false;
+
+    let resolved: ControllerInteractionRemote | null;
+    try {
+      resolved = await this.interactions.resolve({
+        threadId: answered.bbThreadId,
+        interactionId: answered.interactionId,
+        resolution: answered.resolution,
+      }, signal);
+    } catch {
+      // Provider failures are deliberately ambiguous; the durable answer must
+      // remain available for a later authoritative retry.
+      return false;
+    }
+    if (!resolved || !this.matches(answered, resolved) ||
+        !this.isResolvedWithExactAnswer(resolved, answered.resolution)) return false;
+    return this.markDelivered(answered, fence, signal);
+  }
+
+  private async authoritativeGet(
+    answered: ControllerInteractionDelivery,
+    signal?: AbortSignal,
+  ): Promise<ControllerInteractionRemote | null> {
+    try {
+      const observed = await this.interactions.get(answered.bbThreadId, answered.interactionId, signal);
+      return observed && this.matches(answered, observed) ? observed : null;
+    } catch {
+      // A failed authoritative read cannot prove either absence or delivery.
+      return null;
+    }
+  }
+
+  private markDelivered(
+    answered: ControllerInteractionDelivery,
+    fence: ControllerLeaseFence,
+    signal?: AbortSignal,
+  ): boolean {
+    const deliveryFence = this.freshFenceIfCurrent(answered, fence, signal);
+    return deliveryFence !== null && this.store.markDelivered(deliveryFence);
+  }
+
+  private freshFenceIfCurrent(
+    answered: ControllerInteractionDelivery,
+    fence: ControllerLeaseFence,
+    signal?: AbortSignal,
+  ): ControllerInteractionDeliveryFence | null {
+    if (this.isAborted(signal)) return null;
+    try {
+      const deliveryFence: ControllerInteractionDeliveryFence = {
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: this.clock.now(),
+        interactionId: answered.interactionId,
+        turnId: answered.turnId,
+        controllerKey: answered.controllerKey,
+        bbThreadId: answered.bbThreadId,
+        controllerGenerationId: answered.controllerGenerationId,
+      };
+      const predicateCurrent = this.store.isControllerInteractionDeliveryFenceCurrent(deliveryFence);
+      return predicateCurrent && !this.isAborted(signal) ? deliveryFence : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private isAborted(signal?: AbortSignal): boolean {
+    return signal?.aborted === true;
+  }
+
+  private matches(
+    answered: ControllerInteractionDelivery,
+    remote: ControllerInteractionRemote,
+  ): boolean {
+    return remote.id === answered.interactionId && remote.threadId === answered.bbThreadId;
+  }
+
+  private isResolvedWithExactAnswer(
+    remote: ControllerInteractionRemote,
+    expected: Record<string, unknown>,
+  ): boolean {
+    return remote.status === "resolved" && controllerInteractionResolutionMatches(remote.resolution, expected);
   }
 }

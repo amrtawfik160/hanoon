@@ -1,14 +1,29 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { BUNDLED_SKILL_IDS } from "../../src/agent-skills/role-resolver";
 import type Database from "better-sqlite3";
 import { expect, vi } from "vitest";
 import { hashSecret } from "../../src/crypto";
-import type { ControllerTurnRecord } from "../../src/controller/models";
+import type { ControllerLeaseFence, ControllerTurnRecord } from "../../src/controller/models";
 import { registerControllerTools } from "../../src/controller/tools";
-import { openStore } from "../../src/storage/store";
+import { BUNDLED_SKILL_IDS } from "../../src/agent-skills/role-resolver";
+import { openStore, type TelegramAgentStore } from "../../src/storage/store";
 import { policyFixture } from "../helpers";
 
 let fixtureNumber = 0;
+type DisposableControllerFixture = Readonly<{ dispose(): Promise<void> }>;
+const activeControllerFixtures = new Set<DisposableControllerFixture>();
+
+export async function disposeControllerTrustFixtures(): Promise<void> {
+  const fixtures = [...activeControllerFixtures];
+  let firstError: unknown;
+  for (const fixture of fixtures) {
+    try {
+      await fixture.dispose();
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError !== undefined) throw firstError;
+}
 
 type SubmittedTurnColumns = Readonly<{
   evidenceEventSeq?: number;
@@ -26,8 +41,6 @@ export type SubmittedControllerFixtureOptions = Readonly<{
 export function submittedControllerFixture(options: SubmittedControllerFixtureOptions = {}) {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-controller-trust-${fixtureNumber++}`,
-    // The controller's capability profile selects bundled skills, so the host
-    // must know them or `configure` resolves to nothing.
     agentSkillIds: [...BUNDLED_SKILL_IDS],
   });
   const store = openStore(bb.storage, bb.storage.kv, () => 2_000);
@@ -55,12 +68,20 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
     now: 2_000,
   };
   expect(store.claimNextControllerTurn(fence)?.id).toBe(queued.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: queued.controllerKey,
+    turnId: queued.id,
+    projectId: "proj_1",
+    hostId: "host_1",
+    now: fence.now,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: queued.id,
     projectId: "proj_1",
     hostId: "host_1",
     threadId: `thr_controller_trust_${fixtureNumber}`,
+    spawnToken: queued.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, turnId: queued.id })).toBe(true);
 
@@ -99,6 +120,18 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
 
   const turn = store.getControllerTurn(queued.id);
   if (!turn) throw new Error("submitted controller turn disappeared");
+  let disposed = false;
+  const dispose = async (): Promise<void> => {
+    if (disposed) return;
+    disposed = true;
+    try {
+      await harness.lifecycle.dispose();
+    } finally {
+      activeControllerFixtures.delete(disposable);
+    }
+  };
+  const disposable = { dispose };
+  activeControllerFixtures.add(disposable);
   return {
     bb,
     harness,
@@ -108,6 +141,7 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
     fence,
     replacementFence,
     reopen: () => openStore(bb.storage, bb.storage.kv, () => 2_000),
+    ...disposable,
   };
 }
 
@@ -124,6 +158,166 @@ export function validEvidenceInput(turn: ControllerTurnRecord) {
     proofKinds: ["project_state"] as const,
     subjectRefs: ["project:proj_1"] as const,
   };
+}
+
+export function completeAcceptedControllerTurn(
+  store: TelegramAgentStore,
+  turnOrId: ControllerTurnRecord | string,
+  fence: ControllerLeaseFence,
+  responseText: string,
+): void {
+  // Kept for controller-store/controller-service completion coverage only;
+  // downstream consumers use seedCompletedControllerTurn below.
+  const turn = typeof turnOrId === "string" ? store.getControllerTurn(turnOrId) : turnOrId;
+  if (!turn) throw new Error("controller completion fixture turn is missing");
+  if (!store.adoptSubmittedControllerTurnFence({ ...fence, turnId: turn.id })) {
+    throw new Error("controller completion fixture could not adopt the submitted turn");
+  }
+  const accepted = store.proposeControllerFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: responseText }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") {
+    throw new Error(`controller completion fixture finalization was ${accepted.outcome}`);
+  }
+  const current = store.getControllerTurn(turn.id);
+  if (!current) throw new Error("controller completion fixture turn disappeared");
+  const completed = store.completeControllerTurnFromFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bbHighWaterSeq: current.evidenceEventSeq,
+  });
+  if (completed !== "completed") throw new Error(`controller completion fixture returned ${completed}`);
+}
+
+/**
+ * Completes a submitted turn through the same accepted-finalization gate used
+ * by production. Kept as a compatibility fixture for the deployed-line tests
+ * that predate the more explicit `completeAcceptedControllerTurn` helper.
+ */
+export function completeTurnThroughFinalization(
+  store: TelegramAgentStore,
+  fence: ControllerLeaseFence,
+  input: Readonly<{ turnId: string; controllerKey: string; responseText: string }>,
+): void {
+  if (!store.adoptSubmittedControllerTurnFence({ ...fence, turnId: input.turnId })) {
+    throw new Error("submitted controller turn could not be adopted");
+  }
+  const turn = store.getControllerTurn(input.turnId);
+  if (!turn) throw new Error("submitted controller turn disappeared before evidence");
+  const mutationClaim = /\b(?:queued|started|stopped|restarted|retried|cancelled|canceled|resumed|paused|created|deleted|removed)\b/i
+    .test(input.responseText);
+  const claimKind = mutationClaim ? "external_mutation" : "pipeline_outcome";
+  const evidence = store.recordControllerEvidence({
+    ...validEvidenceInput(turn),
+    outcome: "succeeded",
+    proofKinds: [claimKind],
+    ...fence,
+    now: fence.now,
+  });
+  if (evidence.outcome !== "recorded" && evidence.outcome !== "duplicate") {
+    throw new Error(`controller completion fixture evidence was ${evidence.outcome}`);
+  }
+  const evidenceId = evidence.evidence.id;
+  const proposed = store.proposeControllerFinalization({
+    ...fence,
+    turnId: input.turnId,
+    controllerKey: input.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: input.responseText,
+        kind: claimKind,
+        outcome: "succeeded",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [`evidence:${evidenceId}`],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (proposed.outcome !== "accepted") {
+    throw new Error(`finalization was not accepted: ${JSON.stringify(proposed)}`);
+  }
+  const current = store.getControllerTurn(input.turnId);
+  if (!current) throw new Error("submitted controller turn disappeared");
+  const completed = store.completeControllerTurnFromFinalization({
+    ...fence,
+    turnId: input.turnId,
+    controllerKey: input.controllerKey,
+    bbHighWaterSeq: current.evidenceEventSeq,
+  });
+  if (completed !== "completed") throw new Error(`turn was not completed: ${completed}`);
+}
+
+/**
+ * Seeds the durable state consumed by downstream tests without exercising the
+ * completion implementation they are meant to observe. Completion-specific
+ * tests should continue to use completeAcceptedControllerTurn above.
+ */
+export function seedCompletedControllerTurn(
+  db: Database.Database,
+  turnOrId: ControllerTurnRecord | string,
+  responseText: string,
+  now = 2_000,
+): void {
+  const turnId = typeof turnOrId === "string" ? turnOrId : turnOrId.id;
+  const row = db.prepare(
+    `SELECT turn.id, turn.controller_key, turn.ordinal, turn.input_text,
+            controller.telegram_chat_id, turn.state
+       FROM controller_turns AS turn
+       JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+      WHERE turn.id = ?`,
+  ).get(turnId) as {
+    id: string;
+    controller_key: string;
+    ordinal: number;
+    input_text: string;
+    telegram_chat_id: string;
+    state: string;
+  } | undefined;
+  if (!row) throw new Error("controller seed turn is missing");
+  if (row.state !== "submitted") throw new Error(`controller seed turn is ${row.state}, not submitted`);
+
+  const payloadJson = JSON.stringify({ text: responseText, disable_web_page_preview: true });
+  db.transaction(() => {
+    const completed = db.prepare(
+      `UPDATE controller_turns
+          SET state = 'completed', response_text = ?, stream_text = '',
+              stream_phase = 'complete', last_error = NULL, completed_at = ?, updated_at = ?
+        WHERE id = ? AND state = 'submitted'`,
+    ).run(responseText, now, now, row.id);
+    if (completed.changes !== 1) throw new Error("controller seed turn was not submitted at write time");
+
+    db.prepare(
+      `INSERT INTO controller_digest (controller_key, ordinal, owner_text, agent_text, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (controller_key, ordinal) DO UPDATE
+         SET owner_text = excluded.owner_text, agent_text = excluded.agent_text`,
+    ).run(row.controller_key, row.ordinal, row.input_text, responseText, now);
+
+    db.prepare(
+      `INSERT INTO outbox (
+         logical_key, chat_id, message_id, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)
+       ON CONFLICT(logical_key) DO UPDATE SET
+         chat_id = excluded.chat_id,
+         payload_json = excluded.payload_json,
+         status = 'pending',
+         attempts = 0,
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = NULL,
+         updated_at = excluded.updated_at`,
+    ).run(`controller:${row.id}:reply`, row.telegram_chat_id, payloadJson, now, now, now);
+  }).immediate();
 }
 
 export function insertControllerTestJob(
@@ -207,6 +401,7 @@ export function registeredControllerFixture(options: { staleLease?: boolean } = 
     health,
     notify,
     now: () => 2_000,
+    controllerProviderId: () => "codex",
   });
   return {
     ...fixture,
@@ -221,11 +416,7 @@ export function registeredControllerFixture(options: { staleLease?: boolean } = 
   };
 }
 
-/**
- * A registered controller whose agent configuration can be resolved exactly as
- * BB would resolve it, so `bb.agents.configure` can be tested as the single
- * standing-instruction source rather than through the strings it composes from.
- */
+/** A registered controller with the full BB configuration context available. */
 export function configuredControllerFixture(options: { staleLease?: boolean } = {}) {
   const fixture = registeredControllerFixture(options);
   const controller = fixture.store.getControllerForOwner("7", "7");
@@ -257,40 +448,4 @@ export function configuredControllerFixture(options: { staleLease?: boolean } = 
     resolveConfiguration: (overrides: Record<string, unknown> = {}) =>
       fixture.harness.behavior.resolveAgentConfiguration({ ...context, ...overrides } as never),
   };
-}
-
-/**
- * Completes a submitted turn the only way production can: an accepted
- * structured finalization, then its consumption. Tests used to call the raw
- * completion API, which wrote an answer with no finalization behind it.
- */
-export function completeTurnThroughFinalization(
-  store: ReturnType<typeof openStore>,
-  fence: Readonly<{ ownerId: string; generation: number; now: number }>,
-  input: Readonly<{ turnId: string; controllerKey: string; responseText: string }>,
-): void {
-  // The real path adopts the submitted turn under the current executor lease
-  // before any finalization work, so the helper does too.
-  if (!store.adoptSubmittedControllerTurnFence({ ...fence, turnId: input.turnId })) {
-    throw new Error("submitted controller turn could not be adopted");
-  }
-  const proposed = store.proposeControllerFinalization({
-    ...fence,
-    turnId: input.turnId,
-    controllerKey: input.controllerKey,
-    candidate: {
-      disposition: "answered",
-      segments: [{ type: "text", text: input.responseText }],
-      obligationRefs: [],
-    },
-  });
-  if (proposed.outcome !== "accepted") {
-    throw new Error(`finalization was not accepted: ${JSON.stringify(proposed)}`);
-  }
-  const completion = store.completeControllerTurnFromFinalization({
-    ...fence,
-    turnId: input.turnId,
-    controllerKey: input.controllerKey,
-  });
-  if (completion !== "completed") throw new Error(`turn was not completed: ${completion}`);
 }

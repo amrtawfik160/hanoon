@@ -32,8 +32,8 @@ function approvalInteraction(): PendingThreadInteraction {
     status: "pending",
     payload: {
       kind: "approval",
-      subject: { kind: "command", itemId: "i1", command: "rm -rf build", cwd: "/repo", actions: [] },
-      decisions: ["allow_once", "allow_for_session", "deny"],
+      subject: { kind: "command", itemId: "i1", command: "rm -rf build", cwd: "repo", actions: [] },
+      availableDecisions: ["allow_once", "allow_for_session", "deny"],
     },
   };
 }
@@ -169,6 +169,74 @@ it("asks the owner to approve a command a thread is blocked on", async () => {
       [{ text: "Deny", callback_data: `w:${threadDecisionToken(APPROVAL_ID, "deny")}` }],
     ],
   });
+});
+
+it("does not render an approval with a protected absolute cwd", async () => {
+  const store = fixture();
+  const interaction: PendingThreadInteraction = {
+    id: "pint_canonical",
+    status: "pending",
+    payload: {
+      kind: "approval",
+      subject: {
+        kind: "command",
+        itemId: "i2",
+        command: "git status",
+        cwd: "/home/alice/.ssh/id_rsa",
+        actions: [],
+      },
+      availableDecisions: ["allow_once", "deny"],
+    },
+  };
+
+  await service(store, { threads: [watched()], interactions: [interaction] }).service.processDue();
+
+  const asked = store.getOutbox("thread-interaction:pint_canonical");
+  expect(asked?.payload.text).toContain("can't answer from here");
+  expect(asked?.payload.text).not.toContain("/home/");
+  expect(asked?.payload.text).not.toContain("id_rsa");
+  expect(asked?.payload.reply_markup).toBeUndefined();
+});
+
+it("does not render an approval with a protected absolute write scope", async () => {
+  const store = fixture();
+  const interaction: PendingThreadInteraction = {
+    id: "pint_write_scope",
+    status: "pending",
+    payload: {
+      kind: "approval",
+      subject: { kind: "file_change", writeScope: "/srv/private/credentials.json" },
+      availableDecisions: ["deny"],
+    },
+  };
+
+  await service(store, { threads: [watched()], interactions: [interaction] }).service.processDue();
+
+  const asked = store.getOutbox("thread-interaction:pint_write_scope");
+  expect(asked?.payload.text).toContain("can't answer from here");
+  expect(asked?.payload.text).not.toContain("/srv/");
+  expect(asked?.payload.text).not.toContain("credentials.json");
+  expect(asked?.payload.reply_markup).toBeUndefined();
+});
+
+it("does not offer approval buttons when a command cannot be displayed losslessly", async () => {
+  const store = fixture();
+  const interaction: PendingThreadInteraction = {
+    id: "pint_lossy_command",
+    status: "pending",
+    payload: {
+      kind: "approval",
+      subject: { kind: "command", command: "echo safe API_KEY=secret-value", cwd: "/repo" },
+      availableDecisions: ["allow_once", "deny"],
+    },
+  };
+
+  await service(store, { threads: [watched()], interactions: [interaction] }).service.processDue();
+
+  const asked = store.getOutbox("thread-interaction:pint_lossy_command");
+  expect(asked?.payload.text).toContain("can't answer from here");
+  expect(asked?.payload.reply_markup).toBeUndefined();
+  expect(JSON.stringify(asked?.payload)).not.toContain("secret-value");
 });
 
 it("carries an approval decision back to the blocked thread", async () => {
@@ -461,4 +529,28 @@ it("reports a later finish once the quiet period has passed", async () => {
 
   await tick("active", 20 * 60_000).service.processDue();
   await expect(tick("idle").service.processDue()).resolves.toBe(true);
+});
+
+it("paginates past a full first page so later top-level threads are observed", async () => {
+  const store = fixture();
+  const firstPage = Array.from({ length: 100 }, (_, index) => watched({
+    id: `thr_page_${index}`,
+    title: `Thread ${index}`,
+    status: "idle",
+  }));
+  const last = watched({ id: "thr_page_100", title: "Last thread", status: "idle" });
+  const listWatchable = vi.fn(async (offset: number, limit: number) => {
+    expect(limit).toBe(100);
+    return offset === 0 ? firstPage : offset === 100 ? [last] : [];
+  });
+  const notices = new ThreadNoticeService({
+    store,
+    threads: { listWatchable, interactions: vi.fn(async () => []), resolve: vi.fn(async () => undefined) },
+    clock: { now: () => 30_000 },
+  });
+
+  await expect(notices.processDue()).resolves.toBe(false);
+
+  expect(listWatchable.mock.calls).toEqual([[0, 100], [100, 100]]);
+  expect(store.getOutbox("thread:thr_page_100:idle")).toBeNull();
 });

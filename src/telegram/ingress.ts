@@ -364,23 +364,21 @@ export class TelegramIngress {
     const controllerKey = stableControllerKey(identity.userId, identity.chatId);
     // The agent asked something and is blocked on it. A reply now is the answer,
     // not a new request to line up behind the answer it is waiting to give.
-    // An approval or an interaction the plugin cannot represent never consumes
-    // free text: the owner's words would resolve a decision they never made.
-    if (this.store.getPendingControllerInteraction(controllerKey)?.interaction.kind === "user_question") {
-      const answered = this.store.answerControllerInteractionWithText({
+    if (this.store.getPendingControllerInteraction(controllerKey)) {
+      const result = this.store.answerControllerInteractionTextUpdate({
+        updateId,
         controllerKey,
         userId: identity.userId,
         chatId: identity.chatId,
         text: normalized,
         now,
-        // The answer and this update's claim are settled together, so a crash
-        // here cannot replay these words onto the next question.
-        settleUpdateId: updateId,
       });
+      if (result.outcome === "replay") return;
+      const answered = result.answer;
       if (answered.ok) {
         this.rememberStandingInstruction(normalized, answered.turnId, now);
         this.onWorkAvailable();
-        return { updateSettled: answered.updateSettled };
+        return { updateSettled: true };
       }
     }
 
@@ -514,14 +512,14 @@ export class TelegramIngress {
     // interaction: the answer, the callback record, and the acknowledgement all
     // commit together, and the executor is nudged only once they have.
     if (action.type === "controller_interaction" || action.type === "question") {
-      const answered = this.store.answerControllerInteractionByToken({
+      const result = this.store.answerControllerInteractionByTokenAndRecordCallback({
         token: action.token,
         userId: identity.userId,
         chatId: identity.chatId,
         callbackId: callback.id,
         now,
       });
-      if (answered.ok) this.onWorkAvailable();
+      if (result.answer.ok && result.recorded) this.onWorkAvailable();
       return;
     }
     if (action.type === "operation") {

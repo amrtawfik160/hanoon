@@ -110,7 +110,7 @@ it("registers configurable controller execution settings with safe defaults", as
     controllerPermissionMode: {
       type: "select",
       options: ["auto", "accept-edits", "full"],
-      default: "full",
+      default: "auto",
     },
   });
 });

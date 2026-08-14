@@ -111,7 +111,7 @@ it("defaults controller execution when only public connection settings are prese
     controllerFallbackModel2: "disabled",
     controllerReasoningLevel: "xhigh",
     controllerServiceTier: "default",
-    controllerPermissionMode: "full",
+    controllerPermissionMode: "auto",
   });
 });
 
@@ -177,12 +177,12 @@ it("does not let fallback settings weaken the strong-only routing kill switch", 
   ]);
 });
 
-it("preserves a non-default controller execution profile", () => {
+it.each(["auto", "accept-edits", "full"] as const)("preserves an explicit controller permission mode: %s", (permissionMode) => {
   const parsed = parseGlobalConfig(globalValues({
     controllerModel: "gpt-5.6-terra",
     controllerReasoningLevel: "high",
     controllerServiceTier: "default",
-    controllerPermissionMode: "accept-edits",
+    controllerPermissionMode: permissionMode,
     maxConcurrentJobs: undefined,
   }));
 
@@ -192,7 +192,7 @@ it("preserves a non-default controller execution profile", () => {
     controllerModel: "gpt-5.6-terra",
     controllerReasoningLevel: "high",
     controllerServiceTier: "default",
-    controllerPermissionMode: "accept-edits",
+    controllerPermissionMode: permissionMode,
   });
 });
 

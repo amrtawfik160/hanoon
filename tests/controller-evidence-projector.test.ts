@@ -1,4 +1,4 @@
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
 import { sha256ControllerJson } from "../src/controller/capability-executor";
 import {
@@ -9,9 +9,14 @@ import {
 } from "../src/controller/evidence-projector";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "../src/controller/models";
 import {
+  disposeControllerTrustFixtures,
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 
 type CommandItem = Extract<ControllerCompletedNativeItem, { type: "commandExecution" }>;
 type FileItem = Extract<ControllerCompletedNativeItem, { type: "fileChange" }>;
@@ -139,7 +144,17 @@ function readyProjectorFixture(options: ProjectorFixtureOptions = {}) {
     clock: { now: options.clock ?? (() => 2_100) },
     hanoonToolNames: CONTROLLER_TOOL_NAMES,
   });
-  return { ...fixture, controller, projector, rows };
+  const reconcile = projector.reconcile.bind(projector);
+  const fixedProjector = {
+    reconcile: (
+      reconciledController: ControllerThreadRecord,
+      reconciledTurn: ControllerTurnRecord,
+      fence: Parameters<typeof projector.reconcile>[2],
+      signal: AbortSignal,
+      immutableHighWater = target,
+    ) => reconcile(reconciledController, reconciledTurn, fence, signal, immutableHighWater),
+  };
+  return { ...fixture, controller, projector: fixedProjector, rows, target };
 }
 
 function currentTurn(store: ReturnType<typeof readyProjectorFixture>["store"], turnId: string): ControllerTurnRecord {
@@ -239,7 +254,7 @@ it.each(commandApprovalRows)(
   },
 );
 
-it("projects web, image, and generic tool completions with their exact proof kinds", () => {
+it("projects web and image results but treats an opaque provider tool only as observed thread state", () => {
   const roots = { projectRoot: PROJECT_ROOT };
   expect(projectCompletedControllerItem({
     type: "webSearch",
@@ -265,8 +280,8 @@ it("projects web, image, and generic tool completions with their exact proof kin
     subjectRefs: ["bb-item:image_1"],
   });
   expect(projectCompletedControllerItem(toolItem("external_lookup"), roots)).toMatchObject({
-    outcome: "succeeded",
-    proofKinds: ["tool_result"],
+    outcome: "observed",
+    proofKinds: ["thread_state"],
     subjectRefs: ["bb-item:tool_1"],
   });
 });
@@ -326,20 +341,20 @@ it("hashes exact web, image, file, and tool projections without exposing them", 
   });
 });
 
-it("uses generic tool status even when its error field is inconsistent", () => {
+it("keeps opaque provider tool observations non-authoritative regardless of status fields", () => {
   const roots = { projectRoot: PROJECT_ROOT };
   expect(projectCompletedControllerItem(toolItem("external", {
     status: "completed",
     error: "stale error text",
-  }), roots)?.outcome).toBe("succeeded");
+  }), roots)?.outcome).toBe("observed");
   expect(projectCompletedControllerItem(toolItem("external", {
     status: "failed",
     result: { stale: "success" },
-  }), roots)?.outcome).toBe("failed");
+  }), roots)?.outcome).toBe("observed");
   expect(projectCompletedControllerItem(toolItem("external", { status: "pending" }), roots)?.outcome)
     .toBe("observed");
   expect(projectCompletedControllerItem(toolItem("external", { status: "interrupted" }), roots)?.outcome)
-    .toBe("interrupted");
+    .toBe("observed");
 });
 
 it.each(CONTROLLER_TOOL_NAMES)("does not project Hanoon tool call %s a second time", (name) => {
@@ -564,7 +579,29 @@ it("keeps one fixed snapshot and ignores rows above its high-water", async () =>
   expect(reconciled).toMatchObject({ outcome: "reconciled", throughSeq: 2, targetSeq: 2 });
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 128).map((row) => row.sourceItemId))
     .toEqual(["cmd_1", "cmd_2"]);
-  expect(fixture.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(1);
+  expect(fixture.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(0);
+});
+
+it("uses the immutable high-water supplied by the caller instead of taking a fresh snapshot", async () => {
+  const rows = [
+    completedEvent(1, commandItem({ id: "cmd_before_target" })),
+    completedEvent(2, commandItem({ id: "cmd_at_target" })),
+    completedEvent(3, commandItem({ id: "cmd_after_target" })),
+  ];
+  const fixture = readyProjectorFixture({ rows, maxSeq: 3 });
+
+  const reconciled = await fixture.projector.reconcile(
+    fixture.controller,
+    fixture.turn,
+    fixture.fence,
+    new AbortController().signal,
+    2,
+  );
+
+  expect(reconciled).toMatchObject({ outcome: "reconciled", throughSeq: 2, targetSeq: 2 });
+  expect(fixture.store.listControllerEvidence(fixture.turn.id, 128).map((row) => row.sourceItemId))
+    .toEqual(["cmd_before_target", "cmd_at_target"]);
+  expect(fixture.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(0);
 });
 
 it.each([
@@ -614,7 +651,7 @@ it("retries cursor conflicts twice and succeeds on the third attempt with one ta
 
   expect(reconciled).toMatchObject({ outcome: "reconciled", throughSeq: 3, targetSeq: 3 });
   expect(attempts).toBe(3);
-  expect(fixture.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(1);
+  expect(fixture.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(0);
   expect(fixture.harness.inspection.sdk.callsTo("threads.events.list").map((args) =>
     (args[0] as { afterSeq: string }).afterSeq)).toEqual(["0", "1", "2"]);
 });
@@ -640,7 +677,7 @@ it("fails closed after a third cursor conflict while retaining the original targ
     new AbortController().signal,
   )).rejects.toMatchObject({ code: "cursor_conflict" });
   expect(attempts).toBe(3);
-  expect(fixture.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(1);
+  expect(fixture.harness.inspection.sdk.callsTo("threads.timeline")).toHaveLength(0);
   expect(currentTurn(fixture.store, fixture.turn.id).evidenceEventSeq).toBe(2);
 });
 
@@ -721,6 +758,7 @@ it("surfaces repository identity decisions across replay and restart", async () 
     currentTurn(fixture.store, fixture.turn.id),
     fixture.fence,
     new AbortController().signal,
+    2,
   )).toMatchObject({ outcome: "reconciled", throughSeq: 2 });
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 128)).toHaveLength(1);
 
@@ -736,6 +774,7 @@ it("surfaces repository identity decisions across replay and restart", async () 
     currentTurn(fixture.store, fixture.turn.id),
     fixture.fence,
     new AbortController().signal,
+    3,
   )).rejects.toMatchObject({ code: "native_identity_conflict" });
   expect(currentTurn(fixture.store, fixture.turn.id).evidenceEventSeq).toBe(2);
 });
@@ -855,6 +894,7 @@ it("marks a cap crossing without advancing, advances an identical replay at cap,
     currentTurn(replay.store, replay.turn.id),
     replay.fence,
     new AbortController().signal,
+    2,
   )).toMatchObject({ outcome: "reconciled", throughSeq: 2 });
   expect(currentTurn(replay.store, replay.turn.id).evidenceEventSeq).toBe(2);
 
@@ -870,6 +910,7 @@ it("marks a cap crossing without advancing, advances an identical replay at cap,
     currentTurn(replay.store, replay.turn.id),
     replay.fence,
     new AbortController().signal,
+    3,
   )).rejects.toMatchObject({ code: "native_identity_conflict" });
   expect(currentTurn(replay.store, replay.turn.id)).toMatchObject({
     evidenceEventSeq: 2,

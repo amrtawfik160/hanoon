@@ -54,10 +54,10 @@ function nativeEvidenceCandidate(sourceItemId: string) {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(45);
-  expect(ALL_MIGRATIONS.at(-3)).toContain("CREATE TABLE merge_authority");
-  expect(ALL_MIGRATIONS.at(-2)).toContain("CREATE TABLE regression_watch");
-  expect(ALL_MIGRATIONS.at(-1)).toContain("CREATE TABLE credential_bindings");
+  expect(ALL_MIGRATIONS).toHaveLength(50);
+  expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
+  expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
+  expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -112,6 +112,11 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[40]).toContain("evidence_high_water_id INTEGER NOT NULL");
   expect(ALL_MIGRATIONS[41]).toContain("CREATE TABLE controller_interactions");
   expect(ALL_MIGRATIONS[41]).toContain("controller_generation_id TEXT REFERENCES controller_generations(id)");
+  expect(ALL_MIGRATIONS[45]).toContain("steer_reservation_turn_id");
+  expect(ALL_MIGRATIONS[46]).toContain("CREATE TABLE controller_supervisor_steer_attempts");
+  expect(ALL_MIGRATIONS[47]).toContain("CREATE TABLE controller_interaction_quarantine");
+  expect(ALL_MIGRATIONS[48]).toContain("envelope_version");
+  expect(ALL_MIGRATIONS[49]).toContain("consumed_at");
 });
 
 it("pins the exact shipped and controller trust migration bytes in order", () => {
@@ -121,7 +126,9 @@ it("pins the exact shipped and controller trust migration bytes in order", () =>
   expect(sha256(ALL_MIGRATIONS[40]!)).toBe(
     "4ec9eb259bbdce396ac0026c13ebd84ec71f25433092827cc9aae5fe903505d3",
   );
-  expect(sha256(ALL_MIGRATIONS[41]!)).toBe("fb97937ba61125ffeb21c3594ea321f726232285811d7ed2d56f453d7a950f3c");
+  expect(sha256(ALL_MIGRATIONS[41]!)).toBe(
+    "47f96300edfdef5bfec673225293738bc38a06e038bf4c4afee74e1f4e8f0dcf",
+  );
 });
 
 it("requires controller trust state on the public turn record", () => {
@@ -153,7 +160,7 @@ it("enqueues Telegram controller turns idempotently and rejects changed replay i
     retryCount: 0,
     modelFallbackIndex: 0,
     bbEventSeq: 0,
-    streamText: "",
+    streamText: "Queued…",
     telegramMessageId: null,
     streamPhase: "queued",
     evidenceEventSeq: 0,
@@ -942,7 +949,7 @@ it("normalizes a pre-cutover raw stream_text on a zero-advance pass without doub
     totalTokens: 12_345,
     ...fence,
     now: 8_000,
-  })).toBe(true);
+  })).toBe(false);
 
   const replayed = store.getControllerTurn(turn.id)!;
   expect(replayed).toMatchObject({

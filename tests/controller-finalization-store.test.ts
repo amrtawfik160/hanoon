@@ -1,15 +1,22 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
-import { expect, it } from "vitest";
-import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import { afterEach, expect, it } from "vitest";
 import { ControllerEvidenceRepository } from "../src/storage/controller-evidence-repository";
+import { openStore } from "../src/storage/store";
 import {
+  disposeControllerTrustFixtures,
   insertControllerTestJob,
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 
 type RaceWorker = Readonly<{
   child: ChildProcessWithoutNullStreams;
@@ -20,6 +27,12 @@ type RaceWorkerResult = Readonly<{
   outcome: string;
   code?: string;
   revision?: number;
+}>;
+
+type SeededRaceDatabase = Readonly<{
+  db: Database.Database;
+  databasePath: string;
+  disposeHost: () => Promise<void>;
 }>;
 
 function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
@@ -35,16 +48,30 @@ function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
 }
 
 function raceWorkerSource(): string {
+  const evidenceRepositoryModule = JSON.stringify(resolve("src/storage/controller-evidence-repository.ts"));
+  const storeModule = JSON.stringify(resolve("src/storage/store.ts"));
   return String.raw`
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { ControllerEvidenceRepository } from "../src/storage/controller-evidence-repository";
+import { ControllerEvidenceRepository } from ${evidenceRepositoryModule};
+import { openStore } from ${storeModule};
 
 const [dbPath, barrierDir, label, operation] = process.argv.slice(2);
 if (!dbPath || !barrierDir || !label || !operation) throw new Error("race worker arguments are incomplete");
 const db = new Database(dbPath);
 db.pragma("busy_timeout = 5000");
+const kv = {
+  get: async () => undefined,
+  set: async () => undefined,
+  delete: async () => undefined,
+  list: async () => [],
+};
+const storage = {
+  database: () => db,
+  kv,
+  migrate: () => undefined,
+};
 db.function("task8_race_pause", () => {
   writeFileSync(join(barrierDir, "entered-" + label), "entered");
   while (!existsSync(join(barrierDir, "release"))) {
@@ -57,6 +84,7 @@ while (!existsSync(join(barrierDir, "go"))) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 }
 writeFileSync(join(barrierDir, "attempting-" + label), "attempting");
+const store = openStore(storage as Parameters<typeof openStore>[0], kv as Parameters<typeof openStore>[1]);
 try {
   const fence = { ownerId: "executor", generation: 1, now: 2_000 };
   let raceResult;
@@ -67,7 +95,7 @@ try {
       controllerKey: "controller_race",
       candidate: {
         disposition: "answered",
-        segments: [{ type: "text", text: "The answer is complete." }],
+        segments: [{ type: "text", text: "Here is the requested answer." }],
         obligationRefs: [],
       },
     });
@@ -78,25 +106,69 @@ try {
           ...("revision" in proposal ? { revision: proposal.revision } : {}),
         }
       : { outcome: proposal.outcome };
-  } else if (operation === "completion") {
-    raceResult = {
-      outcome: repository.completeFromFinalization({
-        ...fence,
-        turnId: "turn_race",
-        controllerKey: "controller_race",
-      }),
-    };
-  } else {
-    const outcome = repository.claimCompletionContinuation({
+  } else if (operation === "continuation") {
+    const outcome = store.claimControllerCompletionContinuation({
       ...fence,
       turnId: "turn_race",
       controllerKey: "controller_race",
       bbHighWaterSeq: 0,
     });
     if (outcome === "claimed") {
-      writeFileSync(join(barrierDir, "sent-" + label), "sent");
+      writeFileSync(join(barrierDir, "sent-" + label),
+        "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.");
     }
     raceResult = { outcome };
+  } else if (operation === "supervisor") {
+    const outcome = store.claimControllerSupervisorSteer({
+      ...fence,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      expectedThreadId: "thread_race",
+      reason: "tool_budget",
+      inputText: "Stop searching and answer now.",
+    });
+    raceResult = { outcome };
+  } else if (operation === "supervisor-settle") {
+    const outcome = store.settleControllerSupervisorSteer({
+      ...fence,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      reason: "tool_budget",
+      outcome: "applied",
+    });
+    raceResult = { outcome };
+  } else if (operation === "crash") {
+    const outcome = store.claimControllerCompletionContinuation({
+      ...fence,
+      turnId: "turn_race",
+      controllerKey: "controller_race",
+      bbHighWaterSeq: 0,
+    });
+    if (outcome === "claimed") {
+      writeFileSync(join(barrierDir, "crashed-after-claim-" + label), "claimed");
+      process.exit(42);
+    }
+    raceResult = { outcome };
+  } else if (operation === "record") {
+    raceResult = {
+      outcome: store.recordControllerInteraction({
+        ...fence,
+        turnId: "turn_race",
+        controllerKey: "controller_race",
+        bbThreadId: "thread_race",
+        controllerGenerationId: "generation_race",
+        interaction: { kind: "unsupported", interactionId: "race_interaction" },
+      }),
+    };
+  } else {
+    raceResult = {
+      outcome: store.completeControllerTurnFromFinalization({
+        ...fence,
+        turnId: "turn_race",
+        controllerKey: "controller_race",
+        bbHighWaterSeq: 0,
+      }),
+    };
   }
   process.stdout.write(JSON.stringify(raceResult) + "\n");
 } finally {
@@ -105,15 +177,15 @@ try {
 `;
 }
 
-function seededRaceDatabase(directory: string): { db: Database.Database; databasePath: string } {
-  const databasePath = resolve(directory, "race.sqlite");
-  const db = new Database(databasePath);
+let raceHostNumber = 0;
+
+function seededRaceDatabase(): SeededRaceDatabase {
+  const { bb, harness } = createFakePluginHost({ pluginId: `telegram-controller-race-${raceHostNumber++}` });
+  openStore(bb.storage, bb.storage.kv, () => 2_000);
+  const db = bb.storage.database();
+  const databasePath = db.name;
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
-  for (const migration of ALL_MIGRATIONS) db.exec(migration);
-  db.exec("ALTER TABLE approvals ADD COLUMN owner_user_id TEXT");
-  db.exec("ALTER TABLE approvals ADD COLUMN owner_chat_id TEXT");
-  db.exec("ALTER TABLE approvals ADD COLUMN job_version INTEGER");
   db.prepare(
     "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at) VALUES (1, '7', '7', 1)",
   ).run();
@@ -132,10 +204,18 @@ function seededRaceDatabase(directory: string): { db: Database.Database; databas
        'executor', 1, 1, 1, 1)`,
   ).run();
   db.prepare(
+    `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
+     VALUES ('generation_race', 'controller_race', 'thread_race', 1, NULL, NULL)`,
+  ).run();
+  db.prepare(
     `UPDATE executor_lease SET owner_id = 'executor', generation = 1,
        heartbeat_at = 1, lease_expires_at = 10000 WHERE singleton = 1`,
   ).run();
-  return { db, databasePath };
+  return {
+    db,
+    databasePath,
+    disposeHost: async () => { await harness.lifecycle.dispose(); },
+  };
 }
 
 function startRaceWorker(
@@ -143,7 +223,7 @@ function startRaceWorker(
   databasePath: string,
   barrierDir: string,
   label: string,
-  operation: "proposal" | "completion" | "continuation",
+  operation: "proposal" | "completion" | "continuation" | "supervisor" | "supervisor-settle" | "crash" | "record",
 ): RaceWorker {
   const child = spawn(resolve("node_modules/.bin/vite-node"), [
     "--script",
@@ -195,7 +275,7 @@ function processOnlyFinalization() {
   };
 }
 
-function plainFinalization(text = "The answer is complete.") {
+function plainFinalization(text = "Here is the requested answer.") {
   return {
     disposition: "answered" as const,
     segments: [{ type: "text" as const, text }],
@@ -221,7 +301,7 @@ function deferredFinalization(ref: string) {
 
 function acceptPlainFinalization(
   fixture: ReturnType<typeof submittedControllerFixture>,
-  text = "The answer is complete.",
+  text = "Here is the requested answer.",
 ) {
   const accepted = fixture.store.proposeControllerFinalization({
     ...fixture.fence,
@@ -231,6 +311,18 @@ function acceptPlainFinalization(
   });
   if (accepted.outcome !== "accepted") throw new Error("finalization fixture was not accepted");
   return accepted.finalization;
+}
+
+function downgradeAcceptedEnvelope(
+  fixture: ReturnType<typeof submittedControllerFixture>,
+  finalization: ReturnType<typeof acceptPlainFinalization>,
+): void {
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: finalization.candidate,
+    bbEventHighWaterSeq: finalization.bbEventHighWaterSeq,
+  }), finalization.id);
 }
 
 function nativeEvidenceCandidate(sourceItemId: string) {
@@ -244,6 +336,45 @@ function nativeEvidenceCandidate(sourceItemId: string) {
     subjectRefs: [`bb-item:${sourceItemId}`] as const,
   };
 }
+
+it("does not permit a controller mutation after finalization is accepted", () => {
+  const fixture = submittedControllerFixture();
+  const row = fixture.db.prepare(
+    "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  const mutationFence = {
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    expectedThreadId: row.bb_thread_id,
+  };
+
+  expect(fixture.store.canMutateControllerTurn(mutationFence)).toBe(true);
+  acceptPlainFinalization(fixture);
+  expect(fixture.store.canMutateControllerTurn(mutationFence)).toBe(false);
+});
+
+it("rejects recording a new interaction after finalization is accepted", () => {
+  const fixture = submittedControllerFixture();
+  const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+  const controller = fixture.db.prepare(
+    "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  if (!generation) throw new Error("missing controller generation");
+  acceptPlainFinalization(fixture);
+
+  expect(fixture.store.recordControllerInteraction({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbThreadId: controller.bb_thread_id,
+    controllerGenerationId: generation.id,
+    interaction: { kind: "unsupported", interactionId: "interaction_after_finalization" },
+  })).toBe("stale");
+  expect(fixture.db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_interactions WHERE interaction_id = ?",
+  ).get("interaction_after_finalization")).toEqual({ count: 0 });
+});
 
 it("accepts one evidence-bound candidate and makes it immutable", () => {
   const { store, turn, fence, db } = submittedControllerFixture();
@@ -289,6 +420,235 @@ it("accepts one evidence-bound candidate and makes it immutable", () => {
   expect(db.prepare(
     "SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = ?",
   ).get(turn.id)).toEqual({ count: 1 });
+});
+
+it("revalidates a legacy accepted envelope against current evidence after restart", () => {
+  const fixture = submittedControllerFixture();
+  const evidence = fixture.store.recordControllerEvidence({
+    ...validEvidenceInput(fixture.turn),
+    ...fixture.fence,
+  });
+  if (evidence.outcome !== "recorded") throw new Error("evidence fixture was not recorded");
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope fixture was not accepted");
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: accepted.finalization.candidate,
+    bbEventHighWaterSeq: accepted.finalization.bbEventHighWaterSeq,
+  }), accepted.finalization.id);
+
+  const restarted = fixture.reopen();
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
+    id: accepted.finalization.id,
+    semanticEnvelopeVersion: 2,
+  });
+  expect(restarted.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
+  })).toBe("completed");
+});
+
+it("upgrades a legacy accepted envelope before its owner boundary can change", () => {
+  const fixture = submittedControllerFixture();
+  fixture.store.createThreadOperation({
+    id: "legacy_upgrade_operation",
+    nonceHash: "7".repeat(64),
+    ownerUserId: "7",
+    ownerChatId: "7",
+    kind: "stop_thread",
+    threadId: "thread_target",
+    text: null,
+    expiresAt: fixture.fence.now + 100,
+    now: fixture.fence.now,
+  });
+  expect(fixture.store.markThreadOperationConfirmationSent(
+    "legacy_upgrade_operation",
+    77,
+    fixture.fence.now,
+  )).toMatchObject({ state: "awaiting_confirmation" });
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: needsOwnerFinalization(),
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope fixture was not accepted");
+  downgradeAcceptedEnvelope(fixture, accepted.finalization);
+
+  const restarted = fixture.reopen();
+  const firstRead = restarted.getAcceptedControllerFinalization(fixture.turn.id);
+  expect(firstRead).toMatchObject({ id: accepted.finalization.id });
+  fixture.db.prepare("UPDATE thread_operations SET expires_at = 1 WHERE id = ?")
+    .run("legacy_upgrade_operation");
+
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toEqual(firstRead);
+  expect(fixture.db.prepare(
+    "SELECT envelope_version FROM controller_finalizations WHERE id = ?",
+  ).get(accepted.finalization.id)).toEqual({ envelope_version: 2 });
+});
+
+it("fails closed when a legacy accepted envelope no longer matches current evidence", () => {
+  const fixture = submittedControllerFixture();
+  const evidence = fixture.store.recordControllerEvidence({
+    ...validEvidenceInput(fixture.turn),
+    ...fixture.fence,
+  });
+  if (evidence.outcome !== "recorded") throw new Error("evidence fixture was not recorded");
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy envelope fixture was not accepted");
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: accepted.finalization.candidate,
+    bbEventHighWaterSeq: accepted.finalization.bbEventHighWaterSeq,
+  }), accepted.finalization.id);
+  fixture.db.prepare(
+    "UPDATE controller_evidence SET proof_kinds_json = '[\"command_result\"]' WHERE id = ?",
+  ).run(evidence.evidence.id);
+
+  const restarted = fixture.reopen();
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+  expect(fixture.db.prepare(
+    "SELECT accepted_finalization_id FROM controller_turns WHERE id = ?",
+  ).get(fixture.turn.id)).toEqual({ accepted_finalization_id: null });
+  expect(fixture.db.prepare(
+    "SELECT state, rejection_code FROM controller_finalizations WHERE id = ?",
+  ).get(accepted.finalization.id)).toEqual({ state: "rejected", rejection_code: "invalid_contract" });
+  expect(restarted.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
+  })).toBe("stale");
+  expect(restarted.getControllerTurn(fixture.turn.id)).toMatchObject({ state: "submitted" });
+});
+
+it("does not use evidence recorded after the accepted high-water during legacy envelope upgrade", () => {
+  const fixture = submittedControllerFixture();
+  const evidence = fixture.store.recordControllerEvidence({
+    ...validEvidenceInput(fixture.turn),
+    ...fixture.fence,
+  });
+  if (evidence.outcome !== "recorded") throw new Error("legacy evidence-scope fixture was not recorded");
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{
+        type: "claim",
+        text: "The project is available.",
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "project:proj_1",
+        evidenceRefs: [evidence.evidence.ref],
+      }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("legacy evidence-scope finalization was not accepted");
+  expect(fixture.store.recordControllerNativeEvidence({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 0,
+    items: [{
+      sourceName: "projectSnapshot",
+      sourceItemId: "later_project_snapshot",
+      outcome: "observed",
+      argsSha256: "c".repeat(64),
+      resultSha256: "d".repeat(64),
+      proofKinds: ["project_state"],
+      subjectRefs: ["project:proj_1"],
+    }],
+  })).toBe("recorded");
+
+  const legacyCandidate = {
+    ...accepted.finalization.candidate,
+    segments: [{
+      type: "claim" as const,
+      text: "The project is available.",
+      kind: "observed_state" as const,
+      outcome: "observed" as const,
+      subjectRef: "project:proj_1",
+      evidenceRefs: ["evidence:2" as const],
+    }],
+  };
+  fixture.db.prepare(
+    "UPDATE controller_finalizations SET payload_json = ?, envelope_version = 1 WHERE id = ?",
+  ).run(JSON.stringify({
+    _hanoonControllerFinalization: legacyCandidate,
+    bbEventHighWaterSeq: accepted.finalization.bbEventHighWaterSeq,
+  }), accepted.finalization.id);
+
+  const restarted = fixture.reopen();
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+  expect(fixture.db.prepare(
+    "SELECT accepted_finalization_id FROM controller_turns WHERE id = ?",
+  ).get(fixture.turn.id)).toEqual({ accepted_finalization_id: null });
+  expect(fixture.db.prepare(
+    "SELECT state, rejection_code FROM controller_finalizations WHERE id = ?",
+  ).get(accepted.finalization.id)).toEqual({ state: "rejected", rejection_code: "invalid_contract" });
+});
+
+it("rejects finalization while a mutating invocation remains started", () => {
+  const fixture = submittedControllerFixture();
+  const argsSha256 = "a".repeat(64);
+  expect(fixture.store.claimToolReceipt({
+    turnId: fixture.turn.id,
+    toolName: "telegram_agent_remember",
+    argsSha256,
+    controllerKey: fixture.turn.controllerKey,
+    now: fixture.fence.now,
+  })).toEqual({ outcome: "fresh" });
+
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: plainFinalization(),
+  })).toMatchObject({ outcome: "rejected", code: "invocation_in_flight" });
+  expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
+  expect(fixture.store.listToolReceipts(fixture.turn.id)).toMatchObject([
+    { toolName: "telegram_agent_remember", state: "started" },
+  ]);
 });
 
 it("allows eight rejected revisions and inserts no ninth row", () => {
@@ -347,7 +707,7 @@ it("claims one completion continuation only at the observed native cursor", () =
     dispatchAfterSeq: 7,
     bbEventSeq: 7,
     evidenceEventSeq: 7,
-    streamText: "",
+    streamText: "Hanoon is thinking…",
     streamPhase: "thinking",
   });
 });
@@ -391,18 +751,18 @@ it("completes from accepted rendered text exactly once", () => {
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
   })).toBe("completed");
   expect(fixture.store.completeControllerTurnFromFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
   })).toBe("stale");
   expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
     state: "completed",
     responseText: accepted.renderedMessage,
-    // The Task 9 brief requires successful completion to clear the draft:
-    // stream_text is "" while the answer lives in response_text/digest/outbox.
-    streamText: "",
+    streamText: "Hanoon finished.",
     streamPhase: "complete",
   });
   expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([{
@@ -418,48 +778,25 @@ it("completes from accepted rendered text exactly once", () => {
   });
 });
 
-it("completes with exact Markdown-bearing text, an empty stream, and no HTML transform", () => {
+it("uses the rendered finalization text verbatim for completion delivery", () => {
   const fixture = submittedControllerFixture();
-  const markdown = "**bold** line and a _link_ https://example.com/a?x=1";
-  const accepted = acceptPlainFinalization(fixture, markdown);
+  const accepted = acceptPlainFinalization(fixture, "**Accepted** answer");
 
   expect(fixture.store.completeControllerTurnFromFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
   })).toBe("completed");
-
-  // The accepted rendered message is the exact segment text; the brief forbids
-  // passing it through Markdown rewriting. Every owner-visible copy must equal
-  // it byte-for-byte while the draft stream is cleared to "".
-  const turn = fixture.store.getControllerTurn(fixture.turn.id);
-  expect(turn?.responseText).toBe(markdown);
-  expect(turn?.streamText).toBe("");
-  const digest = fixture.store.readControllerDigest(fixture.turn.controllerKey, 10);
-  expect(digest[0]?.agentText).toBe(markdown);
-  const outbox = fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`);
-  expect(outbox?.payload.text).toBe(markdown);
-  expect(outbox?.payload).not.toHaveProperty("parse_mode");
-  expect(outbox?.payload.text).not.toContain("<b>");
-  expect(outbox?.payload.text).not.toContain("&lt;");
-  expect(accepted.renderedMessage).toBe(markdown);
-});
-
-it("preserves a 4,000-code-point accepted rendered message in every completion record", () => {
-  const fixture = submittedControllerFixture();
-  const message = "x".repeat(4_000);
-  const accepted = acceptPlainFinalization(fixture, message);
-
-  expect(Array.from(accepted.renderedMessage)).toHaveLength(4_000);
-  expect(fixture.store.completeControllerTurnFromFinalization({
-    ...fixture.fence,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-  })).toBe("completed");
-
-  expect(fixture.store.getControllerTurn(fixture.turn.id)?.responseText).toBe(message);
-  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)[0]?.agentText).toBe(message);
-  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)?.payload.text).toBe(message);
+  expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
+    responseText: accepted.renderedMessage,
+    streamText: "Hanoon finished.",
+  });
+  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)[0]?.agentText)
+    .toBe(accepted.renderedMessage);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({
+    payload: { text: accepted.renderedMessage },
+  });
 });
 
 it("keeps direct evidence sealed but admits late native evidence and refuses completion", () => {
@@ -483,6 +820,7 @@ it("keeps direct evidence sealed but admits late native evidence and refuses com
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 1,
   })).toBe("evidence_advanced");
   expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
     id: accepted.id,
@@ -515,6 +853,7 @@ it("treats a late native evidence cap marker as evidence advanced", () => {
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
   })).toBe("evidence_advanced");
 });
 
@@ -598,64 +937,65 @@ it("rejects evidence that belongs to another turn", () => {
   })).toMatchObject({ outcome: "rejected", revision: 1, code: "evidence_missing" });
 });
 
-it("retrieves zero-evidence accepted state across reopen and after consumption", () => {
+it("retrieves zero-evidence accepted state across reopen and settles exactly once", () => {
   const fixture = submittedControllerFixture();
   const accepted = acceptPlainFinalization(fixture);
+  const restarted = fixture.reopen();
   expect(accepted.evidenceHighWaterId).toBe(0);
-  expect(fixture.reopen().getAcceptedControllerFinalization(fixture.turn.id)).toEqual(accepted);
-  expect(fixture.store.completeControllerTurnFromFinalization({
+  expect(restarted.getAcceptedControllerFinalization(fixture.turn.id)).toEqual(accepted);
+  expect(restarted.completeControllerTurnFromFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
   })).toBe("completed");
+  expect(restarted.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
+  })).toBe("stale");
   expect(fixture.reopen().getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
     id: accepted.id,
     consumedAt: fixture.fence.now,
   });
+  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)).toHaveLength(1);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({
+    payload: { text: accepted.renderedMessage },
+  });
 });
 
-it("settles once exactly on a reopened store after acceptance-before-completion", () => {
+it("completes from the accepted finalization and ignores no raw response alternative", () => {
   const fixture = submittedControllerFixture();
   const accepted = acceptPlainFinalization(fixture);
-  const reopened = fixture.reopen();
 
-  expect(reopened.completeControllerTurnFromFinalization({
+  expect(fixture.store.completeControllerTurnFromFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
   })).toBe("completed");
-  expect(reopened.getControllerTurn(fixture.turn.id)).toMatchObject({
+  expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
     state: "completed",
     responseText: accepted.renderedMessage,
-    streamText: "",
-    streamPhase: "complete",
+    streamText: "Hanoon finished.",
   });
-  expect(reopened.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([{
-    ownerText: fixture.turn.inputText,
-    agentText: accepted.renderedMessage,
-  }]);
-  expect(reopened.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
-    id: accepted.id,
-    consumedAt: fixture.fence.now,
-  });
-  expect(reopened.completeControllerTurnFromFinalization({
-    ...fixture.fence,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-  })).toBe("stale");
+  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)[0]?.agentText)
+    .toBe(accepted.renderedMessage);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`))
+    .toMatchObject({ payload: { text: accepted.renderedMessage } });
 });
 
-it("rolls back turn, digest, consumption, and outbox together on injected failure", () => {
+it("rolls back every completion side effect when the final outbox write aborts", () => {
   const fixture = submittedControllerFixture();
   const accepted = acceptPlainFinalization(fixture);
-  const db = fixture.db;
-  const outboxBefore = fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`);
-  db.exec(`
-    CREATE TRIGGER boom_completion
-    AFTER UPDATE ON outbox
-    WHEN NEW.logical_key = 'controller:${fixture.turn.id}:reply'
+  const beforeTurn = fixture.store.getControllerTurn(fixture.turn.id);
+  const beforeOutbox = fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`);
+  fixture.db.exec(`
+    CREATE TRIGGER rollback_controller_completion
+    BEFORE INSERT ON controller_digest
     BEGIN
-      SELECT RAISE(ABORT, 'boom-completion');
+      SELECT RAISE(ABORT, 'injected completion rollback');
     END
   `);
 
@@ -663,18 +1003,57 @@ it("rolls back turn, digest, consumption, and outbox together on injected failur
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
-  })).toThrow(/boom-completion/);
+    bbHighWaterSeq: accepted.bbEventHighWaterSeq ?? 0,
+  })).toThrow(/injected completion rollback/);
 
-  expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
-    state: "submitted",
-    responseText: null,
-  });
+  expect(fixture.store.getControllerTurn(fixture.turn.id)).toEqual(beforeTurn);
+  expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({ consumedAt: null });
   expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([]);
-  expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
-    id: accepted.id,
-    consumedAt: null,
-  });
-  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toEqual(outboxBefore);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toEqual(beforeOutbox);
+  fixture.db.exec("DROP TRIGGER rollback_controller_completion");
+  expect(fixture.store.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: accepted.bbEventHighWaterSeq ?? 0,
+  })).toBe("completed");
+});
+
+it("rolls back failure and generation retirement together when its notice write aborts", () => {
+  const fixture = submittedControllerFixture();
+  const beforeTurn = fixture.store.getControllerTurn(fixture.turn.id);
+  const beforeController = fixture.store.getControllerForOwner("7", "7");
+  const beforeGeneration = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 10);
+  const beforeOutbox = fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`);
+  fixture.db.exec(`
+    CREATE TRIGGER rollback_controller_failure
+    BEFORE INSERT ON outbox
+    WHEN NEW.logical_key = 'controller:${fixture.turn.id}:reply'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected failure rollback');
+    END
+  `);
+
+  expect(() => fixture.store.failAndRetireControllerTurn({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    expectedThreadId: beforeController?.threadId ?? "missing",
+    error: "provider failure",
+  })).toThrow(/injected failure rollback/);
+
+  expect(fixture.store.getControllerTurn(fixture.turn.id)).toEqual(beforeTurn);
+  expect(fixture.store.getControllerForOwner("7", "7")).toEqual(beforeController);
+  expect(fixture.store.listControllerGenerations(fixture.turn.controllerKey, 10)).toEqual(beforeGeneration);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toEqual(beforeOutbox);
+  fixture.db.exec("DROP TRIGGER rollback_controller_failure");
+  expect(fixture.store.failAndRetireControllerTurn({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    expectedThreadId: beforeController?.threadId ?? "missing",
+    error: "provider failure",
+  })).toBe("retired");
 });
 
 it("does not expose an accepted finalization through another turn", () => {
@@ -788,189 +1167,241 @@ it.each([
   expect(() => fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toThrow(/finalization/i);
 });
 
-it.each(["pending", "answered"] as const)(
-  "accepts needs-owner only for an exact %s controller interaction",
-  (state) => {
-    const fixture = submittedControllerFixture();
-    const candidate = needsOwnerFinalization();
-    // A delivered row is history: BB already heard that answer, so it is no
-    // longer a boundary the owner is standing on.
-    fixture.db.prepare(
-      `INSERT INTO controller_interactions (
-         interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
-         kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
-       ) VALUES ('interaction_delivered', ?, ?, NULL, NULL, 'unsupported', ?, 'delivered', NULL, ?, NULL, ?)`,
-    ).run(
-      fixture.turn.id,
-      fixture.turn.controllerKey,
-      JSON.stringify({ kind: "unsupported", interactionId: "interaction_delivered", metadata: { sourceKind: null } }),
-      fixture.fence.now,
-      fixture.fence.now,
-    );
-    expect(fixture.store.proposeControllerFinalization({
-      ...fixture.fence,
-      turnId: fixture.turn.id,
-      controllerKey: fixture.turn.controllerKey,
-      candidate,
-    })).toMatchObject({ outcome: "rejected", revision: 1, code: "owner_boundary_missing" });
-
-    const threadId = fixture.db.prepare(
-      "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
-    ).pluck().get(fixture.turn.controllerKey) as string;
-    const generationId = fixture.db.prepare(
-      "SELECT id FROM controller_generations WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL",
-    ).pluck().get(fixture.turn.controllerKey, threadId) as string;
-    // An answered row must carry the answer that made it answered: only an
-    // approval can be answered at all, and never with a null resolution.
-    const exact = state === "answered"
-      ? {
-          kind: "approval",
-          payload: {
-            kind: "approval", interactionId: "interaction_exact",
-            summary: "wants to run:\n\n`npm test`", decisions: ["allow_once", "deny"],
-          },
-          answerJson: JSON.stringify({ decision: "allow_once", grantedPermissions: null }),
-        }
-      : {
-          kind: "unsupported",
-          payload: { kind: "unsupported", interactionId: "interaction_exact", metadata: { sourceKind: null } },
-          answerJson: null,
-        };
-    fixture.db.prepare(
-      `INSERT INTO controller_interactions (
-         interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
-         kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
-       ) VALUES ('interaction_exact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-    ).run(
-      fixture.turn.id,
-      fixture.turn.controllerKey,
-      threadId,
-      generationId,
-      exact.kind,
-      JSON.stringify(exact.payload),
-      state,
-      exact.answerJson,
-      fixture.fence.now,
-      state === "answered" ? fixture.fence.now : null,
-    );
-    expect(fixture.store.proposeControllerFinalization({
-      ...fixture.fence,
-      turnId: fixture.turn.id,
-      controllerKey: fixture.turn.controllerKey,
-      candidate,
-    })).toMatchObject({ outcome: "accepted", finalization: { revision: 2 } });
-  },
-);
-
-/**
- * Inserts one interaction row and lets the caller break exactly one of the
- * relations that make it a live boundary, so each test names a single defect.
- */
-function insertBoundaryInteraction(
-  fixture: ReturnType<typeof submittedControllerFixture>,
-  overrides: {
-    turnId?: string;
-    bbThreadId?: string | null;
-    controllerGenerationId?: string | null;
-    payloadJson?: string;
-    answerJson?: string | null;
-    state?: "pending" | "answered";
-  } = {},
-): { threadId: string; generationId: string } {
-  const threadId = fixture.db.prepare(
+it("accepts needs-owner only for the exact pending or answered generic interaction", () => {
+  const fixture = submittedControllerFixture();
+  const candidate = needsOwnerFinalization();
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate,
+  })).toMatchObject({ outcome: "rejected", revision: 1, code: "owner_boundary_missing" });
+  fixture.db.prepare(
+    `INSERT INTO controller_turns (
+       id, telegram_update_id, controller_key, ordinal, input_text, state,
+       lease_owner, lease_generation, submitted_at, created_at, updated_at
+     ) VALUES ('turn_question_other', 987655, ?, 2, 'Other turn', 'completed',
+       'executor', 1, ?, ?, ?)`,
+  ).run(fixture.turn.controllerKey, fixture.fence.now, fixture.fence.now, fixture.fence.now);
+  const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+  const controller = fixture.db.prepare(
     "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
-  ).pluck().get(fixture.turn.controllerKey) as string;
-  const generationId = fixture.db.prepare(
-    "SELECT id FROM controller_generations WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL",
-  ).pluck().get(fixture.turn.controllerKey, threadId) as string;
-  const state = overrides.state ?? "pending";
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  if (!generation) throw new Error("missing controller generation");
   fixture.db.prepare(
     `INSERT INTO controller_interactions (
        interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
        kind, payload_json, state, answer_json, asked_at, answered_at, delivered_at
-     ) VALUES ('interaction_boundary', ?, ?, ?, ?, 'unsupported', ?, ?, ?, ?, ?, NULL)`,
-  ).run(
-    overrides.turnId ?? fixture.turn.id,
-    fixture.turn.controllerKey,
-    overrides.bbThreadId === undefined ? threadId : overrides.bbThreadId,
-    overrides.controllerGenerationId === undefined ? generationId : overrides.controllerGenerationId,
-    overrides.payloadJson ?? JSON.stringify({
-      kind: "unsupported", interactionId: "interaction_boundary", metadata: { sourceKind: null },
-    }),
-    state,
-    overrides.answerJson ?? null,
-    fixture.fence.now,
-    state === "answered" ? fixture.fence.now : null,
-  );
-  return { threadId, generationId };
-}
+     ) VALUES ('interaction_other', 'turn_question_other', ?, ?, ?, 'unsupported',
+       '{"kind":"unsupported","interactionId":"interaction_other"}', 'answered', '{}', ?, ?, NULL)`,
+  ).run(fixture.turn.controllerKey, controller.bb_thread_id, generation.id, fixture.fence.now, fixture.fence.now);
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate,
+  })).toMatchObject({ outcome: "rejected", revision: 2, code: "owner_boundary_missing" });
+  expect(fixture.store.recordControllerInteraction({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbThreadId: controller.bb_thread_id,
+    controllerGenerationId: generation.id,
+    interaction: { kind: "unsupported", interactionId: "interaction_exact" },
+  })).toBe("recorded");
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate,
+  })).toMatchObject({ outcome: "accepted", finalization: { revision: 3 } });
+});
 
-function proposeNeedsOwner(fixture: ReturnType<typeof submittedControllerFixture>) {
-  return fixture.store.proposeControllerFinalization({
+it("does not complete an accepted needs-owner turn while its exact interaction is pending", () => {
+  const fixture = submittedControllerFixture();
+  const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+  const controller = fixture.db.prepare(
+    "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+  ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+  if (!generation) throw new Error("missing controller generation");
+  expect(fixture.store.recordControllerInteraction({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbThreadId: controller.bb_thread_id,
+    controllerGenerationId: generation.id,
+    interaction: { kind: "unsupported", interactionId: "interaction_pending_completion_guard" },
+  })).toBe("recorded");
+  const accepted = fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbEventHighWaterSeq: 0,
+    candidate: needsOwnerFinalization(),
+  });
+  if (accepted.outcome !== "accepted") throw new Error("needs-owner guard fixture was not accepted");
+
+  expect(fixture.store.completeControllerTurnFromFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    bbHighWaterSeq: 0,
+  })).toBe("stale");
+  expect(fixture.store.getControllerTurn(fixture.turn.id)?.state).toBe("submitted");
+  expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
+    id: accepted.finalization.id,
+    consumedAt: null,
+  });
+});
+
+it.each(["answered", "needs_owner", "deferred"] as const)(
+  "fails completion closed for a pending interaction with a %s finalization",
+  (disposition) => {
+    const fixture = submittedControllerFixture();
+    const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+    const controller = fixture.db.prepare(
+      "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+    ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+    if (!generation) throw new Error("missing controller generation");
+    expect(fixture.store.recordControllerInteraction({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      bbThreadId: controller.bb_thread_id,
+      controllerGenerationId: generation.id,
+      interaction: { kind: "unsupported", interactionId: `interaction_${disposition}_completion_guard` },
+    })).toBe("recorded");
+
+    if (disposition === "deferred") {
+      insertControllerTestJob(fixture.db, { id: "job_completion_guard", state: "implementing" });
+    }
+    const candidate = disposition === "needs_owner"
+      ? needsOwnerFinalization()
+      : disposition === "deferred"
+        ? deferredFinalization("job:job_completion_guard")
+        : plainFinalization();
+    const accepted = fixture.store.proposeControllerFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      candidate,
+    });
+    if (accepted.outcome !== "accepted") throw new Error(`${disposition} fixture was not accepted`);
+
+    expect(fixture.store.completeControllerTurnFromFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      bbHighWaterSeq: 0,
+    })).toBe("stale");
+    expect(fixture.store.getControllerTurn(fixture.turn.id)?.state).toBe("submitted");
+  },
+);
+
+const LEGACY_OWNER_BOUNDARY_SETUPS = [
+  ["controller interaction", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    const generation = fixture.store.listControllerGenerations(fixture.turn.controllerKey, 1)[0];
+    const controller = fixture.db.prepare(
+      "SELECT bb_thread_id FROM controller_threads WHERE controller_key = ?",
+    ).get(fixture.turn.controllerKey) as { bb_thread_id: string };
+    if (!generation) throw new Error("missing controller generation");
+    expect(fixture.store.recordControllerInteraction({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      bbThreadId: controller.bb_thread_id,
+      controllerGenerationId: generation.id,
+      interaction: { kind: "unsupported", interactionId: "legacy_owner_interaction" },
+    })).toBe("recorded");
+  }],
+  ["thread operation", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    fixture.store.createThreadOperation({
+      id: "legacy_owner_operation",
+      nonceHash: "7".repeat(64),
+      ownerUserId: "7",
+      ownerChatId: "7",
+      kind: "stop_thread",
+      threadId: "thread_target",
+      text: null,
+      expiresAt: fixture.fence.now + 100,
+      now: fixture.fence.now,
+    });
+    expect(fixture.store.markThreadOperationConfirmationSent(
+      "legacy_owner_operation",
+      77,
+      fixture.fence.now,
+    )).toMatchObject({ state: "awaiting_confirmation" });
+  }],
+  ["awaiting-confirmation job", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    insertControllerTestJob(fixture.db, { id: "legacy_owner_job", state: "awaiting_confirmation" });
+  }],
+  ["merge approval", (fixture: ReturnType<typeof submittedControllerFixture>) => {
+    insertControllerTestJob(fixture.db, {
+      id: "legacy_owner_merge",
+      state: "awaiting_merge_approval",
+      version: 4,
+      prHeadSha: "a".repeat(40),
+    });
+    fixture.db.prepare(
+      `INSERT INTO approvals (
+         nonce_hash, job_id, head_sha, expires_at, consumed_at, outcome,
+         owner_user_id, owner_chat_id, job_version
+       ) VALUES (?, 'legacy_owner_merge', ?, ?, NULL, NULL, '7', '7', 4)`,
+    ).run("8".repeat(64), "a".repeat(40), fixture.fence.now + 100);
+  }],
+] as const;
+
+it.each(LEGACY_OWNER_BOUNDARY_SETUPS)(
+  "revalidates a legacy needs-owner envelope against the complete %s owner boundary",
+  (_label, setup) => {
+    const fixture = submittedControllerFixture();
+    setup(fixture);
+    const accepted = fixture.store.proposeControllerFinalization({
+      ...fixture.fence,
+      turnId: fixture.turn.id,
+      controllerKey: fixture.turn.controllerKey,
+      candidate: needsOwnerFinalization(),
+    });
+    if (accepted.outcome !== "accepted") throw new Error("owner boundary fixture was not accepted");
+    downgradeAcceptedEnvelope(fixture, accepted.finalization);
+
+    expect(fixture.reopen().getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
+      id: accepted.finalization.id,
+      semanticEnvelopeVersion: 2,
+    });
+  },
+);
+
+it("fails closed when a legacy needs-owner envelope has an expired boundary", () => {
+  const fixture = submittedControllerFixture();
+  fixture.store.createThreadOperation({
+    id: "legacy_expired_operation",
+    nonceHash: "9".repeat(64),
+    ownerUserId: "7",
+    ownerChatId: "7",
+    kind: "stop_thread",
+    threadId: "thread_target",
+    text: null,
+    expiresAt: fixture.fence.now + 100,
+    now: fixture.fence.now,
+  });
+  expect(fixture.store.markThreadOperationConfirmationSent(
+    "legacy_expired_operation",
+    77,
+    fixture.fence.now,
+  )).toMatchObject({ state: "awaiting_confirmation" });
+  const accepted = fixture.store.proposeControllerFinalization({
     ...fixture.fence,
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
     candidate: needsOwnerFinalization(),
   });
-}
+  if (accepted.outcome !== "accepted") throw new Error("expired owner boundary fixture was not accepted");
+  downgradeAcceptedEnvelope(fixture, accepted.finalization);
+  fixture.db.prepare("UPDATE thread_operations SET expires_at = 1 WHERE id = ?")
+    .run("legacy_expired_operation");
 
-it("does not treat an interaction belonging to another turn as this turn's boundary", () => {
-  const fixture = submittedControllerFixture();
-  const other = fixture.store.enqueueControllerTurn({
-    controllerKey: fixture.turn.controllerKey,
-    telegramUserId: "7",
-    telegramChatId: "7",
-    updateId: 999_001,
-    inputText: "a different question entirely",
-    now: fixture.fence.now,
-  });
-  insertBoundaryInteraction(fixture, { turnId: other.id });
-
-  expect(proposeNeedsOwner(fixture)).toMatchObject({ outcome: "rejected", code: "owner_boundary_missing" });
-});
-
-it("does not treat an interaction on a thread the controller has left as a boundary", () => {
-  const fixture = submittedControllerFixture();
-  const { generationId } = insertBoundaryInteraction(fixture, { bbThreadId: "thr_somewhere_else" });
-  expect(generationId).not.toBe("");
-
-  expect(proposeNeedsOwner(fixture)).toMatchObject({ outcome: "rejected", code: "owner_boundary_missing" });
-});
-
-it("does not treat an interaction from an ended generation as a boundary", () => {
-  const fixture = submittedControllerFixture();
-  const { generationId } = insertBoundaryInteraction(fixture);
-  fixture.db.prepare("UPDATE controller_generations SET ended_at = ? WHERE id = ?")
-    .run(fixture.fence.now, generationId);
-
-  expect(proposeNeedsOwner(fixture)).toMatchObject({ outcome: "rejected", code: "owner_boundary_missing" });
-});
-
-it("does not treat an interaction under a duplicated open generation as a boundary", () => {
-  const fixture = submittedControllerFixture();
-  const { threadId } = insertBoundaryInteraction(fixture);
-  // A second open generation on the same thread means nothing can say which one
-  // the owner is actually standing on.
-  fixture.db.prepare(
-    `INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason)
-     VALUES ('generation_duplicate', ?, ?, ?, NULL, NULL)`,
-  ).run(fixture.turn.controllerKey, threadId, fixture.fence.now);
-
-  expect(proposeNeedsOwner(fixture)).toMatchObject({ outcome: "rejected", code: "owner_boundary_missing" });
-});
-
-it("does not treat an interaction with an unreadable payload as a boundary", () => {
-  const fixture = submittedControllerFixture();
-  insertBoundaryInteraction(fixture, { payloadJson: "{not valid json" });
-
-  expect(proposeNeedsOwner(fixture)).toMatchObject({ outcome: "rejected", code: "owner_boundary_missing" });
-});
-
-it("does not treat an answered interaction with an unreadable answer as a boundary", () => {
-  const fixture = submittedControllerFixture();
-  insertBoundaryInteraction(fixture, { state: "answered", answerJson: "{not valid json" });
-
-  expect(proposeNeedsOwner(fixture)).toMatchObject({ outcome: "rejected", code: "owner_boundary_missing" });
+  expect(fixture.reopen().getAcceptedControllerFinalization(fixture.turn.id)).toBeNull();
 });
 
 it("accepts needs-owner for an unexpired one-use confirmation bound to the paired owner", () => {
@@ -1105,13 +1536,15 @@ it("accepts only live controller-owned non-system obligation refs", () => {
 });
 
 it("persists one accepted row when two SQLite processes race", async () => {
-  const directory = mkdtempSync(resolve(".test-scratch-race-proposal-"));
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task8-race-proposal-"));
   const barrierDir = resolve(directory, "barriers");
   const scriptPath = resolve(directory, "race-worker.ts");
   let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
   const workers: RaceWorker[] = [];
   try {
-    const seeded = seededRaceDatabase(directory);
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
     db = seeded.db;
     db.exec(`
       CREATE TRIGGER pause_finalization_accept
@@ -1153,18 +1586,74 @@ it("persists one accepted row when two SQLite processes race", async () => {
   } finally {
     stopRaceWorkers(workers);
     db?.close();
+    await disposeHost?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("serializes record-before-finalization in SQLite and leaves the accepted turn uncompletable", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "telegram-controller-interaction-finalization-race-"));
+  const barrierDir = resolve(directory, "barriers");
+  const scriptPath = resolve(directory, "race-worker.ts");
+  let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
+  const workers: RaceWorker[] = [];
+  try {
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
+    db = seeded.db;
+    db.exec(`
+      CREATE TRIGGER pause_interaction_record
+      BEFORE INSERT ON controller_interactions
+      WHEN NEW.interaction_id = 'race_interaction'
+      BEGIN
+        SELECT task8_race_pause();
+      END
+    `);
+    db.close();
+    db = undefined;
+    writeFileSync(scriptPath, raceWorkerSource());
+    mkdirSync(barrierDir);
+    workers.push(startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "0", "record"));
+    await waitForFile(resolve(barrierDir, "ready-0"));
+    writeFileSync(resolve(barrierDir, "go"), "go");
+    await waitForFile(resolve(barrierDir, "attempting-0"));
+    await waitForFile(resolve(barrierDir, "entered-0"));
+    workers.push(startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "1", "proposal"));
+    await waitForFile(resolve(barrierDir, "ready-1"));
+    await waitForFile(resolve(barrierDir, "attempting-1"));
+    writeFileSync(resolve(barrierDir, "release"), "release");
+    const results = await Promise.all(workers.map((worker) => worker.result));
+    expect(results.map(({ outcome }) => outcome).sort()).toEqual(["accepted", "recorded"]);
+
+    db = new Database(seeded.databasePath);
+    expect(db.prepare(
+      "SELECT state FROM controller_interactions WHERE interaction_id = 'race_interaction'",
+    ).get()).toEqual({ state: "pending" });
+    expect(db.prepare(
+      "SELECT accepted_finalization_id FROM controller_turns WHERE id = 'turn_race'",
+    ).get()).toMatchObject({ accepted_finalization_id: expect.any(Number) });
+    expect(db.prepare(
+      "SELECT state FROM controller_turns WHERE id = 'turn_race'",
+    ).get()).toEqual({ state: "submitted" });
+  } finally {
+    stopRaceWorkers(workers);
+    db?.close();
+    await disposeHost?.();
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
 it("persists one digest, outbox row, and consumption when completion races", async () => {
-  const directory = mkdtempSync(resolve(".test-scratch-race-completion-"));
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task8-race-completion-"));
   const barrierDir = resolve(directory, "barriers");
   const scriptPath = resolve(directory, "race-worker.ts");
   let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
   const workers: RaceWorker[] = [];
   try {
-    const seeded = seededRaceDatabase(directory);
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
     db = seeded.db;
     const repository = new ControllerEvidenceRepository(db);
     expect(repository.proposeFinalization({
@@ -1207,18 +1696,101 @@ it("persists one digest, outbox row, and consumption when completion races", asy
   } finally {
     stopRaceWorkers(workers);
     db?.close();
+    await disposeHost?.();
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-it("permits one continuation send across a real two-process claim race and restart", async () => {
-  const directory = mkdtempSync(resolve(".test-scratch-race-continuation-"));
+it("claims one supervisor steer across SQLite workers and settles its fold", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "telegram-supervisor-race-"));
   const barrierDir = resolve(directory, "barriers");
   const scriptPath = resolve(directory, "race-worker.ts");
   let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
   const workers: RaceWorker[] = [];
   try {
-    const seeded = seededRaceDatabase(directory);
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
+    db = seeded.db;
+    db.pragma("journal_mode = WAL");
+    db.exec(`
+      CREATE TRIGGER pause_supervisor_claim
+      BEFORE INSERT ON controller_supervisor_steer_attempts
+      WHEN NEW.turn_id = 'turn_race'
+      BEGIN
+        SELECT task8_race_pause();
+      END
+    `);
+    db.close();
+    db = undefined;
+    writeFileSync(scriptPath, raceWorkerSource());
+    mkdirSync(barrierDir);
+    workers.push(
+      startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "0", "supervisor"),
+      startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "1", "supervisor"),
+    );
+
+    const results = await releaseRace(barrierDir, workers);
+    expect(results.map(({ outcome }) => outcome).sort()).toEqual(["claimed", "pending"]);
+
+    db = new Database(seeded.databasePath);
+    expect(db.prepare(
+      `SELECT state, idempotency_key FROM controller_supervisor_steer_attempts
+        WHERE turn_id = 'turn_race' AND reason = 'tool_budget'`,
+    ).get()).toEqual({
+      state: "pending",
+      idempotency_key: "controller-supervisor:turn_race:tool_budget",
+    });
+    db.close();
+    db = undefined;
+
+    const settleDirectory = mkdtempSync(join(tmpdir(), "telegram-supervisor-settle-"));
+    const settleBarrierDir = resolve(settleDirectory, "barriers");
+    mkdirSync(settleBarrierDir);
+    const settleWorker = startRaceWorker(
+      scriptPath,
+      seeded.databasePath,
+      settleBarrierDir,
+      "0",
+      "supervisor-settle",
+    );
+    try {
+      await waitForFile(resolve(settleBarrierDir, "ready-0"));
+      writeFileSync(resolve(settleBarrierDir, "go"), "go");
+      await waitForFile(resolve(settleBarrierDir, "attempting-0"));
+      await expect(settleWorker.result).resolves.toEqual({ outcome: "settled" });
+    } finally {
+      stopRaceWorkers([settleWorker]);
+      rmSync(settleDirectory, { recursive: true, force: true });
+    }
+
+    db = new Database(seeded.databasePath);
+    expect(db.prepare(
+      `SELECT state, settled_at FROM controller_supervisor_steer_attempts
+        WHERE turn_id = 'turn_race' AND reason = 'tool_budget'`,
+    ).get()).toMatchObject({ state: "applied", settled_at: 2_000 });
+    expect(db.prepare(
+      `SELECT supervisor_steers, supervisor_reasons FROM controller_turns
+        WHERE id = 'turn_race'`,
+    ).get()).toEqual({ supervisor_steers: 1, supervisor_reasons: "tool_budget" });
+  } finally {
+    stopRaceWorkers(workers);
+    db?.close();
+    await disposeHost?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("claims one continuation and sends one recovery prompt across SQLite workers", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task9-race-continuation-"));
+  const barrierDir = resolve(directory, "barriers");
+  const scriptPath = resolve(directory, "race-worker.ts");
+  let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
+  const workers: RaceWorker[] = [];
+  try {
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
     db = seeded.db;
     db.exec(`
       CREATE TRIGGER pause_continuation_claim
@@ -1239,29 +1811,55 @@ it("permits one continuation send across a real two-process claim race and resta
 
     const results = await releaseRace(barrierDir, workers);
     expect(results.map(({ outcome }) => outcome).sort()).toEqual(["already_claimed", "claimed"]);
-    expect([0, 1].filter((label) => existsSync(resolve(barrierDir, `sent-${label}`)))).toHaveLength(1);
+    const sentLabels = ["0", "1"].filter((label) => existsSync(resolve(barrierDir, `sent-${label}`)));
+    expect(sentLabels).toHaveLength(1);
+    expect(readFileSync(resolve(barrierDir, `sent-${sentLabels[0]}`), "utf8"))
+      .toBe("Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.");
 
     db = new Database(seeded.databasePath);
-    const reopened = new ControllerEvidenceRepository(db);
-    expect(reopened.claimCompletionContinuation({
-      ownerId: "executor",
-      generation: 1,
-      now: 2_001,
-      turnId: "turn_race",
-      controllerKey: "controller_race",
-      bbHighWaterSeq: 0,
-    })).toBe("already_claimed");
-    expect(db.prepare("SELECT COUNT(*) AS count FROM controller_turns WHERE controller_key = 'controller_race'").get())
-      .toEqual({ count: 1 });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM controller_digest WHERE controller_key = 'controller_race'").get())
-      .toEqual({ count: 0 });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM controller_finalizations WHERE turn_id = 'turn_race'").get())
-      .toEqual({ count: 0 });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM outbox WHERE logical_key = 'controller:turn_race:reply'").get())
-      .toEqual({ count: 0 });
+    expect(db.prepare(
+      "SELECT completion_continuations FROM controller_turns WHERE id = 'turn_race'",
+    ).get()).toEqual({ completion_continuations: 1 });
   } finally {
     stopRaceWorkers(workers);
     db?.close();
+    await disposeHost?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("retains a continuation claim after a worker crashes before send", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "telegram-task9-crash-continuation-"));
+  const barrierDir = resolve(directory, "barriers");
+  const scriptPath = resolve(directory, "race-worker.ts");
+  let db: Database.Database | undefined;
+  let disposeHost: (() => Promise<void>) | undefined;
+  const workers: RaceWorker[] = [];
+  try {
+    const seeded = seededRaceDatabase();
+    disposeHost = seeded.disposeHost;
+    db = seeded.db;
+    db.close();
+    db = undefined;
+    writeFileSync(scriptPath, raceWorkerSource());
+    mkdirSync(barrierDir);
+    const worker = startRaceWorker(scriptPath, seeded.databasePath, barrierDir, "0", "crash");
+    workers.push(worker);
+    await waitForFile(resolve(barrierDir, "ready-0"));
+    writeFileSync(resolve(barrierDir, "go"), "go");
+    await waitForFile(resolve(barrierDir, "attempting-0"));
+    await expect(worker.result).rejects.toThrow(/race worker exited 42/);
+    expect(existsSync(resolve(barrierDir, "crashed-after-claim-0"))).toBe(true);
+    expect(existsSync(resolve(barrierDir, "sent-0"))).toBe(false);
+
+    db = new Database(seeded.databasePath);
+    expect(db.prepare(
+      "SELECT completion_continuations FROM controller_turns WHERE id = 'turn_race'",
+    ).get()).toEqual({ completion_continuations: 1 });
+  } finally {
+    stopRaceWorkers(workers);
+    db?.close();
+    await disposeHost?.();
     rmSync(directory, { recursive: true, force: true });
   }
 });

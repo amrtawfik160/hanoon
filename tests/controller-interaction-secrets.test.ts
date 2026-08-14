@@ -44,12 +44,12 @@ const ALL_MARKERS = Object.values(SECRETS);
 let hostNumber = 0;
 
 const evidenceProjector: ControllerEvidenceReconciler = {
-  reconcile: vi.fn(async (_controller, turn) => ({
+  reconcile: vi.fn(async (_controller, turn, _fence, _signal, immutableHighWater) => ({
     outcome: "reconciled" as const,
     reconciliationIncomplete: null,
     fromSeq: turn.evidenceEventSeq,
-    throughSeq: turn.evidenceEventSeq,
-    targetSeq: turn.evidenceEventSeq,
+    throughSeq: immutableHighWater,
+    targetSeq: immutableHighWater,
   })),
 };
 
@@ -273,7 +273,7 @@ it("still offers exactly Allow once and Deny for a safe command and a safe path"
     subject: { kind: "file_change", writeScope: "src/index.ts" },
     availableDecisions: ["allow_once", "deny"],
   });
-  expect(path).toMatchObject({ kind: "approval", summary: "wants to write index.ts" });
+  expect(path).toMatchObject({ kind: "approval", summary: "wants to write files under src/index.ts" });
   expect(renderControllerInteraction(path!)?.reply_markup?.inline_keyboard).toHaveLength(2);
 });
 
@@ -357,13 +357,17 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     store,
     adapter: new BbControllerAdapter({
       sdk: bb.sdk, pluginId: bb.pluginId,
-      executionProfiles: () => [DEFAULT_CONTROLLER_EXECUTION_PROFILE],
+      executionProfile: () => DEFAULT_CONTROLLER_EXECUTION_PROFILE,
     }),
     evidenceProjector,
     interactionService: new ControllerInteractionService({
       store: new ControllerInteractionRepository(database),
-      interactions: bb.sdk.threads.interactions,
-      clock: () => 2_100,
+      interactions: {
+        get: (threadId, interactionId, signal) => bb.sdk.threads.interactions.get({ threadId, interactionId, signal }),
+        resolve: ({ threadId, interactionId, resolution }) =>
+          bb.sdk.threads.interactions.resolve({ threadId, interactionId, resolution: resolution as never }),
+      },
+      clock: { now: () => 2_100 },
     }),
     clock: { now: () => 2_100 },
   });
@@ -449,7 +453,7 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     expect(logged.join("\n")).not.toContain(marker);
   }
   // The owner is still told the thread is blocked, just not with the secret.
-  expect(outbox).toContain("can't answer from here");
+  expect(outbox).toContain("cannot answer");
 });
 
 it.each([

@@ -81,7 +81,7 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 29);
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 34);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -112,6 +112,11 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 24]).toContain("CREATE TABLE controller_evidence");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 25]).toContain("CREATE TABLE controller_interactions");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 28]).toContain("CREATE TABLE credential_bindings");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 29]).toContain("steer_reservation_turn_id");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 30]).toContain("controller_supervisor_steer_attempts");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 31]).toContain("controller_interaction_quarantine");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 32]).toContain("envelope_version");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 33]).toContain("consumed_at");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {

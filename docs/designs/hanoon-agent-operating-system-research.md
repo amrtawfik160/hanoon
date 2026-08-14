@@ -220,7 +220,7 @@ The current Hanoon code already supplies the core primitives this roadmap needs:
 The important gaps are narrower than “build a harness”:
 
 1. the standing controller instructions are also copied into the first input;
-2. the default controller permission mode is `full` because hidden BB interactions cannot be answered from Telegram;
+2. the default controller permission mode is `auto`, with supported hidden BB interactions bridged to Telegram;
 3. ordinary controller completion accepts provider prose rather than a structured, evidence-bound final action;
 4. controller tools lack a common enforceable risk/proof/credential descriptor;
 5. the answer evaluation intentionally does not grade factual or environmental outcomes;

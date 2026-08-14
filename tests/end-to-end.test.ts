@@ -609,6 +609,13 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       now: time,
     });
     if (!controllerTurn) throw new Error("controller turn was not claimable");
+    expect(store.reserveControllerSpawn({
+      controllerKey: controllerTurn.controllerKey,
+      turnId: controllerTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: time,
+    })).toBe(true);
     expect(store.markControllerSpawned({
       turnId: controllerTurn.id,
       ownerId: "controller-setup",
@@ -617,6 +624,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       projectId: "proj_personal",
       hostId: "host_personal",
       threadId: "thr_controller",
+      spawnToken: controllerTurn.id,
     })).toBe(true);
     expect(store.markControllerTurnSubmitted({
       turnId: controllerTurn.id,

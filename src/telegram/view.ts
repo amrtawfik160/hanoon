@@ -36,27 +36,19 @@ export type CallbackAction =
   | { type: "retry"; jobId: string }
   | { type: "review"; jobId: string }
   | { type: "merge"; nonce: string }
-  /**
-   * Approve this merge and grant the project a standing approval, so later
-   * merges on it do not stop to ask. Carries the same one-use nonce as a plain
-   * merge, so it is exactly as bound to this head as the button beside it.
-   */
+  /** Approve this merge and grant a standing approval for the project. */
   | { type: "merge_always"; nonce: string }
   | { type: "operation"; nonce: string }
-  /** One decision the hidden controller thread is blocked on. */
-  | ControllerInteractionCallbackAction
-  /**
-   * A legacy controller question button. Migrated in-flight messages are still
-   * answerable for one release; no new `q:` value is ever emitted.
-   */
+  /** One choice from a generic controller interaction. */
+  | { type: "controller_interaction"; token: string }
+  /** Legacy controller question callbacks remain parseable but are never emitted. */
   | { type: "question"; token: string }
   /** One choice offered for a watched thread that is waiting on the owner. */
   | { type: "thread_interaction"; token: string };
 
-export type ControllerInteractionCallbackAction = {
-  type: "controller_interaction";
-  token: string;
-};
+/** Legacy question callbacks remain parseable for already-rendered Telegram messages. */
+export type LegacyQuestionCallbackAction = { type: "question"; token: string };
+export type ParsedCallbackAction = CallbackAction | LegacyQuestionCallbackAction;
 
 export type ReviewView = {
   verdict?: string;
@@ -368,7 +360,7 @@ export function encodeCallbackData(action: CallbackAction): string {
   return encoded;
 }
 
-export function parseCallbackData(data: string): CallbackAction {
+export function parseCallbackData(data: string): ParsedCallbackAction {
   if (typeof data !== "string" || Buffer.byteLength(data, "utf8") > MAX_CALLBACK_BYTES) {
     throw new TypeError("Telegram callback data is invalid");
   }
@@ -389,11 +381,10 @@ export function parseCallbackData(data: string): CallbackAction {
   if (match) return { type: "merge_always", nonce: match[1] };
   match = /^o:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "operation", nonce: match[1] };
-  match = /^i:([A-Za-z0-9_-]{32})$/.exec(data);
-  if (match) return { type: "controller_interaction", token: match[1] };
-  // Retained for one release so a migrated in-flight question stays answerable.
   match = /^q:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "question", token: match[1] };
+  match = /^i:([A-Za-z0-9_-]{32})$/.exec(data);
+  if (match) return { type: "controller_interaction", token: match[1] };
   match = /^w:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "thread_interaction", token: match[1] };
   throw new TypeError("Telegram callback data is invalid");
@@ -680,11 +671,6 @@ export function renderJobStatus(
     lines.push(`Review: ${html(context.review.verdict ?? "unknown", 80)} (${count} findings)`);
     if (context.review.summary) lines.push(`Review summary: ${html(context.review.summary, 500)}`);
   }
-  const verification = aggregateVerification(context);
-  if (verification) lines.push(`Verification: ${html(verification, 40)}`);
-  if (context.mandatoryGuardOutcome) {
-    lines.push(`Mandatory guards: ${html(context.mandatoryGuardOutcome, 40)}`);
-  }
   if (context.validation && context.validation.length > 0) {
     lines.push("Validation:");
     for (const item of context.validation.slice(0, 20)) {
@@ -696,6 +682,11 @@ export function renderJobStatus(
     for (const item of context.checks.slice(0, 50)) {
       lines.push(`• ${html(item.name, 100)}: ${html(resultLabel(item.outcome ?? item.bucket), 80)}${item.summary ? ` — ${html(item.summary, 300)}` : ""}`);
     }
+  }
+  const verification = aggregateVerification(context);
+  if (verification) lines.push(`Verification: ${html(verification, 40)}`);
+  if (context.mandatoryGuardOutcome) {
+    lines.push(`Mandatory guards: ${html(context.mandatoryGuardOutcome, 40)}`);
   }
   if (job.lastError) lines.push(`Blocker: ${html(job.lastError, 500)}`);
   if (context.ownerDecision) lines.push(`Decision: ${html(context.ownerDecision, 300)}`);

@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { telegramSafeTitle } from "../telegram/markdown";
 import { isSensitiveApprovalPathName, isUnsafeProviderText } from "./credential-policy";
 
 /** One selectable answer to a question the controller thread asked. */
@@ -27,6 +26,12 @@ export type ControllerPendingQuestion = {
   questions: ControllerQuestion[];
 };
 
+export type ControllerApprovalDecision = "allow_once" | "deny";
+export type ControllerInteraction =
+  | { kind: "user_question"; interactionId: string; questions: ControllerQuestion[] }
+  | { kind: "approval"; interactionId: string; summary: string; decisions: ControllerApprovalDecision[] }
+  | { kind: "unsupported"; interactionId: string; metadata?: { sourceKind: string | null } };
+
 export type ControllerQuestionAnswers = Record<string, { selected: string[]; freeText?: string }>;
 
 const MAX_QUESTIONS = 4;
@@ -34,91 +39,324 @@ const MAX_OPTIONS = 6;
 const MAX_PROMPT = 400;
 const MAX_LABEL = 60;
 const MAX_DESCRIPTION = 200;
-const MAX_INTERACTION_ID = 200;
-const MAX_QUESTION_ID = 120;
-const MAX_OPTION_VALUE = 120;
+const MAX_CONTROLLER_TEXT = 4_000;
+const MAX_CANONICAL_SCAN = 16_384;
+const MAX_PERCENT_DECODE_LAYERS = 3;
+const MIN_BASE64_TOKEN_LENGTH = 16;
+const MAX_BASE64_TOKEN_LENGTH = 4_096;
+const MAX_ENCODING_DEPTH = 4;
+const MAX_ENCODING_NODES = 64;
+const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+const CREDENTIAL_QUERY_KEY = [
+  "access[_-]?token",
+  "refresh[_-]?token",
+  "id[_-]?token",
+  "client[_-]?secret",
+  "api[_-]?key",
+  "authorization",
+  "auth(?:[_-]?(?:token|key))?",
+  "session(?:[_-]?token)?",
+  "private(?:[_-]?key)?",
+  "credentials?",
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "key",
+  "jwt",
+  "signature",
+  "sig",
+].join("|");
+
+const SENSITIVE_CONTROLLER_TEXT_PATTERNS = [
+  /(?:m|o|q|i|w):[A-Za-z0-9_-]{32}/u,
+  /\bbearer\s+\S+/iu,
+  new RegExp(`\\b(?:${CREDENTIAL_QUERY_KEY}|credential)\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|\\S+)`, "iu"),
+  /\b(?:access|refresh|id)\s+token|\bclient\s+secret|\bapi\s+key|\bauth(?:orization)?\s+(?:token|key)|\bsession\s+token|\bprivate\s+key/iu,
+  /\b(?:authorization|auth|session|credentials?|password|passwd|secret|token|jwt|signature|sig)\b\s+(?:is\s+)?(?:bearer\s+)?[A-Za-z0-9_+/=-]{12,}\b/iu,
+  /(?:^|[^A-Za-z0-9_])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;|&]*)/u,
+  /(?:^|[\s"'`])(?:export\s+)?[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|KEY|AUTH)[A-Z0-9_]*\s*=\s*\S+/iu,
+  new RegExp(`(?:^|[\\s;|&"'])(?:export\\s+)?(?:${CREDENTIAL_QUERY_KEY})\\s*=\\s*(?:"[^"]*"|'[^']*'|\\S+)`, "iu"),
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/iu,
+  /(?:gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|(?:sk|rk)-[A-Za-z0-9_-]{16,})/u,
+  /\d{8,10}:[A-Za-z0-9_-]{35}/u,
+  /(?:https?|wss?):\/\/[^\s/@]+:[^\s/@]+@/iu,
+  new RegExp(`(?:https?|wss?):\\/\\/[^\\s]*[?&](?:${CREDENTIAL_QUERY_KEY})(?:=|%3d)`, "iu"),
+  /(?:callback|webhook)/iu,
+];
+
+const PROTECTED_BASENAME_MARKERS = [
+  ".env",
+  "credential",
+  "secret",
+  "private",
+  "shadow",
+  "passwd",
+  "password",
+  "token",
+  "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "id_dsa",
+  "id_x25519",
+  "id_xmss",
+  "ssh_host_",
+  "known_hosts",
+  "authorized_keys",
+  "certificate",
+  "cert",
+  ".pem",
+  ".p12",
+  ".pfx",
+  ".crt",
+  ".cer",
+  ".der",
+  ".pub",
+  ".key",
+];
+
+function decodeCanonicalForm(value: string): string | null {
+  if (/%(?![0-9a-f]{2})/iu.test(value)) return null;
+  try {
+    const decoded = decodeURIComponent(value).normalize("NFKC").trim();
+    return decoded.length > 0 && decoded.length <= MAX_CANONICAL_SCAN ? decoded : null;
+  } catch (error) {
+    if (error instanceof URIError) return null;
+    throw error;
+  }
+}
+
+function canonicalForms(value: string): string[] | null {
+  let current = value.normalize("NFKC").trim();
+  if (current.length === 0 || current.length > MAX_CANONICAL_SCAN) return null;
+  const forms = [current];
+  for (let layer = 0; layer < MAX_PERCENT_DECODE_LAYERS && current.includes("%"); layer += 1) {
+    const decoded = decodeCanonicalForm(current);
+    if (!decoded) return null;
+    forms.push(decoded);
+    if (decoded === current) break;
+    current = decoded;
+  }
+  return current.includes("%") ? null : [...new Set(forms)];
+}
+
+const BASE64_TOKEN = /(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{16,}={0,2})(?![A-Za-z0-9+/_-])/gu;
+const UUID_TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
+const UNICODE_ESCAPE = /\\u\{([0-9a-f]{1,6})\}|\\u([0-9a-f]{4})|%u([0-9a-f]{4})/giu;
+
+function decodeBoundedBase64Token(token: string): string | null {
+  if (token.length < MIN_BASE64_TOKEN_LENGTH || token.length > MAX_BASE64_TOKEN_LENGTH) return null;
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/u.test(token)) return null;
+
+  const padding = token.match(/=+$/u)?.[0].length ?? 0;
+  const body = padding > 0 ? token.slice(0, -padding) : token;
+  if (body.length % 4 === 1) return null;
+  const usesUrlAlphabet = /[-_]/u.test(body);
+  const usesStandardAlphabet = /[+/]/u.test(body);
+  if (usesUrlAlphabet && usesStandardAlphabet) return null;
+
+  const standardBody = usesUrlAlphabet ? body.replace(/-/gu, "+").replace(/_/gu, "/") : body;
+  const normalized = `${standardBody}${"=".repeat((4 - (standardBody.length % 4)) % 4)}`;
+  const bytes = Buffer.from(normalized, "base64");
+  if (bytes.length === 0) return null;
+  if (bytes.toString("base64").replace(/=+$/u, "") !== standardBody) return null;
+  try {
+    return STRICT_UTF8_DECODER.decode(bytes);
+  } catch {
+    // Opaque identifiers such as UUIDs are valid base64url alphabets but do
+    // not represent text. Only decoded UTF-8 can contain a textual secret.
+    return null;
+  }
+}
+
+function decodedUnicodeForm(value: string): string | null {
+  let changed = false;
+  const decoded = value.replace(UNICODE_ESCAPE, (_match, braced: string | undefined, fixed: string | undefined, percent: string | undefined) => {
+    const hex = braced ?? fixed ?? percent;
+    if (!hex) return _match;
+    const codePoint = Number.parseInt(hex, 16);
+    if (!Number.isSafeInteger(codePoint) || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+      return _match;
+    }
+    changed = true;
+    return String.fromCodePoint(codePoint);
+  });
+  return changed ? decoded : null;
+}
+
+function decodedBase64Tokens(value: string): string[] {
+  const decoded: string[] = [];
+  BASE64_TOKEN.lastIndex = 0;
+  let match = BASE64_TOKEN.exec(value);
+  while (match !== null) {
+    const token = match[1];
+    if (token && !UUID_TOKEN.test(token)) {
+      const text = decodeBoundedBase64Token(token);
+      if (text) decoded.push(text);
+    }
+    match = BASE64_TOKEN.exec(value);
+  }
+  BASE64_TOKEN.lastIndex = 0;
+  return decoded;
+}
+
+function containsEncodedSensitiveText(value: string): boolean {
+  const queue: Array<{ value: string; depth: number }> = [{ value, depth: 0 }];
+  const visited = new Set<string>();
+  let nodes = 0;
+  while (queue.length > 0) {
+    const node = queue.shift();
+    if (!node) break;
+    const key = String(node.depth) + ":" + node.value;
+    if (visited.has(key)) continue;
+    visited.add(key);
+    nodes += 1;
+    if (nodes > MAX_ENCODING_NODES) return true;
+    if (node.value.includes("%") && !decodeCanonicalForm(node.value)) return true;
+    const forms = [...new Set([
+      node.value.normalize("NFKC"),
+      node.value.normalize("NFKC").replace(DEFAULT_IGNORABLES, ""),
+    ])].filter((form) => form.length > 0 && form.length <= MAX_CANONICAL_SCAN);
+    for (const form of forms) {
+      if (SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form))) return true;
+    }
+    const children = encodedTextChildren(node.value);
+    if (node.depth >= MAX_ENCODING_DEPTH) {
+      // A bounded scan cannot prove that a still-decodable textual layer is
+      // harmless. Opaque UUIDs are excluded by decodedBase64Tokens, while a
+      // real percent/base64/Unicode layer remains fail-closed.
+      if (children.length > 0) return true;
+      continue;
+    }
+    for (const child of children) queue.push({ value: child, depth: node.depth + 1 });
+  }
+  return false;
+}
+
+function encodedTextChildren(value: string): string[] {
+  const children: string[] = [];
+  if (value.includes("%")) {
+    const decoded = decodeCanonicalForm(value);
+    if (decoded && decoded !== value) children.push(decoded);
+  }
+  const unicodeDecoded = decodedUnicodeForm(value);
+  if (unicodeDecoded && unicodeDecoded !== value) children.push(unicodeDecoded);
+  const forms = [...new Set([
+    value.normalize("NFKC"),
+    value.normalize("NFKC").replace(DEFAULT_IGNORABLES, ""),
+  ])];
+  for (const form of forms) children.push(...decodedBase64Tokens(form));
+  return [...new Set(children)].filter((child) => child.length > 0 && child.length <= MAX_CANONICAL_SCAN);
+}
+
+function hasProtectedPathSegment(value: string): boolean {
+  const segments = value.replaceAll("\\", "/").split("/").filter(Boolean);
+  if (segments.length === 0) return true;
+  return segments.some((segment) => {
+    const normalized = segment.toLowerCase();
+    return isSensitiveApprovalPathName(segment) ||
+      PROTECTED_BASENAME_MARKERS.some((marker) => normalized.includes(marker));
+  });
+}
 
 /**
- * Every bounded string in this module comes from the provider, so the credential
- * screen belongs here rather than at each call site: a field that cannot be
- * shown safely is simply absent, and the callers already know what to do with an
- * absent field.
+ * Canonicalizes bounded controller text and scans every decoded form before
+ * clipping. A null result is never safe to persist or present.
  */
-function boundedString(rawText: unknown, limit: number, byteLimit = limit * 4): string | null {
-  if (typeof rawText !== "string") return null;
-  const text = rawText.trim();
-  if (text.length === 0) return null;
-  if (isUnsafeProviderText(text)) return null;
-  const characters = [...text];
-  if (characters.length <= limit && Buffer.byteLength(text, "utf8") <= byteLimit) return text;
-  const kept: string[] = [];
-  for (const character of characters) {
-    if (kept.length >= limit - 1 || Buffer.byteLength(`${kept.join("")}${character}…`, "utf8") > byteLimit) break;
-    kept.push(character);
+export function canonicalControllerText(
+  value: unknown,
+  limit: number,
+  mode: "text" | "path" = "text",
+): string | null {
+  if (typeof value !== "string") return null;
+  const forms = canonicalForms(value);
+  if (!forms) return null;
+  if (mode === "path" && forms.some(hasProtectedPathSegment)) return null;
+  if (forms.some((form) => SENSITIVE_CONTROLLER_TEXT_PATTERNS.some((pattern) => pattern.test(form)))) {
+    return null;
   }
-  return kept.length > 0 ? `${kept.join("")}…` : null;
+  if (forms.some((form) => isUnsafeProviderText(form))) return null;
+  if (forms.some(containsEncodedSensitiveText)) {
+    return null;
+  }
+  const canonical = forms.at(-1);
+  if (!canonical) return null;
+  return canonical.length <= limit ? canonical : `${canonical.slice(0, limit - 1)}…`;
 }
 
-function boundedIdentifier(rawIdentifier: unknown, characterLimit: number): rawIdentifier is string {
-  return typeof rawIdentifier === "string" && rawIdentifier.length > 0 &&
-    [...rawIdentifier].length <= characterLimit && Buffer.byteLength(rawIdentifier, "utf8") <= characterLimit * 4;
+function boundedIdentity(value: unknown, limit: number): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.normalize("NFKC").trim();
+  if (normalized.length === 0 || normalized.length > limit) return null;
+  return canonicalControllerText(normalized, limit);
 }
 
-export function isSafeControllerInteractionId(rawIdentifier: unknown): rawIdentifier is string {
-  return boundedIdentifier(rawIdentifier, MAX_INTERACTION_ID);
+function boundedString(value: unknown, limit: number): string | null {
+  return canonicalControllerText(value, limit);
 }
 
 function parseOption(raw: unknown): ControllerQuestionOption | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const value = typeof candidate.value === "string" && [...candidate.value].length > 0 &&
-    [...candidate.value].length <= MAX_OPTION_VALUE && Buffer.byteLength(candidate.value, "utf8") <= MAX_OPTION_VALUE * 4 &&
-    !isUnsafeProviderText(candidate.value) ? candidate.value : null;
-  const label = boundedString(candidate.label, MAX_LABEL, 64);
+  if (!Object.hasOwn(candidate, "value") || !Object.hasOwn(candidate, "label")) return null;
+  const value = boundedIdentity(candidate.value, 256);
+  const label = boundedString(candidate.label, MAX_LABEL);
   if (!value || !label) return null;
-  return { value, label, description: boundedString(candidate.description, MAX_DESCRIPTION) };
+  const hasDescription = Object.hasOwn(candidate, "description");
+  const description = !hasDescription || candidate.description === null
+    ? null
+    : boundedString(candidate.description, MAX_DESCRIPTION);
+  if (hasDescription && candidate.description !== null && !description) return null;
+  return { value, label, description };
 }
 
-function unsafeRawString(value: unknown): boolean {
-  return typeof value === "string" && isUnsafeProviderText(value);
+function parseQuestionOptions(raw: unknown): ControllerQuestionOption[] | null {
+  if (!Array.isArray(raw) || raw.length > MAX_OPTIONS) return null;
+  const options = raw.map(parseOption);
+  if (options.some((option) => option === null)) return null;
+  const parsedOptions = options.filter((option): option is ControllerQuestionOption => option !== null);
+  return new Set(parsedOptions.map((option) => option.value)).size === parsedOptions.length ? parsedOptions : null;
 }
 
-/**
- * True when any field of a question payload carries credential or callback
- * material. A provider emitting a secret in one field is not a provider whose
- * other fields should be rendered anyway, so this screens the whole payload and
- * the callers downgrade all of it rather than quietly dropping the bad field.
- */
-function questionPayloadIsUnsafe(candidate: Record<string, unknown>): boolean {
-  const questions = Array.isArray(candidate.questions) ? candidate.questions : [];
-  return questions.some((rawQuestion) => {
-    if (typeof rawQuestion !== "object" || rawQuestion === null) return false;
-    const question = rawQuestion as Record<string, unknown>;
-    if ([question.id, question.prompt, question.shortLabel].some(unsafeRawString)) return true;
-    const options = Array.isArray(question.options) ? question.options : [];
-    return options.some((rawOption) => {
-      if (typeof rawOption !== "object" || rawOption === null) return false;
-      const option = rawOption as Record<string, unknown>;
-      return [option.value, option.label, option.description].some(unsafeRawString);
-    });
-  });
+function parseQuestionFlags(candidate: Record<string, unknown>): { multiSelect: boolean; allowFreeText: boolean } | null {
+  const hasMultiSelect = Object.hasOwn(candidate, "multiSelect");
+  const hasFreeText = Object.hasOwn(candidate, "allowFreeText");
+  if (hasMultiSelect && typeof candidate.multiSelect !== "boolean") return null;
+  if (hasFreeText && typeof candidate.allowFreeText !== "boolean") return null;
+  return {
+    multiSelect: hasMultiSelect && candidate.multiSelect === true,
+    allowFreeText: !hasFreeText || candidate.allowFreeText !== false,
+  };
+}
+
+function parseQuestionShortLabel(candidate: Record<string, unknown>): string | null {
+  if (!Object.hasOwn(candidate, "shortLabel") || candidate.shortLabel === null) return null;
+  return boundedString(candidate.shortLabel, MAX_LABEL);
 }
 
 function parseQuestion(raw: unknown): ControllerQuestion | null {
   if (typeof raw !== "object" || raw === null) return null;
   const candidate = raw as Record<string, unknown>;
-  const id = boundedIdentifier(candidate.id, MAX_QUESTION_ID) ? candidate.id : null;
+  if (!Object.hasOwn(candidate, "id") || !Object.hasOwn(candidate, "prompt")) return null;
+  const id = boundedIdentity(candidate.id, 128);
   const prompt = boundedString(candidate.prompt, MAX_PROMPT);
-  if (!id || !prompt) return null;
-  const options = Array.isArray(candidate.options)
-    ? candidate.options.slice(0, MAX_OPTIONS).map(parseOption).filter((option): option is ControllerQuestionOption => option !== null)
-    : [];
+  if (!id || RESERVED_QUESTION_IDS.has(id) || !prompt) return null;
+  const flags = parseQuestionFlags(candidate);
+  if (!flags) return null;
+  const options = Object.hasOwn(candidate, "options")
+    ? parseQuestionOptions(candidate.options)
+    : flags.allowFreeText ? [] : null;
+  if (!options || (options.length === 0 && !flags.allowFreeText)) return null;
+  const shortLabel = parseQuestionShortLabel(candidate);
+  if (Object.hasOwn(candidate, "shortLabel") && candidate.shortLabel !== null && !shortLabel) return null;
   return {
     id,
     prompt,
-    shortLabel: boundedString(candidate.shortLabel, MAX_LABEL, 64),
-    multiSelect: candidate.multiSelect === true,
-    allowFreeText: candidate.allowFreeText !== false,
+    shortLabel,
+    multiSelect: flags.multiSelect,
+    allowFreeText: flags.allowFreeText,
     options,
   };
 }
@@ -129,16 +367,333 @@ function parseQuestion(raw: unknown): ControllerQuestion | null {
  * with, so it is treated as absent rather than parked on.
  */
 export function parsePendingQuestion(interactionId: unknown, payload: unknown): ControllerPendingQuestion | null {
-  if (!isSafeControllerInteractionId(interactionId)) return null;
+  if (typeof interactionId !== "string" || interactionId.length === 0) return null;
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
-  if (candidate.kind !== "user_question" || !Array.isArray(candidate.questions)) return null;
-  const questions = candidate.questions
-    .slice(0, MAX_QUESTIONS)
-    .map(parseQuestion)
-    .filter((question): question is ControllerQuestion => question !== null);
-  if (questions.length === 0) return null;
-  return { interactionId, questions };
+  if (!Object.hasOwn(candidate, "kind") || candidate.kind !== "user_question" ||
+    !Object.hasOwn(candidate, "questions") || !Array.isArray(candidate.questions)) return null;
+  if (candidate.questions.length > MAX_QUESTIONS) return null;
+  const questions = candidate.questions.map(parseQuestion);
+  if (questions.some((question) => question === null)) return null;
+  const parsedQuestions = questions.filter((question): question is ControllerQuestion => question !== null);
+  if (parsedQuestions.length === 0 || new Set(parsedQuestions.map((question) => question.id)).size !== parsedQuestions.length) {
+    return null;
+  }
+  return { interactionId, questions: parsedQuestions };
+}
+
+const CONTROLLER_APPROVAL_DECISIONS: readonly ControllerApprovalDecision[] = ["allow_once", "deny"];
+const MAX_CONTROLLER_INTERACTION_ID = 256;
+const MAX_CONTROLLER_APPROVAL_SUMMARY = 400;
+const MAX_CONTROLLER_QUESTION_ID = 128;
+const MAX_CONTROLLER_OPTION_VALUE = 256;
+const MAX_APPROVAL_PATH = 256;
+const ABSOLUTE_APPROVAL_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/u;
+const SAFE_RELATIVE_APPROVAL_PATH = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/u;
+const UNPROJECTED_APPROVAL_PATH_FIELDS = [
+  "path",
+  "paths",
+  "movePath",
+  "sourcePath",
+  "targetPath",
+  "changes",
+] as const;
+const RESERVED_QUESTION_IDS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "toString",
+  "valueOf",
+  "hasOwnProperty",
+  "isPrototypeOf",
+  "propertyIsEnumerable",
+  "toLocaleString",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
+
+function exactRelativeApprovalPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || ABSOLUTE_APPROVAL_PATH.test(value)) return null;
+  const canonical = canonicalControllerText(value, MAX_APPROVAL_PATH, "path");
+  if (!canonical || canonical !== value || !SAFE_RELATIVE_APPROVAL_PATH.test(canonical)) return null;
+  const segments = canonical.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) return null;
+  return canonical;
+}
+
+function hasUnsupportedCommandPath(command: string): boolean {
+  if (/[<>]/u.test(command) || /[$\\]/u.test(command)) return true;
+  let quote: "'" | '"' | null = null;
+  for (const character of command) {
+    if (character !== "'" && character !== '"') continue;
+    if (quote === null) quote = character;
+    else if (quote === character) quote = null;
+  }
+  if (quote !== null) return true;
+  if (/(?:^|[\s"'=(|;])(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s"';&|),]*/u.test(command)) return true;
+  if (/(?:^|[\s"'=(|;])[^\s"';&|),]*[\\/]\.\.(?:[\\/]|$)/u.test(command) ||
+      /(?:^|[\s"'=(|;])\.\.(?:[\\/]|$)/u.test(command)) return true;
+  return command.split(/[\s"'(),;|]+/u).some((token) => {
+    const candidate = token.replace(/^[("']+|["',;)]+$/gu, "");
+    const attachedOption = /^-{1,2}[^=]+=/.test(candidate);
+    if (attachedOption) return true;
+    if (candidate.length === 0) return false;
+    const path = candidate.includes("=") ? candidate.slice(candidate.lastIndexOf("=") + 1) : candidate;
+    if (/^(?:https?|wss?):\/\//iu.test(path)) return false;
+    if (!candidate.startsWith("-") && hasProtectedPathSegment(path)) return true;
+    if (!/[\\/]/u.test(candidate)) return false;
+    if (/^[^@\s/:]+@[^:\s/]+:[^\s]+$/u.test(candidate)) {
+      return isUnsafeProviderText(candidate);
+    }
+    return exactRelativeApprovalPath(path) === null;
+  });
+}
+
+function hasAmbiguousApprovalSubject(subject: Record<string, unknown>): boolean {
+  if (UNPROJECTED_APPROVAL_PATH_FIELDS.some((field) => Object.hasOwn(subject, field))) return true;
+  if (Object.hasOwn(subject, "env") || Object.hasOwn(subject, "output")) return true;
+  if (Object.hasOwn(subject, "sessionGrant") && subject.sessionGrant !== null) return true;
+  if (!Object.hasOwn(subject, "actions")) return false;
+  return !Array.isArray(subject.actions) || subject.actions.length > 0;
+}
+
+function exactApprovalCwd(subject: Record<string, unknown>): string | null | undefined {
+  if (!Object.hasOwn(subject, "cwd")) return undefined;
+  if (subject.cwd === null) return null;
+  return exactRelativeApprovalPath(subject.cwd);
+}
+
+function boundedApprovalSummary(summary: string): string | null {
+  return Array.from(summary).length <= MAX_CONTROLLER_APPROVAL_SUMMARY ? summary : null;
+}
+
+function controllerApprovalSummary(subject: Record<string, unknown>): string | null {
+  if (subject.kind === "command") {
+    const rawCommand = typeof subject.command === "string" ? subject.command : "";
+    if (rawCommand.length === 0) return null;
+    if (hasAmbiguousApprovalSubject(subject)) return null;
+    if (hasUnsupportedCommandPath(rawCommand)) return null;
+    const command = canonicalControllerText(rawCommand, MAX_PROMPT);
+    if (!command || command !== rawCommand || command.includes("`") || /[\r\n\u0000-\u001f\u007f]/u.test(command)) return null;
+    const cwd = exactApprovalCwd(subject);
+    if (Object.hasOwn(subject, "cwd") && subject.cwd !== null && !cwd) return null;
+    return boundedApprovalSummary(cwd
+      ? `wants to run:\n\n\`${command}\`\n\nin ${cwd}`
+      : `wants to run:\n\n\`${command}\``);
+  }
+  if (subject.kind === "file_change") {
+    if (hasAmbiguousApprovalSubject(subject)) return null;
+    const scope = exactRelativeApprovalPath(subject.writeScope);
+    return scope ? boundedApprovalSummary(`wants to write files under ${scope}`) : null;
+  }
+  return null;
+}
+
+/**
+ * Compatibility validator for durable approval summaries written by the
+ * deployed-line controller. New projections are validated before they reach
+ * storage; this helper keeps older callers able to reject legacy placeholders
+ * without weakening the newer projection rules.
+ */
+export function isSafeControllerApprovalSummary(summary: unknown): summary is string {
+  if (typeof summary !== "string" || Buffer.byteLength(summary, "utf8") > MAX_CONTROLLER_APPROVAL_SUMMARY) {
+    return false;
+  }
+  if (summary === "wants to run:\n\n`a redacted command`" || summary === "wants to write a protected path") {
+    return false;
+  }
+  const command = /^wants to run:\n\n`([^`]*)`(?:\n\nin (.+))?$/u.exec(summary);
+  if (command) {
+    const subject: Record<string, unknown> = { kind: "command", command: command[1] };
+    if (command[2] !== undefined) subject.cwd = command[2];
+    return controllerApprovalSummary(subject) === summary;
+  }
+  const path = /^wants to write(?: files under)? ([A-Za-z0-9._/-]+)$/u.exec(summary)?.[1];
+  return path !== undefined && controllerApprovalSummary({ kind: "file_change", writeScope: path }) !== null;
+}
+
+function canonicalAvailableDecisions(candidate: Record<string, unknown>): string[] | null {
+  if (!Object.hasOwn(candidate, "availableDecisions") || !Array.isArray(candidate.availableDecisions)) return null;
+  const offered = candidate.availableDecisions;
+  if (!offered.every((decision): decision is string => typeof decision === "string")) return null;
+  if (Object.hasOwn(candidate, "decisions")) {
+    if (!Array.isArray(candidate.decisions) || !candidate.decisions.every((decision) => typeof decision === "string") ||
+        candidate.decisions.length !== offered.length || candidate.decisions.some((decision, index) => decision !== offered[index])) {
+      return null;
+    }
+  }
+  return [...offered];
+}
+
+function controllerApprovalDecisions(candidate: Record<string, unknown>): ControllerApprovalDecision[] | null {
+  const offered = canonicalAvailableDecisions(candidate);
+  if (!offered) return null;
+  const decisions = CONTROLLER_APPROVAL_DECISIONS.filter((decision) => offered.includes(decision));
+  return decisions.length > 0 ? [...decisions] : null;
+}
+
+function unsupportedControllerInteraction(
+  interactionId: string,
+  sourceKind: string | null,
+): ControllerInteraction {
+  return { kind: "unsupported", interactionId, metadata: { sourceKind } };
+}
+
+function parseControllerQuestionProjection(interactionId: string, payload: unknown): ControllerInteraction {
+  const question = parsePendingQuestion(interactionId, payload);
+  const bounded = question?.questions.every((item) =>
+    item.id.length <= MAX_CONTROLLER_QUESTION_ID &&
+    item.options.every((option) => option.value.length <= MAX_CONTROLLER_OPTION_VALUE),
+  );
+  return question && bounded
+    ? { kind: "user_question", interactionId, questions: question.questions }
+    : unsupportedControllerInteraction(interactionId, "user_question");
+}
+
+function parseControllerApprovalProjection(
+  interactionId: string,
+  candidate: Record<string, unknown>,
+): ControllerInteraction {
+  const subject = candidate.subject;
+  const summary = typeof subject === "object" && subject !== null
+    ? controllerApprovalSummary(subject as Record<string, unknown>)
+    : null;
+  const decisions = controllerApprovalDecisions(candidate);
+  return summary && decisions
+    ? { kind: "approval", interactionId, summary, decisions }
+    : unsupportedControllerInteraction(interactionId, "approval");
+}
+
+/**
+ * Parses the exact BB interaction payload into the smaller projection that is
+ * safe to persist and present outside BB.
+ */
+export function parseControllerInteraction(
+  interactionId: unknown,
+  payload: unknown,
+): ControllerInteraction | null {
+  if (
+    typeof interactionId !== "string" ||
+    interactionId.length === 0 ||
+    interactionId.length > MAX_CONTROLLER_INTERACTION_ID
+  ) return null;
+  if (typeof payload !== "object" || payload === null) return null;
+  const candidate = payload as Record<string, unknown>;
+  if (!Object.hasOwn(candidate, "kind")) return unsupportedControllerInteraction(interactionId, null);
+  if (candidate.kind === "user_question") return parseControllerQuestionProjection(interactionId, payload);
+  if (candidate.kind !== "approval") {
+    const sourceKind = typeof candidate.kind === "string" && /^[a-z_]{1,40}$/u.test(candidate.kind)
+      ? candidate.kind
+      : null;
+    return unsupportedControllerInteraction(interactionId, sourceKind);
+  }
+  return parseControllerApprovalProjection(interactionId, candidate);
+}
+
+function strictAnswerText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.normalize("NFKC").trim();
+  if (normalized.length === 0 || normalized.length > MAX_CONTROLLER_TEXT) return null;
+  return canonicalControllerText(normalized, MAX_CONTROLLER_TEXT);
+}
+
+function parseSelectedOptions(
+  question: ControllerQuestion,
+  selectedValue: unknown,
+): string[] | null {
+  if (!Array.isArray(selectedValue) || selectedValue.some((option) => typeof option !== "string")) return null;
+  const selected = selectedValue as string[];
+  if (!question.multiSelect && selected.length > 1) return null;
+  if (new Set(selected).size !== selected.length) return null;
+  return selected.every((option) => question.options.some((candidate) => candidate.value === option))
+    ? [...selected]
+    : null;
+}
+
+function parseQuestionAnswer(
+  question: ControllerQuestion,
+  rawAnswer: unknown,
+): ControllerQuestionAnswers[string] | null {
+  if (typeof rawAnswer !== "object" || rawAnswer === null || Array.isArray(rawAnswer)) return null;
+  const candidate = rawAnswer as Record<string, unknown>;
+  const keys = Object.keys(candidate);
+  if (keys.some((key) => key !== "selected" && key !== "freeText") || !Object.hasOwn(candidate, "selected")) return null;
+  const selected = parseSelectedOptions(question, candidate.selected);
+  if (!selected) return null;
+  const parsed: ControllerQuestionAnswers[string] = { selected };
+  if (!Object.hasOwn(candidate, "freeText")) return parsed;
+  if (!question.allowFreeText) return null;
+  const freeText = strictAnswerText(candidate.freeText);
+  return freeText ? { ...parsed, freeText } : null;
+}
+
+function parseControllerQuestionAnswers(
+  value: unknown,
+  questions: readonly ControllerQuestion[],
+  state: "pending" | "answered",
+): ControllerQuestionAnswers | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const questionIds = questions.map((question) => question.id);
+  if (new Set(questionIds).size !== questionIds.length ||
+    questionIds.some((questionId) => RESERVED_QUESTION_IDS.has(questionId))) return null;
+  const answerIds = Object.keys(candidate);
+  if (state === "answered" && (answerIds.length !== questionIds.length ||
+    questionIds.some((questionId) => !Object.hasOwn(candidate, questionId)))) return null;
+  const byId = new Map(questions.map((question) => [question.id, question]));
+  const answers: ControllerQuestionAnswers = {};
+  for (const [questionId, rawAnswer] of Object.entries(candidate)) {
+    const question = byId.get(questionId);
+    const parsed = question ? parseQuestionAnswer(question, rawAnswer) : null;
+    if (!parsed) return null;
+    answers[questionId] = parsed;
+  }
+  return answers;
+}
+
+function parseApprovalResolution(
+  interaction: Extract<ControllerInteraction, { kind: "approval" }>,
+  value: unknown,
+): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (Object.hasOwn(candidate, "decision") && candidate.decision === "allow_once" && Object.keys(candidate).length === 2 &&
+    Object.hasOwn(candidate, "grantedPermissions") && candidate.grantedPermissions === null &&
+    interaction.decisions.includes("allow_once")) {
+    return { decision: "allow_once", grantedPermissions: null };
+  }
+  if (Object.hasOwn(candidate, "decision") && candidate.decision === "deny" && Object.keys(candidate).length === 1 &&
+    interaction.decisions.includes("deny")) {
+    return { decision: "deny" };
+  }
+  return null;
+}
+
+function parseQuestionResolution(
+  interaction: Extract<ControllerInteraction, { kind: "user_question" }>,
+  value: unknown,
+  state: "pending" | "answered",
+): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const answerMap = Object.hasOwn(candidate, "kind") && candidate.kind === "user_answer"
+    ? Object.keys(candidate).length === 2 && Object.hasOwn(candidate, "answers") ? candidate.answers : null
+    : value;
+  const answers = parseControllerQuestionAnswers(answerMap, interaction.questions, state);
+  return answers ? { kind: "user_answer", answers } : null;
+}
+
+/** Validates the exact durable resolution envelope against one stored interaction. */
+export function parseControllerInteractionResolution(
+  interaction: ControllerInteraction,
+  value: unknown,
+  state: "pending" | "answered" = "pending",
+): Record<string, unknown> | null {
+  if (interaction.kind === "approval") return parseApprovalResolution(interaction, value);
+  if (interaction.kind === "user_question") return parseQuestionResolution(interaction, value, state);
+  return null;
 }
 
 /**
@@ -157,31 +712,20 @@ export function questionOptionToken(
     .slice(0, 32);
 }
 
+/** A callback-sized token derived from one exact generic controller choice. */
+export function controllerInteractionToken(interactionId: string, ...choice: string[]): string {
+  return createHash("sha256")
+    .update(`controller-interaction:${interactionId}:${choice.join(":")}`, "utf8")
+    .digest("base64url")
+    .slice(0, 32);
+}
+
 export type RenderedQuestion = {
   text: string;
   reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] };
 };
 
-const TELEGRAM_TEXT_BYTES = 4_096;
-
-function boundedTelegramText(text: string): string {
-  if (Buffer.byteLength(text, "utf8") <= TELEGRAM_TEXT_BYTES) return text;
-  const ellipsis = "…";
-  const kept: string[] = [];
-  let usedBytes = Buffer.byteLength(ellipsis, "utf8");
-  for (const character of text) {
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (usedBytes + characterBytes > TELEGRAM_TEXT_BYTES) break;
-    kept.push(character);
-    usedBytes += characterBytes;
-  }
-  return `${kept.join("")}${ellipsis}`;
-}
-
-function interactionCallback(prefix: string, interactionId: string, questionId: string, optionValue: string): string {
-  const safePrefix = /^[A-Za-z0-9_-]{1,30}$/.test(prefix) ? prefix : "q";
-  return `${safePrefix}:${questionOptionToken(interactionId, questionId, optionValue)}`;
-}
+export type ControllerQuestionCallbackPrefix = "i" | "w";
 
 /**
  * One question per message. Telegram gives a button no room to say which
@@ -191,26 +735,69 @@ function interactionCallback(prefix: string, interactionId: string, questionId: 
 export function renderQuestion(
   interactionId: string,
   question: ControllerQuestion,
-  callbackPrefix = "q",
+  callbackPrefix: ControllerQuestionCallbackPrefix,
 ): RenderedQuestion {
+  if (callbackPrefix !== "i" && callbackPrefix !== "w") {
+    throw new TypeError("controller question callback prefix is invalid");
+  }
   const lines = [question.prompt];
   for (const option of question.options) {
     lines.push(option.description === null ? `• ${option.label}` : `• ${option.label} — ${option.description}`);
   }
   if (question.allowFreeText) lines.push("Or just reply with your own answer.");
   return {
-    text: boundedTelegramText(lines.join("\n\n")),
+    text: lines.join("\n\n"),
     reply_markup: {
       inline_keyboard: question.options.map((option) => [{
-        text: boundedString(option.label, MAX_LABEL, 64) ?? "Option",
-        callback_data: interactionCallback(callbackPrefix, interactionId, question.id, option.value),
+        text: option.label,
+        callback_data: `${callbackPrefix}:${questionOptionToken(interactionId, question.id, option.value)}`,
       }]),
     },
   };
 }
 
-/** The callback prefix every hidden-controller interaction button carries. */
-export const CONTROLLER_INTERACTION_CALLBACK_PREFIX = "i";
+export type RenderedControllerInteraction = RenderedQuestion | { text: string; reply_markup?: undefined };
+
+const CONTROLLER_APPROVAL_LABELS: Record<ControllerApprovalDecision, string> = {
+  allow_once: "Allow once",
+  deny: "Deny",
+};
+
+function renderControllerQuestion(
+  interaction: Extract<ControllerInteraction, { kind: "user_question" }>,
+  answers: ControllerQuestionAnswers,
+): RenderedQuestion {
+  const next = nextUnansweredQuestion(interaction.questions, answers);
+  if (!next) throw new TypeError("controller interaction has no unanswered question");
+  const rendered = renderQuestion(interaction.interactionId, next.question, "i");
+  return { ...rendered, text: `The controller needs your answer.\n\n${rendered.text}` };
+}
+
+function renderControllerApproval(
+  interaction: Extract<ControllerInteraction, { kind: "approval" }>,
+): RenderedQuestion {
+  return {
+    text: `The controller ${interaction.summary}`,
+    reply_markup: {
+      inline_keyboard: interaction.decisions.map((decision) => [{
+        text: CONTROLLER_APPROVAL_LABELS[decision],
+        callback_data: `i:${controllerInteractionToken(interaction.interactionId, decision)}`,
+      }]),
+    },
+  };
+}
+
+export function renderControllerInteraction(
+  interaction: ControllerInteraction,
+  answers: ControllerQuestionAnswers = {},
+): RenderedControllerInteraction {
+  if (interaction.kind === "unsupported") {
+    return { text: "The controller is waiting on an interaction this Telegram bridge cannot answer." };
+  }
+  return interaction.kind === "user_question"
+    ? renderControllerQuestion(interaction, answers)
+    : renderControllerApproval(interaction);
+}
 
 /** What a worker thread is blocked on: a question, or a permission request. */
 export type ThreadApprovalDecision = "allow_once" | "allow_for_session" | "deny";
@@ -220,12 +807,6 @@ export type ThreadInteraction =
   /** A block the plugin can name but not answer, so the owner still hears about it. */
   | { kind: "unsupported"; interactionId: string };
 
-/** The safe, durable projection of an interaction from a hidden controller. */
-export type ControllerInteraction =
-  | { kind: "user_question"; interactionId: string; questions: ControllerQuestion[] }
-  | { kind: "approval"; interactionId: string; summary: string; decisions: Extract<ThreadApprovalDecision, "allow_once" | "deny">[] }
-  | { kind: "unsupported"; interactionId: string; metadata: { sourceKind: string | null } };
-
 const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
   allow_once: "Allow once",
   allow_for_session: "Allow all session",
@@ -233,188 +814,7 @@ const APPROVAL_LABELS: Record<ThreadApprovalDecision, string> = {
 };
 
 function approvalSummary(subject: Record<string, unknown>): string | null {
-  if (subject.kind === "command") {
-    const command = boundedString(subject.command, MAX_PROMPT);
-    if (!command) return null;
-    const cwd = boundedString(subject.cwd, 120);
-    return cwd ? `wants to run:\n\n\`${command}\`\n\nin ${cwd}` : `wants to run:\n\n\`${command}\``;
-  }
-  if (subject.kind === "file_change") {
-    const scope = boundedString(subject.writeScope, 200);
-    return scope ? `wants to write files under ${scope}` : "wants to write files";
-  }
-  return null;
-}
-
-function containsApprovalSecret(commandText: string): boolean {
-  if (isUnsafeProviderText(commandText)) return true;
-  let decoded = commandText;
-  for (let depth = 0; depth < 4; depth += 1) {
-    if (!decoded.includes("%")) break;
-    try {
-      const next = decodeURIComponent(decoded);
-      if (next === decoded) break;
-      decoded = next;
-    } catch {
-      return true;
-    }
-  }
-  if (decoded.includes("%")) return true;
-  if (isUnsafeProviderText(decoded)) return true;
-  return /\b(?:bearer|authorization|token|secret|password|api[_-]?key|callback(?:[-_ ]?(?:url|nonce|code))?)\b/i.test(decoded) ||
-    /[?&](?:token|secret|key|callback|nonce|code)=[^&\s]+/i.test(decoded) ||
-    /\b[a-z_][a-z0-9_]*=[^\s]+/i.test(decoded) ||
-    /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%/.test(decoded) ||
-    /(?:env|environment)\b/i.test(decoded);
-}
-
-export function isSafeControllerApprovalSummary(summary: unknown): summary is string {
-  if (typeof summary !== "string" || Buffer.byteLength(summary, "utf8") > 4_000) return false;
-  // The projection no longer produces a redacted placeholder — an approval it
-  // cannot state becomes unsupported — so a stored row carrying one is a row
-  // this build could not have written and is not accepted back.
-  if (summary === "wants to run:\n\n`a redacted command`" || summary === "wants to write a protected path") {
-    return false;
-  }
-  const command = /^wants to run:\n\n`([^`]*)`$/.exec(summary)?.[1];
-  if (command !== undefined) return command.length > 0 && [...command].length <= MAX_PROMPT && !containsApprovalSecret(command);
-  const basename = /^wants to write ([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/.exec(summary)?.[1];
-  return basename !== undefined && !isSensitiveApprovalPathName(basename) && !isUnsafeProviderText(basename);
-}
-
-function safeApprovalPath(rawPath: unknown): string | null {
-  if (typeof rawPath !== "string" || rawPath.length === 0 || rawPath.length > 240 || rawPath.startsWith("/") ||
-    /^[A-Za-z]:/.test(rawPath) || rawPath === "~" || rawPath.startsWith("~/") || rawPath.includes("\\") ||
-    rawPath.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
-  const basename = rawPath.split("/").at(-1)!;
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(basename)) return null;
-  // A file whose name is a secret by convention, or whose name is itself shaped
-  // like a token, is not made safe by being a well-formed name. The token shape
-  // comes from the same central screen the command path uses, so the two cannot
-  // drift apart.
-  return isSensitiveApprovalPathName(basename) || isUnsafeProviderText(basename) ? null : basename;
-}
-
-/**
- * The bounded approval the owner may act on, or null when there is no safe way
- * to describe it. Null is deliberate rather than a redacted placeholder: a
- * button that says "Allow once" beside text the owner cannot read is a decision
- * made blind, so an approval the plugin cannot state becomes an unsupported
- * interaction with no provider text and no buttons at all.
- */
-function controllerApprovalSummary(subject: unknown): string | null {
-  if (typeof subject !== "object" || subject === null) return null;
-  const candidate = subject as Record<string, unknown>;
-  if (candidate.kind === "command" && typeof candidate.command === "string") {
-    if (containsApprovalSecret(candidate.command) || candidate.command.includes("`") ||
-      candidate.command.length === 0 || candidate.command.length > MAX_PROMPT) return null;
-    return `wants to run:\n\n\`${candidate.command}\``;
-  }
-  if (candidate.kind === "file_change") {
-    const path = safeApprovalPath(candidate.writeScope);
-    return path === null ? null : `wants to write ${path}`;
-  }
-  return null;
-}
-
-/**
- * Projects an exact BB interaction into the bounded data the hidden Telegram
- * controller may retain. Lifecycle payloads are deliberately not accepted here.
- */
-export function parseControllerInteraction(interactionId: unknown, payload: unknown): ControllerInteraction | null {
-  if (!isSafeControllerInteractionId(interactionId) ||
-    typeof payload !== "object" || payload === null) return null;
-  const candidate = payload as Record<string, unknown>;
-  if (candidate.kind === "user_question") {
-    if (questionPayloadIsUnsafe(candidate)) {
-      return { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
-    }
-    if (!Array.isArray(candidate.questions) || candidate.questions.length === 0 || candidate.questions.length > MAX_QUESTIONS ||
-      candidate.questions.some((rawQuestion) => {
-        if (typeof rawQuestion !== "object" || rawQuestion === null) return true;
-        const rawCandidate = rawQuestion as Record<string, unknown>;
-        const options = rawCandidate.options;
-        return typeof rawCandidate.multiSelect !== "boolean" || typeof rawCandidate.allowFreeText !== "boolean" ||
-          options !== undefined && (!Array.isArray(options) || options.length > MAX_OPTIONS || options.some((option) => parseOption(option) === null));
-      })) return { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
-    const pending = parsePendingQuestion(interactionId, payload);
-    // A question with no option and no free text cannot be answered from a
-    // phone. Saying so is the honest projection; keeping it as a question would
-    // park the turn on a message the owner can never settle.
-    return pending && new Set(pending.questions.map((question) => question.id)).size === pending.questions.length &&
-      pending.questions.every((question) => question.allowFreeText || question.options.length > 0)
-      ? { kind: "user_question", interactionId, questions: pending.questions }
-      : { kind: "unsupported", interactionId, metadata: { sourceKind: "user_question" } };
-  }
-  if (candidate.kind === "approval") {
-    const summary = controllerApprovalSummary(candidate.subject);
-    const availableDecisions = Array.isArray(candidate.availableDecisions) ? candidate.availableDecisions : null;
-    if (availableDecisions === null || availableDecisions.some((decision) =>
-      decision !== "allow_once" && decision !== "allow_for_session" && decision !== "deny")) {
-      return { kind: "unsupported", interactionId, metadata: { sourceKind: "approval" } };
-    }
-    const decisions = availableDecisions !== null
-      ? (["allow_once", "deny"] as const).filter((decision) => availableDecisions.includes(decision))
-      : [];
-    return summary && decisions.length > 0
-      ? { kind: "approval", interactionId, summary, decisions: [...decisions] }
-      : { kind: "unsupported", interactionId, metadata: { sourceKind: "approval" } };
-  }
-  const sourceKind = typeof candidate.kind === "string" && /^[a-z_]{1,40}$/.test(candidate.kind)
-    ? candidate.kind
-    : null;
-  return { kind: "unsupported", interactionId, metadata: { sourceKind } };
-}
-
-/**
- * The hidden controller offers a one-off decision only. A session-wide grant
- * would outlive the turn the owner actually looked at, so it is not rendered
- * here even when BB offers it.
- */
-const CONTROLLER_APPROVAL_LABELS: Record<Extract<ThreadApprovalDecision, "allow_once" | "deny">, string> = {
-  allow_once: "Allow once",
-  deny: "Deny",
-};
-
-const UNSUPPORTED_CONTROLLER_INTERACTION_TEXT =
-  "Hanoon is waiting on something I can't answer from here. It needs you in BB.";
-
-export type RenderedControllerInteraction = {
-  /** Which question of a sequence this message asks; 0 for a single message. */
-  step: number;
-  text: string;
-  reply_markup?: RenderedQuestion["reply_markup"];
-};
-
-/**
- * The one Telegram message a durable controller interaction is currently
- * waiting on, or null once a question sequence has been answered through.
- */
-export function renderControllerInteraction(
-  interaction: ControllerInteraction,
-  answers: ControllerQuestionAnswers = {},
-): RenderedControllerInteraction | null {
-  if (interaction.kind === "user_question") {
-    const next = nextUnansweredQuestion(interaction.questions, answers);
-    if (!next) return null;
-    return {
-      step: next.index,
-      ...renderQuestion(interaction.interactionId, next.question, CONTROLLER_INTERACTION_CALLBACK_PREFIX),
-    };
-  }
-  if (interaction.kind === "approval") {
-    return {
-      step: 0,
-      text: boundedTelegramText(`Hanoon ${interaction.summary}`),
-      reply_markup: {
-        inline_keyboard: interaction.decisions.map((decision) => [{
-          text: CONTROLLER_APPROVAL_LABELS[decision],
-          callback_data: `${CONTROLLER_INTERACTION_CALLBACK_PREFIX}:${threadDecisionToken(interaction.interactionId, decision)}`,
-        }]),
-      },
-    };
-  }
-  return { step: 0, text: UNSUPPORTED_CONTROLLER_INTERACTION_TEXT };
+  return controllerApprovalSummary(subject);
 }
 
 /**
@@ -428,7 +828,6 @@ export function parseThreadInteraction(interactionId: unknown, payload: unknown)
   if (typeof payload !== "object" || payload === null) return null;
   const candidate = payload as Record<string, unknown>;
   if (candidate.kind === "user_question") {
-    if (questionPayloadIsUnsafe(candidate)) return { kind: "unsupported", interactionId };
     const question = parsePendingQuestion(interactionId, payload);
     return question
       ? { kind: "user_question", interactionId, questions: question.questions }
@@ -439,7 +838,8 @@ export function parseThreadInteraction(interactionId: unknown, payload: unknown)
   const summary = typeof subject === "object" && subject !== null
     ? approvalSummary(subject as Record<string, unknown>)
     : null;
-  const offered = Array.isArray(candidate.decisions) ? candidate.decisions : Object.keys(APPROVAL_LABELS);
+  const offered = canonicalAvailableDecisions(candidate);
+  if (!offered) return { kind: "unsupported", interactionId };
   const decisions = (Object.keys(APPROVAL_LABELS) as ThreadApprovalDecision[])
     .filter((decision) => offered.includes(decision));
   if (!summary || decisions.length === 0) return { kind: "unsupported", interactionId };
@@ -458,18 +858,17 @@ export function renderThreadInteraction(
   title: string,
   interaction: ThreadInteraction,
 ): RenderedQuestion | { text: string } {
-  const heading = telegramSafeTitle(title);
   if (interaction.kind === "unsupported") {
-    return { text: `*${heading}* is waiting on something I can't answer from here. It needs you in BB.` };
+    return { text: `*${title}* is waiting on something I can't answer from here. It needs you in BB.` };
   }
   if (interaction.kind === "user_question") {
     const first = interaction.questions[0];
     if (!first) throw new TypeError("a thread question must have a question");
     const rendered = renderQuestion(interaction.interactionId, first, "w");
-    return { ...rendered, text: `*${heading}* needs your answer.\n\n${rendered.text}` };
+    return { ...rendered, text: `*${title}* needs your answer.\n\n${rendered.text}` };
   }
   return {
-    text: `*${heading}* ${interaction.summary}`,
+    text: `*${title}* ${interaction.summary}`,
     reply_markup: {
       inline_keyboard: interaction.decisions.map((decision) => [{
         text: APPROVAL_LABELS[decision],
@@ -484,7 +883,7 @@ export function nextUnansweredQuestion(
   questions: readonly ControllerQuestion[],
   answers: ControllerQuestionAnswers,
 ): { question: ControllerQuestion; index: number } | null {
-  const index = questions.findIndex((question) => !(question.id in answers));
+  const index = questions.findIndex((question) => !Object.hasOwn(answers, question.id));
   const question = questions[index];
   return question ? { question, index } : null;
 }

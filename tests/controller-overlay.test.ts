@@ -30,6 +30,10 @@ function fixture() {
   return { bb, store };
 }
 
+function countOccurrences(text: string, needle: string): number {
+  return needle.length === 0 ? 0 : text.split(needle).length - 1;
+}
+
 it("appends the overlay migration after every shipped one", () => {
   expect(ALL_MIGRATIONS[23]).toContain("CREATE TABLE controller_overlay");
 });
@@ -46,6 +50,29 @@ it("layers the owner's wording after the fixed instructions, never before", () =
   expect(composed).toContain("Always show me the PR link.");
   // A boundary stated above must not be reorderable by anything the overlay says.
   expect(composed.indexOf("Merging a pull request")).toBeLessThan(composed.indexOf("Always show me"));
+});
+
+it("keeps one stable instruction sentinel before one owner overlay", () => {
+  const overlay = "Always show me the PR link.";
+  const composed = composeControllerInstructions(overlay);
+
+  expect(CONTROLLER_INSTRUCTIONS.startsWith(`${CONTROLLER_INSTRUCTION_SENTINEL}\n`)).toBe(true);
+  expect(countOccurrences(CONTROLLER_INSTRUCTIONS, CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
+  expect(countOccurrences(composed, CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);
+  expect(countOccurrences(composed, overlay)).toBe(1);
+  expect(composed.indexOf(overlay)).toBeGreaterThan(CONTROLLER_INSTRUCTIONS.length);
+});
+
+it("states the enforced owner-turn and Telegram approval boundaries", () => {
+  expect(CONTROLLER_INSTRUCTIONS).toContain("telegram_agent_respond");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("same-turn evidence");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("durable job or monitor obligation");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("connector installation");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("credential mutation or rotation");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("Allow once");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("Deny");
+  expect(CONTROLLER_INSTRUCTIONS).not.toContain("full permissions");
+  expect(CONTROLLER_INSTRUCTIONS).not.toContain("install and configure it");
 });
 
 it("stores, replaces, and clears the working style", () => {
@@ -192,16 +219,13 @@ it("no longer promises to install and configure integrations on its own", () => 
   expect(CONTROLLER_INSTRUCTIONS).not.toContain("install and configure it, then say what you did");
 });
 
-it("keeps the accepted compatibility permission default exactly", () => {
+it("keeps the accepted controller permission default exactly", () => {
   const parsed = parseGlobalConfig({ botToken: "t", bbAppBaseUrl: "" });
   if (!parsed.ok) throw new Error(parsed.message);
 
-  // Task 12 consolidates instructions only. The fresh-`auto` cutover stays
-  // disabled, so both the profile default and an unset configuration must
-  // still resolve to the pre-Task-12 compatibility value.
-  expect(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode).toBe("full");
-  expect(parsed.value.controllerPermissionMode).toBe("full");
-  expect(controllerExecutionProfile(parsed.value).permissionMode).toBe("full");
+  expect(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode).toBe("auto");
+  expect(parsed.value.controllerPermissionMode).toBe("auto");
+  expect(controllerExecutionProfile(parsed.value).permissionMode).toBe("auto");
 });
 
 it.each(["auto", "accept-edits", "full"] as const)("preserves an explicit %s permission value", (mode) => {

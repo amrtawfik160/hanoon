@@ -148,13 +148,13 @@ CREATE TABLE outbox (
 );
 `] as const;
 
-export const UPDATE_CLAIM_MIGRATIONS = [String.raw`
+export const TASK_3_MIGRATIONS = [String.raw`
 ALTER TABLE telegram_updates ADD COLUMN claim_owner TEXT;
 ALTER TABLE telegram_updates ADD COLUMN claim_generation INTEGER;
 ALTER TABLE telegram_updates ADD COLUMN claim_expires_at INTEGER;
 `] as const;
 
-export const APPROVAL_BINDING_MIGRATIONS = [String.raw`
+export const TASK_9_MIGRATIONS = [String.raw`
 ALTER TABLE callbacks ADD COLUMN approval_nonce_hash TEXT;
 ALTER TABLE callbacks ADD COLUMN head_sha TEXT;
 ALTER TABLE callbacks ADD COLUMN effect_idempotency_key TEXT;
@@ -1363,28 +1363,163 @@ CREATE TABLE controller_interactions (
 CREATE INDEX controller_interactions_state
   ON controller_interactions(controller_key, state, asked_at, interaction_id);
 
--- Legacy pending/answered questions can only be safe if their controller has
--- exactly one live generation. A failed guard aborts this whole migration.
-CREATE TABLE controller_interaction_migration_guard (
+CREATE TEMP TABLE controller_interaction_migration_guard (
+  invariant TEXT PRIMARY KEY,
   valid INTEGER NOT NULL CHECK (valid = 1)
 );
-INSERT INTO controller_interaction_migration_guard(valid)
-SELECT CASE WHEN EXISTS (
+INSERT INTO controller_interaction_migration_guard (invariant, valid)
+SELECT 'legacy_active_source_identity', CASE WHEN NOT EXISTS (
   SELECT 1
     FROM controller_questions AS question
-    JOIN controller_threads AS controller ON controller.controller_key = question.controller_key
     JOIN controller_turns AS turn ON turn.id = question.turn_id
    WHERE question.state IN ('pending', 'answered')
      AND (
-       turn.controller_key <> question.controller_key OR turn.state <> 'submitted' OR
-       controller.state <> 'active' OR controller.bb_thread_id IS NULL OR
-       controller.bb_thread_id IS NULL OR
-       (SELECT COUNT(*) FROM controller_generations AS generation
-         WHERE generation.controller_key = question.controller_key
-           AND generation.thread_id = controller.bb_thread_id
-           AND generation.ended_at IS NULL) <> 1
+       turn.controller_key <> question.controller_key
+       OR
+       turn.state <> 'submitted'
+       OR (
+         SELECT COUNT(*)
+           FROM controller_threads AS current_thread
+          WHERE current_thread.controller_key = question.controller_key
+            AND current_thread.state = 'active'
+            AND current_thread.bb_thread_id IS NOT NULL
+       ) <> 1
+       OR (
+         SELECT COUNT(*)
+           FROM controller_generations AS open_generation
+          WHERE open_generation.controller_key = question.controller_key
+            AND open_generation.ended_at IS NULL
+       ) <> 1
+       OR NOT EXISTS (
+         SELECT 1
+           FROM controller_threads AS current_thread
+           JOIN controller_generations AS open_generation
+             ON open_generation.controller_key = current_thread.controller_key
+            AND open_generation.thread_id = current_thread.bb_thread_id
+            AND open_generation.ended_at IS NULL
+          WHERE current_thread.controller_key = question.controller_key
+            AND current_thread.state = 'active'
+            AND current_thread.bb_thread_id IS NOT NULL
+       )
      )
-) THEN 0 ELSE 1 END;
+) THEN 1 ELSE 0 END;
+
+INSERT INTO controller_interaction_migration_guard (invariant, valid)
+SELECT 'legacy_projection_schema', CASE WHEN NOT EXISTS (
+  SELECT 1
+    FROM controller_questions AS question
+   WHERE question.state IN ('pending', 'answered')
+     AND (
+       json_valid(question.questions_json) <> 1
+       OR json_type(question.questions_json) <> 'array'
+       OR json_array_length(question.questions_json) NOT BETWEEN 1 AND 4
+       OR typeof(question.asked_at) <> 'integer'
+       OR (question.state = 'answered' AND (question.answered_at IS NULL OR typeof(question.answered_at) <> 'integer'))
+       OR EXISTS (
+         SELECT 1 FROM json_each(question.questions_json) AS question_item
+          WHERE json_type(question_item.value) <> 'object'
+             OR COALESCE(json_type(question_item.value, '$.id'), '') <> 'text'
+             OR COALESCE(json_type(question_item.value, '$.prompt'), '') <> 'text'
+             OR COALESCE(json_type(question_item.value, '$.options'), '') <> 'array'
+             OR json_array_length(json_extract(question_item.value, '$.options')) > 6
+             OR (
+               json_type(question_item.value, '$.shortLabel') IS NOT NULL
+               AND json_type(question_item.value, '$.shortLabel') NOT IN ('null', 'text')
+             )
+             OR (
+               json_type(question_item.value, '$.multiSelect') IS NOT NULL
+               AND json_type(question_item.value, '$.multiSelect') NOT IN ('true', 'false')
+             )
+             OR (
+               json_type(question_item.value, '$.allowFreeText') IS NOT NULL
+               AND json_type(question_item.value, '$.allowFreeText') NOT IN ('true', 'false')
+             )
+             OR EXISTS (
+               SELECT 1
+                 FROM json_each(question_item.value) AS question_field
+                GROUP BY question_field.key
+               HAVING COUNT(*) > 1
+             )
+             OR EXISTS (
+               SELECT 1
+                 FROM json_each(json(json_extract(question_item.value, '$.options'))) AS option
+                WHERE json_type(option.value) <> 'object'
+                   OR COALESCE(json_type(option.value, '$.value'), '') <> 'text'
+                   OR COALESCE(json_type(option.value, '$.label'), '') <> 'text'
+                   OR (
+                     json_type(option.value, '$.description') IS NOT NULL
+                     AND json_type(option.value, '$.description') NOT IN ('null', 'text')
+                   )
+                   OR EXISTS (
+                     SELECT 1
+                       FROM json_each(option.value) AS option_field
+                      GROUP BY option_field.key
+                     HAVING COUNT(*) > 1
+                   )
+             )
+             OR EXISTS (
+               SELECT 1
+                 FROM json_each(json(json_extract(question_item.value, '$.options'))) AS option
+                GROUP BY json_extract(option.value, '$.value')
+               HAVING COUNT(*) > 1
+             )
+       )
+       OR (
+         SELECT COUNT(*) FROM json_each(question.questions_json)
+       ) <> (
+         SELECT COUNT(DISTINCT json_extract(question_item.value, '$.id'))
+           FROM json_each(question.questions_json) AS question_item
+       )
+       OR question.state = 'answered' AND question.answers_json IS NULL
+       OR (
+         question.answers_json IS NOT NULL
+         AND (
+           json_valid(question.answers_json) <> 1
+           OR json_type(question.answers_json) <> 'object'
+           OR EXISTS (
+             SELECT 1
+               FROM json_each(question.answers_json) AS answer_key
+              GROUP BY answer_key.key
+             HAVING COUNT(*) > 1
+           )
+           OR EXISTS (
+             SELECT 1
+               FROM json_each(question.answers_json) AS answer
+              WHERE json_type(answer.value) <> 'object'
+                 OR COALESCE(json_type(answer.value, '$.selected'), '') <> 'array'
+                 OR EXISTS (
+                   SELECT 1 FROM json_each(answer.value) AS answer_field
+                    WHERE answer_field.key NOT IN ('selected', 'freeText')
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                     FROM json_each(answer.value) AS answer_field
+                    GROUP BY answer_field.key
+                   HAVING COUNT(*) > 1
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                     FROM json_each(json(json_extract(answer.value, '$.selected'))) AS selected
+                    WHERE selected.type <> 'text'
+                 )
+                 OR EXISTS (
+                   SELECT selected.value
+                     FROM json_each(json(json_extract(answer.value, '$.selected'))) AS selected
+                    GROUP BY selected.value
+                   HAVING COUNT(*) > 1
+                 )
+                 OR (
+                   EXISTS (
+                     SELECT 1 FROM json_each(answer.value) AS answer_field
+                      WHERE answer_field.key = 'freeText'
+                   )
+                   AND COALESCE(json_type(answer.value, '$.freeText'), '') <> 'text'
+                 )
+           )
+         )
+       )
+     )
+) THEN 1 ELSE 0 END;
 
 INSERT INTO controller_interactions (
   interaction_id, turn_id, controller_key, bb_thread_id, controller_generation_id,
@@ -1394,23 +1529,46 @@ SELECT
   question.interaction_id,
   question.turn_id,
   question.controller_key,
-  CASE WHEN question.state = 'delivered' THEN NULL ELSE controller.bb_thread_id END,
-  CASE WHEN question.state = 'delivered' THEN NULL ELSE (
-    SELECT generation.id FROM controller_generations AS generation
-     WHERE generation.controller_key = question.controller_key
-       AND generation.thread_id = controller.bb_thread_id
-       AND generation.ended_at IS NULL
-  ) END,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE current_thread.bb_thread_id END,
+  CASE WHEN question.state = 'delivered' THEN NULL ELSE open_generation.id END,
   'user_question',
-  json_object('kind', 'user_question', 'interactionId', question.interaction_id, 'questions', json(question.questions_json)),
+  json_object(
+    'kind', 'user_question',
+    'interactionId', question.interaction_id,
+    'questions', json(question.questions_json)
+  ),
   question.state,
-  CASE WHEN question.answers_json = '{}' THEN NULL
-       ELSE json_object('kind', 'user_answer', 'answers', json(question.answers_json)) END,
+  CASE WHEN question.state IN ('pending', 'answered') THEN question.answers_json ELSE NULL END,
   question.asked_at,
   question.answered_at,
   CASE WHEN question.state = 'delivered' THEN COALESCE(question.answered_at, question.asked_at) ELSE NULL END
 FROM controller_questions AS question
-JOIN controller_threads AS controller ON controller.controller_key = question.controller_key;
+LEFT JOIN controller_threads AS current_thread
+  ON question.state <> 'delivered'
+ AND current_thread.controller_key = question.controller_key
+ AND current_thread.state = 'active'
+ AND current_thread.bb_thread_id IS NOT NULL
+LEFT JOIN controller_generations AS open_generation
+  ON question.state <> 'delivered'
+ AND open_generation.controller_key = question.controller_key
+ AND open_generation.thread_id = current_thread.bb_thread_id
+ AND open_generation.ended_at IS NULL;
+
+UPDATE controller_turns AS turn
+   SET awaiting_interaction_id = (
+     SELECT interaction.interaction_id
+       FROM controller_interactions AS interaction
+      WHERE interaction.turn_id = turn.id
+        AND interaction.state IN ('pending', 'answered')
+      ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC
+      LIMIT 1
+   )
+ WHERE EXISTS (
+   SELECT 1
+     FROM controller_interactions AS interaction
+    WHERE interaction.turn_id = turn.id
+      AND interaction.state IN ('pending', 'answered')
+ );
 DROP TABLE controller_interaction_migration_guard;
 `] as const;
 
@@ -1590,10 +1748,152 @@ CREATE TABLE credential_health (
 );
 `] as const;
 
+export const CONTROLLER_STEER_RESERVATION_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN steer_reservation_turn_id TEXT;
+`] as const;
+
+export const CONTROLLER_SUPERVISOR_ATTEMPT_MIGRATIONS = [String.raw`
+CREATE TABLE controller_supervisor_steer_attempts (
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  reason TEXT NOT NULL CHECK (reason IN ('tool_budget', 'token_budget', 'command_failures')),
+  thread_id TEXT NOT NULL,
+  input_text TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'unknown')),
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  PRIMARY KEY (turn_id, reason),
+  CHECK ((state = 'pending' AND settled_at IS NULL) OR
+         (state IN ('applied', 'unknown') AND settled_at IS NOT NULL))
+);
+CREATE INDEX controller_supervisor_steer_attempts_pending
+  ON controller_supervisor_steer_attempts(turn_id, state);
+`] as const;
+
+export const CONTROLLER_INTERACTION_REPAIR_MIGRATIONS = [String.raw`
+CREATE TABLE controller_interaction_quarantine (
+  source TEXT NOT NULL CHECK (source IN ('controller', 'thread', 'controller_questions')),
+  interaction_id TEXT NOT NULL,
+  turn_id TEXT,
+  controller_key TEXT,
+  bb_thread_id TEXT,
+  controller_generation_id TEXT,
+  thread_id TEXT,
+  title TEXT,
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  answer_json TEXT,
+  prior_state TEXT NOT NULL CHECK (prior_state IN ('pending', 'answered')),
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  quarantined_at INTEGER NOT NULL,
+  PRIMARY KEY (source, interaction_id)
+);
+
+INSERT INTO controller_interaction_quarantine (
+  source, interaction_id, turn_id, controller_key, bb_thread_id,
+  controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+  prior_state, asked_at, answered_at, quarantined_at
+)
+SELECT
+  'controller', interaction.interaction_id, interaction.turn_id, interaction.controller_key,
+  interaction.bb_thread_id, interaction.controller_generation_id, NULL, NULL,
+  interaction.kind, interaction.payload_json, interaction.answer_json,
+  interaction.state, interaction.asked_at, interaction.answered_at, interaction.asked_at
+FROM controller_interactions AS interaction
+WHERE interaction.state IN ('pending', 'answered')
+  AND interaction.interaction_id IS NOT NULL;
+
+INSERT INTO controller_interaction_quarantine (
+  source, interaction_id, turn_id, controller_key, bb_thread_id,
+  controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+  prior_state, asked_at, answered_at, quarantined_at
+)
+SELECT
+  'thread', interaction.interaction_id, NULL, NULL, NULL, NULL,
+  interaction.thread_id, interaction.title, interaction.kind,
+  interaction.payload_json, interaction.answer_json, interaction.state,
+  interaction.asked_at, interaction.answered_at, interaction.asked_at
+FROM thread_interactions AS interaction
+WHERE interaction.state IN ('pending', 'answered');
+
+UPDATE controller_interactions
+   SET state = 'delivered', answer_json = NULL,
+       bb_thread_id = NULL, controller_generation_id = NULL,
+       delivered_at = COALESCE(answered_at, asked_at)
+ WHERE state IN ('pending', 'answered');
+
+UPDATE thread_interactions
+   SET state = 'delivered', answer_json = NULL
+ WHERE state IN ('pending', 'answered');
+
+UPDATE controller_turns
+   SET awaiting_interaction_id = NULL
+ WHERE awaiting_interaction_id IS NOT NULL;
+
+UPDATE controller_questions
+   SET state = 'delivered', answers_json = NULL,
+       answered_at = COALESCE(answered_at, asked_at)
+ WHERE state IN ('pending', 'answered');
+
+UPDATE outbox
+   SET payload_json = CASE
+         WHEN json_valid(payload_json) = 1 THEN json_set(
+           payload_json,
+           '$.reply_markup', json_object('inline_keyboard', json_array())
+         )
+         ELSE json_object('reply_markup', json_object('inline_keyboard', json_array()))
+       END,
+       status = 'pending', lease_owner = NULL, lease_generation = NULL,
+       lease_expires_at = NULL, next_attempt_at = updated_at, last_error = NULL
+ WHERE EXISTS (
+   SELECT 1 FROM controller_interaction_quarantine AS quarantine
+    WHERE (
+      quarantine.source IN ('controller', 'controller_questions')
+      AND substr(outbox.logical_key, 1, length('controller-interaction:' || quarantine.interaction_id || ':')) =
+          'controller-interaction:' || quarantine.interaction_id || ':'
+    ) OR (
+      quarantine.source = 'thread'
+      AND outbox.logical_key = 'thread-interaction:' || quarantine.interaction_id
+    )
+ );
+`] as const;
+
+export const CONTROLLER_FINALIZATION_ENVELOPE_MIGRATIONS = [String.raw`
+ALTER TABLE controller_finalizations
+  ADD COLUMN envelope_version INTEGER NOT NULL DEFAULT 1
+  CHECK (envelope_version >= 1);
+`] as const;
+
+export const CONTROLLER_INTERACTION_FINAL_REPAIR_MIGRATIONS = [String.raw`
+ALTER TABLE controller_interaction_quarantine ADD COLUMN consumed_at INTEGER;
+
+UPDATE outbox
+   SET payload_json = json_object(
+         'text', 'This interaction is no longer available. Open BB to review it.',
+         'reply_markup', json_object('inline_keyboard', json_array()),
+         'disable_web_page_preview', json('true')
+       ),
+       status = 'pending', lease_owner = NULL, lease_generation = NULL,
+       lease_expires_at = NULL, next_attempt_at = updated_at, last_error = NULL
+ WHERE EXISTS (
+   SELECT 1 FROM controller_interaction_quarantine AS quarantine
+    WHERE (
+      quarantine.source IN ('controller', 'controller_questions')
+      AND substr(outbox.logical_key, 1, length('controller-interaction:' || quarantine.interaction_id || ':')) =
+          'controller-interaction:' || quarantine.interaction_id || ':'
+    ) OR (
+      quarantine.source = 'thread'
+      AND outbox.logical_key = 'thread-interaction:' || quarantine.interaction_id
+    )
+ );
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
-  ...UPDATE_CLAIM_MIGRATIONS,
-  ...APPROVAL_BINDING_MIGRATIONS,
+  ...TASK_3_MIGRATIONS,
+  ...TASK_9_MIGRATIONS,
   ...CONTROLLER_MIGRATIONS,
   ...CONTROLLER_STREAM_MIGRATIONS,
   ...THREAD_OPERATION_MIGRATIONS,
@@ -1636,4 +1936,9 @@ export const ALL_MIGRATIONS = [
   ...MERGE_AUTHORITY_MIGRATIONS,
   ...REGRESSION_WATCH_MIGRATIONS,
   ...CREDENTIAL_ACCESS_MIGRATIONS,
+  ...CONTROLLER_STEER_RESERVATION_MIGRATIONS,
+  ...CONTROLLER_SUPERVISOR_ATTEMPT_MIGRATIONS,
+  ...CONTROLLER_INTERACTION_REPAIR_MIGRATIONS,
+  ...CONTROLLER_FINALIZATION_ENVELOPE_MIGRATIONS,
+  ...CONTROLLER_INTERACTION_FINAL_REPAIR_MIGRATIONS,
 ] as const;

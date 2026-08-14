@@ -24,7 +24,7 @@ import { parseProductionStageSnapshot, productionCommandIdentity } from "../serv
 import { validationCommandIdentity } from "../services/effect-runner";
 import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../bb/validation";
 import { CONTROLLER_PROVIDERS } from "./execution-profile";
-import { isControllerThreadTitle } from "./bb-controller";
+import { isControllerThreadTitle, parseControllerSpawnTitle } from "./bb-controller";
 import { MAX_CONTROLLER_OVERLAY, composeControllerInstructions } from "./instructions";
 import {
   parseWorkerThreadTitle,
@@ -119,6 +119,8 @@ type ToolDependencies = {
   now(): number;
   /** Absent exactly when credential mode is disabled; the three access tools fail closed. */
   credentialAccess?: CredentialAccessService;
+  /** Current persisted controller provider; undefined means configuration is invalid. */
+  controllerProviderId?: () => string | undefined;
 };
 
 type EvidenceIndexDescriptor = Readonly<{
@@ -142,6 +144,22 @@ type EvidenceToolExecution = Readonly<{
   afterEvidenceId: number;
   context: PluginAgentToolContext;
 }>;
+
+async function immutableNativeHighWater(
+  dependencies: ToolDependencies,
+  threadId: string,
+  signal: AbortSignal,
+): Promise<number> {
+  const timeline = await dependencies.sdk.threads.timeline({
+    threadId,
+    summaryOnly: "true",
+    signal,
+  });
+  if (!Number.isSafeInteger(timeline.maxSeq) || timeline.maxSeq < 0) {
+    throw new Error("Controller event high-water was invalid");
+  }
+  return timeline.maxSeq;
+}
 
 function evidenceIndexDescriptor(row: ControllerEvidenceRecord): EvidenceIndexDescriptor {
   return {
@@ -209,9 +227,14 @@ function evidenceAuthorization(
 
 function readableReconciliation(
   reconciliation: ControllerEvidenceReconciliation,
+  immutableHighWater: number,
 ): void {
   if (reconciliation.outcome === "stale") {
     throw new ControllerCapabilityAuthorizationError("turn_missing");
+  }
+  if (reconciliation.outcome === "limit_exceeded") return;
+  if (reconciliation.targetSeq !== immutableHighWater) {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
   }
 }
 
@@ -240,13 +263,19 @@ async function executeEvidenceIndex(request: EvidenceToolExecution): Promise<str
   if (!dependencies.evidenceProjector) {
     throw new ControllerCapabilityAuthorizationError("policy_unreadable");
   }
+  const immutableHighWater = await immutableNativeHighWater(
+    dependencies,
+    authorized.controller.threadId!,
+    context.signal,
+  );
   const reconciliation = await dependencies.evidenceProjector.reconcile(
     authorized.controller,
     authorized.turn,
     authorized.fence,
     context.signal,
+    immutableHighWater,
   );
-  readableReconciliation(reconciliation);
+  readableReconciliation(reconciliation, immutableHighWater);
   return currentEvidenceIndex(request, authorized, reconciliation);
 }
 
@@ -267,11 +296,17 @@ async function executeControllerFinalizer(
   if (!dependencies.evidenceProjector) {
     throw new ControllerCapabilityAuthorizationError("policy_unreadable");
   }
+  const immutableHighWater = await immutableNativeHighWater(
+    dependencies,
+    authorized.controller.threadId!,
+    context.signal,
+  );
   const reconciliation = await dependencies.evidenceProjector.reconcile(
     authorized.controller,
     authorized.turn,
     authorized.fence,
     context.signal,
+    immutableHighWater,
   );
   if (reconciliation.outcome === "stale") {
     throw new ControllerCapabilityAuthorizationError("fence_lost");
@@ -281,6 +316,9 @@ async function executeControllerFinalizer(
       `Controller evidence reconciliation is incomplete: ${reconciliation.reconciliationIncomplete}`,
     );
   }
+  if (reconciliation.targetSeq !== immutableHighWater) {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
+  }
   const current = evidenceAuthorization(dependencies, descriptor, context);
   if (current.turn.id !== authorized.turn.id) {
     throw new ControllerCapabilityAuthorizationError("fence_lost");
@@ -289,6 +327,7 @@ async function executeControllerFinalizer(
     ...current.fence,
     turnId: current.turn.id,
     controllerKey: current.controller.controllerKey,
+    bbEventHighWaterSeq: immutableHighWater,
     candidate,
   });
   if (proposed.outcome === "stale") throw new ControllerCapabilityAuthorizationError("fence_lost");
@@ -1119,6 +1158,10 @@ export function verifiedPipelineOutcome(store: TelegramAgentStore, job: Job): bo
     failedProductionStage(store, job, { role: "CANARY", phase: "canary", mergeSha: facts.mergeSha });
 }
 
+function verifiedProductionOutcome(store: TelegramAgentStore, job: Job): boolean {
+  return terminalPipelineFacts(job)?.production !== undefined && verifiedPipelineOutcome(store, job);
+}
+
 function jobProjectionEvidence(
   dependencies: ToolDependencies,
   domain: ControllerJsonObject,
@@ -1157,13 +1200,21 @@ function jobProjectionEvidence(
   const current = exactId ? dependencies.store.getJob(exactId) : null;
   const before = trustedState(resolution).beforeJob;
   const changed = current !== null && before !== null && before !== undefined && current.version !== before.version;
-  const proofKinds: ("job_state" | "pipeline_outcome" | "obligation")[] = ["job_state"];
-  if (mutation === "read" && current !== null && verifiedPipelineOutcome(dependencies.store, current)) {
+  const proofKinds: ("job_state" | "pipeline_outcome" | "production_outcome" | "external_mutation" | "obligation")[] = ["job_state"];
+  const verifiedPipeline = mutation === "read" && current !== null && verifiedPipelineOutcome(dependencies.store, current);
+  const verifiedProduction = mutation === "read" && current !== null && verifiedProductionOutcome(dependencies.store, current);
+  if (mutation !== "read" && changed) proofKinds.push("external_mutation");
+  if (verifiedPipeline) {
     proofKinds.push("pipeline_outcome");
   }
+  if (verifiedProduction) proofKinds.push("production_outcome");
   if (current !== null && !TERMINAL_JOB_STATES.has(current.state) && mutation !== "cancel") proofKinds.push("obligation");
   return {
-    outcome: mutation !== "read" && changed ? "succeeded" : "observed",
+    outcome: mutation !== "read" && changed
+      ? "succeeded"
+      : verifiedPipeline && (current?.state === "merged" || current?.state === "complete")
+        ? "succeeded"
+        : verifiedPipeline ? "interrupted" : "observed",
     proofKinds,
     subjectRefs: refs,
   };
@@ -1200,10 +1251,13 @@ async function projectTrustedEvidence(
           : job.sourceUpdateId !== authorized.turn.updateId ||
             (capturedId !== undefined && capturedId !== job.id))
       ) throw new Error("created job is not bound to the authorized project and turn");
-      const proofKinds: ("job_state" | "obligation")[] = job ? ["job_state"] : [];
+      const created = capturedId === job.id && trustedState(resolution).beforeJob === null;
+      const proofKinds: ("job_state" | "external_mutation" | "obligation")[] = job
+        ? ["job_state", ...(created ? ["external_mutation" as const] : [])]
+        : [];
       if (job && !TERMINAL_JOB_STATES.has(job.state)) proofKinds.push("obligation");
       return {
-        outcome: capturedId === job.id && trustedState(resolution).beforeJob === null ? "succeeded" : "observed",
+        outcome: created ? "succeeded" : "observed",
         proofKinds,
         subjectRefs: refs,
       };
@@ -1307,7 +1361,14 @@ async function projectTrustedEvidence(
     }
     case "telegram_agent_cancel_watch":
       return { outcome: domain.cancelled === true ? "succeeded" : "observed", proofKinds: ["monitor_state"], subjectRefs: resolution.scope.entityRefs };
-    case "telegram_agent_health":
+    case "telegram_agent_health": {
+      const report = recordValue(domain);
+      return {
+        outcome: report?.ok === true ? "succeeded" : "interrupted",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: [`controller:${authorized.controller.controllerKey}`],
+      };
+    }
     case "telegram_agent_scorecard":
       return { outcome: "observed", proofKinds: ["health_snapshot"], subjectRefs: [`controller:${authorized.controller.controllerKey}`] };
     case "telegram_agent_delegate": {
@@ -2250,6 +2311,18 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   bb.agents.configure((context) => {
     const mappedController = dependencies.store.getControllerByThreadId(context.thread.id);
+    const activeMappedController = mappedController?.state === "active" && mappedController.threadId !== null
+      ? mappedController
+      : null;
+    const spawnIdentity = parseControllerSpawnTitle(context.thread.title);
+    const pendingController = activeMappedController === null && spawnIdentity !== null
+      ? dependencies.store.getControllerForPendingSpawn({
+        controllerKey: spawnIdentity.controllerKey,
+        turnId: spawnIdentity.pendingSpawnToken,
+        pendingSpawnToken: spawnIdentity.pendingSpawnToken,
+        now: dependencies.now(),
+      })
+      : null;
     const owner = dependencies.store.getOwner();
     const ownerController = owner
       ? dependencies.store.getControllerForOwner(owner.userId, owner.chatId)
@@ -2257,17 +2330,36 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     const pending = ownerController
       ? dependencies.store.getPendingControllerTurn(ownerController.controllerKey)
       : null;
-    const mappedCandidate = mappedController !== null &&
-      mappedController.projectId === context.project.id &&
-      mappedController.hostId === context.host.id;
-    const spawningCandidate = mappedController === null && ownerController !== null && pending !== null &&
+    const legacySpawningCandidate = activeMappedController === null && pendingController === null &&
+      ownerController !== null && pending !== null &&
       ownerController.threadId === null && ownerController.pendingSpawnToken === pending.id &&
       pending.state === "dispatching";
-    const controller = mappedController ?? (spawningCandidate ? ownerController : null);
-    const candidate = controller !== null && (mappedCandidate || spawningCandidate) &&
+    const configuredProviderId = dependencies.controllerProviderId?.();
+    const providerMatches = configuredProviderId !== undefined &&
+      (CONTROLLER_PROVIDERS as readonly string[]).includes(configuredProviderId) &&
+      context.provider.id === configuredProviderId;
+    const controller = activeMappedController ?? pendingController ??
+      (legacySpawningCandidate ? ownerController : null);
+    const mappedCandidate = activeMappedController !== null &&
+      activeMappedController.projectId === context.project.id &&
+      activeMappedController.hostId === context.host.id &&
+      isControllerThreadTitle(context.thread.title, activeMappedController.controllerKey, {
+        projectId: activeMappedController.projectId,
+        hostId: activeMappedController.hostId,
+        providerId: context.provider.id,
+      });
+    const pendingCandidate = pendingController !== null && spawnIdentity !== null &&
+      spawnIdentity.controllerKey === pendingController.controllerKey &&
+      spawnIdentity.pendingSpawnToken === pendingController.pendingSpawnToken &&
+      spawnIdentity.projectId === context.project.id &&
+      spawnIdentity.hostId === context.host.id &&
+      spawnIdentity.providerId === context.provider.id &&
+      pendingController.projectId === context.project.id &&
+      pendingController.hostId === context.host.id;
+    const candidate = controller !== null && (mappedCandidate || pendingCandidate || legacySpawningCandidate) &&
       context.origin.kind === null &&
       context.origin.pluginId === bb.pluginId &&
-      (CONTROLLER_PROVIDERS as readonly string[]).includes(context.provider.id) &&
+      providerMatches &&
       context.project.kind === "personal" &&
       context.environment.workspaceProvisionType === "personal" &&
       isControllerThreadTitle(context.thread.title, controller.controllerKey);

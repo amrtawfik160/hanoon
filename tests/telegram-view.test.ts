@@ -7,12 +7,33 @@ import {
   renderJobStatus,
   renderJobStatusSummary,
   renderProjectPicker,
+  type CallbackAction,
 } from "../src/telegram/view";
 import type { JobAdmission } from "../src/autonomy/models";
 import { jobFixture, policyFixture } from "./helpers";
 
 const telegramJobId = "abcdefghijklmnopqrstuv";
 const mergeNonce = "N".repeat(32);
+
+it("round-trips generic controller interaction callbacks within Telegram's limit", () => {
+  const action: CallbackAction = { type: "controller_interaction", token: "T".repeat(32) };
+  const encoded = encodeCallbackData(action);
+
+  expect(encoded).toBe(`i:${"T".repeat(32)}`);
+  expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(64);
+  expect(parseCallbackData(encoded)).toEqual(action);
+  expect(parseCallbackData(`q:${"T".repeat(32)}`)).toEqual({ type: "question", token: "T".repeat(32) });
+  expect(() => encodeCallbackData({ type: "controller_interaction", token: "T".repeat(33) })).toThrow();
+});
+
+it("keeps the legacy q namespace parse-only", () => {
+  const legacyQuestion = {
+    type: "question",
+    token: "T".repeat(32),
+  } as unknown as CallbackAction;
+
+  expect(() => encodeCallbackData(legacyQuestion)).toThrow();
+});
 
 function expectWellFormedTelegramHtml(text: string): void {
   const openTags: string[] = [];

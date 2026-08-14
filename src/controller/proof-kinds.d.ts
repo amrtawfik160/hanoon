@@ -15,6 +15,7 @@ export declare const CONTROLLER_PROOF_KINDS: readonly [
   "workspace_change",
   "external_mutation",
   "pipeline_outcome",
+  "production_outcome",
   "obligation",
   "retrieved_content",
   "health_snapshot",

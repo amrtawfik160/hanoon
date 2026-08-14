@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   canonicalControllerJson,
   ControllerCapabilityExecutionError,
@@ -11,10 +11,15 @@ import {
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
 import { registerControllerTools, verifiedPipelineOutcome } from "../src/controller/tools";
 import {
+  disposeControllerTrustFixtures,
   registeredControllerFixture,
   submittedControllerFixture,
   validEvidenceInput,
 } from "./support/controller-trust-fixtures";
+
+afterEach(async () => {
+  await disposeControllerTrustFixtures();
+});
 import { policyFixture } from "./helpers";
 import { EffectRunner } from "../src/services/effect-runner";
 import { runProductionStage } from "../src/services/production-runner";
@@ -72,6 +77,94 @@ it("does not invoke a domain call when the adopted executor fence is stale", asy
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
 });
 
+it("reserves a mutating invocation before async scope resolution can finalize the turn", async () => {
+  const fixture = executorFixture();
+  let releaseResolution!: () => void;
+  const resolutionReleased = new Promise<void>((resolve) => {
+    releaseResolution = resolve;
+  });
+  let scopeResolved!: () => void;
+  const resolutionStarted = new Promise<void>((resolve) => {
+    scopeResolved = resolve;
+  });
+  const run = vi.fn(() => ({ remembered: { id: "memory_1" } }));
+
+  const execution = executeControllerCapability(fixture.dependencies, {
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
+    params: { subject: "style", body: "Use short answers.", kind: "fact" },
+    context: fixture.context,
+    resolveScope: async () => {
+      scopeResolved();
+      await resolutionReleased;
+      return { scope: globalScope };
+    },
+    run,
+    projectEvidence: () => ({
+      outcome: "succeeded" as const,
+      proofKinds: ["memory_state"] as const,
+      subjectRefs: [] as const,
+    }),
+  });
+
+  await resolutionStarted;
+  expect(fixture.db.prepare(
+    "SELECT state FROM tool_receipts WHERE turn_id = ?",
+  ).get(fixture.turn.id)).toEqual({ state: "started" });
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "Here is the requested answer." }],
+      obligationRefs: [],
+    },
+  })).toMatchObject({ outcome: "rejected", code: "invocation_in_flight" });
+  expect(run).not.toHaveBeenCalled();
+
+  releaseResolution();
+  await expect(execution).resolves.toContain("evidence:1");
+  expect(run).toHaveBeenCalledOnce();
+  expect(fixture.store.proposeControllerFinalization({
+    ...fixture.fence,
+    turnId: fixture.turn.id,
+    controllerKey: fixture.turn.controllerKey,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "Here is the requested answer." }],
+      obligationRefs: [],
+    },
+  })).toMatchObject({ outcome: "accepted" });
+});
+
+it("rolls back receipt settlement when evidence persistence fails", async () => {
+  const fixture = executorFixture();
+  fixture.db.function("fail_controller_evidence_insert", () => {
+    throw new Error("evidence insert failed");
+  });
+  fixture.db.exec(`
+    CREATE TRIGGER fail_controller_evidence_insert
+    BEFORE INSERT ON controller_evidence
+    BEGIN
+      SELECT fail_controller_evidence_insert();
+    END
+  `);
+
+  await expect(executeControllerCapability(fixture.dependencies, {
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
+    params: { subject: "style", body: "Use short answers.", kind: "fact" },
+    context: fixture.context,
+    scope: globalScope,
+    run: () => ({ remembered: { id: "memory_1" } }),
+    projectEvidence: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [] }),
+  })).rejects.toThrow();
+
+  expect(fixture.store.listToolReceipts(fixture.turn.id)).toMatchObject([
+    { toolName: "telegram_agent_remember", state: "started", result: null },
+  ]);
+  expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
+});
+
 it("denies every normal capability after durable acceptance before receipts or evidence", () => {
   const fixture = executorFixture();
   expect(fixture.store.proposeControllerFinalization({
@@ -80,7 +173,7 @@ it("denies every normal capability after durable acceptance before receipts or e
     controllerKey: fixture.turn.controllerKey,
     candidate: {
       disposition: "answered",
-      segments: [{ type: "text", text: "Done." }],
+      segments: [{ type: "text", text: "Here is the requested answer." }],
       obligationRefs: [],
     },
   })).toMatchObject({ outcome: "accepted" });
@@ -113,7 +206,7 @@ it("reports a stale fence before durable finalization", () => {
     controllerKey: fixture.turn.controllerKey,
     candidate: {
       disposition: "answered",
-      segments: [{ type: "text", text: "Done." }],
+      segments: [{ type: "text", text: "Here is the requested answer." }],
       obligationRefs: [],
     },
   })).toMatchObject({ outcome: "accepted" });
@@ -482,17 +575,59 @@ it("records interrupted receipt uncertainty without invoking the domain call", a
   })).toEqual({ outcome: "fresh" });
   const run = vi.fn(() => ({ unreachable: true }));
 
-  const output = JSON.parse(await executeControllerCapability(fixture.dependencies, {
+  const input = {
     descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
     params,
     context: fixture.context,
     scope: globalScope,
     run,
-    projectEvidence: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [] }),
-  }));
+    projectEvidence: () => ({
+      outcome: "succeeded" as const,
+      proofKinds: ["memory_state"] as const,
+      subjectRefs: [] as const,
+    }),
+  } as const;
+  const output = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
+  const repeated = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
 
   expect(run).not.toHaveBeenCalled();
   expect(output).toMatchObject({
+    outcome: "uncertain",
+    _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
+  });
+  expect(repeated).toMatchObject({
+    outcome: "uncertain",
+    _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
+  });
+  expect(fixture.store.listToolReceipts(fixture.turn.id)).toMatchObject([
+    { toolName: "telegram_agent_remember", state: "failed", result: null },
+  ]);
+});
+
+it("does not repeat a mutation whose domain operation threw after reservation", async () => {
+  const fixture = executorFixture();
+  const params = { subject: "style", body: "Use short answers.", kind: "fact" };
+  const run = vi.fn(() => {
+    throw new Error("write result became ambiguous");
+  });
+  const input = {
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
+    params,
+    context: fixture.context,
+    scope: globalScope,
+    run,
+    projectEvidence: () => ({
+      outcome: "succeeded" as const,
+      proofKinds: ["memory_state"] as const,
+      subjectRefs: [] as const,
+    }),
+  } as const;
+
+  await expect(executeControllerCapability(fixture.dependencies, input)).rejects.toThrow("ambiguous");
+  const replay = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
+
+  expect(run).toHaveBeenCalledOnce();
+  expect(replay).toMatchObject({
     outcome: "uncertain",
     _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
   });
@@ -713,15 +848,13 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
         output: "verified",
       })),
       requiredChecks: [{ name: "test", bucket: "pass", state: "SUCCESS", link: null }],
-      // Validation is only promotable against a PR the writer actually observed
-      // open, undrafted, and on the policy base branch.
       githubPr: {
         number: 17,
         url: "https://github.com/acme/cyndra/pull/17",
         state: "OPEN",
         isDraft: false,
         baseRefName: policy.baseBranch,
-        headRefName: "feature/verified",
+        headRefName: "feature/verified-chain",
         mergeStateStatus: "CLEAN",
         mergeable: "MERGEABLE",
         reviewDecision: null,
@@ -806,6 +939,23 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   }));
 
   expect(verifiedPipelineOutcome(fixture.store, job)).toBe(true);
+  registerControllerTools(fixture.bb, {
+    store: fixture.store,
+    sdk: fixture.bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 2_002,
+  });
+  const controller = fixture.store.getControllerForOwner("7", "7");
+  if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
+  const mergedStatus = JSON.parse(await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    { jobId: job.id },
+    { threadId: controller.threadId, projectId: controller.projectId },
+  ) as string) as { _hanoonEvidence: { outcome: string; proofKinds: string[] } };
+  expect(mergedStatus._hanoonEvidence).toMatchObject({ outcome: "succeeded" });
+  expect(mergedStatus._hanoonEvidence.proofKinds).toContain("pipeline_outcome");
   const finalTest = fixture.store.getLatestPipelineStageAttempt(job.id, "FINAL_TEST");
   if (!finalTest?.outcome) throw new Error("real final validation outcome disappeared");
   const originalOutcome = finalTest.outcome;
@@ -825,16 +975,6 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   writeOutcome({ ...originalOutcome, requiredChecks: [{ name: "test", bucket: "pass" }] });
   expect(verifiedPipelineOutcome(fixture.store, job)).toBe(false);
   writeOutcome({ ...originalOutcome, completedAt: "not-a-date" });
-  registerControllerTools(fixture.bb, {
-    store: fixture.store,
-    sdk: fixture.bb.sdk,
-    threadOperations: { request: vi.fn() },
-    health: () => ({ ok: true }),
-    notify: vi.fn(),
-    now: () => 2_002,
-  });
-  const controller = fixture.store.getControllerForOwner("7", "7");
-  if (!controller?.threadId || !controller.projectId) throw new Error("controller fixture is incomplete");
   const status = JSON.parse(await fixture.harness.behavior.callAgentTool(
     "telegram_agent_job_status",
     { jobId: job.id },
@@ -942,6 +1082,12 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
   const completeJob = fixture.store.getJob(job.id);
   if (!completeJob) throw new Error("complete pipeline job disappeared");
   expect(verifiedPipelineOutcome(fixture.store, completeJob)).toBe(true);
+  const completeStatus = JSON.parse(await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_job_status",
+    { jobId: job.id },
+    { threadId: controller.threadId, projectId: controller.projectId },
+  ) as string) as { _hanoonEvidence: { proofKinds: string[] } };
+  expect(completeStatus._hanoonEvidence.proofKinds).toContain("production_outcome");
 
   const mutateProduction = (id: string, snapshot: Record<string, unknown>) => {
     const outputText = JSON.stringify(snapshot);
@@ -1010,7 +1156,7 @@ it("projects the remaining memory, monitor, health, scorecard, and style rows fr
 
   const health = await call("telegram_agent_health", {});
   expect(health._hanoonEvidence).toMatchObject({
-    outcome: "observed",
+    outcome: "succeeded",
     proofKinds: ["health_snapshot"],
     subjectRefs: [`controller:${fixture.turn.controllerKey}`],
   });

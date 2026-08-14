@@ -279,10 +279,10 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
 it("matches the exact trusted 21-tool projection permission matrix", () => {
   const expected = [
     ["telegram_agent_list_projects", ["project_state"]],
-    ["telegram_agent_start_job", ["job_state", "obligation"]],
-    ["telegram_agent_job_status", ["job_state", "pipeline_outcome", "obligation"]],
-    ["telegram_agent_retry_job", ["job_state", "obligation"]],
-    ["telegram_agent_cancel_job", ["job_state"]],
+    ["telegram_agent_start_job", ["job_state", "external_mutation", "obligation"]],
+    ["telegram_agent_job_status", ["job_state", "pipeline_outcome", "production_outcome", "obligation"]],
+    ["telegram_agent_retry_job", ["job_state", "external_mutation", "obligation"]],
+    ["telegram_agent_cancel_job", ["job_state", "external_mutation"]],
     ["telegram_agent_list_threads", ["thread_state"]],
     ["telegram_agent_thread_status", ["thread_state"]],
     ["telegram_agent_read_thread", ["thread_state"]],
@@ -428,7 +428,7 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
       },
       expected: () => ({
         outcome: "succeeded",
-        proofKinds: ["job_state", "obligation"],
+        proofKinds: ["job_state", "external_mutation", "obligation"],
         subjectRefs: [`job:${state.startedJobId!}`],
       }),
     },
@@ -446,14 +446,14 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
       params: () => ({ jobId: "job_matrix_retry" }),
       expected: () => ({
         outcome: "succeeded",
-        proofKinds: ["job_state", "obligation"],
+        proofKinds: ["job_state", "external_mutation", "obligation"],
         subjectRefs: ["job:job_matrix_retry"],
       }),
     },
     {
       name: "telegram_agent_cancel_job",
       params: () => ({ jobId: "job_matrix_cancel" }),
-      expected: () => ({ outcome: "succeeded", proofKinds: ["job_state"], subjectRefs: ["job:job_matrix_cancel"] }),
+      expected: () => ({ outcome: "succeeded", proofKinds: ["job_state", "external_mutation"], subjectRefs: ["job:job_matrix_cancel"] }),
     },
     {
       name: "telegram_agent_list_threads",
@@ -555,7 +555,7 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
       name: "telegram_agent_health",
       params: () => ({}),
       expected: () => ({
-        outcome: "observed",
+        outcome: "succeeded",
         proofKinds: ["health_snapshot"],
         subjectRefs: ["controller:owner-7-controller"],
       }),
@@ -915,6 +915,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     health: () => ({ ok: true }),
     notify,
     now: () => 10_000,
+    controllerProviderId: () => "codex",
   });
 
   expect(harness.registrations.agentTools.map((tool) => tool.name)).toEqual(ALL_CONTROLLER_TOOL_NAMES);
@@ -942,11 +943,11 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     ...context,
     thread: { ...context.thread, id: "thr_unrelated" },
   })).tools).toEqual([]);
-  // Either controller provider may host the conversation; anything else may not.
+  // The controller is bound to the configured provider; anything else may not.
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
     provider: { id: "claude-code", model: "claude-opus-5[1m]" },
-  })).tools.map((tool) => tool.name)).toEqual(minimumTools);
+  })).tools).toEqual([]);
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
     provider: { id: "acp-grok", model: "grok" },
@@ -1067,6 +1068,7 @@ it("exposes an approved bundle only after the persisted continuation profile is 
     health: () => ({ ok: true }),
     notify: vi.fn(),
     now: () => now,
+    controllerProviderId: () => "codex",
   });
 
   expect(parseToolJson(await harness.behavior.callAgentTool(
@@ -1548,14 +1550,18 @@ it.each([
     now: 10_100,
     turnId: turn.id,
   })).toBe(true);
-  bb.storage.database().exec(`
-    CREATE TRIGGER race_job_resolution AFTER INSERT ON tool_receipts
-    WHEN NEW.tool_name = '${toolName}'
-    BEGIN
-      UPDATE jobs SET state = '${racedState}', version = version + 1
-      WHERE id = 'controller_job_b';
-    END;
-  `);
+  const listControlJobs = store.listControlJobs.bind(store);
+  let raced = false;
+  vi.spyOn(store, "listControlJobs").mockImplementation((kind, limit) => {
+    const candidates = listControlJobs(kind, limit);
+    if (!raced) {
+      raced = true;
+      bb.storage.database().prepare(
+        "UPDATE jobs SET state = ?, version = version + 1 WHERE id = ?",
+      ).run(racedState, "controller_job_b");
+    }
+    return candidates;
+  });
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
@@ -1590,13 +1596,18 @@ it.each([
   activate();
   const before = store.getJob("controller_job_exact");
   if (!before) throw new Error("exact race job was not created");
-  bb.storage.database().exec(`
-    CREATE TRIGGER race_exact_job_version AFTER INSERT ON tool_receipts
-    WHEN NEW.tool_name = '${toolName}'
-    BEGIN
-      UPDATE jobs SET version = version + 1 WHERE id = 'controller_job_exact';
-    END;
-  `);
+  const getJob = store.getJob.bind(store);
+  let raced = false;
+  vi.spyOn(store, "getJob").mockImplementation((jobId) => {
+    const job = getJob(jobId);
+    if (!raced && jobId === before.id) {
+      raced = true;
+      bb.storage.database().prepare(
+        "UPDATE jobs SET version = version + 1 WHERE id = ?",
+      ).run(before.id);
+    }
+    return job;
+  });
   const notify = vi.fn();
   registerControllerTools(bb, {
     store,

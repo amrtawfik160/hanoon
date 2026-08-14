@@ -80,7 +80,9 @@ import { assertSafeFailureSummary, containsCredentialLikeText, transition } from
 import { ALL_MIGRATIONS } from "./migrations";
 import {
   CONTROLLER_MEDIA_MIME_TYPES,
+  CONTROLLER_IMAGE_MIME_TYPES,
   CONTROLLER_PHASE_TEXT,
+  MAX_CONTROLLER_IMAGE_BYTES,
   MAX_PERSISTED_MEDIA_BYTES,
   normalizeControllerImage,
   type ControllerImage,
@@ -95,12 +97,17 @@ import {
 import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervisor";
 import { MAX_CONTROLLER_OVERLAY } from "../controller/instructions";
 import {
+  nextUnansweredQuestion,
+  parseControllerInteraction,
+  parseControllerInteractionResolution,
   questionOptionToken,
   renderControllerInteraction,
   renderThreadInteraction,
+  parseThreadInteraction,
   threadDecisionToken,
   type ControllerInteraction,
   type ControllerQuestionAnswers,
+  type ControllerQuestion,
   type ThreadInteraction,
 } from "../controller/questions";
 import {
@@ -148,16 +155,18 @@ import {
   type AcceptedControllerFinalization,
   type ControllerEvidenceInput,
   type ControllerEvidenceRecord,
+  type ControllerToolReceiptSettlementInput,
   type ControllerEvidenceWrite,
   type ControllerFinalizationProposalInput,
   type ControllerFinalizationProposalResult,
   type ControllerNativeEvidenceInput,
   type ControllerNativeEvidenceWrite,
 } from "./controller-evidence-repository";
-
 import {
   ControllerInteractionRepository,
   type ControllerInteractionAnswer,
+  type ControllerInteractionRecordOutcome,
+  type ControllerInteractionDeliveryFence,
   type ControllerInteractionDelivery,
   type ControllerInteractionRecord,
 } from "./controller-interaction-repository";
@@ -200,6 +209,25 @@ export { VersionConflictError, assertSafeExternalHttpsUrl };
 type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
 type PluginKv = PluginStorage["kv"];
+const CONTROLLER_INTERACTION_TAIL_ID = 29;
+const RETIRED_CONTROLLER_INTERACTION_NOTICE = "This interaction is no longer available. Open BB to review it.";
+const RETIRED_CONTROLLER_INTERACTION_PAYLOAD = JSON.stringify({
+  text: RETIRED_CONTROLLER_INTERACTION_NOTICE,
+  reply_markup: { inline_keyboard: [] },
+  disable_web_page_preview: true,
+});
+
+type LegacyControllerQuestionRow = Readonly<{
+  rowid: number;
+  interaction_id: unknown;
+  turn_id: unknown;
+  controller_key: unknown;
+  questions_json: unknown;
+  state: unknown;
+  answers_json: unknown;
+  asked_at: unknown;
+  answered_at: unknown;
+}>;
 
 export type CapabilityDispatchSettings = Readonly<{
   jobGraph: CapabilityJobGraphMode;
@@ -349,7 +377,16 @@ export type ToolReceiptKey = {
 export type ToolReceiptClaim =
   | { outcome: "fresh" }
   | { outcome: "completed"; result: string }
-  | { outcome: "interrupted" };
+  | { outcome: "interrupted" }
+  | { outcome: "finalized" }
+  | { outcome: "fence_lost" };
+
+export type ToolReceiptClaimInput = ToolReceiptKey & Readonly<{
+  controllerKey: string;
+  now: number;
+  ownerId?: string;
+  generation?: number;
+}>;
 
 export type ControllerGeneration = {
   id: string;
@@ -562,6 +599,59 @@ export type ExecutorAttemptPatch = ExecutorFence & Readonly<{
     result?: Record<string, unknown> | null;
     completedAt?: number | null;
   };
+}>;
+
+export type ControllerSteerReservation = Readonly<{
+  controllerKey: string;
+  runningTurnId: string;
+  waitingTurnId: string;
+  threadId: string;
+  inputText: string | null;
+  idempotencyKey: string;
+}>;
+export type ControllerSteerSettlement = "applied" | "not_applied" | "unknown";
+export type ControllerSteerSettlementResult = "settled" | "stale";
+export type ControllerSteerSettlementInput = ControllerLeaseFence & Readonly<{
+  runningTurnId: string;
+  waitingTurnId: string;
+  controllerKey: string;
+  outcome: ControllerSteerSettlement;
+}>;
+
+export type ControllerSupervisorSteerState = "pending" | "applied" | "unknown";
+export type ControllerSupervisorSteerAttempt = Readonly<{
+  turnId: string;
+  controllerKey: string;
+  reason: SupervisorReason;
+  threadId: string;
+  inputText: string;
+  idempotencyKey: string;
+  state: ControllerSupervisorSteerState;
+  createdAt: number;
+  settledAt: number | null;
+}>;
+export type ControllerSupervisorSteerClaim = "claimed" | "pending" | "settled" | "stale";
+export type ControllerSupervisorSteerClaimInput = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+  expectedThreadId: string;
+  reason: SupervisorReason;
+  inputText: string;
+}>;
+export type ControllerSupervisorSteerSettlement = "applied" | "unknown";
+export type ControllerSupervisorSteerSettlementInput = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+  reason: SupervisorReason;
+  outcome: ControllerSupervisorSteerSettlement;
+}>;
+
+type ControllerSteerSettlementRow = Readonly<{
+  controllerKey: string;
+  waitingState: ControllerTurnState | null;
+  waitingOrdinal: number | null;
+  inputText: string | null;
+  telegramChatId: string;
 }>;
 
 export type ExecutorReviewThreadInput = ExecutorFence & Readonly<{
@@ -946,6 +1036,7 @@ type ControllerTurnRow = {
   evidence_event_seq: number;
   completion_continuations: number;
   accepted_finalization_id: number | null;
+  steer_reservation_turn_id: string | null;
   evidence_limit_exceeded_at: number | null;
   stream_text: string;
   telegram_message_id: number | null;
@@ -969,6 +1060,17 @@ type ControllerTurnRow = {
   capability_continuation_state: ControllerTurnRecord["capabilityContinuationState"];
   created_at: number;
   updated_at: number;
+};
+type ControllerSupervisorSteerAttemptRow = {
+  turn_id: string;
+  controller_key: string;
+  reason: string;
+  thread_id: string;
+  input_text: string;
+  idempotency_key: string;
+  state: string;
+  created_at: number;
+  settled_at: number | null;
 };
 type ObservedThreadRow = {
   thread_id: string;
@@ -999,6 +1101,14 @@ export type ThreadInteractionDelivery = {
   title: string;
   resolution: Record<string, unknown>;
 };
+export type ControllerInteractionCallbackResult = Readonly<{
+  answer: ControllerInteractionAnswer;
+  recorded: boolean;
+}>;
+
+export type ControllerInteractionTextUpdateResult =
+  | Readonly<{ outcome: "replay" }>
+  | Readonly<{ outcome: "handled"; answer: ControllerInteractionAnswer }>;
 type ThreadOperationRow = {
   id: string;
   nonce_hash: string;
@@ -1953,6 +2063,490 @@ function ensureApprovalOwnershipColumns(db: SqliteDatabase): void {
 }
 
 export type ControllerFailAndRetireOutcome = "retired" | "stale" | "accepted_won";
+function parseLegacyJson(jsonText: unknown): unknown | null {
+  if (typeof jsonText !== "string") return null;
+  try {
+    return JSON.parse(jsonText) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+type LegacyControllerQuestionRepair = Readonly<{
+  invalid: LegacyControllerQuestionRow[];
+}>;
+
+type ValidatedLegacyControllerQuestion = Readonly<{
+  questionsJson: string;
+  answersJson: string | null;
+  state: "pending" | "answered";
+  answeredAt: number | null;
+}>;
+
+function nonNegativeLegacyTimestamp(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function legacyQuestionAnswerIsSubstantive(
+  answer: ControllerQuestionAnswers[string] | undefined,
+): boolean {
+  return (answer?.selected.length ?? 0) > 0 || (answer?.freeText?.trim().length ?? 0) > 0;
+}
+
+function legacyQuestionAnswerMapHasAllQuestionKeys(
+  questions: readonly ControllerQuestion[],
+  answers: ControllerQuestionAnswers,
+): boolean {
+  return questions.every((question) => Object.hasOwn(answers, question.id));
+}
+
+function legacyQuestionAnswerMapHasNonSubstantiveAnswer(
+  questions: readonly ControllerQuestion[],
+  answers: ControllerQuestionAnswers,
+): boolean {
+  return questions.some((question) => (
+    Object.hasOwn(answers, question.id) && !legacyQuestionAnswerIsSubstantive(answers[question.id])
+  ));
+}
+
+function legacyQuestionAnswersWithoutNonSubstantive(
+  answers: ControllerQuestionAnswers,
+): ControllerQuestionAnswers {
+  const normalized: ControllerQuestionAnswers = {};
+  for (const [questionId, answer] of Object.entries(answers)) {
+    if (legacyQuestionAnswerIsSubstantive(answer)) normalized[questionId] = answer;
+  }
+  return normalized;
+}
+
+function legacyQuestionAnswerMapIsComplete(
+  questions: readonly ControllerQuestion[],
+  answers: ControllerQuestionAnswers,
+): boolean {
+  return nextUnansweredQuestion(questions, answers) === null && questions.every((question) => (
+    legacyQuestionAnswerIsSubstantive(answers[question.id])
+  ));
+}
+
+function sanitizedLegacyQuestionsJson(interactionId: string, jsonText: unknown): string {
+  const questions = parseLegacyJson(jsonText);
+  const interaction = parseControllerInteraction(interactionId, { kind: "user_question", questions });
+  return interaction?.kind === "user_question" ? JSON.stringify(interaction.questions) : "[]";
+}
+
+function validateLegacyControllerQuestion(row: LegacyControllerQuestionRow): ValidatedLegacyControllerQuestion | null {
+  if (row.state !== "pending" && row.state !== "answered") return null;
+  const questions = parseLegacyJson(row.questions_json);
+  const interaction = parseControllerInteraction(row.interaction_id, { kind: "user_question", questions });
+  if (!interaction || interaction.kind !== "user_question") return null;
+  if (row.answers_json === null) {
+    return row.state === "pending"
+      ? {
+          questionsJson: JSON.stringify(interaction.questions),
+          answersJson: null,
+          state: "pending",
+          answeredAt: null,
+        }
+      : null;
+  }
+  const answers = parseLegacyJson(row.answers_json);
+  const resolution = parseControllerInteractionResolution(interaction, answers, row.state);
+  if (!resolution || resolution.kind !== "user_answer") return null;
+  const answerMap = resolution.answers as ControllerQuestionAnswers;
+  if (legacyQuestionAnswerMapHasAllQuestionKeys(interaction.questions, answerMap) &&
+      legacyQuestionAnswerMapHasNonSubstantiveAnswer(interaction.questions, answerMap)) return null;
+  const normalizedAnswers = legacyQuestionAnswersWithoutNonSubstantive(answerMap);
+  const complete = legacyQuestionAnswerMapIsComplete(
+    interaction.questions,
+    normalizedAnswers,
+  );
+  if (!complete && nextUnansweredQuestion(
+    interaction.questions,
+    normalizedAnswers,
+  ) === null) return null;
+  if (row.state === "answered" && !complete) return null;
+  const answeredAt = complete
+    ? nonNegativeLegacyTimestamp(row.answered_at) ?? nonNegativeLegacyTimestamp(row.asked_at)
+    : null;
+  if (complete && answeredAt === null) return null;
+  return {
+    questionsJson: JSON.stringify(interaction.questions),
+    answersJson: JSON.stringify(normalizedAnswers),
+    state: complete ? "answered" : "pending",
+    answeredAt,
+  };
+}
+
+function sanitizeLegacyControllerQuestionSources(db: SqliteDatabase): void {
+  const rows = db.prepare(
+    `SELECT rowid, interaction_id, questions_json, answers_json
+       FROM controller_questions
+      ORDER BY rowid ASC`,
+  ).all() as Array<{
+    rowid: number;
+    interaction_id: unknown;
+    questions_json: unknown;
+    answers_json: unknown;
+  }>;
+  const update = db.prepare(
+    `UPDATE controller_questions
+        SET interaction_id = ?, questions_json = ?, answers_json = ?
+      WHERE rowid = ?`,
+  );
+  for (const row of rows) {
+    const interactionId = typeof row.interaction_id === "string" && row.interaction_id.length > 0
+      ? row.interaction_id
+      : `legacy-row-${row.rowid}`;
+    const questionsJson = sanitizedLegacyQuestionsJson(interactionId, row.questions_json);
+    const answersJson = row.answers_json === null || parseLegacyJson(row.answers_json) !== null
+      ? row.answers_json
+      : null;
+    if (interactionId !== row.interaction_id || questionsJson !== row.questions_json || answersJson !== row.answers_json) {
+      update.run(interactionId, questionsJson, answersJson, row.rowid);
+    }
+  }
+}
+
+function validateLegacyControllerQuestions(db: SqliteDatabase): LegacyControllerQuestionRepair {
+  const rows = db.prepare(
+    `SELECT rowid, interaction_id, turn_id, controller_key, questions_json, state,
+            answers_json, asked_at, answered_at
+       FROM controller_questions
+      WHERE state IN ('pending', 'answered')
+      ORDER BY rowid ASC`,
+  ).all() as LegacyControllerQuestionRow[];
+  const invalid: LegacyControllerQuestionRow[] = [];
+  const stale = db.prepare(
+    `UPDATE controller_questions
+        SET state = 'delivered', answers_json = NULL, answered_at = COALESCE(answered_at, asked_at)
+      WHERE interaction_id = ? AND state IN ('pending', 'answered')`,
+  );
+  for (const row of rows) {
+    const projection = validateLegacyControllerQuestion(row);
+    const identity = typeof row.turn_id === "string" && typeof row.controller_key === "string" &&
+      db.prepare(
+        `SELECT 1
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller
+             ON controller.controller_key = turn.controller_key
+            AND controller.state = 'active'
+            AND controller.bb_thread_id IS NOT NULL
+           JOIN controller_generations AS generation
+             ON generation.controller_key = controller.controller_key
+            AND generation.thread_id = controller.bb_thread_id
+            AND generation.ended_at IS NULL
+          WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+            AND (SELECT COUNT(*) FROM controller_generations AS open_generation
+                  WHERE open_generation.controller_key = controller.controller_key
+                    AND open_generation.ended_at IS NULL) = 1`,
+      ).get(row.turn_id, row.controller_key) !== undefined;
+    if (projection && identity) {
+      db.prepare(
+        `UPDATE controller_questions
+            SET questions_json = ?, answers_json = ?, state = ?, answered_at = ?
+          WHERE rowid = ? AND state IN ('pending', 'answered')`,
+      ).run(
+        projection.questionsJson,
+        projection.answersJson,
+        projection.state,
+        projection.answeredAt,
+        row.rowid,
+      );
+      continue;
+    }
+    invalid.push(row);
+    const safeInteractionId = typeof row.interaction_id === "string" && row.interaction_id.length > 0
+      ? row.interaction_id
+      : `legacy-row-${row.rowid}`;
+    if (safeInteractionId !== row.interaction_id) {
+      db.prepare("UPDATE controller_questions SET interaction_id = ? WHERE rowid = ?")
+        .run(safeInteractionId, row.rowid);
+    }
+    stale.run(safeInteractionId);
+  }
+  sanitizeLegacyControllerQuestionSources(db);
+  return { invalid };
+}
+
+function jsonValue(jsonText: string | null): unknown {
+  if (jsonText === null) return null;
+  try {
+    return JSON.parse(jsonText) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+type RepairQuarantineRow = Readonly<{
+  source: "controller" | "thread" | "controller_questions";
+  interaction_id: string;
+  turn_id: string | null;
+  controller_key: string | null;
+  bb_thread_id: string | null;
+  controller_generation_id: string | null;
+  thread_id: string | null;
+  title: string | null;
+  kind: string;
+  payload_json: string;
+  answer_json: string | null;
+  prior_state: "pending" | "answered";
+  asked_at: number;
+  answered_at: number | null;
+  quarantined_at: number;
+  consumed_at: number | null;
+}>;
+
+function isCurrentControllerInteractionIdentity(
+  db: SqliteDatabase,
+  row: RepairQuarantineRow,
+): boolean {
+  if (row.turn_id === null || row.controller_key === null ||
+      row.bb_thread_id === null || row.controller_generation_id === null) return false;
+  return db.prepare(
+    `SELECT 1
+       FROM controller_turns AS turn
+       JOIN controller_threads AS controller
+         ON controller.controller_key = turn.controller_key
+        AND controller.state = 'active'
+        AND controller.bb_thread_id = ?
+       JOIN controller_generations AS generation
+         ON generation.id = ?
+        AND generation.controller_key = controller.controller_key
+        AND generation.thread_id = controller.bb_thread_id
+        AND generation.ended_at IS NULL
+      WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+        AND (SELECT COUNT(*) FROM controller_generations AS open_generation
+              WHERE open_generation.controller_key = controller.controller_key
+                AND open_generation.ended_at IS NULL) = 1`,
+  ).get(row.bb_thread_id, row.controller_generation_id, row.turn_id, row.controller_key) !== undefined;
+}
+
+function restoreQuarantinedControllerQuestion(
+  db: SqliteDatabase,
+  row: RepairQuarantineRow,
+): boolean {
+  if (row.source !== "controller" || row.kind !== "user_question" ||
+      !isCurrentControllerInteractionIdentity(db, row)) return false;
+  const payload = jsonValue(row.payload_json);
+  const interaction = parseControllerInteraction(row.interaction_id, payload);
+  if (!interaction || interaction.kind !== "user_question") return false;
+  const rawAnswer = jsonValue(row.answer_json);
+  const resolution = rawAnswer === null
+    ? null
+    : parseControllerInteractionResolution(interaction, rawAnswer, row.prior_state);
+  if (row.answer_json !== null && resolution === null) return false;
+  if (row.prior_state === "answered" && resolution === null) return false;
+  const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
+    ? resolution.answers as ControllerQuestionAnswers
+    : {};
+  if (legacyQuestionAnswerMapHasAllQuestionKeys(interaction.questions, answers) &&
+      legacyQuestionAnswerMapHasNonSubstantiveAnswer(interaction.questions, answers)) return false;
+  const normalizedAnswers = legacyQuestionAnswersWithoutNonSubstantive(answers);
+  const next = nextUnansweredQuestion(interaction.questions, normalizedAnswers);
+  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, normalizedAnswers);
+  if (!complete && next === null) return false;
+  if (row.prior_state === "answered" && !complete) return false;
+  const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
+  const restoredAnsweredAt = restoredState === "answered"
+    ? row.answered_at ?? row.asked_at
+    : null;
+  const restored = db.prepare(
+    `UPDATE controller_interactions
+        SET bb_thread_id = ?, controller_generation_id = ?, kind = 'user_question',
+            payload_json = ?, state = ?, answer_json = ?, answered_at = ?, delivered_at = NULL
+      WHERE interaction_id = ? AND state = 'delivered'`,
+  ).run(
+    row.bb_thread_id,
+    row.controller_generation_id,
+    JSON.stringify(interaction),
+    restoredState,
+    resolution ? JSON.stringify({ kind: "user_answer", answers: normalizedAnswers }) : null,
+    restoredAnsweredAt,
+    row.interaction_id,
+  );
+  if (restored.changes !== 1) return false;
+  if (restoredState !== "pending") return true;
+  const controller = db.prepare(
+    "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
+  ).get(row.controller_key) as { telegram_chat_id: string } | undefined;
+  if (!controller) return false;
+  if (!next) return true;
+  const rendered = renderControllerInteraction(interaction, normalizedAnswers);
+  if (!("reply_markup" in rendered)) return true;
+  persistControllerOutbox(db, {
+    logicalKey: `controller-interaction:${row.interaction_id}:${next.index}`,
+    chatId: controller.telegram_chat_id,
+    payload: {
+      ...formattedMessage(rendered.text),
+      reply_markup: rendered.reply_markup,
+      disable_web_page_preview: true,
+    },
+  }, row.asked_at);
+  return true;
+}
+
+function restoreQuarantinedThreadQuestion(
+  db: SqliteDatabase,
+  row: RepairQuarantineRow,
+): boolean {
+  if (row.source !== "thread" || row.kind !== "user_question") return false;
+  const interaction = parseThreadInteraction(row.interaction_id, jsonValue(row.payload_json));
+  if (!interaction || interaction.kind !== "user_question") return false;
+  const rawAnswer = jsonValue(row.answer_json);
+  const resolution = rawAnswer === null
+    ? null
+    : parseControllerInteractionResolution(interaction, rawAnswer, row.prior_state);
+  if (row.answer_json !== null && resolution === null) return false;
+  if (row.prior_state === "answered" && resolution === null) return false;
+  const answers: ControllerQuestionAnswers = resolution?.kind === "user_answer"
+    ? resolution.answers as ControllerQuestionAnswers
+    : {};
+  if (legacyQuestionAnswerMapHasAllQuestionKeys(interaction.questions, answers) &&
+      legacyQuestionAnswerMapHasNonSubstantiveAnswer(interaction.questions, answers)) return false;
+  const normalizedAnswers = legacyQuestionAnswersWithoutNonSubstantive(answers);
+  const next = nextUnansweredQuestion(interaction.questions, normalizedAnswers);
+  const complete = legacyQuestionAnswerMapIsComplete(interaction.questions, normalizedAnswers);
+  if (!complete && next === null) return false;
+  if (row.prior_state === "answered" && !complete) return false;
+  const restoredState: "pending" | "answered" = complete ? "answered" : "pending";
+  const restoredAnsweredAt = restoredState === "answered"
+    ? row.answered_at ?? row.asked_at
+    : null;
+  const restored = db.prepare(
+    `UPDATE thread_interactions
+        SET kind = 'user_question', payload_json = ?, state = ?, answer_json = ?, answered_at = ?
+      WHERE interaction_id = ? AND state = 'delivered'`,
+  ).run(
+    JSON.stringify(interaction),
+    restoredState,
+    resolution ? JSON.stringify({ kind: "user_answer", answers: normalizedAnswers }) : null,
+    restoredAnsweredAt,
+    row.interaction_id,
+  );
+  if (restored.changes !== 1) return false;
+  if (restoredState !== "pending" || row.thread_id === null || row.title === null) return true;
+  const rendered = renderThreadInteraction(row.title, interaction);
+  if (!("reply_markup" in rendered)) return true;
+  const existing = db.prepare(
+    "SELECT chat_id FROM outbox WHERE logical_key = ?",
+  ).get(`thread-interaction:${row.interaction_id}`) as { chat_id: string } | undefined;
+  if (!existing) return true;
+  persistControllerOutbox(db, {
+    logicalKey: `thread-interaction:${row.interaction_id}`,
+    chatId: existing.chat_id,
+    payload: {
+      ...formattedMessage(rendered.text),
+      reply_markup: rendered.reply_markup,
+      disable_web_page_preview: true,
+    },
+  }, row.asked_at);
+  return true;
+}
+
+function quarantineLegacyControllerQuestions(
+  db: SqliteDatabase,
+  rows: readonly LegacyControllerQuestionRow[],
+): void {
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO controller_interaction_quarantine (
+       source, interaction_id, turn_id, controller_key, bb_thread_id,
+       controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+       prior_state, asked_at, answered_at, quarantined_at
+     ) VALUES ('controller_questions', ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const clearOutbox = db.prepare(
+    `UPDATE outbox
+        SET payload_json = ?,
+            status = 'pending', lease_owner = NULL, lease_generation = NULL,
+            lease_expires_at = NULL, next_attempt_at = updated_at, last_error = NULL
+      WHERE substr(logical_key, 1, length('controller-interaction:' || ? || ':')) =
+            'controller-interaction:' || ? || ':'`,
+  );
+  for (const row of rows) {
+    const interactionId = typeof row.interaction_id === "string" && row.interaction_id.length > 0
+      ? row.interaction_id
+      : `legacy-row-${row.rowid}`;
+    const state = row.state === "answered" ? "answered" : "pending";
+    const askedAt = typeof row.asked_at === "number" && Number.isSafeInteger(row.asked_at) && row.asked_at >= 0
+      ? row.asked_at
+      : 0;
+    const answeredAt = typeof row.answered_at === "number" && Number.isSafeInteger(row.answered_at) && row.answered_at >= 0
+      ? row.answered_at
+      : null;
+    insert.run(
+      interactionId,
+      typeof row.turn_id === "string" ? row.turn_id : null,
+      typeof row.controller_key === "string" ? row.controller_key : null,
+      "user_question",
+      typeof row.questions_json === "string" ? row.questions_json : String(row.questions_json ?? ""),
+      typeof row.answers_json === "string" ? row.answers_json : null,
+      state,
+      askedAt,
+      answeredAt,
+      askedAt,
+    );
+    clearOutbox.run(RETIRED_CONTROLLER_INTERACTION_PAYLOAD, interactionId, interactionId);
+  }
+}
+
+function restoreQuarantinedInteractions(db: SqliteDatabase): void {
+  const rows = db.prepare(
+    `SELECT source, interaction_id, turn_id, controller_key, bb_thread_id,
+            controller_generation_id, thread_id, title, kind, payload_json, answer_json,
+            prior_state, asked_at, answered_at, quarantined_at, consumed_at
+       FROM controller_interaction_quarantine
+      WHERE consumed_at IS NULL
+      ORDER BY quarantined_at ASC, interaction_id ASC`,
+  ).all() as RepairQuarantineRow[];
+  const consume = db.prepare(
+    `UPDATE controller_interaction_quarantine
+        SET consumed_at = ?
+      WHERE source = ? AND interaction_id = ? AND consumed_at IS NULL`,
+  );
+  for (const row of rows) {
+    if (row.source === "controller") restoreQuarantinedControllerQuestion(db, row);
+    else if (row.source === "thread") restoreQuarantinedThreadQuestion(db, row);
+    consume.run(row.quarantined_at, row.source, row.interaction_id);
+  }
+  db.prepare(
+    `UPDATE controller_turns AS turn
+        SET awaiting_interaction_id = (
+          SELECT interaction.interaction_id
+            FROM controller_interactions AS interaction
+           WHERE interaction.turn_id = turn.id
+             AND interaction.state IN ('pending', 'answered')
+           ORDER BY interaction.asked_at ASC, interaction.interaction_id ASC
+           LIMIT 1
+        )
+      WHERE EXISTS (
+        SELECT 1 FROM controller_interactions AS interaction
+         WHERE interaction.turn_id = turn.id
+           AND interaction.state IN ('pending', 'answered')
+      )`,
+  ).run();
+}
+
+function hasMigration(db: SqliteDatabase, migrationId: number): boolean {
+  return db.prepare("SELECT 1 FROM _bb_migrations WHERE id = ?").get(migrationId) !== undefined;
+}
+
+export function migrateControllerInteractionStorage(storage: PluginStorage): void {
+  const db = storage.database();
+  storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
+  if (hasMigration(db, CONTROLLER_INTERACTION_TAIL_ID)) {
+    storage.migrate(db, [...ALL_MIGRATIONS]);
+    db.transaction(() => restoreQuarantinedInteractions(db)).immediate();
+    return;
+  }
+  db.transaction(() => {
+    const legacy = validateLegacyControllerQuestions(db);
+    storage.migrate(db, [...ALL_MIGRATIONS]);
+    quarantineLegacyControllerQuestions(db, legacy.invalid);
+    restoreQuarantinedInteractions(db);
+  }).immediate();
+}
 
 export interface TelegramAgentStore {
   createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile;
@@ -2022,6 +2616,12 @@ export interface TelegramAgentStore {
     now: number;
   }): ControllerTurnRecord;
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
+  getControllerForPendingSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    pendingSpawnToken: string;
+    now: number;
+  }): ControllerThreadRecord | null;
   getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null;
   getControllerTurn(turnId: string): ControllerTurnRecord | null;
   requestControllerCapabilityExpansion(input: {
@@ -2040,6 +2640,9 @@ export interface TelegramAgentStore {
     input: ControllerLeaseFence & Readonly<{ turnId: string }>,
   ): boolean;
   recordControllerEvidence(input: ControllerEvidenceInput): ControllerEvidenceWrite;
+  settleToolReceiptAndRecordEvidence(
+    input: ControllerToolReceiptSettlementInput,
+  ): ControllerEvidenceWrite;
   recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite;
@@ -2057,8 +2660,17 @@ export interface TelegramAgentStore {
   completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
+    /** The provider high-water re-read immediately before the atomic completion. */
+    bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced";
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
+  reserveControllerSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    projectId: string;
+    hostId: string;
+    now: number;
+  }): boolean;
   requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
   recordControllerImagePreparationFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
   failStaleControllerDispatches(fence: ControllerLeaseFence): boolean;
@@ -2067,6 +2679,8 @@ export interface TelegramAgentStore {
     projectId: string;
     hostId: string;
     threadId: string;
+    /** Older in-process callers omit this; the durable turn id is the only accepted fallback. */
+    spawnToken?: string;
     leaseMs?: number;
   }): boolean;
   markControllerTurnSubmitted(input: ControllerLeaseFence & {
@@ -2087,11 +2701,14 @@ export interface TelegramAgentStore {
     toolCalls?: number;
     commandFailures?: number;
     totalTokens?: number;
-  }): boolean;
-  recordControllerSupervisorSteer(input: ControllerLeaseFence & {
-    turnId: string;
-    reason: SupervisorReason;
-  }): boolean;
+  } & Record<string, unknown>): boolean;
+  claimControllerSupervisorSteer(input: ControllerSupervisorSteerClaimInput): ControllerSupervisorSteerClaim;
+  getControllerSupervisorSteerAttempt(
+    turnId: string,
+    reason: SupervisorReason,
+  ): ControllerSupervisorSteerAttempt | null;
+  getPendingControllerSupervisorSteer(turnId: string): ControllerSupervisorSteerAttempt | null;
+  settleControllerSupervisorSteer(input: ControllerSupervisorSteerSettlementInput): "settled" | "stale";
   refreshControllerDraft(input: ControllerLeaseFence & {
     turnId: string;
     sentBefore: number;
@@ -2102,7 +2719,18 @@ export interface TelegramAgentStore {
     bbThreadId: string;
     controllerGenerationId: string;
     interaction: ControllerInteraction;
+  }): ControllerInteractionRecordOutcome;
+  markControllerInteractionResolved(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
   }): boolean;
+  answerControllerInteractionByToken(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerInteractionAnswer;
   answerControllerInteractionByToken(input: {
     token: string;
     userId: string;
@@ -2116,8 +2744,37 @@ export interface TelegramAgentStore {
     chatId: string;
     text: string;
     now: number;
+  }): ControllerInteractionAnswer;
+  answerControllerInteractionWithText(input: {
+    controllerKey: string;
+    userId: string;
+    chatId: string;
+    text: string;
+    now: number;
     settleUpdateId?: number;
   }): ControllerInteractionAnswer & { updateSettled: boolean };
+  answerControllerInteractionTextUpdate(input: {
+    updateId: number;
+    controllerKey: string;
+    userId: string;
+    chatId: string;
+    text: string;
+    now: number;
+  }): ControllerInteractionTextUpdateResult;
+  answerControllerInteractionByTokenAndRecordCallback(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    callbackId: string;
+    now: number;
+  }): ControllerInteractionCallbackResult;
+  getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null;
+  getAnsweredControllerInteraction(controllerKey: string): ControllerInteractionDelivery | null;
+  markControllerInteractionDelivered(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
+  }): boolean;
   observeThread(input: {
     threadId: string;
     title: string;
@@ -2141,7 +2798,7 @@ export interface TelegramAgentStore {
   }): ThreadInteractionAnswer;
   getAnsweredThreadInteraction(): ThreadInteractionDelivery | null;
   markThreadInteractionDelivered(interactionId: string, now: number): boolean;
-  discardThreadInteractions(threadId: string, keep: readonly string[], now: number): number;
+  discardThreadInteractions(threadId: string, keep: readonly string[], now?: number): number;
   getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null;
   getAnsweredControllerInteraction(controllerKey: string): ControllerInteractionDelivery | null;
   hasActiveControllerInteraction(turnId: string, controllerKey: string): boolean;
@@ -2157,9 +2814,28 @@ export interface TelegramAgentStore {
     controllerGenerationId: string;
   }): boolean;
   getOpenControllerGeneration(controllerKey: string, threadId: string): ControllerGeneration | null;
+  canMutateControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId?: string | null;
+  }): boolean;
   getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null;
-  recordControllerSteerFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
-  foldControllerTurnIntoRunning(input: ControllerLeaseFence & { turnId: string }): boolean;
+  getControllerSteerReservation(controllerKey: string): ControllerSteerReservation | null;
+  reserveControllerSteer(input: ControllerLeaseFence & {
+    runningTurnId: string;
+    waitingTurnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+  }): boolean;
+  settleControllerSteer(input: ControllerSteerSettlementInput): ControllerSteerSettlementResult;
+  recordControllerSteerFailure(input: ControllerLeaseFence & {
+    runningTurnId: string;
+    waitingTurnId: string;
+  }): boolean;
+  foldControllerTurnIntoRunning(input: ControllerLeaseFence & {
+    runningTurnId: string;
+    waitingTurnId: string;
+  }): boolean;
   resetControllerThread(input: ControllerLeaseFence & {
     controllerKey: string;
     expectedThreadId: string;
@@ -2176,13 +2852,20 @@ export interface TelegramAgentStore {
     controllerKey: string;
     expectedThreadId: string;
     error: string;
-    expectedAcceptedFinalizationId: number | null;
+    ownerMessage?: string;
+    expectedAcceptedFinalizationId?: number | null;
   }): ControllerFailAndRetireOutcome;
   listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[];
   getPendingControllerTurn(controllerKey: string): ControllerTurnRecord | null;
-  claimToolReceipt(input: ToolReceiptKey & { controllerKey: string; now: number }): ToolReceiptClaim;
+  claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim;
   completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void;
-  failToolReceipt(input: ToolReceiptKey & { error: string; now: number }): void;
+  failToolReceipt(input: ToolReceiptKey & Readonly<{
+    error: string;
+    now: number;
+    controllerKey?: string;
+    ownerId?: string;
+    generation?: number;
+  }>): void;
   listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[];
   listControllerGenerations(controllerKey: string, limit: number): ControllerGeneration[];
   createMonitor(input: {
@@ -2532,6 +3215,7 @@ export interface TelegramAgentStore {
   renewExecutorLease(ownerId: string, generation: number, now: number, leaseMs: number): boolean;
   releaseExecutorLease(ownerId: string, generation: number, now: number): boolean;
   isExecutorLeaseCurrent(ownerId: string, generation: number, now: number): boolean;
+  isControllerInteractionDeliveryFenceCurrent(input: ControllerInteractionDeliveryFence): boolean;
   leaseControlEffects(input: ControlEffectLeaseInput): StoredEffect[];
   leaseNextJobEffect(input: JobEffectLeaseInput): StoredEffect | null;
   renewJobOperationFences(input: JobOperationFenceRenewalInput): boolean;
@@ -2771,7 +3455,7 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     completionContinuations,
     acceptedFinalizationId,
     evidenceLimitExceededAt,
-    streamText: row.stream_text,
+    streamText: CONTROLLER_PHASE_TEXT[row.stream_phase],
     telegramMessageId: row.telegram_message_id,
     streamPhase: row.stream_phase,
     responseText: row.response_text,
@@ -2820,6 +3504,36 @@ function parsePersistedControllerNullableNonNegativeInteger(value: number | null
 // JSON would only add a parse failure mode to a column that cannot grow.
 function parseSupervisorReasons(value: string): readonly SupervisorReason[] {
   return value.split(",").filter((slug): slug is SupervisorReason => SUPERVISOR_REASONS.has(slug));
+}
+
+function parseControllerSupervisorSteerAttempt(
+  row: ControllerSupervisorSteerAttemptRow,
+): ControllerSupervisorSteerAttempt {
+  assertControllerIdentifier(row.turn_id, "persisted supervisor turnId");
+  assertControllerKey(row.controller_key);
+  assertControllerIdentifier(row.thread_id, "persisted supervisor threadId");
+  assertControllerText(row.input_text, "persisted supervisor inputText");
+  assertBoundedString(row.idempotency_key, "persisted supervisor idempotencyKey");
+  assertNonNegativeInteger(row.created_at, "persisted supervisor createdAt");
+  if (row.settled_at !== null) assertNonNegativeInteger(row.settled_at, "persisted supervisor settledAt");
+  if (!SUPERVISOR_REASONS.has(row.reason)) throw new Error("Unknown persisted controller supervisor reason");
+  if (row.state !== "pending" && row.state !== "applied" && row.state !== "unknown") {
+    throw new Error("Unknown persisted controller supervisor steer state");
+  }
+  if ((row.state === "pending") !== (row.settled_at === null)) {
+    throw new Error("Persisted controller supervisor steer settlement is inconsistent");
+  }
+  return {
+    turnId: row.turn_id,
+    controllerKey: row.controller_key,
+    reason: row.reason as SupervisorReason,
+    threadId: row.thread_id,
+    inputText: row.input_text,
+    idempotencyKey: row.idempotency_key,
+    state: row.state as ControllerSupervisorSteerState,
+    createdAt: row.created_at,
+    settledAt: row.settled_at,
+  };
 }
 
 function parseControllerImage(row: ControllerTurnRow): ControllerImage | null {
@@ -3422,11 +4136,6 @@ function persistOutbox(
     );
 }
 
-/** Whatever of a multi-question interaction the owner has already settled. */
-function controllerUserAnswers(answer: ControllerInteractionRecord["answer"]): ControllerQuestionAnswers {
-  return answer !== null && "kind" in answer && answer.kind === "user_answer" ? answer.answers : {};
-}
-
 function persistControllerOutbox(
   db: SqliteDatabase,
   item: OutboxInput,
@@ -3534,12 +4243,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.autonomyRepository = new AutonomyRepository(db);
     this.capabilityRepository = new CapabilityRepository(db);
     this.controllerInteractionRepository = new ControllerInteractionRepository(db);
-    // One interaction seam for the whole store: what counts as a live owner
-    // boundary is decided in exactly one place.
-    this.controllerEvidenceRepository = new ControllerEvidenceRepository(
-      db,
-      this.controllerInteractionRepository,
-    );
+    this.controllerEvidenceRepository = new ControllerEvidenceRepository(db, clock);
     this.credentialAccessRepository = new CredentialAccessRepository(db);
   }
 
@@ -3986,6 +4690,45 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return row ? parseControllerThread(row) : null;
   }
 
+  public getControllerForPendingSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    pendingSpawnToken: string;
+    now: number;
+  }): ControllerThreadRecord | null {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerIdentifier(input.pendingSpawnToken, "pendingSpawnToken");
+    assertNonNegativeInteger(input.now, "now");
+    const row = this.db.prepare(
+      `SELECT controller.* FROM controller_threads AS controller
+         JOIN controller_turns AS turn
+           ON turn.id = ? AND turn.controller_key = controller.controller_key
+         JOIN owners ON owners.singleton = 1
+          AND owners.revoked_at IS NULL
+          AND owners.telegram_user_id = controller.telegram_user_id
+          AND owners.telegram_chat_id = controller.telegram_chat_id
+         JOIN executor_lease AS lease ON lease.singleton = 1
+        WHERE controller.controller_key = ?
+          AND controller.state = 'pending_spawn'
+          AND controller.bb_thread_id IS NULL
+          AND controller.pending_spawn_token = ?
+          AND turn.state = 'dispatching'
+          AND turn.lease_owner IS NOT NULL
+          AND turn.lease_owner = lease.owner_id
+          AND turn.lease_generation = lease.generation
+          AND lease.owner_id IS NOT NULL
+          AND lease.lease_expires_at IS NOT NULL
+          AND lease.lease_expires_at > ?`,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.pendingSpawnToken,
+      input.now,
+    ) as ControllerThreadRow | undefined;
+    return row ? parseControllerThread(row) : null;
+  }
+
   public getControllerForOwner(userId: string, chatId: string): ControllerThreadRecord | null {
     assertCanonicalPositiveDecimal(userId, "userId");
     assertCanonicalPositiveDecimal(chatId, "chatId");
@@ -4182,6 +4925,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.controllerEvidenceRepository.record(input);
   }
 
+  public settleToolReceiptAndRecordEvidence(
+    input: ControllerToolReceiptSettlementInput,
+  ): ControllerEvidenceWrite {
+    return this.controllerEvidenceRepository.settleToolReceiptAndRecordEvidence(input);
+  }
+
   public recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite {
@@ -4217,8 +4966,103 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
+    bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced" {
-    return this.controllerEvidenceRepository.completeFromFinalization(input);
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    return this.db.transaction(() => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale" as const;
+      const turn = this.db.prepare(
+        `SELECT turn.controller_key, turn.ordinal, turn.input_text, turn.evidence_event_seq,
+                turn.accepted_finalization_id, turn.evidence_limit_exceeded_at,
+                controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+            AND turn.lease_owner = ? AND turn.lease_generation = ?
+            AND turn.accepted_finalization_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM controller_supervisor_steer_attempts
+               WHERE turn_id = turn.id AND state = 'pending'
+            )
+            AND controller.state = 'active'`,
+      ).get(
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+      ) as {
+        controller_key: string;
+        ordinal: number;
+        input_text: string;
+        evidence_event_seq: number;
+        accepted_finalization_id: number;
+        evidence_limit_exceeded_at: number | null;
+        telegram_chat_id: string;
+      } | undefined;
+      if (!turn) return "stale" as const;
+      const accepted = this.controllerEvidenceRepository.getAcceptedFinalization(input.turnId);
+      if (!accepted || accepted.id !== turn.accepted_finalization_id || accepted.consumedAt !== null) {
+        return "stale" as const;
+      }
+      if (this.db.prepare(
+        `SELECT 1 FROM controller_interactions
+          WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered')
+          LIMIT 1`,
+      ).get(input.turnId, input.controllerKey)) {
+        return "stale" as const;
+      }
+      if (accepted.bbEventHighWaterSeq === null) return "evidence_advanced" as const;
+      const completionHighWater = input.bbHighWaterSeq;
+      if (
+          !Number.isSafeInteger(completionHighWater) || completionHighWater < 0 ||
+          completionHighWater < accepted.bbEventHighWaterSeq ||
+          completionHighWater !== turn.evidence_event_seq) {
+        return "evidence_advanced" as const;
+      }
+      const laterEvidence = this.db.prepare(
+        "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id > ? LIMIT 1",
+      ).get(input.turnId, accepted.evidenceHighWaterId);
+      if (turn.evidence_limit_exceeded_at !== null || laterEvidence) return "evidence_advanced" as const;
+      const completed = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'completed', response_text = ?, stream_text = '',
+                stream_phase = 'complete', last_error = NULL, completed_at = ?, updated_at = ?
+          WHERE id = ? AND controller_key = ? AND state = 'submitted'
+            AND lease_owner = ? AND lease_generation = ?
+            AND accepted_finalization_id = ?`,
+      ).run(
+        accepted.renderedMessage,
+        input.now,
+        input.now,
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        accepted.id,
+      );
+      if (completed.changes !== 1) return "stale" as const;
+      this.appendControllerDigestRow({
+        controllerKey: turn.controller_key,
+        ordinal: turn.ordinal,
+        ownerText: turn.input_text,
+        agentText: accepted.renderedMessage,
+        now: input.now,
+      });
+      const consumed = this.db.prepare(
+        "UPDATE controller_finalizations SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+      ).run(input.now, accepted.id);
+      if (consumed.changes !== 1) throw new Error("Accepted controller finalization consumption raced");
+      persistControllerOutbox(this.db, {
+        logicalKey: `controller:${input.turnId}:reply`,
+        chatId: turn.telegram_chat_id,
+        payload: { text: accepted.renderedMessage, disable_web_page_preview: true },
+      }, input.now);
+      return "completed" as const;
+    }).immediate();
   }
 
   public claimNextControllerTurn(
@@ -4259,6 +5103,67 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  public reserveControllerSpawn(input: {
+    controllerKey: string;
+    turnId: string;
+    projectId: string;
+    hostId: string;
+    now: number;
+  }): boolean {
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertControllerIdentifier(input.hostId, "hostId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      const eligible = this.db.prepare(
+        `SELECT controller.controller_key
+           FROM controller_threads AS controller
+           JOIN controller_turns AS turn
+             ON turn.id = ? AND turn.controller_key = controller.controller_key
+           JOIN owners ON owners.singleton = 1
+            AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+           JOIN executor_lease AS lease ON lease.singleton = 1
+          WHERE controller.controller_key = ?
+            AND controller.state = 'pending_spawn'
+            AND controller.bb_thread_id IS NULL
+            AND controller.pending_spawn_token = ?
+            AND (controller.project_id IS NULL AND controller.host_id IS NULL
+                 OR controller.project_id = ? AND controller.host_id = ?)
+            AND turn.state = 'dispatching'
+            AND turn.lease_owner = lease.owner_id
+            AND turn.lease_generation = lease.generation
+            AND lease.lease_expires_at > ?`,
+      ).get(
+        input.turnId,
+        input.controllerKey,
+        input.turnId,
+        input.projectId,
+        input.hostId,
+        input.now,
+      );
+      if (!eligible) return false;
+      return this.db.prepare(
+        `UPDATE controller_threads
+            SET project_id = ?, host_id = ?, updated_at = ?
+          WHERE controller_key = ? AND state = 'pending_spawn' AND bb_thread_id IS NULL
+            AND pending_spawn_token = ?
+            AND (project_id IS NULL AND host_id IS NULL
+                 OR project_id = ? AND host_id = ?)` ,
+      ).run(
+        input.projectId,
+        input.hostId,
+        input.now,
+        input.controllerKey,
+        input.turnId,
+        input.projectId,
+        input.hostId,
+      ).changes === 1;
+    }).immediate();
+  }
+
   // A claim taken while the BB thread is still answering is returned to the
   // queue rather than failed, so the message is still delivered a moment later.
   public requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean {
@@ -4272,7 +5177,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.now, input.turnId, input.ownerId, input.generation);
       if (requeued.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
             AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, input.turnId, input.turnId);
@@ -4294,7 +5199,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.now, input.turnId, input.ownerId, input.generation);
       if (requeued.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
             AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, input.turnId, input.turnId);
@@ -4325,7 +5230,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(error, fence.now, fence.now, stale.id);
       if (updated.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(fence.now, stale.controller_key, stale.id);
       const outbox = controllerFailureOutbox(stale.id, stale.telegram_chat_id);
@@ -4339,6 +5244,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     projectId: string;
     hostId: string;
     threadId: string;
+    spawnToken?: string;
     leaseMs?: number;
   }): boolean {
     this.assertControllerMutation(input);
@@ -4347,11 +5253,21 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerIdentifier(input.threadId, "threadId");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const turn = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(input.turnId) as ControllerTurnRow | undefined;
+      const turn = this.db.prepare(
+        `SELECT turn.* FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1
+            AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ?`,
+      ).get(input.turnId) as ControllerTurnRow | undefined;
       if (
         !turn || turn.state !== "dispatching" ||
         turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation
       ) return false;
+      const spawnToken = input.spawnToken ?? input.turnId;
+      if (spawnToken !== input.turnId) return false;
       if (turn.capability_profile_revision > 0) {
         if (!turn.capability_profile_id) return false;
         const profile = this.capabilityRepository.getActiveProfile("controller_turn", turn.id);
@@ -4360,13 +5276,37 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           profile.revision !== turn.capability_profile_revision
         ) return false;
       }
+      // Deployed-line callers predate the explicit reserve/mark split. When
+      // they omit the token, perform the same exact project/host reservation
+      // here before marking the spawn. Explicit-token callers must already
+      // have reserved it through reserveControllerSpawn.
+      if (input.spawnToken === undefined) {
+        const reserved = this.db.prepare(
+          `UPDATE controller_threads
+              SET project_id = ?, host_id = ?, updated_at = ?
+            WHERE controller_key = ? AND state = 'pending_spawn' AND bb_thread_id IS NULL
+              AND pending_spawn_token = ?
+              AND (project_id IS NULL AND host_id IS NULL
+                   OR project_id = ? AND host_id = ?)` ,
+        ).run(
+          input.projectId,
+          input.hostId,
+          input.now,
+          turn.controller_key,
+          input.turnId,
+          input.projectId,
+          input.hostId,
+        );
+        if (reserved.changes !== 1) return false;
+      }
       const spawned = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = ?, host_id = ?, bb_thread_id = ?, state = 'active',
                 pending_spawn_token = NULL, capability_subject_id = ?,
                 capability_profile_id = ?, capability_profile_revision = ?,
                 last_error = NULL, updated_at = ?
-          WHERE controller_key = ?`,
+          WHERE controller_key = ? AND state = 'pending_spawn' AND bb_thread_id IS NULL
+            AND pending_spawn_token = ? AND project_id = ? AND host_id = ?`,
       ).run(
         input.projectId,
         input.hostId,
@@ -4376,6 +5316,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         turn.capability_profile_revision,
         input.now,
         turn.controller_key,
+        input.turnId,
+        input.projectId,
+        input.hostId,
       ).changes === 1;
       if (spawned) {
         const configured = this.db.prepare(
@@ -4558,6 +5501,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.expectedThreadId,
       );
       if (generation.changes !== 1) throw new Error("Controller open generation changed during unaccepted retry");
+      const chat = this.db.prepare(
+        `SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?`,
+      ).get(input.controllerKey) as { telegram_chat_id: string } | undefined;
+      if (!chat) throw new Error("Controller mapping disappeared during unaccepted retry");
+      persistControllerOutbox(this.db, {
+        logicalKey: `controller:${input.turnId}:reply`,
+        chatId: chat.telegram_chat_id,
+        payload: { text: CONTROLLER_PHASE_TEXT.connecting, disable_web_page_preview: true },
+      }, input.now);
       return true;
     }).immediate();
   }
@@ -4569,7 +5521,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     toolCalls?: number;
     commandFailures?: number;
     totalTokens?: number;
-  }): boolean {
+  } & Record<string, unknown>): boolean {
     this.assertControllerMutation(input);
     assertNonNegativeInteger(input.cursor, "cursor");
     assertNonNegativeInteger(input.toolCalls ?? 0, "toolCalls");
@@ -4591,7 +5543,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const phaseText = CONTROLLER_PHASE_TEXT[input.phase];
       const cursorAdvanced = input.cursor > row.bb_event_seq;
       const needsNormalization = row.stream_text !== phaseText || row.stream_phase !== input.phase;
-      if (!cursorAdvanced && !needsNormalization) return true;
+      if (!cursorAdvanced && !needsNormalization) return false;
       // A same-cursor call may scrub one legacy raw stream value, but it does
       // not represent new provider activity. Metrics advance only with the BB
       // cursor; updated_at and the outbox change once for a real cursor advance
@@ -4646,116 +5598,272 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
-  /**
-   * Records that the supervisor already nudged this turn for one reason. A
-   * tripped budget stays tripped on every later poll, so without this the same
-   * crossing would nudge the model forever.
-   */
-  public recordControllerSupervisorSteer(input: ControllerLeaseFence & {
-    turnId: string;
-    reason: SupervisorReason;
-  }): boolean {
+  /** Claims the durable attempt before crossing the provider boundary. */
+  public claimControllerSupervisorSteer(input: ControllerSupervisorSteerClaimInput): ControllerSupervisorSteerClaim {
     this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    assertControllerText(input.inputText, "inputText");
     if (!SUPERVISOR_REASONS.has(input.reason)) throw new TypeError("Unknown controller supervisor reason");
-    return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const updated = this.db.prepare(
-        `UPDATE controller_turns
-            SET supervisor_steers = supervisor_steers + 1,
-                supervisor_reasons = CASE
-                  WHEN supervisor_reasons = '' THEN ?
-                  ELSE supervisor_reasons || ',' || ?
-                END,
-                updated_at = ?
-          WHERE id = ? AND state = 'submitted'
-            AND instr(',' || supervisor_reasons || ',', ',' || ? || ',') = 0`,
-      ).run(input.reason, input.reason, input.now, input.turnId, input.reason);
-      return updated.changes === 1;
-    }).immediate();
+    return this.db.transaction(() => this.claimControllerSupervisorSteerInTransaction(input)).immediate();
   }
 
-  /**
-   * Parks a submitted turn on the interaction only the owner can settle and
-   * asks it in Telegram. The turn stays submitted because the BB turn really is
-   * still open — it is waiting on a person, not on the model.
-   */
+  private claimControllerSupervisorSteerInTransaction(
+    input: ControllerSupervisorSteerClaimInput,
+  ): ControllerSupervisorSteerClaim {
+    if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+    const existing = this.controllerSupervisorSteerState(input.turnId, input.reason);
+    if (existing) return existing === "pending" ? "pending" : "settled";
+    const idempotencyKey = `controller-supervisor:${input.turnId}:${input.reason}`;
+    if (this.insertControllerSupervisorSteerAttempt(input, idempotencyKey)) return "claimed";
+    const raced = this.controllerSupervisorSteerState(input.turnId, input.reason);
+    return raced ? (raced === "pending" ? "pending" : "settled") : "stale";
+  }
+
+  private controllerSupervisorSteerState(
+    turnId: string,
+    reason: SupervisorReason,
+  ): ControllerSupervisorSteerState | null {
+    const row = this.db.prepare(
+      `SELECT state FROM controller_supervisor_steer_attempts
+        WHERE turn_id = ? AND reason = ?`,
+    ).get(turnId, reason) as { state: ControllerSupervisorSteerState } | undefined;
+    return row?.state ?? null;
+  }
+
+  private insertControllerSupervisorSteerAttempt(
+    input: ControllerSupervisorSteerClaimInput,
+    idempotencyKey: string,
+  ): boolean {
+    const inserted = this.db.prepare(
+      `INSERT INTO controller_supervisor_steer_attempts (
+         turn_id, controller_key, reason, thread_id, input_text,
+         idempotency_key, state, created_at, settled_at
+       )
+       SELECT ?, ?, ?, ?, ?, ?, 'pending', ?, NULL
+         WHERE EXISTS (
+           SELECT 1 FROM controller_turns AS turn
+            JOIN controller_threads AS controller
+              ON controller.controller_key = turn.controller_key
+            WHERE turn.id = ? AND turn.controller_key = ?
+              AND turn.state = 'submitted'
+              AND turn.lease_owner = ? AND turn.lease_generation = ?
+              AND turn.accepted_finalization_id IS NULL
+              AND turn.steer_reservation_turn_id IS NULL
+              AND controller.state = 'active'
+              AND controller.bb_thread_id = ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM controller_supervisor_steer_attempts
+            WHERE turn_id = ? AND state = 'pending'
+         )`,
+    ).run(
+      input.turnId,
+      input.controllerKey,
+      input.reason,
+      input.expectedThreadId,
+      input.inputText,
+      idempotencyKey,
+      input.now,
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.expectedThreadId,
+      input.turnId,
+    );
+    return inserted.changes === 1;
+  }
+
+  public getControllerSupervisorSteerAttempt(
+    turnId: string,
+    reason: SupervisorReason,
+  ): ControllerSupervisorSteerAttempt | null {
+    assertControllerIdentifier(turnId, "turnId");
+    if (!SUPERVISOR_REASONS.has(reason)) throw new TypeError("Unknown controller supervisor reason");
+    const row = this.db.prepare(
+      `SELECT turn_id, controller_key, reason, thread_id, input_text,
+              idempotency_key, state, created_at, settled_at
+         FROM controller_supervisor_steer_attempts
+        WHERE turn_id = ? AND reason = ?`,
+    ).get(turnId, reason) as ControllerSupervisorSteerAttemptRow | undefined;
+    return row ? parseControllerSupervisorSteerAttempt(row) : null;
+  }
+
+  public getPendingControllerSupervisorSteer(turnId: string): ControllerSupervisorSteerAttempt | null {
+    assertControllerIdentifier(turnId, "turnId");
+    const row = this.db.prepare(
+      `SELECT turn_id, controller_key, reason, thread_id, input_text,
+              idempotency_key, state, created_at, settled_at
+         FROM controller_supervisor_steer_attempts
+        WHERE turn_id = ? AND state = 'pending'
+        ORDER BY created_at ASC
+        LIMIT 1`,
+    ).get(turnId) as ControllerSupervisorSteerAttemptRow | undefined;
+    return row ? parseControllerSupervisorSteerAttempt(row) : null;
+  }
+
+  /** Settles the attempt and folds the reason into the turn in one transaction. */
+  public settleControllerSupervisorSteer(
+    input: ControllerSupervisorSteerSettlementInput,
+  ): "settled" | "stale" {
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    if (!SUPERVISOR_REASONS.has(input.reason)) throw new TypeError("Unknown controller supervisor reason");
+    if (input.outcome !== "applied" && input.outcome !== "unknown") {
+      throw new TypeError("controller supervisor steer settlement outcome is invalid");
+    }
+    return this.db.transaction(() => this.settleControllerSupervisorSteerInTransaction(input)).immediate();
+  }
+
+  private settleControllerSupervisorSteerInTransaction(
+    input: ControllerSupervisorSteerSettlementInput,
+  ): "settled" | "stale" {
+    if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+    const row = this.controllerSupervisorSteerSettlementRow(input);
+    if (!row) return "stale";
+    if (row.state !== "pending") return "settled";
+    const settled = this.db.prepare(
+      `UPDATE controller_supervisor_steer_attempts
+          SET state = ?, settled_at = ?
+        WHERE turn_id = ? AND controller_key = ? AND reason = ? AND state = 'pending'`,
+    ).run(input.outcome, input.now, input.turnId, input.controllerKey, input.reason);
+    if (settled.changes !== 1) return "stale";
+    this.foldControllerSupervisorSteer(input);
+    return "settled";
+  }
+
+  private controllerSupervisorSteerSettlementRow(
+    input: ControllerSupervisorSteerSettlementInput,
+  ): { state: ControllerSupervisorSteerState } | undefined {
+    return this.db.prepare(
+      `SELECT attempt.state
+         FROM controller_supervisor_steer_attempts AS attempt
+         JOIN controller_turns AS turn ON turn.id = attempt.turn_id
+        WHERE attempt.turn_id = ? AND attempt.controller_key = ? AND attempt.reason = ?
+          AND turn.state = 'submitted'
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.accepted_finalization_id IS NULL
+          AND turn.steer_reservation_turn_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM controller_supervisor_steer_attempts AS pending
+             WHERE pending.turn_id = turn.id AND pending.state = 'pending'
+               AND pending.reason <> attempt.reason
+          )`,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.reason,
+      input.ownerId,
+      input.generation,
+    ) as { state: ControllerSupervisorSteerState } | undefined;
+  }
+
+  private foldControllerSupervisorSteer(input: ControllerSupervisorSteerSettlementInput): void {
+    const folded = this.db.prepare(
+      `UPDATE controller_turns
+          SET supervisor_steers = supervisor_steers + 1,
+              supervisor_reasons = CASE
+                WHEN supervisor_reasons = '' THEN ?
+                ELSE supervisor_reasons || ',' || ?
+              END,
+              updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'submitted'
+          AND lease_owner = ? AND lease_generation = ?
+          AND instr(',' || supervisor_reasons || ',', ',' || ? || ',') = 0`,
+    ).run(
+      input.reason,
+      input.reason,
+      input.now,
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.reason,
+    );
+    if (folded.changes !== 1) {
+      throw new Error("Controller supervisor steer fold was not applied atomically");
+    }
+  }
+
   public recordControllerInteraction(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
     bbThreadId: string;
     controllerGenerationId: string;
     interaction: ControllerInteraction;
-  }): boolean {
-    this.assertControllerMutation(input);
-    assertControllerKey(input.controllerKey);
-    assertControllerIdentifier(input.turnId, "turnId");
-    assertControllerIdentifier(input.bbThreadId, "bbThreadId");
-    assertControllerIdentifier(input.controllerGenerationId, "controllerGenerationId");
-    return this.db.transaction((): boolean => {
-      if (!this.controllerInteractionRepository.record(input)) return false;
-      this.askControllerInteraction(input.controllerKey, input.interaction, {}, input.now);
-      return true;
+  }): ControllerInteractionRecordOutcome {
+    return this.db.transaction((): ControllerInteractionRecordOutcome => {
+      const outcome = this.controllerInteractionRepository.record(input);
+      if (outcome !== "recorded") return outcome;
+      const pending = this.controllerInteractionRepository.getPending(input.controllerKey);
+      if (pending?.interactionId === input.interaction.interactionId) {
+        this.persistControllerInteractionPrompt(pending, input.now);
+      }
+      return outcome;
     }).immediate();
   }
 
-  /**
-   * The owner's decision, the Telegram callback it arrived on, and the
-   * acknowledgement they are owed all commit together. Splitting them would let
-   * a crash acknowledge a decision BB never receives, or drop one BB is waiting
-   * for.
-   */
+  public markControllerInteractionResolved(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
+  }): boolean {
+    return this.db.transaction((): boolean => {
+      const controllerKey = this.controllerInteractionControllerKey(input.interactionId);
+      const resolved = this.controllerInteractionRepository.markResolved(input);
+      if (resolved && controllerKey) this.persistNextControllerInteractionPrompt(controllerKey, input.now);
+      return resolved;
+    }).immediate();
+  }
+
   public answerControllerInteractionByToken(input: {
+    token: string;
+    userId: string;
+    chatId: string;
+    now: number;
+  }): ControllerInteractionAnswer {
+    return this.db.transaction((): ControllerInteractionAnswer => {
+      const answer = this.controllerInteractionRepository.answerByToken(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      return answer;
+    }).immediate();
+  }
+
+  public answerControllerInteractionByTokenAndRecordCallback(input: {
     token: string;
     userId: string;
     chatId: string;
     callbackId: string;
     now: number;
-  }): ControllerInteractionCallbackAnswer {
-    assertCanonicalPositiveDecimal(input.userId, "userId");
-    assertCanonicalPositiveDecimal(input.chatId, "chatId");
-    assertNonNegativeInteger(input.now, "now");
-    assertNoRawMergeCallback(input.callbackId, "callbackId");
-    return this.db.transaction((): ControllerInteractionCallbackAnswer => {
-      // A Telegram redelivery of a settled callback must not answer again, and
-      // must not acknowledge a decision the owner already saw acknowledged.
-      if (this.db.prepare("SELECT 1 FROM callbacks WHERE callback_query_id = ?").get(input.callbackId)) {
-        return { ok: false, reason: "replayed" };
+  }): ControllerInteractionCallbackResult {
+    return this.db.transaction((): ControllerInteractionCallbackResult => {
+      const answer = this.controllerInteractionRepository.answerByToken(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      const recorded = this.recordCallback(
+        input.callbackId,
+        null,
+        "controller_interaction",
+        answer.ok ? "accepted" : answer.reason,
+        input.now,
+      );
+      if (recorded) {
+        persistControllerOutbox(this.db, {
+          logicalKey: `callback:${input.callbackId}`,
+          chatId: input.chatId,
+          payload: { text: answer.ok ? "Got it." : "That interaction is no longer open." },
+        }, input.now);
       }
-      const answered = this.controllerInteractionRepository.answerByToken({
-        token: input.token,
-        userId: input.userId,
-        chatId: input.chatId,
-        now: input.now,
-      });
-      this.insertCallback(input.callbackId, null, "controller_interaction", answered.ok ? "accepted" : answered.reason, input.now);
-      this.enqueueOutbox({
-        logicalKey: `callback:${input.callbackId}`,
-        chatId: input.chatId,
-        payload: { text: answered.ok ? "Got it." : "That question is no longer open." },
-      }, input.now);
-      if (!answered.ok) return answered;
-      this.askRemainingControllerQuestion(answered.interactionId, input.now);
-      return { ok: true, interactionId: answered.interactionId, turnId: answered.turnId };
+      return { answer, recorded };
     }).immediate();
   }
 
-  /**
-   * A plain reply answers the open question. The owner is having a conversation,
-   * not filling in a form, so "in review i mean not in progress" is an answer.
-   * Approvals and unsupported interactions never consume free text.
-   */
   public answerControllerInteractionWithText(input: {
     controllerKey: string;
     userId: string;
     chatId: string;
     text: string;
     now: number;
-    /**
-     * The claimed Telegram update this answer came from. Passing it settles the
-     * claim in the same commit as the answer, which is what makes a crash
-     * between the two impossible: a replay of this update finds it already
-     * processed, so the owner's words can never be spent twice.
-     */
     settleUpdateId?: number;
   }): ControllerInteractionAnswer & { updateSettled: boolean } {
     assertControllerKey(input.controllerKey);
@@ -4765,90 +5873,378 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     const settleUpdateId = input.settleUpdateId;
     if (settleUpdateId !== undefined) assertNonNegativeInteger(settleUpdateId, "settleUpdateId");
-    const claimGeneration = settleUpdateId === undefined
-      ? undefined
-      : this.claimedUpdates.get(settleUpdateId);
+    const claimGeneration = settleUpdateId === undefined ? undefined : this.claimedUpdates.get(settleUpdateId);
     if (settleUpdateId !== undefined && claimGeneration === undefined) {
       throw new UpdateClaimConflictError(settleUpdateId);
     }
     const result = this.db.transaction((): ControllerInteractionAnswer & { updateSettled: boolean } => {
-      const answered = this.controllerInteractionRepository.answerWithText(input);
-      if (!answered.ok) return { ...answered, updateSettled: false };
-      this.askRemainingControllerQuestion(answered.interactionId, input.now);
-      if (settleUpdateId === undefined) return { ...answered, updateSettled: false };
-      const updated = this.db
-        .prepare(
-          `UPDATE telegram_updates
-              SET status = 'processed', outcome = 'processed', last_error = NULL, processed_at = ?,
-                  claim_owner = NULL, claim_expires_at = NULL
-            WHERE update_id = ?
-              AND status = 'processing'
-              AND claim_owner = ?
-              AND claim_generation = ?
-              AND claim_expires_at > ?`,
-        )
-        .run(input.now, settleUpdateId, this.claimOwner, claimGeneration, input.now);
-      // Someone else owns this update now, so this process has no right to have
-      // answered on its behalf either. Throwing takes the answer back out.
+      const answer = this.controllerInteractionRepository.answerWithText(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      if (!answer.ok || settleUpdateId === undefined) return { ...answer, updateSettled: false };
+      const updated = this.db.prepare(
+        `UPDATE telegram_updates
+            SET status = 'processed', outcome = 'controller_interaction_answered', last_error = NULL,
+                processed_at = ?, claim_owner = NULL, claim_expires_at = NULL
+          WHERE update_id = ? AND status = 'processing'
+            AND claim_owner = ? AND claim_generation = ? AND claim_expires_at > ?`,
+      ).run(input.now, settleUpdateId, this.claimOwner, claimGeneration, input.now);
       if (updated.changes !== 1) {
         this.claimedUpdates.delete(settleUpdateId);
         throw new UpdateClaimConflictError(settleUpdateId);
       }
       advanceTelegramCursor(this.db);
-      return { ...answered, updateSettled: true };
+      return { ...answer, updateSettled: true };
     }).immediate();
     if (result.updateSettled && settleUpdateId !== undefined) this.claimedUpdates.delete(settleUpdateId);
     return result;
   }
 
-  private askControllerInteraction(
-    controllerKey: string,
-    interaction: ControllerInteraction,
-    answers: ControllerQuestionAnswers,
+  public answerControllerInteractionTextUpdate(input: {
+    updateId: number;
+    controllerKey: string;
+    userId: string;
+    chatId: string;
+    text: string;
+    now: number;
+  }): ControllerInteractionTextUpdateResult {
+    assertNonNegativeInteger(input.updateId, "updateId");
+    const result = this.db.transaction((): ControllerInteractionTextUpdateResult => {
+      const existing = this.db.prepare(
+        `SELECT status, claim_owner, claim_generation, claim_expires_at
+           FROM telegram_updates WHERE update_id = ?`,
+      ).get(input.updateId) as Pick<
+        TelegramUpdateRow,
+        "status" | "claim_owner" | "claim_generation" | "claim_expires_at"
+      > | undefined;
+      if (existing?.status === "processed") return { outcome: "replay" };
+
+      let claimGeneration = this.claimedUpdates.get(input.updateId);
+      if (!existing) {
+        claimGeneration = 1;
+        const expiresAt = input.now + TELEGRAM_UPDATE_LEASE_MS;
+        this.db.prepare(
+          `INSERT INTO telegram_updates (
+             update_id, status, attempts, outcome, last_error, processed_at,
+             claim_owner, claim_generation, claim_expires_at
+           ) VALUES (?, 'processing', 1, NULL, NULL, NULL, ?, ?, ?)`,
+        ).run(input.updateId, this.claimOwner, claimGeneration, expiresAt);
+        this.claimedUpdates.set(input.updateId, claimGeneration);
+      } else if (
+        existing.status !== "processing" || claimGeneration === undefined ||
+        existing.claim_owner !== this.claimOwner || existing.claim_generation !== claimGeneration ||
+        existing.claim_expires_at === null || existing.claim_expires_at <= input.now
+      ) {
+        throw new UpdateClaimConflictError(input.updateId);
+      }
+
+      const answer = this.controllerInteractionRepository.answerWithText(input);
+      this.persistControllerInteractionFollowUp(answer, input.now);
+      if (!answer.ok) return { outcome: "handled", answer };
+
+      const completed = this.db.prepare(
+        `UPDATE telegram_updates
+            SET status = 'processed', outcome = 'controller_interaction_answered',
+                last_error = NULL, processed_at = ?, claim_owner = NULL, claim_expires_at = NULL
+          WHERE update_id = ? AND status = 'processing'
+            AND claim_owner = ? AND claim_generation = ? AND claim_expires_at > ?`,
+      ).run(input.now, input.updateId, this.claimOwner, claimGeneration!, input.now);
+      if (completed.changes !== 1) throw new UpdateClaimConflictError(input.updateId);
+      advanceTelegramCursor(this.db);
+      return { outcome: "handled", answer };
+    }).immediate();
+    if (result.outcome === "replay" || result.answer.ok) this.claimedUpdates.delete(input.updateId);
+    return result;
+  }
+
+  public getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null {
+    return this.controllerInteractionRepository.getPending(controllerKey);
+  }
+
+  public getAnsweredControllerInteraction(controllerKey: string): ControllerInteractionDelivery | null {
+    return this.controllerInteractionRepository.getAnswered(controllerKey);
+  }
+
+  public markControllerInteractionDelivered(input: ControllerLeaseFence & {
+    interactionId: string;
+    turnId: string;
+    bbThreadId: string;
+  }): boolean {
+    return this.db.transaction((): boolean => {
+      const controllerKey = this.controllerInteractionControllerKey(input.interactionId);
+      const delivered = this.controllerInteractionRepository.markDelivered(input);
+      if (delivered && controllerKey) this.persistNextControllerInteractionPrompt(controllerKey, input.now);
+      return delivered;
+    }).immediate();
+  }
+
+  private persistControllerInteractionFollowUp(
+    answer: ControllerInteractionAnswer,
     now: number,
   ): void {
-    const rendered = renderControllerInteraction(interaction, answers);
-    if (!rendered) return;
-    const chat = this.db.prepare(
+    if (!answer.ok || answer.complete) return;
+    const pending = this.controllerInteractionRepository.getPending(answer.controllerKey);
+    if (!pending || pending.interactionId !== answer.interactionId) return;
+    this.persistControllerInteractionPrompt(pending, now);
+  }
+
+  private persistControllerInteractionPrompt(
+    pending: ControllerInteractionRecord,
+    now: number,
+  ): void {
+    const rendered = renderControllerInteraction(pending.interaction, pending.answers);
+    const next = pending.interaction.kind === "user_question"
+      ? nextUnansweredQuestion(pending.interaction.questions, pending.answers)
+      : null;
+    const index = next?.index ?? 0;
+    const controller = this.db.prepare(
       "SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?",
-    ).get(controllerKey) as { telegram_chat_id: string } | undefined;
-    if (!chat) return;
+    ).get(pending.controllerKey) as { telegram_chat_id: string } | undefined;
+    if (!controller) throw new Error("controller interaction owner is unavailable");
     persistControllerOutbox(this.db, {
-      logicalKey: `controller-interaction:${interaction.interactionId}:${rendered.step}`,
-      chatId: chat.telegram_chat_id,
+      logicalKey: `controller-interaction:${pending.interactionId}:${index}`,
+      chatId: controller.telegram_chat_id,
       payload: {
         ...formattedMessage(rendered.text),
-        ...(rendered.reply_markup ? { reply_markup: rendered.reply_markup } : {}),
+        ...( "reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
         disable_web_page_preview: true,
       },
     }, now);
   }
 
-  /** Asks whatever of a multi-question interaction the owner has not settled. */
-  private askRemainingControllerQuestion(interactionId: string, now: number): void {
-    const controllerKey = this.db.prepare(
-      "SELECT controller_key FROM controller_interactions WHERE interaction_id = ? AND state = 'pending'",
-    ).pluck().get(interactionId) as string | undefined;
-    if (controllerKey === undefined) return;
+  private persistNextControllerInteractionPrompt(controllerKey: string, now: number): void {
     const pending = this.controllerInteractionRepository.getPending(controllerKey);
-    if (!pending || pending.interactionId !== interactionId) return;
-    this.askControllerInteraction(controllerKey, pending.interaction, controllerUserAnswers(pending.answer), now);
+    if (pending) this.persistControllerInteractionPrompt(pending, now);
+  }
+
+  private controllerInteractionControllerKey(interactionId: string): string | null {
+    const row = this.db.prepare(
+      "SELECT controller_key FROM controller_interactions WHERE interaction_id = ?",
+    ).get(interactionId) as { controller_key: string } | undefined;
+    return row?.controller_key ?? null;
   }
 
   /**
-   * Counts a steer BB would not take. The reconcile loop runs at draft speed
-   * while an answer streams, so an unbounded retry here would be a hot loop
-   * against BB rather than a recovery.
+   * Reserves the queued owner turn before crossing the provider boundary. The
+   * reservation is the durable fence that keeps finalization and other turn
+   * mutations from winning while BB is deciding whether to accept the steer.
    */
-  public recordControllerSteerFailure(input: ControllerLeaseFence & { turnId: string }): boolean {
-    this.assertControllerMutation(input);
+  public reserveControllerSteer(input: ControllerLeaseFence & {
+    runningTurnId: string;
+    waitingTurnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+  }): boolean {
+    this.assertControllerSteerInput(input);
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       return this.db.prepare(
-        `UPDATE controller_turns SET retry_count = retry_count + 1, updated_at = ?
-          WHERE id = ? AND state = 'queued'`,
-      ).run(input.now, input.turnId).changes === 1;
+        `UPDATE controller_turns
+            SET steer_reservation_turn_id = ?, updated_at = ?
+          WHERE id = ? AND controller_key = ? AND state = 'submitted'
+            AND lease_owner = ? AND lease_generation = ?
+            AND accepted_finalization_id IS NULL
+            AND (steer_reservation_turn_id IS NULL OR steer_reservation_turn_id = ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM controller_supervisor_steer_attempts
+               WHERE turn_id = controller_turns.id AND state = 'pending'
+            )
+            AND EXISTS (
+              SELECT 1 FROM controller_threads AS controller
+               WHERE controller.controller_key = controller_turns.controller_key
+                 AND controller.state = 'active'
+                 AND controller.bb_thread_id = ?
+            )
+            AND EXISTS (
+              SELECT 1 FROM controller_turns AS waiting
+               WHERE waiting.id = ? AND waiting.controller_key = controller_turns.controller_key
+                 AND waiting.state = 'queued' AND waiting.image_file_id IS NULL
+            )`,
+      ).run(
+        input.waitingTurnId,
+        input.now,
+        input.runningTurnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        input.waitingTurnId,
+        input.expectedThreadId,
+        input.waitingTurnId,
+      ).changes === 1;
     }).immediate();
+  }
+
+  public getControllerSteerReservation(controllerKey: string): ControllerSteerReservation | null {
+    assertControllerKey(controllerKey);
+    const row = this.db.prepare(
+      `SELECT running.id AS running_turn_id,
+              running.steer_reservation_turn_id AS waiting_turn_id,
+              running.controller_key,
+              controller.bb_thread_id AS thread_id,
+              waiting.input_text
+         FROM controller_turns AS running
+         JOIN controller_threads AS controller ON controller.controller_key = running.controller_key
+         LEFT JOIN controller_turns AS waiting
+           ON waiting.id = running.steer_reservation_turn_id
+        WHERE running.controller_key = ?
+          AND running.state = 'submitted'
+          AND running.steer_reservation_turn_id IS NOT NULL
+        ORDER BY running.ordinal ASC
+        LIMIT 1`,
+    ).get(controllerKey) as {
+      running_turn_id: string;
+      waiting_turn_id: string;
+      controller_key: string;
+      thread_id: string | null;
+      input_text: string | null;
+    } | undefined;
+    if (!row) return null;
+    return {
+      controllerKey: row.controller_key,
+      runningTurnId: row.running_turn_id,
+      waitingTurnId: row.waiting_turn_id,
+      threadId: row.thread_id ?? "",
+      inputText: row.input_text,
+      idempotencyKey: `controller-steer:${row.running_turn_id}:${row.waiting_turn_id}`,
+    };
+  }
+
+  private controllerSteerSettlementRow(input: ControllerSteerSettlementInput): ControllerSteerSettlementRow | null {
+    const row = this.db.prepare(
+      `SELECT running.controller_key AS controllerKey,
+              waiting.state AS waitingState,
+              waiting.ordinal AS waitingOrdinal,
+              waiting.input_text AS inputText,
+              controller.telegram_chat_id AS telegramChatId
+         FROM controller_turns AS running
+         JOIN controller_threads AS controller ON controller.controller_key = running.controller_key
+         LEFT JOIN controller_turns AS waiting
+           ON waiting.id = running.steer_reservation_turn_id
+        WHERE running.id = ? AND running.controller_key = ? AND running.state = 'submitted'
+          AND running.lease_owner = ? AND running.lease_generation = ?
+          AND running.accepted_finalization_id IS NULL
+          AND running.steer_reservation_turn_id = ?`,
+    ).get(
+      input.runningTurnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.waitingTurnId,
+    ) as ControllerSteerSettlementRow | undefined;
+    return row ?? null;
+  }
+
+  private clearControllerSteerReservation(input: ControllerSteerSettlementInput): boolean {
+    return this.db.prepare(
+      `UPDATE controller_turns
+          SET steer_reservation_turn_id = NULL, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'submitted'
+          AND lease_owner = ? AND lease_generation = ?
+          AND accepted_finalization_id IS NULL
+          AND steer_reservation_turn_id = ?`,
+    ).run(
+      input.now,
+      input.runningTurnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.waitingTurnId,
+    ).changes === 1;
+  }
+
+  private completeAppliedControllerSteer(
+    input: ControllerSteerSettlementInput,
+    row: ControllerSteerSettlementRow,
+  ): void {
+    const folded = "(sent to the answer already in progress)";
+    const updated = this.db.prepare(
+      `UPDATE controller_turns
+          SET state = 'completed', response_text = ?, stream_phase = 'complete',
+              completed_at = ?, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
+    ).run(folded, input.now, input.now, input.waitingTurnId, input.controllerKey);
+    if (updated.changes !== 1) return;
+    if (row.waitingOrdinal === null) throw new Error("queued controller steer has no ordinal");
+    this.appendControllerDigestRow({
+      controllerKey: row.controllerKey,
+      ordinal: row.waitingOrdinal,
+      ownerText: row.inputText ?? "",
+      agentText: folded,
+      now: input.now,
+    });
+  }
+
+  private retryUnappliedControllerSteer(input: ControllerSteerSettlementInput): void {
+    this.db.prepare(
+      `UPDATE controller_turns
+          SET retry_count = retry_count + 1, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
+    ).run(input.now, input.waitingTurnId, input.controllerKey);
+  }
+
+  private failAmbiguousControllerSteer(
+    input: ControllerSteerSettlementInput,
+    row: ControllerSteerSettlementRow,
+  ): void {
+    const error = "Controller steer result was ambiguous; the queued message was not replayed";
+    const failed = this.db.prepare(
+      `UPDATE controller_turns
+          SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
+              completed_at = ?, updated_at = ?
+        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
+    ).run(error, input.now, input.now, input.waitingTurnId, input.controllerKey);
+    if (failed.changes !== 1) return;
+    persistControllerOutbox(
+      this.db,
+      controllerFailureOutbox(input.waitingTurnId, row.telegramChatId),
+      input.now,
+    );
+  }
+
+  public settleControllerSteer(input: ControllerSteerSettlementInput): ControllerSteerSettlementResult {
+    this.assertControllerSteerInput(input);
+    assertControllerKey(input.controllerKey);
+    if (input.outcome !== "applied" && input.outcome !== "not_applied" && input.outcome !== "unknown") {
+      throw new TypeError("controller steer settlement outcome is invalid");
+    }
+    return this.db.transaction((): ControllerSteerSettlementResult => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+      const row = this.controllerSteerSettlementRow(input);
+      if (!row) return "stale";
+
+      if (!this.clearControllerSteerReservation(input)) return "stale";
+      if (row.waitingState !== "queued") return "settled";
+      if (input.outcome === "applied") {
+        this.completeAppliedControllerSteer(input, row);
+        return "settled";
+      }
+      if (input.outcome === "not_applied") {
+        this.retryUnappliedControllerSteer(input);
+        return "settled";
+      }
+      this.failAmbiguousControllerSteer(input, row);
+      return "settled";
+    }).immediate();
+  }
+
+  /**
+   * Counts a steer BB would not take and releases its reservation together
+   * with the retry increment. The reconcile loop runs at draft speed while an
+   * answer streams, so an unbounded retry here would be a hot loop against BB
+   * rather than a recovery.
+   */
+  public recordControllerSteerFailure(input: ControllerLeaseFence & {
+    runningTurnId: string;
+    waitingTurnId: string;
+  }): boolean {
+    const running = this.getControllerTurn(input.runningTurnId);
+    if (!running) return false;
+    return this.settleControllerSteer({
+      ...input,
+      controllerKey: running.controllerKey,
+      outcome: "not_applied",
+    }) === "settled";
   }
 
   /** The oldest message still waiting behind an answer that is being written. */
@@ -4867,31 +6263,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * a correction like "I meant in review" wants the first answer fixed, not a
    * second answer written.
    */
-  public foldControllerTurnIntoRunning(input: ControllerLeaseFence & { turnId: string }): boolean {
-    this.assertControllerMutation(input);
-    return this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const row = this.db.prepare(
-        "SELECT * FROM controller_turns WHERE id = ? AND state = 'queued'",
-      ).get(input.turnId) as ControllerTurnRow | undefined;
-      if (!row) return false;
-      const folded = "(sent to the answer already in progress)";
-      const updated = this.db.prepare(
-        `UPDATE controller_turns
-            SET state = 'completed', response_text = ?, stream_phase = 'complete',
-                completed_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'queued'`,
-      ).run(folded, input.now, input.now, input.turnId);
-      if (updated.changes !== 1) return false;
-      this.appendControllerDigestRow({
-        controllerKey: row.controller_key,
-        ordinal: row.ordinal,
-        ownerText: row.input_text,
-        agentText: folded,
-        now: input.now,
-      });
-      return true;
-    }).immediate();
+  public foldControllerTurnIntoRunning(input: ControllerLeaseFence & {
+    runningTurnId: string;
+    waitingTurnId: string;
+  }): boolean {
+    const running = this.getControllerTurn(input.runningTurnId);
+    if (!running) return false;
+    return this.settleControllerSteer({
+      ...input,
+      controllerKey: running.controllerKey,
+      outcome: "applied",
+    }) === "settled";
   }
 
   /**
@@ -5054,9 +6436,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * answered in BB, and a live question there is a question they will answer
    * twice or tap in vain.
    */
-  public discardThreadInteractions(threadId: string, keep: readonly string[], now: number): number {
+  public discardThreadInteractions(threadId: string, keep: readonly string[], now?: number): number {
     assertControllerIdentifier(threadId, "threadId");
-    assertNonNegativeInteger(now, "now");
+    const effectiveNow = now ?? this.currentNow();
+    assertNonNegativeInteger(effectiveNow, "now");
     const placeholders = keep.map(() => "?").join(", ");
     const filter = keep.length === 0
       ? "thread_id = ? AND state = 'pending'"
@@ -5065,7 +6448,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const stale = this.db.prepare(
         `SELECT interaction_id, title FROM thread_interactions WHERE ${filter}`,
       ).all(threadId, ...keep) as { interaction_id: string; title: string }[];
-      for (const row of stale) this.retireThreadInteractionCard(row.interaction_id, row.title, now);
+      for (const row of stale) this.retireThreadInteractionCard(row.interaction_id, row.title, effectiveNow);
       return this.db.prepare(`DELETE FROM thread_interactions WHERE ${filter}`).run(threadId, ...keep).changes;
     }).immediate();
   }
@@ -5085,18 +6468,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }, now);
   }
 
-  /** The interaction the owner is currently being asked about, if any. */
-  public getPendingControllerInteraction(controllerKey: string): ControllerInteractionRecord | null {
-    assertControllerKey(controllerKey);
-    return this.controllerInteractionRepository.getPending(controllerKey);
-  }
-
-  /** An answer the owner has given that BB has not been told about yet. */
-  public getAnsweredControllerInteraction(controllerKey: string): ControllerInteractionDelivery | null {
-    assertControllerKey(controllerKey);
-    return this.controllerInteractionRepository.getAnswered(controllerKey);
-  }
-
   /**
    * True while the exact submitted turn is still waiting on a person. Delivery
    * only acknowledges BB, so a delivered interaction no longer parks the turn
@@ -5112,15 +6483,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       `SELECT 1 FROM controller_interactions
         WHERE turn_id = ? AND controller_key = ? AND state IN ('pending', 'answered') LIMIT 1`,
     ).get(turnId, controllerKey) !== undefined;
-  }
-
-  /** Settles a durable row BB resolved or interrupted without the owner. */
-  public markControllerInteractionResolved(input: ControllerLeaseFence & {
-    interactionId: string;
-    turnId: string;
-    bbThreadId: string;
-  }): boolean {
-    return this.controllerInteractionRepository.markResolved(input);
   }
 
   /** The read-only source fence a lifecycle reference passes before BB is called. */
@@ -5159,6 +6521,43 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       endReason: row.end_reason,
     };
   }
+
+  public canMutateControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId?: string | null;
+  }): boolean {
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    if (input.expectedThreadId !== undefined && input.expectedThreadId !== null) {
+      assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    }
+    if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+    const row = this.db.prepare(
+      `SELECT 1 FROM controller_turns AS turn
+         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+        WHERE turn.id = ? AND turn.controller_key = ?
+          AND ((turn.state = 'submitted' AND controller.state = 'active') OR
+               (turn.state = 'dispatching' AND controller.state IN ('active', 'pending_spawn')))
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.accepted_finalization_id IS NULL
+          AND turn.steer_reservation_turn_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM controller_supervisor_steer_attempts
+             WHERE turn_id = turn.id AND state = 'pending'
+          )
+          AND ((? IS NULL AND controller.bb_thread_id IS NULL) OR controller.bb_thread_id = ?)` ,
+    ).get(
+      input.turnId,
+      input.controllerKey,
+      input.ownerId,
+      input.generation,
+      input.expectedThreadId ?? null,
+      input.expectedThreadId ?? null,
+    );
+    return row !== undefined;
+  }
+
 
   public refreshControllerDraft(input: ControllerLeaseFence & {
     turnId: string;
@@ -5208,12 +6607,24 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const retired = this.db.prepare(
         `UPDATE controller_threads
             SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
-                state = 'pending_spawn', pending_spawn_token = NULL,
+                state = 'pending_spawn', pending_spawn_token = (
+                  SELECT id FROM controller_turns
+                   WHERE controller_key = ? AND state = 'dispatching'
+                     AND lease_owner = ? AND lease_generation = ?
+                   ORDER BY ordinal ASC LIMIT 1
+                ),
                 capability_subject_id = NULL, capability_profile_id = NULL,
                 capability_profile_revision = 0,
                 last_error = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id = ?`,
-      ).run(input.now, input.controllerKey, input.expectedThreadId).changes === 1;
+      ).run(
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        input.now,
+        input.controllerKey,
+        input.expectedThreadId,
+      ).changes === 1;
       if (retired) {
         this.db.prepare(
           `UPDATE controller_generations SET ended_at = ?, end_reason = ?
@@ -5260,7 +6671,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.error, input.now, input.now, input.turnId);
       if (updated.changes !== 1) return false;
       this.db.prepare(
-        `UPDATE controller_threads SET pending_spawn_token = NULL, updated_at = ?
+        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
       const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.ownerMessage);
@@ -5280,14 +6691,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     controllerKey: string;
     expectedThreadId: string;
     error: string;
-    expectedAcceptedFinalizationId: number | null;
+    ownerMessage?: string;
+    expectedAcceptedFinalizationId?: number | null;
   }): ControllerFailAndRetireOutcome {
     this.assertControllerMutation(input);
     assertControllerKey(input.controllerKey);
     assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
     assertSafeFailureSummary(input.error);
     assertNoRawMergeCallback(input.error, "controller error");
-    const expectedAcceptedFinalizationId = input.expectedAcceptedFinalizationId;
+    if (input.ownerMessage !== undefined) {
+      assertControllerText(input.ownerMessage, "controller failure message");
+      assertNoRawMergeCallback(input.ownerMessage, "controller failure message");
+    }
+    const expectedAcceptedFinalizationId = input.expectedAcceptedFinalizationId ?? null;
     if (expectedAcceptedFinalizationId !== null) {
       assertPositiveInteger(expectedAcceptedFinalizationId, "expectedAcceptedFinalizationId");
     }
@@ -5329,7 +6745,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }
       const failed = this.db.prepare(
         `UPDATE controller_turns
-            SET state = 'failed', last_error = ?, completed_at = ?, updated_at = ?
+            SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
+                completed_at = ?,
+                capability_continuation_state = CASE
+                  WHEN capability_continuation_state IN ('requested', 'relaunching') THEN 'blocked'
+                  ELSE capability_continuation_state
+                END,
+                updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id IS ?`,
@@ -5348,6 +6770,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads
             SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
                 state = 'pending_spawn', pending_spawn_token = NULL,
+                capability_subject_id = NULL, capability_profile_id = NULL,
+                capability_profile_revision = 0,
                 last_error = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id = ? AND state = 'active'`,
       ).run(input.now, input.controllerKey, input.expectedThreadId);
@@ -5392,22 +6816,56 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   // Reserving before the call is what makes replay safe: a crash mid-tool leaves
   // a 'started' receipt, which is reported as uncertain rather than repeated.
-  public claimToolReceipt(input: ToolReceiptKey & { controllerKey: string; now: number }): ToolReceiptClaim {
+  public claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim {
     assertControllerKey(input.controllerKey);
     assertControllerIdentifier(input.turnId, "turnId");
     assertControllerIdentifier(input.toolName, "toolName");
     assertSha256Hex(input.argsSha256);
     assertNonNegativeInteger(input.now, "now");
+    const hasFence = input.ownerId !== undefined || input.generation !== undefined;
+    if (hasFence) {
+      if (input.ownerId === undefined || input.generation === undefined) {
+        throw new TypeError("tool receipt reservation fence is incomplete");
+      }
+      assertControllerIdentifier(input.ownerId, "ownerId");
+      assertNonNegativeInteger(input.generation, "generation");
+    }
 
     return this.db.transaction((): ToolReceiptClaim => {
+      const turn = this.db.prepare(
+        `SELECT controller_key, state, lease_owner, lease_generation, accepted_finalization_id,
+                steer_reservation_turn_id
+           FROM controller_turns WHERE id = ?`,
+      ).get(input.turnId) as {
+        controller_key: string;
+        state: string;
+        lease_owner: string | null;
+        lease_generation: number | null;
+        accepted_finalization_id: number | null;
+        steer_reservation_turn_id: string | null;
+      } | undefined;
+      if (turn && turn.accepted_finalization_id !== null) {
+        return { outcome: "finalized" };
+      }
+      if (hasFence && (
+        !turn || turn.controller_key !== input.controllerKey || turn.state !== "submitted" ||
+        turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation ||
+        turn.steer_reservation_turn_id !== null ||
+        !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)
+      )) return { outcome: "fence_lost" };
       const existing = this.db.prepare(
-        "SELECT state, result_text FROM tool_receipts WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?",
+        `SELECT state, result_text, last_error, controller_key FROM tool_receipts
+          WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?`,
       ).get(input.turnId, input.toolName, input.argsSha256) as
-        { state: string; result_text: string | null } | undefined;
+        { state: string; result_text: string | null; last_error: string | null; controller_key: string } | undefined;
+      if (existing && existing.controller_key !== input.controllerKey) return { outcome: "fence_lost" };
       if (existing?.state === "completed") {
         return { outcome: "completed", result: existing.result_text ?? "" };
       }
       if (existing?.state === "started") return { outcome: "interrupted" };
+      if (existing?.state === "failed" && existing.last_error !== "authorization_failed") {
+        return { outcome: "interrupted" };
+      }
       if (existing) {
         this.db.prepare(
           `UPDATE tool_receipts SET state = 'started', last_error = NULL, updated_at = ?
@@ -5439,12 +6897,38 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (completed.changes !== 1) throw new Error("exact started tool receipt was not completed");
   }
 
-  public failToolReceipt(input: ToolReceiptKey & { error: string; now: number }): void {
+  public failToolReceipt(input: ToolReceiptKey & Readonly<{
+    error: string;
+    now: number;
+    controllerKey?: string;
+    ownerId?: string;
+    generation?: number;
+  }>): void {
     assertNonNegativeInteger(input.now, "now");
+    const hasFence = input.ownerId !== undefined || input.generation !== undefined;
+    if (hasFence && (
+      input.ownerId === undefined || input.generation === undefined || input.controllerKey === undefined
+    )) {
+      throw new TypeError("tool receipt failure fence is incomplete");
+    }
+    if (hasFence) assertControllerKey(input.controllerKey!);
+    if (hasFence && !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)) return;
+    const fencePredicate = hasFence
+      ? ` AND EXISTS (
+           SELECT 1 FROM controller_turns
+            WHERE id = ? AND controller_key = ? AND state = 'submitted'
+              AND lease_owner = ? AND lease_generation = ? AND accepted_finalization_id IS NULL
+              AND steer_reservation_turn_id IS NULL
+         )`
+      : "";
+    const parameters = hasFence
+      ? [input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256,
+          input.turnId, input.controllerKey, input.ownerId!, input.generation!]
+      : [input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256];
     this.db.prepare(
       `UPDATE tool_receipts SET state = 'failed', last_error = ?, updated_at = ?
-        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'`,
-    ).run(input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256);
+        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'${fencePredicate}`,
+    ).run(...parameters);
   }
 
   public listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[] {
@@ -8757,6 +10241,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.executorLeaseIsCurrent(ownerId, generation, now);
   }
 
+  public isControllerInteractionDeliveryFenceCurrent(input: ControllerInteractionDeliveryFence): boolean {
+    return this.controllerInteractionRepository.isControllerInteractionDeliveryFenceCurrent(input);
+  }
+
   public leaseControlEffects(input: ControlEffectLeaseInput): StoredEffect[] {
     this.assertLeaseInput(input.ownerId, input.now, input.leaseMs);
     assertPositiveInteger(input.generation, "generation");
@@ -10712,7 +12200,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertSafeFailureSummary(outcome);
     assertNoRawMergeCallback(outcome, "Telegram update outcome");
     const claimGeneration = this.claimedUpdates.get(updateId);
-    if (claimGeneration === undefined) throw new UpdateClaimConflictError(updateId);
+    if (claimGeneration === undefined) {
+      const existing = this.db.prepare(
+        "SELECT status FROM telegram_updates WHERE update_id = ?",
+      ).get(updateId) as { status: string } | undefined;
+      if (existing?.status === "processed") {
+        advanceTelegramCursor(this.db);
+        return;
+      }
+      throw new UpdateClaimConflictError(updateId);
+    }
 
     const complete = this.db.transaction(() => {
       const updated = this.db
@@ -11304,6 +12801,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!input.ownerId) throw new TypeError("ownerId must not be empty");
     assertPositiveInteger(input.generation, "generation");
     assertNonNegativeInteger(input.now, "now");
+  }
+
+  private assertControllerSteerInput(input: ControllerLeaseFence & {
+    runningTurnId: string;
+    waitingTurnId: string;
+  }): void {
+    this.assertControllerMutation({ ...input, turnId: input.runningTurnId });
+    assertControllerIdentifier(input.waitingTurnId, "waitingTurnId");
   }
 
   private assertLeaseIdentity(key: string, ownerId: string, generation: number, now: number): void {
@@ -12075,8 +13580,8 @@ export function openStore(
   controllerModelRoute: () => ModelRoute = () => DEFAULT_CONTROLLER_CAPABILITY_MODEL,
   capabilityDispatchSettings: () => CapabilityDispatchSettings = () => DEFAULT_CAPABILITY_DISPATCH_SETTINGS,
 ): TelegramAgentStore {
+  migrateControllerInteractionStorage(storage);
   const db = storage.database();
-  storage.migrate(db, [...ALL_MIGRATIONS]);
   ensureApprovalOwnershipColumns(db);
   return new SqliteTelegramAgentStore(db, kv, now, controllerModelRoute, capabilityDispatchSettings);
 }

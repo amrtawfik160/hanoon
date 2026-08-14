@@ -4,7 +4,6 @@ import type { StoredEffect } from "../domain/models";
 import { AutonomyScheduler } from "../autonomy/scheduler";
 import { MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "../autonomy/models";
 import { redactError } from "../errors";
-import { controllerDraftPreview } from "../controller/stream";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
 import { classifyTelegramError } from "../telegram/errors";
 import { JobLaneRunner, type JobLaneKind, type JobLaneSnapshotProvider } from "./job-lane-runner";
@@ -428,6 +427,17 @@ function stableChatDraftId(chatId: string): number {
 function payloadText(item: StoredOutbox): string {
   const text = item.payload.text;
   return typeof text === "string" ? text : "";
+}
+
+function controllerDeliveryPayload(
+  item: StoredOutbox,
+  controllerTurn: NonNullable<ReturnType<TelegramAgentStore["getControllerTurn"]>> | null,
+): Record<string, unknown> {
+  if (!controllerTurn || controllerTurn.state !== "submitted") return item.payload;
+  return {
+    text: CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
+    disable_web_page_preview: true,
+  };
 }
 
 async function abortableHeartbeat(
@@ -875,6 +885,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             const callback = callbackId(item.logicalKey);
             const turnId = controllerTurnId(item.logicalKey);
             const controllerTurn = turnId ? deps.store.getControllerTurn(turnId) : null;
+            const deliveryPayload = controllerDeliveryPayload(item, controllerTurn);
             const terminalControllerDraft = turnId !== null &&
               controllerTurn?.state === "submitted" &&
               (controllerTurn.streamPhase === "complete" || controllerTurn.streamPhase === "failed");
@@ -902,9 +913,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
                 CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
               );
             } else if (knownMessageId !== null) {
-              await telegram.editMessage(item.chatId, knownMessageId, item.payload);
+              await telegram.editMessage(item.chatId, knownMessageId, deliveryPayload);
             } else {
-              deliveredMessageId = (await telegram.sendMessage(item.chatId, item.payload)).message_id;
+              deliveredMessageId = (await telegram.sendMessage(item.chatId, deliveryPayload)).message_id;
             }
             if (jobId && deliveredMessageId !== null && job?.statusMessageId === null && typeof deps.store.completeStatusOutbox === "function") {
               const atomicallyCompleted = deps.store.completeStatusOutbox(

@@ -1,74 +1,55 @@
-import type { TelegramAgentStore } from "../storage/store";
+import type {
+  ControllerSteerReservation,
+  ControllerSupervisorSteerAttempt,
+  TelegramAgentStore,
+} from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
-import { containsForbiddenCallbackMaterial } from "../telegram/callback-material";
 import {
   ControllerImagePreparationError,
-  type ControllerAdapter,
-  type ControllerEventObservation,
+  parseControllerInteractionResolution,
   type ControllerInteractionReference,
+  type ControllerInteractionSnapshot,
+  type ControllerAdapter,
   type ControllerLocation,
+  type ControllerSteerReconciliation,
   type ControllerStatus,
 } from "./bb-controller";
+import {
+  ControllerInteractionService,
+  controllerInteractionResolutionMatches,
+} from "./interaction-service";
+import { parseControllerInteraction } from "./questions";
 import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
-import { projectControllerStream } from "./stream";
+import { normalizeControllerEventObservation, projectControllerStream } from "./stream";
+import type { ControllerEventObservation } from "./bb-controller";
 import { buildTurnContext, composeTurnInput } from "./context";
 import { evaluateSupervisor } from "./supervisor";
-import type { ControllerInteractionFetch, ControllerInteractionService } from "./interaction-service";
 import {
   ControllerEvidenceProjectorError,
   type ControllerEvidenceReconciler,
-  type ControllerEvidenceReconciliation,
 } from "./evidence-projector";
-
-/** The BB half of the hidden-controller interaction bridge. */
-export type ControllerInteractionReconciler = Pick<
-  ControllerInteractionService,
-  "deliverAnswered" | "fetchPending"
->;
 
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
   adapter: ControllerAdapter;
+  interactionService?: ControllerInteractionService;
   evidenceProjector: ControllerEvidenceReconciler;
-  interactionService: ControllerInteractionReconciler;
   clock: { now(): number };
 };
 
-type TerminalContext = Readonly<{
-  controller: ControllerThreadRecord;
+type InteractionReconciliationContext = Readonly<{
   turn: ControllerTurnRecord;
+  controller: ControllerThreadRecord;
   fence: EffectFence;
   signal: AbortSignal;
-  status: ControllerStatus;
-  observation: Awaited<ReturnType<ControllerAdapter["events"]>> | null;
-  reconciliation: ControllerEvidenceReconciliation | null;
-}>;
-type CompletionContinuationClaim = "claimed" | "already_claimed" | "stale" | "failed";
-type FailAndRetireOutcome = ReturnType<TelegramAgentStore["failAndRetireControllerTurn"]>;
-type TerminalHighWaterOutcome = "matched" | "deferred" | "retired";
-type BoundaryFailureContext = Readonly<{
-  controller: ControllerThreadRecord;
-  turn: ControllerTurnRecord;
-  fence: EffectFence;
-  signal: AbortSignal;
-  failureSummary: string;
-  /** The status already read on this pass, when the caller has one. */
-  observedStatus?: ControllerStatus;
 }>;
 
 const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
-const CONTROLLER_THINKING_DRAFT_REFRESH_MS = 2_000;
 // How long a queued message may wait for a busy controller thread before the
 // owner is told it will not be answered.
 const CONTROLLER_BUSY_WAIT_MS = 10 * 60_000;
 const CONTROLLER_IMAGE_FAILURE_MESSAGE =
-  "I couldn't read that photo or clip. Please resend a smaller JPEG, PNG, WebP, GIF, or short video.";
-const CONTROLLER_MODELS_UNAVAILABLE_MESSAGE =
-  "I couldn't connect using any configured controller model. Check provider login or change the controller fallback models in Settings, then resend.";
-export const CONTROLLER_COMPLETION_RECOVERY_PROMPT =
-  "Your previous turn ended without an accepted telegram_agent_respond call. " +
-  "Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. " +
-  "Do not repeat a side effect.";
+  "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.";
 /**
  * How long a submitted turn may go without producing a single BB event before
  * it is treated as wedged. Any event at all — reasoning, a tool call, output —
@@ -79,6 +60,9 @@ export const CONTROLLER_COMPLETION_RECOVERY_PROMPT =
 export const CONTROLLER_STALL_MS = 8 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
 const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
+export const CONTROLLER_COMPLETION_RECOVERY_PROMPT =
+  "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.";
+export const CONTROLLER_RECOVERY_PROMPT = CONTROLLER_COMPLETION_RECOVERY_PROMPT;
 
 function retireReason(status: ControllerStatus): string {
   if (status === "missing") return "Thread was deleted or archived";
@@ -90,15 +74,12 @@ function fenceAt(fence: EffectFence, now: number) {
   return { ownerId: fence.ownerId, generation: fence.generation, now };
 }
 
-function controllerFallbackIsSafe(observation: ControllerEventObservation): boolean {
-  return !observation.inputAccepted && !observation.completed &&
-    !observation.assistantOutputObserved && !observation.toolActivityObserved &&
-    observation.interactions.length === 0 && observation.toolCalls === 0 &&
-    observation.commandFailures === 0;
-}
-
 export class LunaControllerService {
-  public constructor(private readonly dependencies: LunaControllerServiceDependencies) {}
+  private readonly dependencies: LunaControllerServiceDependencies;
+
+  public constructor(dependencies: LunaControllerServiceDependencies) {
+    this.dependencies = dependencies;
+  }
 
   public async processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
     const now = this.dependencies.clock.now();
@@ -118,11 +99,7 @@ export class LunaControllerService {
     if (controller.threadId !== null) {
       let status: ControllerStatus;
       try {
-        status = await this.dependencies.adapter.status(
-          controller.threadId,
-          signal,
-          turn.modelFallbackIndex,
-        );
+        status = await this.dependencies.adapter.status(controller.threadId, signal);
       } catch {
         this.fail(turn, fence, "Controller status could not be verified");
         return true;
@@ -156,6 +133,7 @@ export class LunaControllerService {
         }
         try {
           const input = this.composeInput(turn, { includeDigest: false });
+          if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
           if (turn.image) {
             await this.dependencies.adapter.send(controller.threadId, input, signal, turn.image);
           } else {
@@ -233,723 +211,625 @@ export class LunaControllerService {
       });
     }
 
-    // ===== Pre-terminal reconcile boundary (B2a) =====
-    // 1. Adopt the submitted turn fence under the current global executor
-    //    lease, then re-read. Every mutation below must run against the
-    //    post-adoption record, never the pre-adoption one.
     if (!this.dependencies.store.adoptSubmittedControllerTurnFence({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: submitted.id,
-    })) {
-      // Stale fence / cursor change / abort: no terminal write; a later pass
-      // re-adopts once the supervisor reconciles the advanced boundary.
+    })) return true;
+    let turn = this.dependencies.store.getControllerTurn(submitted.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+
+    if (await this.reconcileReservedSteer(controller.controllerKey, fence, signal)) return true;
+    if (await this.reconcilePendingSupervisorSteer(submitted.id, fence, signal)) return true;
+    turn = this.dependencies.store.getControllerTurn(submitted.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+
+    if (await this.deliverAnsweredInteraction(turn, controller, fence, signal)) return true;
+
+    const evidenceOutcome = await this.reconcileEvidence(controller, turn, fence, signal);
+    if (evidenceOutcome === "retry") return this.handleEvidenceRetry(turn, controller, fence, signal);
+    if (evidenceOutcome === "stale") return true;
+    if (evidenceOutcome === "fatal") {
+      this.failAndRetire(turn, controller, fence, "Controller evidence could not be reconciled safely");
+      return true;
+    }
+    turn = this.dependencies.store.getControllerTurn(turn.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+
+    let status: ControllerStatus;
+    try {
+      status = await this.dependencies.adapter.status(controller.threadId, signal);
+    } catch {
       return false;
     }
-    let turn = this.dependencies.store.getControllerTurn(submitted.id);
-    let liveController = this.dependencies.store.getControllerByThreadId(controller.threadId);
-    if (!this.validAdoptedTurn(turn, liveController, fence, controller)) return false;
-
-    // 2. Deliver one already-durable owner answer. This is the sole operation
-    //    allowed before evidence: until BB hears a decision the owner already
-    //    made, the thread cannot produce any evidence at all, so a pass that
-    //    finds one does nothing else whether or not the delivery lands.
-    const ownerAnswer = this.dependencies.store.getAnsweredControllerInteraction(liveController!.controllerKey);
-    if (ownerAnswer) {
-      // Only one turn of a controller is ever submitted, so an answer parked on
-      // a different one is a broken invariant rather than ordinary lag.
-      if (ownerAnswer.turnId !== turn!.id) {
-        return this.failAndRetire(
-          liveController!,
-          turn!,
-          fence,
-          "Controller owner answer did not match the adopted turn",
-        ) === "retired";
-      }
-      if (await this.deliverOwnerAnswer(liveController!, fence, signal)) return true;
-      return await this.retireParkedOnLostThread(liveController!, turn!, fence, signal);
-    }
-
-    // 3. Run the native-evidence projector on every pass through a fixed
-    //    high-water, before any legacy question/status/events/phase/draft/
-    //    steer/supervisor/stall work, then re-read afterward.
-    let reconciliation: ControllerEvidenceReconciliation | null = null;
+    let observation: ControllerEventObservation | null = null;
     try {
-      reconciliation = await this.dependencies.evidenceProjector.reconcile(
-        liveController!,
-        turn!,
+      const rawObservation = await this.dependencies.adapter.events(
+        controller.threadId,
+        turn.bbEventSeq,
+        signal,
+      );
+      observation = {
+        ...normalizeControllerEventObservation(rawObservation),
+        interactionReferences: rawObservation.interactionReferences ?? [],
+      };
+      if (!Number.isSafeInteger(observation.latestSeq)) return true;
+    } catch {
+      observation = null;
+    }
+    if (observation === null) return false;
+    if (!await this.reconcileInteractionReferences(
+      observation.interactionReferences ?? [],
+      { turn, controller, fence, signal },
+    )) return true;
+    const projected = projectControllerStream(observation, {
+      cursor: turn.bbEventSeq,
+      text: turn.streamText,
+      phase: turn.streamPhase,
+    });
+    if (projected.cursor > turn.bbEventSeq) {
+      this.dependencies.store.updateControllerStream({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+        cursor: projected.cursor,
+        phase: projected.phase,
+        toolCalls: observation.toolCalls,
+        commandFailures: observation.commandFailures,
+        totalTokens: observation.totalTokens,
+      });
+    }
+    const refreshedAt = this.dependencies.clock.now();
+    turn = this.dependencies.store.getControllerTurn(turn.id);
+    controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!turn || turn.state !== "submitted" || !controller?.threadId) return true;
+    if (await this.deliverAnsweredInteraction(turn, controller, fence, signal)) return true;
+    if (this.hasPendingInteraction(controller.controllerKey, turn.id)) return true;
+
+    const accepted = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
+    const parked = turn.awaitingInteractionId;
+    if (parked !== null) return true;
+    if (turn.acceptedFinalizationId !== null && accepted === null) {
+      this.failAndRetire(
+        turn,
+        controller,
+        fence,
+        "Accepted controller finalization failed semantic revalidation",
+      );
+      return true;
+    }
+    if (status === "active" || status === "starting" || status === "stopping") {
+      if (!accepted) {
+        this.dependencies.store.refreshControllerDraft({
+          ...fenceAt(fence, refreshedAt),
+          turnId: turn.id,
+          sentBefore: Math.max(0, refreshedAt - CONTROLLER_DRAFT_REFRESH_MS),
+        });
+        // Anything the owner says while an answer is being written belongs to that
+        // answer. Holding it back until the turn ends is how a correction arrives
+        // too late to correct anything.
+        const waiting = parked === null
+          ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
+          : null;
+        if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
+          if (signal.aborted || !this.dependencies.store.reserveControllerSteer({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            runningTurnId: turn.id,
+            waitingTurnId: waiting.id,
+            controllerKey: turn.controllerKey,
+            expectedThreadId: controller.threadId,
+          })) return true;
+          let outcome: ControllerSteerReconciliation = "applied";
+          try {
+            await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
+          } catch {
+            // A thrown call may have reached BB; reconcile before choosing any retry.
+            outcome = await this.reconcileProviderSteer({
+              threadId: controller.threadId,
+              inputText: waiting.inputText,
+              idempotencyKey: `controller-steer:${turn.id}:${waiting.id}`,
+            }, signal);
+          }
+          const settled = this.dependencies.store.settleControllerSteer({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            runningTurnId: turn.id,
+            waitingTurnId: waiting.id,
+            controllerKey: turn.controllerKey,
+            outcome,
+          });
+          if (settled === "stale") return true;
+          return true;
+        }
+      }
+      // The owner's own words outrank a budget nudge, so this runs only once
+      // nothing of theirs is waiting. A turn parked on a question is waiting on
+      // a person, and no budget should fire against their thinking time.
+      if (!accepted && parked === null && await this.superviseBudget(turn.id, controller, fence, signal)) {
+        return true;
+      }
+      if (parked === null && refreshedAt - turn.updatedAt >= CONTROLLER_STALL_MS) {
+        this.failAndRetire(
+          turn,
+          controller,
+          fence,
+          "Controller turn stopped producing events",
+          "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
+        );
+      }
+      return true;
+    }
+    const providerError = status === "error" || observation.error !== null;
+    if (accepted && (providerError || status === "idle" || observation.completed)) {
+      return await this.completeAccepted(turn, controller, fence, providerError, signal);
+    }
+    if (providerError) {
+      if (
+        !observation.inputAccepted &&
+        turn.retryCount === 0 &&
+        turn.modelFallbackIndex < 2 &&
+        this.dependencies.store.retryUnacceptedControllerTurn({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+        controllerKey: controller.controllerKey,
+        expectedThreadId: controller.threadId,
+        nextFallbackIndex: turn.modelFallbackIndex + 1,
+      })
+      ) return true;
+      this.failAndRetire(turn, controller, fence, "Controller provider turn failed");
+      return true;
+    }
+    if (status === "missing" || status === "incompatible") {
+      this.failAndRetire(
+        turn,
+        controller,
+        fence,
+        status === "missing" ? "Controller conversation became unavailable" : "Controller conversation uses an incompatible provider",
+      );
+      return true;
+    }
+    if (status === "idle" || observation.completed) return this.requestCompletionContinuation(turn, controller, fence, signal);
+    return true;
+  }
+
+  private async reconcileReservedSteer(
+    controllerKey: string,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const reservation = this.dependencies.store.getControllerSteerReservation(controllerKey);
+    if (!reservation) return false;
+    const outcome = await this.reconcileProviderSteer(reservation, signal);
+    const settled = this.dependencies.store.settleControllerSteer({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      runningTurnId: reservation.runningTurnId,
+      waitingTurnId: reservation.waitingTurnId,
+      controllerKey: reservation.controllerKey,
+      outcome,
+    });
+    return settled === "settled" || settled === "stale";
+  }
+
+  private async reconcilePendingSupervisorSteer(
+    turnId: string,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const attempt = this.dependencies.store.getPendingControllerSupervisorSteer(turnId);
+    if (!attempt) return false;
+    const providerOutcome = await this.reconcileProviderSteer(attempt, signal);
+    const outcome = providerOutcome === "applied" ? "applied" : "unknown";
+    const settled = this.dependencies.store.settleControllerSupervisorSteer({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: attempt.turnId,
+      controllerKey: attempt.controllerKey,
+      reason: attempt.reason,
+      outcome,
+    });
+    return settled === "settled" || settled === "stale";
+  }
+
+  private async reconcileProviderSteer(
+    reservation: Pick<ControllerSteerReservation | ControllerSupervisorSteerAttempt, "threadId" | "inputText" | "idempotencyKey">,
+    signal: AbortSignal,
+  ): Promise<ControllerSteerReconciliation> {
+    const reconcile = this.dependencies.adapter.reconcileSteer;
+    if (!reconcile || signal.aborted || reservation.threadId.length === 0 || reservation.inputText === null) {
+      return "unknown";
+    }
+    try {
+      const outcome = await reconcile({
+        threadId: reservation.threadId,
+        text: reservation.inputText,
+        idempotencyKey: reservation.idempotencyKey,
+        signal,
+      });
+      return outcome === "applied" || outcome === "not_applied" || outcome === "unknown"
+        ? outcome
+        : "unknown";
+    } catch {
+      // A transport or provider error cannot distinguish delivery from refusal.
+      // The caller must settle it as unknown so a successor never replays it.
+      return "unknown";
+    }
+  }
+
+  private async reconcileEvidence(
+    controller: ControllerThreadRecord,
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<"ready" | "retry" | "stale" | "fatal"> {
+    let highWater: number;
+    try {
+      highWater = await this.dependencies.adapter.latestSeq(controller.threadId!, signal);
+    } catch {
+      return "retry";
+    }
+    if (!Number.isSafeInteger(highWater) || highWater < 0) return "fatal";
+    if (highWater < turn.evidenceEventSeq) return "stale";
+    if (!this.dependencies.evidenceProjector) return "fatal";
+    try {
+      const reconciliation = await this.dependencies.evidenceProjector.reconcile(
+        controller,
+        turn,
+        fenceAt(fence, this.dependencies.clock.now()),
+        signal,
+        highWater,
+      );
+      if (!reconciliation) return "fatal";
+      if (reconciliation.outcome === "stale") return "stale";
+      if (reconciliation.outcome === "limit_exceeded") {
+        return "fatal";
+      }
+      if (reconciliation.reconciliationIncomplete !== null) return "retry";
+      if (reconciliation.targetSeq !== highWater) return "stale";
+      return "ready";
+    } catch (error) {
+      if (signal.aborted) return "stale";
+      if (error instanceof ControllerEvidenceProjectorError) {
+        return error.code === "cursor_conflict" ? "stale" : "fatal";
+      }
+      return "retry";
+    }
+  }
+
+  private async handleEvidenceRetry(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (this.hasPendingInteraction(controller.controllerKey, turn.id) ||
+        this.dependencies.store.getAnsweredControllerInteraction(controller.controllerKey)?.turnId === turn.id) return true;
+    let status: ControllerStatus;
+    try {
+      status = await this.dependencies.adapter.status(controller.threadId!, signal);
+    } catch {
+      return false;
+    }
+    if (status === "missing" || status === "incompatible") {
+      this.failAndRetire(
+        turn,
+        controller,
+        fence,
+        status === "missing" ? "Controller conversation became unavailable" : "Controller conversation uses an incompatible provider",
+      );
+      return true;
+    }
+    const current = this.dependencies.store.getControllerTurn(turn.id);
+    if (current?.state === "submitted" && current.awaitingInteractionId === null &&
+        this.dependencies.clock.now() - current.updatedAt >= CONTROLLER_STALL_MS) {
+      this.failAndRetire(
+        current,
+        controller,
+        fence,
+        "Controller evidence reconciliation stalled",
+        "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
+      );
+      return true;
+    }
+    return false;
+  }
+
+  private async deliverOwnerAnswer(
+    ownerAnswer: NonNullable<ReturnType<TelegramAgentStore["getAnsweredControllerInteraction"]>>,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!controller.threadId) return;
+    const turn = this.dependencies.store.getControllerTurn(ownerAnswer.turnId);
+    if (!turn || turn.state !== "submitted" ||
+        !this.interactionDeliveryAllowed(ownerAnswer, fence, signal)) return;
+    try {
+      if (this.dependencies.adapter.resolveInteraction) {
+        const resolution = parseControllerInteractionResolution(ownerAnswer.resolution);
+        await this.dependencies.adapter.resolveInteraction(
+          controller.threadId,
+          ownerAnswer.interactionId,
+          resolution,
+          signal,
+        );
+      } else if (ownerAnswer.interaction.kind === "user_question") {
+        await this.dependencies.adapter.answerQuestion(
+          controller.threadId,
+          ownerAnswer.interactionId,
+          ownerAnswer.answers,
+          signal,
+        );
+      } else {
+        return;
+      }
+    } catch {
+      // Provider failures are ambiguous; retaining the durable answer lets the
+      // executor retry after an authoritative read on the next pass.
+      return;
+    }
+    if (!this.interactionDeliveryAllowed(ownerAnswer, fence, signal)) return;
+    const getInteraction = this.dependencies.adapter.getInteraction;
+    if (!getInteraction) return;
+    let observed: ControllerInteractionSnapshot;
+    try {
+      observed = await getInteraction.call(
+        this.dependencies.adapter,
+        controller.threadId,
+        ownerAnswer.interactionId,
+        signal,
+      );
+    } catch {
+      return;
+    }
+    if (observed.id !== ownerAnswer.interactionId || observed.threadId !== ownerAnswer.bbThreadId ||
+        observed.status !== "resolved" ||
+        !controllerInteractionResolutionMatches(observed.resolution, ownerAnswer.resolution)) return;
+    this.dependencies.store.markControllerInteractionDelivered({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      interactionId: ownerAnswer.interactionId,
+      turnId: ownerAnswer.turnId,
+      bbThreadId: ownerAnswer.bbThreadId,
+    });
+  }
+
+  private interactionDeliveryAllowed(
+    ownerAnswer: NonNullable<ReturnType<TelegramAgentStore["getAnsweredControllerInteraction"]>>,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): boolean {
+    return !signal.aborted && this.dependencies.store.isControllerInteractionDeliveryFenceCurrent({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      interactionId: ownerAnswer.interactionId,
+      turnId: ownerAnswer.turnId,
+      controllerKey: ownerAnswer.controllerKey,
+      bbThreadId: ownerAnswer.bbThreadId,
+      controllerGenerationId: ownerAnswer.controllerGenerationId,
+    });
+  }
+
+  private hasPendingInteraction(controllerKey: string, turnId: string): boolean {
+    return this.dependencies.store.getPendingControllerInteraction(controllerKey)?.turnId === turnId;
+  }
+
+  private async deliverAnsweredInteraction(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const answered = this.dependencies.store.getAnsweredControllerInteraction(controller.controllerKey);
+    if (!answered || answered.turnId !== turn.id) return false;
+    if (this.dependencies.interactionService) {
+      await this.dependencies.interactionService.deliverAnswered(
+        controller.controllerKey,
         fenceAt(fence, this.dependencies.clock.now()),
         signal,
       );
-    } catch (error) {
-      if (error instanceof ControllerEvidenceProjectorError) {
-        // Deterministic projection failure: fail and retire atomically with a
-        // bounded internal reason. No raw output can bypass this boundary.
-        return this.failAndRetire(liveController!, turn!, fence, this.projectorFailure(error)) === "retired";
-      }
-      return this.retirePersistentBoundary({
-        controller: liveController!,
-        turn: turn!,
-        fence,
-        signal,
-        failureSummary: "Controller evidence projection remained unavailable",
-      });
-    }
-
-    // Re-read after projection.
-    turn = this.dependencies.store.getControllerTurn(submitted.id);
-    liveController = this.dependencies.store.getControllerByThreadId(controller.threadId);
-    if (!this.validAdoptedTurn(turn, liveController, fence, controller)) return false;
-
-    // 4. Deterministic, non-recoverable reconciliation outcomes fail-and-retire.
-    if (reconciliation !== null) {
-      if (reconciliation.outcome === "stale") return false; // no terminal write
-      if (reconciliation.outcome === "limit_exceeded" || reconciliation.reconciliationIncomplete !== null) {
-        return this.failAndRetire(
-          liveController!,
-          turn!,
-          fence,
-          reconciliation.outcome === "limit_exceeded"
-            ? "Controller evidence limit exceeded during reconciliation"
-            : reconciliation.reconciliationIncomplete === "page_cap"
-              ? "Controller evidence reconciliation exceeded the bounded page cap"
-              : "Controller evidence reconciliation hit a source gap",
-        ) === "retired";
-      }
-    }
-    // A cap marker observed on the re-read turn also fails-and-retires rather
-    // than continuing an unprovable answer.
-    if (turn!.evidenceLimitExceededAt !== null) {
-      return this.failAndRetire(liveController!, turn!, fence, "Controller evidence limit exceeded") === "retired";
-    }
-
-    // ===== Pre-terminal work, all on the post-adoption turn =====
-    let status: ControllerStatus;
-    try {
-      status = await this.dependencies.adapter.status(
-        controller.threadId,
-        signal,
-        submitted.modelFallbackIndex,
-      );
-    } catch {
-      return this.retirePersistentBoundary({
-        controller: liveController!,
-        turn: turn!,
-        fence,
-        signal,
-        failureSummary: "Controller status remained unavailable",
-      });
-    }
-    let observation: Awaited<ReturnType<ControllerAdapter["events"]>> | null = null;
-    try {
-      observation = await this.dependencies.adapter.events(
-        liveController!.threadId!,
-        turn!.bbEventSeq,
-        signal,
-      );
-    } catch {
-      return this.retirePersistentBoundary({
-        controller: liveController!,
-        turn: turn!,
-        fence,
-        signal,
-        failureSummary: "Controller event boundary remained unavailable",
-        observedStatus: status,
-      });
-    }
-    // 5. Persist every observed lifecycle reference before the event cursor
-    //    advances past it, so a failed BB read costs a retry rather than the
-    //    owner's only view of what the thread is blocked on.
-    if (!await this.observeInteractions(liveController!, turn!, observation.interactions, fence, signal)) {
-      return this.retirePersistentBoundary({
-        controller: liveController!,
-        turn: turn!,
-        fence,
-        signal,
-        failureSummary: "Controller interaction boundary remained unavailable",
-        observedStatus: status,
-      });
-    }
-    const projected = projectControllerStream(observation, {
-      cursor: turn!.bbEventSeq,
-      text: turn!.streamText,
-      phase: turn!.streamPhase,
-    });
-    // Keep durable store failures outside the external event-read catch. A
-    // database invariant or write failure is not a transient BB boundary and
-    // must propagate so its surrounding transaction can roll back loudly.
-    this.dependencies.store.updateControllerStream({
-      ...fenceAt(fence, this.dependencies.clock.now()),
-      turnId: turn!.id,
-      cursor: projected.cursor,
-      phase: projected.phase,
-      toolCalls: observation.toolCalls,
-      commandFailures: observation.commandFailures,
-      totalTokens: observation.totalTokens,
-    });
-    // 6. A turn waiting on a person does nothing else at all: no draft refresh,
-    //    steering, budget, stall, continuation, completion, or silence. Its own
-    //    answer is what unblocks it, and that arrives through step 2.
-    if (this.parkedOnInteraction(turn!)) {
-      await this.retireParkedOnLostThread(liveController!, turn!, fence, signal, status);
       return true;
     }
-    const refreshedAt = this.dependencies.clock.now();
-    // A turn parked on a question is waiting on a person. Redrawing its draft
-    // would only replace the question with a stale phase label.
-    const parked = this.awaitingInteractionId(turn!);
-    if (parked === null) {
-      // Drafts are phase-only, so "quiet" is read from the phase itself: every
-      // pre-responding phase refreshes on the faster cadence.
-      const quietPreview = turn!.streamPhase === "queued" || turn!.streamPhase === "connecting" ||
-        turn!.streamPhase === "thinking" || turn!.streamPhase === "using_tools";
-      this.dependencies.store.refreshControllerDraft({
-        ...fenceAt(fence, refreshedAt),
-        turnId: turn!.id,
-        sentBefore: Math.max(0, refreshedAt - (
-          quietPreview ? CONTROLLER_THINKING_DRAFT_REFRESH_MS : CONTROLLER_DRAFT_REFRESH_MS
-        )),
-      });
-    }
-    if (status === "active" || status === "starting" || status === "stopping") {
-      // Active/starting/stopping do only phase/evidence work; no finalization
-      // consumption happens here (B2b owns terminal handling). Anything the
-      // owner says while an answer is being written belongs to that answer.
-      const waiting = this.dependencies.store.getQueuedControllerTurn(liveController!.controllerKey);
-      if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
-        try {
-          await this.dependencies.adapter.steer(liveController!.threadId!, waiting.inputText, signal);
-        } catch {
-          // Out of attempts it stays queued, and the ordinary dispatch answers
-          // it once the turn in flight finishes.
-          this.dependencies.store.recordControllerSteerFailure({
-            ...fenceAt(fence, this.dependencies.clock.now()),
-            turnId: waiting.id,
-          });
-          return true;
-        }
-        this.dependencies.store.foldControllerTurnIntoRunning({
-          ...fenceAt(fence, this.dependencies.clock.now()),
-          turnId: waiting.id,
-        });
-        return true;
-      }
-      // The owner's own words outrank a budget nudge, so this runs only once
-      // nothing of theirs is waiting.
-      if (await this.superviseBudget(turn!.id, liveController!, fence, signal)) {
-        return true;
-      }
-      if (parked === null && refreshedAt - turn!.updatedAt >= CONTROLLER_STALL_MS) {
-        // Stopping the live provider turn is the half that matters. Retiring
-        // only the durable turn leaves the wedge in place, and every later
-        // message then waits out the busy timeout against a thread that will
-        // never go idle.
-        try {
-          await this.dependencies.adapter.stop?.(liveController!.threadId!, signal);
-        } catch {
-          // The durable retirement below still prevents the next message from
-          // being routed back into the wedged provider session.
-        }
-        return this.failAndRetire(
-          liveController!,
-          turn!,
-          fence,
-          "Controller turn stopped producing events",
-        ) === "retired";
-      }
-      return true;
-    }
-    if (observation === null && status !== "missing" && status !== "incompatible") {
-      // A terminal status without its event/interaction boundary is not proof
-      // that there is no parked owner question or later provider activity.
-      return false;
-    }
-
-    // A turn that asked for more capability relaunches into a fresh session
-    // rather than settling here: the current provider session was never
-    // granted the capability the turn still needs.
-    const current = this.dependencies.store.getControllerTurn(turn!.id);
-    if (current?.capabilityContinuationState === "requested") {
-      try {
-        await this.dependencies.adapter.stop?.(liveController!.threadId!, signal);
-      } catch {
-        // An idle provider cannot make another tool call. Durable retirement
-        // below still prevents it from being adopted for the continuation.
-      }
-      if (this.dependencies.store.prepareControllerCapabilityContinuation({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId: current.id,
-        controllerKey: liveController!.controllerKey,
-        expectedThreadId: liveController!.threadId!,
-      })) return true;
-      return this.failAndRetire(
-        liveController!,
-        current,
-        fence,
-        "Controller capability continuation could not prove a safe session boundary",
-      ) === "retired";
-    }
-
-    // A non-active status is a terminal boundary. Re-read the exact submitted
-    // turn and its live generation before inspecting or consuming durable
-    // finalization state; nothing below is allowed to act on the earlier row.
-    turn = this.dependencies.store.getControllerTurn(turn!.id);
-    liveController = this.dependencies.store.getControllerByThreadId(controller.threadId);
-    if (!this.validAdoptedTurn(turn, liveController, fence, controller)) return false;
-    return await this.settleTerminal({
-      controller: liveController!,
-      turn: turn!,
-      fence,
-      signal,
-      status,
-      observation,
-      reconciliation,
-    });
+    await this.deliverOwnerAnswer(answered, controller, fence, signal);
+    return true;
   }
 
-  private async settleTerminal(context: TerminalContext): Promise<boolean> {
-    if (this.parkedOnInteraction(context.turn)) return true;
-    if (context.status === "missing" || context.status === "incompatible") {
-      return this.failAndRetire(
-        context.controller,
-        context.turn,
-        context.fence,
-        context.status === "missing"
-          ? "Controller conversation became unavailable"
-          : "Controller provider became incompatible",
-      ) === "retired";
-    }
-    let accepted: ReturnType<TelegramAgentStore["getAcceptedControllerFinalization"]>;
-    try {
-      accepted = this.dependencies.store.getAcceptedControllerFinalization(context.turn.id);
-    } catch {
-      return this.failAndRetire(
-        context.controller,
-        context.turn,
-        context.fence,
-        "Controller accepted finalization storage is invalid",
-      ) === "retired";
-    }
-    if (accepted !== null) return await this.completeAcceptedFinalization(context);
-    if (context.status === "error") return await this.settleUnfinalizedError(context);
-    return await this.sendCompletionContinuation(context);
-  }
-
-  private async completeAcceptedFinalization(context: TerminalContext): Promise<boolean> {
-    const highWater = await this.terminalHighWaterMatches(context);
-    if (highWater !== "matched") return highWater === "retired";
-    const completion = this.dependencies.store.completeControllerTurnFromFinalization({
-      ...fenceAt(context.fence, this.dependencies.clock.now()),
-      turnId: context.turn.id,
-      controllerKey: context.turn.controllerKey,
-    });
-    if (completion === "stale") return false;
-    if (completion === "evidence_advanced") {
-      return this.failAndRetire(
-        context.controller,
-        context.turn,
-        context.fence,
-        "Controller evidence advanced after finalization",
-      ) === "retired";
-    }
-    if (context.status === "error") {
-      return this.dependencies.store.resetControllerThread({
-        ...fenceAt(context.fence, this.dependencies.clock.now()),
-        controllerKey: context.controller.controllerKey,
-        expectedThreadId: context.controller.threadId!,
-        reason: "Provider turn failed after accepted finalization",
-      });
+  private async reconcileInteractionReferences(
+    references: readonly ControllerInteractionReference[],
+    context: InteractionReconciliationContext,
+  ): Promise<boolean> {
+    for (const reference of references) {
+      if (!await this.reconcileInteractionReference(reference, context)) return false;
     }
     return true;
   }
 
-  private async settleUnfinalizedError(context: TerminalContext): Promise<boolean> {
-    let observation: TerminalContext["observation"] | null = context.observation;
-    if (context.turn.bbEventSeq !== context.turn.dispatchAfterSeq) {
-      try {
-        observation = await this.dependencies.adapter.events(
-          context.controller.threadId!,
-          context.turn.dispatchAfterSeq,
-          context.signal,
-        );
-      } catch {
-        return this.retirePersistentBoundary({
-          controller: context.controller,
-          turn: context.turn,
-          fence: context.fence,
-          signal: context.signal,
-          failureSummary: "Controller provider error baseline remained unavailable",
-        });
-      }
+  private async reconcileInteractionReference(
+    reference: ControllerInteractionReference,
+    context: InteractionReconciliationContext,
+  ): Promise<boolean> {
+    const generationBefore = this.currentControllerGeneration(
+      context.controller.controllerKey,
+      context.controller.threadId!,
+    );
+    if (!generationBefore) return false;
+    const snapshot = await this.readInteraction(reference, context);
+    if (!snapshot) return false;
+    const generationAfter = this.currentControllerGeneration(
+      context.controller.controllerKey,
+      context.controller.threadId!,
+    );
+    if (!generationAfter || generationAfter.id !== generationBefore.id ||
+        snapshot.id !== reference.interactionId || snapshot.threadId !== context.controller.threadId) return false;
+    if (reference.status === "interrupted") return false;
+    if (reference.status === "resolved") return this.settleInteractionReference(reference, snapshot, context);
+    if (snapshot.status === "resolved" || snapshot.status === "interrupted") {
+      return this.settleInteractionReference(reference, snapshot, context);
     }
-    if (observation !== null && !observation.inputAccepted && context.turn.retryCount === 0) {
-      // An unaccepted input is retried against the next configured model, so a
-      // provider that cannot take this turn at all falls back instead of
-      // failing the owner outright.
-      const nextFallbackIndex = context.turn.modelFallbackIndex + 1;
-      if (
-        controllerFallbackIsSafe(observation) &&
-        this.dependencies.adapter.hasExecutionProfile(nextFallbackIndex) &&
-        this.dependencies.store.retryUnacceptedControllerTurn({
-          ...fenceAt(context.fence, this.dependencies.clock.now()),
-          turnId: context.turn.id,
-          controllerKey: context.controller.controllerKey,
-          expectedThreadId: context.controller.threadId!,
-          nextFallbackIndex,
-        })
-      ) return true;
-      let accepted: ReturnType<TelegramAgentStore["getAcceptedControllerFinalization"]>;
-      try {
-        accepted = this.dependencies.store.getAcceptedControllerFinalization(context.turn.id);
-      } catch {
-        return this.failAndRetire(
-          context.controller,
-          context.turn,
-          context.fence,
-          "Controller accepted finalization storage is invalid",
-        ) === "retired";
-      }
-      if (accepted !== null) return await this.settleAcceptedWinner(context);
-    }
-    const failed = this.failAndRetireUnaccepted(context, "Controller provider turn failed");
-    if (failed === "retired") return true;
-    if (failed === "stale") return false;
-    return await this.settleAcceptedWinner(context);
+    if (snapshot.status !== "pending") return false;
+    const interaction = parseControllerInteraction(snapshot.id, snapshot.payload);
+    if (!interaction || (interaction.kind !== reference.kind && interaction.kind !== "unsupported")) return false;
+    const recordOutcome = this.dependencies.store.recordControllerInteraction({
+      ...fenceAt(context.fence, this.dependencies.clock.now()),
+      turnId: context.turn.id,
+      controllerKey: context.controller.controllerKey,
+      bbThreadId: context.controller.threadId!,
+      controllerGenerationId: generationAfter.id,
+      interaction,
+    });
+    return recordOutcome === "recorded" || recordOutcome === "replay";
   }
 
-  private async sendCompletionContinuation(context: TerminalContext): Promise<boolean> {
-    let latestSeq: number;
+  private async readInteraction(
+    reference: ControllerInteractionReference,
+    context: InteractionReconciliationContext,
+  ): Promise<ControllerInteractionSnapshot | null> {
+    const getInteraction = this.dependencies.adapter.getInteraction;
+    if (!getInteraction || !context.controller.threadId) return null;
     try {
-      latestSeq = await this.dependencies.adapter.latestSeq(context.controller.threadId!, context.signal);
-    } catch {
-      return this.retirePersistentBoundary({
-        controller: context.controller,
-        turn: context.turn,
-        fence: context.fence,
-        signal: context.signal,
-        failureSummary: "Controller continuation boundary remained unavailable",
-      });
-    }
-    if (context.reconciliation !== null &&
-        (context.reconciliation.targetSeq === null || context.reconciliation.targetSeq !== latestSeq)) return false;
-    const claim = this.claimCompletionContinuation(context, latestSeq);
-    if (claim === "stale") return false;
-    if (claim !== "claimed") return true;
-    if (!this.dependencies.store.isExecutorLeaseCurrent(
-      context.fence.ownerId,
-      context.fence.generation,
-      this.dependencies.clock.now(),
-    )) return false;
-    try {
-      await this.dependencies.adapter.send(
-        context.controller.threadId!,
-        CONTROLLER_COMPLETION_RECOVERY_PROMPT,
+      return await getInteraction.call(
+        this.dependencies.adapter,
+        context.controller.threadId,
+        reference.interactionId,
         context.signal,
       );
     } catch {
-      return this.failAndRetire(
-        context.controller,
-        context.turn,
-        context.fence,
-        "Controller continuation send outcome is uncertain",
-      ) === "retired";
+      // A failed external read cannot prove the interaction disappeared or resolved.
+      return null;
     }
-    return true;
   }
 
-  private claimCompletionContinuation(
-    context: TerminalContext,
-    latestSeq: number,
-  ): CompletionContinuationClaim {
-    let claim: Exclude<CompletionContinuationClaim, "failed">;
-    try {
-      claim = this.dependencies.store.claimControllerCompletionContinuation({
-        ...fenceAt(context.fence, this.dependencies.clock.now()),
-        turnId: context.turn.id,
-        controllerKey: context.turn.controllerKey,
-        bbHighWaterSeq: latestSeq,
-      });
-    } catch {
-      return this.failAndRetire(
-        context.controller,
-        context.turn,
-        context.fence,
-        "Controller continuation claim failed",
-      ) === "retired" ? "failed" : "stale";
+  private async settleInteractionReference(
+    reference: ControllerInteractionReference,
+    snapshot: ControllerInteractionSnapshot,
+    context: InteractionReconciliationContext,
+  ): Promise<boolean> {
+    if (reference.status !== "resolved" || snapshot.status !== "resolved") return false;
+    const answered = this.dependencies.store.getAnsweredControllerInteraction(context.controller.controllerKey);
+    if (!answered) {
+      const pending = this.dependencies.store.getPendingControllerInteraction(context.controller.controllerKey);
+      // A previously proven delivery removes the row. A still-pending row is
+      // different: BB resolving it without the durable answer is not proof.
+      return pending === null || pending.interactionId !== reference.interactionId;
     }
-    if (claim === "already_claimed") {
-      return this.failAndRetire(
-        context.controller,
-        context.turn,
-        context.fence,
-        "Controller continuation ended without finalization",
-      ) === "retired" ? "failed" : "stale";
-    }
-    return claim;
+    if (answered.turnId !== context.turn.id ||
+        answered.interactionId !== reference.interactionId ||
+        answered.bbThreadId !== context.controller.threadId ||
+        !controllerInteractionResolutionMatches(snapshot.resolution, answered.resolution)) return false;
+    const settled = this.dependencies.store.markControllerInteractionDelivered({
+      ...fenceAt(context.fence, this.dependencies.clock.now()),
+      interactionId: reference.interactionId,
+      turnId: context.turn.id,
+      bbThreadId: context.controller.threadId!,
+    });
+    return settled || this.dependencies.store.isExecutorLeaseCurrent(
+      context.fence.ownerId,
+      context.fence.generation,
+      this.dependencies.clock.now(),
+    );
   }
 
-  /**
-   * Hands BB the one decision the owner already made. A BB failure here is not
-   * terminal: the answer stays durable and the next pass tries again, because
-   * losing it would leave the thread waiting on an owner who has already
-   * replied.
-   */
-  private async deliverOwnerAnswer(
+  private currentControllerGeneration(controllerKey: string, threadId: string): { id: string; threadId: string } | null {
+    const generations = this.dependencies.store.listControllerGenerations(controllerKey, 100);
+    const open = generations.filter((generation) => generation.endedAt === null);
+    if (open.length !== 1 || open[0]?.threadId !== threadId) return null;
+    return { id: open[0].id, threadId: open[0].threadId };
+  }
+
+  private async completeAccepted(
+    turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
     fence: EffectFence,
+    providerError: boolean,
     signal: AbortSignal,
   ): Promise<boolean> {
+    let bbHighWaterSeq: number;
     try {
-      return await this.dependencies.interactionService.deliverAnswered({
-        ownerId: fence.ownerId,
-        generation: fence.generation,
-        now: this.dependencies.clock.now(),
-        controllerKey: controller.controllerKey,
-        signal,
-      });
+      bbHighWaterSeq = await this.dependencies.adapter.latestSeq(controller.threadId!, signal);
     } catch {
       return false;
     }
-  }
-
-  /**
-   * A thread BB has lost can never settle what is parked on it, so the owner is
-   * told once instead of holding dead buttons forever. Only a proven missing or
-   * incompatible thread retires a parked turn; elapsed time never does, because
-   * a parked turn's idle time is the owner's thinking time.
-   */
-  private async retireParkedOnLostThread(
-    controller: ControllerThreadRecord,
-    turn: ControllerTurnRecord,
-    fence: EffectFence,
-    signal: AbortSignal,
-    observed?: ControllerStatus,
-  ): Promise<boolean> {
-    let status = observed;
-    if (status === undefined) {
-      try {
-        status = await this.dependencies.adapter.status(controller.threadId!, signal);
-      } catch {
-        return false;
-      }
+    if (!Number.isSafeInteger(bbHighWaterSeq) || bbHighWaterSeq < 0) {
+      this.failAndRetire(turn, controller, fence, "Controller event high-water was invalid");
+      return true;
     }
-    return this.retireLostThread(controller, turn, fence, status);
-  }
-
-  private retireLostThread(
-    controller: ControllerThreadRecord,
-    turn: ControllerTurnRecord,
-    fence: EffectFence,
-    status: ControllerStatus | undefined,
-  ): boolean {
-    if (status !== "missing" && status !== "incompatible") return false;
-    return this.failAndRetire(
-      controller,
-      turn,
-      fence,
-      status === "missing"
-        ? "Controller conversation became unavailable"
-        : "Controller provider became incompatible",
-    ) === "retired";
-  }
-
-  /**
-   * Turns lifecycle references into durable rows. The inline event is only a
-   * hint: each pending reference is fenced, fetched from BB, and projected
-   * before anything is stored or shown. Returns false when the boundary could
-   * not be read, so the caller leaves the event cursor where it was.
-   */
-  private async observeInteractions(
-    controller: ControllerThreadRecord,
-    turn: ControllerTurnRecord,
-    references: readonly ControllerInteractionReference[],
-    fence: EffectFence,
-    signal: AbortSignal,
-  ): Promise<boolean> {
-    if (references.length === 0) return true;
-    const generation = this.dependencies.store.getOpenControllerGeneration(
-      controller.controllerKey,
-      controller.threadId!,
-    );
-    if (!generation) return false;
-    const settle = (interactionId: string): boolean => {
-      const settled = this.dependencies.store.markControllerInteractionResolved({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        interactionId,
-        turnId: turn.id,
-        bbThreadId: controller.threadId!,
-      });
-      // Refusing to settle a row this turn is parked on would consume BB's
-      // only word that the block is over. A reference for something never
-      // recorded is ordinary and settles nothing. The parked id is re-read
-      // because settling an earlier reference in this window promotes it.
-      return settled || this.awaitingInteractionId(turn) !== interactionId;
-    };
-    for (const reference of references) {
-      if (reference.status !== "pending") {
-        if (!settle(reference.interactionId)) return false;
-        continue;
-      }
-      const source = {
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId: turn.id,
-        controllerKey: controller.controllerKey,
-        bbThreadId: controller.threadId!,
-        controllerGenerationId: generation.id,
-      };
-      if (!this.dependencies.store.controllerInteractionSourceCanRecord(source)) return false;
-      let fetched: ControllerInteractionFetch;
-      try {
-        fetched = await this.dependencies.interactionService.fetchPending({
-          bbThreadId: controller.threadId!,
-          interactionId: reference.interactionId,
-          signal,
+    const outcome = this.dependencies.store.completeControllerTurnFromFinalization({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      bbHighWaterSeq,
+    });
+    if (outcome === "completed") {
+      if (providerError && controller.threadId) {
+        this.dependencies.store.resetControllerThread({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          controllerKey: controller.controllerKey,
+          expectedThreadId: controller.threadId,
+          reason: "Accepted answer persisted before provider error",
         });
-      } catch {
-        return false;
       }
-      // Nothing was established about this block, so the pass may not claim to
-      // have read past the event that named it.
-      if (fetched.outcome === "invalid") return false;
-      // The stream still called it open, but BB says otherwise and BB is the
-      // authority. Settling here is safe, and a no-op when nothing is recorded.
-      if (fetched.outcome === "settled") {
-        if (!settle(reference.interactionId)) return false;
-        continue;
-      }
-      // A refused record means the fence moved or the row disagrees with what
-      // BB just returned. Advancing the cursor past it would lose the owner's
-      // only view of the block, so the pass fails instead.
-      if (!this.dependencies.store.recordControllerInteraction({
-        ...source,
-        now: this.dependencies.clock.now(),
-        interaction: fetched.interaction,
-      })) return false;
+      return true;
+    }
+    const currentTurn = this.dependencies.store.getControllerTurn(turn.id);
+    if (currentTurn && bbHighWaterSeq > currentTurn.evidenceEventSeq) return false;
+    if (outcome === "evidence_advanced") {
+      this.failAndRetire(turn, controller, fence, "Controller evidence advanced after finalization");
     }
     return true;
   }
 
-  /** The interaction the turn is parked on right now, not when the pass began. */
-  private awaitingInteractionId(turn: ControllerTurnRecord): string | null {
-    return this.dependencies.store.getControllerTurn(turn.id)?.awaitingInteractionId ?? null;
-  }
-
-  /**
-   * True while the exact submitted turn still has an interaction the owner has
-   * not settled, or one they settled that BB has not been told about yet.
-   */
-  private parkedOnInteraction(turn: ControllerTurnRecord): boolean {
-    return this.dependencies.store.hasActiveControllerInteraction(turn.id, turn.controllerKey);
-  }
-
-  private async terminalHighWaterMatches(context: TerminalContext): Promise<TerminalHighWaterOutcome> {
-    if (context.reconciliation?.targetSeq === null) return "deferred";
-    let latestSeq: number;
-    try {
-      latestSeq = await this.dependencies.adapter.latestSeq(context.controller.threadId!, context.signal);
-    } catch {
-      return this.retirePersistentBoundary({
-        controller: context.controller,
-        turn: context.turn,
-        fence: context.fence,
-        signal: context.signal,
-        failureSummary: "Controller finalization boundary remained unavailable",
-      }) ? "retired" : "deferred";
-    }
-    return context.reconciliation === null ||
-      (context.reconciliation.targetSeq === latestSeq &&
-        context.turn.evidenceEventSeq === context.reconciliation.targetSeq)
-      ? "matched"
-      : "deferred";
-  }
-
-  private validAdoptedTurn(
-    turn: ControllerTurnRecord | null,
-    liveController: ControllerThreadRecord | null,
+  private async requestCompletionContinuation(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
     fence: EffectFence,
-    requested: ControllerThreadRecord,
-  ): boolean {
-    if (!turn || turn.state !== "submitted") return false;
-    if (!liveController || liveController.state !== "active" ||
-        liveController.threadId !== requested.threadId ||
-        liveController.controllerKey !== requested.controllerKey ||
-        turn.controllerKey !== liveController.controllerKey) return false;
-    if (turn.leaseOwner !== fence.ownerId || turn.leaseGeneration !== fence.generation) return false;
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!controller.threadId) return true;
+    let highWater: number;
+    try {
+      highWater = await this.dependencies.adapter.latestSeq(controller.threadId, signal);
+    } catch {
+      return false;
+    }
+    if (!Number.isSafeInteger(highWater) || highWater < 0) {
+      this.failAndRetire(turn, controller, fence, "Controller event high-water was invalid");
+      return true;
+    }
+    const claim = this.dependencies.store.claimControllerCompletionContinuation({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: controller.controllerKey,
+      bbHighWaterSeq: highWater,
+    });
+    if (claim === "stale") return true;
+    if (claim === "already_claimed") {
+      this.failAndRetire(turn, controller, fence, "Controller turn ended without an accepted finalization");
+      return true;
+    }
+    if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+      this.failAndRetire(turn, controller, fence, "Controller continuation fence was lost before send");
+      return true;
+    }
+    try {
+      await this.dependencies.adapter.send(controller.threadId, CONTROLLER_COMPLETION_RECOVERY_PROMPT, signal);
+    } catch {
+      this.failAndRetire(turn, controller, fence, "Controller continuation outcome is uncertain");
+    }
     return true;
   }
 
   private failAndRetire(
-    controller: ControllerThreadRecord,
     turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
     fence: EffectFence,
     error: string,
-  ): FailAndRetireOutcome {
+    ownerMessage?: string,
+  ): boolean {
+    if (!controller.threadId) return false;
     return this.dependencies.store.failAndRetireControllerTurn({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
-      controllerKey: turn.controllerKey,
-      expectedThreadId: controller.threadId!,
+      controllerKey: controller.controllerKey,
+      expectedThreadId: controller.threadId,
       error,
-      expectedAcceptedFinalizationId: turn.acceptedFinalizationId,
-    });
-  }
-
-  private failAndRetireUnaccepted(context: TerminalContext, error: string): FailAndRetireOutcome {
-    return this.dependencies.store.failAndRetireControllerTurn({
-      ...fenceAt(context.fence, this.dependencies.clock.now()),
-      turnId: context.turn.id,
-      controllerKey: context.turn.controllerKey,
-      expectedThreadId: context.controller.threadId!,
-      error,
-      expectedAcceptedFinalizationId: null,
-    });
-  }
-
-  private async settleAcceptedWinner(context: TerminalContext): Promise<boolean> {
-    const turn = this.dependencies.store.getControllerTurn(context.turn.id);
-    const controller = this.dependencies.store.getControllerByThreadId(context.controller.threadId!);
-    if (!this.validAdoptedTurn(turn, controller, context.fence, context.controller)) return false;
-    if (this.parkedOnInteraction(turn!)) return true;
-    let accepted: ReturnType<TelegramAgentStore["getAcceptedControllerFinalization"]>;
-    try {
-      accepted = this.dependencies.store.getAcceptedControllerFinalization(turn!.id);
-    } catch {
-      return this.failAndRetire(
-        controller!,
-        turn!,
-        context.fence,
-        "Controller accepted finalization storage is invalid",
-      ) === "retired";
-    }
-    if (accepted === null) return false;
-    return await this.completeAcceptedFinalization({ ...context, controller: controller!, turn: turn! });
-  }
-
-  private retirePersistentBoundary(context: BoundaryFailureContext): boolean {
-    if (context.signal.aborted) return false;
-    // A turn waiting on a person produces no events, so its idle time is the
-    // owner's thinking time rather than evidence of a wedged thread. Measuring
-    // a boundary failure against it would fail a turn the owner is still
-    // answering, and take their live Telegram buttons down with it. Only a
-    // thread BB has provably lost ends a parked turn.
-    if (this.parkedOnInteraction(context.turn)) {
-      return this.retireLostThread(context.controller, context.turn, context.fence, context.observedStatus);
-    }
-    if (this.dependencies.clock.now() - context.turn.updatedAt < CONTROLLER_STALL_MS) return false;
-    return this.failAndRetire(
-      context.controller,
-      context.turn,
-      context.fence,
-      context.failureSummary,
-    ) === "retired";
-  }
-
-  private projectorFailure(error: ControllerEvidenceProjectorError): string {
-    switch (error.code) {
-      case "source_identity_invalid": return "Controller provider identity became invalid";
-      case "source_event_invalid": return "Controller provider reported an invalid event boundary";
-      case "native_identity_conflict": return "Controller native evidence conflicted in identity";
-      case "cursor_conflict": return "Controller evidence cursor conflicted during projection";
-    }
+      ownerMessage,
+    }) === "retired";
   }
 
   /**
@@ -963,7 +843,9 @@ export class LunaControllerService {
     signal: AbortSignal,
   ): Promise<boolean> {
     const turn = this.dependencies.store.getControllerTurn(turnId);
-    if (!turn || turn.state !== "submitted" || controller.threadId === null) return false;
+    if (!turn || turn.state !== "submitted" || controller.threadId === null ||
+        turn.acceptedFinalizationId !== null ||
+        this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
     const decision = evaluateSupervisor({
       toolCalls: turn.toolCalls,
       // Spend for *this* turn: the reported figure counts the whole thread,
@@ -975,29 +857,50 @@ export class LunaControllerService {
     });
     if (decision.kind === "continue") return false;
     if (decision.kind === "steer") {
-      try {
-        await this.dependencies.adapter.steer(controller.threadId, decision.text, signal);
-      } catch {
-        // A nudge that did not land is not worth failing an answer over. The
-        // hard budget still stops the turn, and the next poll may deliver it.
-        return false;
-      }
-      return this.dependencies.store.recordControllerSupervisorSteer({
+      const claim = this.dependencies.store.claimControllerSupervisorSteer({
         ...fenceAt(fence, this.dependencies.clock.now()),
         turnId,
+        controllerKey: turn.controllerKey,
+        expectedThreadId: controller.threadId,
         reason: decision.reason,
+        inputText: decision.text,
       });
+      if (claim === "stale" || claim === "settled") return true;
+      const attempt = this.dependencies.store.getControllerSupervisorSteerAttempt(turnId, decision.reason);
+      if (!attempt) return true;
+      if (claim === "pending") return this.reconcilePendingSupervisorSteer(turnId, fence, signal);
+
+      let outcome: "applied" | "unknown" = "unknown";
+      try {
+        if (!signal.aborted) {
+          await this.dependencies.adapter.steer(attempt.threadId, attempt.inputText, signal);
+          outcome = "applied";
+        }
+      } catch {
+        // The provider boundary is ambiguous. Reconcile once when the
+        // adapter can prove whether this idempotency key landed; otherwise
+        // settle unknown so a successor never replays it.
+        const reconciled = await this.reconcileProviderSteer(attempt, signal);
+        outcome = reconciled === "applied" ? "applied" : "unknown";
+      }
+      const settled = this.dependencies.store.settleControllerSupervisorSteer({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId,
+        controllerKey: turn.controllerKey,
+        reason: decision.reason,
+        outcome,
+      });
+      return settled === "settled" || settled === "stale";
     }
-    // Stopping the provider is the half that matters: a turn stopped for cost
-    // that left its provider alive could keep calling tools after its durable
-    // authorization disappeared. Stop it first; retirement still proceeds if
-    // BB cannot confirm the stop.
-    try {
-      await this.dependencies.adapter.stop?.(controller.threadId!, signal);
-    } catch {
-      // Retiring the turn below remains the safe fallback.
-    }
-    return this.failAndRetire(controller, turn, fence, "Controller turn exceeded its budget") === "retired";
+    if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
+    this.failAndRetire(
+      turn,
+      controller,
+      fence,
+      "Controller turn exceeded its budget",
+      decision.ownerMessage,
+    );
+    return true;
   }
 
   private async spawnOrAdopt(
@@ -1007,40 +910,74 @@ export class LunaControllerService {
     signal: AbortSignal,
   ): Promise<ControllerLocation | null> {
     let candidate: ControllerLocation | null = null;
-    // Image turns never adopt by title before attempting their own spawn. A
-    // title match cannot prove that the image was attached, and adopting it
-    // would silently drop the image. Recovery after an uncertain actual spawn
-    // remains available in the catch block below.
-    if (!turn.image && turn.capabilityProfileRevision === 0) {
-      try {
-        candidate = await this.dependencies.adapter.findSpawnCandidate(
-          controller.controllerKey,
-          signal,
-          turn.modelFallbackIndex,
-        );
-      } catch {
-        this.fail(turn, fence, "Controller spawn candidates are ambiguous");
+    const pendingSpawnToken = controller.pendingSpawnToken;
+    if (pendingSpawnToken === null) {
+      this.fail(turn, fence, "Controller spawn token is unavailable");
+      return null;
+    }
+    if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+      if (signal.aborted) {
+        this.dependencies.store.requeueControllerTurn({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          turnId: turn.id,
+        });
+      }
+      return null;
+    }
+    // The adapter only returns a candidate after matching the complete
+    // tokenized identity: controller, pending turn, project, host, provider,
+    // plugin origin, and hidden/non-terminal state. That identity is also the
+    // evidence that an image-bearing spawn was this turn: the image is
+    // prepared before BB creates the titled thread. Reserve the same
+    // project/host before mapping it so adoption and a fresh spawn share the
+    // same durable fence.
+    try {
+      candidate = await this.dependencies.adapter.findSpawnCandidate(
+        controller.controllerKey,
+        pendingSpawnToken,
+        signal,
+      );
+    } catch {
+      this.fail(turn, fence, "Controller spawn candidates are ambiguous");
+      return null;
+    }
+    if (candidate) {
+      if (!this.dependencies.store.reserveControllerSpawn({
+        controllerKey: controller.controllerKey,
+        turnId: turn.id,
+        projectId: candidate.projectId,
+        hostId: candidate.hostId,
+        now: this.dependencies.clock.now(),
+      })) {
+        this.fail(turn, fence, "Controller spawn reservation is unavailable or stale");
         return null;
       }
+      return candidate;
     }
-    if (candidate) return candidate;
     // A replacement thread opens with the conversation so far, so retiring a
     // failed thread costs the owner a pause rather than the whole conversation.
     const seeded = { ...turn, inputText: this.composeInput(turn, { includeDigest: true }) };
     try {
+      if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+        if (signal.aborted) {
+          this.dependencies.store.requeueControllerTurn({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            turnId: turn.id,
+          });
+        }
+        return null;
+      }
       return await this.dependencies.adapter.spawn(seeded, controller, signal);
     } catch (error) {
       if (this.handleImagePreparationError(error, turn, fence, signal)) return null;
-      if (turn.capabilityProfileRevision === 0) {
-        try {
-          candidate = await this.dependencies.adapter.findSpawnCandidate(
-            controller.controllerKey,
-            signal,
-            turn.modelFallbackIndex,
-          );
-        } catch {
-          candidate = null;
-        }
+      try {
+        candidate = await this.dependencies.adapter.findSpawnCandidate(
+          controller.controllerKey,
+          pendingSpawnToken,
+          signal,
+        );
+      } catch {
+        candidate = null;
       }
       if (candidate) return candidate;
       this.fail(turn, fence, "Controller spawn outcome is uncertain");
@@ -1057,10 +994,21 @@ export class LunaControllerService {
       turnId: turn.id,
       now: this.dependencies.clock.now(),
     });
-    const input = composeTurnInput(context, turn.inputText);
-    return turn.capabilityContinuationState === "relaunching"
-      ? `Resume the same owner request after the approved capability relaunch. Use only the capabilities configured for this fresh session.\n\n${input}`
-      : input;
+    return composeTurnInput(context, turn.inputText);
+  }
+
+  private providerMutationAllowed(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): boolean {
+    return !signal.aborted && this.dependencies.store.canMutateControllerTurn({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      expectedThreadId: controller.threadId,
+    });
   }
 
   private waitForIdle(turn: ControllerTurnRecord, fence: EffectFence): void {
@@ -1108,8 +1056,8 @@ export class LunaControllerService {
     fence: EffectFence,
     error: string,
     ownerMessage?: string,
-  ): boolean {
-    return this.dependencies.store.failControllerTurn({
+  ): void {
+    this.dependencies.store.failControllerTurn({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       error,

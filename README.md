@@ -120,7 +120,7 @@ npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
 ```
 
 > [!WARNING]
-> This is a full-trust BB plugin. The controller permission mode is a setting whose current default is `full`, carried forward from before the trust kernel: the agent can use the shell, the `bb` CLI, and installed skills and MCP servers on any connected machine without a BB-app prompt. That default is current residual risk, not a safe target — it is not enforced isolation, and instruction text is not enforcement. A saved `auto` or `accept-edits` value is preserved exactly; a permission prompt BB raises for the hidden controller is bridged into Telegram as *Allow once* / *Deny*. Merging a pull request and promoting to production still require a Telegram approval from the owner — one-use, or standing for a project the owner explicitly granted — and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
+> This is a full-trust BB plugin. Fresh or unset controller permission settings resolve to `auto`; an explicitly saved `auto`, `accept-edits`, or `full` value is preserved. BB-native permission prompts raised for the hidden controller can be bridged into Telegram as *Allow once* / *Deny*. Merging a pull request and promoting to production still require a Telegram approval from the owner — one-use, or standing for a project the owner explicitly granted — and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
 
 ## Quick start
 

@@ -14,6 +14,7 @@ import type {
 import { encodeCallbackData, persistableJobStatusPayload, renderProjectPicker } from "../src/telegram/view";
 import { VersionConflictError, openStore, type TelegramAgentStore } from "../src/storage/store";
 import {
+  controllerInteractionToken,
   questionOptionToken,
   threadDecisionToken,
   type ControllerInteraction,
@@ -1117,7 +1118,7 @@ function parkedControllerInteraction(
     bbThreadId: "thr_ingress_controller",
     controllerGenerationId: generation.id,
     interaction,
-  })).toBe(true);
+  })).toBe("recorded");
   return { controllerKey: CONTROLLER_KEY, turnId: turn.id };
 }
 
@@ -1144,13 +1145,13 @@ const questionFixtureInteraction: ControllerInteraction = {
 it("commits a tapped controller decision, its callback, and the acknowledgement together", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
   const { controllerKey } = parkedControllerInteraction(fixture, approvalFixtureInteraction);
-  const token = threadDecisionToken("pint_ingress_approval", "allow_once");
+  const token = controllerInteractionToken("pint_ingress_approval", "allow_once");
 
   await fixture.ingress.handleClaimed(callbackUpdate(910, "cb-allow", 7, 70, `i:${token}`), 4_000);
 
   expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toMatchObject({
     interactionId: "pint_ingress_approval",
-    answer: { decision: "allow_once", grantedPermissions: null },
+    resolution: { decision: "allow_once", grantedPermissions: null },
   });
   expect(fixture.store.getCallback("cb-allow")).toMatchObject({
     action: "controller_interaction",
@@ -1168,7 +1169,7 @@ it("answers a migrated legacy q: controller callback exactly once", async () => 
   await fixture.ingress.handleClaimed(callbackUpdate(912, "cb-legacy", 7, 70, `q:${token}`), 4_001);
 
   expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toMatchObject({
-    answer: { kind: "user_answer", answers: { which: { selected: ["main"] } } },
+    resolution: { kind: "user_answer", answers: { which: { selected: ["main"] } } },
     answeredAt: 4_000,
   });
 });
@@ -1182,7 +1183,7 @@ it("never lets a controller callback from another user or chat decide anything",
   await fixture.ingress.handleClaimed(callbackUpdate(914, "cb-wrong-chat", 7, 71, `i:${token}`), 4_001);
 
   expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toBeNull();
-  expect(fixture.store.getPendingControllerInteraction(controllerKey)?.state).toBe("pending");
+  expect(fixture.store.getPendingControllerInteraction(controllerKey)).not.toBeNull();
   expect(fixture.store.getCallback("cb-wrong-user")).toBeNull();
   expect(fixture.store.getCallback("cb-wrong-chat")).toBeNull();
 });
@@ -1197,7 +1198,7 @@ it("reads a plain reply as the answer to an open controller question", async () 
   const outcome = await fixture.ingress.handleClaimed(messageUpdate(915, 7, 70, "use the release branch"), 4_000);
 
   expect(outcome).toEqual({ updateSettled: true });
-  expect(fixture.store.getAnsweredControllerInteraction(controllerKey)?.answer).toEqual({
+  expect(fixture.store.getAnsweredControllerInteraction(controllerKey)?.resolution).toEqual({
     kind: "user_answer",
     answers: { which: { selected: [], freeText: "use the release branch" } },
   });
@@ -1211,7 +1212,7 @@ it("never lets a plain reply approve anything and queues it as a new turn", asyn
   await fixture.ingress.handleClaimed(messageUpdate(916, 7, 70, "yes go ahead"), 4_000);
 
   expect(fixture.store.getAnsweredControllerInteraction(controllerKey)).toBeNull();
-  expect(fixture.store.getPendingControllerInteraction(controllerKey)?.state).toBe("pending");
+  expect(fixture.store.getPendingControllerInteraction(controllerKey)).not.toBeNull();
   expect(fixture.store.listControllerTurns(controllerKey, 10)).toHaveLength(2);
 });
 
