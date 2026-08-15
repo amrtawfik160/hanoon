@@ -1902,6 +1902,29 @@ export const THREAD_FOLLOW_UP_MIGRATIONS = [String.raw`
 ALTER TABLE controller_turns ADD COLUMN thread_follow_up_json TEXT;
 `] as const;
 
+export const CONTROLLER_GENERATION_QUARANTINE_MIGRATIONS = [String.raw`
+CREATE TABLE controller_generation_quarantine (
+  generation_id TEXT PRIMARY KEY,
+  controller_key TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  original_ended_at INTEGER,
+  original_end_reason TEXT,
+  quarantined_at INTEGER NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN (
+    'ambiguous_open_generations', 'generation_mapping_mismatch'
+  ))
+);
+CREATE INDEX controller_generation_quarantine_controller
+  ON controller_generation_quarantine(controller_key, quarantined_at);
+`] as const;
+
+export const CONTROLLER_GENERATION_INVARIANT_MIGRATIONS = [String.raw`
+CREATE UNIQUE INDEX one_open_controller_generation
+  ON controller_generations(controller_key)
+  WHERE ended_at IS NULL;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -1955,4 +1978,6 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_INTERACTION_FINAL_REPAIR_MIGRATIONS,
   ...CONTROLLER_RECOVERY_MIGRATIONS,
   ...THREAD_FOLLOW_UP_MIGRATIONS,
+  ...CONTROLLER_GENERATION_QUARANTINE_MIGRATIONS,
+  ...CONTROLLER_GENERATION_INVARIANT_MIGRATIONS,
 ] as const;

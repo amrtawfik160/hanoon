@@ -595,9 +595,12 @@ const DELIVERY_STAGE_INVALIDATIONS = [
   },
   {
     name: "ambiguous open generation",
-    apply: (database: Database.Database) => database.prepare(
-      "INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen_service_2', 'owner-7-controller', 'thr_service_1', 2_101, NULL, NULL)",
-    ).run(),
+    apply: (database: Database.Database) => {
+      database.exec("DROP INDEX one_open_controller_generation");
+      database.prepare(
+        "INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen_service_2', 'owner-7-controller', 'thr_service_1', 2_101, NULL, NULL)",
+      ).run();
+    },
   },
   {
     name: "answered-row identity change",

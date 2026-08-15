@@ -210,6 +210,11 @@ type PluginStorage = BbPluginApi["storage"];
 type SqliteDatabase = Database.Database;
 type PluginKv = PluginStorage["kv"];
 const CONTROLLER_INTERACTION_TAIL_ID = 29;
+const CONTROLLER_GENERATION_CONSTRAINT_ID = 53;
+const CONTROLLER_GENERATION_QUARANTINE_REASON = "ambiguous_open_generations";
+const CONTROLLER_GENERATION_MISMATCH_REASON = "generation_mapping_mismatch";
+const CONTROLLER_GENERATION_RECOVERY_ERROR = "Controller generation identity was ambiguous; owner input preserved for recovery";
+const CONTROLLER_GENERATION_RECOVERY_END_REASON = "quarantined: ambiguous controller generation identity";
 const RETIRED_CONTROLLER_INTERACTION_NOTICE = "This interaction is no longer available. Open BB to review it.";
 const RETIRED_CONTROLLER_INTERACTION_PAYLOAD = JSON.stringify({
   text: RETIRED_CONTROLLER_INTERACTION_NOTICE,
@@ -2553,19 +2558,192 @@ function hasMigration(db: SqliteDatabase, migrationId: number): boolean {
   return db.prepare("SELECT 1 FROM _bb_migrations WHERE id = ?").get(migrationId) !== undefined;
 }
 
-export function migrateControllerInteractionStorage(storage: PluginStorage): void {
+type OpenControllerGenerationRow = Readonly<{
+  id: string;
+  controller_key: string;
+  thread_id: string;
+  started_at: number;
+  ended_at: number | null;
+  end_reason: string | null;
+}>;
+
+type ControllerGenerationRepair = Readonly<{
+  controllerKey: string;
+  telegramChatId: string | null;
+  now: number;
+  reason: typeof CONTROLLER_GENERATION_QUARANTINE_REASON | typeof CONTROLLER_GENERATION_MISMATCH_REASON;
+  generations: readonly OpenControllerGenerationRow[];
+}>;
+
+function listOpenControllerGenerations(
+  db: SqliteDatabase,
+  controllerKey: string,
+): OpenControllerGenerationRow[] {
+  return db.prepare(
+    `SELECT id, controller_key, thread_id, started_at, ended_at, end_reason
+       FROM controller_generations
+      WHERE controller_key = ? AND ended_at IS NULL
+      ORDER BY id ASC`,
+  ).all(controllerKey) as OpenControllerGenerationRow[];
+}
+
+function quarantineControllerGenerationEvidence(
+  db: SqliteDatabase,
+  repair: ControllerGenerationRepair,
+): void {
+  const quarantine = db.prepare(
+    `INSERT INTO controller_generation_quarantine (
+       generation_id, controller_key, thread_id, started_at,
+       original_ended_at, original_end_reason, quarantined_at, reason
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const generation of repair.generations) {
+    quarantine.run(
+      generation.id,
+      generation.controller_key,
+      generation.thread_id,
+      generation.started_at,
+      generation.ended_at,
+      generation.end_reason,
+      repair.now,
+      repair.reason,
+    );
+  }
+}
+
+function closeCorruptControllerGenerations(
+  db: SqliteDatabase,
+  repair: ControllerGenerationRepair,
+): void {
+  db.prepare(
+    `UPDATE controller_generations
+        SET ended_at = ?, end_reason = ?
+      WHERE controller_key = ? AND ended_at IS NULL`,
+  ).run(repair.now, CONTROLLER_GENERATION_RECOVERY_END_REASON, repair.controllerKey);
+}
+
+function preserveControllerTurnsForGenerationRecovery(
+  db: SqliteDatabase,
+  repair: ControllerGenerationRepair,
+): void {
+  db.prepare(
+    `UPDATE controller_turns
+        SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
+            dispatch_after_seq = 0, bb_event_seq = 0, evidence_event_seq = 0,
+            completion_continuations = 2, input_accepted = 0,
+            stream_text = '', stream_phase = 'queued', submitted_at = NULL,
+            last_error = ?, updated_at = ?
+      WHERE controller_key = ? AND state IN ('dispatching', 'submitted')`,
+  ).run(CONTROLLER_GENERATION_RECOVERY_ERROR, repair.now, repair.controllerKey);
+}
+
+function clearCorruptControllerMapping(
+  db: SqliteDatabase,
+  repair: ControllerGenerationRepair,
+): void {
+  db.prepare(
+    `UPDATE controller_threads
+        SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+            state = CASE WHEN state = 'revoked' THEN 'revoked' ELSE 'pending_spawn' END,
+            pending_spawn_token = NULL,
+            capability_subject_id = NULL, capability_profile_id = NULL,
+            capability_profile_revision = 0, last_error = NULL, updated_at = ?
+      WHERE controller_key = ?`,
+  ).run(repair.now, repair.controllerKey);
+}
+
+function enqueueControllerGenerationRecoveryNotice(
+  db: SqliteDatabase,
+  repair: ControllerGenerationRepair,
+): void {
+  if (repair.telegramChatId === null) return;
+  persistControllerOutbox(db, {
+    logicalKey: `controller-generation-recovery:${repair.controllerKey}`,
+    chatId: repair.telegramChatId,
+    payload: {
+      text: CONTROLLER_FAILURE_TEXT.owner_message_delivery_uncertain,
+      disable_web_page_preview: true,
+    },
+  }, repair.now);
+}
+
+function repairControllerGenerationSet(
+  db: SqliteDatabase,
+  repair: ControllerGenerationRepair,
+): void {
+  quarantineControllerGenerationEvidence(db, repair);
+  closeCorruptControllerGenerations(db, repair);
+  preserveControllerTurnsForGenerationRecovery(db, repair);
+  clearCorruptControllerMapping(db, repair);
+  enqueueControllerGenerationRecoveryNotice(db, repair);
+}
+
+function repairControllerGenerationInvariant(
+  db: SqliteDatabase,
+  input: Readonly<{
+    controllerKey: string;
+    expectedThreadId: string;
+    telegramChatId: string;
+    now: number;
+  }>,
+): boolean {
+  const generations = listOpenControllerGenerations(db, input.controllerKey);
+  if (generations.length === 1 && generations[0]?.thread_id === input.expectedThreadId) return false;
+  repairControllerGenerationSet(db, {
+    ...input,
+    reason: generations.length > 1
+      ? CONTROLLER_GENERATION_QUARANTINE_REASON
+      : CONTROLLER_GENERATION_MISMATCH_REASON,
+    generations,
+  });
+  return true;
+}
+
+function preflightControllerGenerationConstraint(db: SqliteDatabase, now: number): void {
+  const duplicates = db.prepare(
+    `SELECT generation.controller_key, controller.telegram_chat_id
+       FROM controller_generations AS generation
+       LEFT JOIN controller_threads AS controller
+         ON controller.controller_key = generation.controller_key
+      WHERE generation.ended_at IS NULL
+      GROUP BY generation.controller_key, controller.telegram_chat_id
+     HAVING COUNT(*) > 1
+      ORDER BY generation.controller_key ASC`,
+  ).all() as Array<{ controller_key: string; telegram_chat_id: string | null }>;
+  for (const duplicate of duplicates) {
+    repairControllerGenerationSet(db, {
+      controllerKey: duplicate.controller_key,
+      telegramChatId: duplicate.telegram_chat_id,
+      now,
+      reason: CONTROLLER_GENERATION_QUARANTINE_REASON,
+      generations: listOpenControllerGenerations(db, duplicate.controller_key),
+    });
+  }
+}
+
+export function migrateControllerInteractionStorage(
+  storage: PluginStorage,
+  now: number = Date.now(),
+): void {
+  assertNonNegativeInteger(now, "controller generation migration time");
   const db = storage.database();
   storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
   if (hasMigration(db, CONTROLLER_INTERACTION_TAIL_ID)) {
-    storage.migrate(db, [...ALL_MIGRATIONS]);
-    db.transaction(() => restoreQuarantinedInteractions(db)).immediate();
+    storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
+    db.transaction(() => {
+      restoreQuarantinedInteractions(db);
+      preflightControllerGenerationConstraint(db, now);
+      storage.migrate(db, [...ALL_MIGRATIONS]);
+    }).immediate();
     return;
   }
   db.transaction(() => {
     const legacy = validateLegacyControllerQuestions(db);
-    storage.migrate(db, [...ALL_MIGRATIONS]);
+    storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
     quarantineLegacyControllerQuestions(db, legacy.invalid);
     restoreQuarantinedInteractions(db);
+    preflightControllerGenerationConstraint(db, now);
+    storage.migrate(db, [...ALL_MIGRATIONS]);
   }).immediate();
 }
 
@@ -5668,14 +5846,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.expectedThreadId,
       ) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
       if (!row) return "stale";
+      if (repairControllerGenerationInvariant(this.db, {
+        controllerKey: input.controllerKey,
+        expectedThreadId: input.expectedThreadId,
+        telegramChatId: row.telegram_chat_id,
+        now: input.now,
+      })) return "requeued";
       if (row.accepted_finalization_id !== null) return "accepted_won";
       if (row.completion_continuations >= 2) return "exhausted";
-      const openGenerations = this.db.prepare(
-        "SELECT thread_id FROM controller_generations WHERE controller_key = ? AND ended_at IS NULL ORDER BY id ASC",
-      ).all(input.controllerKey) as Array<{ thread_id: string }>;
-      if (openGenerations.length !== 1 || openGenerations[0]?.thread_id !== input.expectedThreadId) {
-        throw new Error("Controller generation invariant failed during recovery");
-      }
       const recovered = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
@@ -6983,7 +7161,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   // retry exhaustion, ...) fails the turn and retires the live generation in
   // one immediate transaction, so a crash can never leave a submitted turn
   // without a usable thread or an unsafe generation reusable. The safe failure
-  // notice never carries the accepted finalization words.
+  // notice never carries the accepted finalization words. Corrupt generation
+  // identity takes the recovery path instead, because no thread can be chosen
+  // safely and the owner's durable input must remain retryable.
   public failAndRetireControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -7024,21 +7204,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.expectedThreadId,
       ) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
       if (!row) return "stale";
+      if (repairControllerGenerationInvariant(this.db, {
+        controllerKey: input.controllerKey,
+        expectedThreadId: input.expectedThreadId,
+        telegramChatId: row.telegram_chat_id,
+        now: input.now,
+      })) return "retired";
       if (row.accepted_finalization_id !== expectedAcceptedFinalizationId) {
         if (expectedAcceptedFinalizationId === null && row.accepted_finalization_id !== null) {
           return "accepted_won";
         }
         return "stale";
-      }
-      // Fail-and-retire must not mutate around a corrupted generation. Exactly
-      // one open (ended_at IS NULL) generation must match this live thread;
-      // a missing, already-ended, or duplicate-open row is corruption and the
-      // whole operation fails with no write.
-      const openGenerations = this.db.prepare(
-        "SELECT thread_id FROM controller_generations WHERE controller_key = ? AND ended_at IS NULL ORDER BY id ASC",
-      ).all(input.controllerKey) as Array<{ thread_id: string }>;
-      if (openGenerations.length !== 1 || openGenerations[0]?.thread_id !== input.expectedThreadId) {
-        throw new Error("Controller generation invariant failed during fail-and-retire");
       }
       const failed = this.db.prepare(
         `UPDATE controller_turns
@@ -13886,7 +14062,7 @@ export function openStore(
   controllerModelRoute: () => ModelRoute = () => DEFAULT_CONTROLLER_CAPABILITY_MODEL,
   capabilityDispatchSettings: () => CapabilityDispatchSettings = () => DEFAULT_CAPABILITY_DISPATCH_SETTINGS,
 ): TelegramAgentStore {
-  migrateControllerInteractionStorage(storage);
+  migrateControllerInteractionStorage(storage, now());
   const db = storage.database();
   ensureApprovalOwnershipColumns(db);
   return new SqliteTelegramAgentStore(db, kv, now, controllerModelRoute, capabilityDispatchSettings);

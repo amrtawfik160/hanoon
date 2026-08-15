@@ -51,10 +51,156 @@ function nativeEvidenceCandidate(sourceItemId: string) {
   };
 }
 
+const GENERATION_REPAIR_MIGRATION_START = 52;
+const PRESERVED_FINALIZATION_PAYLOAD = JSON.stringify({
+  disposition: "answered",
+  segments: [{ type: "text", text: "preserved finalization" }],
+  obligationRefs: [],
+});
+
+function seedDuplicateControllerGenerations(
+  bb: ReturnType<typeof createFakePluginHost>["bb"],
+) {
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, GENERATION_REPAIR_MIGRATION_START));
+  db.prepare(
+    `INSERT INTO owners (
+       singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at
+     ) VALUES (1, '7', '7', 1_000, NULL)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, project_id, host_id,
+       bb_thread_id, state, created_at, updated_at
+     ) VALUES (
+       'owner-7-controller', '7', '7', 'proj_personal', 'host_personal',
+       'thr_corrupt_primary', 'active', 1_000, 1_500
+     )`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_turns (
+       id, telegram_update_id, controller_key, ordinal, input_text, state,
+       lease_owner, lease_generation, submitted_at, created_at, updated_at
+     ) VALUES (
+       'turn-corrupt-submitted', 91_001, 'owner-7-controller', 1,
+       'preserve submitted owner input', 'submitted', 'executor', 1, 1_500, 1_000, 1_500
+     )`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_turns (
+       id, telegram_update_id, controller_key, ordinal, input_text, state,
+       created_at, updated_at
+     ) VALUES (
+       'turn-corrupt-queued', 91_002, 'owner-7-controller', 2,
+       'preserve queued owner input', 'queued', 1_100, 1_100
+     )`,
+  ).run();
+  const finalization = db.prepare(
+    `INSERT INTO controller_finalizations (
+       turn_id, revision, payload_json, rendered_message, evidence_high_water_id,
+       state, rejection_code, created_at, validated_at, consumed_at
+     ) VALUES (?, 1, ?, ?, 0, 'accepted', NULL, 1_400, 1_400, NULL)`,
+  ).run(
+    "turn-corrupt-submitted",
+    PRESERVED_FINALIZATION_PAYLOAD,
+    "preserved finalization",
+  );
+  db.prepare(
+    "UPDATE controller_turns SET accepted_finalization_id = ? WHERE id = 'turn-corrupt-submitted'",
+  ).run(Number(finalization.lastInsertRowid));
+  db.prepare(
+    `INSERT INTO controller_generations (
+       id, controller_key, thread_id, started_at, ended_at, end_reason
+     ) VALUES
+       ('gen-corrupt-primary', 'owner-7-controller', 'thr_corrupt_primary', 1_200, NULL, NULL),
+       ('gen-corrupt-other', 'owner-7-controller', 'thr_corrupt_other', 1_300, NULL, NULL)`,
+  ).run();
+  return { db, finalizationId: Number(finalization.lastInsertRowid) };
+}
+
+function expectDuplicateGenerationRepair(
+  bb: ReturnType<typeof createFakePluginHost>["bb"],
+  finalizationId: number,
+) {
+  const db = bb.storage.database();
+  const store = openStore(bb.storage, bb.storage.kv, () => 2_000);
+  expect(store.getControllerTurn("turn-corrupt-submitted")).toMatchObject({
+    state: "queued",
+    inputText: "preserve submitted owner input",
+    acceptedFinalizationId: finalizationId,
+    completionContinuations: 2,
+  });
+  expect(store.getControllerTurn("turn-corrupt-queued")).toMatchObject({
+    state: "queued",
+    inputText: "preserve queued owner input",
+  });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    state: "pending_spawn",
+    threadId: null,
+  });
+  expect(db.prepare(
+    `SELECT id, controller_key, thread_id, started_at
+       FROM controller_generations
+      WHERE controller_key = 'owner-7-controller'
+      ORDER BY id`,
+  ).all()).toEqual([
+    {
+      id: "gen-corrupt-other",
+      controller_key: "owner-7-controller",
+      thread_id: "thr_corrupt_other",
+      started_at: 1_300,
+    },
+    {
+      id: "gen-corrupt-primary",
+      controller_key: "owner-7-controller",
+      thread_id: "thr_corrupt_primary",
+      started_at: 1_200,
+    },
+  ]);
+  expect(db.prepare(
+    `SELECT generation_id, controller_key, thread_id, started_at,
+            original_ended_at, original_end_reason, reason
+       FROM controller_generation_quarantine
+      ORDER BY generation_id`,
+  ).all()).toEqual([
+    {
+      generation_id: "gen-corrupt-other",
+      controller_key: "owner-7-controller",
+      thread_id: "thr_corrupt_other",
+      started_at: 1_300,
+      original_ended_at: null,
+      original_end_reason: null,
+      reason: "ambiguous_open_generations",
+    },
+    {
+      generation_id: "gen-corrupt-primary",
+      controller_key: "owner-7-controller",
+      thread_id: "thr_corrupt_primary",
+      started_at: 1_200,
+      original_ended_at: null,
+      original_end_reason: null,
+      reason: "ambiguous_open_generations",
+    },
+  ]);
+  expect(db.prepare(
+    "SELECT payload_json, consumed_at FROM controller_finalizations WHERE id = ?",
+  ).get(finalizationId)).toEqual({
+    payload_json: PRESERVED_FINALIZATION_PAYLOAD,
+    consumed_at: null,
+  });
+  expect(store.getOutbox("controller-generation-recovery:owner-7-controller")?.payload).toEqual({
+    text: "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
+    disable_web_page_preview: true,
+  });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM outbox WHERE logical_key = 'controller-generation-recovery:owner-7-controller'",
+  ).get()).toEqual({ count: 1 });
+}
+
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(52);
+  expect(ALL_MIGRATIONS).toHaveLength(54);
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
   expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");
@@ -122,6 +268,104 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[50]).toContain("recovery_source_turn_id");
   expect(ALL_MIGRATIONS[50]).not.toMatch(/\b(?:UPDATE|DELETE|DROP)\b/u);
   expect(ALL_MIGRATIONS[51]).toContain("thread_follow_up_json");
+  expect(ALL_MIGRATIONS[52]).toContain("CREATE TABLE controller_generation_quarantine");
+  expect(ALL_MIGRATIONS[53]).toContain("CREATE UNIQUE INDEX one_open_controller_generation");
+});
+
+it("preflights duplicate open generations without choosing a winner", () => {
+  const { bb } = createFakePluginHost({ pluginId: `telegram-controller-generation-migration-${fixtureNumber++}` });
+  const { db, finalizationId } = seedDuplicateControllerGenerations(bb);
+
+  expectDuplicateGenerationRepair(bb, finalizationId);
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generations WHERE controller_key = 'owner-7-controller' AND ended_at IS NULL",
+  ).get()).toEqual({ count: 0 });
+
+  db.prepare(
+    `INSERT INTO controller_generations (
+       id, controller_key, thread_id, started_at, ended_at, end_reason
+     ) VALUES ('gen-fresh', 'owner-7-controller', 'thr_fresh', 2_100, NULL, NULL)`,
+  ).run();
+  expect(() => db.prepare(
+    `INSERT INTO controller_generations (
+       id, controller_key, thread_id, started_at, ended_at, end_reason
+     ) VALUES ('gen-forbidden', 'owner-7-controller', 'thr_forbidden', 2_200, NULL, NULL)`,
+  ).run()).toThrow(/unique/i);
+});
+
+it("resumes when interrupted after quarantine schema creation and before preflight", () => {
+  const { bb } = createFakePluginHost({ pluginId: `telegram-controller-generation-before-${fixtureNumber++}` });
+  const { db, finalizationId } = seedDuplicateControllerGenerations(bb);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, 53));
+
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generations WHERE controller_key = 'owner-7-controller' AND ended_at IS NULL",
+  ).get()).toEqual({ count: 2 });
+  expectDuplicateGenerationRepair(bb, finalizationId);
+});
+
+it("rolls back an interrupted generation preflight and completes on restart", () => {
+  const { bb } = createFakePluginHost({ pluginId: `telegram-controller-generation-during-${fixtureNumber++}` });
+  const { db, finalizationId } = seedDuplicateControllerGenerations(bb);
+  db.exec(`
+    CREATE TRIGGER interrupt_generation_preflight
+    BEFORE UPDATE OF ended_at ON controller_generations
+    WHEN NEW.controller_key = 'owner-7-controller'
+    BEGIN
+      SELECT RAISE(ABORT, 'interrupt-generation-preflight');
+    END
+  `);
+
+  expect(() => openStore(bb.storage, bb.storage.kv, () => 2_000)).toThrow(/interrupt-generation-preflight/);
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generations WHERE controller_key = 'owner-7-controller' AND ended_at IS NULL",
+  ).get()).toEqual({ count: 2 });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generation_quarantine",
+  ).get()).toEqual({ count: 0 });
+  expect(db.prepare(
+    "SELECT state, bb_thread_id FROM controller_threads WHERE controller_key = 'owner-7-controller'",
+  ).get()).toEqual({ state: "active", bb_thread_id: "thr_corrupt_primary" });
+
+  db.exec("DROP TRIGGER interrupt_generation_preflight");
+  expectDuplicateGenerationRepair(bb, finalizationId);
+});
+
+it("rolls back and restarts after interruption following preflight", () => {
+  const { bb } = createFakePluginHost({ pluginId: `telegram-controller-generation-after-${fixtureNumber++}` });
+  const { db, finalizationId } = seedDuplicateControllerGenerations(bb);
+  const originalMigrate = bb.storage.migrate.bind(bb.storage);
+  let interrupted = false;
+  bb.storage.migrate = (database, statements) => {
+    const quarantineExists = database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'controller_generation_quarantine'",
+    ).get() !== undefined;
+    const preflightFinished = quarantineExists && database.prepare(
+      "SELECT 1 FROM controller_generation_quarantine LIMIT 1",
+    ).get() !== undefined;
+    if (!interrupted && statements.length === ALL_MIGRATIONS.length && preflightFinished) {
+      interrupted = true;
+      throw new Error("interrupt-after-generation-preflight");
+    }
+    originalMigrate(database, statements);
+  };
+
+  expect(() => openStore(bb.storage, bb.storage.kv, () => 2_000)).toThrow(/interrupt-after-generation-preflight/);
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generation_quarantine",
+  ).get()).toEqual({ count: 0 });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generations WHERE controller_key = 'owner-7-controller' AND ended_at IS NULL",
+  ).get()).toEqual({ count: 2 });
+  expect(db.prepare(
+    "SELECT state, bb_thread_id FROM controller_threads WHERE controller_key = 'owner-7-controller'",
+  ).get()).toEqual({ state: "active", bb_thread_id: "thr_corrupt_primary" });
+  expect(db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'one_open_controller_generation'",
+  ).get()).toBeUndefined();
+
+  bb.storage.migrate = originalMigrate;
+  expectDuplicateGenerationRepair(bb, finalizationId);
 });
 
 it("upgrades a live legacy controller row after an interrupted recovery migration", () => {
@@ -953,57 +1197,141 @@ it("rejects credential-shaped fail-and-retire error with no write", () => {
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active" });
 });
 
-it("fails-and-retires only against exactly one open generation and never a corrupted one", () => {
+// Regression for the duplicate-open generation crash loop observed on 2026-08-14.
+it("repairs duplicate generations during fail-and-retire while preserving owner work", () => {
   const { bb, store } = fixture();
   const db = bb.storage.database();
   const key = "owner-7-controller";
-  const thread = "thr_gen_guard";
+  const thread = "thr_gen_repair_retire";
   const { turn, fence } = submittedTurn(store, thread);
-
-  // No open generation at all: corruption, must fail with no write.
-  db.prepare("UPDATE controller_generations SET ended_at = 1, end_reason = 'ended' WHERE controller_key = ? AND thread_id = ?")
-    .run(key, thread);
-  expect(() => store.failAndRetireControllerTurn({
-    turnId: turn.id, controllerKey: key, expectedThreadId: thread, error: "no generation",
-    expectedAcceptedFinalizationId: null, ...fence,
-  })).toThrow(/generation/i);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active", threadId: thread });
-
-  // Restore one open generation, then duplicate it: >1 open is corruption.
-  db.prepare("UPDATE controller_generations SET ended_at = NULL, end_reason = NULL WHERE controller_key = ? AND thread_id = ?")
-    .run(key, thread);
-  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen-dup', ?, ?, 1, NULL, NULL)")
-    .run(key, thread);
-  expect(() => store.failAndRetireControllerTurn({
-    turnId: turn.id, controllerKey: key, expectedThreadId: thread, error: "duplicate open",
-    expectedAcceptedFinalizationId: null, ...fence,
-  })).toThrow(/generation/i);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active", threadId: thread });
-
-  // Remove the duplicate so exactly one open remains: fails-and-retires.
-  db.prepare("DELETE FROM controller_generations WHERE id = 'gen-dup'").run();
-
-  // One matching generation plus a foreign open generation for the same
-  // controller is still corrupt: retiring only the expected thread would
-  // leave another generation reusable.
-  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen-foreign', ?, 'thr_foreign_open', 1, NULL, NULL)")
+  const waiting = store.enqueueControllerTurn(turnInput(78_900, "preserve queued follow-up"));
+  const accepted = store.proposeControllerFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: key,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "preserve accepted finalization" }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("accepted finalization fixture was not accepted");
+  db.exec("DROP INDEX one_open_controller_generation");
+  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen-retire-foreign', ?, 'thr_retire_foreign', 1, NULL, NULL)")
     .run(key);
-  expect(() => store.failAndRetireControllerTurn({
-    turnId: turn.id, controllerKey: key, expectedThreadId: thread, error: "foreign open",
-    expectedAcceptedFinalizationId: null, ...fence,
-  })).toThrow(/generation/i);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted" });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active", threadId: thread });
-  db.prepare("DELETE FROM controller_generations WHERE id = 'gen-foreign'").run();
 
   expect(store.failAndRetireControllerTurn({
-    turnId: turn.id, controllerKey: key, expectedThreadId: thread, error: "single open",
-    expectedAcceptedFinalizationId: null, ...fence,
+    turnId: turn.id,
+    controllerKey: key,
+    expectedThreadId: thread,
+    error: "runtime caller prose must stay private",
+    expectedAcceptedFinalizationId: accepted.finalization.id,
+    ...fence,
   })).toBe("retired");
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "queued",
+    inputText: "I ran into a wall",
+    acceptedFinalizationId: accepted.finalization.id,
+    completionContinuations: 2,
+  });
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({
+    state: "queued",
+    inputText: "preserve queued follow-up",
+  });
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({
+    id: accepted.finalization.id,
+    consumedAt: null,
+  });
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generations WHERE controller_key = ? AND ended_at IS NULL",
+  ).get(key)).toEqual({ count: 0 });
+  expect(db.prepare(
+    "SELECT generation_id, thread_id FROM controller_generation_quarantine WHERE controller_key = ? ORDER BY generation_id",
+  ).all(key)).toHaveLength(2);
+  const notices = store.listOutbox(100).filter((outbox) =>
+    outbox.logicalKey === "controller-generation-recovery:owner-7-controller"
+  );
+  expect(notices).toHaveLength(1);
+  expect(notices[0]?.payload.text).toBe(
+    "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
+  );
+  expect(JSON.stringify(notices[0]?.payload)).not.toContain("runtime caller prose");
+});
+
+it("repairs duplicate generations during recovery while preserving receipts and finalization", () => {
+  const { bb, store } = fixture();
+  const db = bb.storage.database();
+  const key = "owner-7-controller";
+  const thread = "thr_gen_repair_recovery";
+  const { turn, fence } = submittedTurn(store, thread);
+  const waiting = store.enqueueControllerTurn(turnInput(78_901, "preserve second queued follow-up"));
+  expect(store.updateControllerStream({
+    ...fence,
+    turnId: turn.id,
+    cursor: 2,
+    phase: "responding",
+    inputAccepted: true,
+    assistantDraft: { itemId: "message-corrupt-recovery", text: "preserve private draft" },
+  })).toBe(true);
+  const receipt = { turnId: turn.id, toolName: "telegram_agent_cancel", argsSha256: "e".repeat(64) };
+  expect(store.claimToolReceipt({ ...receipt, controllerKey: key, ...fence })).toEqual({ outcome: "fresh" });
+  store.completeToolReceipt({ ...receipt, result: JSON.stringify({ cancelled: true }), now: fence.now });
+  const accepted = store.proposeControllerFinalization({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: key,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "preserve recovery finalization" }],
+      obligationRefs: [],
+    },
+  });
+  if (accepted.outcome !== "accepted") throw new Error("accepted finalization fixture was not accepted");
+  db.exec("DROP INDEX one_open_controller_generation");
+  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen-recovery-foreign', ?, 'thr_recovery_foreign', 1, NULL, NULL)")
+    .run(key);
+
+  expect(store.beginControllerRecovery({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: key,
+    expectedThreadId: thread,
+    error: "recovery caller prose must stay private",
+    nextFallbackIndex: 1,
+  })).toBe("requeued");
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "queued",
+    inputText: "I ran into a wall",
+    privateDraftText: "preserve private draft",
+    acceptedFinalizationId: accepted.finalization.id,
+    completionContinuations: 2,
+  });
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({
+    state: "queued",
+    inputText: "preserve second queued follow-up",
+  });
+  expect(store.listToolReceipts(turn.id)).toMatchObject([
+    { toolName: receipt.toolName, state: "completed", result: JSON.stringify({ cancelled: true }) },
+  ]);
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({
+    id: accepted.finalization.id,
+    consumedAt: null,
+  });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_generations WHERE controller_key = ? AND ended_at IS NULL",
+  ).get(key)).toEqual({ count: 0 });
+  const notices = store.listOutbox(100).filter((outbox) =>
+    outbox.logicalKey === "controller-generation-recovery:owner-7-controller"
+  );
+  expect(notices).toHaveLength(1);
+  expect(notices[0]?.payload.text).toBe(
+    "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
+  );
+  expect(JSON.stringify(notices[0]?.payload)).not.toContain("recovery caller prose");
 });
 
 it("preserves the turn updated_at when a native batch does not advance the cursor", () => {

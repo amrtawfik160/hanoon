@@ -81,7 +81,7 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 36);
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 38);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -119,6 +119,8 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 33]).toContain("consumed_at");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 34]).toContain("input_accepted");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 35]).toContain("thread_follow_up_json");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 36]).toContain("controller_generation_quarantine");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 37]).toContain("one_open_controller_generation");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {
