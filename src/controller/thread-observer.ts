@@ -286,6 +286,7 @@ export async function sendToVisibleThread(input: {
   return {
     sent: {
       threadId: input.threadId,
+      threadName: thread.title,
       status: thread.status,
       imageCount: input.images?.length ?? 0,
     },
