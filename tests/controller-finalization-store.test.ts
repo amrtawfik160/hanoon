@@ -799,7 +799,7 @@ it("uses the rendered finalization text verbatim for completion delivery", () =>
   });
 });
 
-it("keeps direct evidence sealed but admits late native evidence and refuses completion", () => {
+it("keeps direct evidence sealed but delivers after late native evidence", () => {
   const fixture = submittedControllerFixture();
   const accepted = acceptPlainFinalization(fixture);
   const outboxBefore = fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`);
@@ -821,16 +821,19 @@ it("keeps direct evidence sealed but admits late native evidence and refuses com
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
     bbHighWaterSeq: 1,
-  })).toBe("evidence_advanced");
+  })).toBe("completed");
   expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)).toMatchObject({
     id: accepted.id,
-    consumedAt: null,
+    consumedAt: fixture.fence.now,
   });
-  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)).toEqual([]);
-  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toEqual(outboxBefore);
+  expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 10)[0]?.agentText)
+    .toBe(accepted.renderedMessage);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).not.toEqual(outboxBefore);
+  expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`))
+    .toMatchObject({ payload: { text: accepted.renderedMessage } });
 });
 
-it("treats a late native evidence cap marker as evidence advanced", () => {
+it("delivers after a late native evidence cap marker", () => {
   const fixture = submittedControllerFixture();
   for (let index = 0; index < 128; index += 1) {
     expect(fixture.store.recordControllerEvidence({
@@ -854,7 +857,11 @@ it("treats a late native evidence cap marker as evidence advanced", () => {
     turnId: fixture.turn.id,
     controllerKey: fixture.turn.controllerKey,
     bbHighWaterSeq: 0,
-  })).toBe("evidence_advanced");
+  })).toBe("completed");
+  expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
+    state: "completed",
+    responseText: expect.any(String),
+  });
 });
 
 it("uses the eighth revision for acceptance and inserts nothing on accepted retry", () => {

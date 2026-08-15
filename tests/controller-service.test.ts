@@ -772,7 +772,7 @@ it("ignores raw provider output and completes only from the accepted finalizatio
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe(accepted.renderedMessage);
 });
 
-it("keeps an accepted finalization unconsumed while the provider is active", async () => {
+it("delivers an accepted finalization while the provider is still active", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 67, inputText: "wait for terminal" }),
@@ -808,10 +808,13 @@ it("keeps an accepted finalization unconsumed while the provider is active", asy
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
-  expect(store.readControllerDigest("owner-7-controller", 10)).toEqual([]);
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toBe(accepted.renderedMessage);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "completed",
+    responseText: accepted.renderedMessage,
+  });
+  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(2_002);
+  expect(store.readControllerDigest("owner-7-controller", 10)[0]?.agentText).toBe(accepted.renderedMessage);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe(accepted.renderedMessage);
 });
 
 it("retires a turn when a legacy accepted envelope fails evidence revalidation", async () => {
@@ -884,7 +887,7 @@ it("retires a turn when a legacy accepted envelope fails evidence revalidation",
 });
 
 it.each(["source_gap", "page_cap"] as const)(
-  "retries an accepted turn after a transient evidence %s",
+  "delivers an accepted turn despite transient evidence %s",
   async (reconciliationIncomplete) => {
     const { store, fence } = serviceFixture();
     const turn = store.enqueueControllerTurn({
@@ -929,13 +932,13 @@ it.each(["source_gap", "page_cap"] as const)(
       clock: { now: () => 2_002 },
     });
 
-    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-    expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-    expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+    expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: accepted.renderedMessage });
+    expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: 2_002 });
   },
 );
 
-it("does not steer or fail an active accepted turn at ordinary budgets", async () => {
+it("completes an active accepted turn without budget steering", async () => {
   const { store, fence, db } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 674, inputText: "keep accepted answer alive" }),
@@ -968,11 +971,11 @@ it("does not steer or fail an active accepted turn at ordinary budgets", async (
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.steer).not.toHaveBeenCalled();
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: accepted.renderedMessage });
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: 2_002 });
 });
 
-it("does not let an accepted active turn bypass the stall boundary", async () => {
+it("delivers an accepted active turn after the stall boundary", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 671, inputText: "bound the accepted turn" }),
@@ -1013,8 +1016,8 @@ it("does not let an accepted active turn bypass the stall boundary", async () =>
 
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
 
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: accepted.renderedMessage });
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: 2_000 + CONTROLLER_STALL_MS + 1 });
 });
 
 it("accepts finalizer completion and ordinary lifecycle events after acceptance", async () => {
@@ -1071,7 +1074,7 @@ it("accepts finalizer completion and ordinary lifecycle events after acceptance"
   expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(2_004);
 });
 
-it("waits for the exact projected high-water before retiring a late evidence turn", async () => {
+it("delivers an accepted answer after evidence advances past its seal", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 673, inputText: "project before completing" }),
@@ -1087,7 +1090,6 @@ it("waits for the exact projected high-water before retiring a late evidence tur
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).toBe(true);
   const accepted = acceptControllerFinalization(store, turn.id);
-  let projectEvidence = false;
   const projectedEvidence = {
     sourceName: "commandExecution",
     sourceItemId: "late-native",
@@ -1097,40 +1099,22 @@ it("waits for the exact projected high-water before retiring a late evidence tur
     proofKinds: ["command_result"] as const,
     subjectRefs: ["bb-item:late-native"] as const,
   };
-  const projector = {
-    reconcile: vi.fn(async (...args: unknown[]) => {
-      const projectedTurn = args[1] as { evidenceEventSeq: number };
-      const targetSeq = args[4] as number;
-      if (targetSeq > projectedTurn.evidenceEventSeq) {
-        expect(store.recordControllerNativeEvidence({
-          ownerId: fence.ownerId,
-          generation: fence.generation,
-          now: 2_000,
-          turnId: turn.id,
-          controllerKey: turn.controllerKey,
-          fromSeq: projectedTurn.evidenceEventSeq,
-          throughSeq: targetSeq,
-          items: projectEvidence ? [projectedEvidence] : [],
-        })).toBe("recorded");
-      }
-      return {
-        outcome: "reconciled" as const,
-        reconciliationIncomplete: null,
-        fromSeq: projectedTurn.evidenceEventSeq,
-        throughSeq: targetSeq,
-        targetSeq,
-      };
-    }),
-  };
-  const latestSequences = [0, 1, 1, 1];
-  const eventSequences = [0, 1];
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [projectedEvidence],
+  })).toBe("recorded");
   const adapter: ControllerAdapter = {
     spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
-    status: vi.fn(async () => "idle" as const),
-    latestSeq: vi.fn(async () => latestSequences.shift() ?? 1),
+    status: vi.fn(async () => "error" as const),
+    latestSeq: vi.fn(async () => { throw new Error("provider disappeared after finalization"); }),
     events: vi.fn(async () => ({
-      latestSeq: eventSequences.shift() ?? 1,
+      latestSeq: 1,
       inputAccepted: true,
       assistantOutputObserved: true,
       toolActivityObserved: true,
@@ -1148,18 +1132,14 @@ it("waits for the exact projected high-water before retiring a late evidence tur
   const service = new LunaControllerService({
     store,
     adapter,
-    evidenceProjector: projector,
+    evidenceProjector,
     clock: { now: () => 2_004 },
   });
 
-  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(false);
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", evidenceEventSeq: 0 });
-  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
-
-  projectEvidence = true;
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(store.getControllerTurn(turn.id)?.state).toBe("submitted");
-  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: null });
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: accepted.renderedMessage });
+  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ id: accepted.id, consumedAt: 2_004 });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe(accepted.renderedMessage);
   expect(store.listControllerEvidence(turn.id, 10)).toMatchObject([
     { sourceKind: "bb_item", sourceItemId: "late-native" },
   ]);
@@ -1236,7 +1216,6 @@ it("dispatches FIFO, waits for idle output, and then sends the next turn with mo
   status = "idle";
   acceptControllerFinalization(store, "controller-turn-11");
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
-  expect(evidenceProjector.reconcile).toHaveBeenCalled();
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   expect(adapter.send).toHaveBeenCalledWith("thr_controller", "second", fence.signal);
   expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["completed", "submitted"]);
@@ -2118,6 +2097,127 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     lastError: "Controller thread stayed busy for too long",
   });
   expect(store.getOutbox(`controller:${stranded.id}:reply`)?.status).toBe("pending");
+});
+
+it("fails a stalled submitted turn after reload, releases it, and drains the queued turn", async () => {
+  const fixture = serviceFixture();
+  const { store, fence } = fixture;
+  const stalled = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 641, inputText: "this turn will stall" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const queued = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 642, inputText: "the queue should continue" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now: 2_000 })?.id).toBe(stalled.id);
+  reserveControllerSpawnForTest(store, stalled.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now: 2_000,
+    turnId: stalled.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_stalled_after_reload",
+    spawnToken: stalled.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, now: 2_000, turnId: stalled.id })).toBe(true);
+
+  const stalledAt = 2_000 + CONTROLLER_STALL_MS + 1;
+  const restarted = fixture.reopen();
+  const lease = restarted.acquireExecutorLease("reloaded-executor", stalledAt, 30_000);
+  if (!lease.acquired) throw new Error("missing reload lease");
+  const restartedFence = {
+    ownerId: "reloaded-executor",
+    generation: lease.generation,
+    signal: AbortSignal.timeout(2_000),
+  };
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => {
+      if (!restarted.reserveControllerSpawn({
+        controllerKey: "owner-7-controller",
+        turnId: spawnTurn.id,
+        projectId: "proj_personal",
+        hostId: "host_personal",
+        now: stalledAt + 2,
+      })) throw new Error("controller spawn reservation failed after reload");
+      return {
+        threadId: "thr_after_stall",
+        projectId: "proj_personal",
+        hostId: "host_personal",
+        spawnToken: spawnTurn.id,
+      };
+    }),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => { throw new Error("watchdog should run before provider reads"); }),
+    events: vi.fn(async () => ({
+      latestSeq: 0,
+      inputAccepted: false,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      pendingQuestion: null,
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store: restarted,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => stalledAt },
+  });
+
+  await expect(service.reconcile(restartedFence, restartedFence.signal)).resolves.toBe(true);
+
+  expect(restarted.getControllerTurn(stalled.id)).toMatchObject({
+    state: "failed",
+    leaseOwner: null,
+    leaseGeneration: null,
+    lastError: "Controller turn stopped producing events",
+  });
+  expect(restarted.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
+  expect(restarted.getOutbox(`controller:${stalled.id}:reply`)).toMatchObject({ status: "pending" });
+  expect(adapter.status).not.toHaveBeenCalled();
+  expect(adapter.latestSeq).not.toHaveBeenCalled();
+
+  expect(restarted.releaseExecutorLease(
+    restartedFence.ownerId,
+    restartedFence.generation,
+    stalledAt + 1,
+  )).toBe(true);
+  const afterSecondReload = fixture.reopen();
+  const secondLease = afterSecondReload.acquireExecutorLease("reloaded-again", stalledAt + 2, 30_000);
+  if (!secondLease.acquired) throw new Error("missing second reload lease");
+  const secondFence = {
+    ownerId: "reloaded-again",
+    generation: secondLease.generation,
+    signal: AbortSignal.timeout(2_000),
+  };
+  const secondService = new LunaControllerService({
+    store: afterSecondReload,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => stalledAt + 2 },
+  });
+
+  await expect(secondService.processOne(secondFence, secondFence.signal)).resolves.toBe(true);
+  expect(afterSecondReload.getControllerTurn(queued.id)).toMatchObject({ state: "submitted" });
+  expect(afterSecondReload.getControllerForOwner("7", "7")).toMatchObject({
+    state: "active",
+    threadId: "thr_after_stall",
+  });
+  expect(adapter.spawn).toHaveBeenCalledTimes(1);
 });
 
 it("delivers a completed answer even when the controller thread ends in error", async () => {

@@ -680,7 +680,7 @@ it("allows lifecycle-only BB event high-water advancement after acceptance", () 
   expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(fence.now);
 });
 
-it("rejects completion while raw BB high-water is ahead of durable evidence projection", () => {
+it("delivers when raw BB high-water is ahead of durable evidence projection", () => {
   const { store, turn, fence } = submittedControllerFixture({
     turnColumns: { evidenceEventSeq: 4 },
   });
@@ -702,9 +702,9 @@ it("rejects completion while raw BB high-water is ahead of durable evidence proj
     turnId: turn.id,
     controllerKey: turn.controllerKey,
     bbHighWaterSeq: 5,
-  })).toBe("evidence_advanced");
-  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", evidenceEventSeq: 4 });
-  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBeNull();
+  })).toBe("completed");
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", evidenceEventSeq: 4 });
+  expect(store.getAcceptedControllerFinalization(turn.id)?.consumedAt).toBe(fence.now);
 });
 
 it("exposes the fixed proof-kind vocabulary once from controller models", async () => {

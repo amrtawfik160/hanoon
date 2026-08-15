@@ -235,9 +235,9 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       if (!turn) return false;
       if (turn.lease_owner === input.ownerId && turn.lease_generation === input.generation) return true;
       return this.db.prepare(
-        `UPDATE controller_turns SET lease_owner = ?, lease_generation = ?, updated_at = ?
+        `UPDATE controller_turns SET lease_owner = ?, lease_generation = ?
           WHERE id = ? AND state = 'submitted'`,
-      ).run(input.ownerId, input.generation, input.now, input.turnId).changes === 1;
+      ).run(input.ownerId, input.generation, input.turnId).changes === 1;
     }).immediate();
   }
 

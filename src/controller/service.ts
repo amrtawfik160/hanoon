@@ -227,6 +227,52 @@ export class LunaControllerService {
 
     if (await this.deliverAnsweredInteraction(turn, controller, fence, signal)) return true;
 
+    const acceptedBeforeProgress = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
+    if (acceptedBeforeProgress) {
+      if (this.hasPendingInteraction(controller.controllerKey, turn.id)) return true;
+      const completed = await this.completeAccepted(turn, controller, fence, false);
+      const completedTurn = this.dependencies.store.getControllerTurn(turn.id);
+      if (completedTurn?.state === "completed" && controller.threadId) {
+        let statusAfterAcceptance: ControllerStatus | null = null;
+        try {
+          statusAfterAcceptance = await this.dependencies.adapter.status(controller.threadId, signal);
+        } catch {
+          // Delivery is already durable; a status read is only best-effort cleanup.
+        }
+        if (
+          statusAfterAcceptance === "missing" ||
+          statusAfterAcceptance === "error" ||
+          statusAfterAcceptance === "incompatible"
+        ) {
+          this.dependencies.store.resetControllerThread({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            controllerKey: controller.controllerKey,
+            expectedThreadId: controller.threadId,
+            reason: retireReason(statusAfterAcceptance),
+          });
+        }
+      }
+      return completed;
+    }
+    if (turn.acceptedFinalizationId !== null) {
+      this.failAndRetire(
+        turn,
+        controller,
+        fence,
+        "Accepted controller finalization failed semantic revalidation",
+      );
+      return true;
+    }
+    if (
+      turn.awaitingInteractionId === null &&
+      this.dependencies.clock.now() - turn.updatedAt >= CONTROLLER_STALL_MS
+    ) {
+      // No owner message: the retire path deliberately sends a fixed internally
+      // mapped notice, so caller prose here would be validated and discarded.
+      this.failAndRetire(turn, controller, fence, "Controller turn stopped producing events");
+      return true;
+    }
+
     const evidenceOutcome = await this.reconcileEvidence(controller, turn, fence, signal);
     if (evidenceOutcome === "retry") return this.handleEvidenceRetry(turn, controller, fence, signal);
     if (evidenceOutcome === "stale") return true;
@@ -361,7 +407,7 @@ export class LunaControllerService {
     }
     const providerError = status === "error" || observation.error !== null;
     if (accepted && (providerError || status === "idle" || observation.completed)) {
-      return await this.completeAccepted(turn, controller, fence, providerError, signal);
+      return await this.completeAccepted(turn, controller, fence, providerError);
     }
     if (providerError) {
       if (
@@ -737,18 +783,10 @@ export class LunaControllerService {
     controller: ControllerThreadRecord,
     fence: EffectFence,
     providerError: boolean,
-    signal: AbortSignal,
   ): Promise<boolean> {
-    let bbHighWaterSeq: number;
-    try {
-      bbHighWaterSeq = await this.dependencies.adapter.latestSeq(controller.threadId!, signal);
-    } catch {
-      return false;
-    }
-    if (!Number.isSafeInteger(bbHighWaterSeq) || bbHighWaterSeq < 0) {
-      this.failAndRetire(turn, controller, fence, "Controller event high-water was invalid");
-      return true;
-    }
+    const accepted = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
+    if (!accepted) return true;
+    const bbHighWaterSeq = accepted.bbEventHighWaterSeq ?? turn.evidenceEventSeq;
     const outcome = this.dependencies.store.completeControllerTurnFromFinalization({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
@@ -766,11 +804,8 @@ export class LunaControllerService {
       }
       return true;
     }
-    const currentTurn = this.dependencies.store.getControllerTurn(turn.id);
-    if (currentTurn && bbHighWaterSeq > currentTurn.evidenceEventSeq) return false;
-    if (outcome === "evidence_advanced") {
-      this.failAndRetire(turn, controller, fence, "Controller evidence advanced after finalization");
-    }
+    // The accepted finalization is durable. A later evidence row, provider
+    // error, or stale race must not retire the answer it already sealed.
     return true;
   }
 

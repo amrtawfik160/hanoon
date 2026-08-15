@@ -2660,7 +2660,7 @@ export interface TelegramAgentStore {
   completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
-    /** The provider high-water re-read immediately before the atomic completion. */
+    /** The accepted finalization's provider high-water marker, or legacy cursor. */
     bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced";
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
@@ -4973,8 +4973,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction(() => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale" as const;
       const turn = this.db.prepare(
-        `SELECT turn.controller_key, turn.ordinal, turn.input_text, turn.evidence_event_seq,
-                turn.accepted_finalization_id, turn.evidence_limit_exceeded_at,
+        `SELECT turn.controller_key, turn.ordinal, turn.input_text,
+                turn.accepted_finalization_id,
                 controller.telegram_chat_id
            FROM controller_turns AS turn
            JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
@@ -4998,9 +4998,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         controller_key: string;
         ordinal: number;
         input_text: string;
-        evidence_event_seq: number;
         accepted_finalization_id: number;
-        evidence_limit_exceeded_at: number | null;
         telegram_chat_id: string;
       } | undefined;
       if (!turn) return "stale" as const;
@@ -5015,22 +5013,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).get(input.turnId, input.controllerKey)) {
         return "stale" as const;
       }
-      if (accepted.bbEventHighWaterSeq === null) return "evidence_advanced" as const;
       const completionHighWater = input.bbHighWaterSeq;
       if (
           !Number.isSafeInteger(completionHighWater) || completionHighWater < 0 ||
-          completionHighWater < accepted.bbEventHighWaterSeq ||
-          completionHighWater !== turn.evidence_event_seq) {
+          (accepted.bbEventHighWaterSeq !== null && completionHighWater < accepted.bbEventHighWaterSeq)) {
         return "evidence_advanced" as const;
       }
-      const laterEvidence = this.db.prepare(
-        "SELECT 1 FROM controller_evidence WHERE turn_id = ? AND id > ? LIMIT 1",
-      ).get(input.turnId, accepted.evidenceHighWaterId);
-      if (turn.evidence_limit_exceeded_at !== null || laterEvidence) return "evidence_advanced" as const;
       const completed = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'completed', response_text = ?, stream_text = '',
-                stream_phase = 'complete', last_error = NULL, completed_at = ?, updated_at = ?
+                stream_phase = 'complete', last_error = NULL, lease_owner = NULL,
+                lease_generation = NULL, completed_at = ?, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id = ?`,
@@ -6746,6 +6739,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const failed = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
+                lease_owner = NULL, lease_generation = NULL,
                 completed_at = ?,
                 capability_continuation_state = CASE
                   WHEN capability_continuation_state IN ('requested', 'relaunching') THEN 'blocked'

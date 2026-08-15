@@ -1137,56 +1137,24 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
   await verifyRegisteredTelegramToken(fixture, recording);
   const executorRun = fixture.harness.behavior.runService("job-executor");
   executorRunForCleanup = executorRun;
-    await waitForCondition(() => expect(finalOutbox(fixture.store, fixture.turn.id)).toEqual(expect.objectContaining({
+    await waitForCondition(() => expect(finalOutbox(fixture.store, fixture.turn.id)).toMatchObject({
       status: "sent",
-      messageId: null,
-      payload: { text: "Connecting to Hanoon…", disable_web_page_preview: true },
-    })));
-    expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)?.consumedAt).toBeNull();
+      messageId: 900,
+      payload: { text: NATURAL_RESPONSE, disable_web_page_preview: true },
+    }));
+    expect(fixture.store.getAcceptedControllerFinalization(fixture.turn.id)?.consumedAt).toBe(NOW);
     expect(state.threadStatuses).toContain("active");
     expect(storedControllerTurn(fixture.db, fixture.turn.id)).toMatchObject({
-      state: "submitted",
-      lease_owner: expect.any(String),
-      lease_generation: expect.any(Number),
-      dispatch_after_seq: 0,
-      bb_event_seq: 0,
-      evidence_event_seq: 0,
-      completion_continuations: 0,
+      state: "completed",
+      lease_owner: null,
+      lease_generation: null,
       accepted_finalization_id: 1,
-      stream_text: "",
-      stream_phase: "connecting",
-      response_text: null,
-      telegram_message_id: null,
-      submitted_at: NOW,
-      completed_at: null,
+      response_text: NATURAL_RESPONSE,
+      completed_at: NOW,
     });
-    expect(recording.sentMessages).toEqual([]);
-    expect(recording.editedMessages).toEqual([]);
     assertRegisteredControllerMapping(recording, state);
     expect(recording.drafts.every((draft) => draft.payload.text !== NATURAL_RESPONSE)).toBe(true);
 
-    state.events = [
-      eventRow(state.threadId, 1, "item/started", { item: { type: "toolCall", id: "finalizer-call" } }),
-      eventRow(state.threadId, 2, "item/completed", {
-        providerThreadId: "provider-thread-1",
-        item: {
-          type: "toolCall",
-          id: "finalizer-call",
-          server: "plugin",
-          tool: "telegram_agent_respond",
-          arguments: { disposition: "answered" },
-          status: "completed",
-          result: { outcome: "accepted" },
-        },
-      }),
-      eventRow(state.threadId, 3, "thread/tokenUsage/updated", {
-        tokenUsage: { total: { totalTokens: 1 } },
-      }),
-      eventRow(state.threadId, 4, "turn/completed", {}),
-    ];
-    state.maxSeq = 4;
-    state.status = "idle";
-    await nudgeExecutor(fixture, "4");
     await waitForCondition(() => expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
       state: "completed",
       responseText: NATURAL_RESPONSE,
@@ -1207,7 +1175,7 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
       },
     }]);
     expect(finalMessage.messageId).toBe(900);
-    expect(state.threadStatuses).toContain("idle");
+    expect(state.threadStatuses).toContain("active");
     expect(recording.editedMessages).toEqual([]);
     await waitForCondition(() => expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({
       status: "sent",
@@ -1243,11 +1211,11 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
     expect(fixture.store.listControllerEvidence(fixture.turn.id, 128)).toEqual(naturalEvidence);
     expect(storedControllerTurn(fixture.db, fixture.turn.id)).toMatchObject({
       state: "completed",
-      lease_owner: expect.any(String),
-      lease_generation: expect.any(Number),
+      lease_owner: null,
+      lease_generation: null,
       dispatch_after_seq: 0,
-      bb_event_seq: 4,
-      evidence_event_seq: 4,
+      bb_event_seq: 0,
+      evidence_event_seq: 0,
       completion_continuations: 0,
       accepted_finalization_id: 1,
       stream_text: "",
