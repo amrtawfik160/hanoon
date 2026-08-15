@@ -43,7 +43,6 @@ it("names what is wrong when the executor has stopped", () => {
   expect(report.problems).toContain("the executor lease is not current");
 });
 
-<<<<<<< HEAD
 it("makes a stale activation visible in the existing health report", () => {
   const { db, store } = fixture();
   expect(store.acquireExecutorLease("executor", NOW, 30_000).acquired).toBe(true);

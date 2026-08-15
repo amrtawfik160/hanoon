@@ -7,7 +7,6 @@ import type { ProjectPolicy } from "../src/domain/models";
 import { buildHealthReport } from "../src/services/health-report";
 import { TelegramIngress } from "../src/telegram/ingress";
 import { TelegramApiError } from "../src/telegram/errors";
-import { buildHealthReport } from "../src/services/health-report";
 import type {
   InlineKeyboardMarkup,
   SendMessagePayload,
