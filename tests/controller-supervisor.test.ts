@@ -37,6 +37,7 @@ const quiet: SupervisorSignals = {
   toolCalls: 0,
   totalTokens: 0,
   commandFailures: 0,
+  evidenceRows: 0,
   steersIssued: 0,
   steeredReasons: [],
 };
@@ -526,6 +527,42 @@ it("does not replay a budget steer after finalization loses its lease across res
     supervisorSteers: 1,
     supervisorReasons: ["tool_budget"],
   });
+});
+
+it("degrades a turn whose evidence budget is spent instead of retiring it", async () => {
+  const { store, fence } = storeFixture("evidence-spent");
+  const turn = submittedTurn(store, fence);
+  let seq = 1;
+  const adapter = serviceAdapter(() => observation({ latestSeq: (seq += 1) }), () => "active");
+  const spentProjector = {
+    reconcile: vi.fn(async () => ({ outcome: "limit_exceeded" as const })),
+  };
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector: spentProjector,
+    clock: { now: () => 2_001 },
+  });
+  const runFence = { ...fence, signal: AbortSignal.timeout(2_000) };
+
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+
+  // The owner's question survives: the turn is still running, and it has been
+  // told to answer in plain text rather than being retired mid-thought.
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    supervisorReasons: ["evidence_spent"],
+  });
+  expect(adapter.steer).toHaveBeenCalledWith(
+    "thr_controller",
+    expect.stringContaining("no claim segments"),
+    runFence.signal,
+  );
+
+  // A spent budget stays spent on every later poll, so it must nag only once.
+  await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+  expect(adapter.steer).toHaveBeenCalledTimes(1);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted" });
 });
 
 it("budgets this turn's tokens, not the whole thread's history", async () => {

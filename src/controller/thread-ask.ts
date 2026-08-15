@@ -20,6 +20,8 @@
  *      the failure this design is avoiding.
  */
 
+import { EVIDENCE_SPENT_OWNER_NOTICE } from "./evidence-budget";
+
 /** Heading above the recorded asks. Plain words, because the owner reads it. */
 export const THREAD_ASK_HEADING = "What I asked for:";
 
@@ -131,20 +133,37 @@ export type ComposedOwnerReply = Readonly<{
   reportedCount: number;
 }>;
 
+export type OwnerReplyConditions = Readonly<{
+  /** Whether this turn answered on an evidence budget that had run out. */
+  evidenceBudgetSpent?: boolean;
+}>;
+
 /**
  * Compose the message the owner actually receives: the finalization the
- * contract accepted, followed by what the controller asked threads to do.
+ * contract accepted, a note when the answer was thinner than usual, then what
+ * the controller asked threads to do.
  *
- * The accepted text is never modified. The report is appended, so a reply that
- * passed the evidence gate still says exactly what it said.
+ * The accepted text is never modified. Everything else is appended, so a reply
+ * that passed the evidence gate still says exactly what it said.
+ *
+ * The degraded note is fixed text on the delivery path rather than something
+ * the controller is asked to include. An answer given on a spent budget has
+ * gaps in it, and whether the owner learns that cannot depend on the model
+ * remembering to mention it.
  */
 export function composeOwnerReply(
   acceptedMessage: string,
   asks: readonly RecordedThreadAsk[],
   maxChars: number,
+  conditions: OwnerReplyConditions = {},
 ): ComposedOwnerReply {
-  const budget = maxChars - Array.from(acceptedMessage).length;
+  const note = conditions.evidenceBudgetSpent ? `\n\n${EVIDENCE_SPENT_OWNER_NOTICE}` : "";
+  // The answer outranks the note: if both will not fit, the note is what goes.
+  const head = Array.from(`${acceptedMessage}${note}`).length <= maxChars
+    ? `${acceptedMessage}${note}`
+    : acceptedMessage;
+  const budget = maxChars - Array.from(head).length;
   const report = budget > 0 ? renderThreadAskReport(asks, budget) : null;
-  if (report === null) return { text: acceptedMessage, reportedCount: 0 };
-  return { text: `${acceptedMessage}${report.block}`, reportedCount: report.reportedCount };
+  if (report === null) return { text: head, reportedCount: 0 };
+  return { text: `${head}${report.block}`, reportedCount: report.reportedCount };
 }

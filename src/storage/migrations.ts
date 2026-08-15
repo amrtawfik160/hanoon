@@ -1973,6 +1973,35 @@ CREATE INDEX controller_thread_asks_unreported
   WHERE reported_at IS NULL;
 `] as const;
 
+// Two more reasons a turn can be steered, both about the evidence budget: one
+// as it nears the cap, one once the cap has refused a write. The reason column
+// carries a CHECK, which SQLite cannot widen in place, so the table is rebuilt
+// with its rows carried over.
+export const CONTROLLER_EVIDENCE_STEER_MIGRATIONS = [String.raw`
+CREATE TABLE controller_supervisor_steer_attempts_v2 (
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  reason TEXT NOT NULL CHECK (reason IN (
+    'tool_budget', 'token_budget', 'command_failures', 'evidence_budget', 'evidence_spent')),
+  thread_id TEXT NOT NULL,
+  input_text TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'unknown')),
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  PRIMARY KEY (turn_id, reason),
+  CHECK ((state = 'pending' AND settled_at IS NULL) OR
+         (state IN ('applied', 'unknown') AND settled_at IS NOT NULL))
+);
+INSERT INTO controller_supervisor_steer_attempts_v2
+  SELECT * FROM controller_supervisor_steer_attempts;
+DROP TABLE controller_supervisor_steer_attempts;
+ALTER TABLE controller_supervisor_steer_attempts_v2
+  RENAME TO controller_supervisor_steer_attempts;
+CREATE INDEX controller_supervisor_steer_attempts_pending
+  ON controller_supervisor_steer_attempts(turn_id, state);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2030,4 +2059,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_GENERATION_INVARIANT_MIGRATIONS,
   ...CONTROLLER_DELIVERY_STATE_MIGRATIONS,
   ...CONTROLLER_THREAD_ASK_MIGRATIONS,
+  ...CONTROLLER_EVIDENCE_STEER_MIGRATIONS,
 ] as const;

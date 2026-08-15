@@ -2881,6 +2881,8 @@ export interface TelegramAgentStore {
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite;
   listControllerEvidence(turnId: string, limit: number): ControllerEvidenceRecord[];
+  /** Evidence rows recorded so far, which is what the evidence budget reads. */
+  countControllerEvidence(turnId: string): number;
   getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null;
   proposeControllerFinalization(
     input: ControllerFinalizationProposalInput,
@@ -5360,6 +5362,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.controllerEvidenceRepository.list(turnId, limit);
   }
 
+  public countControllerEvidence(turnId: string): number {
+    return this.controllerEvidenceRepository.count(turnId);
+  }
+
   public getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null {
     return this.controllerEvidenceRepository.get(turnId, evidenceId);
   }
@@ -5471,7 +5477,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const turn = this.db.prepare(
         `SELECT turn.controller_key, turn.ordinal, turn.input_text,
                 turn.accepted_finalization_id, turn.thread_follow_up_json,
-                controller.telegram_chat_id
+                turn.evidence_limit_exceeded_at, controller.telegram_chat_id
            FROM controller_turns AS turn
            JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
            JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
@@ -5496,6 +5502,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input_text: string;
         accepted_finalization_id: number;
         thread_follow_up_json: string | null;
+        evidence_limit_exceeded_at: number | null;
         telegram_chat_id: string;
       } | undefined;
       if (!turn) return "stale" as const;
@@ -5521,7 +5528,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       // neither do. An ask the owner never hears about is a decision taken in
       // his name that he cannot see, so it must not be lost to a failed write.
       const pendingAsks = this.unreportedControllerThreadAsks(turn.controller_key);
-      const reply = composeOwnerReply(accepted.renderedMessage, pendingAsks, MAX_OWNER_REPLY_CHARS);
+      const reply = composeOwnerReply(accepted.renderedMessage, pendingAsks, MAX_OWNER_REPLY_CHARS, {
+        evidenceBudgetSpent: turn.evidence_limit_exceeded_at !== null,
+      });
       const completed = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'completed', response_text = ?, stream_text = '',

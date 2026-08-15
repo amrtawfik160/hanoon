@@ -468,9 +468,28 @@ describe("ordered rejection branches", () => {
     expect(validateControllerFinalization(ordinary, emptyFinalizationContext({ evidenceLimitExceeded: false })))
       .toMatchObject({ outcome: "accepted" });
     expectRejection(
-      ordinary,
-      emptyFinalizationContext({ evidenceLimitExceeded: true }),
+      claimFinalization(),
+      {
+        ...contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+        evidenceLimitExceeded: true,
+      },
       "evidence_limit_exceeded",
+    );
+  });
+
+  it("still answers in plain text once the evidence limit is spent", () => {
+    // The cap costs the turn its claims, not the owner their answer. A turn
+    // that can say nothing at all is a question thrown away.
+    expect(validateControllerFinalization(ordinary, emptyFinalizationContext({ evidenceLimitExceeded: true })))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it("keeps the plain-text guards on a degraded answer", () => {
+    // Dropping claims must not become a way to assert a success nothing backs.
+    expectRejection(
+      textFinalization("I deployed the fix to production."),
+      emptyFinalizationContext({ evidenceLimitExceeded: true }),
+      "high_impact_text_unclaimed",
     );
   });
 
@@ -2098,7 +2117,10 @@ describe("fixed corrections", () => {
       ["invalid_contract", validateControllerFinalization({ invalid: "candidate-marker" }, emptyFinalizationContext())],
       ["accepted_already", validateControllerFinalization(ordinary, emptyFinalizationContext({ acceptedAlready: true }))],
       ["revision_limit", validateControllerFinalization(ordinary, emptyFinalizationContext({ revisionCount: 8 }))],
-      ["evidence_limit_exceeded", validateControllerFinalization(ordinary, emptyFinalizationContext({ evidenceLimitExceeded: true }))],
+      ["evidence_limit_exceeded", validateControllerFinalization(claimFinalization(), {
+        ...contextWithEvidence(evidenceRow("evidence:1", "project_state")),
+        evidenceLimitExceeded: true,
+      })],
       ["duplicate_evidence_reference", validateControllerFinalization(
         claimFinalization({ evidenceRefs: ["evidence:1", "evidence:1"] }),
         contextWithEvidence(evidenceRow("evidence:1", "project_state")),

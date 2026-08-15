@@ -131,7 +131,7 @@ const CORRECTIONS: Record<FinalizationRejectionCode, string> = {
   invalid_contract: "Return one valid bounded finalization without unsafe material.",
   accepted_already: "This turn already has an accepted finalization.",
   revision_limit: "The finalization revision limit has been reached.",
-  evidence_limit_exceeded: "The evidence limit was exceeded; do not finalize this turn.",
+  evidence_limit_exceeded: "The evidence limit was reached, so no claim can be backed. Finalize in plain text with no claim segments, and say plainly what you could not verify.",
   duplicate_evidence_reference: "Remove duplicate evidence references within each claim.",
   evidence_missing: "Reference only evidence available to this turn.",
   subject_mismatch: "Use evidence whose subject exactly matches the claim subject.",
@@ -1327,13 +1327,23 @@ function renderCandidate(candidate: ControllerFinalization): string | null {
   }
 }
 
+/**
+ * A turn whose evidence budget was refused a write has an incomplete record of
+ * what it did, so it may no longer make evidence-backed claims. It may still
+ * answer: a claim-free finalization asserts nothing the record has to support,
+ * and every plain-text guard below still applies to it, so a degraded answer
+ * cannot smuggle in an unbacked success assertion.
+ *
+ * Blocking that answer too is what turned a spent budget into a lost question.
+ */
 function contextRejectionCode(
+  candidate: ControllerFinalization,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
   if (context.acceptedAlready) return "accepted_already";
   if (context.invocationInFlight) return "invocation_in_flight";
   if (context.revisionCount >= 8) return "revision_limit";
-  if (context.evidenceLimitExceeded) return "evidence_limit_exceeded";
+  if (context.evidenceLimitExceeded && claims(candidate).length > 0) return "evidence_limit_exceeded";
   return null;
 }
 
@@ -1371,7 +1381,7 @@ function semanticRejectionCode(
   renderedMessage: string,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
-  return contextRejectionCode(context)
+  return contextRejectionCode(candidate, context)
     ?? claimRejectionCode(candidate, renderedMessage, context)
     ?? dispositionRejectionCode(candidate, context)
     ?? (isProcessOnly(candidate, renderedMessage) ? "process_only" : null)

@@ -1,3 +1,9 @@
+import {
+  EVIDENCE_BUDGET_DEGRADE_ROWS,
+  EVIDENCE_DEGRADE_STEER,
+  EVIDENCE_SPENT_STEER,
+} from "./evidence-budget";
+
 /**
  * A full-permission controller turn is bounded by wall-clock silence alone
  * (CONTROLLER_STALL_MS). A turn that keeps producing events while going nowhere
@@ -23,18 +29,27 @@ export const SUPERVISOR_HARD_TOKENS = 600_000;
 // Five non-zero exits is a model trying variations instead of reading the error.
 export const SUPERVISOR_SOFT_COMMAND_FAILURES = 5;
 
-export type SupervisorReason = "tool_budget" | "token_budget" | "command_failures";
+export type SupervisorReason =
+  | "tool_budget"
+  | "token_budget"
+  | "command_failures"
+  | "evidence_budget"
+  | "evidence_spent";
 
 export const SUPERVISOR_REASONS: ReadonlySet<string> = new Set<SupervisorReason>([
   "tool_budget",
   "token_budget",
   "command_failures",
+  "evidence_budget",
+  "evidence_spent",
 ]);
 
 export type SupervisorSignals = {
   toolCalls: number;
   totalTokens: number;
   commandFailures: number;
+  /** Evidence rows recorded on this turn, against `CONTROLLER_EVIDENCE_LIMIT`. */
+  evidenceRows: number;
   steersIssued: number;
   steeredReasons: readonly SupervisorReason[];
 };
@@ -51,6 +66,8 @@ const STEER_TEXT: Record<SupervisorReason, string> = {
     "This turn is running long. Land the answer now with what you already know, and name the one thing that would settle anything still open.",
   command_failures:
     "Several commands have failed. Stop trying variations: read the actual error, form one hypothesis, and either test that once or tell the owner what is blocking you.",
+  evidence_budget: EVIDENCE_DEGRADE_STEER,
+  evidence_spent: EVIDENCE_SPENT_STEER,
 };
 
 const STOP_MESSAGE =
@@ -61,6 +78,13 @@ const STOP_MESSAGE =
  * available nudges, and never twice for the same reason — a tripped budget
  * stays tripped on every later poll, so without that guard one crossing would
  * nudge forever.
+ *
+ * `evidence_budget` leads the soft list because it is the only one of them
+ * whose ceiling, once reached, costs the turn its ability to make claims at
+ * all. A tool-call nudge that lands first is a nudge the evidence budget may
+ * not get. `evidence_spent` is never returned from here: it fires after the
+ * cap has already refused a write, which must not be starved by the two-steer
+ * ration, so its caller claims it directly.
  */
 export function evaluateSupervisor(signals: SupervisorSignals): SupervisorDecision {
   if (signals.toolCalls >= SUPERVISOR_HARD_TOOL_CALLS) {
@@ -72,6 +96,7 @@ export function evaluateSupervisor(signals: SupervisorSignals): SupervisorDecisi
   if (signals.steersIssued >= SUPERVISOR_MAX_STEERS_PER_TURN) return { kind: "continue" };
   const used = new Set(signals.steeredReasons);
   const soft: readonly (readonly [SupervisorReason, boolean])[] = [
+    ["evidence_budget", signals.evidenceRows >= EVIDENCE_BUDGET_DEGRADE_ROWS],
     ["tool_budget", signals.toolCalls >= SUPERVISOR_SOFT_TOOL_CALLS],
     ["token_budget", signals.totalTokens >= SUPERVISOR_SOFT_TOKENS],
     ["command_failures", signals.commandFailures >= SUPERVISOR_SOFT_COMMAND_FAILURES],
