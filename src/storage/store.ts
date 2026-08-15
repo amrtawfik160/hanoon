@@ -406,6 +406,7 @@ export type ControllerFailureCode =
   | "owner_message_delivery_exhausted"
   | "owner_message_delivery_unresolved"
   | "owner_message_waiting_for_fresh_generation"
+  | "owner_message_requeued"
   | "image_preparation_failed";
 
 export type ControllerDeliveryReconciliationResult = "pending" | "failed" | "recovery_required" | "stale";
@@ -4272,18 +4273,26 @@ function matchThreadInteractionToken(
 }
 
 const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> = {
-  unknown: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
-  stalled: "That controller turn stopped making progress after its recovery attempts, so I ended it safely.",
-  budget_exceeded: "That controller turn reached its safety budget, so I stopped it.",
-  oauth_expired: "The controller provider sign-in has expired. Reconnect that provider before asking it to continue.",
-  provider_rejected: "The controller provider rejected its current model or account configuration. Fix those provider settings before trying again.",
-  recovery_exhausted: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
+  // Every line here is read by the owner in place of the answer they asked for,
+  // so each one has to be true for the single path that reaches it and has to
+  // say what became of their message. A resend is invited only where nothing
+  // ran, so taking it up cannot repeat an action.
+  unknown: "I couldn't finish that one, so your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.",
+  stalled: "That one stopped making progress after I tried again, so I ended it safely. Your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.",
+  budget_exceeded: "That one reached its safety limit, so I stopped it. Your message didn't get a full answer. Nothing was repeated. Send it again and I'll pick it up.",
+  oauth_expired: "The provider sign-in has expired, so I couldn't answer your message. Reconnect that provider, then send your message again.",
+  provider_rejected: "The provider refused its current model or account settings, so I couldn't answer your message. Fix those provider settings, then send your message again.",
+  recovery_exhausted: "I tried that again and still couldn't finish it, so your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.",
   owner_message_delivery_uncertain: "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
   owner_message_delivery_exhausted: "I couldn't confirm whether my previous message reached you after repeated attempts. It may be missing or duplicated; open BB to inspect the result.",
   owner_message_delivery_unresolved: "I preserved that message, but could not confirm whether it was delivered. I did not repeat it. Please review the conversation before trying again.",
   owner_message_waiting_for_fresh_generation: "I kept your message queued because that controller is still busy. If it does not free up soon, I’ll continue in a fresh conversation.",
+  owner_message_requeued: "I couldn't finish that one, but nothing had started yet, so I've put your message back and I'm picking it up again in a fresh conversation. Nothing was repeated.",
   image_preparation_failed: "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.",
 };
+
+/** Shown when a message arrives mid-turn and is folded into the running reply. */
+const CONTROLLER_STEER_FOLDED_TEXT = "Got that, and I'm working it into the answer I'm already writing.";
 
 const MAX_CONTROLLER_DISPATCH_RETRY_COUNT = 6;
 const MAX_CONTROLLER_DELIVERY_RECONCILIATION_ATTEMPTS = 3;
@@ -6264,9 +6273,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         );
         if (configured.changes !== 1) return false;
       }
+      // The evidence cursor starts where this turn's own message entered the
+      // thread, exactly as the continuation path sets all three together. Left
+      // at 0 it rescans the whole conversation on every turn, so each turn
+      // re-ingests its predecessors' items and the per-turn row count climbs
+      // with conversation length until it crosses the evidence cap.
       const updated = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'submitted', dispatch_after_seq = ?, bb_event_seq = ?,
+                evidence_event_seq = ?,
                 stream_phase = 'connecting', submitted_at = ?,
                 delivery_state = 'none', delivery_reconcile_attempts = 0,
                 next_dispatch_at = 0, last_error = NULL,
@@ -6287,6 +6302,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                  )
             )`,
       ).run(
+        dispatchAfterSeq,
         dispatchAfterSeq,
         dispatchAfterSeq,
         input.now,
@@ -7182,6 +7198,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       agentText: folded,
       now: input.now,
     });
+    // The answer itself arrives folded into the reply already being written, so
+    // without this the owner's message drew no bubble at all and reads in
+    // Telegram exactly like being ignored.
+    persistControllerOutbox(this.db, {
+      logicalKey: controllerReplyLogicalKey(input.waitingTurnId, null),
+      chatId: row.telegramChatId,
+      payload: {
+        text: CONTROLLER_STEER_FOLDED_TEXT,
+        disable_web_page_preview: true,
+      },
+    }, input.now);
   }
 
   private retryUnappliedControllerSteer(input: ControllerSteerSettlementInput): void {
@@ -7857,6 +7884,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL`,
       ).run(input.now, "retired", input.controllerKey, input.expectedThreadId);
       if (generationRetired.changes !== 1) throw new Error("Controller generation changed during fail-and-retire");
+      const requeued = this.requeueUntouchedOwnerMessage(row, input.failureCode ?? "unknown", input.now);
       // The owner-facing notice is a fixed internally mapped safe message,
       // never caller prose: an arbitrary text could equal or leak the accepted
       // rendered message or a credential. The internal `error` stays out of the
@@ -7864,12 +7892,72 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const outbox = controllerFailureOutbox(
         input.turnId,
         row.telegram_chat_id,
-        input.failureCode ?? "unknown",
+        requeued ? "owner_message_requeued" : input.failureCode ?? "unknown",
         row.thread_follow_up_json,
       );
       persistControllerOutbox(this.db, outbox, input.now);
       return "retired";
     }).immediate();
+  }
+
+  /**
+   * Put an owner message back only when the failed turn provably cost nothing.
+   *
+   * A turn that opened no tool, recorded no evidence, reserved no receipt and
+   * had no accepted answer cannot have done anything worth not repeating, so
+   * replaying it is safe. `input_accepted` is deliberately not part of that
+   * test: turns have run dozens of tool calls with it still 0, so trusting it
+   * would replay real work. An image is left out because the retry would carry
+   * only the text, which is not the message the owner sent.
+   *
+   * Only an unclassified or recovery-exhausted failure is replayed. An expired
+   * sign-in or a rejected provider would fail again the same way until the
+   * owner fixes it, and the delivery codes describe a message whose fate is
+   * already uncertain. The replacement records where it came from, so a second
+   * failure asks the owner instead of looping.
+   */
+  private requeueUntouchedOwnerMessage(
+    row: ControllerTurnRow & { telegram_chat_id: string },
+    failureCode: ControllerFailureCode,
+    now: number,
+  ): boolean {
+    if (failureCode !== "unknown" && failureCode !== "recovery_exhausted") return false;
+    if (row.origin !== "owner" || row.image_file_id !== null) return false;
+    if (row.recovery_source_turn_id !== null) return false;
+    if (row.tool_calls !== 0 || row.accepted_finalization_id !== null) return false;
+    const touched = this.db.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM controller_evidence WHERE turn_id = ?) AS evidence,
+         (SELECT COUNT(*) FROM tool_receipts WHERE turn_id = ?) AS receipts`,
+    ).get(row.id, row.id) as { evidence: number; receipts: number };
+    if (touched.evidence !== 0 || touched.receipts !== 0) return false;
+    const latestUpdate = this.db.prepare(
+      "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
+    ).get() as { update_id: number };
+    try {
+      const replacement = this.enqueueControllerTurn({
+        controllerKey: row.controller_key,
+        telegramUserId: this.requiredOwnerForController(row.controller_key).userId,
+        telegramChatId: row.telegram_chat_id,
+        updateId: Math.max(latestUpdate.update_id + 1, THREAD_FOLLOW_UP_UPDATE_ID_BASE),
+        inputText: row.input_text,
+        origin: "owner",
+        now,
+      });
+      this.db.prepare(
+        "UPDATE controller_turns SET recovery_source_turn_id = ? WHERE id = ? AND state = 'queued'",
+      ).run(row.id, replacement.id);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private requiredOwnerForController(controllerKey: string): { userId: string; chatId: string } {
+    const owner = this.db.prepare(
+      "SELECT telegram_user_id, telegram_chat_id FROM controller_threads WHERE controller_key = ?",
+    ).get(controllerKey) as { telegram_user_id: string; telegram_chat_id: string };
+    return { userId: owner.telegram_user_id, chatId: owner.telegram_chat_id };
   }
 
   public listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[] {

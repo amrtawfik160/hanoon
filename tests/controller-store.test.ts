@@ -1067,6 +1067,36 @@ function submittedTurn(store: ReturnType<typeof openStore>, threadId: string) {
   return { store, turn, fence };
 }
 
+// A turn's evidence cursor has to start where its own message entered the
+// thread. Left at 0 it rescans the whole conversation every turn, so the row
+// count climbs with conversation length until it crosses the evidence cap and
+// a turn that needed no evidence at all dies of the budget.
+it("starts a submitted turn's evidence cursor at its own dispatch baseline", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(771, "what do you mean"));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_evidence_baseline",
+  })).toBe(true);
+
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ...fence,
+    dispatchAfterSeq: 1_528,
+  })).toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    dispatchAfterSeq: 1_528,
+    bbEventSeq: 1_528,
+    evidenceEventSeq: 1_528,
+  });
+});
+
 it("atomically fails and retires a submitted controller turn with a safe notice", () => {
   const { bb, store } = fixture();
   const { turn, fence } = submittedTurn(store, "thr_fail_retire");
@@ -1099,27 +1129,23 @@ it("atomically fails and retires a submitted controller turn with a safe notice"
   expect(generations[0]).toMatchObject({ ended_at: 2_000, end_reason: "retired" });
   // The owner-facing notice is a fixed internally mapped safe message; the
   // caller's bounded internal `error` never reaches the Telegram payload.
+  // This turn opened no tool and recorded no evidence, so its message is put
+  // back rather than apologised for.
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
-    text: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
+    text: "I couldn't finish that one, but nothing had started yet, so I've put your message back and I'm picking it up again in a fresh conversation. Nothing was repeated.",
     disable_web_page_preview: true,
   });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toContain("projector ran out");
 });
 
-it.each([
-  ["stalled", /stopped making progress/i],
-  ["budget_exceeded", /safety budget/i],
-  ["oauth_expired", /sign-in has expired/i],
-  ["provider_rejected", /provider settings/i],
-  ["recovery_exhausted", /after recovery/i],
-  ["owner_message_delivery_uncertain", /preserved.*message/i],
-  ["owner_message_delivery_exhausted", /couldn't confirm.*previous message.*missing or duplicated/i],
-  ["owner_message_delivery_unresolved", /did not repeat.*review the conversation/i],
-  ["owner_message_waiting_for_fresh_generation", /kept.*message queued.*fresh conversation/i],
-  ["image_preparation_failed", /couldn't read that image safely/i],
-] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
-  const { store } = fixture();
+// A turn that did nothing may have its message put back, which changes the
+// notice. Pass `didWork` to read the copy for a turn that cannot be replayed.
+function failureNotice(failureCode: ControllerFailureCode, didWork = true): string {
+  const { bb, store } = fixture();
   const { turn, fence } = submittedTurn(store, `thr_failure_code_${failureCode}`);
+  if (didWork) {
+    bb.storage.database().prepare("UPDATE controller_turns SET tool_calls = 4 WHERE id = ?").run(turn.id);
+  }
 
   expect(store.failAndRetireControllerTurn({
     ...fence,
@@ -1127,13 +1153,148 @@ it.each([
     controllerKey: turn.controllerKey,
     expectedThreadId: `thr_failure_code_${failureCode}`,
     error: "bounded internal summary",
-    failureCode: failureCode satisfies ControllerFailureCode,
+    failureCode,
   })).toBe("retired");
 
   const text = store.getOutbox(`controller:${turn.id}:reply`)?.payload.text;
-  expect(text).toMatch(expectedText);
-  expect(text).not.toMatch(/resend your request/i);
+  expect(text).toBeTypeOf("string");
   expect(text).not.toContain("bounded internal summary");
+  return text as string;
+}
+
+it.each([
+  ["stalled", /stopped making progress/i],
+  ["budget_exceeded", /safety limit/i],
+  ["oauth_expired", /sign-in has expired/i],
+  ["provider_rejected", /provider settings/i],
+  ["recovery_exhausted", /tried that again/i],
+  ["unknown", /couldn't finish/i],
+  ["owner_message_delivery_uncertain", /preserved.*message/i],
+  ["owner_message_delivery_exhausted", /couldn't confirm.*previous message.*missing or duplicated/i],
+  ["owner_message_delivery_unresolved", /did not repeat.*review the conversation/i],
+  ["owner_message_waiting_for_fresh_generation", /kept.*message queued.*fresh conversation/i],
+  ["image_preparation_failed", /couldn't read that image safely/i],
+] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
+  expect(failureNotice(failureCode)).toMatch(expectedText);
+});
+
+// The owner reads this instead of the answer they asked for, so it has to say
+// what became of their message. "unknown" used to borrow the recovery sentence
+// and claim a recovery that never ran.
+it("gives an unclassified failure its own copy that claims no recovery", () => {
+  const unknown = failureNotice("unknown");
+  expect(unknown).not.toBe(failureNotice("recovery_exhausted"));
+  expect(unknown).not.toMatch(/after recovery|tried that again|retried/i);
+});
+
+it.each([
+  "unknown",
+  "recovery_exhausted",
+  "stalled",
+  "budget_exceeded",
+  "oauth_expired",
+  "provider_rejected",
+] as const)("tells the owner what became of their message for %s", (failureCode) => {
+  const text = failureNotice(failureCode);
+  expect(text).toMatch(/your message|send it again|send your message again/i);
+});
+
+// Nothing ran, so inviting a resend cannot repeat an action.
+it.each(["unknown", "recovery_exhausted", "stalled", "budget_exceeded"] as const)(
+  "invites a safe resend for %s",
+  (failureCode) => {
+    expect(failureNotice(failureCode)).toMatch(/send it again/i);
+    expect(failureNotice(failureCode)).toMatch(/nothing was repeated/i);
+  },
+);
+
+// Turn 326 died 249ms after it arrived having done nothing at all, and the
+// owner's message went with it. A message that provably cost nothing can be
+// put back rather than apologised for.
+it("requeues an owner message when the failed turn did nothing", () => {
+  const { store } = fixture();
+  const { turn, fence } = submittedTurn(store, "thr_requeue_untouched");
+
+  expect(store.failAndRetireControllerTurn({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_requeue_untouched",
+    error: "bounded internal summary",
+  })).toBe("retired");
+
+  const replacement = store.listControllerTurns("owner-7-controller", 10)
+    .find((candidate) => candidate.id !== turn.id);
+  expect(replacement).toMatchObject({
+    state: "queued",
+    inputText: turn.inputText,
+    origin: "owner",
+    recoverySourceTurnId: turn.id,
+  });
+  const text = store.getOutbox(`controller:${turn.id}:reply`)?.payload.text;
+  expect(text).toMatch(/picking it up again/i);
+  expect(text).not.toMatch(/send it again/i);
+});
+
+it.each([
+  ["a tool ran", (db: ReturnType<typeof fixture>["bb"]["storage"], id: string) =>
+    db.database().prepare("UPDATE controller_turns SET tool_calls = 9 WHERE id = ?").run(id)],
+  // Self-reference is enough to mark it as already replaced once, and it keeps
+  // the foreign key pointing at a turn that exists.
+  ["it was already a replacement", (db: ReturnType<typeof fixture>["bb"]["storage"], id: string) =>
+    db.database().prepare("UPDATE controller_turns SET recovery_source_turn_id = ? WHERE id = ?").run(id, id)],
+  ["it carried an image", (db: ReturnType<typeof fixture>["bb"]["storage"], id: string) =>
+    db.database().prepare(
+      `UPDATE controller_turns
+          SET image_file_id = 'file_1', image_file_name = 'shot.png',
+              image_mime_type = 'image/png', image_size_bytes = 1024, image_kind = 'image'
+        WHERE id = ?`,
+    ).run(id)],
+])("never requeues an owner message when %s", (_reason, taint) => {
+  const { bb, store } = fixture();
+  const { turn, fence } = submittedTurn(store, "thr_requeue_blocked");
+  taint(bb.storage, turn.id);
+
+  expect(store.failAndRetireControllerTurn({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_requeue_blocked",
+    error: "bounded internal summary",
+  })).toBe("retired");
+
+  expect(store.listControllerTurns("owner-7-controller", 10)).toHaveLength(1);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toMatch(/send it again/i);
+});
+
+// A provider that refused once refuses again, so replaying only loops.
+it.each(["oauth_expired", "provider_rejected"] as const)(
+  "never requeues an owner message for %s",
+  (failureCode) => {
+    const { store } = fixture();
+    const { turn, fence } = submittedTurn(store, `thr_no_requeue_${failureCode}`);
+
+    expect(store.failAndRetireControllerTurn({
+      ...fence,
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      expectedThreadId: `thr_no_requeue_${failureCode}`,
+      error: "bounded internal summary",
+      failureCode,
+    })).toBe("retired");
+
+    expect(store.listControllerTurns("owner-7-controller", 10)).toHaveLength(1);
+  },
+);
+
+// These describe a message whose delivery is unconfirmed, so a resend could
+// duplicate an action that already happened.
+it.each([
+  "owner_message_delivery_uncertain",
+  "owner_message_delivery_exhausted",
+  "owner_message_delivery_unresolved",
+] as const)("never invites a resend for %s", (failureCode) => {
+  expect(failureNotice(failureCode)).not.toMatch(/send it again|resend/i);
 });
 
 it("persists acceptance and a bounded private draft without projecting the draft", () => {
@@ -1199,6 +1360,37 @@ it("atomically retires an accepted broken generation into one restart-safe recov
     completionContinuations: 2,
     privateDraftText: "Bounded unfinished answer",
   });
+});
+
+// The owner asked a real question at 1:42am, it was folded into the running
+// answer, and no bubble appeared at all. From Telegram that is identical to
+// being ignored, so a folded message has to leave something visible behind.
+it("acknowledges an owner message folded into the running answer", () => {
+  const { store } = fixture();
+  const { turn: running, fence } = submittedTurn(store, "thr_folded_ack");
+  const waiting = store.enqueueControllerTurn(
+    turnInput(78_010, "yeah but if hanoon started a new thread and gave it the context"),
+  );
+  expect(store.reserveControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    expectedThreadId: "thr_folded_ack",
+  })).toBe(true);
+
+  expect(store.settleControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    outcome: "applied",
+  })).toBe("settled");
+
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "completed" });
+  const notice = store.getOutbox(`controller:${waiting.id}:reply`);
+  expect(notice?.payload.text).toMatch(/answer i'm already writing|already writing/i);
+  expect(notice?.chatId).toBe("7");
 });
 
 it("preserves an ambiguously steered owner message and inherits exact receipts", () => {
@@ -1281,7 +1473,7 @@ it("lets a durable acceptance win an unaccepted fail-and-retire attempt", () => 
   })).toBe("retired");
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toBe("I couldn't complete that controller turn safely after recovery. No action was repeated.");
+    .toBe("I couldn't finish that one, so your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.");
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
     .not.toContain("SECRET accepted answer");
   expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ consumedAt: null });

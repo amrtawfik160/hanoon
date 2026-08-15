@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   CONTROLLER_CLAIM_KINDS,
   FINALIZATION_REJECTION_CODES,
+  controllerFinalizationCorrection,
   controllerFinalizationJsonSchema,
   controllerFinalizationSchema,
   renderControllerFinalization,
@@ -136,17 +137,63 @@ describe("controller finalization public contract", () => {
     });
   });
 
-  it("renders exact segment concatenation without separators", () => {
+  it("renders every segment boundary as a paragraph break", () => {
     const candidate: ControllerFinalization = {
       disposition: "answered",
       segments: [
         { type: "text", text: "First" },
-        { type: "text", text: " second" },
-        { type: "text", text: "." },
+        { type: "text", text: "second" },
+        { type: "text", text: "third." },
       ],
       obligationRefs: [],
     };
-    expect(renderControllerFinalization(candidate)).toBe("First second.");
+    expect(renderControllerFinalization(candidate)).toBe("First\n\nsecond\n\nthird.");
+  });
+
+  // These are the exact pairs the owner read in Telegram with sentences glued
+  // together, because segments used to be joined with the empty string.
+  it.each([
+    ["maybe the hard way.", "New one when you want a check"],
+    ["rather than a one-line brief.", "What it has to fix:"],
+    ["Valor is the reference now.", "The lesson worth taking from it:"],
+    [
+      "Got it. Plain words from here on, every time.",
+      "Nothing else from me tonight unless you want it.",
+    ],
+  ])("separates %j from the segment after it", (first, second) => {
+    const rendered = renderControllerFinalization({
+      disposition: "answered",
+      segments: [{ type: "text", text: first }, { type: "text", text: second }],
+      obligationRefs: [],
+    });
+    expect(rendered).toBe(`${first}\n\n${second}`);
+    expect(rendered).not.toContain(`${first}${second}`);
+  });
+
+  it("trims segment edges so stray whitespace cannot collapse the break", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "  Leading and trailing space. \n" },
+        { type: "text", text: "\n\n Next paragraph.  " },
+      ],
+      obligationRefs: [],
+    };
+    expect(renderControllerFinalization(candidate))
+      .toBe("Leading and trailing space.\n\nNext paragraph.");
+  });
+
+  it("keeps newlines the model intended inside one segment", () => {
+    const candidate: ControllerFinalization = {
+      disposition: "answered",
+      segments: [
+        { type: "text", text: "Four still sit with you:\n- merges\n- the freeze fix" },
+        { type: "text", text: "Say which and I start." },
+      ],
+      obligationRefs: [],
+    };
+    expect(renderControllerFinalization(candidate))
+      .toBe("Four still sit with you:\n- merges\n- the freeze fix\n\nSay which and I start.");
   });
 
   it("counts rendered Unicode code points rather than UTF-16 units", () => {
@@ -154,6 +201,19 @@ describe("controller finalization public contract", () => {
     expect(renderControllerFinalization(candidate)).toBe("😀".repeat(4_000));
     expect(() => renderControllerFinalization(textFinalization("😀".repeat(4_001))))
       .toThrow("final message exceeds 4000 characters");
+  });
+
+  it("counts the separators it adds against the 4000-character bound", () => {
+    const halves = [{ type: "text" as const, text: "a".repeat(2_000) }, {
+      type: "text" as const,
+      text: "b".repeat(2_000),
+    }];
+    // 2000 + 2000 fits exactly, but the paragraph break between them does not.
+    expect(() => renderControllerFinalization({
+      disposition: "answered",
+      segments: halves,
+      obligationRefs: [],
+    })).toThrow("final message exceeds 4000 characters");
   });
 });
 
@@ -464,14 +524,32 @@ describe("ordered rejection branches", () => {
     expectRejection(ordinary, emptyFinalizationContext({ revisionCount: 8 }), "revision_limit");
   });
 
-  it("checks the evidence-limit flag at both boolean boundaries", () => {
+  // A saturated evidence budget bounds what may still be claimed, not whether
+  // the owner gets an answer. "what do you mean" needs no evidence, and a turn
+  // like it must never be unable to reply because the budget filled up.
+  it("still accepts a claimless answer once the evidence limit is exceeded", () => {
     expect(validateControllerFinalization(ordinary, emptyFinalizationContext({ evidenceLimitExceeded: false })))
       .toMatchObject({ outcome: "accepted" });
+    expect(validateControllerFinalization(ordinary, emptyFinalizationContext({ evidenceLimitExceeded: true })))
+      .toMatchObject({ outcome: "accepted" });
+  });
+
+  it("rejects a claim once the evidence limit is exceeded", () => {
+    const candidate = claimFinalization({ kind: "observed_state", outcome: "observed" });
+    const evidence = contextWithEvidence(evidenceRow("evidence:1", "project_state"));
+    expect(validateControllerFinalization(candidate, evidence)).toMatchObject({ outcome: "accepted" });
     expectRejection(
-      ordinary,
-      emptyFinalizationContext({ evidenceLimitExceeded: true }),
+      candidate,
+      { ...evidence, evidenceLimitExceeded: true },
       "evidence_limit_exceeded",
     );
+  });
+
+  it("tells a saturated turn to answer rather than to stay silent", () => {
+    expect(controllerFinalizationCorrection("evidence_limit_exceeded"))
+      .toMatch(/answer/i);
+    expect(controllerFinalizationCorrection("evidence_limit_exceeded"))
+      .not.toMatch(/do not finalize/i);
   });
 
   it("rejects duplicate evidence references within one claim", () => {
@@ -1864,19 +1942,37 @@ describe("bounded text heuristics", () => {
     "In non-production, ",
     "Without touching production, ",
   ])("accepts a prefix non-target production qualifier: %s", (prefix) => {
+    // A segment renders as its own paragraph, so a qualifier only scopes an
+    // assertion it actually shares a segment with.
+    expect(validateControllerFinalization(
+      claimFinalization({
+        kind: "execution_result",
+        outcome: "succeeded",
+        text: `${prefix}tests passed.`,
+      }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it.each([
+    "Outside production, ",
+    "In non-production, ",
+    "Without touching production, ",
+  ])("does not let %s in an earlier paragraph qualify a later one", (prefix) => {
     const claim = claimFinalization({
       kind: "execution_result",
       outcome: "succeeded",
       text: "Tests passed.",
     }).segments[0];
-    expect(validateControllerFinalization(
+    expectRejection(
       {
         disposition: "answered",
         segments: [{ type: "text", text: prefix }, claim],
         obligationRefs: [],
       },
       contextWithEvidence(evidenceRow("evidence:1", "command_result", "succeeded")),
-    )).toMatchObject({ outcome: "accepted" });
+      "proof_incompatible",
+    );
   });
 
   it.each([
@@ -2437,7 +2533,11 @@ describe("fixed corrections", () => {
       ["invalid_contract", validateControllerFinalization({ invalid: "candidate-marker" }, emptyFinalizationContext())],
       ["accepted_already", validateControllerFinalization(ordinary, emptyFinalizationContext({ acceptedAlready: true }))],
       ["revision_limit", validateControllerFinalization(ordinary, emptyFinalizationContext({ revisionCount: 8 }))],
-      ["evidence_limit_exceeded", validateControllerFinalization(ordinary, emptyFinalizationContext({ evidenceLimitExceeded: true }))],
+      // A full budget only blocks claims now, so this code needs a claim.
+      ["evidence_limit_exceeded", validateControllerFinalization(
+        claimFinalization(),
+        { ...contextWithEvidence(evidenceRow("evidence:1", "project_state")), evidenceLimitExceeded: true },
+      )],
       ["duplicate_evidence_reference", validateControllerFinalization(
         claimFinalization({ evidenceRefs: ["evidence:1", "evidence:1"] }),
         contextWithEvidence(evidenceRow("evidence:1", "project_state")),

@@ -39,6 +39,9 @@ export type PersistedFinalizationRejectionCode = Exclude<
 >;
 type EvidenceRef = `evidence:${number}`;
 
+/** One blank line, so each segment lands as its own paragraph in Telegram. */
+const SEGMENT_SEPARATOR = "\n\n";
+
 const boundedSegmentText = z.string().refine(
   (text) => Array.from(text).length <= 4_000,
   "segment text must be at most 4000 characters",
@@ -131,7 +134,7 @@ const CORRECTIONS: Record<FinalizationRejectionCode, string> = {
   invalid_contract: "Return one valid bounded finalization without unsafe material.",
   accepted_already: "This turn already has an accepted finalization.",
   revision_limit: "The finalization revision limit has been reached.",
-  evidence_limit_exceeded: "The evidence limit was exceeded; do not finalize this turn.",
+  evidence_limit_exceeded: "This turn's evidence budget is full, so no further claim can be verified. Answer the owner in plain text segments with no claim segments.",
   duplicate_evidence_reference: "Remove duplicate evidence references within each claim.",
   evidence_missing: "Reference only evidence available to this turn.",
   subject_mismatch: "Use evidence whose subject exactly matches the claim subject.",
@@ -462,8 +465,18 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   },
 ];
 
+/**
+ * A segment is a paragraph, so the renderer owns the break between segments.
+ * Joining on the empty string delivered glued prose ("...the hard way.New one
+ * when you want a check") because nothing asked the model to carry its own
+ * separators. Edges are trimmed so stray whitespace cannot collapse the break,
+ * newlines inside a segment survive, and the bound is measured on the joined
+ * text so the separators this adds cannot push a message past Telegram's limit.
+ */
 export function renderControllerFinalization(candidate: ControllerFinalization): string {
-  const renderedMessage = candidate.segments.map((segment) => segment.text).join("");
+  const renderedMessage = candidate.segments
+    .map((segment) => segment.text.trim())
+    .join(SEGMENT_SEPARATOR);
   if (Array.from(renderedMessage).length > 4_000) {
     throw new TypeError("final message exceeds 4000 characters");
   }
@@ -1387,13 +1400,33 @@ function renderCandidate(candidate: ControllerFinalization): string | null {
   }
 }
 
+/**
+ * Every fail-closed scan reads two renderings of the same finalization.
+ *
+ * The boundary-free concatenation stays primary, so a callback or credential
+ * split across two segments is still caught exactly as it was before segments
+ * gained a paragraph break, and the declared rejection order is unchanged.
+ * The delivered text is then scanned too, because inserting a break can form an
+ * assertion the concatenation hides — "deploy" and "succeeded" in adjacent
+ * segments read as one sentence only once the separator sits between them.
+ */
+function boundaryFreeRendering(candidate: ControllerFinalization): string {
+  return candidate.segments.map((segment) => segment.text.trim()).join("");
+}
+
 function contextRejectionCode(
+  candidate: ControllerFinalization,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
   if (context.acceptedAlready) return "accepted_already";
   if (context.invocationInFlight) return "invocation_in_flight";
   if (context.revisionCount >= 8) return "revision_limit";
-  if (context.evidenceLimitExceeded) return "evidence_limit_exceeded";
+  // A saturated budget means the evidence set is truncated, so a claim resting
+  // on it cannot be trusted. A plain answer rests on nothing and still lands:
+  // blocking it too left a turn that needed no evidence unable to reply at all.
+  if (context.evidenceLimitExceeded && claims(candidate).length > 0) {
+    return "evidence_limit_exceeded";
+  }
   return null;
 }
 
@@ -1431,7 +1464,7 @@ function semanticRejectionCode(
   renderedMessage: string,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
-  return contextRejectionCode(context)
+  return contextRejectionCode(candidate, context)
     ?? claimRejectionCode(candidate, renderedMessage, context)
     ?? dispositionRejectionCode(candidate, context)
     ?? (isProcessOnly(candidate, renderedMessage) ? "process_only" : null)
@@ -1448,9 +1481,15 @@ export function validateControllerFinalization(
   const candidate = parsed.data;
   const renderedMessage = renderCandidate(candidate);
   if (renderedMessage === null) return rejected("invalid_contract", fixedStorageProjection());
-  const unsafeProjection = unsafeStorageProjection(candidate, renderedMessage);
-  if (unsafeProjection) return rejected("invalid_contract", unsafeProjection);
-  const rejectionCode = semanticRejectionCode(candidate, renderedMessage, context);
-  if (rejectionCode) return rejected(rejectionCode, candidate);
+  const scanned = boundaryFreeRendering(candidate);
+  const readings = scanned === renderedMessage ? [scanned] : [scanned, renderedMessage];
+  for (const reading of readings) {
+    const unsafeProjection = unsafeStorageProjection(candidate, reading);
+    if (unsafeProjection) return rejected("invalid_contract", unsafeProjection);
+  }
+  for (const reading of readings) {
+    const rejectionCode = semanticRejectionCode(candidate, reading, context);
+    if (rejectionCode) return rejected(rejectionCode, candidate);
+  }
   return { outcome: "accepted", candidate, renderedMessage };
 }

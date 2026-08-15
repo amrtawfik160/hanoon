@@ -1162,6 +1162,69 @@ it.each(["source_gap", "page_cap"] as const)(
   },
 );
 
+// Turn 326 was the owner typing "what do you mean": no tool needed, no
+// evidence of its own. Its first native batch crossed the evidence cap, and a
+// cap crossing was fatal, so the turn died 249ms after arrival and took the
+// whole controller thread with it. Saturating the budget must cost the turn
+// further ingestion, never the turn itself or the conversation.
+it("keeps a saturated turn and its controller alive instead of retiring them", async () => {
+  const { store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 671, inputText: "what do you mean" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })?.id)
+    .toBe(turn.id);
+  reserveControllerSpawnForTest(store, turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+    projectId: "proj_personal", hostId: "host_personal", threadId: "thr_evidence_saturated",
+    spawnToken: turn.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id, ownerId: fence.ownerId, generation: fence.generation, now: 2_000,
+  })).toBe(true);
+  const projector = {
+    reconcile: vi.fn(async () => ({
+      outcome: "limit_exceeded" as const,
+      reconciliationIncomplete: null,
+      fromSeq: 0,
+      throughSeq: 0,
+      targetSeq: 0,
+    })),
+  };
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    send: vi.fn(async () => undefined),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 0),
+    events: vi.fn(async () => ({ latestSeq: 0, inputAccepted: true, assistantOutputObserved: true, toolActivityObserved: false, completed: false, error: null, pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector: projector,
+    clock: { now: () => 2_002 },
+  });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted" });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    state: "active",
+    threadId: "thr_evidence_saturated",
+  });
+  // Whatever is queued for the owner is the live stream placeholder, never a
+  // failure notice about a turn that is still running.
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text ?? "")
+    .not.toMatch(/couldn't complete/i);
+});
+
 it("completes an active accepted turn without budget steering", async () => {
   const { store, fence, db } = serviceFixture();
   const turn = store.enqueueControllerTurn({
@@ -3329,7 +3392,9 @@ it("projects active Luna assistant deltas into the durable controller reply", as
     spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
-    latestSeq: vi.fn(async () => 0),
+    // The dispatch baseline is read from latestSeq just before sending, so the
+    // thread's latest sequence is never behind the turn that sits in it.
+    latestSeq: vi.fn(async () => 10),
     events: vi.fn(async () => ({
       latestSeq: 10,
       inputAccepted: true,
@@ -3656,7 +3721,9 @@ it("retries one controller generation when BB proves the input was never accepte
     spawn,
     send: vi.fn(async () => undefined),
     status: vi.fn(async (threadId: string) => threadId === "thr_never_accepted" ? "error" : "active"),
-    latestSeq: vi.fn(async () => 0),
+    // The dispatch baseline is read from latestSeq just before sending, so the
+    // thread's latest sequence is never behind the turn that sits in it.
+    latestSeq: vi.fn(async () => 11),
     events: vi.fn(async () => ({
       latestSeq: 11,
       inputAccepted: false,
@@ -4180,7 +4247,7 @@ it("uses one same-session correction, one receipt-seeded fresh recovery, then a 
   now = 2_003;
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed", completionContinuations: 2 });
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toMatch(/after recovery/i);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toMatch(/tried that again/i);
 });
 
 it("uses the vetted stall notice when exhausted recovery cannot read its event high-water", async () => {

@@ -2076,7 +2076,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[22],
     register: () => bb.agents.registerTool({
       name: CONTROLLER_TOOL_NAMES[22],
-      description: "Submit one bounded evidence-backed final response for the current controller turn.",
+      description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in.",
       parameters: controllerFinalizationJsonSchema,
       execute: (candidate, context) => executeControllerFinalizer(
         dependencies,
