@@ -35,6 +35,18 @@ export type TelegramServiceDeps = {
   warn?: (message: string) => void;
 };
 
+type TelegramPollingActivation = {
+  controller: AbortController;
+  pollSettled: Promise<void>;
+};
+
+// Path-plugin reloads evaluate a fresh module, so the polling generation must
+// live on the process rather than in module-local state.
+const TELEGRAM_POLLING_ACTIVATION = Symbol.for("telegram-agent.polling-activation");
+const telegramPollingProcess = globalThis as typeof globalThis & {
+  [key: symbol]: TelegramPollingActivation | undefined;
+};
+
 const POLL_RETRY_BASE_MS = 1_000;
 const POLL_RETRY_MAX_MS = 30_000;
 const TELEGRAM_POLL_TIMEOUT_SECONDS = 30;
@@ -64,6 +76,16 @@ function pollRetryDelay(consecutiveFailures: number): number {
 
 export async function runTelegramService(deps: TelegramServiceDeps, signal: AbortSignal): Promise<void> {
   const warn = deps.warn ?? (() => undefined);
+  const activationController = new AbortController();
+  const serviceSignal = AbortSignal.any([signal, activationController.signal]);
+  const previousActivation = telegramPollingProcess[TELEGRAM_POLLING_ACTIVATION];
+  const activation: TelegramPollingActivation = {
+    controller: activationController,
+    pollSettled: Promise.resolve(),
+  };
+  telegramPollingProcess[TELEGRAM_POLLING_ACTIVATION] = activation;
+  previousActivation?.controller.abort();
+  await previousActivation?.pollSettled;
   let token: string | null = null;
   let client: TelegramServiceClient | null = null;
   let identityBound = false;
@@ -71,7 +93,7 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
   let consecutiveConflicts = 0;
   deps.store.reconcileTelegramCursor();
 
-  while (!signal.aborted) {
+  while (!serviceSignal.aborted) {
     const config = deps.getConfig();
     if (!config.ok) throw configurationError(config.message);
     if (config.value.botToken !== token) {
@@ -84,9 +106,9 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
     if (!identityBound) {
       let identity: { id: number; username: string };
       try {
-        identity = await client.getMe(signal);
+        identity = await client.getMe(serviceSignal);
       } catch (error) {
-        if (signal.aborted) return;
+        if (serviceSignal.aborted) return;
         if (isConflict(error) && ++consecutiveConflicts > MAX_CONSECUTIVE_CONFLICTS) {
           throw configurationError("Another process is polling this Telegram bot token.");
         }
@@ -109,9 +131,15 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
 
     let updates: TelegramUpdate[];
     try {
-      updates = await client.getUpdates(deps.store.getNextTelegramOffset(), TELEGRAM_POLL_TIMEOUT_SECONDS, signal);
+      const pendingUpdates = client.getUpdates(
+        deps.store.getNextTelegramOffset(),
+        TELEGRAM_POLL_TIMEOUT_SECONDS,
+        serviceSignal,
+      );
+      activation.pollSettled = pendingUpdates.then(() => undefined, () => undefined);
+      updates = await pendingUpdates;
     } catch (error) {
-      if (signal.aborted) return;
+      if (serviceSignal.aborted) return;
       if (isConflict(error) && ++consecutiveConflicts > MAX_CONSECUTIVE_CONFLICTS) {
         throw configurationError("Another process is polling this Telegram bot token.");
       }
@@ -125,7 +153,7 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
     consecutiveConflicts = 0;
 
     for (const update of [...updates].sort((left, right) => left.update_id - right.update_id)) {
-      if (signal.aborted) return;
+      if (serviceSignal.aborted) return;
       const claim = deps.store.beginTelegramUpdate(update.update_id, deps.clock.now());
       if (claim === "processed") continue;
       try {
@@ -157,10 +185,10 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
     consecutivePollFailures += 1;
     warn(`${context}: ${redactError(error).slice(0, 500)}`);
     try {
-      await abortableSleep(pollRetryDelay(consecutivePollFailures), signal);
+      await abortableSleep(pollRetryDelay(consecutivePollFailures), serviceSignal);
     } catch {
       return false;
     }
-    return !signal.aborted;
+    return !serviceSignal.aborted;
   }
 }

@@ -327,6 +327,57 @@ describe("Telegram ingress service", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("supersedes an orphaned activation before its replacement starts polling", async () => {
+    const { store } = storeFixture();
+    const firstAbort = new AbortController();
+    const replacementAbort = new AbortController();
+    let activation = 0;
+    let activePolls = 0;
+    let maximumActivePolls = 0;
+    let markFirstPollStarted: () => void = () => undefined;
+    const firstPollStarted = new Promise<void>((resolve) => {
+      markFirstPollStarted = resolve;
+    });
+    const client = vi.fn(() => {
+      activation += 1;
+      const currentActivation = activation;
+      return {
+        getMe: vi.fn(async () => ({ id: 123, username: "bot" })),
+        getUpdates: vi.fn(async (_offset: number, _timeoutSeconds: number, signal: AbortSignal) => {
+          activePolls += 1;
+          maximumActivePolls = Math.max(maximumActivePolls, activePolls);
+          if (currentActivation === 1) {
+            markFirstPollStarted();
+            await new Promise<void>((_resolve, reject) => {
+              signal.addEventListener("abort", () => {
+                activePolls -= 1;
+                reject(signal.reason);
+              }, { once: true });
+            });
+            return [];
+          }
+          firstAbort.abort();
+          replacementAbort.abort();
+          activePolls -= 1;
+          return [];
+        }),
+      };
+    }) as TelegramServiceDeps["client"];
+    const deps = serviceDeps(
+      store,
+      client,
+      { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
+      () => ({ ok: true, value: { botToken: "123:secret" } }),
+    );
+
+    const first = runTelegramService(deps, firstAbort.signal);
+    await firstPollStarted;
+    const replacement = runTelegramService(deps, replacementAbort.signal);
+    await Promise.all([first, replacement]);
+
+    expect(maximumActivePolls).toBe(1);
+  });
+
   it("binds identity once per token and keeps polling through a transient conflict", async () => {
     const { store } = storeFixture();
     const abort = new AbortController();
@@ -359,7 +410,7 @@ describe("Telegram ingress service", () => {
     const abort = new AbortController();
     const client = realClientFactory([
       { ok: true, result: { id: 123, username: "bot" } },
-      ...Array.from({ length: 12 }, () => ({ ok: false, error_code: 409, description: "Conflict" })),
+      ...Array.from({ length: 12 }, () => ({ ok: false as const, error_code: 409, description: "Conflict" })),
     ]);
 
     const promise = runTelegramService(
