@@ -2072,6 +2072,345 @@ describe("bounded text heuristics", () => {
   });
 });
 
+type OwnerCommunicationIncidentExpectation =
+  | "accepted"
+  | "proof_incompatible"
+  | "owner_boundary_missing";
+
+const OWNER_COMMUNICATION_INCIDENT_REVISIONS: readonly Readonly<{
+  revision: number;
+  expected: OwnerCommunicationIncidentExpectation;
+  candidate: ControllerFinalization;
+}>[] = [
+  {
+    revision: 1,
+    expected: "proof_incompatible",
+    candidate: {
+      disposition: "needs_owner",
+      obligationRefs: [],
+      segments: [
+        {
+          evidenceRefs: ["evidence:2445"],
+          kind: "observed_state",
+          outcome: "observed",
+          subjectRef: "thread:thr_wybgegrdxt",
+          text: "The Hanoon thread is idle. Its closing message says the reload-identity fix is verified with 3,737 tests passing and is held on its own branch, not merged into the live worktree, and that the hung-call fix is still building.",
+          type: "claim",
+        },
+        {
+          text: "It stopped short of merging for a good reason: the plugin runs straight from that live worktree, so merging would put the change live at the next restart, including a watchdog one at 3am. That is a promotion, not a merge, and it is yours.",
+          type: "text",
+        },
+        {
+          text: "So the reload fix is finished and parked, waiting only on you. Say go and I put it through the guarded job so you get the one-use tap. The hung-call fix is still the last piece before the pair comes to you together, if you would rather wait and do one approval.",
+          type: "text",
+        },
+        { text: "Nothing else needs you tonight.", type: "text" },
+      ],
+    },
+  },
+  {
+    revision: 2,
+    expected: "proof_incompatible",
+    candidate: {
+      disposition: "needs_owner",
+      obligationRefs: [],
+      segments: [
+        {
+          evidenceRefs: ["evidence:2445"],
+          kind: "observed_state",
+          outcome: "observed",
+          subjectRef: "thread:thr_wybgegrdxt",
+          text: "The Hanoon thread is idle, and its latest message says the reload fix is kept on its own branch rather than merged into the live worktree, while the hung-call fix is still building.",
+          type: "claim",
+        },
+        {
+          text: "It reports that fix as verified with its full suite passing, and it stopped short of merging for a good reason: the plugin runs straight from that live worktree, so merging would put the change live at the next restart, including a watchdog one at 3am. That is a promotion, not a merge, and it is yours.",
+          type: "text",
+        },
+        {
+          text: "So the reload fix is finished and parked, waiting only on you. Say go and I put it through the guarded job so you get the one-use tap. Or wait for the hung-call fix and approve both in one go.",
+          type: "text",
+        },
+        { text: "Nothing else needs you tonight.", type: "text" },
+      ],
+    },
+  },
+  {
+    revision: 3,
+    expected: "owner_boundary_missing",
+    candidate: {
+      disposition: "needs_owner",
+      obligationRefs: [],
+      segments: [
+        {
+          evidenceRefs: ["evidence:2445"],
+          kind: "observed_state",
+          outcome: "observed",
+          subjectRef: "thread:thr_wybgegrdxt",
+          text: "The Hanoon thread is idle, and its latest message says the reload work sits on its own branch rather than the live worktree, and that the hung-call fix is still building.",
+          type: "claim",
+        },
+        {
+          text: "It is holding that branch back on purpose. The plugin runs straight from the live worktree, so merging there would put the change live at the next restart, including a watchdog one at 3am. That makes it a promotion, and promotion is yours.",
+          type: "text",
+        },
+        {
+          text: "So nothing goes live without your tap. Do you want the reload branch put through the guarded job now, or held until the hung-call work is ready so you approve both at once?",
+          type: "text",
+        },
+        { text: "Nothing else needs you tonight.", type: "text" },
+      ],
+    },
+  },
+  {
+    revision: 4,
+    expected: "owner_boundary_missing",
+    candidate: {
+      disposition: "needs_owner",
+      obligationRefs: [],
+      segments: [
+        {
+          evidenceRefs: ["evidence:2445"],
+          kind: "observed_state",
+          outcome: "observed",
+          subjectRef: "thread:thr_wybgegrdxt",
+          text: "The Hanoon thread is idle.",
+          type: "claim",
+        },
+        {
+          text: "It signed off by asking for one thing from you: nothing it built goes into the live worktree until you approve promotion. Its reasoning is that the plugin runs straight from that worktree, so a merge there would go live at the next restart, including a watchdog one at 3am.",
+          type: "text",
+        },
+        {
+          text: "By its own account the hung-call fix is still building, so the reload branch is the only thing parked and waiting on you.",
+          type: "text",
+        },
+        {
+          text: "Do you want it put through the guarded job now, or held until the hung-call work is there so you approve both at once? Nothing else needs you tonight.",
+          type: "text",
+        },
+      ],
+    },
+  },
+  {
+    revision: 5,
+    expected: "accepted",
+    candidate: {
+      disposition: "answered",
+      obligationRefs: [],
+      segments: [
+        {
+          evidenceRefs: ["evidence:2445"],
+          kind: "observed_state",
+          outcome: "observed",
+          subjectRef: "thread:thr_wybgegrdxt",
+          text: "The Hanoon thread is idle.",
+          type: "claim",
+        },
+        {
+          text: "It signed off by asking for one thing from you: nothing it built goes into the live worktree until you approve promotion. Its reasoning is that the plugin runs straight from that worktree, so a merge there would go live at the next restart, including a watchdog one at 3am.",
+          type: "text",
+        },
+        {
+          text: "By its own account the hung-call fix is still building, so the reload branch is the only thing parked and waiting on you.",
+          type: "text",
+        },
+        {
+          text: "Do you want it put through the guarded job now, or held until the hung-call work is there so you approve both at once? Nothing else needs you tonight.",
+          type: "text",
+        },
+      ],
+    },
+  },
+  {
+    revision: 6,
+    expected: "accepted",
+    candidate: {
+      disposition: "answered",
+      obligationRefs: [],
+      segments: [
+        {
+          evidenceRefs: ["evidence:2445"],
+          kind: "observed_state",
+          outcome: "observed",
+          subjectRef: "thread:thr_wybgegrdxt",
+          text: "The Hanoon thread is idle.",
+          type: "claim",
+        },
+        {
+          text: "It signed off with one request for you: nothing from it goes into the live worktree without your approval. The plugin runs straight from that worktree, so anything merged there takes effect at the next restart, including a watchdog one at 3am.",
+          type: "text",
+        },
+        {
+          text: "So what is waiting on you is a promotion decision, not code. Want me to put it through the guarded job so you get the tap, or hold it for now? Nothing else needs you tonight.",
+          type: "text",
+        },
+      ],
+    },
+  },
+];
+
+describe("owner communication production incident", () => {
+  const incidentContext = contextWithEvidence(
+    evidenceRow("evidence:2445", "thread_state", "observed", "thread:thr_wybgegrdxt"),
+  );
+
+  it.each(OWNER_COMMUNICATION_INCIDENT_REVISIONS)(
+    "classifies incident revision $revision without suppressing useful reporting",
+    ({ candidate, expected }) => {
+      const validation = validateControllerFinalization(candidate, incidentContext);
+      if (expected === "accepted") {
+        expect(validation).toMatchObject({ outcome: "accepted" });
+        return;
+      }
+      expect(validation).toMatchObject({ outcome: "rejected", code: expected });
+      if (validation.outcome !== "rejected") throw new Error("expected rejection");
+      if (expected === "proof_incompatible") {
+        expect(validation.correction).toContain("kind observed_state");
+        expect(validation.correction).toContain("outcome observed");
+        expect(validation.correction).toContain("Confidence: medium");
+        expect(validation.correction).toContain("source subjectRef/evidenceRefs");
+        expect(validation.correction).toMatch(/answered.*offer/i);
+      } else {
+        expect(validation.correction).toMatch(/answered.*conditional offer/i);
+        expect(validation.correction).toMatch(/needs_owner.*active/i);
+      }
+    },
+  );
+
+  it("delivers a source-attributed result with durable source evidence and explicit confidence", () => {
+    const candidate = claimFinalization({
+      kind: "observed_state",
+      outcome: "observed",
+      subjectRef: "thread:thr_wybgegrdxt",
+      evidenceRefs: ["evidence:2445"],
+      text: "The thread reports that its suite passed. Confidence: medium.",
+    });
+
+    expect(validateControllerFinalization(candidate, incidentContext)).toMatchObject({
+      outcome: "accepted",
+      renderedMessage: "The thread reports that its suite passed. Confidence: medium.",
+    });
+  });
+
+  it("does not let source-attribution wording replace an explicit confidence", () => {
+    const candidate = claimFinalization({
+      kind: "observed_state",
+      outcome: "observed",
+      subjectRef: "thread:thr_wybgegrdxt",
+      evidenceRefs: ["evidence:2445"],
+      text: "The thread reports that its suite passed.",
+    });
+
+    expectRejection(candidate, incidentContext, "proof_incompatible");
+  });
+
+  it("requires a source-attributed result to use an observed-state claim", () => {
+    const candidate = claimFinalization({
+      kind: "workspace_change",
+      outcome: "observed",
+      subjectRef: "thread:thr_wybgegrdxt",
+      evidenceRefs: ["evidence:2446"],
+      text: "The thread reports that its suite passed. Confidence: medium.",
+    });
+    const workspaceContext = contextWithEvidence(
+      evidenceRow("evidence:2446", "workspace_change", "observed", "thread:thr_wybgegrdxt"),
+    );
+
+    expectRejection(candidate, workspaceContext, "proof_incompatible");
+  });
+
+  it.each([
+    "Tests passed. Confidence: medium.",
+    "The thread reports that tests passed. I fixed the bug. Confidence: medium.",
+    "The thread reports that tests passed and I fixed the bug. Confidence: medium.",
+    "The thread reports that tests passed, I fixed the bug. Confidence: medium.",
+  ])("does not let attribution confidence shield a direct success assertion: %s", (text) => {
+    expectRejection(
+      claimFinalization({
+        kind: "observed_state",
+        outcome: "observed",
+        subjectRef: "thread:thr_wybgegrdxt",
+        evidenceRefs: ["evidence:2445"],
+        text,
+      }),
+      incidentContext,
+      "proof_incompatible",
+    );
+  });
+
+  it("requires attributed success to retain its durable claim source", () => {
+    expectRejection(
+      textFinalization("The thread reports that its suite passed. Confidence: medium."),
+      incidentContext,
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it("still refuses a fabricated success claim without same-turn durable evidence", () => {
+    expectRejection(
+      textFinalization("I implemented the fix and all tests pass."),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it.each([
+    "Everything I fixed remains on my branch.",
+    "Something I merged remains in the worktree.",
+    "What I implemented stays in this checkout.",
+  ])("does not misread a first-person completed action as a topic modifier: %s", (text) => {
+    expectRejection(
+      textFinalization(text),
+      emptyFinalizationContext(),
+      "high_impact_text_unclaimed",
+    );
+  });
+
+  it("keeps a guarded promotion offer distinct from a completed action", () => {
+    expect(validateControllerFinalization(
+      textFinalization("I can put the branch through the guarded promotion job if you approve."),
+      emptyFinalizationContext(),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("allows merge and promotion topics without inferring that either happened", () => {
+    expect(validateControllerFinalization(
+      textFinalization(
+        "The live worktree is the promotion target; anything merged there takes effect on restart.",
+      ),
+      emptyFinalizationContext(),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("provides one-revision shapes that the incident corrections accept", () => {
+    const attributedReport: ControllerFinalization = {
+      disposition: "answered",
+      obligationRefs: [],
+      segments: [
+        claimFinalization({
+          kind: "observed_state",
+          outcome: "observed",
+          subjectRef: "thread:thr_wybgegrdxt",
+          evidenceRefs: ["evidence:2445"],
+          text: "The thread reports the reload fix verified on its branch with 3,737 tests passing, while the hung-call fix is still building. Confidence: medium.",
+        }).segments[0]!,
+        { type: "text", text: " I can put the branch through the guarded promotion job if you approve." },
+      ],
+    };
+    const answeredOffer: ControllerFinalization = {
+      ...OWNER_COMMUNICATION_INCIDENT_REVISIONS[3]!.candidate,
+      disposition: "answered",
+    };
+
+    expect(validateControllerFinalization(attributedReport, incidentContext))
+      .toMatchObject({ outcome: "accepted" });
+    expect(validateControllerFinalization(answeredOffer, incidentContext))
+      .toMatchObject({ outcome: "accepted" });
+  });
+});
+
 describe("fixed corrections", () => {
   it("returns bounded code-specific corrections without interpolating candidate or evidence strings", () => {
     const missingRefCandidate = claimFinalization({
