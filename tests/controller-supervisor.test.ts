@@ -535,7 +535,13 @@ it("degrades a turn whose evidence budget is spent instead of retiring it", asyn
   let seq = 1;
   const adapter = serviceAdapter(() => observation({ latestSeq: (seq += 1) }), () => "active");
   const spentProjector = {
-    reconcile: vi.fn(async () => ({ outcome: "limit_exceeded" as const })),
+    reconcile: vi.fn(async () => ({
+      outcome: "limit_exceeded" as const,
+      reconciliationIncomplete: null,
+      fromSeq: 0,
+      throughSeq: 0,
+      targetSeq: null,
+    })),
   };
   const service = new LunaControllerService({
     store,

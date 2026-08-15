@@ -3216,6 +3216,16 @@ export interface TelegramAgentStore {
     now: number;
     dedupMs: number;
   }): boolean;
+  /**
+   * True the first time a housekeeping notice is claimed inside its window.
+   * The agent's own upkeep speaks once and then stays quiet.
+   */
+  claimHousekeepingNotice(input: {
+    key: string;
+    detail: string;
+    now: number;
+    dedupMs: number;
+  }): boolean;
   pauseProjectAdmission(input: {
     projectId: string;
     reason: string;
@@ -8646,6 +8656,29 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `INSERT INTO failure_escalations (fingerprint, project_id, cluster_size, reason, escalated_at, expires_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
       ).run(input.fingerprint, input.projectId, input.clusterSize, reason, input.now, input.now + input.dedupMs);
+      return true;
+    })();
+  }
+
+  public claimHousekeepingNotice(input: {
+    key: string;
+    detail: string;
+    now: number;
+    dedupMs: number;
+  }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    assertNonNegativeInteger(input.dedupMs, "dedupMs");
+    const key = assertMemoryText(input.key, 120, "housekeeping notice key");
+    const detail = assertMemoryText(input.detail || "-", 500, "housekeeping notice detail");
+    return this.db.transaction((): boolean => {
+      this.db.prepare("DELETE FROM housekeeping_notices WHERE expires_at <= ?").run(input.now);
+      if (this.db.prepare("SELECT notice_key FROM housekeeping_notices WHERE notice_key = ?").get(key)) {
+        return false;
+      }
+      this.db.prepare(
+        `INSERT INTO housekeeping_notices (notice_key, detail, claimed_at, expires_at)
+         VALUES (?, ?, ?, ?)`,
+      ).run(key, detail, input.now, input.now + input.dedupMs);
       return true;
     })();
   }

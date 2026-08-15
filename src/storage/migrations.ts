@@ -2002,6 +2002,18 @@ CREATE INDEX controller_supervisor_steer_attempts_pending
   ON controller_supervisor_steer_attempts(turn_id, state);
 `] as const;
 
+// Upkeep the agent does for itself has to be able to say something once and
+// then stay quiet. A notice claimed here is a notice already given, until its
+// window expires.
+export const HOUSEKEEPING_NOTICE_MIGRATIONS = [String.raw`
+CREATE TABLE housekeeping_notices (
+  notice_key TEXT PRIMARY KEY,
+  detail TEXT NOT NULL,
+  claimed_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2060,4 +2072,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_DELIVERY_STATE_MIGRATIONS,
   ...CONTROLLER_THREAD_ASK_MIGRATIONS,
   ...CONTROLLER_EVIDENCE_STEER_MIGRATIONS,
+  ...HOUSEKEEPING_NOTICE_MIGRATIONS,
 ] as const;
