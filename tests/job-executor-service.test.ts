@@ -1417,6 +1417,179 @@ describe("singleton job executor", () => {
     });
   });
 
+  it("coalesces repeated controller phase edits before they reach Telegram", async () => {
+    const { store } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 501 }));
+    const editMessage = vi.fn(async () => undefined);
+    let loop = 0;
+    let executorFence: { ownerId: string; generation: number } | null = null;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (executorFence && (loop === 1 || loop === 2)) {
+        expect(store.updateControllerStream({
+          ownerId: executorFence.ownerId,
+          generation: executorFence.generation,
+          now: 1_000 + loop * 1_000,
+          turnId,
+          cursor: loop,
+          phase: "responding",
+        })).toBe(true);
+      }
+      if (loop === 3) abort.abort();
+    });
+    const reconcile = vi.fn(async (fence: Parameters<NonNullable<JobExecutorDependencies["controller"]>["reconcile"]>[0]) => {
+      executorFence = fence;
+      return true;
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage }),
+      controller: {
+        reconcile,
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    expect(waitForWork).toHaveBeenCalledTimes(3);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(editMessage).toHaveBeenCalledOnce();
+    expect(editMessage).toHaveBeenCalledWith("7", 501, {
+      text: CONTROLLER_PHASE_TEXT.responding,
+      disable_web_page_preview: true,
+    });
+  });
+
+  it("does not let a slow stream edit hold back the terminal reply", async () => {
+    const { store } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    let nextMessageId = 500;
+    const sendMessage = vi.fn(async () => ({ message_id: ++nextMessageId }));
+    let resolveEdit!: () => void;
+    const editMessage = vi.fn(() => new Promise<void>((resolve) => {
+      resolveEdit = resolve;
+    }));
+    let loop = 0;
+    let executorFence: { ownerId: string; generation: number } | null = null;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (loop === 1 && executorFence) {
+        expect(store.updateControllerStream({
+          ownerId: executorFence.ownerId,
+          generation: executorFence.generation,
+          now: 2_000,
+          turnId,
+          cursor: 1,
+          phase: "responding",
+        })).toBe(true);
+      }
+      if (loop === 3) abort.abort();
+    });
+    const reconcile = vi.fn(async (fence: Parameters<NonNullable<JobExecutorDependencies["controller"]>["reconcile"]>[0]) => {
+      executorFence = fence;
+      if (loop === 2) {
+        completeTurnThroughFinalization(store, {
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: 3_000,
+        }, { turnId, controllerKey: "executor-presence-controller", responseText: "Final answer" });
+      }
+      return true;
+    });
+
+    const run = runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage }),
+      controller: {
+        reconcile,
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    try {
+      const completed = await Promise.race([
+        run.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+      ]);
+      expect(completed).toBe(true);
+      expect(sendMessage).toHaveBeenCalledWith("7", {
+        text: "Final answer",
+        disable_web_page_preview: true,
+      });
+    } finally {
+      resolveEdit();
+      await run;
+    }
+  });
+
+  it("keeps delivering a reply when Telegram presence fails", async () => {
+    const { store } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    let nextMessageId = 500;
+    const sendMessage = vi.fn(async () => ({ message_id: ++nextMessageId }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendChatAction = vi.fn(async () => {
+      throw new Error("typing unavailable");
+    });
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: { sendChatAction },
+      warn: vi.fn(),
+    });
+    let loop = 0;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (loop === 3) abort.abort();
+    });
+    const reconcile = vi.fn(async (fence: Parameters<NonNullable<JobExecutorDependencies["controller"]>["reconcile"]>[0]) => {
+      if (loop === 1) {
+        completeTurnThroughFinalization(store, {
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: 2_000,
+        }, { turnId, controllerKey: "executor-presence-controller", responseText: "Final answer" });
+      }
+      return true;
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage }),
+      presence,
+      controller: {
+        reconcile,
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    expect(sendChatAction).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledWith("7", {
+      text: CONTROLLER_PHASE_TEXT.connecting,
+      disable_web_page_preview: true,
+    });
+    expect(editMessage).toHaveBeenCalledWith("7", 501, {
+      text: "Final answer",
+      disable_web_page_preview: true,
+    });
+  });
+
   it("derives an ephemeral draft from the phase, never a legacy raw stream_text token", async () => {
     const { store, db } = fixture();
     const turnId = addSubmittedControllerTurn(store);

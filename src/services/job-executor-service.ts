@@ -5,7 +5,7 @@ import { AutonomyScheduler } from "../autonomy/scheduler";
 import { MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "../autonomy/models";
 import { redactError } from "../errors";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
-import { classifyTelegramError } from "../telegram/errors";
+import { classifyTelegramError, TelegramApiError } from "../telegram/errors";
 import { JobLaneRunner, type JobLaneKind, type JobLaneSnapshotProvider } from "./job-lane-runner";
 import {
   projectUnknownWorker,
@@ -197,6 +197,14 @@ type PipelineDispatchState = {
   cursorJobId: string | null;
   laneLimit: number;
 };
+
+type ControllerStreamDelivery = Readonly<{
+  outbox: StoredOutbox;
+  telegram: JobExecutorTelegram;
+  text: string;
+  payload: Record<string, unknown>;
+  messageId: number | null;
+}>;
 
 function validConfiguredCap(rawCap: number | null | undefined): MaxConcurrentJobs | null {
   if (typeof rawCap !== "number" || !Number.isSafeInteger(rawCap) || rawCap < 1 || rawCap > MAX_CONCURRENT_JOBS) return null;
@@ -440,6 +448,19 @@ function controllerDeliveryPayload(
   };
 }
 
+function controllerStreamRetryAt(error: unknown, now: number): number | null {
+  if (
+    !(error instanceof TelegramApiError) ||
+    error.errorCode !== 429 ||
+    error.retryAfterSeconds === null ||
+    !Number.isFinite(error.retryAfterSeconds) ||
+    error.retryAfterSeconds < 0
+  ) return null;
+  const delay = Math.ceil(error.retryAfterSeconds * 1_000);
+  if (!Number.isFinite(delay)) return Number.MAX_SAFE_INTEGER;
+  return Math.min(Number.MAX_SAFE_INTEGER, now + delay + 1_000);
+}
+
 async function abortableHeartbeat(
   store: TelegramAgentStore,
   ownerId: string,
@@ -510,6 +531,10 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
     const laneOperations = new Map<string, LaneOperationRecord>();
     const adoptedJobIds = new Set<string>();
     const nextWorkerReconcileAt = new Map<string, number>();
+    const controllerStreamInFlight = new Map<string, Promise<void>>();
+    const controllerStreamLastText = new Map<string, string>();
+    const controllerStreamMessageIds = new Map<string, number>();
+    const controllerStreamBackoffUntil = new Map<string, number>();
     const hasCurrentAdoptedClaims = (jobId: string, now: number): boolean => {
       const claims = deps.store.listCurrentHeldResourceClaims(jobId, 100);
       return claims.length > 0 && claims.every((claim) =>
@@ -523,6 +548,102 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       laneOperations.clear();
     };
     workAbort.signal.addEventListener("abort", onWorkAbort, { once: true });
+    const settleControllerStream = (
+      outbox: StoredOutbox,
+      text: string,
+      messageId: number | null,
+      error?: unknown,
+    ): void => {
+      try {
+        const now = deps.clock.now();
+        assertNow(now);
+        const retryAt = controllerStreamRetryAt(error, now);
+        if (retryAt !== null) {
+          controllerStreamBackoffUntil.set(
+            outbox.logicalKey,
+            Math.max(controllerStreamBackoffUntil.get(outbox.logicalKey) ?? 0, retryAt),
+          );
+        } else if (error === undefined) {
+          controllerStreamBackoffUntil.delete(outbox.logicalKey);
+        }
+        const current = deps.store.getOutbox(outbox.logicalKey);
+        if (!current) return;
+        if (current.status === "leased" && payloadText(current) !== text) {
+          deps.store.failOutbox(
+            outbox.logicalKey,
+            ownerId,
+            lease.generation,
+            "controller stream update superseded",
+            retryAt ?? now,
+            now,
+          );
+        } else if (current.status === "leased" && retryAt !== null) {
+          deps.store.failOutbox(
+            outbox.logicalKey,
+            ownerId,
+            lease.generation,
+            safeFailure(error),
+            retryAt,
+            now,
+          );
+        } else if (current.status === "leased" && payloadText(current) === text) {
+          // A cosmetic failure other than a server-directed rate limit is
+          // dropped. The reply path must not inherit preview delivery errors.
+          deps.store.completeOutbox(outbox.logicalKey, ownerId, lease.generation, messageId, now);
+        }
+      } catch {
+        // A stream update is cosmetic and must fail open, including when its
+        // lease has already moved on to the terminal reply.
+      }
+      try {
+        deps.onWorkAvailable?.();
+      } catch {
+        // Wake-up hooks are cosmetic from the stream's point of view too.
+      }
+    };
+    const startControllerStream = (delivery: ControllerStreamDelivery): void => {
+      const streamRequest = (async (): Promise<void> => {
+        let deliveredMessageId = delivery.messageId;
+        try {
+          if (delivery.messageId === null && delivery.telegram.sendMessageDraft) {
+            // The draft is an ephemeral phase indicator, not the durable
+            // answer. It must never hold the executor while Telegram is slow.
+            await delivery.telegram.sendMessageDraft(
+              delivery.outbox.chatId,
+              stableChatDraftId(delivery.outbox.chatId),
+              delivery.text,
+            );
+          } else if (delivery.messageId !== null) {
+            await delivery.telegram.editMessage(delivery.outbox.chatId, delivery.messageId, delivery.payload);
+          } else {
+            deliveredMessageId = (await delivery.telegram.sendMessage(
+              delivery.outbox.chatId,
+              delivery.payload,
+            )).message_id;
+          }
+          if (deliveredMessageId !== null) {
+            controllerStreamMessageIds.set(delivery.outbox.logicalKey, deliveredMessageId);
+          }
+          controllerStreamLastText.set(delivery.outbox.logicalKey, delivery.text);
+          settleControllerStream(delivery.outbox, delivery.text, deliveredMessageId);
+        } catch (error) {
+          settleControllerStream(delivery.outbox, delivery.text, deliveredMessageId, error);
+        }
+      })();
+      controllerStreamInFlight.set(delivery.outbox.logicalKey, streamRequest);
+      void streamRequest.then(
+        () => {
+          if (controllerStreamInFlight.get(delivery.outbox.logicalKey) === streamRequest) {
+            controllerStreamInFlight.delete(delivery.outbox.logicalKey);
+          }
+        },
+        () => {
+          if (controllerStreamInFlight.get(delivery.outbox.logicalKey) === streamRequest) {
+            controllerStreamInFlight.delete(delivery.outbox.logicalKey);
+          }
+        },
+      );
+    };
     const heartbeat = abortableHeartbeat(
       deps.store,
       ownerId,
@@ -889,6 +1010,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             const terminalControllerDraft = turnId !== null &&
               controllerTurn?.state === "submitted" &&
               (controllerTurn.streamPhase === "complete" || controllerTurn.streamPhase === "failed");
+            const controllerStreamText = turnId !== null &&
+              controllerTurn?.state === "submitted" &&
+              !terminalControllerDraft
+              ? CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase]
+              : null;
             if (terminalControllerDraft) {
               // Suppress terminal placeholders before choosing draft, edit, or
               // ordinary-send transport. A pre-cutover row can already carry a
@@ -896,6 +1022,45 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               // neither case may turn stale stream payload into owner-visible
               // text beside the real terminal writer's message.
               deliveredMessageId = knownMessageId;
+            } else if (controllerStreamText !== null) {
+              const streamMessageId = knownMessageId ?? controllerStreamMessageIds.get(item.logicalKey) ?? null;
+              if (controllerStreamLastText.get(item.logicalKey) === controllerStreamText) {
+                settleControllerStream(item, controllerStreamText, streamMessageId);
+                continue;
+              }
+              if (controllerStreamInFlight.has(item.logicalKey)) {
+                // Leave the newest durable row leased until the earlier
+                // cosmetic request settles; its completion handler will
+                // requeue it if the phase changed in the meantime.
+                continue;
+              }
+              const now = deps.clock.now();
+              assertNow(now);
+              const backoffUntil = controllerStreamBackoffUntil.get(item.logicalKey) ?? 0;
+              if (backoffUntil > now) {
+                try {
+                  deps.store.failOutbox(
+                    item.logicalKey,
+                    ownerId,
+                    lease.generation,
+                    "controller stream rate limit",
+                    backoffUntil,
+                    now,
+                  );
+                } catch {
+                  // A cosmetic backoff must not affect the real reply path.
+                }
+                continue;
+              }
+              controllerStreamBackoffUntil.delete(item.logicalKey);
+              startControllerStream({
+                outbox: item,
+                telegram,
+                text: controllerStreamText,
+                payload: deliveryPayload,
+                messageId: streamMessageId,
+              });
+              continue;
             } else if (callback && telegram.answerCallback) {
               await telegram.answerCallback(callback, payloadText(item));
             } else if (
@@ -1049,15 +1214,19 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           continueAcquiring = true;
           break;
         }
-        let presenceWaitMs: number | null;
+        let presenceWaitMs: number | null = null;
         try {
           presenceWaitMs = deps.presence
             ? await deps.presence.pulse(deps.clock.now(), workAbort.signal)
             : null;
-        } catch (error) {
-          if (!workAbort.signal.aborted) throw error;
+        } catch {
+          if (!workAbort.signal.aborted) {
+            // Presence is cosmetic. A coordinator or transport regression
+            // must not prevent the executor from delivering real messages.
+            presenceWaitMs = null;
+          }
           if (leaseLost) continueAcquiring = true;
-          break;
+          if (workAbort.signal.aborted) break;
         }
         const ordinaryWaitMs = deps.controller?.isStreaming?.()
           ? STREAM_POLL_MS

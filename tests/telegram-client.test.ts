@@ -157,6 +157,50 @@ describe("Telegram Bot API client", () => {
     expect(JSON.stringify(fetchMock.calls)).not.toContain("123:secret");
   });
 
+  it("does not abort a retry_after delay at the ordinary request timeout", async () => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("The operation timed out", "TimeoutError")), milliseconds);
+      return controller.signal;
+    });
+    try {
+      let markSleepStarted: (() => void) | undefined;
+      const sleepStarted = new Promise<void>((resolve) => {
+        markSleepStarted = resolve;
+      });
+      const sleep = vi.fn((milliseconds: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, milliseconds);
+        const onAbort = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+          reject(signal.reason ?? new Error("retry was aborted"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        markSleepStarted?.();
+      }));
+      const fetchMock = telegramFetch([
+        { ok: false, error_code: 429, description: "slow", parameters: { retry_after: 22 } },
+        { ok: true, result: { message_id: 10 } },
+      ]);
+      const client = new TelegramClient("token", fetchMock, { sleep });
+      const pending = client.sendMessage("1", { text: "hello" });
+
+      await sleepStarted;
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(fetchMock.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(7_000);
+      await expect(pending).resolves.toMatchObject({ message_id: 10 });
+      expect(sleep).toHaveBeenCalledWith(22_000, expect.any(AbortSignal));
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("allows three transient retries after the initial request", async () => {
     immediateSleep.mockClear();
     const fetchMock = telegramFetch([

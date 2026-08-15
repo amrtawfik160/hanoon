@@ -89,7 +89,7 @@ function isApiEnvelope(candidate: unknown): candidate is ApiEnvelope {
 function retryDelay(failure: ApiFailure, retryIndex: number): number {
   const retryAfterSeconds = failure.parameters?.retry_after;
   if (typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
-    return Math.min(Math.ceil(retryAfterSeconds * 1_000), MAX_RETRY_DELAY_MS);
+    return Math.ceil(retryAfterSeconds * 1_000);
   }
   return Math.min(RETRY_BASE_DELAY_MS * 2 ** retryIndex, MAX_RETRY_DELAY_MS);
 }
@@ -407,7 +407,11 @@ export class TelegramClient {
     failure: ApiFailure,
     retryIndex: number,
   ): Promise<void> {
-    const retrySignal = composeRequestSignal(request.callerSignal, request.timeoutMs);
+    // The ordinary request timeout applies to one HTTP attempt, not to the
+    // server-directed quiet period between attempts. A 429 retry_after can be
+    // longer than that timeout, so only an explicit caller signal may cancel
+    // this wait.
+    const retrySignal = request.callerSignal ?? new AbortController().signal;
     try {
       await this.sleep(retryDelay(failure, retryIndex), retrySignal);
     } catch {

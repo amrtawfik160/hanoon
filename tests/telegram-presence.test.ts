@@ -199,4 +199,33 @@ describe("Telegram presence heartbeat", () => {
 
     await expect(coordinator.pulse(1_000, AbortSignal.timeout(1_000))).resolves.toBe(11_000);
   });
+
+  it("returns without waiting for a slow cosmetic typing request", async () => {
+    const active = controllerFixture();
+    expect(active.store.claimNextControllerTurn(active.fence)).toMatchObject({ state: "dispatching" });
+    let resolveTyping!: () => void;
+    const typing = new Promise<void>((resolve) => {
+      resolveTyping = resolve;
+    });
+    const sendChatAction = vi.fn(() => typing);
+    const coordinator = new TelegramPresenceCoordinator({
+      store: active.store,
+      telegram: { sendChatAction },
+      warn: vi.fn(),
+    });
+    const pulse = coordinator.pulse(1_000, new AbortController().signal);
+
+    try {
+      await Promise.resolve();
+      const returned = await Promise.race([
+        pulse.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 0)),
+      ]);
+      expect(returned).toBe(true);
+      expect(sendChatAction).toHaveBeenCalledOnce();
+    } finally {
+      resolveTyping();
+      await pulse;
+    }
+  });
 });
