@@ -1627,12 +1627,16 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       telegramToken: () => config.ok ? config.value.botToken : undefined,
       getTelegramClient: () => {
         if (!config.ok) throw new Error(config.message);
-        const client = telegramForToken(config.value.botToken);
+        const client = new TelegramClient(config.value.botToken, fetch, { maxAttempts: 1 });
         return {
-          sendMessage: (chatId: string, payload: Record<string, unknown>) => client.sendMessage(chatId, payload as Parameters<TelegramClient["sendMessage"]>[1]),
-          sendMessageDraft: (chatId: string, draftId: number, text: string) => client.sendMessageDraft(chatId, draftId, text),
-          editMessage: (chatId: string, messageId: number, payload: Record<string, unknown>) => client.editMessage(chatId, messageId, payload as Parameters<TelegramClient["editMessage"]>[2]),
-          answerCallback: (callbackQueryId: string, text: string) => client.answerCallback(callbackQueryId, text),
+          sendMessage: (chatId: string, payload: Record<string, unknown>, signal: AbortSignal) =>
+            client.sendMessage(chatId, payload as Parameters<TelegramClient["sendMessage"]>[1], signal),
+          sendMessageDraft: (chatId: string, draftId: number, text: string, signal: AbortSignal) =>
+            client.sendMessageDraft(chatId, draftId, text, signal),
+          editMessage: (chatId: string, messageId: number, payload: Record<string, unknown>, signal: AbortSignal) =>
+            client.editMessage(chatId, messageId, payload as Parameters<TelegramClient["editMessage"]>[2], signal),
+          answerCallback: (callbackQueryId: string, text: string, signal: AbortSignal) =>
+            client.answerCallback(callbackQueryId, text, signal),
         };
       },
       releaseOnShutdown: true,

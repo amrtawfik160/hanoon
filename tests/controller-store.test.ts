@@ -1010,6 +1010,7 @@ it.each([
   ["provider_rejected", /provider settings/i],
   ["recovery_exhausted", /after recovery/i],
   ["owner_message_delivery_uncertain", /preserved.*message/i],
+  ["owner_message_delivery_exhausted", /couldn't confirm.*previous message.*missing or duplicated/i],
 ] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
   const { store } = fixture();
   const { turn, fence } = submittedTurn(store, `thr_failure_code_${failureCode}`);

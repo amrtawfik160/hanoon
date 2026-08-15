@@ -400,7 +400,8 @@ export type ControllerFailureCode =
   | "oauth_expired"
   | "provider_rejected"
   | "recovery_exhausted"
-  | "owner_message_delivery_uncertain";
+  | "owner_message_delivery_uncertain"
+  | "owner_message_delivery_exhausted";
 
 export type ControllerGeneration = {
   id: string;
@@ -583,6 +584,16 @@ export type ExecutorFence = Readonly<{
   ownerId: string;
   generation: number;
   now: number;
+}>;
+
+export type OutboxDeliveryFailureNoticeInput = ExecutorFence & Readonly<{
+  logicalKey: string;
+  error: string;
+}>;
+
+export type OutboxLeaseRenewalInput = ExecutorFence & Readonly<{
+  logicalKey: string;
+  leaseMs: number;
 }>;
 
 export type ExecutorEventInput = ExecutorFence & Readonly<{
@@ -3432,6 +3443,7 @@ export interface TelegramAgentStore {
   beginDraining(input: ExecutorFence & Readonly<{ jobId: string }>): Job | null;
   finalizeRelease(input: ExecutorFence & Readonly<{ jobId: string }>): ReleaseResult | null;
   leaseOutbox(ownerId: string, generation: number, now: number, limit: number, leaseMs: number): StoredOutbox[];
+  renewOutboxLease(input: OutboxLeaseRenewalInput): boolean;
   completeEffect(key: string, ownerId: string, generation: number, now: number): boolean;
   completeOutbox(key: string, ownerId: string, generation: number, messageId: number | null, now: number): boolean;
   completeStatusOutbox(
@@ -3454,6 +3466,7 @@ export interface TelegramAgentStore {
   ): boolean;
   failEffect(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean;
   failOutbox(key: string, ownerId: string, generation: number, error: string, nextAttemptAt: number, now: number): boolean;
+  replaceOutboxWithDeliveryFailureNotice(input: OutboxDeliveryFailureNoticeInput): boolean;
   deadLetterEffect(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
   deadLetterOutbox(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
   getOutbox(logicalKey: string): StoredOutbox | null;
@@ -4187,6 +4200,7 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
   provider_rejected: "The controller provider rejected its current model or account configuration. Fix those provider settings before trying again.",
   recovery_exhausted: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
   owner_message_delivery_uncertain: "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
+  owner_message_delivery_exhausted: "I couldn't confirm whether my previous message reached you after repeated attempts. It may be missing or duplicated; open BB to inspect the result.",
 };
 
 function validatedThreadFollowUp(input: unknown): ThreadFollowUp {
@@ -11139,6 +11153,28 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  public renewOutboxLease(input: OutboxLeaseRenewalInput): boolean {
+    this.assertLeaseIdentity(input.logicalKey, input.ownerId, input.generation, input.now);
+    this.assertLeaseInput(input.ownerId, input.now, input.leaseMs);
+    return this.db.prepare(
+      `UPDATE outbox SET lease_expires_at = ?, updated_at = ?
+       WHERE logical_key = ? AND status = 'leased' AND lease_owner = ?
+         AND lease_generation = ? AND lease_expires_at > ?
+         AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
+           AND generation = ? AND lease_expires_at > ?)`,
+    ).run(
+      input.now + input.leaseMs,
+      input.now,
+      input.logicalKey,
+      input.ownerId,
+      input.generation,
+      input.now,
+      input.ownerId,
+      input.generation,
+      input.now,
+    ).changes === 1;
+  }
+
   public completeEffect(key: string, ownerId: string, generation: number, now: number): boolean {
     this.assertLeaseIdentity(key, ownerId, generation, now);
     const complete = this.db.transaction(() => this.db
@@ -11278,6 +11314,41 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .run(status, error, nextAttemptAt, now, key, ownerId, generation, now);
       if (updated.changes === 1 && status === "dead") this.markJobPermanentFailureFromOutbox(key, error, now);
       return updated.changes === 1;
+    }).immediate();
+  }
+
+  public replaceOutboxWithDeliveryFailureNotice(input: OutboxDeliveryFailureNoticeInput): boolean {
+    this.assertLeaseIdentity(input.logicalKey, input.ownerId, input.generation, input.now);
+    assertSafeFailureSummary(input.error);
+    assertNoRawMergeCallback(input.error, "outbox error");
+    const payloadJson = serializeBoundedJson({
+      text: CONTROLLER_FAILURE_TEXT.owner_message_delivery_exhausted,
+      disable_web_page_preview: true,
+    }, "outbox payload", MAX_MERGE_RESULT_JSON);
+    return this.db.transaction(() => {
+      const outbox = this.outboxByKey(input.logicalKey);
+      if (!outbox || !this.outboxLeaseIsActiveForRow(
+        outbox,
+        input.ownerId,
+        input.generation,
+        input.now,
+      )) return false;
+      return this.db.prepare(
+        `UPDATE outbox SET payload_json = ?, status = 'failed', attempts = 0,
+           lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL,
+           next_attempt_at = ?, last_error = ?, updated_at = ?
+         WHERE logical_key = ? AND status = 'leased' AND lease_owner = ?
+           AND lease_generation = ? AND lease_expires_at > ?`,
+      ).run(
+        payloadJson,
+        input.now,
+        input.error,
+        input.now,
+        input.logicalKey,
+        input.ownerId,
+        input.generation,
+        input.now,
+      ).changes === 1;
     }).immediate();
   }
 

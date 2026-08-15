@@ -243,7 +243,7 @@ Score each row separately. Mocked/deterministic, live provider, Telegram, and ex
 | 10 | fixed report path/digest, harness identity, budgets, denominators, outcomes, and time/token/cost availability | `<report path>`, `<sha-256>`, `<passed/denominator per scenario>` |
 | 11 | proof that merge, deploy, credential, spend, destructive action, managed publication, and privilege/default activation were **not** exercised | `<explicit not-exercised statement per item>` |
 | 12 | runtime atomic-activity, conditional-commit, and native-isolation attestations | `unavailable / disabled` unless real host evidence exists |
-| 13 | Telegram delivery ambiguity and retry status, reported separately from the one logical outbox result | `<logical key>`, `<ambiguous sends>`, `<retries>` |
+| 13 | Telegram backoff, retry, and uncertainty-report status, reported separately from the one logical outbox result | `<logical key>`, `<retry delay>`, `<exhaustion notice>` |
 
 Row 6 has no planned production fault hook for pausing exactly after tap persistence and before BB resolution, so it is **incomplete** unless a mechanically controlled window exists; the deterministic restart proof lives in `tests/controller-trust-integration.test.ts`.
 
@@ -251,7 +251,7 @@ Row 4 may use an explicitly configured disposable `auto` profile and a harmless 
 
 Row 12 is **disabled/unavailable** on the current runtime: the vendored BB thread, timeline, and interaction calls share no atomic activity revision and the commit API is unconditional. Because of that row, the overall live gate cannot be called passed.
 
-Row 13 records transport truth, not intent: Telegram delivery is at-least-once, an ambiguous send is retained as unknown, and a retry may duplicate the message. Never record an attempt or an enqueue as a delivery.
+Row 13 records transport truth, not intent: an explicit server backoff is persisted in full, a transient failure known not to have sent is retried durably, a known-message edit reconciles by stored message id, and an uncertain brand-new send retries on its existing logical row even though that may duplicate it. If uncertainty exhausts the retry budget, the row must deliver the store-mapped warning instead of disappearing silently. Never record an attempt or an enqueue as a delivery.
 
 Never exercise a live merge, deploy, credential change, spend, destructive action, ref mutation, or managed publication for this acceptance run.
 

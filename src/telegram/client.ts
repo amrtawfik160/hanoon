@@ -7,7 +7,7 @@ import {
   type SendMessagePayload,
   type TelegramUpdate,
 } from "./types";
-import { TelegramApiError } from "./errors";
+import { TelegramApiError, type TelegramDeliveryOutcome } from "./errors";
 
 export { TelegramApiError } from "./errors";
 
@@ -16,12 +16,20 @@ const MAX_LONG_POLL_TIMEOUT_SECONDS = 50;
 const MAX_ATTEMPTS = 4;
 const MAX_RETRY_DELAY_MS = 30_000;
 const RETRY_BASE_DELAY_MS = 250;
+const DEFINITELY_UNSENT_NETWORK_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
 const TELEGRAM_API_ROOT = "https://api.telegram.org/bot";
 const TELEGRAM_FILE_ROOT = "https://api.telegram.org/file/bot";
 
 type Sleep = (milliseconds: number, signal: AbortSignal) => Promise<void>;
 type TelegramFetch = typeof fetch;
-type ClientDependencies = { sleep?: Sleep };
+type ClientDependencies = { sleep?: Sleep; maxAttempts?: number };
 
 type ApiFailure = {
   ok: false;
@@ -45,6 +53,7 @@ type TelegramRequest<T> = {
 type AttemptResult = {
   envelope: ApiEnvelope;
   httpStatus: number;
+  validatedEnvelope: boolean;
   requestSignal: AbortSignal;
 };
 
@@ -56,9 +65,15 @@ export class TelegramConflictError extends TelegramApiError {
 }
 
 export class TelegramRequestError extends Error {
-  public constructor(message: "Telegram request aborted" | "Telegram request failed") {
+  public readonly deliveryOutcome: TelegramDeliveryOutcome;
+
+  public constructor(
+    message: "Telegram request aborted" | "Telegram request failed",
+    deliveryOutcome: TelegramDeliveryOutcome = "unknown",
+  ) {
     super(message);
     this.name = "TelegramRequestError";
+    this.deliveryOutcome = deliveryOutcome;
   }
 }
 
@@ -86,10 +101,24 @@ function isApiEnvelope(candidate: unknown): candidate is ApiEnvelope {
   return typeof candidate.error_code === "number" && Number.isInteger(candidate.error_code);
 }
 
+function validatedMaxAttempts(value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > MAX_ATTEMPTS) {
+    throw new TypeError("maxAttempts must be an integer from 1 to 4");
+  }
+  return value;
+}
+
+function retryAfterSeconds(failure: ApiFailure): number | null {
+  const retryAfter = failure.parameters?.retry_after;
+  return typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0
+    ? retryAfter
+    : null;
+}
+
 function retryDelay(failure: ApiFailure, retryIndex: number): number {
-  const retryAfterSeconds = failure.parameters?.retry_after;
-  if (typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
-    return Math.ceil(retryAfterSeconds * 1_000);
+  const serverDelaySeconds = retryAfterSeconds(failure);
+  if (serverDelaySeconds !== null) {
+    return Math.ceil(serverDelaySeconds * 1_000);
   }
   return Math.min(RETRY_BASE_DELAY_MS * 2 ** retryIndex, MAX_RETRY_DELAY_MS);
 }
@@ -109,9 +138,25 @@ function composeRequestSignal(callerSignal: AbortSignal | undefined, timeoutMs: 
   return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 }
 
-function safeRequestError(requestSignal: AbortSignal, callerSignal: AbortSignal | undefined): TelegramRequestError {
+function fetchFailureDeliveryOutcome(error: unknown): TelegramDeliveryOutcome {
+  if (!isRecord(error)) return "unknown";
+  const failure = isRecord(error.cause) ? error.cause : error;
+  const code = typeof failure.code === "string" ? failure.code : null;
+  if (code !== null && DEFINITELY_UNSENT_NETWORK_CODES.has(code)) return "not_sent";
+  const socket = isRecord(failure.socket) ? failure.socket : null;
+  return socket?.bytesWritten === 0 ? "not_sent" : "unknown";
+}
+
+function safeRequestError(
+  requestSignal: AbortSignal,
+  callerSignal: AbortSignal | undefined,
+  deliveryOutcome: TelegramDeliveryOutcome = "unknown",
+): TelegramRequestError {
   const aborted = callerSignal?.aborted || requestSignal.aborted;
-  return new TelegramRequestError(aborted ? "Telegram request aborted" : "Telegram request failed");
+  return new TelegramRequestError(
+    aborted ? "Telegram request aborted" : "Telegram request failed",
+    deliveryOutcome,
+  );
 }
 
 function parseUpdates(apiResult: unknown): TelegramUpdate[] {
@@ -204,6 +249,7 @@ function parseSuccessfulResult<T>(parseResult: (apiResult: unknown) => T, apiRes
 
 export class TelegramClient {
   private readonly sleep: Sleep;
+  private readonly maxAttempts: number;
 
   public constructor(
     private readonly token: string,
@@ -212,6 +258,7 @@ export class TelegramClient {
   ) {
     if (typeof token !== "string" || token.length === 0) throw new TypeError("Telegram bot token is required");
     this.sleep = dependencies.sleep ?? abortableSleep;
+    this.maxAttempts = validatedMaxAttempts(dependencies.maxAttempts ?? MAX_ATTEMPTS);
   }
 
   public getUpdates(offset: number, timeoutSeconds: number, signal: AbortSignal): Promise<TelegramUpdate[]> {
@@ -350,10 +397,7 @@ export class TelegramClient {
   }
 
   private async request<T>(request: TelegramRequest<T>): Promise<T> {
-    const maxAttempts = request.maxAttempts ?? MAX_ATTEMPTS;
-    if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > MAX_ATTEMPTS) {
-      throw new TypeError("maxAttempts must be an integer from 1 to 4");
-    }
+    const maxAttempts = validatedMaxAttempts(request.maxAttempts ?? this.maxAttempts);
     const serializedPayload = serializePayload(request.payload);
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const attemptResult = await this.performAttempt(request, serializedPayload);
@@ -367,7 +411,10 @@ export class TelegramClient {
         httpStatus: attemptResult.httpStatus,
         errorCode: attemptResult.envelope.error_code,
         description: attemptResult.envelope.description,
-        retryAfterSeconds: attemptResult.envelope.parameters?.retry_after ?? null,
+        retryAfterSeconds: retryAfterSeconds(attemptResult.envelope),
+        deliveryOutcome: !attemptResult.validatedEnvelope && attemptResult.httpStatus >= 500
+          ? "unknown"
+          : "not_sent",
         redact: [this.token],
       });
       if (attemptResult.envelope.error_code === 409) throw new TelegramConflictError({
@@ -386,7 +433,7 @@ export class TelegramClient {
 
   private async performAttempt(request: TelegramRequest<unknown>, serializedPayload: string): Promise<AttemptResult> {
     const requestSignal = composeRequestSignal(request.callerSignal, request.timeoutMs);
-    if (request.callerSignal?.aborted) throw safeRequestError(requestSignal, request.callerSignal);
+    if (request.callerSignal?.aborted) throw safeRequestError(requestSignal, request.callerSignal, "not_sent");
     let response: Response;
     try {
       response = await this.fetchFn(`${TELEGRAM_API_ROOT}${this.token}/${request.method}`, {
@@ -395,11 +442,17 @@ export class TelegramClient {
         body: serializedPayload,
         signal: requestSignal,
       });
-    } catch {
-      throw safeRequestError(requestSignal, request.callerSignal);
+    } catch (error) {
+      throw safeRequestError(requestSignal, request.callerSignal, fetchFailureDeliveryOutcome(error));
     }
     if (requestSignal.aborted) throw safeRequestError(requestSignal, request.callerSignal);
-    return { envelope: await this.readEnvelope(response), httpStatus: response.status, requestSignal };
+    const parsedResponse = await this.readEnvelope(response);
+    return {
+      envelope: parsedResponse.envelope,
+      httpStatus: response.status,
+      validatedEnvelope: parsedResponse.validated,
+      requestSignal,
+    };
   }
 
   private async waitForRetry(
@@ -419,15 +472,15 @@ export class TelegramClient {
     }
   }
 
-  private async readEnvelope(response: Response): Promise<ApiEnvelope> {
+  private async readEnvelope(response: Response): Promise<{ envelope: ApiEnvelope; validated: boolean }> {
     let responseBody: unknown;
     try {
       responseBody = await response.json();
     } catch {
-      return this.failureFromHttpStatus(response.status);
+      return { envelope: this.failureFromHttpStatus(response.status), validated: false };
     }
-    if (isApiEnvelope(responseBody)) return responseBody;
-    return this.failureFromHttpStatus(response.status);
+    if (isApiEnvelope(responseBody)) return { envelope: responseBody, validated: true };
+    return { envelope: this.failureFromHttpStatus(response.status), validated: false };
   }
 
   private failureFromHttpStatus(status: number): ApiEnvelope {
@@ -440,6 +493,6 @@ function serializePayload(payload: Record<string, unknown>): string {
   try {
     return JSON.stringify(payload);
   } catch {
-    throw new TelegramRequestError("Telegram request failed");
+    throw new TelegramRequestError("Telegram request failed", "not_sent");
   }
 }

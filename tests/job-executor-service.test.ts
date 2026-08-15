@@ -11,6 +11,7 @@ import {
   WORKER_RECONCILE_INTERVAL_MS,
   type JobExecutorDependencies,
 } from "../src/services/job-executor-service";
+import { TelegramRequestError } from "../src/telegram/client";
 import { TelegramApiError } from "../src/telegram/errors";
 import { TelegramPresenceCoordinator } from "../src/services/telegram-presence";
 import { JobLaneSnapshotProvider } from "../src/services/job-lane-runner";
@@ -33,6 +34,23 @@ function fixture(): { store: TelegramAgentStore; db: Database.Database } {
     }),
     db: bb.storage.database(),
   };
+}
+
+async function runOutboxPass(
+  store: TelegramAgentStore,
+  now: number,
+  telegram: NonNullable<JobExecutorDependencies["telegram"]>,
+): Promise<void> {
+  const abort = new AbortController();
+  await runJobExecutorService({
+    store,
+    clock: { now: () => now },
+    sleep: vi.fn(async () => abort.abort()),
+    effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+    telegram,
+    jitter: () => 0,
+    releaseOnShutdown: true,
+  }, abort.signal);
 }
 
 function insertJobAndOutbox(store: TelegramAgentStore, db: Database.Database): void {
@@ -1215,6 +1233,247 @@ describe("singleton job executor", () => {
     expect(store.acquireExecutorLease("other", 1_000, 30_000)).toEqual({ acquired: true, generation: 2 });
   });
 
+  it("persists the full Telegram retry_after without holding the outbox lease", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({ logicalKey: "notice:rate-limited", chatId: "70", payload: { text: "hello" } }, 1_000);
+    store.enqueueOutbox({ logicalKey: "notice:ready", chatId: "70", payload: { text: "real reply" } }, 1_000);
+    const delivered: string[] = [];
+    const signals: Array<AbortSignal | undefined> = [];
+    let attempts = 0;
+    const sendMessage = vi.fn(async (
+      _chatId: string,
+      payload: Record<string, unknown>,
+      signal?: AbortSignal,
+    ) => {
+      attempts += 1;
+      signals.push(signal);
+      if (attempts === 1) {
+        throw new TelegramApiError({
+          httpStatus: 429,
+          errorCode: 429,
+          description: "Too Many Requests",
+          retryAfterSeconds: 120,
+        });
+      }
+      delivered.push(String(payload.text));
+      return { message_id: 901 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("notice:rate-limited")).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: 121_000,
+    });
+    expect(store.getOutbox("notice:ready")).toMatchObject({ status: "sent", attempts: 1 });
+    expect(delivered).toEqual(["real reply"]);
+
+    await runOutboxPass(store, 120_999, telegram);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+
+    await runOutboxPass(store, 121_000, telegram);
+    expect(store.getOutbox("notice:rate-limited")).toMatchObject({ status: "sent", attempts: 2 });
+    expect(delivered).toEqual(["real reply", "hello"]);
+    expect(signals).toEqual([
+      expect.any(AbortSignal),
+      expect.any(AbortSignal),
+      expect.any(AbortSignal),
+    ]);
+  });
+
+  it("durably retries a transient request that is known not to have been sent", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({ logicalKey: "notice:dns-retry", chatId: "70", payload: { text: "hello" } }, 1_000);
+    let attempts = 0;
+    const sendMessage = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new TelegramRequestError("Telegram request failed", "not_sent");
+      return { message_id: 902 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("notice:dns-retry")).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      nextAttemptAt: 1_500,
+    });
+
+    await runOutboxPass(store, 1_499, telegram);
+    expect(sendMessage).toHaveBeenCalledOnce();
+
+    await runOutboxPass(store, 1_500, telegram);
+    expect(store.getOutbox("notice:dns-retry")).toMatchObject({ status: "sent", attempts: 2 });
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["the response was lost", new TelegramRequestError("Telegram request failed", "unknown")],
+    ["the transient response was malformed", new TelegramApiError({
+      httpStatus: 502,
+      errorCode: 502,
+      deliveryOutcome: "unknown",
+    })],
+  ])("retries an accepted new message when %s until delivery is confirmed", async (_scenario, deliveryError) => {
+    const { store, db } = fixture();
+    insertJobAndOutbox(store, db);
+    const ownerMessages: string[] = [];
+    let attempts = 0;
+    const sendMessage = vi.fn(async (_chatId: string, payload: Record<string, unknown>) => {
+      attempts += 1;
+      ownerMessages.push(String(payload.text));
+      if (attempts === 1) throw deliveryError;
+      return { message_id: 903 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("job:job_1:status")).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      leaseOwner: null,
+      nextAttemptAt: 1_500,
+    });
+
+    await runOutboxPass(store, 1_500, telegram);
+    expect(store.getOutbox("job:job_1:status")).toMatchObject({ status: "sent", attempts: 2 });
+    expect(ownerMessages).toEqual(["initial", "initial"]);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces an exhausted uncertain delivery with a vetted owner-visible warning", async () => {
+    const { store, db } = fixture();
+    insertJobAndOutbox(store, db);
+    const attemptedTexts: string[] = [];
+    const deliveredTexts: string[] = [];
+    let warningAttempts = 0;
+    const sendMessage = vi.fn(async (_chatId: string, payload: Record<string, unknown>) => {
+      const text = String(payload.text);
+      attemptedTexts.push(text);
+      if (text === "initial") throw new TelegramRequestError("Telegram request failed", "unknown");
+      warningAttempts += 1;
+      if (warningAttempts === 1) throw new TelegramRequestError("Telegram request failed", "not_sent");
+      deliveredTexts.push(text);
+      return { message_id: 904 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+    let now = 1_000;
+
+    for (let attempt = 0; attempt < 21; attempt += 1) {
+      await runOutboxPass(store, now, telegram);
+      const outbox = store.getOutbox("job:job_1:status")!;
+      if (outbox.status === "sent") break;
+      now = outbox.nextAttemptAt;
+    }
+
+    const outbox = store.getOutbox("job:job_1:status");
+    expect(outbox).toMatchObject({ status: "sent", messageId: 904 });
+    expect(attemptedTexts.filter((text) => text === "initial")).toHaveLength(20);
+    expect(attemptedTexts.filter((text) => text !== "initial")).toHaveLength(2);
+    expect(deliveredTexts).toHaveLength(1);
+    expect(deliveredTexts[0]).toMatch(/couldn't confirm.*previous message.*missing or duplicated/i);
+    expect(outbox?.payload.text).toBe(deliveredTexts[0]);
+  });
+
+  it("retries an ambiguous edit against its stored Telegram message identity", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({
+      logicalKey: "notice:known-message",
+      chatId: "70",
+      messageId: 77,
+      payload: { text: "updated" },
+    }, 1_000);
+    let attempts = 0;
+    const editMessage = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new TelegramRequestError("Telegram request failed", "unknown");
+    });
+    const sendMessage = vi.fn(async () => ({ message_id: 903 }));
+    const telegram = () => ({ sendMessage, editMessage });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("notice:known-message")).toMatchObject({
+      status: "failed",
+      nextAttemptAt: 1_500,
+    });
+
+    await runOutboxPass(store, 1_500, telegram);
+    expect(store.getOutbox("notice:known-message")).toMatchObject({ status: "sent", messageId: 77 });
+    expect(editMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("drains 25 queued messages in three bounded passes", async () => {
+    const { store } = fixture();
+    for (let index = 0; index < 25; index += 1) {
+      store.enqueueOutbox({
+        logicalKey: `notice:burst:${String(index).padStart(2, "0")}`,
+        chatId: "70",
+        payload: { text: `message ${index}` },
+      }, 1_000);
+    }
+    const abort = new AbortController();
+    let now = 1_000;
+    const sendMessage = vi.fn(async () => ({ message_id: 904 }));
+    const waitForWork = vi.fn(async () => {
+      const allSent = store.listOutbox(25).every((outbox) => outbox.status === "sent");
+      if (allSent) abort.abort();
+      else now += 1_000;
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage: vi.fn(async () => undefined) }),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledTimes(25);
+    expect(now).toBe(3_000);
+    expect(store.listOutbox(25).every((outbox) => outbox.status === "sent")).toBe(true);
+  });
+
+  it("leases each burst message immediately before its bounded network call", async () => {
+    const { store } = fixture();
+    for (let index = 0; index < 10; index += 1) {
+      store.enqueueOutbox({
+        logicalKey: `notice:fresh-lease:${index}`,
+        chatId: "70",
+        payload: { text: `message ${index}` },
+      }, 1_000);
+    }
+    const abort = new AbortController();
+    let now = 1_000;
+    const sendMessage = vi.fn(async (_chatId: string, payload: Record<string, unknown>, signal?: AbortSignal) => {
+      const current = store.listOutbox(10).find((outbox) => outbox.payload.text === payload.text);
+      expect(current).toMatchObject({
+        status: "leased",
+        leaseExpiresAt: now + 30_000,
+      });
+      expect(signal).toBeInstanceOf(AbortSignal);
+      now += 4_000;
+      expect(store.renewExecutorLease(current!.leaseOwner!, current!.leaseGeneration!, now, 30_000)).toBe(true);
+      return { message_id: 905 };
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      waitForWork: vi.fn(async () => abort.abort()),
+      telegram: () => ({ sendMessage, editMessage: vi.fn(async () => undefined) }),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledTimes(10);
+    expect(store.listOutbox(10).every((outbox) => outbox.status === "sent")).toBe(true);
+  });
+
   it("completes an expired callback answer without retrying or crashing", async () => {
     const { store } = fixture();
     store.enqueueOutbox({ logicalKey: "callback:expired", chatId: "70", payload: { text: "Done" } }, 1_000);
@@ -1275,7 +1534,53 @@ describe("singleton job executor", () => {
       }),
     }, abort.signal);
 
-    expect(sendMessage).toHaveBeenCalledWith("70", { text: "updated" });
+    expect(sendMessage).toHaveBeenCalledWith("70", { text: "updated" }, expect.any(AbortSignal));
+    expect(store.getJob(job.id)?.statusMessageId).toBe(202);
+    expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", messageId: 202 });
+  });
+
+  it("renews the row before a replacement send can consume the remaining lease", async () => {
+    const { store } = fixture();
+    const created = store.createJob({ id: "job_slow_replace", sourceUpdateId: 13, requestText: "work", now: 1_000 });
+    const job = store.setJobStatusMessage(created.id, 101, created.version, 1_001);
+    store.enqueueOutbox({
+      logicalKey: `job:${job.id}:status`,
+      chatId: "70",
+      messageId: 101,
+      payload: { text: "updated" },
+    }, 1_002);
+    const abort = new AbortController();
+    let now = 2_000;
+    const renewExecutor = (): void => {
+      const outbox = store.getOutbox(`job:${job.id}:status`)!;
+      expect(store.renewExecutorLease(outbox.leaseOwner!, outbox.leaseGeneration!, now, 30_000)).toBe(true);
+    };
+    const editMessage = vi.fn(async () => {
+      now += 15_000;
+      renewExecutor();
+      throw new TelegramApiError({
+        httpStatus: 400,
+        errorCode: 400,
+        description: "Bad Request: message to edit not found",
+        retryAfterSeconds: null,
+      });
+    });
+    const sendMessage = vi.fn(async () => {
+      now += 15_000;
+      renewExecutor();
+      abort.abort();
+      return { message_id: 202 };
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      telegram: () => ({ sendMessage, editMessage }),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledOnce();
     expect(store.getJob(job.id)?.statusMessageId).toBe(202);
     expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", messageId: 202 });
   });
@@ -1308,8 +1613,20 @@ describe("singleton job executor", () => {
       telegram: () => ({ sendMessage: vi.fn(async () => ({ message_id: 1 })), editMessage }),
     }, abort.signal);
 
-    expect(editMessage).toHaveBeenNthCalledWith(1, "70", 303, { text: "<b>broken", parse_mode: "HTML" });
-    expect(editMessage).toHaveBeenNthCalledWith(2, "70", 303, { text: "<b>broken" });
+    expect(editMessage).toHaveBeenNthCalledWith(
+      1,
+      "70",
+      303,
+      { text: "<b>broken", parse_mode: "HTML" },
+      expect.any(AbortSignal),
+    );
+    expect(editMessage).toHaveBeenNthCalledWith(
+      2,
+      "70",
+      303,
+      { text: "<b>broken" },
+      expect.any(AbortSignal),
+    );
     expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", attempts: 1 });
   });
 
@@ -1404,8 +1721,20 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), CONTROLLER_PHASE_TEXT.connecting);
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), CONTROLLER_PHASE_TEXT.responding);
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(
+      1,
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.connecting,
+      expect.any(AbortSignal),
+    );
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(
+      2,
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.responding,
+      expect.any(AbortSignal),
+    );
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBeGreaterThan(0);
     expect(sendMessage).not.toHaveBeenCalled();
@@ -1464,7 +1793,7 @@ describe("singleton job executor", () => {
     expect(editMessage).toHaveBeenCalledWith("7", 501, {
       text: CONTROLLER_PHASE_TEXT.responding,
       disable_web_page_preview: true,
-    });
+    }, expect.any(AbortSignal));
   });
 
   it("does not let a slow stream edit hold back the terminal reply", async () => {
@@ -1527,7 +1856,7 @@ describe("singleton job executor", () => {
       expect(sendMessage).toHaveBeenCalledWith("7", {
         text: "Final answer",
         disable_web_page_preview: true,
-      });
+      }, expect.any(AbortSignal));
     } finally {
       resolveEdit();
       await run;
@@ -1583,11 +1912,11 @@ describe("singleton job executor", () => {
     expect(sendMessage).toHaveBeenCalledWith("7", {
       text: CONTROLLER_PHASE_TEXT.connecting,
       disable_web_page_preview: true,
-    });
+    }, expect.any(AbortSignal));
     expect(editMessage).toHaveBeenCalledWith("7", 501, {
       text: "Final answer",
       disable_web_page_preview: true,
-    });
+    }, expect.any(AbortSignal));
   });
 
   it("derives an ephemeral draft from the phase, never a legacy raw stream_text token", async () => {
@@ -1617,7 +1946,12 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledTimes(1);
-    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), CONTROLLER_PHASE_TEXT.thinking);
+    expect(sendMessageDraft).toHaveBeenCalledWith(
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.thinking,
+      expect.any(AbortSignal),
+    );
     expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("RAW-SECRET");
     expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("token");
   });
@@ -1749,12 +2083,17 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledOnce();
-    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), CONTROLLER_PHASE_TEXT.connecting);
+    expect(sendMessageDraft).toHaveBeenCalledWith(
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.connecting,
+      expect.any(AbortSignal),
+    );
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage).toHaveBeenCalledWith("7", {
       text: "Final answer",
       disable_web_page_preview: true,
-    });
+    }, expect.any(AbortSignal));
     expect(editMessage).not.toHaveBeenCalled();
     expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({
       status: "sent",

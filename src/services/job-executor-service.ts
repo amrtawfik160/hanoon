@@ -6,6 +6,7 @@ import { MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "../autonomy/models"
 import { redactError } from "../errors";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
 import { classifyTelegramError, TelegramApiError } from "../telegram/errors";
+import { TelegramRequestError, TelegramResponseValidationError } from "../telegram/client";
 import { JobLaneRunner, type JobLaneKind, type JobLaneSnapshotProvider } from "./job-lane-runner";
 import {
   projectUnknownWorker,
@@ -17,10 +18,10 @@ import { CONTROLLER_PHASE_TEXT } from "../controller/models";
 type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
 export type JobExecutorTelegram = {
-  sendMessage(chatId: string, payload: Record<string, unknown>): Promise<{ message_id: number }>;
-  sendMessageDraft?(chatId: string, draftId: number, text: string): Promise<void>;
-  editMessage(chatId: string, messageId: number, payload: Record<string, unknown>): Promise<void>;
-  answerCallback?(callbackQueryId: string, text: string): Promise<void>;
+  sendMessage(chatId: string, payload: Record<string, unknown>, signal: AbortSignal): Promise<{ message_id: number }>;
+  sendMessageDraft?(chatId: string, draftId: number, text: string, signal: AbortSignal): Promise<void>;
+  editMessage(chatId: string, messageId: number, payload: Record<string, unknown>, signal: AbortSignal): Promise<void>;
+  answerCallback?(callbackQueryId: string, text: string, signal: AbortSignal): Promise<void>;
 };
 
 export type JobExecutorDependencies = {
@@ -91,6 +92,7 @@ const IDLE_POLL_MS = 60_000;
 // wait is also the draft's frame rate: a whole second of output lands in one
 // jump. While an answer is arriving the loop runs at roughly draft speed.
 const STREAM_POLL_MS = 250;
+const OUTBOX_BURST_LIMIT = 10;
 export const WORKER_RECONCILE_INTERVAL_MS = 10_000;
 const PERMANENT_EFFECT_ERROR_NAMES = new Set([
   "TypeError",
@@ -463,6 +465,30 @@ function controllerStreamRetryAt(error: unknown, now: number): number | null {
   return Math.min(Number.MAX_SAFE_INTEGER, now + delay + 1_000);
 }
 
+function durableOutboxRetryAt(
+  error: unknown,
+  attempts: number,
+  now: number,
+  jitter: () => number,
+): number {
+  if (
+    error instanceof TelegramApiError &&
+    error.retryAfterSeconds !== null &&
+    Number.isFinite(error.retryAfterSeconds) &&
+    error.retryAfterSeconds >= 0
+  ) {
+    const delay = Math.ceil(error.retryAfterSeconds * 1_000);
+    return Number.isFinite(delay) ? Math.min(Number.MAX_SAFE_INTEGER, now + delay) : Number.MAX_SAFE_INTEGER;
+  }
+  return now + retryDelay(attempts, jitter);
+}
+
+function deliveryOutcomeIsAmbiguous(error: unknown): boolean {
+  return error instanceof TelegramResponseValidationError ||
+    ((error instanceof TelegramRequestError || error instanceof TelegramApiError) &&
+      error.deliveryOutcome === "unknown");
+}
+
 async function abortableHeartbeat(
   store: TelegramAgentStore,
   ownerId: string,
@@ -614,13 +640,20 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               delivery.outbox.chatId,
               stableChatDraftId(delivery.outbox.chatId),
               delivery.text,
+              workAbort.signal,
             );
           } else if (delivery.messageId !== null) {
-            await delivery.telegram.editMessage(delivery.outbox.chatId, delivery.messageId, delivery.payload);
+            await delivery.telegram.editMessage(
+              delivery.outbox.chatId,
+              delivery.messageId,
+              delivery.payload,
+              workAbort.signal,
+            );
           } else {
             deliveredMessageId = (await delivery.telegram.sendMessage(
               delivery.outbox.chatId,
               delivery.payload,
+              workAbort.signal,
             )).message_id;
           }
           if (deliveredMessageId !== null) {
@@ -990,12 +1023,25 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           break;
         }
 
-        const outbox = deps.store.leaseOutbox(ownerId, lease.generation, deps.clock.now(), 10, leaseMs);
-        for (const item of outbox) {
+        for (let outboxIndex = 0; outboxIndex < OUTBOX_BURST_LIMIT; outboxIndex += 1) {
           if (workAbort.signal.aborted || !deps.store.isExecutorLeaseCurrent(ownerId, lease.generation, deps.clock.now())) {
             continueAcquiring = true;
             break;
           }
+          const item = deps.store.leaseOutbox(ownerId, lease.generation, deps.clock.now(), 1, leaseMs)[0];
+          if (!item) break;
+          let attemptedNewMessage = false;
+          const renewOutboxForRecovery = (): boolean => {
+            const now = deps.clock.now();
+            assertNow(now);
+            return deps.store.renewOutboxLease({
+              logicalKey: item.logicalKey,
+              ownerId,
+              generation: lease.generation,
+              now,
+              leaseMs,
+            });
+          };
           didWork = true;
           try {
             const token = deps.telegramToken?.();
@@ -1064,7 +1110,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               });
               continue;
             } else if (callback && telegram.answerCallback) {
-              await telegram.answerCallback(callback, payloadText(item));
+              await telegram.answerCallback(callback, payloadText(item), workAbort.signal);
             } else if (
               turnId !== null &&
               controllerTurn?.state === "submitted" &&
@@ -1078,11 +1124,17 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
                 item.chatId,
                 stableChatDraftId(item.chatId),
                 CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
+                workAbort.signal,
               );
             } else if (knownMessageId !== null) {
-              await telegram.editMessage(item.chatId, knownMessageId, deliveryPayload);
+              await telegram.editMessage(item.chatId, knownMessageId, deliveryPayload, workAbort.signal);
             } else {
-              deliveredMessageId = (await telegram.sendMessage(item.chatId, deliveryPayload)).message_id;
+              attemptedNewMessage = true;
+              deliveredMessageId = (await telegram.sendMessage(
+                item.chatId,
+                deliveryPayload,
+                workAbort.signal,
+              )).message_id;
             }
             if (jobId && deliveredMessageId !== null && job?.statusMessageId === null && typeof deps.store.completeStatusOutbox === "function") {
               const atomicallyCompleted = deps.store.completeStatusOutbox(
@@ -1105,7 +1157,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               }
             }
           } catch (error) {
-            if (workAbort.signal.aborted || !deps.store.isExecutorLeaseCurrent(ownerId, lease.generation, deps.clock.now())) {
+            const initialDeliveryIsAmbiguous = attemptedNewMessage && deliveryOutcomeIsAmbiguous(error);
+            if (
+              !deps.store.isExecutorLeaseCurrent(ownerId, lease.generation, deps.clock.now()) ||
+              (workAbort.signal.aborted && !initialDeliveryIsAmbiguous)
+            ) {
               continueAcquiring = true;
               break;
             }
@@ -1126,8 +1182,13 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             }
 
             if (classification === "edit_unavailable" && telegram && jobId && job) {
+              if (!renewOutboxForRecovery()) {
+                continueAcquiring = true;
+                break;
+              }
               try {
-                const replacement = await telegram.sendMessage(item.chatId, item.payload);
+                attemptedNewMessage = true;
+                const replacement = await telegram.sendMessage(item.chatId, item.payload, workAbort.signal);
                 const replaced = deps.store.replaceStatusOutboxMessage(
                   item.logicalKey,
                   ownerId,
@@ -1149,16 +1210,29 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             }
 
             if (classification === "bad_entities" && telegram && Object.hasOwn(item.payload, "parse_mode")) {
+              if (!renewOutboxForRecovery()) {
+                continueAcquiring = true;
+                break;
+              }
               const { parse_mode: _parseMode, ...plainPayload } = item.payload;
               try {
                 let deliveredMessageId = knownMessageId;
                 const callback = callbackId(item.logicalKey);
                 if (callback && telegram.answerCallback) {
-                  await telegram.answerCallback(callback, payloadText({ ...item, payload: plainPayload }));
+                  await telegram.answerCallback(
+                    callback,
+                    payloadText({ ...item, payload: plainPayload }),
+                    workAbort.signal,
+                  );
                 } else if (knownMessageId !== null) {
-                  await telegram.editMessage(item.chatId, knownMessageId, plainPayload);
+                  await telegram.editMessage(item.chatId, knownMessageId, plainPayload, workAbort.signal);
                 } else {
-                  deliveredMessageId = (await telegram.sendMessage(item.chatId, plainPayload)).message_id;
+                  attemptedNewMessage = true;
+                  deliveredMessageId = (await telegram.sendMessage(
+                    item.chatId,
+                    plainPayload,
+                    workAbort.signal,
+                  )).message_id;
                 }
                 if (jobId && job && deliveredMessageId !== null && job.statusMessageId === null) {
                   const completed = deps.store.completeStatusOutbox(
@@ -1187,19 +1261,46 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               }
             }
 
-            const failure = safeFailure(deliveryError);
+            const settlementNow = deps.clock.now();
+            assertNow(settlementNow);
             let settled = false;
-            if (classification === "authentication" || classification === "permanent" || item.attempts >= 20) {
-              settled = deps.store.deadLetterOutbox(item.logicalKey, ownerId, lease.generation, failure, deps.clock.now());
+            const failure = safeFailure(deliveryError);
+            if (attemptedNewMessage && deliveryOutcomeIsAmbiguous(deliveryError)) {
+              settled = item.attempts >= 20
+                ? deps.store.replaceOutboxWithDeliveryFailureNotice({
+                    logicalKey: item.logicalKey,
+                    ownerId,
+                    generation: lease.generation,
+                    error: failure,
+                    now: settlementNow,
+                  })
+                : deps.store.failOutbox(
+                    item.logicalKey,
+                    ownerId,
+                    lease.generation,
+                    failure,
+                    durableOutboxRetryAt(deliveryError, item.attempts, settlementNow, jitter),
+                    settlementNow,
+                  );
             } else {
-              settled = deps.store.failOutbox(
-                item.logicalKey,
-                ownerId,
-                lease.generation,
-                failure,
-                deps.clock.now() + retryDelay(item.attempts, jitter),
-                deps.clock.now(),
-              );
+              if (classification === "authentication" || classification === "permanent" || item.attempts >= 20) {
+                settled = deps.store.deadLetterOutbox(
+                  item.logicalKey,
+                  ownerId,
+                  lease.generation,
+                  failure,
+                  settlementNow,
+                );
+              } else {
+                settled = deps.store.failOutbox(
+                  item.logicalKey,
+                  ownerId,
+                  lease.generation,
+                  failure,
+                  durableOutboxRetryAt(deliveryError, item.attempts, settlementNow, jitter),
+                  settlementNow,
+                );
+              }
             }
             if (!settled) {
               continueAcquiring = true;

@@ -157,48 +157,70 @@ describe("Telegram Bot API client", () => {
     expect(JSON.stringify(fetchMock.calls)).not.toContain("123:secret");
   });
 
-  it("does not abort a retry_after delay at the ordinary request timeout", async () => {
-    vi.useFakeTimers();
-    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
-      const controller = new AbortController();
-      setTimeout(() => controller.abort(new DOMException("The operation timed out", "TimeoutError")), milliseconds);
-      return controller.signal;
-    });
-    try {
-      let markSleepStarted: (() => void) | undefined;
-      const sleepStarted = new Promise<void>((resolve) => {
-        markSleepStarted = resolve;
-      });
-      const sleep = vi.fn((milliseconds: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          signal.removeEventListener("abort", onAbort);
-          resolve();
-        }, milliseconds);
-        const onAbort = () => {
-          clearTimeout(timer);
-          signal.removeEventListener("abort", onAbort);
-          reject(signal.reason ?? new Error("retry was aborted"));
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-        markSleepStarted?.();
-      }));
-      const fetchMock = telegramFetch([
-        { ok: false, error_code: 429, description: "slow", parameters: { retry_after: 22 } },
-        { ok: true, result: { message_id: 10 } },
-      ]);
-      const client = new TelegramClient("token", fetchMock, { sleep });
-      const pending = client.sendMessage("1", { text: "hello" });
+  it("returns a 22-second retry_after without sleeping when the caller owns retries", async () => {
+    const sleep = vi.fn(immediateSleep);
+    const fetchMock = telegramFetch([
+      { ok: false, error_code: 429, description: "slow", parameters: { retry_after: 22 } },
+      { ok: true, result: { message_id: 10 } },
+    ]);
+    const client = new TelegramClient("token", fetchMock, { sleep, maxAttempts: 1 });
 
-      await sleepStarted;
-      await vi.advanceTimersByTimeAsync(15_000);
-      expect(fetchMock.calls).toHaveLength(1);
-      await vi.advanceTimersByTimeAsync(7_000);
-      await expect(pending).resolves.toMatchObject({ message_id: 10 });
-      expect(sleep).toHaveBeenCalledWith(22_000, expect.any(AbortSignal));
-    } finally {
-      timeout.mockRestore();
-      vi.useRealTimers();
-    }
+    const error = await client.sendMessage("1", { text: "hello" }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "TelegramApiError",
+      errorCode: 429,
+      retryAfterSeconds: 22,
+    });
+    expect(fetchMock.calls).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a DNS lookup failure", { code: "EAI_AGAIN" }, "not_sent"],
+    ["a connection timeout", { code: "UND_ERR_CONNECT_TIMEOUT" }, "not_sent"],
+    ["a reset before any bytes were written", { code: "ECONNRESET", socket: { bytesWritten: 0 } }, "not_sent"],
+    ["a reset after request bytes were written", { code: "ECONNRESET", socket: { bytesWritten: 128 } }, "unknown"],
+  ] as const)("classifies %s for durable retry safety", async (_scenario, cause, expectedOutcome) => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError("fetch failed", { cause });
+    });
+    const client = new TelegramClient("token", fetchMock, { maxAttempts: 1 });
+
+    const error = await client.sendMessage("1", { text: "hello" }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "TelegramRequestError",
+      deliveryOutcome: expectedOutcome,
+    });
+  });
+
+  it("treats a malformed transient response as uncertain for a one-attempt caller", async () => {
+    const fetchMock = vi.fn(async () => new Response("not-json", { status: 502 }));
+    const client = new TelegramClient("token", fetchMock, { maxAttempts: 1 });
+
+    const error = await client.sendMessage("1", { text: "hello" }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "TelegramApiError",
+      deliveryOutcome: "unknown",
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("preserves ordinary retries after a malformed transient response", async () => {
+    immediateSleep.mockClear();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("not-json", { status: 502 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true,
+        result: { message_id: 10 },
+      }), { status: 200 }));
+    const client = new TelegramClient("token", fetchMock, { sleep: immediateSleep });
+
+    await expect(client.sendMessage("1", { text: "hello" })).resolves.toMatchObject({ message_id: 10 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(immediateSleep).toHaveBeenCalledWith(250, expect.any(AbortSignal));
   });
 
   it("allows three transient retries after the initial request", async () => {
