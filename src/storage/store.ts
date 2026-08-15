@@ -3097,7 +3097,7 @@ export interface TelegramAgentStore {
     username: string;
     now: number;
     hasActiveJob: boolean;
-  }): "created" | "same" | "changed" | "active_job_conflict";
+  }): "created" | "same" | "identity_mismatch" | "active_job_conflict";
   getTelegramIdentity(): TelegramIdentity | null;
   upsertProjectPolicy(policy: ProjectPolicy, now: number): ProjectPolicyRecord;
   getProjectPolicy(projectId: string): ProjectPolicyRecord | null;
@@ -8825,10 +8825,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     username: string;
     now: number;
     hasActiveJob: boolean;
-  }): "created" | "same" | "changed" | "active_job_conflict" {
+  }): "created" | "same" | "identity_mismatch" | "active_job_conflict" {
     assertCanonicalPositiveDecimal(input.botId, "botId");
 
-    const bind = this.db.transaction((): "created" | "same" | "changed" | "active_job_conflict" => {
+    const bind = this.db.transaction((): "created" | "same" | "identity_mismatch" | "active_job_conflict" => {
       const current = this.db
         .prepare(
           "SELECT bot_id, username, verified_at FROM telegram_identity WHERE singleton = 1",
@@ -8855,28 +8855,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }
 
       if (input.hasActiveJob || this.hasUnreleasedAdmissions()) return "active_job_conflict";
-
-      this.revokeControllerAccess(input.now);
-      this.db
-        .prepare(
-          "UPDATE owners SET revoked_at = ? WHERE singleton = 1 AND revoked_at IS NULL",
-        )
-        .run(input.now);
-      this.db.prepare("DELETE FROM pairing_codes").run();
-      this.db.prepare("DELETE FROM approvals").run();
-      this.db.prepare("DELETE FROM telegram_updates").run();
-      this.db.prepare("DELETE FROM callbacks").run();
-      this.db.prepare("DELETE FROM outbox").run();
-      this.db
-        .prepare("UPDATE telegram_cursor SET next_offset = 0 WHERE singleton = 1")
-        .run();
-      this.db
-        .prepare(
-          "UPDATE telegram_identity SET bot_id = ?, username = ?, verified_at = ? WHERE singleton = 1",
-        )
-        .run(input.botId, input.username, input.now);
-
-      return "changed";
+      return "identity_mismatch";
     });
     return bind();
   }

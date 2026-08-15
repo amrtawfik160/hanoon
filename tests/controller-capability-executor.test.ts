@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { afterEach, expect, it, vi } from "vitest";
+import { z } from "zod";
 import {
   canonicalControllerJson,
   ControllerCapabilityExecutionError,
   authorizeControllerCapability,
   executeControllerCapability,
+  registerControllerCapabilityTool,
   sha256ControllerJson,
   type ControllerCapabilityDependencies,
 } from "../src/controller/capability-executor";
@@ -682,17 +684,62 @@ it("routes a registered tool through durable evidence before returning", async (
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toHaveLength(1);
 });
 
-it("makes zero BB calls when durable controller authorization fails", async () => {
+it("returns a structured tool error and makes zero BB calls when durable controller authorization fails", async () => {
   const fixture = registeredControllerFixture();
 
-  await expect(fixture.harness.behavior.callAgentTool(
+  const result = await fixture.harness.behavior.callAgentTool(
     "telegram_agent_thread_status",
     { threadId: "thr_visible" },
     { ...fixture.toolContext, threadId: "thr_forged" },
-  )).rejects.toThrow(/identity|controller|authorized/i);
+  );
+
+  expect(result).toEqual({
+    content: [{ type: "text", text: '{"error":{"code":"identity_mismatch"}}' }],
+    isError: true,
+  });
 
   expect(fixture.harness.inspection.sdk.callsTo("threads.get")).toEqual([]);
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
+});
+
+it("returns a structured tool error when a registered capability exceeds its result limit", async () => {
+  const fixture = executorFixture();
+  registerControllerCapabilityTool(fixture.bb, fixture.dependencies, {
+    name: "telegram_agent_list_projects",
+    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_list_projects,
+    description: "List projects",
+    parameters: z.object({}),
+    resolveScope: () => ({ scope: globalScope }),
+    execute: () => ({ text: "é".repeat(4_000) }),
+    projectEvidence: () => ({
+      outcome: "observed",
+      proofKinds: ["project_state"],
+      subjectRefs: [],
+    }),
+  });
+
+  const result = await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_list_projects",
+    {},
+    fixture.context,
+  );
+
+  expect(result).toEqual({
+    content: [{ type: "text", text: '{"error":{"code":"result_limit_exceeded"}}' }],
+    isError: true,
+  });
+  expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
+});
+
+it("continues throwing genuine storage faults from registered tools", async () => {
+  const fixture = registeredControllerFixture();
+  fixture.db.exec("DROP TABLE controller_evidence");
+
+  await expect(fixture.harness.behavior.callAgentTool(
+    "telegram_agent_list_projects",
+    {},
+    fixture.toolContext,
+  )).rejects.toMatchObject({ code: "evidence_write_failed" });
 });
 
 it("keeps credentials and token audiences out of every provider parameter schema", async () => {
@@ -715,7 +762,10 @@ it("denies a disabled exact project before creating a job or evidence", async ()
     "telegram_agent_start_job",
     { projectId: "proj_1", task: "must not run" },
     fixture.toolContext,
-  )).rejects.toThrow(/scope/i);
+  )).resolves.toEqual({
+    content: [{ type: "text", text: '{"error":{"code":"scope_denied"}}' }],
+    isError: true,
+  });
 
   expect(fixture.store.listJobs(100)).toHaveLength(before);
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
@@ -753,7 +803,10 @@ it("isolates owner monitors from system and foreign cancellation", async () => {
     "telegram_agent_cancel_watch",
     { id: systemMonitor.id },
     fixture.toolContext,
-  )).rejects.toThrow(/scope/i);
+  )).resolves.toEqual({
+    content: [{ type: "text", text: '{"error":{"code":"scope_denied"}}' }],
+    isError: true,
+  });
   expect(fixture.store.listSystemMonitors()[0]).toMatchObject({ id: systemMonitor.id, state: "armed" });
 
   const cancelled = JSON.parse(await fixture.harness.behavior.callAgentTool(

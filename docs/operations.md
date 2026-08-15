@@ -80,7 +80,7 @@ Memories are bounded per scope; when the bound is reached the weakest is dropped
 
 An invalid cron expression is rejected when the monitor is created. A schedule that later cannot be advanced is marked failed and reported by `/health` rather than retried forever.
 
-Watches are not all owner-requested: a thread the agent starts or messages is watched automatically, so asking what it is watching will list those too. They retire themselves when their thread lands. Armed monitors are capped per controller, and at the cap an automatic watch is declined rather than arming — the thread still runs, but nothing wakes the agent when it finishes. The armed count in `/health` is the one to watch; the next-due time beside it covers schedules only, since a thread watch waits on its thread rather than on the clock.
+Asking what the agent is watching lists durable monitor rows only. Starting or messaging a thread tries to arm a best-effort courtesy monitor; at the armed-monitor cap the action still succeeds without that monitor. Lifecycle handling can also infer engagement from durable controller evidence containing the exact `thread:<id>` reference and enqueue a follow-up without a monitor row. That inferred follow-up is absent from the watch list and does not consume the armed-monitor cap; thread list and status reads currently produce qualifying evidence too. The armed count in `/health` therefore covers monitors, not every possible lifecycle follow-up. Its next-due time covers schedules only, since a thread watch waits on its thread rather than on the clock.
 
 ## Thread notices
 

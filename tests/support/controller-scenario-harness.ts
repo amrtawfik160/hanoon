@@ -580,6 +580,20 @@ function parseScenarioToolResult(value: unknown): Record<string, unknown> {
   return parsed;
 }
 
+function structuredToolErrorCode(value: unknown): string | null {
+  const result = scenarioRecord(value);
+  if (result?.isError !== true || !Array.isArray(result.content)) return null;
+  const content = scenarioRecord(result.content[0]);
+  if (content?.type !== "text" || typeof content.text !== "string") return null;
+  try {
+    const payload = scenarioRecord(JSON.parse(content.text));
+    const error = scenarioRecord(payload?.error);
+    return typeof error?.code === "string" ? error.code : null;
+  } catch {
+    return null;
+  }
+}
+
 type ScenarioAssertionFacts = Readonly<{
   turn: ReturnType<TelegramAgentStore["getControllerTurn"]>;
   reply: ReturnType<TelegramAgentStore["getOutbox"]>;
@@ -1499,11 +1513,12 @@ async function runExtendedScenario(input: Readonly<{
     const staleApprovalOutboxCountAfter = store.listOutbox(256).length;
     let denialCode: string | null = null;
     try {
-      await harness.behavior.callAgentTool(
+      const denied = await harness.behavior.callAgentTool(
         "telegram_agent_start_job",
         { projectId: "proj_1", task: "This mutation must be denied." },
         toolContext,
       );
+      denialCode = structuredToolErrorCode(denied);
     } catch (error) {
       denialCode = typeof scenarioRecord(error)?.code === "string"
         ? scenarioRecord(error)?.code as string

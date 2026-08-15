@@ -3,6 +3,7 @@ import type {
   PluginCliContext,
   PluginCliResult,
 } from "@bb/plugin-sdk";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { createSecret, hashSecret } from "./crypto";
 import {
   projectPolicySchema,
@@ -10,7 +11,12 @@ import {
   type ProjectPolicy,
 } from "./domain/models";
 import { TelegramClient } from "./telegram/client";
-import { OWNER_MEMORY_SCOPE, type OwnerMemoryImportInput, type TelegramAgentStore } from "./storage/store";
+import {
+  OWNER_MEMORY_SCOPE,
+  type Owner,
+  type OwnerMemoryImportInput,
+  type TelegramAgentStore,
+} from "./storage/store";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { projectResourceWait } from "./storage/autonomy-repository";
 import {
@@ -43,6 +49,15 @@ export type TelegramAgentCliDependencies = {
     modelRouting: "adaptive" | "strong-only";
   }>;
   credentialAccess: Pick<CredentialAccessService, "list" | "status">;
+  unpairNonceKey: string;
+  recordOperatorAudit(input: Readonly<{
+    schemaVersion: 1;
+    operation: "unpair";
+    outcome: "confirmed";
+    occurredAt: number;
+    affectedTelegramIdentity: Readonly<{ userId: string; chatId: string; pairedAt: number }>;
+    operatorContext: Readonly<{ threadId: string | null; projectId: string | null }>;
+  }>): Promise<void>;
   notify?: () => void;
 };
 
@@ -68,6 +83,10 @@ class CliOperationError extends Error {}
 const JSON_FLAG: FlagSpec = { kind: "flag" };
 
 const TOP_LEVEL_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+const UNPAIR_FLAGS: Record<string, FlagSpec> = {
+  json: JSON_FLAG,
+  confirm: { kind: "value" },
+};
 
 const MEMORY_IMPORT_FLAGS: Record<string, FlagSpec> = {
   json: JSON_FLAG,
@@ -145,7 +164,7 @@ const CLI_HELP = `Usage: bb telegram-agent <command> [options]
 
 Commands:
   pair [--json]
-  unpair [--json]
+  unpair [--confirm <nonce>] [--json]
   project list [--json]
   project enable <project-id> [options]
   project disable <project-id> [--json]
@@ -705,18 +724,158 @@ async function runMemoryImport(
   );
 }
 
-function runUnpair(
+type UnpairNoncePayload = Readonly<{
+  operation: "unpair";
+  userId: string;
+  chatId: string;
+  pairedAt: number;
+  expiresAt: number;
+  salt: string;
+}>;
+
+type ConfirmUnpairInput = Readonly<{
+  owner: Owner;
+  nonce: string;
+  now: number;
+  context: PluginCliContext;
+  json: boolean;
+}>;
+
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+function signUnpairPayload(encodedPayload: string, key: string): string {
+  return createHmac("sha256", key).update(encodedPayload, "utf8").digest("base64url");
+}
+
+function createUnpairNonce(
+  owner: Owner,
+  now: number,
+  key: string,
+): string {
+  const payload: UnpairNoncePayload = {
+    operation: "unpair",
+    userId: owner.userId,
+    chatId: owner.chatId,
+    pairedAt: owner.pairedAt,
+    expiresAt: now + PAIRING_TTL_MS,
+    salt: createSecret(12),
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return `${encodedPayload}.${signUnpairPayload(encodedPayload, key)}`;
+}
+
+function invalidUnpairNonce(): never {
+  throw new CliOperationError("Unpair confirmation nonce is invalid");
+}
+
+function parseUnpairPayload(encodedPayload: string): UnpairNoncePayload {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8")) as unknown;
+  } catch {
+    invalidUnpairNonce();
+  }
+  if (
+    !isRecord(payload) || Object.keys(payload).sort().join(",") !== "chatId,expiresAt,operation,pairedAt,salt,userId" ||
+    payload.operation !== "unpair" || typeof payload.userId !== "string" ||
+    typeof payload.chatId !== "string" || !Number.isSafeInteger(payload.pairedAt) ||
+    !Number.isSafeInteger(payload.expiresAt) || typeof payload.salt !== "string"
+  ) invalidUnpairNonce();
+  return payload as UnpairNoncePayload;
+}
+
+function validUnpairSignature(encodedPayload: string, encodedSignature: string, key: string): boolean {
+  const expectedSignature = Buffer.from(signUnpairPayload(encodedPayload, key), "base64url");
+  const suppliedSignature = Buffer.from(encodedSignature, "base64url");
+  return expectedSignature.length === suppliedSignature.length &&
+    timingSafeEqual(expectedSignature, suppliedSignature);
+}
+
+function validateUnpairNonce(
+  nonce: string,
+  owner: Owner,
+  now: number,
+  key: string,
+): void {
+  if (nonce.length > 1_024) invalidUnpairNonce();
+  const [encodedPayload, encodedSignature, extra] = nonce.split(".");
+  if (
+    extra !== undefined || !encodedPayload || !encodedSignature ||
+    !BASE64URL_PATTERN.test(encodedPayload) || !BASE64URL_PATTERN.test(encodedSignature) ||
+    !validUnpairSignature(encodedPayload, encodedSignature, key)
+  ) invalidUnpairNonce();
+  const payload = parseUnpairPayload(encodedPayload);
+  if (now >= payload.expiresAt) throw new CliOperationError("Unpair confirmation nonce expired");
+  if (
+    payload.userId !== owner.userId || payload.chatId !== owner.chatId ||
+    payload.pairedAt !== owner.pairedAt
+  ) throw new CliOperationError("Unpair confirmation nonce does not match the paired Telegram identity");
+}
+
+function unpairChallenge(
   deps: TelegramAgentCliDependencies,
+  owner: Owner,
+  now: number,
   json: boolean,
 ): PluginCliResult {
-  const now = deps.now();
-  const revoked = deps.store.revokeOwner(now);
-  const approvalsRevoked = deps.revokeAllApprovals(now);
+  const nonce = createUnpairNonce(owner, now, deps.unpairNonceKey);
   return success(
-    { revoked, approvalsRevoked },
-    revoked ? "Telegram owner unpaired" : "Telegram owner was already unpaired",
+    {
+      confirmationRequired: true,
+      nonce,
+      owner,
+      sensitive: true,
+      expiresInSeconds: PAIRING_TTL_MS / 1_000,
+    },
+    `Unpair Telegram user ${owner.userId} in private chat ${owner.chatId}. ` +
+      `Confirm within 10 minutes: bb telegram-agent unpair --confirm ${nonce}`,
     json,
   );
+}
+
+function sameOwner(current: Owner | null, expected: Owner): boolean {
+  return current !== null && current.userId === expected.userId &&
+    current.chatId === expected.chatId && current.pairedAt === expected.pairedAt;
+}
+
+async function confirmUnpair(
+  deps: TelegramAgentCliDependencies,
+  input: ConfirmUnpairInput,
+): Promise<PluginCliResult> {
+  validateUnpairNonce(input.nonce, input.owner, input.now, deps.unpairNonceKey);
+  await deps.recordOperatorAudit({
+    schemaVersion: 1,
+    operation: "unpair",
+    outcome: "confirmed",
+    occurredAt: input.now,
+    affectedTelegramIdentity: input.owner,
+    operatorContext: {
+      threadId: input.context.threadId ?? null,
+      projectId: input.context.projectId ?? null,
+    },
+  });
+  if (!sameOwner(deps.store.getOwner(), input.owner) || !deps.store.revokeOwner(input.now)) {
+    throw new CliOperationError("The paired Telegram identity changed before unpair could complete");
+  }
+  const approvalsRevoked = deps.revokeAllApprovals(input.now);
+  return success({ revoked: true, approvalsRevoked }, "Telegram owner unpaired", input.json);
+}
+
+async function runUnpair(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  context: PluginCliContext,
+  json: boolean,
+): Promise<PluginCliResult> {
+  const now = deps.now();
+  const owner = deps.store.getOwner();
+  if (!owner) {
+    if (parsed.values.has("confirm")) throw new CliOperationError("No Telegram owner is paired");
+    return success({ revoked: false, confirmationRequired: false }, "Telegram owner was already unpaired", json);
+  }
+  const confirmation = parsed.values.get("confirm");
+  if (confirmation === undefined) return unpairChallenge(deps, owner, now, json);
+  return await confirmUnpair(deps, { owner, nonce: confirmation, now, context, json });
 }
 
 function runProjectList(
@@ -1359,9 +1518,9 @@ export async function runTelegramAgentCli(
       return await runPair(deps, context, parsed.flags.has("json"));
     }
     if (command === "unpair") {
-      const parsed = parseFlags(argv.slice(1), TOP_LEVEL_FLAGS);
+      const parsed = parseFlags(argv.slice(1), UNPAIR_FLAGS);
       noPositionals(parsed);
-      return runUnpair(deps, parsed.flags.has("json"));
+      return await runUnpair(deps, parsed, context, parsed.flags.has("json"));
     }
     if (command === "memory") {
       if (argv[1] !== "import") throw new CliInputError("Unknown memory command");

@@ -87,6 +87,10 @@ it("registers one telegram-agent CLI with complete operator command metadata", a
   });
   expect(harness.registrations.cli?.commands).toEqual(expect.arrayContaining([
     expect.objectContaining({ name: "pair" }),
+    expect.objectContaining({
+      name: "unpair",
+      usage: "bb telegram-agent unpair [--confirm <nonce>] [--json]",
+    }),
     expect.objectContaining({ name: "project" }),
     expect.objectContaining({ name: "job" }),
     expect.objectContaining({ name: "doctor" }),
@@ -287,17 +291,102 @@ it("pairs through Telegram getMe and marks the one-use link sensitive and expiri
   expect(store.getTelegramIdentity()).toMatchObject({ botId: "123", username: "task_bot" });
 });
 
-it("unpairs the owner and revokes approvals through the operator command", async () => {
+it("requires an identity-bound nonce before unpairing and records a content-free operator audit", async () => {
   const { bb, harness } = await loadPlugin();
   const db = bb.storage.database();
   db.prepare(
     "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', 1, NULL)",
   ).run();
+  db.prepare(
+    "INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run("job-unpair", 700, "private chat content must not enter the audit", "blocked", 1, 1);
+  db.prepare(
+    "INSERT INTO approvals (nonce_hash, job_id, head_sha, expires_at) VALUES (?, ?, ?, ?)",
+  ).run(hashSecret("approval-to-revoke"), "job-unpair", "abc123", Date.now() + 60_000);
 
-  const result = await harness.behavior.runCli(["unpair", "--json"]);
+  const ownerBefore = db.prepare("SELECT * FROM owners").all();
+  const approvalsBefore = db.prepare("SELECT * FROM approvals").all();
+  const pairingCodesBefore = db.prepare("SELECT * FROM pairing_codes").all();
+
+  const challenge = await harness.behavior.runCli(["unpair", "--json"]);
+  expect(challenge.exitCode).toBe(0);
+  const challengeOutput = parseJson(challenge.stdout);
+  expect(challengeOutput).toMatchObject({
+    confirmationRequired: true,
+    expiresInSeconds: 600,
+    sensitive: true,
+    owner: { userId: "7", chatId: "70", pairedAt: 1 },
+  });
+  expect(challengeOutput.nonce).toEqual(expect.any(String));
+  expect(db.prepare("SELECT * FROM owners").all()).toEqual(ownerBefore);
+  expect(db.prepare("SELECT * FROM approvals").all()).toEqual(approvalsBefore);
+  expect(db.prepare("SELECT * FROM pairing_codes").all()).toEqual(pairingCodesBefore);
+  expect(await bb.storage.kv.list("operator-audit/unpair/")).toEqual([]);
+
+  const nonce = String(challengeOutput.nonce);
+  const refused = await harness.behavior.runCli(["unpair", "--confirm", `${nonce}x`, "--json"]);
+  expect(refused.exitCode).toBe(1);
+  expect(openStore(bb.storage).getOwner()).toEqual({ userId: "7", chatId: "70", pairedAt: 1 });
+  expect(db.prepare("SELECT outcome FROM approvals").get()).toEqual({ outcome: null });
+
+  const result = await harness.behavior.runCli(
+    ["unpair", "--confirm", nonce, "--json"],
+    { threadId: "thr_delegated", projectId: "proj_personal" },
+  );
   expect(result.exitCode).toBe(0);
-  expect(parseJson(result.stdout)).toMatchObject({ revoked: true });
+  expect(parseJson(result.stdout)).toMatchObject({ revoked: true, approvalsRevoked: 1 });
   expect(openStore(bb.storage).getOwner()).toBeNull();
+  expect(db.prepare("SELECT outcome FROM approvals").get()).toEqual({ outcome: "revoked" });
+
+  const auditKeys = await bb.storage.kv.list("operator-audit/unpair/");
+  expect(auditKeys).toHaveLength(1);
+  const audit = await bb.storage.kv.get(auditKeys[0]!);
+  expect(audit).toEqual({
+    schemaVersion: 1,
+    operation: "unpair",
+    outcome: "confirmed",
+    occurredAt: expect.any(Number),
+    affectedTelegramIdentity: { userId: "7", chatId: "70", pairedAt: 1 },
+    operatorContext: { threadId: "thr_delegated", projectId: "proj_personal" },
+  });
+  expect(JSON.stringify(audit)).not.toContain(nonce);
+  expect(JSON.stringify(audit)).not.toContain("private chat content");
+});
+
+it("refuses an expired unpair nonce without changing owner state", async () => {
+  const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+  const { bb, harness } = await loadPlugin();
+  bb.storage.database().prepare(
+    "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', 1, NULL)",
+  ).run();
+  const challenge = parseJson((await harness.behavior.runCli(["unpair", "--json"])).stdout);
+
+  now.mockReturnValue(1_600_000);
+  const result = await harness.behavior.runCli(["unpair", "--confirm", String(challenge.nonce), "--json"]);
+
+  expect(result.exitCode).toBe(1);
+  expect(openStore(bb.storage).getOwner()).toEqual({ userId: "7", chatId: "70", pairedAt: 1 });
+  expect(await bb.storage.kv.list("operator-audit/unpair/")).toEqual([]);
+});
+
+it("refuses an unpair nonce after the paired Telegram identity changes", async () => {
+  const { bb, harness } = await loadPlugin();
+  const db = bb.storage.database();
+  db.prepare(
+    "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', 1, NULL)",
+  ).run();
+  const challenge = parseJson((await harness.behavior.runCli(["unpair", "--json"])).stdout);
+  db.prepare(
+    "UPDATE owners SET telegram_user_id = '8', telegram_chat_id = '80', paired_at = 2 WHERE singleton = 1",
+  ).run();
+
+  const result = await harness.behavior.runCli([
+    "unpair", "--confirm", String(challenge.nonce), "--json",
+  ]);
+
+  expect(result.exitCode).toBe(1);
+  expect(openStore(bb.storage).getOwner()).toEqual({ userId: "8", chatId: "80", pairedAt: 2 });
+  expect(await bb.storage.kv.list("operator-audit/unpair/")).toEqual([]);
 });
 
 it("rejects unknown, missing, duplicate, and malformed flags with exit code 2", async () => {

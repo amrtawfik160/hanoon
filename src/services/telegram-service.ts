@@ -23,6 +23,7 @@ export type TelegramServiceDeps = {
     | "getTelegramUpdateAttempts"
     | "reconcileTelegramCursor"
     | "bindTelegramIdentity"
+    | "getTelegramIdentity"
     | "hasUnreleasedAdmissions"
   >;
   client: (token: string) => TelegramServiceClient;
@@ -124,6 +125,16 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
       });
       if (binding === "active_job_conflict") {
         throw configurationError("Telegram bot identity changed while an active job exists (active_job_conflict).");
+      }
+      if (binding === "identity_mismatch") {
+        const stored = deps.store.getTelegramIdentity();
+        const storedIdentity = stored
+          ? `@${stored.username} (${stored.botId})`
+          : "an unknown stored bot";
+        throw configurationError(
+          `Telegram bot identity mismatch (bot_identity_mismatch): stored ${storedIdentity}; ` +
+          `configured token resolves to @${identity.username} (${String(identity.id)}).`,
+        );
       }
       identityBound = true;
       deps.onTokenVerified?.(token);

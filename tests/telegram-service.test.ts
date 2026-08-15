@@ -404,6 +404,36 @@ describe("Telegram ingress service", () => {
     expect(store.getNextTelegramOffset()).toBe(11);
   });
 
+  it("enters needs-configuration without polling or changing state when the bot identity differs", async () => {
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const getUpdates = vi.fn(async () => {
+      abort.abort();
+      return [];
+    });
+    const client = vi.fn(() => ({
+      getMe: vi.fn(async () => ({ id: 456, username: "other_bot" })),
+      getUpdates,
+    })) as TelegramServiceDeps["client"];
+
+    await expect(runTelegramService(
+      serviceDeps(
+        store,
+        client,
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
+        () => ({ ok: true, value: { botToken: "456:secret" } }),
+      ),
+      abort.signal,
+    )).rejects.toMatchObject({
+      name: "NeedsConfigurationError",
+      message: expect.stringMatching(/identity mismatch.*stored.*bot.*123.*configured.*other_bot.*456/i),
+    });
+
+    expect(getUpdates).not.toHaveBeenCalled();
+    expect(store.getTelegramIdentity()).toEqual({ botId: "123", username: "bot", verifiedAt: 1 });
+    expect(store.getOwner()).toEqual({ userId: "7", chatId: "70", pairedAt: 1 });
+  });
+
   it("stops only once a polling conflict is sustained", async () => {
     vi.useFakeTimers();
     const { store } = storeFixture();

@@ -15,6 +15,7 @@ type ThreadProjectionInput = Pick<ListedThread,
 >>;
 
 const THREAD_SCAN_LIMIT = 100;
+const LIST_THREADS_RESULT_BUDGET_BYTES = 5_000;
 const ACTIVE_STATUSES = new Set(["active", "starting", "stopping"]);
 const ACTIVE_RUNTIME_STATUSES = new Set(["active", "starting", "stopping", "provisioning", "host-reconnecting", "waiting-for-host"]);
 const ETA_REASON = "BB does not expose a reliable completion estimate for provider turns";
@@ -102,10 +103,25 @@ export async function listVisibleThreads(input: {
     .filter((thread) => thread.visibility === "visible" && thread.archivedAt === null && thread.deletedAt === null)
     .filter((thread) => matchesFilter(thread, input.status))
     .sort((left, right) => right.updatedAt - left.updatedAt);
+  const projectedThreads: BbThreadProjection[] = [];
+  let byteLimitReached = false;
+  for (const thread of matching.slice(0, input.limit)) {
+    const nextProjection = projectThread(thread, projects, input.now);
+    const candidateProjection = {
+      observedAt: input.now,
+      truncated: true,
+      threads: [...projectedThreads, nextProjection],
+    };
+    if (Buffer.byteLength(JSON.stringify(candidateProjection), "utf8") > LIST_THREADS_RESULT_BUDGET_BYTES) {
+      byteLimitReached = true;
+      break;
+    }
+    projectedThreads.push(nextProjection);
+  }
   return {
     observedAt: input.now,
-    truncated: matching.length > input.limit || threads.length === THREAD_SCAN_LIMIT,
-    threads: matching.slice(0, input.limit).map((thread) => projectThread(thread, projects, input.now)),
+    truncated: byteLimitReached || matching.length > input.limit || threads.length === THREAD_SCAN_LIMIT,
+    threads: projectedThreads,
   };
 }
 

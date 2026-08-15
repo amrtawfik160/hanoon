@@ -66,6 +66,45 @@ function visibleThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntr
   };
 }
 
+it("truncates the visible-thread prefix before its tool result can exceed the safe byte budget", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  harness.sdk.stub("threads.list", async () => Array.from({ length: 10 }, (_, index) => visibleThread({
+    id: `thr_${index}`,
+    title: `${index}-${"x".repeat(700)}`,
+    updatedAt: 10_000 - index,
+  })));
+  harness.sdk.stub("projects.list", async () => [{
+    id: "proj_1",
+    kind: "software",
+    name: "Project",
+    gitRemoteUrl: null,
+    createdAt: 1,
+    updatedAt: 1,
+    sources: [],
+  }]);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+  const serialized = await harness.behavior.callAgentTool(
+    "telegram_agent_list_threads",
+    { status: "active", limit: 10 },
+    controllerToolContext,
+  );
+  if (typeof serialized !== "string") throw new Error("thread list did not return bounded JSON text");
+  const result = JSON.parse(serialized) as { truncated: boolean; threads: unknown[] };
+
+  expect(result.truncated).toBe(true);
+  expect(result.threads.length).toBeGreaterThan(0);
+  expect(result.threads.length).toBeLessThan(10);
+  expect(Buffer.byteLength(serialized, "utf8"))
+    .toBeLessThanOrEqual(CONTROLLER_CAPABILITIES.telegram_agent_list_threads.result_limit);
+});
+
 function backgroundCommand() {
   return {
     id: "cmd_1",
@@ -92,6 +131,13 @@ function parseToolJson(value: unknown): unknown {
   const parsed = JSON.parse(value) as Record<string, unknown>;
   delete parsed._hanoonEvidence;
   return parsed;
+}
+
+function structuredToolError(code: string) {
+  return {
+    content: [{ type: "text", text: JSON.stringify({ error: { code } }) }],
+    isError: true,
+  };
 }
 
 type RuntimeEvidence = Readonly<{
@@ -1001,7 +1047,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     "telegram_agent_list_projects",
     {},
     { threadId: "thr_unrelated", projectId: "proj_personal" },
-  )).rejects.toThrow(/controller|authorized/i);
+  )).resolves.toEqual(structuredToolError("identity_mismatch"));
   const projects = await harness.behavior.callAgentTool(
     "telegram_agent_list_projects",
     {},
@@ -1047,7 +1093,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     "telegram_agent_thread_status",
     { threadId: "thr_hidden" },
     { threadId: "thr_controller", projectId: "proj_personal" },
-  )).rejects.toThrow(/scope|not visible/i);
+  )).resolves.toEqual(structuredToolError("scope_denied"));
 
   const operation = await harness.behavior.callAgentTool(
     "telegram_agent_request_thread_operation",
@@ -1633,7 +1679,7 @@ it.each([
     toolName,
     { jobId: "missing_job" },
     controllerToolContext,
-  )).rejects.toMatchObject({ code: "scope_denied" });
+  )).resolves.toEqual(structuredToolError("scope_denied"));
 });
 
 it.each([
@@ -1801,7 +1847,7 @@ it("denies a valid enabled policy stored under a different project identity", as
     "telegram_agent_start_job",
     { projectId: "proj_1", task: "must not cross project policy identity" },
     controllerToolContext,
-  )).rejects.toMatchObject({ code: "scope_denied" });
+  )).resolves.toEqual(structuredToolError("scope_denied"));
 });
 
 it("reads what a thread is doing so slowness can be explained rather than deflected", async () => {
@@ -1953,7 +1999,7 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     "telegram_agent_send_to_thread",
     { threadId: "thr_hidden", text: "leak" },
     { threadId: "thr_controller", projectId: "proj_personal" },
-  )).rejects.toThrow(/scope|not visible/i);
+  )).resolves.toEqual(structuredToolError("scope_denied"));
 });
 
 it("uses the authorized project host once and interrupts replay after cross-project projection failure", async () => {
@@ -2473,7 +2519,8 @@ it("refuses to delegate for a thread that is not the durable controller", async 
   await expect(harness.behavior.callAgentTool("telegram_agent_delegate", {
     instruction: "compare them",
     tasks: [{ projectId: "proj_a", title: "only", prompt: "only task" }],
-  }, { threadId: "thr_unrelated", projectId: "proj_personal" })).rejects.toThrow(/identity|not authorized/);
+  }, { threadId: "thr_unrelated", projectId: "proj_personal" }))
+    .resolves.toEqual(structuredToolError("identity_mismatch"));
   expect(store.listOpenDelegations(10)).toEqual([]);
 });
 

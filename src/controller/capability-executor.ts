@@ -127,6 +127,15 @@ export class ControllerCapabilityExecutionError extends Error {
   }
 }
 
+function handledCapabilityErrorCode(error: unknown): string | null {
+  if (error instanceof ControllerCapabilityAuthorizationError) return error.code;
+  if (
+    error instanceof ControllerCapabilityExecutionError &&
+    (error.code === "params_invalid" || error.code === "result_limit_exceeded")
+  ) return error.code;
+  return null;
+}
+
 function assertSafeInteger(value: number, field: string): void {
   if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} is invalid`);
 }
@@ -616,15 +625,26 @@ export function registerControllerCapabilityTool<Schema extends z.ZodType>(
     ...(registration.experimental_statusLabels
       ? { experimental_statusLabels: registration.experimental_statusLabels }
       : {}),
-    execute: (params, context) => executeControllerCapability(dependencies, {
-      descriptor: registration.descriptor,
-      params,
-      context,
-      approval: "not_required",
-      resolveScope: (authorized) => registration.resolveScope(params, context, authorized),
-      run: (resolution, authorized) => registration.execute(params, context, resolution, authorized),
-      projectEvidence: (domainResult, resolution) =>
-        registration.projectEvidence(params, context, domainResult, resolution),
-    }),
+    execute: async (params, context) => {
+      try {
+        return await executeControllerCapability(dependencies, {
+          descriptor: registration.descriptor,
+          params,
+          context,
+          approval: "not_required",
+          resolveScope: (authorized) => registration.resolveScope(params, context, authorized),
+          run: (resolution, authorized) => registration.execute(params, context, resolution, authorized),
+          projectEvidence: (domainResult, resolution) =>
+            registration.projectEvidence(params, context, domainResult, resolution),
+        });
+      } catch (error) {
+        const code = handledCapabilityErrorCode(error);
+        if (code === null) throw error;
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: { code } }) }],
+          isError: true,
+        };
+      }
+    },
   });
 }

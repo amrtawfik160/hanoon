@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { createHash } from "node:crypto";
+import { createSecret } from "./crypto";
 import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes";
 import { CAPABILITY_BY_ID } from "./capabilities/catalog";
 import {
@@ -419,12 +420,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
 
   const terminal = new TerminalCommandRunner(bb.sdk);
+  const unpairNonceKey = createSecret(32);
   bb.cli.register({
     name: "telegram-agent",
     summary: "Pair Telegram and manage reviewed BB implementation jobs",
     commands: [
       { name: "pair", summary: "Create a one-use Telegram pairing link", usage: "bb telegram-agent pair [--json]" },
-      { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--json]" },
+      { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--confirm <nonce>] [--json]" },
       { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
       { name: "capability", summary: "Inspect capability evidence and control recipe rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
@@ -445,6 +447,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         modelRouting: "adaptive",
       },
       credentialAccess: credentialAccessService,
+      unpairNonceKey,
+      recordOperatorAudit: async (auditEntry) => {
+        const auditKey = `operator-audit/unpair/${String(auditEntry.occurredAt).padStart(13, "0")}-${createSecret(8)}`;
+        await bb.storage.kv.set(auditKey, auditEntry);
+      },
       revokeAllApprovals: (now) => {
         const db = bb.storage.database();
         const revoke = db.transaction(() => {
