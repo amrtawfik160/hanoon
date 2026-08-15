@@ -15,6 +15,7 @@ import {
   capabilityRoutingSettings,
   controllerCapabilityModelRoute,
   controllerExecutionProfile,
+  controllerExecutionProfiles,
   credentialBrokerConfigFingerprint,
   parseGlobalConfig,
   systemUpkeepEnabled,
@@ -760,9 +761,9 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     pluginId: bb.pluginId,
     now: clock,
     reserveSpawn: (input) => store.reserveControllerSpawn(input),
-    executionProfile: () => {
+    executionProfiles: () => {
       if (!config.ok) throw new Error(config.message);
-      return controllerExecutionProfile(config.value);
+      return controllerExecutionProfiles(config.value);
     },
     downloadImage: async (fileId, maxBytes, signal) => {
       try {
@@ -812,6 +813,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     adapter: controllerAdapter,
     interactionService: controllerInteractionService,
     clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
   });
   const monitors = new MonitorService({
     store,

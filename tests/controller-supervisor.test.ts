@@ -440,7 +440,7 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
   });
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toBe("I couldn't complete that controller turn safely. Please resend your request.");
+    .toBe("That controller turn reached its safety budget, so I stopped it.");
 });
 
 it("leaves a turn parked on an owner question alone however much it has spent", async () => {

@@ -186,7 +186,7 @@ it("does not advance the lifecycle cursor past the omitted 257th reference", asy
   expect(first.inputAccepted).toBe(false);
   expect(first.toolActivityObserved).toBe(false);
   expect(first.totalTokens).toBe(0);
-  expect(first.error).toBeNull();
+  expect(first.failure).toBeNull();
   expect(pageRequests).toEqual([
     { afterSeq: "0", limit: "100" },
     { afterSeq: "100", limit: "100" },
@@ -201,7 +201,12 @@ it("does not advance the lifecycle cursor past the omitted 257th reference", asy
   expect(second.inputAccepted).toBe(true);
   expect(second.toolActivityObserved).toBe(true);
   expect(second.totalTokens).toBe(42);
-  expect(second.error).toBe("Controller provider turn failed");
+  expect(second.failure).toEqual({
+    code: "unknown",
+    retryable: true,
+    willRetry: false,
+    inputAccepted: true,
+  });
   expect(pageRequests).toEqual([
     { afterSeq: "0", limit: "100" },
     { afterSeq: "100", limit: "100" },
@@ -818,7 +823,7 @@ it("delivers the owner's answer back to the blocked BB thread", async () => {
   expect(adapter.answerQuestion).toHaveBeenCalledTimes(1);
 });
 
-it("gives up on a turn that stopped producing events and unblocks the queue", async () => {
+it("starts same-session recovery for a turn that stopped producing events", async () => {
   const { store, fence } = storeFixture("service-stall");
   const turn = submittedTurn(store, fence);
   const service = new LunaControllerService({
@@ -831,9 +836,8 @@ it("gives up on a turn that stopped producing events and unblocks the queue", as
 
   await expect(service.reconcile({ ...fence, signal }, signal)).resolves.toBe(true);
 
-  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
-  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toContain("couldn't complete that controller turn safely");
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", completionContinuations: 1 });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "active", threadId: "thr_controller" });
 });
 
 it("waits indefinitely while the owner still owes the thread an answer", async () => {
@@ -877,7 +881,7 @@ it("hands a message sent mid-answer to the thread already writing it", async () 
   expect(store.getControllerTurn(running.id)?.state).toBe("submitted");
 });
 
-it("fails a mid-answer message when the provider steer result is ambiguous", async () => {
+it("preserves a mid-answer message when the provider steer result is ambiguous", async () => {
   const { store, fence } = storeFixture("service-steer-fails");
   submittedTurn(store, fence);
   const correction = store.enqueueControllerTurn({
@@ -897,9 +901,10 @@ it("fails a mid-answer message when the provider steer result is ambiguous", asy
   await service.reconcile({ ...fence, signal }, signal);
 
   expect(store.getControllerTurn(correction.id)).toMatchObject({
-    state: "failed",
-    lastError: expect.stringContaining("ambiguous"),
+    state: "queued",
+    lastError: expect.stringContaining("uncertain"),
   });
+  expect(store.getControllerTurn(correction.id)?.recoverySourceTurnId).not.toBeNull();
 });
 
 it("retires a parked question when its turn dies, so later messages are not swallowed", () => {
@@ -966,11 +971,11 @@ it("does not replay a message when the provider keeps returning ambiguous steer 
 
   // Bounded: the reconcile loop runs every 250ms while streaming, so an
   // unbounded retry here would hammer BB for as long as the answer takes.
-  expect(steer.mock.calls.length).toBeLessThanOrEqual(3);
-  expect(store.getControllerTurn(correction.id)).toMatchObject({ state: "failed" });
+  expect(steer).toHaveBeenCalledTimes(1);
+  expect(store.getControllerTurn(correction.id)).toMatchObject({ state: "queued" });
 });
 
-it("retires the wedged thread when a turn stalls, so the next message is not stuck behind it", async () => {
+it("keeps the wedged generation only for its bounded same-session correction", async () => {
   const { store, fence } = storeFixture("stall-retires");
   const turn = submittedTurn(store, fence);
   const service = new LunaControllerService({
@@ -983,10 +988,8 @@ it("retires the wedged thread when a turn stalls, so the next message is not stu
 
   await service.reconcile({ ...fence, signal }, signal);
 
-  expect(store.getControllerTurn(turn.id)?.state).toBe("failed");
-  // Failing the turn while leaving the thread wedged means every later message
-  // waits out the busy timeout instead of getting a fresh thread.
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", completionContinuations: 1 });
   const controller = store.getControllerForOwner("7", "7");
-  expect(controller?.threadId).toBeNull();
-  expect(controller?.state).toBe("pending_spawn");
+  expect(controller?.threadId).toBe("thr_controller");
+  expect(controller?.state).toBe("active");
 });

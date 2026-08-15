@@ -42,13 +42,33 @@ export type ControllerInteractionSnapshot = Readonly<{
   payload: unknown;
   resolution?: unknown;
 }>;
+export type ControllerProviderFailureCode =
+  | "startup_timeout"
+  | "process_exit"
+  | "oauth_expired"
+  | "host_disconnected"
+  | "rpc_timeout"
+  | "provider_rejected"
+  | "unknown";
+export type ControllerProviderFailure = Readonly<{
+  code: ControllerProviderFailureCode;
+  retryable: boolean;
+  willRetry: boolean;
+  inputAccepted: boolean;
+}>;
+export type ControllerAssistantDraft = Readonly<{
+  itemId: string | null;
+  text: string;
+}>;
 export type ControllerEventObservation = {
   latestSeq: number;
   inputAccepted: boolean;
   assistantOutputObserved: boolean;
   toolActivityObserved: boolean;
   completed: boolean;
-  error: string | null;
+  failure: ControllerProviderFailure | null;
+  /** Private recovery material. It must never be projected into Telegram. */
+  assistantDraft: ControllerAssistantDraft | null;
   /** Bounded lifecycle references; BB interaction payloads are never event authority. */
   interactionReferences?: readonly ControllerInteractionReference[];
   /** Tool-shaped item starts in this window; the caller accumulates them. */
@@ -59,7 +79,8 @@ export type ControllerEventObservation = {
   totalTokens: number;
 };
 
-type LegacyControllerEventObservation = Omit<ControllerEventObservation, "assistantOutputObserved" | "toolActivityObserved" | "interactionReferences"> & {
+type LegacyControllerEventObservation = Omit<ControllerEventObservation, "assistantOutputObserved" | "toolActivityObserved" | "interactionReferences" | "failure" | "assistantDraft"> & {
+  error: string | null;
   interactionReferences?: readonly ControllerInteractionReference[];
 } & Record<string, unknown>;
 
@@ -77,6 +98,7 @@ type ControllerAdapterMethods = {
     text: string,
     signal: AbortSignal,
     image?: ControllerImage | null,
+    modelFallbackIndex?: number,
   ): Promise<void>;
   /** Redirects a thread that is already working, rather than queueing behind it. */
   steer(
@@ -108,10 +130,11 @@ type ControllerAdapterMethods = {
     resolution: ControllerInteractionResolution,
     signal: AbortSignal,
   ): Promise<void>;
-  status(threadId: string, signal: AbortSignal): Promise<ControllerStatus>;
+  status(threadId: string, signal: AbortSignal, modelFallbackIndex?: number): Promise<ControllerStatus>;
   latestSeq(threadId: string, signal: AbortSignal): Promise<number>;
   events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventResult>;
-  findSpawnCandidate(controllerKey: string, pendingSpawnToken: string, signal: AbortSignal): Promise<ControllerLocation | null>;
+  findSpawnCandidate(controllerKey: string, pendingSpawnToken: string, signal: AbortSignal, modelFallbackIndex?: number): Promise<ControllerLocation | null>;
+  configuredProfileCount?(): number;
 };
 
 export type ControllerAdapter = ControllerAdapterMethods;
@@ -121,6 +144,7 @@ export const MAX_CONTROLLER_EVENT_PAGES = 50;
 const CONTROLLER_THREAD_PAGE_LIMIT = 100;
 const MAX_CONTROLLER_THREAD_PAGES = 50;
 const MAX_CONTROLLER_INTERACTION_REFERENCES = 256;
+export const MAX_CONTROLLER_PRIVATE_DRAFT_CHARS = 4_000;
 
 // Reasoning, plain messages, and plan updates are the model thinking out loud.
 // Everything here reaches outside the model, which is what a budget should bound.
@@ -162,6 +186,44 @@ export class ControllerImagePreparationError extends Error {
 
 function isRecord(candidate: unknown): candidate is Record<string, unknown> {
   return typeof candidate === "object" && candidate !== null && !Array.isArray(candidate);
+}
+
+function boundedDraftTail(text: string): string {
+  return text.length <= MAX_CONTROLLER_PRIVATE_DRAFT_CHARS
+    ? text
+    : text.slice(text.length - MAX_CONTROLLER_PRIVATE_DRAFT_CHARS);
+}
+
+function providerFailure(row: ControllerEventRow, inputAccepted: boolean): ControllerProviderFailure {
+  const data: Record<string, unknown> = isRecord(row.data) ? row.data as Record<string, unknown> : {};
+  const errorInfo: Record<string, unknown> = isRecord(data.errorInfo)
+    ? data.errorInfo as Record<string, unknown>
+    : {};
+  const raw = [data.code, data.message, data.detail, errorInfo.category, errorInfo.providerCode]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+  const httpStatus = typeof errorInfo.httpStatusCode === "number" ? errorInfo.httpStatusCode : null;
+  const willRetry = row.type === "provider/error" && data.willRetry === true;
+  let code: ControllerProviderFailureCode;
+  if (errorInfo.category === "unauthorized" || /oauth[^\n]{0,40}(?:expired|invalid)|token[^\n]{0,40}expired/u.test(raw)) {
+    code = "oauth_expired";
+  } else if (httpStatus === 400 || errorInfo.category === "bad-request" || /\bbad request\b|\bhard 400\b/u.test(raw)) {
+    code = "provider_rejected";
+  } else if (/initiali[sz](?:ation|e)[^\n]{0,60}timeout|startup[^\n]{0,40}timeout/u.test(raw)) {
+    code = "startup_timeout";
+  } else if (/json[- _]?rpc[^\n]{0,60}timeout|\brpc[^\n]{0,40}timeout|steer[^\n]{0,40}timeout/u.test(raw)) {
+    code = "rpc_timeout";
+  } else if (/host[^\n]{0,40}(?:daemon[^\n]{0,20})?disconnect|daemon[^\n]{0,40}unavailable/u.test(raw)) {
+    code = "host_disconnected";
+  } else if (/process[^\n]{0,60}(?:exit|code\s*(?:137|143))|sigkill|sigterm/u.test(raw)) {
+    code = "process_exit";
+  } else {
+    code = "unknown";
+  }
+  const retryable = willRetry || code === "startup_timeout" || code === "process_exit" ||
+    code === "host_disconnected" || code === "rpc_timeout" || code === "unknown";
+  return { code, retryable, willRetry, inputAccepted };
 }
 
 function boundedStringList(rawList: unknown, field: string): string[] {
@@ -314,7 +376,8 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
   public constructor(private readonly dependencies: {
     sdk: BbSdk;
     pluginId: string;
-    executionProfile: () => ControllerExecutionProfile;
+    executionProfile?: () => ControllerExecutionProfile;
+    executionProfiles?: () => readonly ControllerExecutionProfile[];
     now?: () => number;
     reserveSpawn?: (input: {
       controllerKey: string;
@@ -330,6 +393,26 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     ) => Promise<Uint8Array>;
   }) {}
 
+  private profiles(): readonly ControllerExecutionProfile[] {
+    const profiles = this.dependencies.executionProfiles?.() ??
+      (this.dependencies.executionProfile ? [this.dependencies.executionProfile()] : []);
+    if (profiles.length < 1 || profiles.length > 3) {
+      throw new Error("Controller execution profiles must contain one to three entries");
+    }
+    return profiles;
+  }
+
+  private profileAt(index: number): ControllerExecutionProfile {
+    if (!Number.isInteger(index) || index < 0) throw new TypeError("Controller execution profile index is invalid");
+    const profile = this.profiles()[index];
+    if (!profile) throw new Error("Controller execution profile is unavailable");
+    return profile;
+  }
+
+  public configuredProfileCount(): number {
+    return this.profiles().length;
+  }
+
   public async spawn(
     turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
@@ -342,7 +425,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       if (turn.image) throw new ControllerImagePreparationError(true);
       throw error;
     }
-    const execution = this.dependencies.executionProfile();
+    const execution = this.profileAt(turn.modelFallbackIndex);
     if (controller.pendingSpawnToken === null) {
       throw new Error("Controller spawn token is missing");
     }
@@ -388,8 +471,9 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     text: string,
     signal: AbortSignal,
     image: ControllerImage | null = null,
+    modelFallbackIndex = 0,
   ): Promise<void> {
-    const execution = this.dependencies.executionProfile();
+    const execution = this.profileAt(modelFallbackIndex);
     let personal: { projectId: string; hostId: string } | null = null;
     if (image) {
       try {
@@ -461,12 +545,12 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     });
   }
 
-  public async status(threadId: string, signal: AbortSignal): Promise<ControllerStatus> {
+  public async status(threadId: string, signal: AbortSignal, modelFallbackIndex = 0): Promise<ControllerStatus> {
     const thread = await this.dependencies.sdk.threads.get({ threadId, signal });
     if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
     // Switching the configured model can move the conversation to another
     // provider; the old thread cannot run the new model, so it is retired.
-    if (thread.providerId !== controllerProviderFor(this.dependencies.executionProfile().model)) {
+    if (thread.providerId !== controllerProviderFor(this.profileAt(modelFallbackIndex).model)) {
       return "incompatible";
     }
     return thread.status;
@@ -493,7 +577,8 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     let assistantOutputObserved = false;
     let toolActivityObserved = false;
     let completed = false;
-    let error: string | null = null;
+    let failure: ControllerProviderFailure | null = null;
+    let assistantDraft: ControllerAssistantDraft | null = null;
     const interactionReferences = new Map<string, { reference: ControllerInteractionReference; seq: number }>();
     let toolCalls = 0;
     let commandFailures = 0;
@@ -515,7 +600,15 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
         }
         latestSeq = Math.max(latestSeq, row.seq);
         if (row.type === "turn/input/accepted") inputAccepted = true;
-        if (row.type === "item/agentMessage/delta") assistantOutputObserved = true;
+        if (row.type === "item/agentMessage/delta") {
+          assistantOutputObserved = true;
+          const data: Record<string, unknown> = isRecord(row.data) ? row.data as Record<string, unknown> : {};
+          const delta = typeof data.delta === "string" ? data.delta : "";
+          const itemId = typeof data.itemId === "string" && data.itemId.length <= 256 ? data.itemId : null;
+          const currentDraft: ControllerAssistantDraft | null = assistantDraft;
+          const prior: string = currentDraft?.itemId === itemId ? currentDraft.text : "";
+          assistantDraft = { itemId, text: boundedDraftTail(prior + delta) };
+        }
         if (row.type === "turn/completed") completed = true;
         if (row.type === "item/started" && TOOL_ITEM_TYPES.has(row.data.item.type)) {
           toolActivityObserved = true;
@@ -530,7 +623,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
           if (Number.isFinite(total) && total > totalTokens) totalTokens = total;
         }
         if (row.type === "system/error" || row.type === "provider/error") {
-          error = "Controller provider turn failed";
+          failure = providerFailure(row, inputAccepted);
         }
         if (lifecycle) {
           const previous = interactionReferences.get(lifecycle.key);
@@ -554,7 +647,8 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       assistantOutputObserved,
       toolActivityObserved,
       completed,
-      error,
+      failure: failure === null ? null : { ...failure, inputAccepted },
+      assistantDraft,
       interactionReferences: [...interactionReferences.values()].map(({ reference }) => reference),
       toolCalls,
       commandFailures,
@@ -566,9 +660,10 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     controllerKey: string,
     pendingSpawnToken: string,
     signal: AbortSignal,
+    modelFallbackIndex = 0,
   ): Promise<ControllerLocation | null> {
     const personal = await this.resolvePersonalProject(signal);
-    const providerId = controllerProviderFor(this.dependencies.executionProfile().model);
+    const providerId = controllerProviderFor(this.profileAt(modelFallbackIndex).model);
     const candidates = new Map<string, ControllerSpawnTitleIdentity>();
     let offset = 0;
     for (let page = 0; page < MAX_CONTROLLER_THREAD_PAGES; page += 1) {

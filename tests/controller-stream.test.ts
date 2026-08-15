@@ -22,7 +22,8 @@ describe("controller stream projection", () => {
       assistantOutputObserved: true,
       toolActivityObserved: false,
       completed: false,
-      error: null,
+      failure: null,
+      assistantDraft: null,
       interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 10,
@@ -44,7 +45,8 @@ describe("controller stream projection", () => {
       assistantOutputObserved: true,
       toolActivityObserved: false,
       completed: false,
-      error: null,
+      failure: null,
+      assistantDraft: null,
       interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 13,
@@ -66,7 +68,8 @@ describe("controller stream projection", () => {
       assistantOutputObserved: false,
       toolActivityObserved: true,
       completed: false,
-      error: null,
+      failure: null,
+      assistantDraft: null,
       interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 0,

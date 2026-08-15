@@ -388,6 +388,15 @@ export type ToolReceiptClaimInput = ToolReceiptKey & Readonly<{
   generation?: number;
 }>;
 
+export type ControllerFailureCode =
+  | "unknown"
+  | "stalled"
+  | "budget_exceeded"
+  | "oauth_expired"
+  | "provider_rejected"
+  | "recovery_exhausted"
+  | "owner_message_delivery_uncertain";
+
 export type ControllerGeneration = {
   id: string;
   controllerKey: string;
@@ -1036,6 +1045,10 @@ type ControllerTurnRow = {
   evidence_event_seq: number;
   completion_continuations: number;
   accepted_finalization_id: number | null;
+  input_accepted: number;
+  private_draft_item_id: string | null;
+  private_draft_text: string;
+  recovery_source_turn_id: string | null;
   steer_reservation_turn_id: string | null;
   evidence_limit_exceeded_at: number | null;
   stream_text: string;
@@ -1273,6 +1286,7 @@ const MAX_OPEN_DELEGATIONS = 2;
 const MAX_DELEGATION_SUMMARY = 600;
 const MAX_DELEGATION_TITLE = 120;
 const MAX_RECEIPT_RESULT_BYTES = 8_000;
+const MAX_CONTROLLER_PRIVATE_DRAFT_CHARS = 4_000;
 const MAX_EFFECT_KEY = 256;
 const MAX_PIPELINE_OUTPUT_BYTES = 65_536;
 const SAFE_MERGE_FAILURE_REASON = "Merge effect failed safely";
@@ -2063,6 +2077,7 @@ function ensureApprovalOwnershipColumns(db: SqliteDatabase): void {
 }
 
 export type ControllerFailAndRetireOutcome = "retired" | "stale" | "accepted_won";
+export type ControllerRecoveryOutcome = "requeued" | "stale" | "accepted_won" | "exhausted";
 function parseLegacyJson(jsonText: unknown): unknown | null {
   if (typeof jsonText !== "string") return null;
   try {
@@ -2852,9 +2867,16 @@ export interface TelegramAgentStore {
     controllerKey: string;
     expectedThreadId: string;
     error: string;
-    ownerMessage?: string;
+    failureCode?: ControllerFailureCode;
     expectedAcceptedFinalizationId?: number | null;
   }): ControllerFailAndRetireOutcome;
+  beginControllerRecovery(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+    error: string;
+    nextFallbackIndex: number;
+  }): ControllerRecoveryOutcome;
   listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[];
   getPendingControllerTurn(controllerKey: string): ControllerTurnRecord | null;
   claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim;
@@ -3437,6 +3459,19 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     row.evidence_limit_exceeded_at,
     "evidence_limit_exceeded_at",
   );
+  if (row.input_accepted !== 0 && row.input_accepted !== 1) {
+    throw new Error("Persisted controller turn input_accepted must be zero or one");
+  }
+  if (row.private_draft_item_id !== null &&
+      (row.private_draft_item_id.length === 0 || row.private_draft_item_id.length > 256)) {
+    throw new Error("Persisted controller private draft item id is invalid");
+  }
+  if (row.private_draft_text.length > MAX_CONTROLLER_PRIVATE_DRAFT_CHARS) {
+    throw new Error("Persisted controller private draft exceeds its bound");
+  }
+  if (row.recovery_source_turn_id !== null) {
+    assertControllerIdentifier(row.recovery_source_turn_id, "persisted recovery source turn id");
+  }
   return {
     id: row.id,
     updateId: row.telegram_update_id,
@@ -3454,6 +3489,10 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     evidenceEventSeq,
     completionContinuations,
     acceptedFinalizationId,
+    inputAccepted: row.input_accepted === 1,
+    privateDraftItemId: row.private_draft_item_id,
+    privateDraftText: row.private_draft_text,
+    recoverySourceTurnId: row.recovery_source_turn_id,
     evidenceLimitExceededAt,
     streamText: CONTROLLER_PHASE_TEXT[row.stream_phase],
     telegramMessageId: row.telegram_message_id,
@@ -3951,12 +3990,26 @@ function matchThreadInteractionToken(
   return null;
 }
 
-function controllerFailureOutbox(turnId: string, chatId: string, ownerMessage?: string): OutboxInput {
+const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> = {
+  unknown: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
+  stalled: "That controller turn stopped making progress after its recovery attempts, so I ended it safely.",
+  budget_exceeded: "That controller turn reached its safety budget, so I stopped it.",
+  oauth_expired: "The controller provider sign-in has expired. Reconnect that provider before asking it to continue.",
+  provider_rejected: "The controller provider rejected its current model or account configuration. Fix those provider settings before trying again.",
+  recovery_exhausted: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
+  owner_message_delivery_uncertain: "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
+};
+
+function controllerFailureOutbox(
+  turnId: string,
+  chatId: string,
+  failureCode: ControllerFailureCode = "unknown",
+): OutboxInput {
   return {
     logicalKey: `controller:${turnId}:reply`,
     chatId,
     payload: {
-      text: ownerMessage ?? "I couldn't complete that controller turn safely. Please resend your request.",
+      text: CONTROLLER_FAILURE_TEXT[failureCode],
       disable_web_page_preview: true,
     },
   };
@@ -5023,7 +5076,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_turns
             SET state = 'completed', response_text = ?, stream_text = '',
                 stream_phase = 'complete', last_error = NULL, lease_owner = NULL,
-                lease_generation = NULL, completed_at = ?, updated_at = ?
+                lease_generation = NULL, private_draft_item_id = NULL,
+                private_draft_text = '', completed_at = ?, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id = ?`,
@@ -5457,7 +5511,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const turn = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
-                dispatch_after_seq = 0, bb_event_seq = 0, retry_count = retry_count + 1,
+                dispatch_after_seq = 0, bb_event_seq = 0,
                 model_fallback_index = ?,
                 stream_text = '', stream_phase = 'queued', submitted_at = NULL,
                 last_error = NULL, updated_at = ?
@@ -5507,6 +5561,88 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  public beginControllerRecovery(input: ControllerLeaseFence & {
+    turnId: string;
+    controllerKey: string;
+    expectedThreadId: string;
+    error: string;
+    nextFallbackIndex: number;
+  }): ControllerRecoveryOutcome {
+    this.assertControllerMutation(input);
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    assertSafeFailureSummary(input.error);
+    assertNoRawMergeCallback(input.error, "controller recovery error");
+    assertNonNegativeInteger(input.nextFallbackIndex, "nextFallbackIndex");
+    if (input.nextFallbackIndex > 2) throw new TypeError("nextFallbackIndex must be at most 2");
+    return this.db.transaction((): ControllerRecoveryOutcome => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+      const row = this.db.prepare(
+        `SELECT turn.*, controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+          WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+            AND turn.lease_owner = ? AND turn.lease_generation = ?
+            AND controller.state = 'active' AND controller.bb_thread_id = ?`,
+      ).get(
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+        input.expectedThreadId,
+      ) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
+      if (!row) return "stale";
+      if (row.accepted_finalization_id !== null) return "accepted_won";
+      if (row.completion_continuations >= 2) return "exhausted";
+      const openGenerations = this.db.prepare(
+        "SELECT thread_id FROM controller_generations WHERE controller_key = ? AND ended_at IS NULL ORDER BY id ASC",
+      ).all(input.controllerKey) as Array<{ thread_id: string }>;
+      if (openGenerations.length !== 1 || openGenerations[0]?.thread_id !== input.expectedThreadId) {
+        throw new Error("Controller generation invariant failed during recovery");
+      }
+      const recovered = this.db.prepare(
+        `UPDATE controller_turns
+            SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
+                dispatch_after_seq = 0, bb_event_seq = 0, evidence_event_seq = 0,
+                completion_continuations = 2, input_accepted = 0,
+                model_fallback_index = ?, stream_text = '', stream_phase = 'queued',
+                submitted_at = NULL, last_error = ?, updated_at = ?
+          WHERE id = ? AND controller_key = ? AND state = 'submitted'
+            AND lease_owner = ? AND lease_generation = ?
+            AND accepted_finalization_id IS NULL AND completion_continuations < 2`,
+      ).run(
+        input.nextFallbackIndex,
+        input.error,
+        input.now,
+        input.turnId,
+        input.controllerKey,
+        input.ownerId,
+        input.generation,
+      );
+      if (recovered.changes !== 1) throw new Error("Controller turn changed during recovery");
+      const retired = this.db.prepare(
+        `UPDATE controller_threads
+            SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+                state = 'pending_spawn', pending_spawn_token = NULL,
+                capability_subject_id = NULL, capability_profile_id = NULL,
+                capability_profile_revision = 0, last_error = NULL, updated_at = ?
+          WHERE controller_key = ? AND bb_thread_id = ? AND state = 'active'`,
+      ).run(input.now, input.controllerKey, input.expectedThreadId);
+      if (retired.changes !== 1) throw new Error("Controller changed during recovery");
+      const generation = this.db.prepare(
+        `UPDATE controller_generations SET ended_at = ?, end_reason = 'recovery'
+          WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL`,
+      ).run(input.now, input.controllerKey, input.expectedThreadId);
+      if (generation.changes !== 1) throw new Error("Controller generation changed during recovery");
+      persistControllerOutbox(this.db, {
+        logicalKey: `controller:${input.turnId}:reply`,
+        chatId: row.telegram_chat_id,
+        payload: { text: CONTROLLER_PHASE_TEXT.connecting, disable_web_page_preview: true },
+      }, input.now);
+      return "requeued";
+    }).immediate();
+  }
+
   public updateControllerStream(input: ControllerLeaseFence & {
     turnId: string;
     cursor: number;
@@ -5514,12 +5650,24 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     toolCalls?: number;
     commandFailures?: number;
     totalTokens?: number;
+    inputAccepted?: boolean;
+    assistantDraft?: Readonly<{ itemId: string | null; text: string }> | null;
   } & Record<string, unknown>): boolean {
     this.assertControllerMutation(input);
     assertNonNegativeInteger(input.cursor, "cursor");
     assertNonNegativeInteger(input.toolCalls ?? 0, "toolCalls");
     assertNonNegativeInteger(input.commandFailures ?? 0, "commandFailures");
     assertNonNegativeInteger(input.totalTokens ?? 0, "totalTokens");
+    if (input.inputAccepted !== undefined && typeof input.inputAccepted !== "boolean") {
+      throw new TypeError("inputAccepted must be boolean");
+    }
+    if (input.assistantDraft !== undefined && input.assistantDraft !== null) {
+      if (input.assistantDraft.itemId !== null &&
+          (input.assistantDraft.itemId.length === 0 || input.assistantDraft.itemId.length > 256)) {
+        throw new TypeError("assistant draft item id is invalid");
+      }
+      if (typeof input.assistantDraft.text !== "string") throw new TypeError("assistant draft text is invalid");
+    }
     const phases = new Set<ControllerTurnRecord["streamPhase"]>([
       "queued", "connecting", "thinking", "using_tools", "responding", "complete", "failed",
     ]);
@@ -5536,7 +5684,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const phaseText = CONTROLLER_PHASE_TEXT[input.phase];
       const cursorAdvanced = input.cursor > row.bb_event_seq;
       const needsNormalization = row.stream_text !== phaseText || row.stream_phase !== input.phase;
-      if (!cursorAdvanced && !needsNormalization) return false;
+      const assistantDraft = cursorAdvanced ? input.assistantDraft : undefined;
+      const nextDraftText = assistantDraft === undefined || assistantDraft === null
+        ? row.private_draft_text
+        : `${row.private_draft_item_id === assistantDraft.itemId ? row.private_draft_text : ""}${assistantDraft.text}`
+          .slice(-MAX_CONTROLLER_PRIVATE_DRAFT_CHARS);
+      const nextDraftItemId = assistantDraft === undefined || assistantDraft === null
+        ? row.private_draft_item_id
+        : assistantDraft.itemId;
+      const acceptedInNewWindow = cursorAdvanced && input.inputAccepted === true;
+      const needsPrivateUpdate = (acceptedInNewWindow && row.input_accepted === 0) ||
+        nextDraftText !== row.private_draft_text || nextDraftItemId !== row.private_draft_item_id;
+      if (!cursorAdvanced && !needsNormalization && !needsPrivateUpdate) return false;
       // A same-cursor call may scrub one legacy raw stream value, but it does
       // not represent new provider activity. Metrics advance only with the BB
       // cursor; updated_at and the outbox change once for a real cursor advance
@@ -5547,6 +5706,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                 tool_calls = tool_calls + ?,
                 command_failures = command_failures + ?,
                 total_tokens = MAX(total_tokens, ?),
+                input_accepted = MAX(input_accepted, ?),
+                private_draft_item_id = ?, private_draft_text = ?,
                 -- BB reports tokens cumulatively for the whole thread, and a
                 -- controller thread outlives many turns. The first non-zero
                 -- reading of a turn is therefore the thread's prior spend, not
@@ -5566,6 +5727,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         cursorAdvanced ? input.toolCalls ?? 0 : 0,
         cursorAdvanced ? input.commandFailures ?? 0 : 0,
         cursorAdvanced ? input.totalTokens ?? 0 : row.total_tokens,
+        acceptedInNewWindow ? 1 : row.input_accepted,
+        nextDraftItemId,
+        nextDraftText,
         cursorAdvanced ? input.totalTokens ?? 0 : 0,
         input.turnId,
         input.cursor,
@@ -6176,23 +6340,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).run(input.now, input.waitingTurnId, input.controllerKey);
   }
 
-  private failAmbiguousControllerSteer(
-    input: ControllerSteerSettlementInput,
-    row: ControllerSteerSettlementRow,
-  ): void {
-    const error = "Controller steer result was ambiguous; the queued message was not replayed";
-    const failed = this.db.prepare(
+  private preserveAmbiguousControllerSteer(input: ControllerSteerSettlementInput): void {
+    const preserved = this.db.prepare(
       `UPDATE controller_turns
-          SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
-              completed_at = ?, updated_at = ?
+          SET recovery_source_turn_id = ?,
+              last_error = 'Controller steer delivery was uncertain; queued message preserved',
+              updated_at = ?
         WHERE id = ? AND controller_key = ? AND state = 'queued'`,
-    ).run(error, input.now, input.now, input.waitingTurnId, input.controllerKey);
-    if (failed.changes !== 1) return;
-    persistControllerOutbox(
-      this.db,
-      controllerFailureOutbox(input.waitingTurnId, row.telegramChatId),
-      input.now,
-    );
+    ).run(input.runningTurnId, input.now, input.waitingTurnId, input.controllerKey);
+    if (preserved.changes !== 1) throw new Error("Ambiguous controller steer message could not be preserved");
   }
 
   public settleControllerSteer(input: ControllerSteerSettlementInput): ControllerSteerSettlementResult {
@@ -6216,7 +6372,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         this.retryUnappliedControllerSteer(input);
         return "settled";
       }
-      this.failAmbiguousControllerSteer(input, row);
+      this.preserveAmbiguousControllerSteer(input);
       return "settled";
     }).immediate();
   }
@@ -6667,7 +6823,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
-      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.ownerMessage);
+      const outbox = input.ownerMessage === undefined
+        ? controllerFailureOutbox(input.turnId, row.telegram_chat_id)
+        : {
+            logicalKey: `controller:${input.turnId}:reply`,
+            chatId: row.telegram_chat_id,
+            payload: { text: input.ownerMessage, disable_web_page_preview: true },
+          };
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();
@@ -6684,7 +6846,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     controllerKey: string;
     expectedThreadId: string;
     error: string;
-    ownerMessage?: string;
+    failureCode?: ControllerFailureCode;
     expectedAcceptedFinalizationId?: number | null;
   }): ControllerFailAndRetireOutcome {
     this.assertControllerMutation(input);
@@ -6692,9 +6854,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
     assertSafeFailureSummary(input.error);
     assertNoRawMergeCallback(input.error, "controller error");
-    if (input.ownerMessage !== undefined) {
-      assertControllerText(input.ownerMessage, "controller failure message");
-      assertNoRawMergeCallback(input.ownerMessage, "controller failure message");
+    if (input.failureCode !== undefined && !Object.hasOwn(CONTROLLER_FAILURE_TEXT, input.failureCode)) {
+      throw new TypeError("controller failure code is invalid");
     }
     const expectedAcceptedFinalizationId = input.expectedAcceptedFinalizationId ?? null;
     if (expectedAcceptedFinalizationId !== null) {
@@ -6779,7 +6940,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       // never caller prose: an arbitrary text could equal or leak the accepted
       // rendered message or a credential. The internal `error` stays out of the
       // Telegram payload.
-      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id);
+      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.failureCode ?? "unknown");
       persistControllerOutbox(this.db, outbox, input.now);
       return "retired";
     }).immediate();
@@ -6828,7 +6989,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction((): ToolReceiptClaim => {
       const turn = this.db.prepare(
         `SELECT controller_key, state, lease_owner, lease_generation, accepted_finalization_id,
-                steer_reservation_turn_id
+                steer_reservation_turn_id, recovery_source_turn_id
            FROM controller_turns WHERE id = ?`,
       ).get(input.turnId) as {
         controller_key: string;
@@ -6837,6 +6998,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         lease_generation: number | null;
         accepted_finalization_id: number | null;
         steer_reservation_turn_id: string | null;
+        recovery_source_turn_id: string | null;
       } | undefined;
       if (turn && turn.accepted_finalization_id !== null) {
         return { outcome: "finalized" };
@@ -6847,11 +7009,30 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         turn.steer_reservation_turn_id !== null ||
         !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)
       )) return { outcome: "fence_lost" };
-      const existing = this.db.prepare(
+      let inheritedReceipt = false;
+      let existing = this.db.prepare(
         `SELECT state, result_text, last_error, controller_key FROM tool_receipts
           WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?`,
       ).get(input.turnId, input.toolName, input.argsSha256) as
         { state: string; result_text: string | null; last_error: string | null; controller_key: string } | undefined;
+      if (!existing && turn?.recovery_source_turn_id) {
+        existing = this.db.prepare(
+          `SELECT receipt.state, receipt.result_text, receipt.last_error, receipt.controller_key
+             FROM tool_receipts AS receipt
+             JOIN controller_turns AS source ON source.id = receipt.turn_id
+            WHERE receipt.turn_id = ? AND receipt.tool_name = ? AND receipt.args_sha256 = ?
+              AND source.controller_key = ?`,
+        ).get(
+          turn.recovery_source_turn_id,
+          input.toolName,
+          input.argsSha256,
+          input.controllerKey,
+        ) as typeof existing;
+        inheritedReceipt = existing !== undefined;
+      }
+      if (inheritedReceipt && existing?.state === "failed" && existing.last_error === "authorization_failed") {
+        existing = undefined;
+      }
       if (existing && existing.controller_key !== input.controllerKey) return { outcome: "fence_lost" };
       if (existing?.state === "completed") {
         return { outcome: "completed", result: existing.result_text ?? "" };
@@ -6928,9 +7109,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[] {
     assertControllerIdentifier(turnId, "turnId");
     return this.db.prepare(
-      `SELECT tool_name AS toolName, state, result_text AS result FROM tool_receipts
-        WHERE turn_id = ? ORDER BY created_at ASC LIMIT 50`,
-    ).all(turnId) as { toolName: string; state: string; result: string | null }[];
+      `SELECT receipt.tool_name AS toolName, receipt.state, receipt.result_text AS result
+         FROM tool_receipts AS receipt
+        WHERE receipt.turn_id = ? OR receipt.turn_id = (
+          SELECT recovery_source_turn_id FROM controller_turns WHERE id = ?
+        )
+        ORDER BY receipt.created_at ASC LIMIT 50`,
+    ).all(turnId, turnId) as { toolName: string; state: string; result: string | null }[];
   }
 
   public listControllerGenerations(controllerKey: string, limit: number): ControllerGeneration[] {

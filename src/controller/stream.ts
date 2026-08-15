@@ -11,7 +11,7 @@ function nextStreamPhase(
   observation: ControllerEventObservation,
   prior: ControllerStreamPhase,
 ): ControllerStreamPhase {
-  if (observation.error !== null) return "failed";
+  if (observation.failure !== null && !observation.failure.willRetry) return "failed";
   if (observation.completed) return "complete";
   if (observation.assistantOutputObserved) return "responding";
   if (observation.toolActivityObserved) return "using_tools";
@@ -22,33 +22,45 @@ function nextStreamPhase(
 export function normalizeControllerEventObservation(
   observation: ControllerEventResult,
 ): ControllerEventObservation {
-  if ("assistantOutputObserved" in observation && "toolActivityObserved" in observation &&
-      typeof observation.assistantOutputObserved === "boolean" &&
-      typeof observation.toolActivityObserved === "boolean") {
+  const modern = observation as ControllerEventObservation;
+  if ("failure" in observation && typeof modern.assistantOutputObserved === "boolean" &&
+      typeof modern.toolActivityObserved === "boolean") {
     return {
-      latestSeq: observation.latestSeq,
-      inputAccepted: observation.inputAccepted,
-      assistantOutputObserved: observation.assistantOutputObserved,
-      toolActivityObserved: observation.toolActivityObserved,
-      completed: observation.completed,
-      error: observation.error,
-      interactionReferences: observation.interactionReferences ?? [],
-      toolCalls: observation.toolCalls,
-      commandFailures: observation.commandFailures,
-      totalTokens: observation.totalTokens,
+      latestSeq: modern.latestSeq,
+      inputAccepted: modern.inputAccepted,
+      assistantOutputObserved: modern.assistantOutputObserved,
+      toolActivityObserved: modern.toolActivityObserved,
+      completed: modern.completed,
+      failure: modern.failure,
+      assistantDraft: modern.assistantDraft,
+      interactionReferences: modern.interactionReferences ?? [],
+      toolCalls: modern.toolCalls,
+      commandFailures: modern.commandFailures,
+      totalTokens: modern.totalTokens,
     };
   }
+  const legacy = observation as ControllerEventResult & { error: string | null };
   return {
-    latestSeq: observation.latestSeq,
-    inputAccepted: observation.inputAccepted,
-    assistantOutputObserved: false,
-    toolActivityObserved: false,
-    completed: observation.completed,
-    error: observation.error,
-    interactionReferences: observation.interactionReferences ?? [],
-    toolCalls: observation.toolCalls,
-    commandFailures: observation.commandFailures,
-    totalTokens: observation.totalTokens,
+    latestSeq: legacy.latestSeq,
+    inputAccepted: legacy.inputAccepted,
+    assistantOutputObserved: typeof legacy.assistantOutputObserved === "boolean"
+      ? legacy.assistantOutputObserved
+      : false,
+    toolActivityObserved: typeof legacy.toolActivityObserved === "boolean"
+      ? legacy.toolActivityObserved
+      : false,
+    completed: legacy.completed,
+    failure: legacy.error === null ? null : {
+      code: "unknown",
+      retryable: true,
+      willRetry: false,
+      inputAccepted: legacy.inputAccepted,
+    },
+    assistantDraft: null,
+    interactionReferences: legacy.interactionReferences ?? [],
+    toolCalls: legacy.toolCalls,
+    commandFailures: legacy.commandFailures,
+    totalTokens: legacy.totalTokens,
   };
 }
 

@@ -1890,6 +1890,14 @@ UPDATE outbox
  );
 `] as const;
 
+export const CONTROLLER_RECOVERY_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN input_accepted INTEGER NOT NULL DEFAULT 0
+  CHECK (input_accepted IN (0, 1));
+ALTER TABLE controller_turns ADD COLUMN private_draft_item_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN private_draft_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE controller_turns ADD COLUMN recovery_source_turn_id TEXT REFERENCES controller_turns(id);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -1941,4 +1949,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_INTERACTION_REPAIR_MIGRATIONS,
   ...CONTROLLER_FINALIZATION_ENVELOPE_MIGRATIONS,
   ...CONTROLLER_INTERACTION_FINAL_REPAIR_MIGRATIONS,
+  ...CONTROLLER_RECOVERY_MIGRATIONS,
 ] as const;

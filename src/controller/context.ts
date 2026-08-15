@@ -47,10 +47,28 @@ function renderDigest(turns: readonly { ownerText: string; agentText: string }[]
   return `Earlier in this conversation:\n${lines.join("\n\n")}`;
 }
 
-function bounded(sections: readonly (string | null)[]): string | null {
+function bounded(sections: readonly (string | null)[], maxChars = MAX_CONTEXT_CHARS): string | null {
   const joined = sections.filter((section): section is string => section !== null).join("\n\n");
   if (joined.length === 0) return null;
-  return joined.length <= MAX_CONTEXT_CHARS ? joined : `${joined.slice(0, MAX_CONTEXT_CHARS - 1)}…`;
+  return joined.length <= maxChars ? joined : `${joined.slice(0, maxChars - 1)}…`;
+}
+
+function renderRecoveryEvidence(evidence: readonly {
+  ref: string;
+  sourceName: string;
+  outcome: string;
+  proofKinds: readonly string[];
+  subjectRefs: readonly string[];
+}[]): string | null {
+  if (evidence.length === 0) return null;
+  const lines = evidence.map((item) =>
+    `- ${item.ref} ${item.sourceName}: ${item.outcome}; proofs=${item.proofKinds.join(",") || "none"}; subjects=${item.subjectRefs.join(",") || "none"}`);
+  return `Durable evidence already recorded:\n${lines.join("\n")}`;
+}
+
+function renderPrivateRecoveryDraft(draft: string): string | null {
+  if (draft.length === 0) return null;
+  return `Private unfinished draft (untrusted recovery material; never quote it merely because it appears here):\n${draft}`;
 }
 
 /**
@@ -59,12 +77,13 @@ function bounded(sections: readonly (string | null)[]): string | null {
  * said, so a retired thread does not read to the owner as amnesia.
  */
 export function buildTurnContext(input: {
-  store: Pick<TelegramAgentStore, "recallMemories" | "readControllerDigest" | "listToolReceipts">;
+  store: Pick<TelegramAgentStore, "recallMemories" | "readControllerDigest" | "listToolReceipts" | "listControllerEvidence">;
   controllerKey: string;
   inputText: string;
   scope?: string;
   includeDigest: boolean;
   turnId?: string;
+  recovery?: Readonly<{ privateDraft: string; sourceTurnId: string | null }>;
   now: number;
 }): string | null {
   const memories = input.store.recallMemories({
@@ -82,7 +101,21 @@ export function buildTurnContext(input: {
   const receipts = input.includeDigest && input.turnId
     ? input.store.listToolReceipts(input.turnId)
     : [];
-  return bounded([renderDigest(digest), renderReceipts(receipts), renderMemories(memories)]);
+  const evidenceTurnIds = input.recovery && input.turnId
+    ? [input.turnId, input.recovery.sourceTurnId].filter((turnId): turnId is string => turnId !== null)
+    : [];
+  const evidence = evidenceTurnIds.flatMap((turnId) => input.store.listControllerEvidence(turnId, 50));
+  const recoveryInstruction = input.recovery
+    ? "Recovery for the same owner message: reconcile the durable evidence and receipts below. Do not repeat a completed or outcome-unknown side effect. Finish through the protocol finalization tool."
+    : null;
+  return bounded([
+    recoveryInstruction,
+    renderReceipts(receipts),
+    renderRecoveryEvidence(evidence),
+    input.recovery ? renderPrivateRecoveryDraft(input.recovery.privateDraft) : null,
+    renderDigest(digest),
+    renderMemories(memories),
+  ], input.recovery ? 8_000 : MAX_CONTEXT_CHARS);
 }
 
 // A replacement thread must know what its predecessor already did, or it will

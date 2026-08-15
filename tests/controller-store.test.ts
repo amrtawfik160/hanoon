@@ -5,7 +5,7 @@ import type { ControllerTurnRecord } from "../src/controller/models";
 import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
-import { IdempotencyConflictError, openStore } from "../src/storage/store";
+import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
@@ -54,7 +54,7 @@ function nativeEvidenceCandidate(sourceItemId: string) {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(50);
+  expect(ALL_MIGRATIONS).toHaveLength(51);
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
   expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");
@@ -117,6 +117,44 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[47]).toContain("CREATE TABLE controller_interaction_quarantine");
   expect(ALL_MIGRATIONS[48]).toContain("envelope_version");
   expect(ALL_MIGRATIONS[49]).toContain("consumed_at");
+  expect(ALL_MIGRATIONS[50]).toContain("input_accepted");
+  expect(ALL_MIGRATIONS[50]).toContain("private_draft_text");
+  expect(ALL_MIGRATIONS[50]).toContain("recovery_source_turn_id");
+  expect(ALL_MIGRATIONS[50]).not.toMatch(/\b(?:UPDATE|DELETE|DROP)\b/u);
+});
+
+it("upgrades a live legacy controller row after an interrupted recovery migration", () => {
+  const { bb } = createFakePluginHost({ pluginId: `telegram-controller-migration-${fixtureNumber++}` });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, 50));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES (?, ?, ?, 'pending_spawn', ?, ?)`,
+  ).run("owner-legacy-controller", "7", "7", 1_000, 1_000);
+  db.prepare(
+    `INSERT INTO controller_turns (
+       id, telegram_update_id, controller_key, ordinal, input_text, state, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`,
+  ).run("legacy-controller-turn", 9_001, "owner-legacy-controller", 1, "preserve me", 1_000, 1_000);
+
+  db.exec("BEGIN IMMEDIATE");
+  db.exec("ALTER TABLE controller_turns ADD COLUMN input_accepted INTEGER NOT NULL DEFAULT 0 CHECK (input_accepted IN (0, 1))");
+  db.exec("ROLLBACK");
+  expect(db.prepare("SELECT name FROM pragma_table_info('controller_turns') WHERE name = 'input_accepted'").get()).toBeUndefined();
+
+  const store = openStore(bb.storage, bb.storage.kv, () => 2_000);
+
+  expect(store.getControllerTurn("legacy-controller-turn")).toMatchObject({
+    inputText: "preserve me",
+    state: "queued",
+    inputAccepted: false,
+    privateDraftItemId: null,
+    privateDraftText: "",
+    recoverySourceTurnId: null,
+  });
+  expect(db.prepare("SELECT COUNT(*) AS count FROM controller_turns WHERE id = ?")
+    .get("legacy-controller-turn")).toEqual({ count: 1 });
 });
 
 it("pins the exact shipped and controller trust migration bytes in order", () => {
@@ -330,14 +368,14 @@ it("requeues one unaccepted controller turn in a fresh generation without losing
   })).toBe(true);
 
   expect(store.listControllerTurns("owner-7-controller", 10)).toMatchObject([
-    { id: first.id, state: "queued", retryCount: 1, modelFallbackIndex: 1, dispatchAfterSeq: 0 },
+    { id: first.id, state: "queued", retryCount: 0, modelFallbackIndex: 1, dispatchAfterSeq: 0 },
     { updateId: 372, state: "queued", retryCount: 0, modelFallbackIndex: 0 },
   ]);
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
   expect(store.claimNextControllerTurn(fence)).toMatchObject({
     id: first.id,
     state: "dispatching",
-    retryCount: 1,
+    retryCount: 0,
     modelFallbackIndex: 1,
   });
   expect(store.markControllerSpawned({
@@ -359,7 +397,7 @@ it("requeues one unaccepted controller turn in a fresh generation without losing
   expect(store.claimNextControllerTurn(fence)).toMatchObject({
     id: first.id,
     state: "dispatching",
-    retryCount: 2,
+    retryCount: 0,
     modelFallbackIndex: 2,
   });
 });
@@ -395,7 +433,7 @@ it("rolls back an unaccepted retry when its open generation changes after the tu
   const db = bb.storage.database();
   db.exec(`
     CREATE TRIGGER remove_retry_generation
-    AFTER UPDATE OF retry_count ON controller_turns
+    AFTER UPDATE OF model_fallback_index ON controller_turns
     WHEN NEW.id = '${turn.id}'
     BEGIN
       UPDATE controller_generations SET ended_at = 1, end_reason = 'raced'
@@ -714,10 +752,138 @@ it("atomically fails and retires a submitted controller turn with a safe notice"
   // The owner-facing notice is a fixed internally mapped safe message; the
   // caller's bounded internal `error` never reaches the Telegram payload.
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
-    text: "I couldn't complete that controller turn safely. Please resend your request.",
+    text: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
     disable_web_page_preview: true,
   });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toContain("projector ran out");
+});
+
+it.each([
+  ["stalled", /stopped making progress/i],
+  ["budget_exceeded", /safety budget/i],
+  ["oauth_expired", /sign-in has expired/i],
+  ["provider_rejected", /provider settings/i],
+  ["recovery_exhausted", /after recovery/i],
+  ["owner_message_delivery_uncertain", /preserved.*message/i],
+] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
+  const { store } = fixture();
+  const { turn, fence } = submittedTurn(store, `thr_failure_code_${failureCode}`);
+
+  expect(store.failAndRetireControllerTurn({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: `thr_failure_code_${failureCode}`,
+    error: "bounded internal summary",
+    failureCode: failureCode satisfies ControllerFailureCode,
+  })).toBe("retired");
+
+  const text = store.getOutbox(`controller:${turn.id}:reply`)?.payload.text;
+  expect(text).toMatch(expectedText);
+  expect(text).not.toMatch(/resend your request/i);
+  expect(text).not.toContain("bounded internal summary");
+});
+
+it("persists acceptance and a bounded private draft without projecting the draft", () => {
+  const { store } = fixture();
+  const { turn, fence } = submittedTurn(store, "thr_private_draft");
+  const privateDraft = `private-start-${"x".repeat(5_000)}`;
+
+  expect(store.updateControllerStream({
+    ...fence,
+    turnId: turn.id,
+    cursor: 4,
+    phase: "responding",
+    inputAccepted: true,
+    assistantDraft: { itemId: "message-private", text: privateDraft },
+  })).toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    inputAccepted: true,
+    privateDraftItemId: "message-private",
+  });
+  expect(store.getControllerTurn(turn.id)?.privateDraftText).toHaveLength(4_000);
+  expect(JSON.stringify(store.getOutbox(`controller:${turn.id}:reply`))).not.toContain("private-start");
+});
+
+it("atomically retires an accepted broken generation into one restart-safe recovery turn", () => {
+  const { bb, store } = fixture();
+  const { turn, fence } = submittedTurn(store, "thr_recovery_broken");
+  expect(store.updateControllerStream({
+    ...fence,
+    turnId: turn.id,
+    cursor: 5,
+    phase: "responding",
+    inputAccepted: true,
+    assistantDraft: { itemId: "message-recovery", text: "Bounded unfinished answer" },
+  })).toBe(true);
+  const receipt = { turnId: turn.id, toolName: "telegram_agent_cancel", argsSha256: "a".repeat(64) };
+  expect(store.claimToolReceipt({ ...receipt, controllerKey: turn.controllerKey, ...fence })).toEqual({ outcome: "fresh" });
+  store.completeToolReceipt({ ...receipt, result: JSON.stringify({ cancelled: true }), now: fence.now });
+
+  expect(store.beginControllerRecovery({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_recovery_broken",
+    error: "provider process exited",
+    nextFallbackIndex: 0,
+  })).toBe("requeued");
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "queued",
+    completionContinuations: 2,
+    inputAccepted: false,
+    privateDraftText: "Bounded unfinished answer",
+    retryCount: 0,
+  });
+  expect(store.listToolReceipts(turn.id)).toMatchObject([{ toolName: "telegram_agent_cancel", state: "completed" }]);
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
+
+  const restarted = openStore(bb.storage, bb.storage.kv, () => 2_001);
+  expect(restarted.claimNextControllerTurn({ ...fence, now: 2_001 })).toMatchObject({
+    id: turn.id,
+    state: "dispatching",
+    completionContinuations: 2,
+    privateDraftText: "Bounded unfinished answer",
+  });
+});
+
+it("preserves an ambiguously steered owner message and inherits exact receipts", () => {
+  const { store } = fixture();
+  const { turn: running, fence } = submittedTurn(store, "thr_ambiguous_preserve");
+  const waiting = store.enqueueControllerTurn(turnInput(78_001, "actually cancel the second job"));
+  const receipt = { turnId: running.id, toolName: "telegram_agent_cancel", argsSha256: "b".repeat(64) };
+  expect(store.claimToolReceipt({ ...receipt, controllerKey: running.controllerKey, ...fence })).toEqual({ outcome: "fresh" });
+  store.completeToolReceipt({ ...receipt, result: JSON.stringify({ cancelled: true }), now: fence.now });
+  expect(store.reserveControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    expectedThreadId: "thr_ambiguous_preserve",
+  })).toBe(true);
+
+  expect(store.settleControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    outcome: "unknown",
+  })).toBe("settled");
+
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({
+    state: "queued",
+    recoverySourceTurnId: running.id,
+  });
+  expect(store.getOutbox(`controller:${waiting.id}:reply`)).toBeNull();
+  expect(store.claimToolReceipt({
+    turnId: waiting.id,
+    toolName: receipt.toolName,
+    argsSha256: receipt.argsSha256,
+    controllerKey: running.controllerKey,
+    now: 2_001,
+  })).toEqual({ outcome: "completed", result: JSON.stringify({ cancelled: true }) });
 });
 
 it("lets a durable acceptance win an unaccepted fail-and-retire attempt", () => {
@@ -763,7 +929,7 @@ it("lets a durable acceptance win an unaccepted fail-and-retire attempt", () => 
   })).toBe("retired");
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toBe("I couldn't complete that controller turn safely. Please resend your request.");
+    .toBe("I couldn't complete that controller turn safely after recovery. No action was repeated.");
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
     .not.toContain("SECRET accepted answer");
   expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ consumedAt: null });

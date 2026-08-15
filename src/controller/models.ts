@@ -127,6 +127,13 @@ export type ControllerTurnRecord = {
   evidenceEventSeq: number;
   completionContinuations: number;
   acceptedFinalizationId: number | null;
+  /** Whether the provider durably acknowledged this generation's input. */
+  inputAccepted: boolean;
+  /** Private, bounded recovery material; never owner-visible. */
+  privateDraftItemId: string | null;
+  privateDraftText: string;
+  /** Prior turn whose exact receipts protect an ambiguously steered message. */
+  recoverySourceTurnId: string | null;
   evidenceLimitExceededAt: number | null;
   streamText: string;
   telegramMessageId: number | null;

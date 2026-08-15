@@ -1,4 +1,5 @@
 import type {
+  ControllerFailureCode,
   ControllerSteerReservation,
   ControllerSupervisorSteerAttempt,
   TelegramAgentStore,
@@ -13,6 +14,7 @@ import {
   type ControllerLocation,
   type ControllerSteerReconciliation,
   type ControllerStatus,
+  type ControllerProviderFailure,
 } from "./bb-controller";
 import {
   ControllerInteractionService,
@@ -35,6 +37,7 @@ export type LunaControllerServiceDependencies = {
   interactionService?: ControllerInteractionService;
   evidenceProjector: ControllerEvidenceReconciler;
   clock: { now(): number };
+  warn?: (message: string) => void;
 };
 
 type InteractionReconciliationContext = Readonly<{
@@ -99,7 +102,7 @@ export class LunaControllerService {
     if (controller.threadId !== null) {
       let status: ControllerStatus;
       try {
-        status = await this.dependencies.adapter.status(controller.threadId, signal);
+        status = await this.dependencies.adapter.status(controller.threadId, signal, turn.modelFallbackIndex);
       } catch {
         this.fail(turn, fence, "Controller status could not be verified");
         return true;
@@ -135,9 +138,9 @@ export class LunaControllerService {
           const input = this.composeInput(turn, { includeDigest: false });
           if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
           if (turn.image) {
-            await this.dependencies.adapter.send(controller.threadId, input, signal, turn.image);
+            await this.dependencies.adapter.send(controller.threadId, input, signal, turn.image, turn.modelFallbackIndex);
           } else {
-            await this.dependencies.adapter.send(controller.threadId, input, signal);
+            await this.dependencies.adapter.send(controller.threadId, input, signal, null, turn.modelFallbackIndex);
           }
         } catch (error) {
           if (this.handleImagePreparationError(error, turn, fence, signal)) return true;
@@ -235,7 +238,7 @@ export class LunaControllerService {
       if (completedTurn?.state === "completed" && controller.threadId) {
         let statusAfterAcceptance: ControllerStatus | null = null;
         try {
-          statusAfterAcceptance = await this.dependencies.adapter.status(controller.threadId, signal);
+          statusAfterAcceptance = await this.dependencies.adapter.status(controller.threadId, signal, turn.modelFallbackIndex);
         } catch {
           // Delivery is already durable; a status read is only best-effort cleanup.
         }
@@ -267,10 +270,7 @@ export class LunaControllerService {
       turn.awaitingInteractionId === null &&
       this.dependencies.clock.now() - turn.updatedAt >= CONTROLLER_STALL_MS
     ) {
-      // No owner message: the retire path deliberately sends a fixed internally
-      // mapped notice, so caller prose here would be validated and discarded.
-      this.failAndRetire(turn, controller, fence, "Controller turn stopped producing events");
-      return true;
+      return this.requestCompletionContinuation(turn, controller, fence, signal, "stalled");
     }
 
     const evidenceOutcome = await this.reconcileEvidence(controller, turn, fence, signal);
@@ -286,7 +286,7 @@ export class LunaControllerService {
 
     let status: ControllerStatus;
     try {
-      status = await this.dependencies.adapter.status(controller.threadId, signal);
+      status = await this.dependencies.adapter.status(controller.threadId, signal, turn.modelFallbackIndex);
     } catch {
       return false;
     }
@@ -315,7 +315,7 @@ export class LunaControllerService {
       text: turn.streamText,
       phase: turn.streamPhase,
     });
-    if (projected.cursor > turn.bbEventSeq) {
+    if (projected.cursor >= turn.bbEventSeq) {
       this.dependencies.store.updateControllerStream({
         ...fenceAt(fence, this.dependencies.clock.now()),
         turnId: turn.id,
@@ -324,6 +324,8 @@ export class LunaControllerService {
         toolCalls: observation.toolCalls,
         commandFailures: observation.commandFailures,
         totalTokens: observation.totalTokens,
+        inputAccepted: observation.inputAccepted || observation.failure?.inputAccepted === true,
+        assistantDraft: observation.assistantDraft,
       });
     }
     const refreshedAt = this.dependencies.clock.now();
@@ -358,7 +360,8 @@ export class LunaControllerService {
         const waiting = parked === null
           ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
           : null;
-        if (waiting && !waiting.image && waiting.retryCount < MAX_STEER_ATTEMPTS) {
+        if (waiting && !waiting.image && waiting.recoverySourceTurnId === null &&
+            waiting.retryCount < MAX_STEER_ATTEMPTS) {
           if (signal.aborted || !this.dependencies.store.reserveControllerSteer({
             ...fenceAt(fence, this.dependencies.clock.now()),
             runningTurnId: turn.id,
@@ -395,43 +398,48 @@ export class LunaControllerService {
         return true;
       }
       if (parked === null && refreshedAt - turn.updatedAt >= CONTROLLER_STALL_MS) {
-        this.failAndRetire(
-          turn,
-          controller,
-          fence,
-          "Controller turn stopped producing events",
-          "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
-        );
+        return this.requestCompletionContinuation(turn, controller, fence, signal, "stalled");
       }
       return true;
     }
-    const providerError = status === "error" || observation.error !== null;
+    const statusFailure = this.failureForStatus(status, turn.inputAccepted);
+    const failure = status === "missing" || status === "incompatible"
+      ? statusFailure
+      : observation.failure ?? statusFailure;
+    const providerError = failure !== null;
     if (accepted && (providerError || status === "idle" || observation.completed)) {
       return await this.completeAccepted(turn, controller, fence, providerError);
     }
-    if (providerError) {
-      if (
-        !observation.inputAccepted &&
-        turn.retryCount === 0 &&
-        turn.modelFallbackIndex < 2 &&
-        this.dependencies.store.retryUnacceptedControllerTurn({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId: turn.id,
-        controllerKey: controller.controllerKey,
-        expectedThreadId: controller.threadId,
-        nextFallbackIndex: turn.modelFallbackIndex + 1,
-      })
-      ) return true;
-      this.failAndRetire(turn, controller, fence, "Controller provider turn failed");
+    if (failure?.willRetry) {
+      this.warnFailure("provider_retry", turn, controller, failure);
       return true;
     }
-    if (status === "missing" || status === "incompatible") {
-      this.failAndRetire(
-        turn,
-        controller,
-        fence,
-        status === "missing" ? "Controller conversation became unavailable" : "Controller conversation uses an incompatible provider",
-      );
+    if (failure) {
+      this.warnFailure("provider_failure", turn, controller, failure);
+      if (failure.code === "oauth_expired" || failure.code === "provider_rejected") {
+        this.failAndRetire(turn, controller, fence, `Controller permanent failure: ${failure.code}`, failure.code);
+        return true;
+      }
+      const inputAccepted = turn.inputAccepted || observation.inputAccepted || failure.inputAccepted;
+      if (turn.completionContinuations >= 2) {
+        this.failAndRetire(turn, controller, fence, `Controller recovery failed: ${failure.code}`, "recovery_exhausted");
+        return true;
+      }
+      const profileCount = this.configuredProfileCount();
+      if (!inputAccepted && turn.modelFallbackIndex + 1 < profileCount) {
+        this.dependencies.store.retryUnacceptedControllerTurn({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          turnId: turn.id,
+          controllerKey: controller.controllerKey,
+          expectedThreadId: controller.threadId,
+          nextFallbackIndex: turn.modelFallbackIndex + 1,
+        });
+        return true;
+      }
+      if (inputAccepted) {
+        return this.beginFreshRecovery(turn, controller, fence, failure.code);
+      }
+      this.failAndRetire(turn, controller, fence, `Controller profiles exhausted: ${failure.code}`, "recovery_exhausted");
       return true;
     }
     if (status === "idle" || observation.completed) return this.requestCompletionContinuation(turn, controller, fence, signal);
@@ -550,7 +558,7 @@ export class LunaControllerService {
         this.dependencies.store.getAnsweredControllerInteraction(controller.controllerKey)?.turnId === turn.id) return true;
     let status: ControllerStatus;
     try {
-      status = await this.dependencies.adapter.status(controller.threadId!, signal);
+      status = await this.dependencies.adapter.status(controller.threadId!, signal, turn.modelFallbackIndex);
     } catch {
       return false;
     }
@@ -566,14 +574,7 @@ export class LunaControllerService {
     const current = this.dependencies.store.getControllerTurn(turn.id);
     if (current?.state === "submitted" && current.awaitingInteractionId === null &&
         this.dependencies.clock.now() - current.updatedAt >= CONTROLLER_STALL_MS) {
-      this.failAndRetire(
-        current,
-        controller,
-        fence,
-        "Controller evidence reconciliation stalled",
-        "That one stalled, so I gave up on it and started a fresh session. Ask me again.",
-      );
-      return true;
+      return this.requestCompletionContinuation(current, controller, fence, signal, "stalled");
     }
     return false;
   }
@@ -809,22 +810,90 @@ export class LunaControllerService {
     return true;
   }
 
+  private configuredProfileCount(): number {
+    const count = this.dependencies.adapter.configuredProfileCount?.() ?? 1;
+    if (!Number.isInteger(count) || count < 1 || count > 3) {
+      throw new Error("Controller adapter returned an invalid execution profile count");
+    }
+    return count;
+  }
+
+  private failureForStatus(status: ControllerStatus, inputAccepted: boolean): ControllerProviderFailure | null {
+    if (status === "missing") {
+      return { code: "host_disconnected", retryable: true, willRetry: false, inputAccepted };
+    }
+    if (status === "incompatible") {
+      return { code: "provider_rejected", retryable: false, willRetry: false, inputAccepted };
+    }
+    if (status === "error") {
+      return { code: "unknown", retryable: true, willRetry: false, inputAccepted };
+    }
+    return null;
+  }
+
+  private warnFailure(
+    stage: string,
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    failure: ControllerProviderFailure,
+  ): void {
+    this.dependencies.warn?.(JSON.stringify({
+      event: "controller_failure",
+      stage,
+      turnId: turn.id,
+      controllerThreadId: controller.threadId,
+      code: failure.code,
+      retryable: failure.retryable,
+      willRetry: failure.willRetry,
+      inputAccepted: failure.inputAccepted,
+      executionProfileAttempt: turn.modelFallbackIndex + 1,
+      recoveryAttempt: turn.completionContinuations >= 2 ? 1 : 0,
+    }));
+  }
+
+  private async beginFreshRecovery(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    reason: string,
+    terminalFailureCode: ControllerFailureCode = "recovery_exhausted",
+  ): Promise<boolean> {
+    if (!controller.threadId) return true;
+    const profileCount = this.configuredProfileCount();
+    const nextFallbackIndex = profileCount === 1
+      ? 0
+      : (turn.modelFallbackIndex + 1) % profileCount;
+    const outcome = this.dependencies.store.beginControllerRecovery({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      expectedThreadId: controller.threadId,
+      error: `Controller recovery: ${reason}`,
+      nextFallbackIndex,
+    });
+    if (outcome === "accepted_won") return this.completeAccepted(turn, controller, fence, true);
+    if (outcome === "exhausted") {
+      this.failAndRetire(turn, controller, fence, "Controller recovery attempts exhausted", terminalFailureCode);
+    }
+    return true;
+  }
+
   private async requestCompletionContinuation(
     turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
     fence: EffectFence,
     signal: AbortSignal,
+    terminalFailureCode: ControllerFailureCode = "recovery_exhausted",
   ): Promise<boolean> {
     if (!controller.threadId) return true;
     let highWater: number;
     try {
       highWater = await this.dependencies.adapter.latestSeq(controller.threadId, signal);
     } catch {
-      return false;
+      return this.beginFreshRecovery(turn, controller, fence, "event high-water unavailable", terminalFailureCode);
     }
     if (!Number.isSafeInteger(highWater) || highWater < 0) {
-      this.failAndRetire(turn, controller, fence, "Controller event high-water was invalid");
-      return true;
+      return this.beginFreshRecovery(turn, controller, fence, "event high-water invalid", terminalFailureCode);
     }
     const claim = this.dependencies.store.claimControllerCompletionContinuation({
       ...fenceAt(fence, this.dependencies.clock.now()),
@@ -834,17 +903,49 @@ export class LunaControllerService {
     });
     if (claim === "stale") return true;
     if (claim === "already_claimed") {
-      this.failAndRetire(turn, controller, fence, "Controller turn ended without an accepted finalization");
-      return true;
+      if (turn.completionContinuations >= 2) {
+        this.failAndRetire(
+          turn,
+          controller,
+          fence,
+          "Controller recovery ended without an accepted finalization",
+          terminalFailureCode,
+        );
+        return true;
+      }
+      return this.beginFreshRecovery(
+        turn,
+        controller,
+        fence,
+        "same-session correction was insufficient",
+        terminalFailureCode,
+      );
     }
     if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
-      this.failAndRetire(turn, controller, fence, "Controller continuation fence was lost before send");
-      return true;
+      return this.beginFreshRecovery(
+        turn,
+        controller,
+        fence,
+        "correction fence was lost before send",
+        terminalFailureCode,
+      );
     }
     try {
-      await this.dependencies.adapter.send(controller.threadId, CONTROLLER_COMPLETION_RECOVERY_PROMPT, signal);
+      await this.dependencies.adapter.send(
+        controller.threadId,
+        CONTROLLER_COMPLETION_RECOVERY_PROMPT,
+        signal,
+        null,
+        turn.modelFallbackIndex,
+      );
     } catch {
-      this.failAndRetire(turn, controller, fence, "Controller continuation outcome is uncertain");
+      return this.beginFreshRecovery(
+        turn,
+        controller,
+        fence,
+        "correction outcome was uncertain",
+        terminalFailureCode,
+      );
     }
     return true;
   }
@@ -854,7 +955,7 @@ export class LunaControllerService {
     controller: ControllerThreadRecord,
     fence: EffectFence,
     error: string,
-    ownerMessage?: string,
+    failureCode: ControllerFailureCode = "unknown",
   ): boolean {
     if (!controller.threadId) return false;
     return this.dependencies.store.failAndRetireControllerTurn({
@@ -863,7 +964,7 @@ export class LunaControllerService {
       controllerKey: controller.controllerKey,
       expectedThreadId: controller.threadId,
       error,
-      ownerMessage,
+      failureCode,
     }) === "retired";
   }
 
@@ -933,7 +1034,7 @@ export class LunaControllerService {
       controller,
       fence,
       "Controller turn exceeded its budget",
-      decision.ownerMessage,
+      "budget_exceeded",
     );
     return true;
   }
@@ -971,6 +1072,7 @@ export class LunaControllerService {
         controller.controllerKey,
         pendingSpawnToken,
         signal,
+        turn.modelFallbackIndex,
       );
     } catch {
       this.fail(turn, fence, "Controller spawn candidates are ambiguous");
@@ -1010,6 +1112,7 @@ export class LunaControllerService {
           controller.controllerKey,
           pendingSpawnToken,
           signal,
+          turn.modelFallbackIndex,
         );
       } catch {
         candidate = null;
@@ -1021,12 +1124,16 @@ export class LunaControllerService {
   }
 
   private composeInput(turn: ControllerTurnRecord, options: { includeDigest: boolean }): string {
+    const recovery = turn.completionContinuations >= 2 || turn.recoverySourceTurnId !== null
+      ? { privateDraft: turn.privateDraftText, sourceTurnId: turn.recoverySourceTurnId }
+      : undefined;
     const context = buildTurnContext({
       store: this.dependencies.store,
       controllerKey: turn.controllerKey,
       inputText: turn.inputText,
-      includeDigest: options.includeDigest,
+      includeDigest: options.includeDigest || recovery !== undefined,
       turnId: turn.id,
+      recovery,
       now: this.dependencies.clock.now(),
     });
     return composeTurnInput(context, turn.inputText);
