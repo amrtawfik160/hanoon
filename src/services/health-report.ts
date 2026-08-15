@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { MaxConcurrentJobs } from "../autonomy/models";
 import type { JobLaneSnapshot } from "./job-lane-runner";
+import { inspectRuntimeIdentity, type ActivationHealth, type RuntimeIdentity } from "./runtime-identity";
 
 type SqliteDatabase = Database.Database;
 
@@ -35,6 +36,7 @@ export type HealthReport = {
   monitors: { armed: number; nextDueAt: number | null; failed: number };
   memory: { live: number; searchable: boolean };
   database: { integrity: string };
+  activation: ActivationHealth | null;
 };
 
 function count(db: SqliteDatabase, sql: string, ...params: unknown[]): number {
@@ -56,6 +58,7 @@ export function buildHealthReport(
   now: number,
   maxConcurrentJobs: MaxConcurrentJobs | null,
   lanes: JobLaneSnapshot,
+  runtimeIdentity?: RuntimeIdentity,
 ): HealthReport {
   const lease = db.prepare("SELECT owner_id, generation, lease_expires_at FROM executor_lease WHERE singleton = 1")
     .get() as { owner_id: string | null; generation: number | null; lease_expires_at: number | null } | undefined;
@@ -166,6 +169,7 @@ export function buildHealthReport(
       searchable: isSearchable(db),
     },
     database: { integrity: integrityCheck(db) },
+    activation: runtimeIdentity ? inspectRuntimeIdentity(db, runtimeIdentity) : null,
   };
 
   if (!report.executor.current) report.problems.push("the executor lease is not current");
@@ -176,6 +180,7 @@ export function buildHealthReport(
   if (report.monitors.failed > 0) report.problems.push(`${report.monitors.failed} monitor(s) failed`);
   if (!report.memory.searchable) report.problems.push("memory search is unavailable");
   if (report.database.integrity !== "ok") report.problems.push(`database integrity: ${report.database.integrity}`);
+  if (report.activation && !report.activation.ok) report.problems.push(...report.activation.problems);
   report.ok = report.problems.length === 0;
   return report;
 }

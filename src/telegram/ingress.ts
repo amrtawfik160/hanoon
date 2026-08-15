@@ -20,6 +20,7 @@ import {
 import { detectStandingInstruction } from "../controller/context";
 import { containsCredentialLikeText } from "../domain/state-machine";
 import type { HealthReport } from "../services/health-report";
+import { activationSummary } from "../services/runtime-identity";
 import {
   telegramUpdateSchema,
   type SendMessagePayload,
@@ -879,9 +880,13 @@ export class TelegramIngress {
     if (!this.health) return "Health reporting is unavailable.";
     const report = this.health(now);
     const paused = this.pausedLine();
+    const activation = report.activation === null
+      ? []
+      : [`Activation: ${report.activation.ok ? "current" : "ACTIVATION MISMATCH"} (${activationSummary(report.activation)})`];
     if (report.ok && paused === null) {
       return [
         "All good.",
+        ...activation,
         `Executor: running (generation ${report.executor.generation ?? "none"})`,
         `Queue: ${report.work.pendingEffects} job step(s), ${report.delivery.pendingOutbox} message(s) waiting`,
         `Watching: ${report.monitors.armed} monitor(s)`,
@@ -889,6 +894,7 @@ export class TelegramIngress {
       ].join("\n");
     }
     return [
+      ...activation,
       report.problems.length > 0
         ? `Problems:\n${report.problems.map((problem) => `- ${problem}`).join("\n")}`
         : "Running, but not everything is taking work.",

@@ -106,6 +106,11 @@ import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
 import { runProductionStage } from "./services/production-runner";
 import { CapabilityInventoryService } from "./services/capability-inventory-service";
+import {
+  captureRuntimeIdentity,
+  inspectRuntimeIdentity,
+  type ActivationHealth,
+} from "./services/runtime-identity";
 
 function clock(): number {
   return Date.now();
@@ -116,7 +121,8 @@ function reviewLineageScopeId(jobId: string, reviewStage: string): string {
   return `review-lineage:${digest}`;
 }
 
-export async function createPlugin(bb: BbPluginApi): Promise<void> {
+export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise<void> {
+  const runtimeIdentity = captureRuntimeIdentity(pluginRoot, clock());
   const settings = bb.settings.define({
     botToken: { type: "string", label: "Telegram bot token", secret: true },
     bbAppBaseUrl: { type: "string", label: "BB app base URL", default: "" },
@@ -278,7 +284,32 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()), store);
   const executorNudge = new ExecutorNudge();
   const laneSnapshots = new JobLaneSnapshotProvider();
+
+  const reportActivationProblem = (activation: ActivationHealth | null): void => {
+    if (activation && !activation.ok) {
+      bb.status.needsConfiguration(
+        `Plugin activation mismatch: ${activation.problems.join("; ")} (source ${activation.sourceRoot})`,
+      );
+    }
+  };
+  const runtimeHealth = (): ActivationHealth => {
+    const activation = inspectRuntimeIdentity(bb.storage.database(), runtimeIdentity);
+    reportActivationProblem(activation);
+    return activation;
+  };
+  const pluginHealth = (now: number) => {
+    const report = buildHealthReport(
+      bb.storage.database(),
+      now,
+      config.ok ? config.value.maxConcurrentJobs : null,
+      laneSnapshots.snapshot(),
+      runtimeIdentity,
+    );
+    reportActivationProblem(report.activation);
+    return report;
+  };
   if (!config.ok) bb.status.needsConfiguration(config.message);
+  else reportActivationProblem(runtimeHealth());
 
   let credentialConfig: CredentialBrokerConfigResult = parseCredentialBrokerConfig(await settings.get());
   let credentialFingerprint = credentialBrokerConfigFingerprint(credentialConfig);
@@ -369,12 +400,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         signal ?? new AbortController().signal,
       );
     },
-    health: (now) => buildHealthReport(
-      bb.storage.database(),
-      now,
-      config.ok ? config.value.maxConcurrentJobs : null,
-      laneSnapshots.snapshot(),
-    ),
+    health: pluginHealth,
     notify: () => executorNudge.notify(),
     now: clock,
     credentialAccess: credentialAccessService,
@@ -447,6 +473,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         modelRouting: "adaptive",
       },
       credentialAccess: credentialAccessService,
+      runtime: runtimeHealth,
       unpairNonceKey,
       recordOperatorAudit: async (auditEntry) => {
         const auditKey = `operator-audit/unpair/${String(auditEntry.occurredAt).padStart(13, "0")}-${createSecret(8)}`;
@@ -750,12 +777,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     bb: { sdk: bb.sdk },
     collectGateInput,
   });
-  const health = (now: number) => buildHealthReport(
-    bb.storage.database(),
-    now,
-    config.ok ? config.value.maxConcurrentJobs : null,
-    laneSnapshots.snapshot(),
-  );
+  const health = pluginHealth;
   const ingress = new TelegramIngress({
     store,
     telegram: telegramTransport,

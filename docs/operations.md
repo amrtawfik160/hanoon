@@ -10,7 +10,7 @@ Send `/health` in the paired chat. It is answered from durable state rather than
 /health
 ```
 
-A healthy `/health` reply confirms the executor is running and summarizes queued job steps, waiting messages, armed monitors, and stored memories. The durable health report used by controller health inspection additionally separates the configured cap, admitted, draining and queued counts, occupied slots, available slots, pipeline/control lane use, oldest queue age, and held project/repository/production resource counts. An invalid cap is reported as a configuration problem rather than replaced with the default. An unhealthy reply also names executor, dead-letter, Telegram, monitor, memory-search, and database-integrity problems.
+A healthy `/health` reply confirms the executor is running and summarizes queued job steps, waiting messages, armed monitors, and stored memories. It also prints `Activation: current` with the registered source root, loaded build fingerprint, load time, and `schema=applied/expected` migration identity. `ACTIVATION MISMATCH` means the process is stale or its database is not at the schema expected by the loaded code; do not treat `running` as success. The durable health report used by controller health inspection additionally separates the configured cap, admitted, draining and queued counts, occupied slots, available slots, pipeline/control lane use, oldest queue age, and held project/repository/production resource counts. An invalid cap is reported as a configuration problem rather than replaced with the default. An unhealthy reply also names executor, dead-letter, Telegram, monitor, memory-search, database-integrity, and activation problems.
 
 From a shell:
 
@@ -21,7 +21,7 @@ bb telegram-agent doctor proj_7f3d2a91
 bb plugin logs telegram-agent -n 50
 ```
 
-A healthy loaded plugin reports `running` with both `telegram-ingress` and `job-executor` services running. The global doctor requires a configured token and paired owner, and always reports the credential broker section covered below. The project doctor reports every failing prerequisite and returns a non-zero exit code if the project is not ready.
+`bb plugin list --json` is only a host lifecycle report: it can say `running` while the loaded source or schema is stale. Use `bb telegram-agent doctor --json` and require the `plugin activation` row to pass; its JSON includes the same source, build, and schema identity. The global doctor requires a configured token and paired owner, and always reports the credential broker section covered below. The project doctor reports every failing prerequisite and returns a non-zero exit code if the project is not ready.
 
 Use `--json` on Telegram Agent commands when another tool must consume the result.
 
@@ -196,14 +196,34 @@ Unpairing revokes the owner mapping, controller access, pending controller opera
 
 ## Restart and recovery
 
-Reload after source changes or to restart both plugin services:
+BB reloads the source root recorded in the installed plugin registration. It does not select the checkout that happens to be your current directory, and the plugin cannot change that host behavior. Check the registered source before deploying:
+
+```bash
+bb plugin source telegram-agent --json
+```
+
+The `resolved` path in that output must be the source root containing the code and migration you deployed. Then reload and verify the activation identity, not just the lifecycle line:
 
 ```bash
 bb plugin reload telegram-agent
 bb plugin list --json
+bb telegram-agent doctor --json
 ```
 
 The plugin resumes from durable controller/job/effect/outbox state. The executor reacquires its generation-fenced lease and reconciles each occupied job before adopting that job's held claims into the new generation. After adoption it rechecks active workers every ten seconds, in addition to event-driven reconciliation. It never adopts foreign claims.
+
+If reload leaves the activation stale, use a full disable/enable cycle. Do not run the two commands back-to-back: wait until the plugin is `disabled` and its services are gone, then keep a pause of at least 12 seconds before enabling it. Wait longer if the host still reports a service or `degraded` state.
+
+```bash
+bb plugin disable telegram-agent
+bb plugin list --json
+# After disabled and with no services remaining, wait at least 12 seconds.
+bb plugin enable telegram-agent
+bb plugin list --json
+bb telegram-agent doctor --json
+```
+
+After deploying a migration, require the doctor activation row and `/health` to show matching `schema=applied/expected` values, then verify the migrated table or columns. If inspecting SQLite directly, first copy the live database and open the copy read-only; query `_bb_migrations` and the relevant `PRAGMA table_info(...)`. A `running` status by itself does not prove that the migration or the new code is live.
 
 Important recovery behavior:
 

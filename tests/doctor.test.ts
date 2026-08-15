@@ -127,6 +127,7 @@ it("reports individual readiness rows for every Telegram, BB, host, provider, an
   expect(result.stderr).toBe("");
   const output = parseDoctor(result.stdout);
   expect(output.checks.map((check) => check.name)).toEqual(expect.arrayContaining([
+    "plugin activation",
     "token presence",
     "owner pairing",
     "enabled project",
@@ -139,6 +140,7 @@ it("reports individual readiness rows for every Telegram, BB, host, provider, an
     "gh repo view",
     "PR merge SDK availability",
   ]));
+  expect(output.checks.find((check) => check.name === "plugin activation")?.summary).toMatch(/source=.*build=.*schema=/u);
   expect(output.checks.every((check) => check.status === "pass")).toBe(true);
   expect(commands.size).toBe(2);
   expect([...commands.values()]).toEqual(expect.arrayContaining([
