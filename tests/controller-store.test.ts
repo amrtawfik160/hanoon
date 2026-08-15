@@ -54,7 +54,7 @@ function nativeEvidenceCandidate(sourceItemId: string) {
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(51);
+  expect(ALL_MIGRATIONS).toHaveLength(52);
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
   expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");
@@ -121,6 +121,7 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[50]).toContain("private_draft_text");
   expect(ALL_MIGRATIONS[50]).toContain("recovery_source_turn_id");
   expect(ALL_MIGRATIONS[50]).not.toMatch(/\b(?:UPDATE|DELETE|DROP)\b/u);
+  expect(ALL_MIGRATIONS[51]).toContain("thread_follow_up_json");
 });
 
 it("upgrades a live legacy controller row after an interrupted recovery migration", () => {

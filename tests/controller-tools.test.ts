@@ -237,8 +237,8 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned when the trust kernel merged with this branch's tool surface:
   // start_job gained `path`/`separateWork`, create_thread and send_to_thread
   // gained `attachOwnerImage`, watch refuses schedules that poll live work, and
-  // watch now states that any visible thread can be watched.
-  expect(digest).toBe("c3310a516584d3ef2858a7f5b34bd168cc3cca2f6494b952f63b7dc4588dd7b5");
+  // watch now distinguishes tool-created watches from evidence-backed CLI work.
+  expect(digest).toBe("a19a230f021d64edc174b96310ad8415ca028216cc2cfa126785a3d43b3f2286");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",

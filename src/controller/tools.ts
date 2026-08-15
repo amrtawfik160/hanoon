@@ -1853,7 +1853,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[14],
-    description: "Set a durable monitor that wakes you later so you can act without the owner asking again. Use thread_idle to watch any visible BB thread until it finishes or fails, whether or not you started it — the plugin already hears BB events in real time. Threads you start or message are watched for you automatically. Use a schedule only for clock time, never to poll a running thread or job. Write the instruction to your future self, in full, because you will only receive that text.",
+    description: "Set a durable monitor that wakes you later so you can act without the owner asking again. Use thread_idle to watch any visible BB thread until it finishes or fails, whether or not you started it — the plugin already hears BB events in real time. Threads started or messaged through the controller thread tools are watched automatically. CLI-created work is followed automatically only when controller evidence records its exact thread:<id> reference; set thread_idle yourself when that evidence may be absent. Use a schedule only for clock time, never to poll a running thread or job. Write the instruction to your future self, in full, because you will only receive that text.",
     experimental_statusLabels: { pending: "Setting a monitor", completed: "Monitor set" },
     parameters: z.discriminatedUnion("kind", [
       z.object({

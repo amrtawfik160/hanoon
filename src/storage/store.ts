@@ -1049,6 +1049,7 @@ type ControllerTurnRow = {
   private_draft_item_id: string | null;
   private_draft_text: string;
   recovery_source_turn_id: string | null;
+  thread_follow_up_json: string | null;
   steer_reservation_turn_id: string | null;
   evidence_limit_exceeded_at: number | null;
   stream_text: string;
@@ -1094,6 +1095,11 @@ type ObservedThreadRow = {
   first_seen_at: number;
   updated_at: number;
 };
+type ThreadFollowUp = Readonly<{
+  threadId: string;
+  title: string;
+  status: "idle" | "error";
+}>;
 type ThreadInteractionRow = {
   interaction_id: string;
   thread_id: string;
@@ -2628,6 +2634,7 @@ export interface TelegramAgentStore {
     inputText: string;
     image?: ControllerImage | null;
     origin?: "owner" | "system";
+    threadFollowUp?: ThreadFollowUp;
     now: number;
   }): ControllerTurnRecord;
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
@@ -2794,6 +2801,7 @@ export interface TelegramAgentStore {
     threadId: string;
     title: string;
     status: string;
+    userId: string;
     chatId: string;
     now: number;
   }): "finished" | "failed" | null;
@@ -3960,6 +3968,9 @@ function parseMemory(row: MemoryRow): MemoryRecord {
 // anything else is bookkeeping, not news.
 const WORKING_THREAD_STATUSES = new Set(["active", "starting", "stopping"]);
 const NOTICE_COOLDOWN_MS = 10 * 60_000;
+// Other system turns use clock-derived ids. A disjoint high range keeps this
+// transactional writer from colliding with their in-memory counters.
+const THREAD_FOLLOW_UP_UPDATE_ID_BASE = 8_000_000_000_000_000;
 
 function matchThreadInteractionToken(
   interaction: ThreadInteraction,
@@ -4000,13 +4011,55 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
   owner_message_delivery_uncertain: "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
 };
 
+function validatedThreadFollowUp(input: unknown): ThreadFollowUp {
+  if (typeof input !== "object" || input === null) {
+    throw new TypeError("thread follow-up must be an object");
+  }
+  const followUp = input as Record<string, unknown>;
+  assertControllerIdentifier(followUp.threadId as string, "thread follow-up id");
+  assertControllerText(followUp.title as string, "thread follow-up title");
+  if (followUp.status !== "idle" && followUp.status !== "error") {
+    throw new TypeError("thread follow-up status must be idle or error");
+  }
+  return {
+    threadId: followUp.threadId as string,
+    title: followUp.title as string,
+    status: followUp.status,
+  };
+}
+
+function parseThreadFollowUp(value: string | null): ThreadFollowUp | null {
+  if (value === null) return null;
+  const parsed: unknown = JSON.parse(value);
+  return validatedThreadFollowUp(parsed);
+}
+
+function controllerReplyLogicalKey(turnId: string, threadFollowUpJson: string | null): string {
+  const followUp = parseThreadFollowUp(threadFollowUpJson);
+  return followUp === null
+    ? `controller:${turnId}:reply`
+    : `thread:${followUp.threadId}:${followUp.status}`;
+}
+
 function controllerFailureOutbox(
   turnId: string,
   chatId: string,
   failureCode: ControllerFailureCode = "unknown",
+  threadFollowUpJson: string | null = null,
 ): OutboxInput {
+  const followUp = parseThreadFollowUp(threadFollowUpJson);
+  if (followUp !== null) {
+    return {
+      logicalKey: `thread:${followUp.threadId}:${followUp.status}`,
+      chatId,
+      payload: renderThreadLifecycleNotice(
+        followUp.title,
+        followUp.status === "idle" ? "finished" : "failed",
+      ),
+    };
+  }
   return {
-    logicalKey: `controller:${turnId}:reply`,
+    logicalKey: controllerReplyLogicalKey(turnId, null),
     chatId,
     payload: {
       text: CONTROLLER_FAILURE_TEXT[failureCode],
@@ -4596,6 +4649,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     inputText: string;
     image?: ControllerImage | null;
     origin?: "owner" | "system";
+    threadFollowUp?: ThreadFollowUp;
     now: number;
   }): ControllerTurnRecord {
     assertControllerKey(input.controllerKey);
@@ -4605,6 +4659,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerText(input.inputText, "controller input");
     const image = input.image ? normalizeControllerImage(input.image) : null;
     if (image) assertControllerImage(image);
+    const threadFollowUp = input.threadFollowUp === undefined
+      ? null
+      : validatedThreadFollowUp(input.threadFollowUp);
+    const threadFollowUpJson = threadFollowUp === null ? null : JSON.stringify(threadFollowUp);
     assertNonNegativeInteger(input.now, "now");
     const dispatchSettings = this.capabilityDispatchSettings();
     if (
@@ -4638,7 +4696,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           existing.image_duration_seconds !== (image?.durationSeconds ?? null) ||
           existing.thumbnail_file_id !== (image?.thumbnail?.fileId ?? null) ||
           existing.thumbnail_file_name !== (image?.thumbnail?.fileName ?? null) ||
-          existing.thumbnail_size_bytes !== (image?.thumbnail?.sizeBytes ?? null)
+          existing.thumbnail_size_bytes !== (image?.thumbnail?.sizeBytes ?? null) ||
+          existing.thread_follow_up_json !== threadFollowUpJson
         ) {
           throw new IdempotencyConflictError(input.updateId);
         }
@@ -4683,8 +4742,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            image_file_id, image_file_name, image_mime_type, image_size_bytes,
            image_kind, image_duration_seconds,
            thumbnail_file_id, thumbnail_file_name, thumbnail_size_bytes,
-           state, origin, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
+           state, origin, thread_follow_up_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
       ).run(
         id,
         input.updateId,
@@ -4701,6 +4760,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         image?.thumbnail?.fileName ?? null,
         image?.thumbnail?.sizeBytes ?? null,
         input.origin === "system" ? "system" : "owner",
+        threadFollowUpJson,
         input.now,
         input.now,
       );
@@ -5027,7 +5087,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale" as const;
       const turn = this.db.prepare(
         `SELECT turn.controller_key, turn.ordinal, turn.input_text,
-                turn.accepted_finalization_id,
+                turn.accepted_finalization_id, turn.thread_follow_up_json,
                 controller.telegram_chat_id
            FROM controller_turns AS turn
            JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
@@ -5052,6 +5112,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         ordinal: number;
         input_text: string;
         accepted_finalization_id: number;
+        thread_follow_up_json: string | null;
         telegram_chat_id: string;
       } | undefined;
       if (!turn) return "stale" as const;
@@ -5104,7 +5165,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.now, accepted.id);
       if (consumed.changes !== 1) throw new Error("Accepted controller finalization consumption raced");
       persistControllerOutbox(this.db, {
-        logicalKey: `controller:${input.turnId}:reply`,
+        logicalKey: controllerReplyLogicalKey(input.turnId, turn.thread_follow_up_json),
         chatId: turn.telegram_chat_id,
         payload: { text: accepted.renderedMessage, disable_web_page_preview: true },
       }, input.now);
@@ -5280,7 +5341,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(fence.now, stale.controller_key, stale.id);
-      const outbox = controllerFailureOutbox(stale.id, stale.telegram_chat_id);
+      const outbox = controllerFailureOutbox(
+        stale.id,
+        stale.telegram_chat_id,
+        "unknown",
+        stale.thread_follow_up_json,
+      );
       persistControllerOutbox(this.db, outbox, fence.now);
       return true;
     }).immediate();
@@ -5457,14 +5523,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       );
       if (updated.changes !== 1) return false;
       const row = this.db.prepare(
-        `SELECT turn.id, controller.telegram_chat_id
+        `SELECT turn.id, turn.thread_follow_up_json, controller.telegram_chat_id
            FROM controller_turns AS turn
            JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
           WHERE turn.id = ? AND turn.state = 'submitted'`,
-      ).get(input.turnId) as { id: string; telegram_chat_id: string } | undefined;
+      ).get(input.turnId) as {
+        id: string;
+        thread_follow_up_json: string | null;
+        telegram_chat_id: string;
+      } | undefined;
       if (!row) throw new Error("Submitted controller turn disappeared before placeholder creation");
       const outbox: OutboxInput = {
-        logicalKey: `controller:${row.id}:reply`,
+        logicalKey: controllerReplyLogicalKey(row.id, row.thread_follow_up_json),
         chatId: row.telegram_chat_id,
         payload: { text: CONTROLLER_PHASE_TEXT.connecting, disable_web_page_preview: true },
       };
@@ -5549,11 +5619,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       );
       if (generation.changes !== 1) throw new Error("Controller open generation changed during unaccepted retry");
       const chat = this.db.prepare(
-        `SELECT telegram_chat_id FROM controller_threads WHERE controller_key = ?`,
-      ).get(input.controllerKey) as { telegram_chat_id: string } | undefined;
+        `SELECT controller.telegram_chat_id, turn.thread_follow_up_json
+           FROM controller_threads AS controller
+           JOIN controller_turns AS turn ON turn.controller_key = controller.controller_key
+          WHERE controller.controller_key = ? AND turn.id = ?`,
+      ).get(input.controllerKey, input.turnId) as {
+        telegram_chat_id: string;
+        thread_follow_up_json: string | null;
+      } | undefined;
       if (!chat) throw new Error("Controller mapping disappeared during unaccepted retry");
       persistControllerOutbox(this.db, {
-        logicalKey: `controller:${input.turnId}:reply`,
+        logicalKey: controllerReplyLogicalKey(input.turnId, chat.thread_follow_up_json),
         chatId: chat.telegram_chat_id,
         payload: { text: CONTROLLER_PHASE_TEXT.connecting, disable_web_page_preview: true },
       }, input.now);
@@ -5635,7 +5711,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(input.now, input.controllerKey, input.expectedThreadId);
       if (generation.changes !== 1) throw new Error("Controller generation changed during recovery");
       persistControllerOutbox(this.db, {
-        logicalKey: `controller:${input.turnId}:reply`,
+        logicalKey: controllerReplyLogicalKey(input.turnId, row.thread_follow_up_json),
         chatId: row.telegram_chat_id,
         payload: { text: CONTROLLER_PHASE_TEXT.connecting, disable_web_page_preview: true },
       }, input.now);
@@ -5744,7 +5820,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       // not surfaced during a transient error observation or a retry.
       if (input.phase !== "complete" && input.phase !== "failed") {
         const outbox: OutboxInput = {
-          logicalKey: `controller:${input.turnId}:reply`,
+          logicalKey: controllerReplyLogicalKey(input.turnId, row.thread_follow_up_json),
           chatId: row.telegram_chat_id,
           messageId: row.telegram_message_id,
           payload: { ...formattedMessage(phaseText), disable_web_page_preview: true },
@@ -6396,11 +6472,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }) === "settled";
   }
 
-  /** The oldest message still waiting behind an answer that is being written. */
+  /**
+   * The oldest owner message waiting behind an answer being written. Lifecycle
+   * follow-ups need their own delivery so they cannot be folded into that answer.
+   */
   public getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null {
     assertControllerKey(controllerKey);
     const row = this.db.prepare(
-      `SELECT * FROM controller_turns WHERE controller_key = ? AND state = 'queued'
+      `SELECT * FROM controller_turns
+        WHERE controller_key = ? AND state = 'queued' AND thread_follow_up_json IS NULL
         ORDER BY created_at ASC, ordinal ASC LIMIT 1`,
     ).get(controllerKey) as ControllerTurnRow | undefined;
     return row ? parseControllerTurn(row) : null;
@@ -6435,11 +6515,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     threadId: string;
     title: string;
     status: string;
+    userId: string;
     chatId: string;
     now: number;
   }): "finished" | "failed" | null {
     assertControllerIdentifier(input.threadId, "threadId");
     assertControllerText(input.title, "thread title");
+    assertCanonicalPositiveDecimal(input.userId, "userId");
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): "finished" | "failed" | null => {
       const known = this.db.prepare("SELECT * FROM observed_threads WHERE thread_id = ?")
@@ -6466,6 +6548,63 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (known.notified_at !== null && input.now - known.notified_at < NOTICE_COOLDOWN_MS) return null;
       this.db.prepare("UPDATE observed_threads SET notified_status = ?, notified_at = ? WHERE thread_id = ?")
         .run(input.status, input.now, input.threadId);
+      const monitorOwnsFollowUp = this.db.prepare(
+        `SELECT 1 FROM monitors
+          WHERE kind = 'thread_idle' AND thread_id = ?
+            AND (state = 'armed' OR last_fired_at >= ?)
+          LIMIT 1`,
+      ).get(input.threadId, input.now - NOTICE_COOLDOWN_MS);
+      if (monitorOwnsFollowUp) return notice;
+      const engagement = this.db.prepare(
+        `SELECT evidence.controller_key
+           FROM controller_evidence AS evidence
+           JOIN controller_threads AS controller
+             ON controller.controller_key = evidence.controller_key
+          WHERE controller.telegram_user_id = ? AND controller.telegram_chat_id = ?
+            AND controller.state <> 'revoked'
+            AND EXISTS (
+              SELECT 1 FROM json_each(evidence.subject_refs_json) AS subject
+               WHERE subject.value = ?
+            )
+          ORDER BY evidence.observed_at DESC, evidence.id DESC
+          LIMIT 1`,
+      ).get(
+        input.userId,
+        input.chatId,
+        `thread:${input.threadId}`,
+      ) as { controller_key: string } | undefined;
+      if (engagement) {
+        const latestUpdate = this.db.prepare(
+          "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
+        ).get() as { update_id: number };
+        const updateId = Math.max(
+          latestUpdate.update_id + 1,
+          THREAD_FOLLOW_UP_UPDATE_ID_BASE,
+        );
+        try {
+          this.enqueueControllerTurn({
+            controllerKey: engagement.controller_key,
+            telegramUserId: input.userId,
+            telegramChatId: input.chatId,
+            updateId,
+            inputText: `A BB thread you engaged with has landed: ${input.threadId}. ` +
+              `It ${notice === "finished" ? "finished" : "failed"}. Read how it ended, report the outcome, ` +
+              "and carry out or offer the next step you promised. If that step is guarded, wait for the " +
+              "owner's explicit approval; this system turn grants no merge authority.",
+            origin: "system",
+            threadFollowUp: {
+              threadId: input.threadId,
+              title: input.title,
+              status: notice === "finished" ? "idle" : "error",
+            },
+            now: input.now,
+          });
+          return notice;
+        } catch {
+          // The lifecycle notice is the recovery path: follow-up must never
+          // make the owner lose the plain outcome they received before it.
+        }
+      }
       persistControllerOutbox(this.db, {
         logicalKey: `thread:${input.threadId}:${input.status}`,
         chatId: input.chatId,
@@ -6716,6 +6855,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.sentBefore, "sentBefore");
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const turn = this.db.prepare(
+        "SELECT thread_follow_up_json FROM controller_turns WHERE id = ?",
+      ).get(input.turnId) as { thread_follow_up_json: string | null } | undefined;
+      if (!turn) return false;
       return this.db.prepare(
         `UPDATE outbox
             SET status = 'pending', attempts = 0, next_attempt_at = ?, last_error = NULL, updated_at = ?
@@ -6729,7 +6872,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(
         input.now,
         input.now,
-        `controller:${input.turnId}:reply`,
+        controllerReplyLogicalKey(input.turnId, turn.thread_follow_up_json),
         input.sentBefore,
         input.turnId,
       ).changes === 1;
@@ -6823,8 +6966,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
-      const outbox = input.ownerMessage === undefined
-        ? controllerFailureOutbox(input.turnId, row.telegram_chat_id)
+      const outbox = input.ownerMessage === undefined || row.thread_follow_up_json !== null
+        ? controllerFailureOutbox(input.turnId, row.telegram_chat_id, "unknown", row.thread_follow_up_json)
         : {
             logicalKey: `controller:${input.turnId}:reply`,
             chatId: row.telegram_chat_id,
@@ -6940,7 +7083,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       // never caller prose: an arbitrary text could equal or leak the accepted
       // rendered message or a credential. The internal `error` stays out of the
       // Telegram payload.
-      const outbox = controllerFailureOutbox(input.turnId, row.telegram_chat_id, input.failureCode ?? "unknown");
+      const outbox = controllerFailureOutbox(
+        input.turnId,
+        row.telegram_chat_id,
+        input.failureCode ?? "unknown",
+        row.thread_follow_up_json,
+      );
       persistControllerOutbox(this.db, outbox, input.now);
       return "retired";
     }).immediate();

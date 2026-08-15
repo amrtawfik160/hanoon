@@ -14,12 +14,52 @@ const QUESTION_ID = "pint_question1";
 
 let fixtureNumber = 0;
 
-function fixture() {
+function fixtureWithDatabase() {
   const { bb } = createFakePluginHost({ pluginId: `telegram-notices-${fixtureNumber++}` });
   const store = openStore(bb.storage, bb.storage.kv, () => 2_000);
   store.createPairingCode(hashSecret("pair"), 1_000, 10_000);
   expect(store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001)).toEqual({ ok: true });
-  return store;
+  return { db: bb.storage.database(), store };
+}
+
+function fixture() {
+  return fixtureWithDatabase().store;
+}
+
+const CONTROLLER_KEY = "owner-7-controller";
+
+function engagedFixture(threadId = "thr_work") {
+  const { db, store } = fixtureWithDatabase();
+  const evidenceTurn = store.enqueueControllerTurn({
+    controllerKey: CONTROLLER_KEY,
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 100_000 + fixtureNumber,
+    inputText: "Delegate the requested work through the BB CLI.",
+    now: 2_000,
+  });
+  db.prepare(
+    "UPDATE controller_turns SET state = 'completed', response_text = 'Delegated.', completed_at = 2500 WHERE id = ?",
+  ).run(evidenceTurn.id);
+  db.prepare(
+    `INSERT INTO controller_evidence (
+       turn_id, controller_key, source_kind, source_name, source_item_id,
+       outcome, args_sha256, result_sha256, proof_kinds_json,
+       subject_refs_json, observed_at
+     ) VALUES (?, ?, 'bb_item', 'commandExecution', 'cli-thread-create',
+       'succeeded', ?, ?, '["command_result"]', ?, 2500)`,
+  ).run(
+    evidenceTurn.id,
+    CONTROLLER_KEY,
+    "a".repeat(64),
+    "b".repeat(64),
+    JSON.stringify([`thread:${threadId}`]),
+  );
+  return { db, evidenceTurn, store };
+}
+
+function systemFollowUps(store: ReturnType<typeof fixture>) {
+  return store.listControllerTurns(CONTROLLER_KEY, 20).filter((turn) => turn.origin === "system");
 }
 
 function watched(overrides: Partial<WatchedThread> = {}): WatchedThread {
@@ -79,6 +119,35 @@ function service(store: ReturnType<typeof fixture>, options: {
   };
 }
 
+async function submittedEngagedFollowUp() {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+  const [followUp] = systemFollowUps(store);
+  if (!followUp) throw new Error("engaged-thread follow-up was not queued");
+  const lease = store.acquireExecutorLease("executor", 5_000, 30_000);
+  if (!lease.acquired) throw new Error("executor lease was not acquired");
+  const fence = { ownerId: "executor", generation: lease.generation, now: 5_000 };
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(followUp.id);
+  expect(store.reserveControllerSpawn({
+    ...fence,
+    controllerKey: CONTROLLER_KEY,
+    turnId: followUp.id,
+    projectId: "proj_1",
+    hostId: "host_1",
+  })).toBe(true);
+  expect(store.markControllerSpawned({
+    ...fence,
+    turnId: followUp.id,
+    projectId: "proj_1",
+    hostId: "host_1",
+    threadId: "thr_controller",
+    spawnToken: followUp.id,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, turnId: followUp.id })).toBe(true);
+  return { fence, followUp, store };
+}
+
 it("says nothing about a thread that was already finished when it first looked", async () => {
   const store = fixture();
   const { service: notices } = service(store, { threads: [watched({ status: "idle" })] });
@@ -98,6 +167,245 @@ it("tells the owner when a watched thread finishes", async () => {
 
   expect(store.getOutbox("thread:thr_work:idle")?.payload.text).toContain("Fix the login bug");
   expect(store.getOutbox("thread:thr_work:idle")?.payload.text).toContain("finished");
+});
+
+it("wakes once when a CLI-created thread referenced by controller evidence finishes", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 5_000 }).service.processDue();
+
+  const [followUp] = systemFollowUps(store);
+  expect(systemFollowUps(store)).toHaveLength(1);
+  expect(followUp?.inputText).toContain("thr_work");
+  expect(followUp?.inputText).toMatch(/finished|landed/i);
+  expect(store.getOutbox("thread:thr_work:idle")).toBeNull();
+});
+
+it("does not wake the controller for an unrelated thread finish", async () => {
+  const store = fixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+
+  expect(store.listControllerTurns(CONTROLLER_KEY, 20)).toEqual([]);
+  expect(store.getOutbox("thread:thr_work:idle")?.payload.text).toContain("finished");
+});
+
+it("lets an existing thread monitor own the wake without a bare duplicate", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  store.createMonitor({
+    controllerKey: CONTROLLER_KEY,
+    kind: "thread_idle",
+    threadId: "thr_work",
+    instruction: "Report the delegated result.",
+    dueAt: null,
+    now: 3_100,
+  });
+
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+
+  expect(systemFollowUps(store)).toEqual([]);
+  expect(store.getOutbox("thread:thr_work:idle")).toBeNull();
+  expect(store.listArmedMonitors(20)).toHaveLength(1);
+});
+
+it("does not add a bare duplicate after the thread monitor already fired", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  const monitor = store.createMonitor({
+    controllerKey: CONTROLLER_KEY,
+    kind: "thread_idle",
+    threadId: "thr_work",
+    instruction: "Report the delegated result.",
+    dueAt: null,
+    now: 3_100,
+  });
+  expect(store.recordMonitorFired({ id: monitor.id, nextDueAt: null, now: 3_900 })).toBe(true);
+
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+
+  expect(systemFollowUps(store)).toEqual([]);
+  expect(store.getOutbox("thread:thr_work:idle")).toBeNull();
+});
+
+it("wakes an engaged thread without exceeding a full monitor cap", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  for (let index = 0; index < 20; index += 1) {
+    store.createMonitor({
+      controllerKey: CONTROLLER_KEY,
+      kind: "schedule",
+      cron: "0 9 * * *",
+      instruction: `Scheduled obligation ${index}.`,
+      dueAt: 10_000 + index,
+      now: 3_100 + index,
+    });
+  }
+
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+
+  expect(systemFollowUps(store)).toHaveLength(1);
+  expect(store.listArmedMonitors(20)).toHaveLength(20);
+});
+
+it("keeps lifecycle wake ids out of the existing system notification space", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+
+  expect(() => store.enqueueControllerTurn({
+    controllerKey: CONTROLLER_KEY,
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 2_000_000_000,
+    inputText: "A separate system notification.",
+    origin: "system",
+    now: 4_000,
+  })).not.toThrow();
+});
+
+it("does not wake twice for repeated work inside the notice cooldown", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+
+  await service(store, { threads: [watched()], now: () => 5_000 }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 6_000 }).service.processDue();
+
+  expect(systemFollowUps(store)).toHaveLength(1);
+});
+
+it("keeps an engaged-thread follow-up out of an answer already in progress", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+  const [followUp] = systemFollowUps(store);
+  expect(followUp).toBeDefined();
+  if (!followUp) return;
+
+  const ownerTurn = store.enqueueControllerTurn({
+    controllerKey: CONTROLLER_KEY,
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 200_000 + fixtureNumber,
+    inputText: "A correction for the answer already in progress.",
+    now: 4_100,
+  });
+
+  expect(store.getQueuedControllerTurn(CONTROLLER_KEY)?.id).toBe(ownerTurn.id);
+  expect(store.getControllerTurn(followUp.id)?.state).toBe("queued");
+});
+
+it("falls back to the bare notice when the engaged-thread wake cannot be enqueued", async () => {
+  const { db, evidenceTurn, store } = engagedFixture();
+  const replyKey = `controller:${evidenceTurn.id}:reply`;
+  db.prepare(
+    `INSERT INTO outbox (
+       logical_key, chat_id, message_id, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, '7', 99, '{"text":"Delegated."}', 'sent', 0, 2500, 2500, 2500)`,
+  ).run(replyKey);
+  const turnBefore = store.getControllerTurn(evidenceTurn.id);
+  const replyBefore = store.getOutbox(replyKey);
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  db.function("fail_thread_follow_up_enqueue", () => {
+    throw new Error("injected follow-up enqueue failure");
+  });
+  db.exec(`
+    CREATE TRIGGER fail_thread_follow_up_enqueue
+    BEFORE INSERT ON controller_turns
+    WHEN NEW.origin = 'system'
+    BEGIN
+      SELECT fail_thread_follow_up_enqueue();
+    END
+  `);
+
+  await expect(service(store, {
+    threads: [watched({ status: "idle" })],
+    now: () => 4_000,
+  }).service.processDue()).resolves.toBe(true);
+
+  expect(store.getControllerTurn(evidenceTurn.id)).toEqual(turnBefore);
+  expect(store.getOutbox(replyKey)).toEqual(replyBefore);
+  expect(store.getOutbox("thread:thr_work:idle")?.payload.text).toContain("finished");
+});
+
+it("sends the bare notice when the engaged-thread follow-up turn fails", async () => {
+  const { store } = engagedFixture();
+  await service(store, { threads: [watched()], now: () => 3_000 }).service.processDue();
+  await service(store, { threads: [watched({ status: "idle" })], now: () => 4_000 }).service.processDue();
+  const [followUp] = systemFollowUps(store);
+  expect(followUp).toBeDefined();
+  if (!followUp) return;
+  const lease = store.acquireExecutorLease("executor", 5_000, 30_000);
+  expect(lease.acquired).toBe(true);
+  if (!lease.acquired) return;
+  expect(store.claimNextControllerTurn({
+    ownerId: "executor",
+    generation: lease.generation,
+    now: 5_000,
+  })?.id).toBe(followUp.id);
+
+  expect(store.failControllerTurn({
+    ownerId: "executor",
+    generation: lease.generation,
+    turnId: followUp.id,
+    error: "Injected controller failure",
+    now: 5_100,
+  })).toBe(true);
+
+  const fallback = store.getOutbox("thread:thr_work:idle");
+  expect(fallback?.payload.text).toContain("Fix the login bug");
+  expect(fallback?.payload.text).toContain("finished");
+  expect(store.getOutbox(`controller:${followUp.id}:reply`)).toBeNull();
+});
+
+it("uses one thread outbox message for a successful engaged-thread follow-up", async () => {
+  const { fence, followUp, store } = await submittedEngagedFollowUp();
+  expect(store.proposeControllerFinalization({
+    ...fence,
+    turnId: followUp.id,
+    controllerKey: CONTROLLER_KEY,
+    candidate: {
+      disposition: "answered",
+      segments: [{ type: "text", text: "Here is the requested delegated-work follow-up." }],
+      obligationRefs: [],
+    },
+  }).outcome).toBe("accepted");
+  expect(store.completeControllerTurnFromFinalization({
+    ...fence,
+    turnId: followUp.id,
+    controllerKey: CONTROLLER_KEY,
+    bbHighWaterSeq: 0,
+  })).toBe("completed");
+
+  const threadReply = store.getOutbox("thread:thr_work:idle");
+  expect(threadReply?.payload.text).toContain("requested delegated-work follow-up");
+  expect(store.getOutbox(`controller:${followUp.id}:reply`)).toBeNull();
+  expect(store.listOutbox(20).filter((outbox) =>
+    outbox.logicalKey === "thread:thr_work:idle" || outbox.logicalKey === `controller:${followUp.id}:reply`
+  )).toHaveLength(1);
+});
+
+it("sends the bare notice when the engaged-thread follow-up is retired", async () => {
+  const { fence, followUp, store } = await submittedEngagedFollowUp();
+
+  expect(store.failAndRetireControllerTurn({
+    ...fence,
+    turnId: followUp.id,
+    controllerKey: CONTROLLER_KEY,
+    expectedThreadId: "thr_controller",
+    error: "Injected terminal controller failure",
+    failureCode: "recovery_exhausted",
+  })).toBe("retired");
+
+  const fallback = store.getOutbox("thread:thr_work:idle");
+  expect(fallback?.payload.text).toContain("Fix the login bug");
+  expect(fallback?.payload.text).toContain("finished");
+  expect(store.getOutbox(`controller:${followUp.id}:reply`)).toBeNull();
 });
 
 it("does not announce a Hanoon pipeline worker as a generic thread notice", async () => {

@@ -487,7 +487,7 @@ async function runInteractionRace(
 }
 
 it("pins the shipped migration bytes and appends the runtime repair migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(51);
+  expect(ALL_MIGRATIONS).toHaveLength(52);
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
   );
@@ -502,6 +502,7 @@ it("pins the shipped migration bytes and appends the runtime repair migrations",
   expect(ALL_MIGRATIONS[48]).toContain("envelope_version");
   expect(ALL_MIGRATIONS[49]).toContain("consumed_at");
   expect(ALL_MIGRATIONS[50]).toContain("private_draft_text");
+  expect(ALL_MIGRATIONS[51]).toContain("thread_follow_up_json");
 });
 
 it("copies legacy questions once, preserves their table, and restores the active pointer", () => {

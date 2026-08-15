@@ -103,6 +103,7 @@ export class ThreadNoticeService {
         threadId: thread.id,
         title: thread.title,
         status: thread.status,
+        userId: owner.userId,
         chatId: owner.chatId,
         now,
       }) !== null) didWork = true;
