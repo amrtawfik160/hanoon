@@ -155,7 +155,7 @@ describe("controller finalization public contract", () => {
   it.each([
     ["maybe the hard way.", "New one when you want a check"],
     ["rather than a one-line brief.", "What it has to fix:"],
-    ["Valor is the reference now.", "The lesson worth taking from it:"],
+    ["That project is the reference now.", "The lesson worth taking from it:"],
     [
       "Got it. Plain words from here on, every time.",
       "Nothing else from me tonight unless you want it.",
