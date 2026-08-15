@@ -38,6 +38,12 @@ export type TelegramServiceDeps = {
 const POLL_RETRY_BASE_MS = 1_000;
 const POLL_RETRY_MAX_MS = 30_000;
 const TELEGRAM_POLL_TIMEOUT_SECONDS = 30;
+// A 409 is usually transient: another poller's long poll is still draining, or
+// a test run briefly borrowed the token. Treating the first one as terminal
+// latches the plugin into needs-configuration and silently drops every message
+// until a human notices. Only a sustained conflict is a real configuration
+// fault, so retry the same way as any other transient failure until then.
+const MAX_CONSECUTIVE_CONFLICTS = 10;
 
 function isConflict(error: unknown): boolean {
   return error instanceof TelegramConflictError ||
@@ -62,6 +68,7 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
   let client: TelegramServiceClient | null = null;
   let identityBound = false;
   let consecutivePollFailures = 0;
+  let consecutiveConflicts = 0;
   deps.store.reconcileTelegramCursor();
 
   while (!signal.aborted) {
@@ -80,7 +87,9 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
         identity = await client.getMe(signal);
       } catch (error) {
         if (signal.aborted) return;
-        if (isConflict(error)) throw configurationError("Another process is polling this Telegram bot token.");
+        if (isConflict(error) && ++consecutiveConflicts > MAX_CONSECUTIVE_CONFLICTS) {
+          throw configurationError("Another process is polling this Telegram bot token.");
+        }
         if (isRejectedToken(error)) throw configurationError("The Telegram bot token was rejected.");
         if (!await backOff(error, "Telegram identity check failed")) return;
         continue;
@@ -103,7 +112,9 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
       updates = await client.getUpdates(deps.store.getNextTelegramOffset(), TELEGRAM_POLL_TIMEOUT_SECONDS, signal);
     } catch (error) {
       if (signal.aborted) return;
-      if (isConflict(error)) throw configurationError("Another process is polling this Telegram bot token.");
+      if (isConflict(error) && ++consecutiveConflicts > MAX_CONSECUTIVE_CONFLICTS) {
+        throw configurationError("Another process is polling this Telegram bot token.");
+      }
       if (isRejectedToken(error)) throw configurationError("The Telegram bot token was rejected.");
       // A stalled long poll or a transient Telegram failure must not take the
       // whole ingress down: crashing it drops every message until it restarts.
@@ -111,6 +122,7 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
       continue;
     }
     consecutivePollFailures = 0;
+    consecutiveConflicts = 0;
 
     for (const update of [...updates].sort((left, right) => left.update_id - right.update_id)) {
       if (signal.aborted) return;

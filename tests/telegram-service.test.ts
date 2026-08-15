@@ -327,15 +327,19 @@ describe("Telegram ingress service", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("binds identity once per token and stops on a polling conflict", async () => {
+  it("binds identity once per token and keeps polling through a transient conflict", async () => {
     const { store } = storeFixture();
     const abort = new AbortController();
     const client = realClientFactory([
       { ok: true, result: { id: 123, username: "bot" } },
       { ok: false, error_code: 409, description: "Conflict" },
-    ]);
+      { ok: true, result: [{ update_id: 10 }] },
+      { ok: true, result: [] },
+    ], (pollNumber) => {
+      if (pollNumber === 3) abort.abort();
+    });
 
-    await expect(runTelegramService(
+    await runTelegramService(
       serviceDeps(
         store,
         client,
@@ -343,9 +347,34 @@ describe("Telegram ingress service", () => {
         () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
-    )).rejects.toMatchObject({ name: "NeedsConfigurationError" });
+    );
 
     expect(store.getTelegramIdentity()).toMatchObject({ botId: "123", username: "bot" });
+    expect(store.getNextTelegramOffset()).toBe(11);
+  });
+
+  it("stops only once a polling conflict is sustained", async () => {
+    vi.useFakeTimers();
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const client = realClientFactory([
+      { ok: true, result: { id: 123, username: "bot" } },
+      ...Array.from({ length: 12 }, () => ({ ok: false, error_code: 409, description: "Conflict" })),
+    ]);
+
+    const promise = runTelegramService(
+      serviceDeps(
+        store,
+        client,
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
+      ),
+      abort.signal,
+    );
+    const assertion = expect(promise).rejects.toMatchObject({ name: "NeedsConfigurationError" });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await assertion;
+    vi.useRealTimers();
   });
 
   it("redacts bot tokens from service failures", async () => {
