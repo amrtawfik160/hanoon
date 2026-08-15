@@ -2246,3 +2246,41 @@ describe("singleton job executor", () => {
     // without loosening the budget for every other test.
   }, 15_000);
 });
+
+describe("controller stall deadline", () => {
+  // A wedged turn produces no provider events, so an executor that only woke
+  // for provider activity never reached the stall check: a turn sat sixteen
+  // minutes past its eight minute deadline until the plugin was restarted by
+  // hand. The loop must sleep up to the deadline, not past it.
+  it("shortens the wait to the in-flight turn's deadline and leaves it alone otherwise", async () => {
+    for (const [deadlineMs, expectShortened] of [[25, true], [null, false]] as const) {
+      const { store } = fixture();
+      const waits: number[] = [];
+      let now = 2_000;
+      const abort = new AbortController();
+
+      await runJobExecutorService({
+        store,
+        clock: { now: () => now },
+        maxConcurrentJobs: () => 1,
+        controller: {
+          processOne: async () => false,
+          reconcile: async () => false,
+          // Far shorter than any ordinary poll interval, so a wait this short
+          // can only have been bounded by the deadline.
+          nextStallDeadlineMs: () => deadlineMs,
+        },
+        effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+        waitForWork: async (milliseconds) => {
+          waits.push(milliseconds);
+          now += milliseconds;
+          if (waits.length === 2) abort.abort();
+        },
+        releaseOnShutdown: true,
+      } as JobExecutorDependencies, abort.signal);
+
+      expect(waits.length).toBeGreaterThan(0);
+      expect(waits.every((wait) => wait === 25)).toBe(expectShortened);
+    }
+  });
+});

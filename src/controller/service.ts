@@ -188,6 +188,23 @@ export class LunaControllerService {
     return this.dependencies.store.getPendingControllerTurn(controller.controllerKey)?.state === "submitted";
   }
 
+  /**
+   * Milliseconds until the in-flight turn runs out of time, or null when none
+   * is running. A wedged turn produces no events, so an executor that only woke
+   * for provider activity never reached the stall check and left the turn
+   * sitting well past its deadline. The deadline is a fixed moment: the loop
+   * sleeps up to it rather than past it.
+   */
+  public nextStallDeadlineMs(now: number): number | null {
+    const owner = this.dependencies.store.getOwner();
+    if (!owner) return null;
+    const controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+    if (!controller?.threadId) return null;
+    const pending = this.dependencies.store.getPendingControllerTurn(controller.controllerKey);
+    if (pending?.state !== "submitted" || pending.awaitingInteractionId !== null) return null;
+    return Math.max(0, pending.updatedAt + CONTROLLER_STALL_MS - now);
+  }
+
   public async reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
     if (this.dependencies.store.failStaleControllerDispatches(
       fenceAt(fence, this.dependencies.clock.now()),

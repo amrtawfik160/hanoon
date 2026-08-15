@@ -44,6 +44,8 @@ export type JobExecutorDependencies = {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
     reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
     isStreaming?(): boolean;
+    /** Milliseconds until the in-flight turn is out of time, if one is running. */
+    nextStallDeadlineMs?(now: number): number | null;
   };
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
@@ -1239,9 +1241,15 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           return Math.min(soonest, Math.max(1, dueAt - sweepNow));
         }, Number.POSITIVE_INFINITY);
         const ordinaryAndSweepWaitMs = Math.min(ordinaryWaitMs, workerSweepWaitMs);
-        const waitMs = presenceWaitMs === null
-          ? ordinaryAndSweepWaitMs
-          : Math.min(ordinaryAndSweepWaitMs, Math.max(1, presenceWaitMs));
+        // A turn's deadline is a fixed moment, so the loop sleeps up to it and
+        // not past it. Noticing a wedge must not depend on the provider
+        // producing events: a silent thread produces none, which is exactly the
+        // case the deadline exists for.
+        const deadlineWaitMs = deps.controller?.nextStallDeadlineMs?.(deps.clock.now()) ?? null;
+        const waitMs = [presenceWaitMs, deadlineWaitMs].reduce<number>(
+          (soonest, candidate) => candidate === null ? soonest : Math.min(soonest, Math.max(1, candidate)),
+          ordinaryAndSweepWaitMs,
+        );
         try {
           const busyLaneJobIds = lanes.snapshot().busyJobIds;
           const busyReleaseCandidate = !deps.waitForWork && busyLaneJobIds.some((jobId) =>
