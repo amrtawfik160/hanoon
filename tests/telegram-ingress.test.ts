@@ -4,6 +4,7 @@ import { expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { hashSecret } from "../src/crypto";
 import type { ProjectPolicy } from "../src/domain/models";
+import { buildHealthReport } from "../src/services/health-report";
 import { TelegramIngress } from "../src/telegram/ingress";
 import { TelegramApiError } from "../src/telegram/errors";
 import type {
@@ -1087,6 +1088,25 @@ it("steers only an admitted job with the exact status reply identity", async () 
   ]);
   expect(fixture.store.listEffectsForJob(queuedId).filter((effect) => effect.kind === "steer_implementation")).toHaveLength(0);
   expect(fixture.store.getControllerForOwner("7", "70")).not.toBeNull();
+});
+
+it("surfaces a stale executor heartbeat in the status summary", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  expect(fixture.store.acquireExecutorLease("executor", 1_000, 30_000).acquired).toBe(true);
+  const ingress = new TelegramIngress({
+    store: fixture.store,
+    telegram: fixture.telegram,
+    health: (now) => buildHealthReport(
+      fixture.db,
+      now,
+      2,
+      { pipelineActive: 0, controlActive: 0, busyJobIds: [] },
+    ),
+  });
+
+  await ingress.handleClaimed(messageUpdate(826, 7, 70, "/status"), 40_001);
+
+  expect(statusPayload(fixture).text).toContain("Executor warning: the executor heartbeat is stale.");
 });
 
 function parkedControllerInteraction(

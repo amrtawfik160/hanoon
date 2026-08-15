@@ -408,7 +408,7 @@ export type ControllerFailureCode =
   | "owner_message_waiting_for_fresh_generation"
   | "image_preparation_failed";
 
-export type ControllerDeliveryReconciliationResult = "pending" | "failed" | "stale";
+export type ControllerDeliveryReconciliationResult = "pending" | "failed" | "recovery_required" | "stale";
 
 export type ControllerGeneration = {
   id: string;
@@ -3730,13 +3730,17 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     row.next_dispatch_at,
     "next_dispatch_at",
   );
+  const continuationCorrelationId = `controller-continuation:${row.id}:1`;
+  const continuationDelivery = row.state === "submitted" && completionContinuations === 1 &&
+    row.dispatch_kind === "send" && row.dispatch_correlation_id === continuationCorrelationId;
   if (row.delivery_state === "intent" && (
-    row.state !== "dispatching" || row.dispatch_kind === null || row.dispatch_correlation_id === null
+    (row.state !== "dispatching" && !continuationDelivery) ||
+    row.dispatch_kind === null || row.dispatch_correlation_id === null
   )) {
     throw new Error("Persisted controller dispatch intent is incomplete");
   }
   if (row.delivery_state === "delivery_unknown" &&
-      row.state !== "dispatching" && row.state !== "failed") {
+      row.state !== "dispatching" && row.state !== "failed" && !continuationDelivery) {
     throw new Error("Persisted unknown controller delivery has an invalid turn state");
   }
   return {
@@ -5424,7 +5428,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             SET state = 'completed', response_text = ?, stream_text = '',
                 stream_phase = 'complete', last_error = NULL, lease_owner = NULL,
                 lease_generation = NULL, private_draft_item_id = NULL,
-                private_draft_text = '', completed_at = ?, updated_at = ?
+                private_draft_text = '', delivery_state = 'none',
+                delivery_reconcile_attempts = 0, next_dispatch_at = 0,
+                completed_at = ?, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id = ?`,
@@ -5592,7 +5598,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             SET delivery_state = 'delivery_unknown',
                 last_error = 'Controller delivery outcome is unknown',
                 next_dispatch_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'dispatching' AND delivery_state = 'intent'
+          WHERE id = ? AND delivery_state = 'intent'
+            AND (
+              state = 'dispatching' OR (
+                state = 'submitted' AND completion_continuations = 1
+                AND dispatch_kind = 'send'
+                AND dispatch_correlation_id = 'controller-continuation:' || id || ':1'
+              )
+            )
             AND lease_owner = ? AND lease_generation = ?`,
       ).run(
         input.now,
@@ -5615,7 +5628,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction((): ControllerDeliveryReconciliationResult => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
       const row = this.db.prepare(
-        `SELECT turn.controller_key, turn.delivery_reconcile_attempts,
+        `SELECT turn.controller_key, turn.state, turn.delivery_reconcile_attempts,
                 turn.thread_follow_up_json, controller.telegram_chat_id,
                 controller.bb_thread_id, controller.pending_spawn_token
            FROM controller_turns AS turn
@@ -5623,11 +5636,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
             AND owners.telegram_user_id = controller.telegram_user_id
             AND owners.telegram_chat_id = controller.telegram_chat_id
-          WHERE turn.id = ? AND turn.state = 'dispatching'
+          WHERE turn.id = ? AND (
+              turn.state = 'dispatching' OR (
+                turn.state = 'submitted' AND turn.completion_continuations = 1
+                AND turn.dispatch_kind = 'send'
+                AND turn.dispatch_correlation_id = 'controller-continuation:' || turn.id || ':1'
+              )
+            )
             AND turn.delivery_state = 'delivery_unknown'
             AND turn.lease_owner = ? AND turn.lease_generation = ?`,
       ).get(input.turnId, input.ownerId, input.generation) as {
         controller_key: string;
+        state: "dispatching" | "submitted";
         delivery_reconcile_attempts: number;
         thread_follow_up_json: string | null;
         telegram_chat_id: string;
@@ -5637,6 +5657,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!row) return "stale";
       const attempts = row.delivery_reconcile_attempts + 1;
       if (attempts >= MAX_CONTROLLER_DELIVERY_RECONCILIATION_ATTEMPTS) {
+        if (row.state === "submitted") {
+          const released = this.db.prepare(
+            `UPDATE controller_turns
+                SET delivery_state = 'none', delivery_reconcile_attempts = ?,
+                    next_dispatch_at = 0,
+                    last_error = 'Controller correction delivery could not be reconciled',
+                    updated_at = ?
+              WHERE id = ? AND state = 'submitted'
+                AND delivery_state = 'delivery_unknown'
+                AND lease_owner = ? AND lease_generation = ?`,
+          ).run(
+            attempts,
+            input.now,
+            input.turnId,
+            input.ownerId,
+            input.generation,
+          );
+          return released.changes === 1 ? "recovery_required" : "stale";
+        }
         const failed = this.db.prepare(
           `UPDATE controller_turns
               SET state = 'failed', delivery_reconcile_attempts = ?,
@@ -5676,7 +5715,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             SET delivery_reconcile_attempts = ?,
                 last_error = 'Controller delivery reconciliation is pending',
                 next_dispatch_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'dispatching'
+          WHERE id = ? AND state IN ('dispatching', 'submitted')
             AND delivery_state = 'delivery_unknown'
             AND lease_owner = ? AND lease_generation = ?`,
       ).run(
@@ -5688,12 +5727,23 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.generation,
       );
       if (pending.changes !== 1) return "stale";
-      persistControllerOutbox(this.db, controllerFailureOutbox(
-        input.turnId,
-        row.telegram_chat_id,
-        "owner_message_delivery_uncertain",
-        row.thread_follow_up_json,
-      ), input.now);
+      persistControllerOutbox(
+        this.db,
+        row.state === "dispatching"
+          ? controllerFailureOutbox(
+            input.turnId,
+            row.telegram_chat_id,
+            "owner_message_delivery_uncertain",
+            row.thread_follow_up_json,
+          )
+          : controllerPhaseOutbox(
+            input.turnId,
+            row.telegram_chat_id,
+            "connecting",
+            row.thread_follow_up_json,
+          ),
+        input.now,
+      );
       return "pending";
     }).immediate();
   }
@@ -5943,7 +5993,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
             AND owners.telegram_user_id = controller.telegram_user_id
             AND owners.telegram_chat_id = controller.telegram_chat_id
-          WHERE turn.state = 'dispatching'
+          WHERE (
+              turn.state = 'dispatching' OR (
+                turn.state = 'submitted' AND turn.delivery_state IN ('intent', 'delivery_unknown')
+                AND turn.completion_continuations = 1 AND turn.dispatch_kind = 'send'
+                AND turn.dispatch_correlation_id = 'controller-continuation:' || turn.id || ':1'
+              )
+            )
             AND (turn.lease_owner <> ? OR turn.lease_generation <> ?)
           ORDER BY turn.created_at ASC, turn.ordinal ASC LIMIT 1`,
       ).get(fence.ownerId, fence.generation) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
@@ -5977,7 +6033,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                 next_dispatch_at = ?,
                 last_error = 'Controller delivery requires reconciliation after lease loss',
                 updated_at = ?
-          WHERE id = ? AND state = 'dispatching'
+          WHERE id = ? AND state IN ('dispatching', 'submitted')
             AND delivery_state IN ('intent', 'delivery_unknown')`,
       ).run(
         fence.ownerId,
@@ -6131,6 +6187,32 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       const turn = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?")
         .get(input.turnId) as ControllerTurnRow | undefined;
+      if (turn?.state === "submitted") {
+        if (
+          turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation ||
+          turn.completion_continuations !== 1 || turn.dispatch_kind !== "send" ||
+          turn.dispatch_correlation_id !== `controller-continuation:${input.turnId}:1` ||
+          (turn.delivery_state !== "intent" && turn.delivery_state !== "delivery_unknown") ||
+          turn.dispatch_after_seq !== dispatchAfterSeq
+        ) return false;
+        return this.db.prepare(
+          `UPDATE controller_turns
+              SET delivery_state = 'none', delivery_reconcile_attempts = 0,
+                  next_dispatch_at = 0, last_error = NULL, updated_at = ?
+            WHERE id = ? AND state = 'submitted'
+              AND lease_owner = ? AND lease_generation = ?
+              AND delivery_state IN ('intent', 'delivery_unknown')
+              AND completion_continuations = 1 AND dispatch_kind = 'send'
+              AND dispatch_correlation_id = ? AND dispatch_after_seq = ?`,
+        ).run(
+          input.now,
+          input.turnId,
+          input.ownerId,
+          input.generation,
+          `controller-continuation:${input.turnId}:1`,
+          dispatchAfterSeq,
+        ).changes === 1;
+      }
       if (
         !turn || turn.state !== "dispatching" || turn.lease_owner !== input.ownerId ||
         turn.lease_generation !== input.generation
@@ -6374,7 +6456,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                 dispatch_after_seq = 0, bb_event_seq = 0, evidence_event_seq = 0,
                 completion_continuations = 2, input_accepted = 0,
                 model_fallback_index = ?, stream_text = '', stream_phase = 'queued',
-                submitted_at = NULL, last_error = ?, updated_at = ?
+                submitted_at = NULL, delivery_state = 'none',
+                delivery_reconcile_attempts = 0, next_dispatch_at = 0,
+                last_error = ?, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id IS NULL AND completion_continuations < 2`,
@@ -7737,7 +7821,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_turns
             SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
                 lease_owner = NULL, lease_generation = NULL,
-                completed_at = ?,
+                delivery_state = 'none', delivery_reconcile_attempts = 0,
+                next_dispatch_at = 0, completed_at = ?,
                 capability_continuation_state = CASE
                   WHEN capability_continuation_state IN ('requested', 'relaunching') THEN 'blocked'
                   ELSE capability_continuation_state

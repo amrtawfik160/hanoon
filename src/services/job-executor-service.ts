@@ -563,6 +563,35 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
     const controllerStreamLastText = new Map<string, string>();
     const controllerStreamMessageIds = new Map<string, number>();
     const controllerStreamBackoffUntil = new Map<string, number>();
+    type ControllerPass = {
+      abort: AbortController;
+      stallTimer: ReturnType<typeof setTimeout> | null;
+      settled: boolean;
+      outcome: Readonly<{ didWork: boolean }> | Readonly<{ error: unknown }> | null;
+    };
+    let controllerPass: ControllerPass | null = null;
+    const wakeForControllerPass = (): void => {
+      try {
+        deps.onWorkAvailable?.();
+      } catch {
+        // A wake-up hint cannot make a completed controller pass fail.
+      }
+    };
+    const clearControllerStallTimer = (pass: ControllerPass): void => {
+      if (pass.stallTimer === null) return;
+      clearTimeout(pass.stallTimer);
+      pass.stallTimer = null;
+    };
+    const armControllerStallTimer = (pass: ControllerPass): void => {
+      clearControllerStallTimer(pass);
+      const stallDeadlineMs = deps.controller?.nextStallDeadlineMs?.(deps.clock.now()) ?? null;
+      if (stallDeadlineMs === null || !Number.isSafeInteger(stallDeadlineMs) || stallDeadlineMs <= 0) return;
+      pass.stallTimer = setTimeout(() => {
+        pass.stallTimer = null;
+        pass.abort.abort(new Error("controller stall deadline reached"));
+        wakeForControllerPass();
+      }, stallDeadlineMs);
+    };
     const hasCurrentAdoptedClaims = (jobId: string, now: number): boolean => {
       const claims = deps.store.listCurrentHeldResourceClaims(jobId, 100);
       return claims.length > 0 && claims.every((claim) =>
@@ -572,6 +601,10 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       );
     };
     const onWorkAbort = (): void => {
+      if (controllerPass) {
+        clearControllerStallTimer(controllerPass);
+        controllerPass.abort.abort(abortReason(workAbort.signal));
+      }
       lanes.abortAll(abortReason(workAbort.signal));
       laneOperations.clear();
     };
@@ -688,6 +721,58 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       leaseMs,
       loseLease,
     );
+    const takeControllerPassOutcome = (): boolean | null => {
+      if (!controllerPass?.settled) return null;
+      const completed = controllerPass;
+      controllerPass = null;
+      clearControllerStallTimer(completed);
+      if (completed.outcome && "error" in completed.outcome) {
+        if (completed.abort.signal.aborted) return false;
+        throw completed.outcome.error;
+      }
+      return completed.outcome?.didWork ?? false;
+    };
+    const startControllerPass = (): void => {
+      if (!deps.controller || controllerPass !== null) return;
+      const abort = new AbortController();
+      const passSignal = AbortSignal.any([workAbort.signal, abort.signal]);
+      const pass: ControllerPass = {
+        abort,
+        stallTimer: null,
+        settled: false,
+        outcome: null,
+      };
+      controllerPass = pass;
+      const fence = { ownerId, generation: lease.generation, signal: passSignal };
+      const running = (async (): Promise<boolean> => {
+        let reconciled: boolean;
+        armControllerStallTimer(pass);
+        try {
+          reconciled = await deps.controller!.reconcile(fence, passSignal);
+        } finally {
+          clearControllerStallTimer(pass);
+        }
+        if (passSignal.aborted) return reconciled;
+        armControllerStallTimer(pass);
+        try {
+          return await deps.controller!.processOne(fence, passSignal) || reconciled;
+        } finally {
+          clearControllerStallTimer(pass);
+        }
+      })();
+      void running.then(
+        (didWork) => {
+          pass.outcome = { didWork };
+          pass.settled = true;
+          clearControllerStallTimer(pass);
+        },
+        (error) => {
+          pass.outcome = { error };
+          pass.settled = true;
+          clearControllerStallTimer(pass);
+        },
+      );
+    };
     try {
       while (!signal.aborted && !workAbort.signal.aborted) {
         const currentNow = deps.clock.now();
@@ -740,16 +825,21 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           for (let microtask = 0; microtask < 20; microtask += 1) await Promise.resolve();
         };
         collectCompletions();
+        const priorControllerOutcome = takeControllerPassOutcome();
+        if (priorControllerOutcome !== null) didWork = priorControllerOutcome || didWork;
         if (continueAcquiring || workAbort.signal.aborted) {
           if (leaseLost) continueAcquiring = true;
           break;
         }
 
         const effectFence = { ownerId, generation: lease.generation, signal: workAbort.signal };
-        if (deps.controller) {
-          didWork = await deps.controller.reconcile(effectFence, workAbort.signal) || didWork;
-          didWork = await deps.controller.processOne(effectFence, workAbort.signal) || didWork;
+        if (deps.controller && controllerPass === null) {
+          startControllerPass();
+          await settleLaneMicrotasks();
+          const immediateControllerOutcome = takeControllerPassOutcome();
+          if (immediateControllerOutcome !== null) didWork = immediateControllerOutcome || didWork;
         }
+        if (controllerPass !== null) didWork = true;
         if (deps.operations) {
           didWork = await deps.operations.processOne(effectFence, workAbort.signal) || didWork;
         }
@@ -1317,6 +1407,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           continueAcquiring = true;
           break;
         }
+        const controllerOutcome = takeControllerPassOutcome();
+        if (controllerOutcome !== null) didWork = controllerOutcome || didWork;
+        if (controllerPass !== null) didWork = true;
         let presenceWaitMs: number | null = null;
         try {
           presenceWaitMs = deps.presence

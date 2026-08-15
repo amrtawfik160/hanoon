@@ -42,6 +42,30 @@ it("names what is wrong when the executor has stopped", () => {
   expect(report.problems).toContain("the executor lease is not current");
 });
 
+it("surfaces a stale executor heartbeat even while its lease still looks current", () => {
+  const { db, store } = fixture();
+  expect(store.acquireExecutorLease("executor", NOW - 60_000, 120_000).acquired).toBe(true);
+
+  const report = buildHealthReport(db, NOW, 2, EMPTY_LANES);
+
+  expect(report).toMatchObject({
+    ok: false,
+    executor: {
+      current: false,
+      heartbeatAt: NOW - 60_000,
+      heartbeatAgeMs: 60_000,
+      heartbeatStale: true,
+    },
+  });
+  expect(report.problems).toContain("the executor heartbeat is stale");
+
+  db.prepare("UPDATE executor_lease SET lease_expires_at = ? WHERE singleton = 1").run(NOW - 1);
+  expect(buildHealthReport(db, NOW, 2, EMPTY_LANES).problems).toEqual(expect.arrayContaining([
+    "the executor lease is not current",
+    "the executor heartbeat is stale",
+  ]));
+});
+
 it("surfaces undelivered messages and failed Telegram updates", () => {
   const { db, store } = fixture();
   expect(store.acquireExecutorLease("executor", NOW, 30_000).acquired).toBe(true);
