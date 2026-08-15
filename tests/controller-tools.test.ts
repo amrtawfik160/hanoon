@@ -38,7 +38,6 @@ function visibleThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntr
     parentThreadId: null,
     sourceThreadId: null,
     originKind: null,
-    childOrigin: null,
     originPluginId: null,
     visibility: "visible",
     archivedAt: null,
