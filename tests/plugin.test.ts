@@ -132,6 +132,40 @@ it("keeps the Telegram polling timeout out of user-facing settings", async () =>
   expect(harness.registrations.settingsDescriptors).not.toHaveProperty("pollTimeoutSeconds");
 });
 
+it("keeps self-diagnosis disabled and completely unregistered by default", async () => {
+  const realtime = recordingSdkSubscribe();
+  const { bb, harness } = createFakePluginHost({
+    pluginId: `telegram-agent-self-diagnosis-off-${pluginNumber++}`,
+    settings: { botToken: "123:test-token" },
+    sdk: { subscribe: realtime.subscribe },
+  });
+  await plugin(bb);
+
+  expect(harness.registrations.settingsDescriptors.selfDiagnosisEnabled).toMatchObject({
+    type: "boolean",
+    default: false,
+  });
+  expect(harness.registrations.settingsDescriptors.selfDiagnosisProjectId).toMatchObject({ default: "" });
+  expect(harness.registrations.services.map((service) => service.name)).not.toContain("self-diagnosis");
+  expect(harness.inspection.sdk.callsTo("projects.list")).toEqual([]);
+});
+
+it("registers self-diagnosis only when explicitly enabled", async () => {
+  const realtime = recordingSdkSubscribe();
+  const { bb, harness } = createFakePluginHost({
+    pluginId: `telegram-agent-self-diagnosis-on-${pluginNumber++}`,
+    settings: {
+      botToken: "123:test-token",
+      selfDiagnosisEnabled: true,
+      selfDiagnosisProjectId: "project-1",
+    },
+    sdk: { subscribe: realtime.subscribe },
+  });
+  await plugin(bb);
+
+  expect(harness.registrations.services.map((service) => service.name)).toContain("self-diagnosis");
+});
+
 it("applies a changed concurrency cap to later admissions", async () => {
   const { bb, harness } = await loadPlugin();
   await harness.behavior.setSettings({ botToken: "123:test-token", maxConcurrentJobs: "1" });

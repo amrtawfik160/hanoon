@@ -158,6 +158,8 @@ bb telegram-agent doctor proj_7f3d2a91
 
 The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. Projects that deploy to the same target can share `production.targetKey`, which serializes that target even when their repositories differ. See [Configuration](docs/configuration.md) for the complete verified schema and examples.
 
+Self-diagnosis is off by default. To enable it, set the boolean `selfDiagnosisEnabled` to `true`, set `selfDiagnosisProjectId` to the enabled project containing this checkout, and reload the plugin. It runs out of band and creates only cooled-down draft pull requests; it never merges or changes an existing pull request.
+
 ### 4. Talk to Hanoon
 
 Send a normal private message. Hanoon answers conversationally, and acts when asked. Screenshots, GIFs, and short videos are part of the same turn — clips are sampled into stills the agent can see.
