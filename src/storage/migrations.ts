@@ -1925,6 +1925,34 @@ CREATE UNIQUE INDEX one_open_controller_generation
   WHERE ended_at IS NULL;
 `] as const;
 
+export const CONTROLLER_DELIVERY_STATE_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'none'
+  CHECK (delivery_state IN ('none', 'intent', 'delivery_unknown'));
+ALTER TABLE controller_turns ADD COLUMN dispatch_kind TEXT
+  CHECK (dispatch_kind IS NULL OR dispatch_kind IN ('send', 'spawn'));
+ALTER TABLE controller_turns ADD COLUMN dispatch_correlation_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN dispatch_retry_count INTEGER NOT NULL DEFAULT 0
+  CHECK (dispatch_retry_count >= 0);
+ALTER TABLE controller_turns ADD COLUMN delivery_reconcile_attempts INTEGER NOT NULL DEFAULT 0
+  CHECK (delivery_reconcile_attempts >= 0);
+ALTER TABLE controller_turns ADD COLUMN busy_wait_notified_at INTEGER
+  CHECK (busy_wait_notified_at IS NULL OR busy_wait_notified_at >= 0);
+ALTER TABLE controller_turns ADD COLUMN next_dispatch_at INTEGER NOT NULL DEFAULT 0
+  CHECK (next_dispatch_at >= 0);
+
+UPDATE controller_turns
+   SET delivery_state = 'delivery_unknown',
+       dispatch_kind = CASE
+         WHEN EXISTS (
+           SELECT 1 FROM controller_threads AS controller
+            WHERE controller.controller_key = controller_turns.controller_key
+              AND controller.bb_thread_id IS NOT NULL
+         ) THEN 'send'
+         ELSE 'spawn'
+       END
+ WHERE state = 'dispatching';
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -1980,4 +2008,5 @@ export const ALL_MIGRATIONS = [
   ...THREAD_FOLLOW_UP_MIGRATIONS,
   ...CONTROLLER_GENERATION_QUARANTINE_MIGRATIONS,
   ...CONTROLLER_GENERATION_INVARIANT_MIGRATIONS,
+  ...CONTROLLER_DELIVERY_STATE_MIGRATIONS,
 ] as const;

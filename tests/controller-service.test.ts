@@ -13,7 +13,12 @@ import {
   DEFAULT_CONTROLLER_EXECUTION_PROFILE,
   type ControllerExecutionProfile,
 } from "../src/controller/execution-profile";
-import { CONTROLLER_STALL_MS, LunaControllerService } from "../src/controller/service";
+import {
+  CONTROLLER_BUSY_NOTICE_MS,
+  CONTROLLER_BUSY_ROLLOVER_MS,
+  CONTROLLER_STALL_MS,
+  LunaControllerService,
+} from "../src/controller/service";
 import { completeAcceptedControllerTurn, validEvidenceInput } from "./support/controller-trust-fixtures";
 
 const evidenceProjector = {
@@ -82,6 +87,13 @@ function turnRecord(overrides: Record<string, unknown> = {}) {
     leaseOwner: "executor",
     leaseGeneration: 1,
     dispatchAfterSeq: 0,
+    deliveryState: "none",
+    dispatchKind: null,
+    dispatchCorrelationId: null,
+    dispatchRetryCount: 0,
+    deliveryReconcileAttempts: 0,
+    busyWaitNotifiedAt: null,
+    nextDispatchAt: 0,
     retryCount: 0,
     modelFallbackIndex: 0,
     bbEventSeq: 0,
@@ -681,6 +693,38 @@ function reserveControllerSpawnForTest(
   })) {
     throw new Error("controller spawn reservation failed");
   }
+}
+
+function activateControllerForServiceTest(
+  store: ReturnType<typeof serviceFixture>["store"],
+  fence: ReturnType<typeof serviceFixture>["fence"],
+  updateId: number,
+  threadId: string,
+  now = 2_000,
+): void {
+  const setup = store.enqueueControllerTurn({
+    ...turnRecord({ updateId, inputText: "controller setup" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now,
+  });
+  expect(store.claimNextControllerTurn({ ...fence, now })?.id).toBe(setup.id);
+  reserveControllerSpawnForTest(store, setup.id, now);
+  expect(store.markControllerSpawned({
+    ...fence,
+    now,
+    turnId: setup.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId,
+    spawnToken: setup.id,
+  })).toBe(true);
+  expect(store.failControllerTurn({
+    ...fence,
+    now,
+    turnId: setup.id,
+    error: "controller test setup completed",
+  })).toBe(true);
 }
 
 function recordServiceQuestion(
@@ -2077,6 +2121,189 @@ it("retires a thread whose provider no longer matches the configured model", asy
   await expect(adapter.status("thr_controller", AbortSignal.timeout(1_000))).resolves.toBe("incompatible");
 });
 
+it.each([
+  ["status", "Controller status could not be verified"],
+  ["timeline baseline", "Controller event baseline could not be verified"],
+  ["invalid timeline baseline", "Controller event baseline was invalid"],
+] as const)("requeues a transient %s read with capped dispatch backoff", async (failedRead, expectedError) => {
+  const { db, store, fence } = serviceFixture();
+  const updateOffset = failedRead === "status" ? 0 : failedRead === "timeline baseline" ? 1 : 2;
+  activateControllerForServiceTest(store, fence, 60_101 + updateOffset * 2, "thr_transient_read");
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 60_102 + updateOffset * 2, inputText: "preserve this request" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(),
+    send: vi.fn(),
+    status: vi.fn(async () => {
+      if (failedRead === "status") throw new Error("temporary status outage");
+      return "idle" as const;
+    }),
+    latestSeq: vi.fn(async () => {
+      if (failedRead === "timeline baseline") throw new Error("temporary timeline outage");
+      if (failedRead === "invalid timeline baseline") return -1;
+      return 7;
+    }),
+    events: vi.fn(),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "queued",
+    inputText: "preserve this request",
+    lastError: expectedError,
+  });
+  expect(db.prepare(
+    `SELECT delivery_state, dispatch_retry_count, delivery_reconcile_attempts, next_dispatch_at
+       FROM controller_turns WHERE id = ?`,
+  ).get(turn.id)).toEqual({
+    delivery_state: "none",
+    dispatch_retry_count: 1,
+    delivery_reconcile_attempts: 0,
+    next_dispatch_at: 3_002,
+  });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe("Queued…");
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(false);
+  expect(adapter.send).not.toHaveBeenCalled();
+});
+
+it("requeues a transient spawn-candidate read before any spawn intent exists", async () => {
+  const { db, store, fence } = serviceFixture();
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 60_105, inputText: "start a fresh controller" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(),
+    send: vi.fn(),
+    status: vi.fn(),
+    latestSeq: vi.fn(),
+    events: vi.fn(),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => { throw new Error("temporary candidate read outage"); }),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_001 } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "queued",
+    inputText: "start a fresh controller",
+    lastError: "Controller spawn candidates could not be read",
+  });
+  expect(db.prepare(
+    "SELECT delivery_state, dispatch_retry_count, next_dispatch_at FROM controller_turns WHERE id = ?",
+  ).get(turn.id)).toEqual({ delivery_state: "none", dispatch_retry_count: 1, next_dispatch_at: 3_001 });
+  expect(adapter.spawn).not.toHaveBeenCalled();
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe("Queued…");
+});
+
+it("adopts an uncertain spawn after restart without spawning the owner input twice", async () => {
+  const fixture = serviceFixture();
+  const { db, store, fence } = fixture;
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 60_106, inputText: "spawn this exactly once" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_000,
+  });
+  const firstFind = vi.fn()
+    .mockResolvedValueOnce(null)
+    .mockRejectedValueOnce(new Error("candidate timeline unavailable"));
+  const firstSpawn = vi.fn(async () => {
+    expect(db.prepare(
+      "SELECT delivery_state, dispatch_kind, dispatch_correlation_id FROM controller_turns WHERE id = ?",
+    ).get(turn.id)).toEqual({
+      delivery_state: "intent",
+      dispatch_kind: "spawn",
+      dispatch_correlation_id: turn.id,
+    });
+    throw new Error("spawn response was lost");
+  });
+  const firstAdapter: ControllerAdapter = {
+    spawn: firstSpawn,
+    send: vi.fn(),
+    status: vi.fn(),
+    latestSeq: vi.fn(),
+    events: vi.fn(),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: firstFind,
+  };
+  const firstService = new LunaControllerService({
+    store,
+    adapter: firstAdapter,
+    evidenceProjector,
+    clock: { now: () => 2_001 },
+  });
+
+  await expect(firstService.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(firstSpawn).toHaveBeenCalledTimes(1);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "dispatching", inputText: "spawn this exactly once" });
+  expect(db.prepare(
+    "SELECT delivery_state, dispatch_kind, dispatch_correlation_id FROM controller_turns WHERE id = ?",
+  ).get(turn.id)).toEqual({
+    delivery_state: "delivery_unknown",
+    dispatch_kind: "spawn",
+    dispatch_correlation_id: turn.id,
+  });
+
+  expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 2_002)).toBe(true);
+  const restarted = fixture.reopen();
+  const successorLease = restarted.acquireExecutorLease("spawn-successor", 3_100, 30_000);
+  if (!successorLease.acquired) throw new Error("missing spawn successor lease");
+  const successorFence = {
+    ownerId: "spawn-successor",
+    generation: successorLease.generation,
+    signal: AbortSignal.timeout(2_000),
+  };
+  const successorSpawn = vi.fn();
+  const successorAdapter: ControllerAdapter = {
+    spawn: successorSpawn,
+    send: vi.fn(),
+    status: vi.fn(),
+    latestSeq: vi.fn(),
+    events: vi.fn(),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => ({
+      threadId: "thr_spawn_reconciled",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: turn.id,
+    })),
+  };
+  const successorService = new LunaControllerService({
+    store: restarted,
+    adapter: successorAdapter,
+    evidenceProjector,
+    clock: { now: () => 3_100 },
+  });
+
+  await expect(successorService.reconcile(successorFence, successorFence.signal)).resolves.toBe(true);
+
+  expect(successorSpawn).not.toHaveBeenCalled();
+  expect(restarted.getControllerForOwner("7", "7")).toMatchObject({
+    state: "active",
+    threadId: "thr_spawn_reconciled",
+  });
+  expect(restarted.getControllerTurn(turn.id)).toMatchObject({ state: "submitted", inputText: "spawn this exactly once" });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_turns WHERE telegram_update_id = ? AND input_text = ?",
+  ).get(turn.updateId, turn.inputText)).toEqual({ count: 1 });
+});
+
 it("requeues a turn while the controller thread is still busy instead of failing it", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
@@ -2135,8 +2362,8 @@ it("requeues a turn while the controller thread is still busy instead of failing
   expect(store.getControllerTurn(pending.id)).toMatchObject({ state: "submitted", dispatchAfterSeq: 4 });
 });
 
-it("gives up on a turn the busy controller never accepts within its bounded wait", async () => {
-  const { store, fence } = serviceFixture();
+it("notifies once and rolls a persistently busy queued turn onto a fresh generation", async () => {
+  const { db, store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 63, inputText: "answer me" }),
     telegramUserId: "7",
@@ -2169,8 +2396,24 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     telegramChatId: "7",
     now: 2_001,
   });
+  let now = 2_001 + CONTROLLER_BUSY_NOTICE_MS;
+  const spawn = vi.fn(async (spawnTurn: { id: string }) => {
+    if (!store.reserveControllerSpawn({
+      controllerKey: stranded.controllerKey,
+      turnId: spawnTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now,
+    })) throw new Error("fresh generation reservation failed");
+    return {
+      threadId: "thr_after_busy_rollover",
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      spawnToken: spawnTurn.id,
+    };
+  });
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
+    spawn,
     send: vi.fn(async () => undefined),
     status: vi.fn(async () => "active" as const),
     latestSeq: vi.fn(async () => 0),
@@ -2179,17 +2422,54 @@ it("gives up on a turn the busy controller never accepts within its bounded wait
     answerQuestion: vi.fn(async () => undefined),
     findSpawnCandidate: vi.fn(async () => null),
   };
-  const wedgedAt = 2_001 + 15 * 60_000;
-  expect(store.renewExecutorLease(fence.ownerId, fence.generation, 2_100, 30 * 60_000)).toBe(true);
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => wedgedAt } });
+  expect(store.renewExecutorLease(
+    fence.ownerId,
+    fence.generation,
+    2_100,
+    CONTROLLER_BUSY_ROLLOVER_MS + 30_000,
+  )).toBe(true);
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => now } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
 
   expect(store.getControllerTurn(stranded.id)).toMatchObject({
-    state: "failed",
-    lastError: "Controller thread stayed busy for too long",
+    state: "queued",
+    inputText: "second question",
+    busyWaitNotifiedAt: now,
+    lastError: null,
   });
-  expect(store.getOutbox(`controller:${stranded.id}:reply`)?.status).toBe("pending");
+  const noticeKey = `controller:${stranded.id}:busy-wait`;
+  expect(store.getOutbox(noticeKey)).toMatchObject({
+    status: "pending",
+    payload: { text: expect.stringMatching(/kept.*message queued.*fresh conversation/i) },
+  });
+  const firstNotice = db.prepare(
+    "SELECT payload_json, updated_at FROM outbox WHERE logical_key = ?",
+  ).get(noticeKey);
+
+  now += 1;
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(db.prepare(
+    "SELECT payload_json, updated_at FROM outbox WHERE logical_key = ?",
+  ).get(noticeKey)).toEqual(firstNotice);
+
+  now = 2_001 + CONTROLLER_BUSY_ROLLOVER_MS;
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(store.getControllerTurn(stranded.id)).toMatchObject({
+    state: "submitted",
+    inputText: "second question",
+    busyWaitNotifiedAt: 2_001 + CONTROLLER_BUSY_NOTICE_MS,
+  });
+  expect(store.getControllerForOwner("7", "7")).toMatchObject({
+    state: "active",
+    threadId: "thr_after_busy_rollover",
+  });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_turns WHERE telegram_update_id = ? AND input_text = ?",
+  ).get(stranded.updateId, stranded.inputText)).toEqual({ count: 1 });
+  expect(adapter.send).not.toHaveBeenCalled();
 });
 
 it("persists a fresh stalled-turn recovery across reload before draining later input", async () => {
@@ -2414,45 +2694,261 @@ it("reports a streaming turn only while its answer is still arriving", async () 
   expect(service.isStreaming()).toBe(false);
 });
 
-it("fails an uncertain send closed and never submits it twice", async () => {
-  const { store, fence } = serviceFixture();
-  store.enqueueControllerTurn({ ...turnRecord({ updateId: 21, inputText: "send once" }), telegramUserId: "7", telegramChatId: "7", now: 2_000 });
+it("reconciles an uncertain send from the exact timeline without submitting it twice", async () => {
+  const { db, store, fence } = serviceFixture();
+  activateControllerForServiceTest(store, fence, 61_001, "thr_uncertain_send");
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 61_002, inputText: "send once" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
   const adapter: ControllerAdapter = {
-    spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
-    send: vi.fn(async () => { throw new Error("uncertain send"); }),
+    spawn: vi.fn(),
+    send: vi.fn(async () => {
+      expect(db.prepare(
+        `SELECT delivery_state, dispatch_kind, dispatch_correlation_id, dispatch_after_seq
+           FROM controller_turns WHERE id = ?`,
+      ).get(turn.id)).toEqual({
+        delivery_state: "intent",
+        dispatch_kind: "send",
+        dispatch_correlation_id: `controller-dispatch:${turn.id}`,
+        dispatch_after_seq: 10,
+      });
+      throw new Error("uncertain send");
+    }),
     status: vi.fn(async () => "idle" as const),
-    latestSeq: vi.fn(async () => 0),
-    events: vi.fn(async () => ({ latestSeq: 22, inputAccepted: true, assistantDelta: "", completed: false, error: "Controller provider turn failed", pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0 })),
+    latestSeq: vi.fn(async () => 10),
+    events: vi.fn(async (_threadId, afterSeq) => ({
+      latestSeq: 11,
+      inputAccepted: afterSeq === 10,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      failure: null,
+      assistantDraft: null,
+      interactionReferences: [],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
     steer: vi.fn(async () => undefined),
     answerQuestion: vi.fn(async () => undefined),
-    findSpawnCandidate: vi.fn(async () => ({ threadId: "thr_controller", projectId: "proj_personal", hostId: "host_personal", spawnToken: "controller-turn-21" })),
+    findSpawnCandidate: vi.fn(async () => null),
   };
-  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_000 } });
-  expect(store.claimNextControllerTurn({ ownerId: fence.ownerId, generation: fence.generation, now: 2_000 })).not.toBeNull();
-  reserveControllerSpawnForTest(store, "controller-turn-21");
-  expect(store.markControllerSpawned({
-    turnId: "controller-turn-21",
-    ownerId: fence.ownerId,
-    generation: fence.generation,
-    now: 2_000,
-    projectId: "proj_personal",
-    hostId: "host_personal",
-    threadId: "thr_controller",
-    spawnToken: "controller-turn-21",
-  })).toBe(true);
-  expect(store.failControllerTurn({
-    turnId: "controller-turn-21",
-    ownerId: fence.ownerId,
-    generation: fence.generation,
-    now: 2_000,
-    error: "setup",
-  })).toBe(true);
-  store.enqueueControllerTurn({ ...turnRecord({ updateId: 22, inputText: "send once" }), telegramUserId: "7", telegramChatId: "7", now: 2_001 });
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => 2_002 } });
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(false);
+
   expect(adapter.send).toHaveBeenCalledTimes(1);
-  expect(store.listControllerTurns("owner-7-controller", 10).at(-1)?.state).toBe("failed");
+  expect(adapter.events).toHaveBeenCalledWith("thr_uncertain_send", 10, fence.signal);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    inputText: "send once",
+    dispatchAfterSeq: 10,
+  });
+  expect(db.prepare(
+    `SELECT delivery_state, dispatch_kind, dispatch_correlation_id, delivery_reconcile_attempts
+       FROM controller_turns WHERE id = ?`,
+  ).get(turn.id)).toEqual({
+    delivery_state: "none",
+    dispatch_kind: "send",
+    dispatch_correlation_id: `controller-dispatch:${turn.id}`,
+    delivery_reconcile_attempts: 0,
+  });
+});
+
+it("preserves an uncertain send exactly once across a restart during reconciliation", async () => {
+  const fixture = serviceFixture();
+  const { db, store, fence } = fixture;
+  activateControllerForServiceTest(store, fence, 61_003, "thr_restart_reconcile");
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 61_004, inputText: "do not lose or repeat this" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  const firstAdapter: ControllerAdapter = {
+    spawn: vi.fn(),
+    send: vi.fn(async () => { throw new Error("connection ended after send"); }),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 20),
+    events: vi.fn(async () => { throw new Error("timeline temporarily unavailable"); }),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const firstService = new LunaControllerService({
+    store,
+    adapter: firstAdapter,
+    evidenceProjector,
+    clock: { now: () => 2_002 },
+  });
+
+  await expect(firstService.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "dispatching", inputText: "do not lose or repeat this" });
+  expect(db.prepare(
+    "SELECT delivery_state, delivery_reconcile_attempts FROM controller_turns WHERE id = ?",
+  ).get(turn.id)).toEqual({ delivery_state: "delivery_unknown", delivery_reconcile_attempts: 1 });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
+    .toBe("I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.");
+
+  expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 2_003)).toBe(true);
+  const restarted = fixture.reopen();
+  const successorLease = restarted.acquireExecutorLease("successor", 3_100, 30_000);
+  if (!successorLease.acquired) throw new Error("missing successor lease");
+  const successorFence = {
+    ownerId: "successor",
+    generation: successorLease.generation,
+    signal: AbortSignal.timeout(2_000),
+  };
+  const successorAdapter: ControllerAdapter = {
+    spawn: vi.fn(),
+    send: vi.fn(),
+    status: vi.fn(async () => "active" as const),
+    latestSeq: vi.fn(async () => 21),
+    events: vi.fn(async (_threadId, afterSeq) => ({
+      latestSeq: 21,
+      inputAccepted: afterSeq === 20,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: false,
+      failure: null,
+      assistantDraft: null,
+      interactionReferences: [],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const successorService = new LunaControllerService({
+    store: restarted,
+    adapter: successorAdapter,
+    evidenceProjector,
+    clock: { now: () => 3_100 },
+  });
+
+  await expect(successorService.reconcile(successorFence, successorFence.signal)).resolves.toBe(true);
+
+  expect(successorAdapter.send).not.toHaveBeenCalled();
+  expect(restarted.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    inputText: "do not lose or repeat this",
+    dispatchAfterSeq: 20,
+  });
+  expect(db.prepare(
+    "SELECT COUNT(*) AS count FROM controller_turns WHERE telegram_update_id = ? AND input_text = ?",
+  ).get(turn.updateId, turn.inputText)).toEqual({ count: 1 });
+});
+
+it("terminates unresolved delivery after bounded reconciliation and tells the owner", async () => {
+  const { store, fence } = serviceFixture();
+  activateControllerForServiceTest(store, fence, 61_005, "thr_unresolved_delivery");
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 61_006, inputText: "keep this exact owner input" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  let now = 2_002;
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(),
+    send: vi.fn(async () => { throw new Error("uncertain provider boundary"); }),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 30),
+    events: vi.fn(async () => { throw new Error("timeline unavailable"); }),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => now } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(store.getControllerTurn(turn.id)?.state).toBe("dispatching");
+  now = 3_002;
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  expect(store.getControllerTurn(turn.id)?.state).toBe("dispatching");
+  now = 5_002;
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(adapter.send).toHaveBeenCalledTimes(1);
+  expect(adapter.events).toHaveBeenCalledTimes(3);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "failed",
+    inputText: "keep this exact owner input",
+    lastError: "Controller delivery could not be reconciled",
+  });
+  const notice = store.getOutbox(`controller:${turn.id}:reply`)?.payload.text;
+  expect(notice).toBe(
+    "I preserved that message, but could not confirm whether it was delivered. I did not repeat it. Please review the conversation before trying again.",
+  );
+  expect(notice).not.toContain("timeline unavailable");
+});
+
+it("bounds reconciliation when proved delivery cannot be durably submitted", async () => {
+  const { db, store, fence } = serviceFixture();
+  activateControllerForServiceTest(store, fence, 61_007, "thr_unsettled_delivery");
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 61_008, inputText: "preserve a proved but unsettled delivery" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  db.exec(`
+    CREATE TRIGGER block_controller_submission
+    BEFORE UPDATE OF state ON controller_turns
+    WHEN OLD.telegram_update_id = 61008 AND NEW.state = 'submitted'
+    BEGIN
+      SELECT RAISE(IGNORE);
+    END
+  `);
+  let now = 2_002;
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(),
+    send: vi.fn(async () => { throw new Error("uncertain provider boundary"); }),
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 40),
+    events: vi.fn(async () => ({
+      latestSeq: 41,
+      inputAccepted: true,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      failure: null,
+      assistantDraft: null,
+      interactionReferences: [],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({ store, adapter, evidenceProjector, clock: { now: () => now } });
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "dispatching",
+    deliveryState: "delivery_unknown",
+    deliveryReconcileAttempts: 1,
+  });
+  now = 3_002;
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+  now = 5_002;
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(adapter.send).toHaveBeenCalledTimes(1);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "failed",
+    inputText: "preserve a proved but unsettled delivery",
+    deliveryReconcileAttempts: 3,
+  });
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toMatch(/did not repeat/i);
 });
 
 it("keeps an idle submitted turn durable when BB output retrieval fails transiently", async () => {

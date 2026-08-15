@@ -248,7 +248,7 @@ Delivering the answer to BB is the one operation allowed to run before evidence 
 
 Legacy controller-question storage remains as migration history and a one-release compatibility read for in-flight messages. It is never written again.
 
-Two timeouts bound the ways an answer can go missing, and their ordering matters. A submitted turn that produces no BB event for eight minutes is treated as wedged: the turn fails with a message to the owner **and the thread is retired**, so the next message opens a fresh session. That deadline sits below the ten-minute limit on how long a queued message waits for a busy thread, so recovery happens before the queue starts failing behind it. A turn parked on an interaction is exempt — waiting on a person is not a stall.
+Two timeouts bound the ways an answer can go missing, and their ordering matters. A submitted turn that produces no BB event for eight minutes is treated as wedged: the turn fails with a message to the owner **and the thread is retired**, so the next message opens a fresh session. That deadline sits below the ten-minute rollover for a queued message behind a busy thread, so ordinary stall recovery happens first. A queued owner message still waiting after two minutes gets one acknowledgement; at ten minutes the preserved turn opens a fresh controller generation instead of failing. A turn parked on an interaction is exempt — waiting on a person is not a stall.
 
 A message the owner sends while an answer is still being written is steered into the running thread rather than queued behind it, so a correction lands while it can still correct something.
 

@@ -3,6 +3,8 @@ import type { SupervisorReason } from "./supervisor";
 
 export type ControllerThreadState = "pending_spawn" | "active" | "failed" | "revoked";
 export type ControllerTurnState = "queued" | "dispatching" | "submitted" | "completed" | "failed";
+export type ControllerDeliveryState = "none" | "intent" | "delivery_unknown";
+export type ControllerDispatchKind = "send" | "spawn";
 export type ControllerCapabilityContinuationState = "requested" | "relaunching" | "resolved" | "blocked";
 export { CONTROLLER_PROOF_KINDS } from "./proof-kinds.js";
 export type ControllerProofKind = (typeof CONTROLLER_PROOF_KINDS)[number];
@@ -120,6 +122,17 @@ export type ControllerTurnRecord = {
   leaseOwner: string | null;
   leaseGeneration: number | null;
   dispatchAfterSeq: number;
+  /** Write-ahead state for the provider mutation represented by this turn. */
+  deliveryState: ControllerDeliveryState;
+  dispatchKind: ControllerDispatchKind | null;
+  dispatchCorrelationId: string | null;
+  /** Capped pre-dispatch backoff level, separate from media retries. */
+  dispatchRetryCount: number;
+  /** Exact-delivery reconciliation attempts after a provider result became ambiguous. */
+  deliveryReconcileAttempts: number;
+  /** When the owner was told once that a persistently busy thread still holds this input. */
+  busyWaitNotifiedAt: number | null;
+  nextDispatchAt: number;
   retryCount: number;
   /** Zero is the primary model; one and two select the ordered fallback slots. */
   modelFallbackIndex: number;

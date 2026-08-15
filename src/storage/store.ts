@@ -85,6 +85,8 @@ import {
   MAX_CONTROLLER_IMAGE_BYTES,
   MAX_PERSISTED_MEDIA_BYTES,
   normalizeControllerImage,
+  type ControllerDeliveryState,
+  type ControllerDispatchKind,
   type ControllerImage,
   type ControllerLeaseFence,
   type ControllerMediaKind,
@@ -401,7 +403,12 @@ export type ControllerFailureCode =
   | "provider_rejected"
   | "recovery_exhausted"
   | "owner_message_delivery_uncertain"
-  | "owner_message_delivery_exhausted";
+  | "owner_message_delivery_exhausted"
+  | "owner_message_delivery_unresolved"
+  | "owner_message_waiting_for_fresh_generation"
+  | "image_preparation_failed";
+
+export type ControllerDeliveryReconciliationResult = "pending" | "failed" | "stale";
 
 export type ControllerGeneration = {
   id: string;
@@ -1055,6 +1062,13 @@ type ControllerTurnRow = {
   lease_owner: string | null;
   lease_generation: number | null;
   dispatch_after_seq: number;
+  delivery_state: ControllerDeliveryState;
+  dispatch_kind: ControllerDispatchKind | null;
+  dispatch_correlation_id: string | null;
+  dispatch_retry_count: number;
+  delivery_reconcile_attempts: number;
+  busy_wait_notified_at: number | null;
+  next_dispatch_at: number;
   retry_count: number;
   model_fallback_index: number;
   bb_event_seq: number;
@@ -2875,6 +2889,17 @@ export interface TelegramAgentStore {
     bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced";
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
+  prepareControllerDispatch(input: ControllerLeaseFence & {
+    turnId: string;
+    kind: ControllerDispatchKind;
+    expectedThreadId?: string;
+    dispatchAfterSeq?: number;
+  }): boolean;
+  markControllerDeliveryUnknown(input: ControllerLeaseFence & { turnId: string }): boolean;
+  recordControllerDeliveryReconciliationPending(input: ControllerLeaseFence & {
+    turnId: string;
+    retryAfterMs: number;
+  }): ControllerDeliveryReconciliationResult;
   reserveControllerSpawn(input: {
     controllerKey: string;
     turnId: string;
@@ -2882,8 +2907,17 @@ export interface TelegramAgentStore {
     hostId: string;
     now: number;
   }): boolean;
-  requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean;
-  recordControllerImagePreparationFailure(input: ControllerLeaseFence & { turnId: string }): boolean;
+  requeueControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    retryAfterMs?: number;
+    error?: string;
+    incrementDispatchRetry?: boolean;
+  }): boolean;
+  recordControllerBusyWaitNotice(input: ControllerLeaseFence & { turnId: string }): boolean;
+  recordControllerImagePreparationFailure(input: ControllerLeaseFence & {
+    turnId: string;
+    incrementRetry?: boolean;
+  }): boolean;
   failStaleControllerDispatches(fence: ControllerLeaseFence): boolean;
   markControllerSpawned(input: ControllerLeaseFence & {
     turnId: string;
@@ -3056,7 +3090,7 @@ export interface TelegramAgentStore {
   failControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     error: string;
-    ownerMessage?: string;
+    failureCode?: ControllerFailureCode;
     leaseMs?: number;
   }): boolean;
   failAndRetireControllerTurn(input: ControllerLeaseFence & {
@@ -3671,6 +3705,40 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
   if (row.recovery_source_turn_id !== null) {
     assertControllerIdentifier(row.recovery_source_turn_id, "persisted recovery source turn id");
   }
+  if (row.delivery_state !== "none" && row.delivery_state !== "intent" && row.delivery_state !== "delivery_unknown") {
+    throw new Error("Persisted controller turn delivery_state is invalid");
+  }
+  if (row.dispatch_kind !== null && row.dispatch_kind !== "send" && row.dispatch_kind !== "spawn") {
+    throw new Error("Persisted controller turn dispatch_kind is invalid");
+  }
+  if (row.dispatch_correlation_id !== null) {
+    assertControllerIdentifier(row.dispatch_correlation_id, "persisted dispatch correlation id");
+  }
+  const dispatchRetryCount = parsePersistedControllerNonNegativeInteger(
+    row.dispatch_retry_count,
+    "dispatch_retry_count",
+  );
+  const deliveryReconcileAttempts = parsePersistedControllerNonNegativeInteger(
+    row.delivery_reconcile_attempts,
+    "delivery_reconcile_attempts",
+  );
+  const busyWaitNotifiedAt = parsePersistedControllerNullableNonNegativeInteger(
+    row.busy_wait_notified_at,
+    "busy_wait_notified_at",
+  );
+  const nextDispatchAt = parsePersistedControllerNonNegativeInteger(
+    row.next_dispatch_at,
+    "next_dispatch_at",
+  );
+  if (row.delivery_state === "intent" && (
+    row.state !== "dispatching" || row.dispatch_kind === null || row.dispatch_correlation_id === null
+  )) {
+    throw new Error("Persisted controller dispatch intent is incomplete");
+  }
+  if (row.delivery_state === "delivery_unknown" &&
+      row.state !== "dispatching" && row.state !== "failed") {
+    throw new Error("Persisted unknown controller delivery has an invalid turn state");
+  }
   return {
     id: row.id,
     updateId: row.telegram_update_id,
@@ -3682,6 +3750,13 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     leaseOwner: row.lease_owner,
     leaseGeneration: row.lease_generation,
     dispatchAfterSeq: row.dispatch_after_seq,
+    deliveryState: row.delivery_state,
+    dispatchKind: row.dispatch_kind,
+    dispatchCorrelationId: row.dispatch_correlation_id,
+    dispatchRetryCount,
+    deliveryReconcileAttempts,
+    busyWaitNotifiedAt,
+    nextDispatchAt,
     retryCount: row.retry_count,
     modelFallbackIndex: row.model_fallback_index,
     bbEventSeq: row.bb_event_seq,
@@ -4201,7 +4276,13 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
   recovery_exhausted: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
   owner_message_delivery_uncertain: "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
   owner_message_delivery_exhausted: "I couldn't confirm whether my previous message reached you after repeated attempts. It may be missing or duplicated; open BB to inspect the result.",
+  owner_message_delivery_unresolved: "I preserved that message, but could not confirm whether it was delivered. I did not repeat it. Please review the conversation before trying again.",
+  owner_message_waiting_for_fresh_generation: "I kept your message queued because that controller is still busy. If it does not free up soon, I’ll continue in a fresh conversation.",
+  image_preparation_failed: "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.",
 };
+
+const MAX_CONTROLLER_DISPATCH_RETRY_COUNT = 6;
+const MAX_CONTROLLER_DELIVERY_RECONCILIATION_ATTEMPTS = 3;
 
 function validatedThreadFollowUp(input: unknown): ThreadFollowUp {
   if (typeof input !== "object" || input === null) {
@@ -4257,6 +4338,19 @@ function controllerFailureOutbox(
       text: CONTROLLER_FAILURE_TEXT[failureCode],
       disable_web_page_preview: true,
     },
+  };
+}
+
+function controllerPhaseOutbox(
+  turnId: string,
+  chatId: string,
+  phase: "queued" | "connecting",
+  threadFollowUpJson: string | null,
+): OutboxInput {
+  return {
+    logicalKey: controllerReplyLogicalKey(turnId, threadFollowUpJson),
+    chatId,
+    payload: { text: CONTROLLER_PHASE_TEXT[phase], disable_web_page_preview: true },
   };
 }
 
@@ -5379,13 +5473,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             AND owners.telegram_user_id = controller.telegram_user_id
             AND owners.telegram_chat_id = controller.telegram_chat_id
           WHERE turn.state = 'queued'
+            AND turn.delivery_state = 'none'
+            AND turn.next_dispatch_at <= ?
             AND NOT EXISTS (
               SELECT 1 FROM controller_turns AS active
                WHERE active.controller_key = turn.controller_key
                  AND active.state IN ('dispatching', 'submitted')
             )
           ORDER BY turn.created_at ASC, turn.ordinal ASC LIMIT 1`,
-      ).get() as ControllerTurnRow | undefined;
+      ).get(fence.now) as ControllerTurnRow | undefined;
       if (!row) return null;
       const updated = this.db.prepare(
         `UPDATE controller_turns
@@ -5400,6 +5496,205 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(row.id, fence.now, row.controller_key);
       const claimed = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(row.id) as ControllerTurnRow;
       return parseControllerTurn(claimed);
+    }).immediate();
+  }
+
+  public prepareControllerDispatch(input: ControllerLeaseFence & {
+    turnId: string;
+    kind: ControllerDispatchKind;
+    expectedThreadId?: string;
+    dispatchAfterSeq?: number;
+  }): boolean {
+    this.assertControllerMutation(input);
+    if (input.kind !== "send" && input.kind !== "spawn") {
+      throw new TypeError("controller dispatch kind is invalid");
+    }
+    if (input.kind === "send") {
+      if (input.expectedThreadId === undefined) {
+        throw new TypeError("send dispatch requires an expected thread id");
+      }
+      assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    }
+    const dispatchAfterSeq = input.dispatchAfterSeq ?? 0;
+    assertNonNegativeInteger(dispatchAfterSeq, "dispatchAfterSeq");
+    if (input.kind === "spawn" && dispatchAfterSeq !== 0) {
+      throw new TypeError("spawn dispatch cannot carry a timeline baseline");
+    }
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.controller_key, turn.thread_follow_up_json,
+                controller.telegram_chat_id, controller.state AS controller_state,
+                controller.bb_thread_id, controller.pending_spawn_token
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ? AND turn.state = 'dispatching'
+            AND turn.lease_owner = ? AND turn.lease_generation = ?
+            AND turn.delivery_state = 'none'`,
+      ).get(input.turnId, input.ownerId, input.generation) as {
+        controller_key: string;
+        thread_follow_up_json: string | null;
+        telegram_chat_id: string;
+        controller_state: ControllerThreadState;
+        bb_thread_id: string | null;
+        pending_spawn_token: string | null;
+      } | undefined;
+      if (!row) return false;
+      if (input.kind === "send" && (
+        row.controller_state !== "active" || row.bb_thread_id !== input.expectedThreadId
+      )) return false;
+      if (input.kind === "spawn" && (
+        row.controller_state !== "pending_spawn" || row.bb_thread_id !== null ||
+        row.pending_spawn_token !== input.turnId
+      )) return false;
+      const correlationId = input.kind === "spawn"
+        ? input.turnId
+        : `controller-dispatch:${input.turnId}`;
+      const prepared = this.db.prepare(
+        `UPDATE controller_turns
+            SET delivery_state = 'intent', dispatch_kind = ?, dispatch_correlation_id = ?,
+                dispatch_after_seq = ?, dispatch_retry_count = 0,
+                delivery_reconcile_attempts = 0, next_dispatch_at = 0,
+                last_error = NULL, updated_at = ?
+          WHERE id = ? AND state = 'dispatching' AND delivery_state = 'none'
+            AND lease_owner = ? AND lease_generation = ?`,
+      ).run(
+        input.kind,
+        correlationId,
+        dispatchAfterSeq,
+        input.now,
+        input.turnId,
+        input.ownerId,
+        input.generation,
+      );
+      if (prepared.changes !== 1) return false;
+      persistControllerOutbox(this.db, controllerPhaseOutbox(
+        input.turnId,
+        row.telegram_chat_id,
+        "connecting",
+        row.thread_follow_up_json,
+      ), input.now);
+      return true;
+    }).immediate();
+  }
+
+  public markControllerDeliveryUnknown(
+    input: ControllerLeaseFence & { turnId: string },
+  ): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      return this.db.prepare(
+        `UPDATE controller_turns
+            SET delivery_state = 'delivery_unknown',
+                last_error = 'Controller delivery outcome is unknown',
+                next_dispatch_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'dispatching' AND delivery_state = 'intent'
+            AND lease_owner = ? AND lease_generation = ?`,
+      ).run(
+        input.now,
+        input.now,
+        input.turnId,
+        input.ownerId,
+        input.generation,
+      ).changes === 1;
+    }).immediate();
+  }
+
+  public recordControllerDeliveryReconciliationPending(input: ControllerLeaseFence & {
+    turnId: string;
+    retryAfterMs: number;
+  }): ControllerDeliveryReconciliationResult {
+    this.assertControllerMutation(input);
+    assertNonNegativeInteger(input.retryAfterMs, "retryAfterMs");
+    const nextDispatchAt = input.now + input.retryAfterMs;
+    assertNonNegativeInteger(nextDispatchAt, "nextDispatchAt");
+    return this.db.transaction((): ControllerDeliveryReconciliationResult => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
+      const row = this.db.prepare(
+        `SELECT turn.controller_key, turn.delivery_reconcile_attempts,
+                turn.thread_follow_up_json, controller.telegram_chat_id,
+                controller.bb_thread_id, controller.pending_spawn_token
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ? AND turn.state = 'dispatching'
+            AND turn.delivery_state = 'delivery_unknown'
+            AND turn.lease_owner = ? AND turn.lease_generation = ?`,
+      ).get(input.turnId, input.ownerId, input.generation) as {
+        controller_key: string;
+        delivery_reconcile_attempts: number;
+        thread_follow_up_json: string | null;
+        telegram_chat_id: string;
+        bb_thread_id: string | null;
+        pending_spawn_token: string | null;
+      } | undefined;
+      if (!row) return "stale";
+      const attempts = row.delivery_reconcile_attempts + 1;
+      if (attempts >= MAX_CONTROLLER_DELIVERY_RECONCILIATION_ATTEMPTS) {
+        const failed = this.db.prepare(
+          `UPDATE controller_turns
+              SET state = 'failed', delivery_reconcile_attempts = ?,
+                  last_error = 'Controller delivery could not be reconciled',
+                  stream_text = '', stream_phase = 'failed',
+                  lease_owner = NULL, lease_generation = NULL,
+                  next_dispatch_at = 0, completed_at = ?, updated_at = ?
+            WHERE id = ? AND state = 'dispatching'
+              AND delivery_state = 'delivery_unknown'
+              AND lease_owner = ? AND lease_generation = ?`,
+        ).run(
+          attempts,
+          input.now,
+          input.now,
+          input.turnId,
+          input.ownerId,
+          input.generation,
+        );
+        if (failed.changes !== 1) return "stale";
+        if (row.bb_thread_id === null && row.pending_spawn_token === input.turnId) {
+          this.db.prepare(
+            `UPDATE controller_threads
+                SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
+              WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
+          ).run(input.now, row.controller_key, input.turnId);
+        }
+        persistControllerOutbox(this.db, controllerFailureOutbox(
+          input.turnId,
+          row.telegram_chat_id,
+          "owner_message_delivery_unresolved",
+          row.thread_follow_up_json,
+        ), input.now);
+        return "failed";
+      }
+      const pending = this.db.prepare(
+        `UPDATE controller_turns
+            SET delivery_reconcile_attempts = ?,
+                last_error = 'Controller delivery reconciliation is pending',
+                next_dispatch_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'dispatching'
+            AND delivery_state = 'delivery_unknown'
+            AND lease_owner = ? AND lease_generation = ?`,
+      ).run(
+        attempts,
+        nextDispatchAt,
+        input.now,
+        input.turnId,
+        input.ownerId,
+        input.generation,
+      );
+      if (pending.changes !== 1) return "stale";
+      persistControllerOutbox(this.db, controllerFailureOutbox(
+        input.turnId,
+        row.telegram_chat_id,
+        "owner_message_delivery_uncertain",
+        row.thread_follow_up_json,
+      ), input.now);
+      return "pending";
     }).immediate();
   }
 
@@ -5465,44 +5760,175 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   // A claim taken while the BB thread is still answering is returned to the
-  // queue rather than failed, so the message is still delivered a moment later.
-  public requeueControllerTurn(input: ControllerLeaseFence & { turnId: string }): boolean {
+  // queue; the service separately bounds that wait with a notice and rollover.
+  public requeueControllerTurn(input: ControllerLeaseFence & {
+    turnId: string;
+    retryAfterMs?: number;
+    error?: string;
+    incrementDispatchRetry?: boolean;
+  }): boolean {
     this.assertControllerMutation(input);
+    const retryAfterMs = input.retryAfterMs ?? 0;
+    assertNonNegativeInteger(retryAfterMs, "retryAfterMs");
+    const nextDispatchAt = input.now + retryAfterMs;
+    assertNonNegativeInteger(nextDispatchAt, "nextDispatchAt");
+    if (input.error !== undefined) {
+      assertSafeFailureSummary(input.error);
+      assertNoRawMergeCallback(input.error, "controller requeue error");
+    }
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.controller_key, turn.thread_follow_up_json, controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ? AND turn.state = 'dispatching' AND turn.delivery_state = 'none'
+            AND turn.lease_owner = ? AND turn.lease_generation = ?`,
+      ).get(input.turnId, input.ownerId, input.generation) as {
+        controller_key: string;
+        thread_follow_up_json: string | null;
+        telegram_chat_id: string;
+      } | undefined;
+      if (!row) return false;
       const requeued = this.db.prepare(
         `UPDATE controller_turns
-            SET state = 'queued', lease_owner = NULL, lease_generation = NULL, updated_at = ?
-          WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?`,
-      ).run(input.now, input.turnId, input.ownerId, input.generation);
+            SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
+                dispatch_after_seq = 0, delivery_state = 'none', dispatch_kind = NULL,
+                dispatch_correlation_id = NULL, delivery_reconcile_attempts = 0,
+                dispatch_retry_count = CASE WHEN ? = 1
+                  THEN MIN(dispatch_retry_count + 1, ?)
+                  ELSE dispatch_retry_count
+                END,
+                next_dispatch_at = ?, last_error = ?, updated_at = ?
+          WHERE id = ? AND state = 'dispatching' AND delivery_state = 'none'
+            AND lease_owner = ? AND lease_generation = ?`,
+      ).run(
+        input.incrementDispatchRetry === true ? 1 : 0,
+        MAX_CONTROLLER_DISPATCH_RETRY_COUNT,
+        nextDispatchAt,
+        input.error ?? null,
+        input.now,
+        input.turnId,
+        input.ownerId,
+        input.generation,
+      );
       if (requeued.changes !== 1) return false;
       this.db.prepare(
         `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
-          WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
-            AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
-      ).run(input.now, input.turnId, input.turnId);
+          WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
+      ).run(input.now, row.controller_key, input.turnId);
+      persistControllerOutbox(this.db, controllerPhaseOutbox(
+        input.turnId,
+        row.telegram_chat_id,
+        "queued",
+        row.thread_follow_up_json,
+      ), input.now);
       return true;
     }).immediate();
   }
 
-  public recordControllerImagePreparationFailure(
+  public recordControllerBusyWaitNotice(
     input: ControllerLeaseFence & { turnId: string },
   ): boolean {
     this.assertControllerMutation(input);
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.thread_follow_up_json, controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+           JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
+            AND owners.telegram_user_id = controller.telegram_user_id
+            AND owners.telegram_chat_id = controller.telegram_chat_id
+          WHERE turn.id = ? AND turn.state = 'dispatching' AND turn.delivery_state = 'none'
+            AND turn.busy_wait_notified_at IS NULL
+            AND turn.lease_owner = ? AND turn.lease_generation = ?`,
+      ).get(input.turnId, input.ownerId, input.generation) as {
+        thread_follow_up_json: string | null;
+        telegram_chat_id: string;
+      } | undefined;
+      if (!row) return false;
+      const recorded = this.db.prepare(
+        `UPDATE controller_turns
+            SET busy_wait_notified_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'dispatching' AND delivery_state = 'none'
+            AND busy_wait_notified_at IS NULL
+            AND lease_owner = ? AND lease_generation = ?`,
+      ).run(
+        input.now,
+        input.now,
+        input.turnId,
+        input.ownerId,
+        input.generation,
+      );
+      if (recorded.changes !== 1) return false;
+      const notice = controllerFailureOutbox(
+        input.turnId,
+        row.telegram_chat_id,
+        "owner_message_waiting_for_fresh_generation",
+        row.thread_follow_up_json,
+      );
+      persistControllerOutbox(this.db, {
+        ...notice,
+        logicalKey: row.thread_follow_up_json === null
+          ? `controller:${input.turnId}:busy-wait`
+          : notice.logicalKey,
+      }, input.now);
+      return true;
+    }).immediate();
+  }
+
+  public recordControllerImagePreparationFailure(
+    input: ControllerLeaseFence & { turnId: string; incrementRetry?: boolean },
+  ): boolean {
+    this.assertControllerMutation(input);
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const row = this.db.prepare(
+        `SELECT turn.controller_key, turn.thread_follow_up_json, controller.telegram_chat_id
+           FROM controller_turns AS turn
+           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+          WHERE turn.id = ? AND turn.state = 'dispatching'
+            AND turn.lease_owner = ? AND turn.lease_generation = ?
+            AND turn.delivery_state IN ('none', 'intent')`,
+      ).get(input.turnId, input.ownerId, input.generation) as {
+        controller_key: string;
+        thread_follow_up_json: string | null;
+        telegram_chat_id: string;
+      } | undefined;
+      if (!row) return false;
       const requeued = this.db.prepare(
         `UPDATE controller_turns
-            SET state = 'queued', retry_count = retry_count + 1,
-                lease_owner = NULL, lease_generation = NULL, updated_at = ?
-          WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?`,
-      ).run(input.now, input.turnId, input.ownerId, input.generation);
+            SET state = 'queued', retry_count = retry_count + ?,
+                lease_owner = NULL, lease_generation = NULL,
+                dispatch_after_seq = 0, delivery_state = 'none', dispatch_kind = NULL,
+                dispatch_correlation_id = NULL, dispatch_retry_count = 0,
+                delivery_reconcile_attempts = 0, next_dispatch_at = ?,
+                last_error = 'Controller image preparation failed', updated_at = ?
+          WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?
+            AND delivery_state IN ('none', 'intent')`,
+      ).run(
+        input.incrementRetry === false ? 0 : 1,
+        input.now,
+        input.now,
+        input.turnId,
+        input.ownerId,
+        input.generation,
+      );
       if (requeued.changes !== 1) return false;
       this.db.prepare(
         `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
-          WHERE controller_key = (SELECT controller_key FROM controller_turns WHERE id = ?)
-            AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
-      ).run(input.now, input.turnId, input.turnId);
+          WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
+      ).run(input.now, row.controller_key, input.turnId);
+      persistControllerOutbox(this.db, controllerPhaseOutbox(
+        input.turnId,
+        row.telegram_chat_id,
+        "queued",
+        row.thread_follow_up_json,
+      ), input.now);
       return true;
     }).immediate();
   }
@@ -5522,24 +5948,51 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           ORDER BY turn.created_at ASC, turn.ordinal ASC LIMIT 1`,
       ).get(fence.ownerId, fence.generation) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
       if (!stale) return false;
-      const error = "Controller dispatch ownership was lost before submission was confirmed";
-      const updated = this.db.prepare(
+      if (stale.delivery_state === "none") {
+        const requeued = this.db.prepare(
+          `UPDATE controller_turns
+              SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
+                  dispatch_after_seq = 0, dispatch_kind = NULL,
+                  dispatch_correlation_id = NULL, delivery_reconcile_attempts = 0,
+                  next_dispatch_at = ?, updated_at = ?
+            WHERE id = ? AND state = 'dispatching' AND delivery_state = 'none'`,
+        ).run(fence.now, fence.now, stale.id);
+        if (requeued.changes !== 1) return false;
+        this.db.prepare(
+          `UPDATE controller_threads
+              SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
+            WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
+        ).run(fence.now, stale.controller_key, stale.id);
+        persistControllerOutbox(this.db, controllerPhaseOutbox(
+          stale.id,
+          stale.telegram_chat_id,
+          "queued",
+          stale.thread_follow_up_json,
+        ), fence.now);
+        return true;
+      }
+      const adopted = this.db.prepare(
         `UPDATE controller_turns
-            SET state = 'failed', last_error = ?, completed_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'dispatching'`,
-      ).run(error, fence.now, fence.now, stale.id);
-      if (updated.changes !== 1) return false;
-      this.db.prepare(
-        `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
-          WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
-      ).run(fence.now, stale.controller_key, stale.id);
-      const outbox = controllerFailureOutbox(
+            SET delivery_state = 'delivery_unknown', lease_owner = ?, lease_generation = ?,
+                next_dispatch_at = ?,
+                last_error = 'Controller delivery requires reconciliation after lease loss',
+                updated_at = ?
+          WHERE id = ? AND state = 'dispatching'
+            AND delivery_state IN ('intent', 'delivery_unknown')`,
+      ).run(
+        fence.ownerId,
+        fence.generation,
+        fence.now,
+        fence.now,
+        stale.id,
+      );
+      if (adopted.changes !== 1) return false;
+      persistControllerOutbox(this.db, controllerPhaseOutbox(
         stale.id,
         stale.telegram_chat_id,
-        "unknown",
+        "connecting",
         stale.thread_follow_up_json,
-      );
-      persistControllerOutbox(this.db, outbox, fence.now);
+      ), fence.now);
       return true;
     }).immediate();
   }
@@ -5573,6 +6026,24 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ) return false;
       const spawnToken = input.spawnToken ?? input.turnId;
       if (spawnToken !== input.turnId) return false;
+      if (turn.delivery_state === "none") {
+        const compatibilityIntent = this.db.prepare(
+          `UPDATE controller_turns
+              SET delivery_state = 'intent', dispatch_kind = 'spawn',
+                  dispatch_correlation_id = ?, delivery_reconcile_attempts = 0,
+                  next_dispatch_at = 0, updated_at = ?
+            WHERE id = ? AND state = 'dispatching' AND delivery_state = 'none'
+              AND lease_owner = ? AND lease_generation = ?`,
+        ).run(input.turnId, input.now, input.turnId, input.ownerId, input.generation);
+        if (compatibilityIntent.changes !== 1) return false;
+        turn.delivery_state = "intent";
+        turn.dispatch_kind = "spawn";
+        turn.dispatch_correlation_id = input.turnId;
+      }
+      if (
+        (turn.delivery_state !== "intent" && turn.delivery_state !== "delivery_unknown") ||
+        turn.dispatch_kind !== "spawn" || turn.dispatch_correlation_id !== input.turnId
+      ) return false;
       if (turn.capability_profile_revision > 0) {
         if (!turn.capability_profile_id) return false;
         const profile = this.capabilityRepository.getActiveProfile("controller_turn", turn.id);
@@ -5664,6 +6135,32 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         !turn || turn.state !== "dispatching" || turn.lease_owner !== input.ownerId ||
         turn.lease_generation !== input.generation
       ) return false;
+      if (turn.delivery_state === "none") {
+        const compatibilityIntent = this.db.prepare(
+          `UPDATE controller_turns
+              SET delivery_state = 'intent', dispatch_kind = 'send',
+                  dispatch_correlation_id = ?, dispatch_after_seq = ?,
+                  delivery_reconcile_attempts = 0, next_dispatch_at = 0,
+                  updated_at = ?
+            WHERE id = ? AND state = 'dispatching' AND delivery_state = 'none'
+              AND lease_owner = ? AND lease_generation = ?`,
+        ).run(
+          `controller-dispatch:${input.turnId}`,
+          dispatchAfterSeq,
+          input.now,
+          input.turnId,
+          input.ownerId,
+          input.generation,
+        );
+        if (compatibilityIntent.changes !== 1) return false;
+        turn.delivery_state = "intent";
+        turn.dispatch_kind = "send";
+        turn.dispatch_correlation_id = `controller-dispatch:${input.turnId}`;
+      }
+      if (
+        (turn.delivery_state !== "intent" && turn.delivery_state !== "delivery_unknown") ||
+        turn.dispatch_kind === null || turn.dispatch_correlation_id === null
+      ) return false;
       if (turn.capability_profile_revision > 0) {
         if (!turn.capability_profile_id) return false;
         const profile = this.capabilityRepository.getActiveProfile("controller_turn", turn.id);
@@ -5689,9 +6186,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_turns
             SET state = 'submitted', dispatch_after_seq = ?, bb_event_seq = ?,
                 stream_phase = 'connecting', submitted_at = ?,
+                delivery_state = 'none', delivery_reconcile_attempts = 0,
+                next_dispatch_at = 0, last_error = NULL,
                 capability_configured_revision = capability_profile_revision,
                 updated_at = ?
           WHERE id = ? AND state = 'dispatching' AND lease_owner = ? AND lease_generation = ?
+            AND delivery_state IN ('intent', 'delivery_unknown')
             AND EXISTS (
               SELECT 1 FROM controller_threads
                WHERE controller_key = controller_turns.controller_key
@@ -7122,15 +7622,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public failControllerTurn(input: ControllerLeaseFence & {
     turnId: string;
     error: string;
-    ownerMessage?: string;
+    failureCode?: ControllerFailureCode;
     leaseMs?: number;
   }): boolean {
     this.assertControllerMutation(input);
     assertSafeFailureSummary(input.error);
     assertNoRawMergeCallback(input.error, "controller error");
-    if (input.ownerMessage !== undefined) {
-      assertControllerText(input.ownerMessage, "controller failure message");
-      assertNoRawMergeCallback(input.ownerMessage, "controller failure message");
+    if (input.failureCode !== undefined && !Object.hasOwn(CONTROLLER_FAILURE_TEXT, input.failureCode)) {
+      throw new TypeError("controller failure code is invalid");
     }
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
@@ -7146,6 +7645,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const updated = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'failed', last_error = ?, completed_at = ?,
+                delivery_state = CASE
+                  WHEN delivery_state = 'intent' THEN 'delivery_unknown'
+                  ELSE delivery_state
+                END,
+                lease_owner = NULL, lease_generation = NULL, next_dispatch_at = 0,
                 capability_continuation_state = CASE
                   WHEN capability_continuation_state IN ('requested', 'relaunching') THEN 'blocked'
                   ELSE capability_continuation_state
@@ -7158,13 +7662,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_threads SET project_id = NULL, host_id = NULL, pending_spawn_token = NULL, updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL AND pending_spawn_token = ?`,
       ).run(input.now, row.controller_key, input.turnId);
-      const outbox = input.ownerMessage === undefined || row.thread_follow_up_json !== null
-        ? controllerFailureOutbox(input.turnId, row.telegram_chat_id, "unknown", row.thread_follow_up_json)
-        : {
-            logicalKey: `controller:${input.turnId}:reply`,
-            chatId: row.telegram_chat_id,
-            payload: { text: input.ownerMessage, disable_web_page_preview: true },
-          };
+      const outbox = controllerFailureOutbox(
+        input.turnId,
+        row.telegram_chat_id,
+        input.failureCode ?? "unknown",
+        row.thread_follow_up_json,
+      );
       persistControllerOutbox(this.db, outbox, input.now);
       return true;
     }).immediate();

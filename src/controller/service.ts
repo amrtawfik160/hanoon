@@ -48,11 +48,8 @@ type InteractionReconciliationContext = Readonly<{
 }>;
 
 const CONTROLLER_DRAFT_REFRESH_MS = 20_000;
-// How long a queued message may wait for a busy controller thread before the
-// owner is told it will not be answered.
-const CONTROLLER_BUSY_WAIT_MS = 10 * 60_000;
-const CONTROLLER_IMAGE_FAILURE_MESSAGE =
-  "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.";
+const CONTROLLER_DISPATCH_BACKOFF_BASE_MS = 1_000;
+const CONTROLLER_DISPATCH_BACKOFF_MAX_MS = 30_000;
 /**
  * How long a submitted turn may go without producing a single BB event before
  * it is treated as wedged. Any event at all — reasoning, a tool call, output —
@@ -61,6 +58,10 @@ const CONTROLLER_IMAGE_FAILURE_MESSAGE =
  * reports the thread as active.
  */
 export const CONTROLLER_STALL_MS = 8 * 60_000;
+export const CONTROLLER_BUSY_NOTICE_MS = 2 * 60_000;
+// Give the submitted-turn watchdog its full window, then retire a thread whose
+// unrelated busy state would otherwise strand queued owner input forever.
+export const CONTROLLER_BUSY_ROLLOVER_MS = CONTROLLER_STALL_MS + 2 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
 const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
 export const CONTROLLER_COMPLETION_RECOVERY_PROMPT =
@@ -75,6 +76,11 @@ function retireReason(status: ControllerStatus): string {
 
 function fenceAt(fence: EffectFence, now: number) {
   return { ownerId: fence.ownerId, generation: fence.generation, now };
+}
+
+function controllerDispatchBackoffMs(attempts: number): number {
+  const exponent = Math.min(Math.max(0, attempts), 5);
+  return Math.min(CONTROLLER_DISPATCH_BACKOFF_MAX_MS, CONTROLLER_DISPATCH_BACKOFF_BASE_MS * (2 ** exponent));
 }
 
 export class LunaControllerService {
@@ -104,7 +110,7 @@ export class LunaControllerService {
       try {
         status = await this.dependencies.adapter.status(controller.threadId, signal, turn.modelFallbackIndex);
       } catch {
-        this.fail(turn, fence, "Controller status could not be verified");
+        this.requeueAfterTransientRead(turn, fence, "Controller status could not be verified");
         return true;
       }
       if (status === "missing" || status === "error" || status === "incompatible") {
@@ -122,21 +128,41 @@ export class LunaControllerService {
           this.fail(turn, fence, "Controller mapping is unavailable after recovery");
           return true;
         }
-      } else {
-        if (status !== "idle") {
-          this.waitForIdle(turn, fence);
+      } else if (status !== "idle") {
+        if (this.waitForIdle(turn, controller, fence) === "queued") {
           return true;
         }
+        const refreshed = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+        if (!refreshed || refreshed.controllerKey !== turn.controllerKey || refreshed.threadId !== null) {
+          this.dependencies.store.requeueControllerTurn({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            turnId: turn.id,
+          });
+          return true;
+        }
+        controller = refreshed;
+      } else {
         let dispatchAfterSeq: number;
         try {
           dispatchAfterSeq = await this.dependencies.adapter.latestSeq(controller.threadId, signal);
         } catch {
-          this.fail(turn, fence, "Controller event baseline could not be verified");
+          this.requeueAfterTransientRead(turn, fence, "Controller event baseline could not be verified");
           return true;
         }
+        if (!Number.isSafeInteger(dispatchAfterSeq) || dispatchAfterSeq < 0) {
+          this.requeueAfterTransientRead(turn, fence, "Controller event baseline was invalid");
+          return true;
+        }
+        const input = this.composeInput(turn, { includeDigest: false });
+        if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
+        if (!this.dependencies.store.prepareControllerDispatch({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          turnId: turn.id,
+          kind: "send",
+          expectedThreadId: controller.threadId,
+          dispatchAfterSeq,
+        })) return true;
         try {
-          const input = this.composeInput(turn, { includeDigest: false });
-          if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
           if (turn.image) {
             await this.dependencies.adapter.send(controller.threadId, input, signal, turn.image, turn.modelFallbackIndex);
           } else {
@@ -144,8 +170,14 @@ export class LunaControllerService {
           }
         } catch (error) {
           if (this.handleImagePreparationError(error, turn, fence, signal)) return true;
-          this.fail(turn, fence, "Controller send outcome is uncertain");
-          return true;
+          if (!this.dependencies.store.markControllerDeliveryUnknown({
+            ...fenceAt(fence, this.dependencies.clock.now()),
+            turnId: turn.id,
+          })) return true;
+          const unknown = this.dependencies.store.getControllerTurn(turn.id);
+          return unknown?.state === "dispatching" && unknown.deliveryState === "delivery_unknown"
+            ? this.reconcileUnknownDelivery(unknown, controller, fence, signal)
+            : true;
         }
         if (!this.dependencies.store.markControllerTurnSubmitted({
           ...fenceAt(fence, this.dependencies.clock.now()),
@@ -206,14 +238,27 @@ export class LunaControllerService {
   }
 
   public async reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
-    if (this.dependencies.store.failStaleControllerDispatches(
+    const recoveredDispatch = this.dependencies.store.failStaleControllerDispatches(
       fenceAt(fence, this.dependencies.clock.now()),
-    )) return true;
+    );
     const owner = this.dependencies.store.getOwner();
-    if (!owner) return false;
+    if (!owner) return recoveredDispatch;
     let controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
-    if (!controller?.threadId) return false;
-    const pending = this.dependencies.store.getPendingControllerTurn(controller.controllerKey);
+    if (!controller) return recoveredDispatch;
+    let pending = this.dependencies.store.getPendingControllerTurn(controller.controllerKey);
+    if (pending?.state === "dispatching" && pending.deliveryState === "intent") {
+      this.dependencies.store.markControllerDeliveryUnknown({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: pending.id,
+      });
+      pending = this.dependencies.store.getControllerTurn(pending.id);
+    }
+    if (pending?.state === "dispatching" && pending.deliveryState === "delivery_unknown") {
+      if (pending.nextDispatchAt > this.dependencies.clock.now()) return recoveredDispatch;
+      return this.reconcileUnknownDelivery(pending, controller, fence, signal);
+    }
+    if (recoveredDispatch) return true;
+    if (!controller.threadId) return false;
     const submitted = pending?.state === "submitted" ? pending : null;
     if (!submitted) {
       let status: ControllerStatus;
@@ -523,6 +568,120 @@ export class LunaControllerService {
       // The caller must settle it as unknown so a successor never replays it.
       return "unknown";
     }
+  }
+
+  private async reconcileUnknownDelivery(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted) return true;
+    if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+      return this.recordUnknownDeliveryPending(turn, fence, signal);
+    }
+    return turn.dispatchKind === "spawn"
+      ? this.reconcileUnknownSpawn(turn, controller, fence, signal)
+      : this.reconcileUnknownSend(turn, controller, fence, signal);
+  }
+
+  private async reconcileUnknownSpawn(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (controller.threadId !== null && controller.capabilitySubjectId === turn.id) {
+      if (!this.dependencies.store.markControllerTurnSubmitted({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+      })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+      return true;
+    }
+    if (
+      turn.dispatchCorrelationId === null ||
+      controller.threadId !== null ||
+      controller.pendingSpawnToken !== turn.dispatchCorrelationId
+    ) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    let candidate: ControllerLocation | null;
+    try {
+      candidate = await this.dependencies.adapter.findSpawnCandidate(
+        controller.controllerKey,
+        turn.dispatchCorrelationId,
+        signal,
+        turn.modelFallbackIndex,
+      );
+    } catch {
+      return this.recordUnknownDeliveryPending(turn, fence, signal);
+    }
+    if (!candidate || candidate.spawnToken !== turn.dispatchCorrelationId) {
+      return this.recordUnknownDeliveryPending(turn, fence, signal);
+    }
+    if (!this.dependencies.store.reserveControllerSpawn({
+      controllerKey: controller.controllerKey,
+      turnId: turn.id,
+      projectId: candidate.projectId,
+      hostId: candidate.hostId,
+      now: this.dependencies.clock.now(),
+    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    if (!this.dependencies.store.markControllerSpawned({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      ...candidate,
+    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    if (!this.dependencies.store.markControllerTurnSubmitted({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    return true;
+  }
+
+  private async reconcileUnknownSend(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (
+      turn.dispatchKind !== "send" || turn.dispatchCorrelationId !== `controller-dispatch:${turn.id}` ||
+      controller.threadId === null
+    ) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    let observation: ControllerEventObservation;
+    try {
+      observation = normalizeControllerEventObservation(await this.dependencies.adapter.events(
+        controller.threadId,
+        turn.dispatchAfterSeq,
+        signal,
+      ));
+    } catch {
+      return this.recordUnknownDeliveryPending(turn, fence, signal);
+    }
+    if (!Number.isSafeInteger(observation.latestSeq) || observation.latestSeq < turn.dispatchAfterSeq) {
+      return this.recordUnknownDeliveryPending(turn, fence, signal);
+    }
+    const applied = observation.inputAccepted || observation.assistantOutputObserved ||
+      observation.toolActivityObserved || observation.completed || observation.failure?.inputAccepted === true;
+    if (!applied) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    if (!this.dependencies.store.markControllerTurnSubmitted({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      dispatchAfterSeq: turn.dispatchAfterSeq,
+    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    return true;
+  }
+
+  private recordUnknownDeliveryPending(
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+  ): boolean {
+    if (signal.aborted) return true;
+    this.dependencies.store.recordControllerDeliveryReconciliationPending({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      retryAfterMs: controllerDispatchBackoffMs(turn.deliveryReconcileAttempts),
+    });
+    return true;
   }
 
   private async reconcileEvidence(
@@ -1092,50 +1251,53 @@ export class LunaControllerService {
         turn.modelFallbackIndex,
       );
     } catch {
-      this.fail(turn, fence, "Controller spawn candidates are ambiguous");
+      this.requeueAfterTransientRead(turn, fence, "Controller spawn candidates could not be read");
       return null;
     }
     if (candidate) {
+      if (!this.dependencies.store.prepareControllerDispatch({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+        kind: "spawn",
+      })) return null;
       if (!this.dependencies.store.reserveControllerSpawn({
         controllerKey: controller.controllerKey,
         turnId: turn.id,
         projectId: candidate.projectId,
         hostId: candidate.hostId,
         now: this.dependencies.clock.now(),
-      })) {
-        this.fail(turn, fence, "Controller spawn reservation is unavailable or stale");
-        return null;
-      }
+      })) return null;
       return candidate;
     }
     // A replacement thread opens with the conversation so far, so retiring a
     // failed thread costs the owner a pause rather than the whole conversation.
     const seeded = { ...turn, inputText: this.composeInput(turn, { includeDigest: true }) };
-    try {
-      if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
-        if (signal.aborted) {
-          this.dependencies.store.requeueControllerTurn({
-            ...fenceAt(fence, this.dependencies.clock.now()),
-            turnId: turn.id,
-          });
-        }
-        return null;
+    if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
+      if (signal.aborted) {
+        this.dependencies.store.requeueControllerTurn({
+          ...fenceAt(fence, this.dependencies.clock.now()),
+          turnId: turn.id,
+        });
       }
+      return null;
+    }
+    if (!this.dependencies.store.prepareControllerDispatch({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      kind: "spawn",
+    })) return null;
+    try {
       return await this.dependencies.adapter.spawn(seeded, controller, signal);
     } catch (error) {
       if (this.handleImagePreparationError(error, turn, fence, signal)) return null;
-      try {
-        candidate = await this.dependencies.adapter.findSpawnCandidate(
-          controller.controllerKey,
-          pendingSpawnToken,
-          signal,
-          turn.modelFallbackIndex,
-        );
-      } catch {
-        candidate = null;
+      if (!this.dependencies.store.markControllerDeliveryUnknown({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+      })) return null;
+      const unknown = this.dependencies.store.getControllerTurn(turn.id);
+      if (unknown?.state === "dispatching" && unknown.deliveryState === "delivery_unknown") {
+        await this.reconcileUnknownDelivery(unknown, controller, fence, signal);
       }
-      if (candidate) return candidate;
-      this.fail(turn, fence, "Controller spawn outcome is uncertain");
       return null;
     }
   }
@@ -1170,13 +1332,47 @@ export class LunaControllerService {
     });
   }
 
-  private waitForIdle(turn: ControllerTurnRecord, fence: EffectFence): void {
+  private waitForIdle(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+  ): "queued" | "fresh_generation" {
     const now = this.dependencies.clock.now();
-    if (now - turn.createdAt >= CONTROLLER_BUSY_WAIT_MS) {
-      this.fail(turn, fence, "Controller thread stayed busy for too long");
-      return;
+    const waitMs = Math.max(0, now - turn.createdAt);
+    if (waitMs >= CONTROLLER_BUSY_NOTICE_MS) {
+      this.dependencies.store.recordControllerBusyWaitNotice({
+        ...fenceAt(fence, now),
+        turnId: turn.id,
+      });
     }
-    this.dependencies.store.requeueControllerTurn({ ...fenceAt(fence, now), turnId: turn.id });
+    if (waitMs >= CONTROLLER_BUSY_ROLLOVER_MS && controller.threadId !== null &&
+        this.dependencies.store.resetControllerThread({
+          ...fenceAt(fence, now),
+          controllerKey: controller.controllerKey,
+          expectedThreadId: controller.threadId,
+          reason: "Controller remained busy beyond the queued-message wait",
+        })) {
+      return "fresh_generation";
+    }
+    this.dependencies.store.requeueControllerTurn({
+      ...fenceAt(fence, now),
+      turnId: turn.id,
+    });
+    return "queued";
+  }
+
+  private requeueAfterTransientRead(
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    error: string,
+  ): void {
+    this.dependencies.store.requeueControllerTurn({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      retryAfterMs: controllerDispatchBackoffMs(turn.dispatchRetryCount),
+      incrementDispatchRetry: true,
+      error,
+    });
   }
 
   private failImage(turn: ControllerTurnRecord, fence: EffectFence): void {
@@ -1184,7 +1380,7 @@ export class LunaControllerService {
       turn,
       fence,
       "Controller image preparation failed",
-      CONTROLLER_IMAGE_FAILURE_MESSAGE,
+      "image_preparation_failed",
     );
   }
 
@@ -1200,12 +1396,11 @@ export class LunaControllerService {
       return true;
     }
     const now = this.dependencies.clock.now();
-    const requeued = signal.aborted
-      ? this.dependencies.store.requeueControllerTurn({ ...fenceAt(fence, now), turnId: turn.id })
-      : this.dependencies.store.recordControllerImagePreparationFailure({
-        ...fenceAt(fence, now),
-        turnId: turn.id,
-      });
+    const requeued = this.dependencies.store.recordControllerImagePreparationFailure({
+      ...fenceAt(fence, now),
+      turnId: turn.id,
+      incrementRetry: !signal.aborted,
+    });
     if (!requeued) throw new Error("Controller image retry could not be recorded");
     return true;
   }
@@ -1214,13 +1409,13 @@ export class LunaControllerService {
     turn: ControllerTurnRecord,
     fence: EffectFence,
     error: string,
-    ownerMessage?: string,
+    failureCode: ControllerFailureCode = "unknown",
   ): void {
     this.dependencies.store.failControllerTurn({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       error,
-      ownerMessage,
+      failureCode,
     });
   }
 }

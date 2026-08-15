@@ -200,7 +200,7 @@ function expectDuplicateGenerationRepair(
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(54);
+  expect(ALL_MIGRATIONS).toHaveLength(55);
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
   expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");
@@ -270,6 +270,82 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[51]).toContain("thread_follow_up_json");
   expect(ALL_MIGRATIONS[52]).toContain("CREATE TABLE controller_generation_quarantine");
   expect(ALL_MIGRATIONS[53]).toContain("CREATE UNIQUE INDEX one_open_controller_generation");
+  expect(ALL_MIGRATIONS[54]).toContain("delivery_state");
+  expect(ALL_MIGRATIONS[54]).toContain("dispatch_retry_count");
+  expect(ALL_MIGRATIONS[54]).toContain("delivery_reconcile_attempts");
+  expect(ALL_MIGRATIONS[54]).toContain("busy_wait_notified_at");
+  expect(ALL_MIGRATIONS[54]).not.toMatch(/\b(?:DROP|RENAME)\b/u);
+});
+
+it("rolls back an interrupted additive delivery-state migration and starts cleanly on retry", () => {
+  const { bb } = createFakePluginHost({ pluginId: `telegram-controller-delivery-migration-${fixtureNumber++}` });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, 54));
+  db.prepare(
+    `INSERT INTO owners (
+       singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at
+     ) VALUES (1, '7', '7', 1_000, NULL)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, project_id, host_id,
+       bb_thread_id, state, created_at, updated_at
+     ) VALUES (
+       'owner-7-controller', '7', '7', 'proj_personal', 'host_personal',
+       'thr_live_dispatch', 'active', 1_000, 1_500
+     )`,
+  ).run();
+  db.prepare(
+    `INSERT INTO controller_turns (
+       id, telegram_update_id, controller_key, ordinal, input_text, state,
+       lease_owner, lease_generation, created_at, updated_at
+     ) VALUES (
+       'turn-live-dispatch', 92_001, 'owner-7-controller', 1,
+       'preserve live dispatch', 'dispatching', 'executor', 1, 1_000, 1_500
+     )`,
+  ).run();
+  db.exec(`
+    CREATE TRIGGER interrupt_delivery_state_migration
+    BEFORE UPDATE ON controller_turns
+    WHEN OLD.id = 'turn-live-dispatch'
+    BEGIN
+      SELECT RAISE(ABORT, 'interrupt-delivery-state-migration');
+    END
+  `);
+
+  expect(() => openStore(bb.storage, bb.storage.kv, () => 2_000))
+    .toThrow(/interrupt-delivery-state-migration/);
+  expect(db.prepare(
+    "SELECT name FROM pragma_table_info('controller_turns') WHERE name = 'delivery_state'",
+  ).get()).toBeUndefined();
+  expect(db.prepare(
+    "SELECT name FROM pragma_table_info('controller_turns') WHERE name = 'busy_wait_notified_at'",
+  ).get()).toBeUndefined();
+  expect(db.prepare(
+    "SELECT input_text, state FROM controller_turns WHERE id = 'turn-live-dispatch'",
+  ).get()).toEqual({ input_text: "preserve live dispatch", state: "dispatching" });
+
+  db.exec("DROP TRIGGER interrupt_delivery_state_migration");
+  const store = openStore(bb.storage, bb.storage.kv, () => 2_001);
+
+  expect(store.getControllerTurn("turn-live-dispatch")).toMatchObject({
+    inputText: "preserve live dispatch",
+    state: "dispatching",
+  });
+  expect(db.prepare(
+    `SELECT delivery_state, dispatch_kind, dispatch_correlation_id,
+            dispatch_retry_count, delivery_reconcile_attempts, busy_wait_notified_at,
+            next_dispatch_at
+       FROM controller_turns WHERE id = 'turn-live-dispatch'`,
+  ).get()).toEqual({
+    delivery_state: "delivery_unknown",
+    dispatch_kind: "send",
+    dispatch_correlation_id: null,
+    dispatch_retry_count: 0,
+    delivery_reconcile_attempts: 0,
+    busy_wait_notified_at: null,
+    next_dispatch_at: 0,
+  });
 });
 
 it("preflights duplicate open generations without choosing a winner", () => {
@@ -565,7 +641,7 @@ it("fences controller mutations against a stale executor generation", () => {
   expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
 });
 
-it("fails a stale uncertain dispatch closed so the FIFO can continue", () => {
+it("requeues a stale claim that never persisted dispatch intent", () => {
   const { store } = fixture();
   const first = store.enqueueControllerTurn(turnInput(351, "first"));
   store.enqueueControllerTurn(turnInput(352, "second"));
@@ -580,13 +656,17 @@ it("fails a stale uncertain dispatch closed so the FIFO can continue", () => {
     now: 32_001,
   })).toBe(true);
 
-  expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["failed", "queued"]);
-  expect(store.getOutbox(`controller:${first.id}:reply`)).toMatchObject({ status: "pending" });
+  expect(store.listControllerTurns("owner-7-controller", 10).map((turn) => turn.state)).toEqual(["queued", "queued"]);
+  expect(store.getControllerTurn(first.id)).toMatchObject({ inputText: "first", lastError: null });
+  expect(store.getOutbox(`controller:${first.id}:reply`)).toMatchObject({
+    status: "pending",
+    payload: { text: "Queued…" },
+  });
   expect(store.claimNextControllerTurn({
     ownerId: "successor",
     generation: successor.generation,
     now: 32_001,
-  })).toMatchObject({ updateId: 352, state: "dispatching" });
+  })).toMatchObject({ updateId: 351, state: "dispatching", inputText: "first" });
 });
 
 it("requeues one unaccepted controller turn in a fresh generation without losing FIFO order", () => {
@@ -814,6 +894,29 @@ it("rejects credential-shaped controller failure text", () => {
   expect(store.listControllerTurns("owner-7-controller", 10)[0]?.state).toBe("dispatching");
 });
 
+it("ignores caller-supplied owner prose and renders failures only from the closed store mapping", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(402));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  const input = {
+    ...fence,
+    turnId: turn.id,
+    error: "bounded internal delivery summary",
+    failureCode: "owner_message_delivery_uncertain",
+    ownerMessage: "CALLER PROSE MUST NEVER REACH TELEGRAM",
+  } as unknown as Parameters<typeof store.failControllerTurn>[0];
+
+  expect(store.failControllerTurn(input)).toBe(true);
+
+  const text = store.getOutbox(`controller:${turn.id}:reply`)?.payload.text;
+  expect(text).toBe(
+    "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
+  );
+  expect(text).not.toContain("CALLER PROSE");
+  expect(text).not.toContain("bounded internal delivery summary");
+});
+
 it("sends the accepted answer byte-for-byte, with no rewriting and no parse mode", () => {
   const { store } = fixture();
   const turn = store.enqueueControllerTurn(turnInput(701));
@@ -1011,6 +1114,9 @@ it.each([
   ["recovery_exhausted", /after recovery/i],
   ["owner_message_delivery_uncertain", /preserved.*message/i],
   ["owner_message_delivery_exhausted", /couldn't confirm.*previous message.*missing or duplicated/i],
+  ["owner_message_delivery_unresolved", /did not repeat.*review the conversation/i],
+  ["owner_message_waiting_for_fresh_generation", /kept.*message queued.*fresh conversation/i],
+  ["image_preparation_failed", /couldn't read that image safely/i],
 ] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
   const { store } = fixture();
   const { turn, fence } = submittedTurn(store, `thr_failure_code_${failureCode}`);
