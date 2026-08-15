@@ -157,7 +157,7 @@ function sdkFixture(options: {
     sizeBytes: input.clientFile.byteLength,
   }));
   const list = vi.fn(async () => options.threads ?? []);
-  const get = vi.fn(async () => ({
+  const get = vi.fn(async (_input?: { signal?: AbortSignal }) => ({
     id: "thr_controller",
     status: "idle",
     providerId: options.threadProvider ?? "claude-code",
@@ -167,7 +167,12 @@ function sdkFixture(options: {
   const output = vi.fn(async () => ({ output: "Hello from Luna." }));
   const pages = options.eventPages ?? [options.events ?? []];
   let page = 0;
-  const eventsList = vi.fn(async () => pages[page++] ?? []);
+  const eventsList = vi.fn(async (_input: {
+    threadId: string;
+    afterSeq?: string;
+    limit?: string;
+    signal?: AbortSignal;
+  }) => pages[page++] ?? []);
   const timeline = vi.fn(async () => ({ maxSeq: options.maxSeq ?? 0 }));
   const sdk = {
     projects: {
@@ -186,7 +191,7 @@ function sdkFixture(options: {
     reserveSpawn: () => true,
     downloadImage: options.downloadImage,
   };
-  return { adapter: new BbControllerAdapter(dependencies), spawn, send, upload, list, eventsList, timeline };
+  return { adapter: new BbControllerAdapter(dependencies), spawn, send, upload, list, get, eventsList, timeline };
 }
 
 function agentDelta(seq: number, delta: string) {
@@ -288,6 +293,84 @@ it("uses BB's active-steer mode for a text correction", async () => {
   }));
 });
 
+it("bounds one provider status RPC with the caller abort signal and a hard deadline", async () => {
+  vi.useFakeTimers();
+  const callerAbort = new AbortController();
+  const { adapter, get } = sdkFixture();
+  let providerSignal: AbortSignal | undefined;
+  get.mockImplementation(async (input?: { signal?: AbortSignal }) => {
+    providerSignal = input?.signal;
+    await new Promise<void>((_resolve, reject) => {
+      input?.signal?.addEventListener("abort", () => reject(input.signal?.reason), { once: true });
+    });
+    throw new Error("unreachable");
+  });
+  let outcome: "pending" | "resolved" | "rejected" = "pending";
+  const status = adapter.status("thr_controller", callerAbort.signal).then(
+    () => { outcome = "resolved"; },
+    () => { outcome = "rejected"; },
+  );
+
+  try {
+    await vi.advanceTimersByTimeAsync(30_001);
+
+    expect(outcome).toBe("rejected");
+    expect(providerSignal).toBeDefined();
+    expect(providerSignal).not.toBe(callerAbort.signal);
+    expect(providerSignal?.aborted).toBe(true);
+  } finally {
+    callerAbort.abort();
+    await status;
+    vi.useRealTimers();
+  }
+});
+
+it("allows only one abandoned provider mutation to remain in flight", async () => {
+  vi.useFakeTimers();
+  let releaseFirst!: () => void;
+  const firstProviderCall = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const { adapter, send } = sdkFixture();
+  send.mockImplementationOnce(async () => {
+    await firstProviderCall;
+    return { ok: true };
+  });
+  const first = adapter.send("thr_controller", "first", new AbortController().signal);
+  const firstOutcome = first.then(
+    () => null,
+    (error: unknown) => error,
+  );
+
+  try {
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(await firstOutcome).toBeInstanceOf(Error);
+    expect((await firstOutcome as Error).message).toMatch(/30000ms/);
+
+    await expect(adapter.send(
+      "thr_controller",
+      "second",
+      new AbortController().signal,
+    )).rejects.toThrow(/previous controller mutation/i);
+    expect(send).toHaveBeenCalledOnce();
+
+    releaseFirst();
+    for (let microtask = 0; microtask < 20 && adapter.hasPendingMutation(); microtask += 1) {
+      await Promise.resolve();
+    }
+    expect(adapter.hasPendingMutation()).toBe(false);
+    await expect(adapter.send(
+      "thr_controller",
+      "third",
+      new AbortController().signal,
+    )).resolves.toBeUndefined();
+    expect(send).toHaveBeenCalledTimes(2);
+  } finally {
+    releaseFirst();
+    vi.useRealTimers();
+  }
+});
+
 it("classifies a pre-submit image download failure as retryable", async () => {
   const downloadImage = vi.fn(async () => { throw new Error("temporary Telegram outage"); });
   const { adapter, send } = sdkFixture({ downloadImage });
@@ -321,12 +404,16 @@ it("reduces BB controller events after the durable sequence without exposing rea
     assistantDraft: { itemId: null, text: "Hello" },
     interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
   });
-  expect(eventsList).toHaveBeenCalledWith({
+  expect(eventsList).toHaveBeenCalledOnce();
+  const eventRequest = eventsList.mock.calls[0]?.[0];
+  expect(eventRequest).toMatchObject({
     threadId: "thr_controller",
     afterSeq: "10",
     limit: "100",
-    signal,
   });
+  if (!eventRequest?.signal) throw new Error("event request did not receive a cancellation signal");
+  expect(eventRequest.signal).not.toBe(signal);
+  expect(eventRequest.signal.aborted).toBe(false);
 });
 
 it.each([
@@ -2759,6 +2846,218 @@ it("reconciles an uncertain send from the exact timeline without submitting it t
   });
 });
 
+it("moves a timed-out send through delivery_unknown and reconciles it without replay", async () => {
+  vi.useFakeTimers();
+  const { store, fence } = serviceFixture();
+  activateControllerForServiceTest(store, fence, 61_101, "thr_timed_out_send");
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 61_102, inputText: "send this once despite a lost response" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  let releaseProvider!: () => void;
+  const abandonedSend = new Promise<void>((resolve) => {
+    releaseProvider = resolve;
+  });
+  const { adapter, send } = sdkFixture({
+    maxSeq: 10,
+    events: [{
+      id: "event-accepted-after-timeout",
+      threadId: "thr_timed_out_send",
+      seq: 11,
+      createdAt: 2_002,
+      scope: { kind: "thread" },
+      type: "turn/input/accepted",
+      data: {},
+    }],
+  });
+  send.mockImplementation(async () => {
+    await abandonedSend;
+    return { ok: true };
+  });
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => 2_002 },
+  });
+  let settled = false;
+  const processing = service.processOne(fence, fence.signal).then((result) => {
+    settled = true;
+    return result;
+  });
+
+  try {
+    for (let microtask = 0; microtask < 20 && send.mock.calls.length === 0; microtask += 1) {
+      await Promise.resolve();
+    }
+    expect(send).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(30_001);
+    for (let microtask = 0; microtask < 20 && !settled; microtask += 1) await Promise.resolve();
+
+    expect(settled).toBe(true);
+    await expect(processing).resolves.toBe(true);
+    expect(send).toHaveBeenCalledOnce();
+    expect(store.getControllerTurn(turn.id)).toMatchObject({
+      state: "submitted",
+      deliveryState: "none",
+      dispatchAfterSeq: 10,
+    });
+  } finally {
+    releaseProvider();
+    await processing;
+    vi.useRealTimers();
+  }
+});
+
+it("does not let a late SDK completion write through a retired executor generation", async () => {
+  vi.useFakeTimers();
+  const { store, fence } = serviceFixture();
+  activateControllerForServiceTest(store, fence, 61_201, "thr_late_send");
+  const turn = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 61_202, inputText: "keep the late result fenced" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  let releaseProvider!: () => void;
+  const providerCall = new Promise<void>((resolve) => {
+    releaseProvider = resolve;
+  });
+  const { adapter, send } = sdkFixture({ maxSeq: 10, events: [] });
+  send.mockImplementation(async () => {
+    await providerCall;
+    return { ok: true };
+  });
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => 2_002 },
+  });
+  const processing = service.processOne(fence, fence.signal);
+
+  try {
+    for (let microtask = 0; microtask < 20 && send.mock.calls.length === 0; microtask += 1) {
+      await Promise.resolve();
+    }
+    await vi.advanceTimersByTimeAsync(30_001);
+    await expect(processing).resolves.toBe(true);
+    expect(store.getControllerTurn(turn.id)).toMatchObject({
+      state: "dispatching",
+      deliveryState: "delivery_unknown",
+      leaseOwner: fence.ownerId,
+      leaseGeneration: fence.generation,
+    });
+
+    expect(store.releaseExecutorLease(fence.ownerId, fence.generation, 2_003)).toBe(true);
+    const successor = store.acquireExecutorLease("successor", 2_004, 30_000);
+    if (!successor.acquired) throw new Error("missing successor lease");
+    expect(store.failStaleControllerDispatches({
+      ownerId: "successor",
+      generation: successor.generation,
+      now: 2_004,
+    })).toBe(true);
+
+    releaseProvider();
+    for (let microtask = 0; microtask < 20 && adapter.hasPendingMutation(); microtask += 1) {
+      await Promise.resolve();
+    }
+
+    expect(adapter.hasPendingMutation()).toBe(false);
+    expect(send).toHaveBeenCalledOnce();
+    expect(store.getControllerTurn(turn.id)).toMatchObject({
+      state: "dispatching",
+      deliveryState: "delivery_unknown",
+      leaseOwner: "successor",
+      leaseGeneration: successor.generation,
+    });
+    expect(store.markControllerTurnSubmitted({
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now: 2_005,
+      turnId: turn.id,
+      dispatchAfterSeq: 10,
+    })).toBe(false);
+  } finally {
+    releaseProvider();
+    vi.useRealTimers();
+  }
+});
+
+it("fails an unresolved mutation visibly while leaving later owner input queued", async () => {
+  vi.useFakeTimers();
+  const { store, fence } = serviceFixture();
+  activateControllerForServiceTest(store, fence, 61_301, "thr_abandoned_mutation");
+  const first = store.enqueueControllerTurn({
+    ...turnRecord({ updateId: 61_302, inputText: "first owner message" }),
+    telegramUserId: "7",
+    telegramChatId: "7",
+    now: 2_001,
+  });
+  let releaseProvider!: () => void;
+  const providerCall = new Promise<void>((resolve) => {
+    releaseProvider = resolve;
+  });
+  const { adapter, send } = sdkFixture({ maxSeq: 10, events: [] });
+  send.mockImplementation(async () => {
+    await providerCall;
+    return { ok: true };
+  });
+  let now = 2_002;
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => now },
+  });
+  const firstProcessing = service.processOne(fence, fence.signal);
+
+  try {
+    for (let microtask = 0; microtask < 20 && send.mock.calls.length === 0; microtask += 1) {
+      await Promise.resolve();
+    }
+    await vi.advanceTimersByTimeAsync(30_001);
+    await expect(firstProcessing).resolves.toBe(true);
+    expect(store.getControllerTurn(first.id)).toMatchObject({
+      state: "dispatching",
+      deliveryState: "delivery_unknown",
+      deliveryReconcileAttempts: 1,
+    });
+    const second = store.enqueueControllerTurn({
+      ...turnRecord({ updateId: 61_303, inputText: "second owner message" }),
+      telegramUserId: "7",
+      telegramChatId: "7",
+      now: 2_003,
+    });
+
+    await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+    now = 3_002;
+    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+    now = 5_002;
+    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(adapter.hasPendingMutation()).toBe(true);
+    expect(store.getControllerTurn(first.id)).toMatchObject({
+      state: "failed",
+      inputText: "first owner message",
+      deliveryReconcileAttempts: 3,
+    });
+    expect(store.getOutbox(`controller:${first.id}:reply`)?.payload.text).toMatch(/did not repeat/i);
+    expect(store.getControllerTurn(second.id)).toMatchObject({
+      state: "queued",
+      deliveryState: "none",
+      inputText: "second owner message",
+    });
+  } finally {
+    releaseProvider();
+    vi.useRealTimers();
+  }
+});
+
 it("preserves an uncertain send exactly once across a restart during reconciliation", async () => {
   const fixture = serviceFixture();
   const { db, store, fence } = fixture;
@@ -3589,6 +3888,227 @@ it("lets an accepted finalization win a provider-error race", async () => {
   await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "completed", responseText: "The accepted answer wins." });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toBe("The accepted answer wins.");
+});
+
+it("persists an exact continuation-send intent before calling the provider", async () => {
+  const { db, store, fence } = serviceFixture();
+  const turn = submittedServiceTurn(store, fence, {
+    updateId: 55_101,
+    threadId: "thr_continuation_intent",
+  });
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [],
+  })).toBe("recorded");
+  let intentAtProviderCall: unknown;
+  const send = vi.fn(async () => {
+    intentAtProviderCall = db.prepare(
+      `SELECT state, delivery_state, dispatch_kind, dispatch_correlation_id, dispatch_after_seq
+         FROM controller_turns WHERE id = ?`,
+    ).get(turn.id);
+  });
+  const expectedIntent = {
+      state: "submitted",
+      delivery_state: "intent",
+      dispatch_kind: "send",
+      dispatch_correlation_id: `controller-continuation:${turn.id}:1`,
+      dispatch_after_seq: 1,
+    };
+  const adapter: ControllerAdapter = {
+    spawn: vi.fn(),
+    send,
+    status: vi.fn(async () => "idle" as const),
+    latestSeq: vi.fn(async () => 1),
+    events: vi.fn(async () => ({
+      latestSeq: 1,
+      inputAccepted: true,
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
+      completed: true,
+      failure: null,
+      assistantDraft: null,
+      interactionReferences: [],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })),
+    steer: vi.fn(),
+    answerQuestion: vi.fn(),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => 2_001 },
+  });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  expect(send).toHaveBeenCalledOnce();
+  expect(intentAtProviderCall).toEqual(expectedIntent);
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    deliveryState: "none",
+    completionContinuations: 1,
+  });
+});
+
+it("reconciles a timed-out continuation send from its exact timeline without replay", async () => {
+  vi.useFakeTimers();
+  const { store, fence } = serviceFixture();
+  const turn = submittedServiceTurn(store, fence, {
+    updateId: 55_102,
+    threadId: "thr_continuation_timeout",
+  });
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [],
+  })).toBe("recorded");
+  let releaseProvider!: () => void;
+  const providerCall = new Promise<void>((resolve) => {
+    releaseProvider = resolve;
+  });
+  const { adapter, send } = sdkFixture({
+    maxSeq: 1,
+    eventPages: [[{
+      id: "continuation-before-timeout",
+      threadId: "thr_continuation_timeout",
+      seq: 1,
+      createdAt: 2_000,
+      scope: { kind: "thread" },
+      type: "turn/completed",
+      data: {},
+    }], [{
+      id: "continuation-accepted-after-timeout",
+      threadId: "thr_continuation_timeout",
+      seq: 2,
+      createdAt: 2_001,
+      scope: { kind: "thread" },
+      type: "turn/input/accepted",
+      data: {},
+    }]],
+  });
+  send.mockImplementation(async () => {
+    await providerCall;
+    return { ok: true };
+  });
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => 2_001 },
+  });
+  const reconciliation = service.reconcile(fence, fence.signal);
+
+  try {
+    for (let microtask = 0; microtask < 20 && send.mock.calls.length === 0; microtask += 1) {
+      await Promise.resolve();
+    }
+    expect(send).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(30_001);
+    await expect(reconciliation).resolves.toBe(true);
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(store.getControllerTurn(turn.id)).toMatchObject({
+      state: "submitted",
+      completionContinuations: 1,
+      deliveryState: "none",
+      dispatchAfterSeq: 1,
+    });
+  } finally {
+    releaseProvider();
+    vi.useRealTimers();
+  }
+});
+
+it("keeps a late continuation completion fenced after retiring its controller generation", async () => {
+  vi.useFakeTimers();
+  const { store, fence } = serviceFixture();
+  const turn = submittedServiceTurn(store, fence, {
+    updateId: 55_103,
+    threadId: "thr_retired_continuation",
+  });
+  expect(store.recordControllerNativeEvidence({
+    ...fence,
+    now: 2_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    fromSeq: 0,
+    throughSeq: 1,
+    items: [],
+  })).toBe("recorded");
+  let releaseProvider!: () => void;
+  const providerCall = new Promise<void>((resolve) => {
+    releaseProvider = resolve;
+  });
+  const { adapter, send } = sdkFixture({ maxSeq: 1, eventPages: [[], [], [], []] });
+  send.mockImplementation(async () => {
+    await providerCall;
+    return { ok: true };
+  });
+  let now = 2_001;
+  const service = new LunaControllerService({
+    store,
+    adapter,
+    evidenceProjector,
+    clock: { now: () => now },
+  });
+  const firstReconciliation = service.reconcile(fence, fence.signal);
+
+  try {
+    for (let microtask = 0; microtask < 20 && send.mock.calls.length === 0; microtask += 1) {
+      await Promise.resolve();
+    }
+    await vi.advanceTimersByTimeAsync(30_001);
+    await expect(firstReconciliation).resolves.toBe(true);
+
+    now = 3_001;
+    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+    now = 5_001;
+    await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+    expect(adapter.hasPendingMutation()).toBe(true);
+    expect(store.getControllerTurn(turn.id)).toMatchObject({
+      state: "queued",
+      completionContinuations: 2,
+      deliveryState: "none",
+    });
+    expect(store.getControllerForOwner("7", "7")).toMatchObject({
+      threadId: null,
+      state: "pending_spawn",
+    });
+    expect(store.listControllerGenerations(turn.controllerKey, 10)).toContainEqual(expect.objectContaining({
+      threadId: "thr_retired_continuation",
+      endedAt: 5_001,
+    }));
+
+    releaseProvider();
+    for (let microtask = 0; microtask < 20 && adapter.hasPendingMutation(); microtask += 1) {
+      await Promise.resolve();
+    }
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(store.getControllerTurn(turn.id)).toMatchObject({
+      state: "queued",
+      completionContinuations: 2,
+    });
+    expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
+  } finally {
+    releaseProvider();
+    vi.useRealTimers();
+  }
 });
 
 it("uses one same-session correction, one receipt-seeded fresh recovery, then a safe terminal", async () => {

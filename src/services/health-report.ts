@@ -27,7 +27,15 @@ export type HealthReport = {
   observedAt: number;
   ok: boolean;
   problems: string[];
-  executor: { owner: string | null; generation: number | null; leaseExpiresAt: number | null; current: boolean };
+  executor: {
+    owner: string | null;
+    generation: number | null;
+    leaseExpiresAt: number | null;
+    heartbeatAt: number | null;
+    heartbeatAgeMs: number | null;
+    heartbeatStale: boolean;
+    current: boolean;
+  };
   work: { pendingEffects: number; deadEffects: number; oldestPendingEffectAgeMs: number | null };
   delivery: { pendingOutbox: number; deadOutbox: number; oldestPendingOutboxAgeMs: number | null };
   telegram: { nextOffset: number; failedUpdates: number };
@@ -38,6 +46,8 @@ export type HealthReport = {
   database: { integrity: string };
   activation: ActivationHealth | null;
 };
+
+export const EXECUTOR_HEARTBEAT_STALE_MS = 30_000;
 
 function count(db: SqliteDatabase, sql: string, ...params: unknown[]): number {
   const row = db.prepare(sql).get(...params) as { value: number } | undefined;
@@ -60,8 +70,14 @@ export function buildHealthReport(
   lanes: JobLaneSnapshot,
   runtimeIdentity?: RuntimeIdentity,
 ): HealthReport {
-  const lease = db.prepare("SELECT owner_id, generation, lease_expires_at FROM executor_lease WHERE singleton = 1")
-    .get() as { owner_id: string | null; generation: number | null; lease_expires_at: number | null } | undefined;
+  const lease = db.prepare(
+    "SELECT owner_id, generation, lease_expires_at, heartbeat_at FROM executor_lease WHERE singleton = 1",
+  ).get() as {
+    owner_id: string | null;
+    generation: number | null;
+    lease_expires_at: number | null;
+    heartbeat_at: number | null;
+  } | undefined;
   const controller = db.prepare(
     "SELECT controller_key, bb_thread_id, state FROM controller_threads LIMIT 1",
   ).get() as { controller_key: string; bb_thread_id: string | null; state: string } | undefined;
@@ -91,6 +107,11 @@ export function buildHealthReport(
   const drainingJobs = admissions.draining ?? 0;
   const queuedJobs = admissions.queued ?? 0;
   const occupiedJobs = admittedJobs + drainingJobs;
+  const leaseCurrent = (lease?.lease_expires_at ?? 0) > now;
+  const heartbeatAt = lease?.heartbeat_at ?? null;
+  const heartbeatAgeMs = heartbeatAt === null ? null : Math.max(0, now - heartbeatAt);
+  const heartbeatStale = lease?.owner_id !== null && lease?.owner_id !== undefined &&
+    (heartbeatAgeMs === null || heartbeatAgeMs > EXECUTOR_HEARTBEAT_STALE_MS);
 
   const report: HealthReport = {
     observedAt: now,
@@ -100,7 +121,10 @@ export function buildHealthReport(
       owner: lease?.owner_id ?? null,
       generation: lease?.generation ?? null,
       leaseExpiresAt: lease?.lease_expires_at ?? null,
-      current: (lease?.lease_expires_at ?? 0) > now,
+      heartbeatAt,
+      heartbeatAgeMs,
+      heartbeatStale,
+      current: leaseCurrent && !heartbeatStale,
     },
     work: {
       pendingEffects: count(db, "SELECT COUNT(*) AS value FROM effects WHERE status IN ('pending', 'leased')"),
@@ -172,7 +196,8 @@ export function buildHealthReport(
     activation: runtimeIdentity ? inspectRuntimeIdentity(db, runtimeIdentity) : null,
   };
 
-  if (!report.executor.current) report.problems.push("the executor lease is not current");
+  if (!leaseCurrent) report.problems.push("the executor lease is not current");
+  if (heartbeatStale) report.problems.push("the executor heartbeat is stale");
   if (maxConcurrentJobs === null) report.problems.push("concurrency configuration is invalid");
   if (report.work.deadEffects > 0) report.problems.push(`${report.work.deadEffects} job step(s) gave up`);
   if (report.delivery.deadOutbox > 0) report.problems.push(`${report.delivery.deadOutbox} message(s) could not be delivered`);

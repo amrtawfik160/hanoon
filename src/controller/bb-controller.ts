@@ -1,4 +1,5 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
+import { OperationDeadlineError, withAbortDeadline } from "../async";
 import {
   MAX_CONTROLLER_IMAGE_BYTES,
   type ControllerImage,
@@ -135,6 +136,8 @@ type ControllerAdapterMethods = {
   events(threadId: string, afterSeq: number, signal: AbortSignal): Promise<ControllerEventResult>;
   findSpawnCandidate(controllerKey: string, pendingSpawnToken: string, signal: AbortSignal, modelFallbackIndex?: number): Promise<ControllerLocation | null>;
   configuredProfileCount?(): number;
+  /** True while an SDK mutation abandoned at its deadline is still running. */
+  hasPendingMutation?(): boolean;
 };
 
 export type ControllerAdapter = ControllerAdapterMethods;
@@ -145,6 +148,8 @@ const CONTROLLER_THREAD_PAGE_LIMIT = 100;
 const MAX_CONTROLLER_THREAD_PAGES = 50;
 const MAX_CONTROLLER_INTERACTION_REFERENCES = 256;
 export const MAX_CONTROLLER_PRIVATE_DRAFT_CHARS = 4_000;
+/** Bounds one SDK request/response exchange, never the lifetime of a turn. */
+export const CONTROLLER_PROVIDER_RPC_TIMEOUT_MS = 30_000;
 
 // Reasoning, plain messages, and plan updates are the model thinking out loud.
 // Everything here reaches outside the model, which is what a budget should bound.
@@ -373,6 +378,8 @@ export function isControllerThreadTitle(
 }
 
 export class BbControllerAdapter implements ControllerAdapterMethods {
+  private pendingMutation: Promise<unknown> | null = null;
+
   public constructor(private readonly dependencies: {
     sdk: BbSdk;
     pluginId: string;
@@ -413,6 +420,32 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     return this.profiles().length;
   }
 
+  public hasPendingMutation(): boolean {
+    return this.pendingMutation !== null;
+  }
+
+  private providerRead<T>(signal: AbortSignal, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    return withAbortDeadline(signal, CONTROLLER_PROVIDER_RPC_TIMEOUT_MS, operation);
+  }
+
+  private providerMutation<T>(signal: AbortSignal, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    return withAbortDeadline(signal, CONTROLLER_PROVIDER_RPC_TIMEOUT_MS, (roundTripSignal) => {
+      if (this.pendingMutation !== null) {
+        throw new Error("A previous controller mutation is still awaiting its provider outcome");
+      }
+      // The current SDK mutation surface does not accept AbortSignal. Keep the
+      // real promise tracked after our await deadline so no second abandoned
+      // mutation can accumulate behind it.
+      const pending = operation(roundTripSignal);
+      this.pendingMutation = pending;
+      const clear = (): void => {
+        if (this.pendingMutation === pending) this.pendingMutation = null;
+      };
+      void pending.then(clear, clear);
+      return pending;
+    });
+  }
+
   public async spawn(
     turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
@@ -429,6 +462,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     if (controller.pendingSpawnToken === null) {
       throw new Error("Controller spawn token is missing");
     }
+    const pendingSpawnToken = controller.pendingSpawnToken;
     const input = await this.promptInput(
       personal.projectId,
       turn.inputText,
@@ -445,11 +479,11 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     })) {
       throw new Error("Controller spawn reservation is unavailable or stale");
     }
-    const thread = await this.dependencies.sdk.threads.spawn({
+    const thread = await this.providerMutation(signal, async () => this.dependencies.sdk.threads.spawn({
       projectId: personal.projectId,
       title: controllerSpawnTitle(
         controller.controllerKey,
-        controller.pendingSpawnToken,
+        pendingSpawnToken,
         personal.projectId,
         personal.hostId,
         controllerProviderFor(execution.model),
@@ -462,8 +496,8 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
         workspace: { type: "personal" },
       },
       ...controllerExecutionArguments(execution, { includeProvider: true }),
-    });
-    return { threadId: thread.id, ...personal, spawnToken: controller.pendingSpawnToken };
+    }));
+    return { threadId: thread.id, ...personal, spawnToken: pendingSpawnToken };
   }
 
   public async send(
@@ -483,12 +517,12 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       }
     }
     const input = await this.promptInput(personal?.projectId ?? null, text, image, signal);
-    await this.dependencies.sdk.threads.send({
+    await this.providerMutation(signal, async () => this.dependencies.sdk.threads.send({
       threadId,
       mode: "start",
       ...controllerExecutionArguments(execution, { includeProvider: false }),
       input,
-    });
+    }));
   }
 
   // Images deliberately do not use this path: preparing one can outlive the
@@ -499,11 +533,11 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     text: string,
     signal: AbortSignal,
   ): Promise<void> {
-    await this.dependencies.sdk.threads.send({
+    await this.providerMutation(signal, async () => this.dependencies.sdk.threads.send({
       threadId,
       mode: "steer-if-active",
       input: [{ type: "text", text, mentions: [] }],
-    });
+    }));
   }
 
   public async answerQuestion(
@@ -520,7 +554,8 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     interactionId: string,
     signal: AbortSignal,
   ): Promise<ControllerInteractionSnapshot> {
-    const interaction = await this.dependencies.sdk.threads.interactions.get({ threadId, interactionId, signal });
+    const interaction = await this.providerRead(signal, (roundTripSignal) =>
+      this.dependencies.sdk.threads.interactions.get({ threadId, interactionId, signal: roundTripSignal }));
     return {
       id: interaction.id,
       threadId: interaction.threadId,
@@ -538,15 +573,16 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
   ): Promise<void> {
     if (signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
     const validatedResolution = parseControllerInteractionResolution(resolution);
-    await this.dependencies.sdk.threads.interactions.resolve({
+    await this.providerMutation(signal, async () => this.dependencies.sdk.threads.interactions.resolve({
       threadId,
       interactionId,
       resolution: validatedResolution,
-    });
+    }));
   }
 
   public async status(threadId: string, signal: AbortSignal, modelFallbackIndex = 0): Promise<ControllerStatus> {
-    const thread = await this.dependencies.sdk.threads.get({ threadId, signal });
+    const thread = await this.providerRead(signal, (roundTripSignal) =>
+      this.dependencies.sdk.threads.get({ threadId, signal: roundTripSignal }));
     if (thread.deletedAt !== null || thread.archivedAt !== null) return "missing";
     // Switching the configured model can move the conversation to another
     // provider; the old thread cannot run the new model, so it is retired.
@@ -559,11 +595,12 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
   // The high-water sequence, so a new turn's baseline cannot land inside the
   // thread's history and replay older answers into the live reply.
   public async latestSeq(threadId: string, signal: AbortSignal): Promise<number> {
-    const timeline = await this.dependencies.sdk.threads.timeline({
-      threadId,
-      summaryOnly: "true",
-      signal,
-    });
+    const timeline = await this.providerRead(signal, (roundTripSignal) =>
+      this.dependencies.sdk.threads.timeline({
+        threadId,
+        summaryOnly: "true",
+        signal: roundTripSignal,
+      }));
     return timeline.maxSeq;
   }
 
@@ -585,12 +622,13 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     let totalTokens = 0;
     let cursorBlocked = false;
     for (let page = 0; page < MAX_CONTROLLER_EVENT_PAGES; page += 1) {
-      const rows = await this.dependencies.sdk.threads.events.list({
-        threadId,
-        afterSeq: String(latestSeq),
-        limit: String(CONTROLLER_EVENT_PAGE_LIMIT),
-        signal,
-      });
+      const rows = await this.providerRead(signal, (roundTripSignal) =>
+        this.dependencies.sdk.threads.events.list({
+          threadId,
+          afterSeq: String(latestSeq),
+          limit: String(CONTROLLER_EVENT_PAGE_LIMIT),
+          signal: roundTripSignal,
+        }));
       for (const row of rows) {
         const lifecycle = lifecycleReferenceCandidate(row);
         if (lifecycle && !interactionReferences.has(lifecycle.key) &&
@@ -667,14 +705,15 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     const candidates = new Map<string, ControllerSpawnTitleIdentity>();
     let offset = 0;
     for (let page = 0; page < MAX_CONTROLLER_THREAD_PAGES; page += 1) {
-      const threads = await this.dependencies.sdk.threads.list({
-        projectId: personal.projectId,
-        includeHidden: true,
-        originPluginId: this.dependencies.pluginId,
-        limit: CONTROLLER_THREAD_PAGE_LIMIT,
-        offset,
-        signal,
-      });
+      const threads = await this.providerRead(signal, (roundTripSignal) =>
+        this.dependencies.sdk.threads.list({
+          projectId: personal.projectId,
+          includeHidden: true,
+          originPluginId: this.dependencies.pluginId,
+          limit: CONTROLLER_THREAD_PAGE_LIMIT,
+          offset,
+          signal: roundTripSignal,
+        }));
       if (threads.length > CONTROLLER_THREAD_PAGE_LIMIT) {
         throw new Error("Controller thread recovery returned an oversized page");
       }
@@ -738,29 +777,33 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       throw new ControllerImagePreparationError(false);
     }
     try {
-      const uploaded = await this.dependencies.sdk.projects.attachments.upload({
-        projectId,
-        clientFile: bytes,
-        filename: image.fileName,
-        mimeType: image.mimeType,
-      });
+      const uploaded = await this.providerMutation(signal, async () =>
+        this.dependencies.sdk.projects.attachments.upload({
+          projectId,
+          clientFile: bytes,
+          filename: image.fileName,
+          mimeType: image.mimeType,
+        }));
       if (uploaded.type !== "localImage") throw new ControllerImagePreparationError(false);
       input.push({ type: "localImage", path: uploaded.path });
       return input;
     } catch (error) {
       if (error instanceof ControllerImagePreparationError) throw error;
+      if (error instanceof OperationDeadlineError) throw error;
       throw new ControllerImagePreparationError(true);
     }
   }
 
   private async resolvePersonalProject(signal: AbortSignal): Promise<{ projectId: string; hostId: string }> {
-    const projects = await this.dependencies.sdk.projects.list({ includePersonal: true, signal });
+    const projects = await this.providerRead(signal, (roundTripSignal) =>
+      this.dependencies.sdk.projects.list({ includePersonal: true, signal: roundTripSignal }));
     const personal = projects.filter((project) => project.kind === "personal");
     if (personal.length !== 1) throw new Error("Exactly one BB personal project is required for the controller");
     const project = personal[0];
     if (!project) throw new Error("BB personal project is unavailable");
     if (project.sources.length === 0) {
-      const hosts = await this.dependencies.sdk.hosts.list({ signal });
+      const hosts = await this.providerRead(signal, (roundTripSignal) =>
+        this.dependencies.sdk.hosts.list({ signal: roundTripSignal }));
       const connected = hosts.filter((host) => host.status === "connected");
       if (connected.length !== 1) {
         throw new Error("BB personal project has no source and its connected host is ambiguous");
