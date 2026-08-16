@@ -25,6 +25,8 @@ import {
   type NativeAdapterTransitionEnvelope,
 } from "../capabilities/native-adapters";
 import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
+import type { PipelineStage } from "../domain/stage-execution";
+import { jobStageExecution } from "../domain/stage-routing";
 import { ApprovalService } from "./approval-service";
 import { decideAutoApproval } from "./merge-authority";
 import { buildWorkOrder, type CapabilityWorkOrderEnvelope } from "../bb/handoffs";
@@ -993,7 +995,46 @@ export class EffectRunner {
       handoffPath: runnerAttempt.handoffPath ?? null,
       handoffSha256: runnerAttempt.handoffSha256 ?? null,
     });
+    this.recordStageExecution(job, kind === "implementation" ? "implementation" : "review", attempt, threadId, capabilityProfile);
     return { threadId, environmentId };
+  }
+
+  /**
+   * Opens this attempt's row in the stage ledger. Tiering can only be tuned
+   * from what stages actually ran on, so the tuple is recorded at dispatch
+   * rather than inferred later from whatever policy happens to be current.
+   */
+  private recordStageExecution(
+    job: Job,
+    stage: PipelineStage,
+    attempt: Readonly<{ id: string; ordinal?: number }>,
+    threadId: string | null,
+    capability: CapabilityWorkOrderEnvelope | undefined,
+  ): void {
+    if (!job.policy) return;
+    const execution = jobStageExecution({
+      job,
+      policy: job.policy,
+      stage,
+      attemptOrdinal: attempt.ordinal,
+      ...(job.routingMode === "active" && capability?.model ? { capabilityRoute: capability.model } : {}),
+    });
+    this.dependencies.store.recordStageExecution({
+      jobId: job.id,
+      attemptId: attempt.id,
+      stage,
+      attemptOrdinal: Math.max(1, attempt.ordinal ?? 1),
+      threadId,
+      baseTier: execution.baseTier,
+      tier: execution.tier,
+      escalationSteps: execution.escalationSteps,
+      source: execution.source,
+      providerId: execution.providerId,
+      modelId: execution.model,
+      reasoningLevel: execution.reasoningLevel,
+      serviceTier: execution.serviceTier,
+      now: this.now(),
+    });
   }
 
   private async findPipelineStageCandidate(
@@ -1095,6 +1136,7 @@ export class EffectRunner {
       ? stageInputSha(workOrder.sha256, previousCritique.outputSha256)
       : stageInputSha(workOrder.sha256);
     const attempt = this.createPipelineAttempt(effect, job, "PLAN", inputSha256);
+    const runnerAttempt = pipelineAttemptForRunner(attempt, capabilityProfile);
     let created = attempt.threadId && attempt.environmentId
       ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
       : await this.findPipelineStageCandidate(effect, bb, job, attempt);
@@ -1108,12 +1150,13 @@ export class EffectRunner {
         operation: "spawn-planner",
         invoke: () => bb.spawnPlanner!(
           job,
-          pipelineAttemptForRunner(attempt, capabilityProfile),
+          runnerAttempt,
           previousCritique?.outputText,
         ),
         validate: validateThreadResult,
       });
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
+      this.recordStageExecution(job, "plan", attempt, created.threadId, capabilityProfile);
     }
     this.settleRecoveredModelRoute(
       attempt.id,
@@ -1158,6 +1201,7 @@ export class EffectRunner {
       "CRITIQUE",
       stageInputSha(workOrder.sha256, plan.outputSha256),
     );
+    const runnerAttempt = pipelineAttemptForRunner(attempt, capabilityProfile);
     let created = attempt.threadId && attempt.environmentId
       ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
       : await this.findPipelineStageCandidate(effect, bb, job, attempt);
@@ -1171,12 +1215,13 @@ export class EffectRunner {
         operation: "spawn-critic",
         invoke: () => bb.spawnCritic!(
           job,
-          pipelineAttemptForRunner(attempt, capabilityProfile),
+          runnerAttempt,
           pipelineAttemptForRunner(plan),
         ),
         validate: validateThreadResult,
       });
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
+      this.recordStageExecution(job, "critique", attempt, created.threadId, capabilityProfile);
     }
     this.settleRecoveredModelRoute(
       attempt.id,
@@ -1206,6 +1251,7 @@ export class EffectRunner {
       "DOCS",
       stageInputSha(workOrder.sha256, job.prHeadSha),
     );
+    const runnerAttempt = pipelineAttemptForRunner(attempt, capabilityProfile);
     let created = attempt.threadId && attempt.environmentId
       ? { threadId: attempt.threadId, environmentId: attempt.environmentId }
       : await this.findPipelineStageCandidate(effect, bb, job, attempt);
@@ -1217,10 +1263,11 @@ export class EffectRunner {
         subjectId: attempt.id,
         stage: "documentation",
         operation: "spawn-documentation",
-        invoke: () => bb.spawnDocs!(job, pipelineAttemptForRunner(attempt, capabilityProfile)),
+        invoke: () => bb.spawnDocs!(job, runnerAttempt),
         validate: validateThreadResult,
       });
       created = { threadId: threadResultId(result), environmentId: threadResultEnvironment(result) };
+      this.recordStageExecution(job, "docs", attempt, created.threadId, capabilityProfile);
     }
     this.settleRecoveredModelRoute(
       attempt.id,

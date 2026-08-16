@@ -206,6 +206,12 @@ import {
   type CredentialVerificationPrepareInput,
   type CredentialVerificationPrepareResult,
 } from "./credential-access-repository";
+import {
+  StageExecutionRepository,
+  type RecordStageExecutionInput,
+  type SettleStageExecutionInput,
+  type StageExecutionRecord,
+} from "./stage-execution-repository";
 import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
 
 /**
@@ -2812,6 +2818,9 @@ export interface TelegramAgentStore {
     subjectId: string,
     limit: number,
   ): ModelRouteTrial[];
+  recordStageExecution(input: RecordStageExecutionInput): StageExecutionRecord;
+  settleStageExecution(input: SettleStageExecutionInput): StageExecutionRecord | null;
+  listStageExecutions(jobId: string, limit?: number): StageExecutionRecord[];
   replaceExternalCapabilityInventory(input: {
     hostScope: string;
     items: readonly CapabilityInventoryItem[];
@@ -4726,6 +4735,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly controllerEvidenceRepository: ControllerEvidenceRepository;
   private readonly controllerInteractionRepository: ControllerInteractionRepository;
   private readonly credentialAccessRepository: CredentialAccessRepository;
+  private readonly stageExecutionRepository: StageExecutionRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -4739,6 +4749,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.controllerInteractionRepository = new ControllerInteractionRepository(db);
     this.controllerEvidenceRepository = new ControllerEvidenceRepository(db, clock);
     this.credentialAccessRepository = new CredentialAccessRepository(db);
+    this.stageExecutionRepository = new StageExecutionRepository(db);
   }
 
   public reconcileCredentialHealth(input: CredentialHealthReconcileInput): CredentialHealthReconcileResult {
@@ -4834,6 +4845,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     limit: number,
   ): ModelRouteTrial[] {
     return this.capabilityRepository.listModelRouteTrials(subjectKind, subjectId, limit);
+  }
+
+  public recordStageExecution(input: RecordStageExecutionInput): StageExecutionRecord {
+    return this.stageExecutionRepository.recordStageExecution(input);
+  }
+
+  public settleStageExecution(input: SettleStageExecutionInput): StageExecutionRecord | null {
+    return this.stageExecutionRepository.settleStageExecution(input);
+  }
+
+  public listStageExecutions(jobId: string, limit = 200): StageExecutionRecord[] {
+    return this.stageExecutionRepository.listStageExecutions(jobId, limit);
   }
 
   public replaceExternalCapabilityInventory(input: {

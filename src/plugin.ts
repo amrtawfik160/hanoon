@@ -109,6 +109,7 @@ import { FailureLoopService } from "./services/failure-loop-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
+import { settleStageLedger } from "./services/stage-ledger";
 import { runProductionStage } from "./services/production-runner";
 import { CapabilityInventoryService } from "./services/capability-inventory-service";
 import {
@@ -1285,6 +1286,27 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       : reviewStage ? "review" as const
       : "implementation" as const;
     const generation = workerRegistrationGeneration(job, workerKind);
+    /**
+     * Closes this attempt's stage-ledger row once its worker has stopped.
+     * `outcome` describes how the worker ended, not what the stage decided:
+     * the verdict lives in the attempt record, while this row measures what the
+     * chosen model actually consumed. Reading usage costs a provider call, so
+     * it happens once, at the end.
+     */
+    const settleStageMeasurement = async (outcome: "succeeded" | "failed"): Promise<void> => {
+      await settleStageLedger({
+        store,
+        readUsage: (threadId) => bbRunner.readThreadUsage(threadId),
+        jobId: job.id,
+        attemptId: pipelineRole
+          ? store.getLatestPipelineStageAttempt(job.id, pipelineRole)?.id
+          : store.getAttemptByThreadId(resourceId)?.id,
+        stage: workerKind,
+        threadId: resourceId,
+        outcome,
+        now: clock(),
+      });
+    };
     const previousLiveness = store.getWorkerLivenessForResource(job.id, resourceId);
     let thread: Awaited<ReturnType<BbRunner["getThread"]>>;
     try {
@@ -1348,9 +1370,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       if (latest && latest.cancelRequestedAt === null) {
         applyExecutorEvent(job.id, latest.version, { type: "THREAD_FAILED", workerKind, error: `${workerKind} worker thread failed` });
       }
+      await settleStageMeasurement("failed");
       return;
     }
     if (projected.state !== "idle") return;
+    await settleStageMeasurement("succeeded");
+    if (!fenceCurrent()) return;
 
     if (pipelineRole && currentPipelineAttempt) {
       let output: string;

@@ -2025,6 +2025,45 @@ export const DELEGATION_STALL_MIGRATIONS = [String.raw`
 ALTER TABLE delegation_threads ADD COLUMN stall_notified_at INTEGER;
 `] as const;
 
+/**
+ * What every stage attempt actually ran on, and what it cost. Tiering can only
+ * be tuned from real numbers, so the numbers are recorded per attempt rather
+ * than inferred later from the policy that happened to be current.
+ */
+export const STAGE_EXECUTION_MIGRATIONS = [String.raw`
+CREATE TABLE stage_executions (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL CHECK (length(attempt_id) BETWEEN 1 AND 256),
+  stage TEXT NOT NULL CHECK (stage IN (
+    'plan', 'critique', 'implementation', 'review',
+    'validation', 'docs', 'merge', 'deploy', 'canary'
+  )),
+  attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 1),
+  thread_id TEXT,
+  base_tier TEXT NOT NULL CHECK (base_tier IN ('fast', 'standard', 'strong')),
+  tier TEXT NOT NULL CHECK (tier IN ('fast', 'standard', 'strong')),
+  escalation_steps INTEGER NOT NULL CHECK (escalation_steps BETWEEN 0 AND 2),
+  source TEXT NOT NULL CHECK (source IN ('stage-policy', 'legacy-policy', 'default', 'capability-route')),
+  provider_id TEXT NOT NULL CHECK (length(provider_id) BETWEEN 1 AND 128),
+  model_id TEXT NOT NULL CHECK (length(model_id) BETWEEN 1 AND 256),
+  reasoning_level TEXT NOT NULL CHECK (length(reasoning_level) BETWEEN 1 AND 64),
+  service_tier TEXT NOT NULL CHECK (service_tier IN ('default', 'fast')),
+  input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+  cached_input_tokens INTEGER CHECK (cached_input_tokens IS NULL OR cached_input_tokens >= 0),
+  output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+  reasoning_output_tokens INTEGER CHECK (reasoning_output_tokens IS NULL OR reasoning_output_tokens >= 0),
+  total_tokens INTEGER CHECK (total_tokens IS NULL OR total_tokens >= 0),
+  cost_micro_usd INTEGER CHECK (cost_micro_usd IS NULL OR cost_micro_usd >= 0),
+  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded', 'failed', 'cancelled')),
+  started_at INTEGER NOT NULL CHECK (started_at >= 0),
+  settled_at INTEGER CHECK (settled_at IS NULL OR settled_at >= 0),
+  UNIQUE(job_id, stage, attempt_id)
+);
+CREATE INDEX stage_executions_by_job ON stage_executions(job_id, started_at, id);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2086,4 +2125,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_EVIDENCE_STEER_MIGRATIONS,
   ...HOUSEKEEPING_NOTICE_MIGRATIONS,
   ...DELEGATION_STALL_MIGRATIONS,
+  ...STAGE_EXECUTION_MIGRATIONS,
 ] as const;

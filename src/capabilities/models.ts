@@ -51,17 +51,23 @@ export type ModelPoolRegistry = Readonly<Record<
 export const DEFAULT_MODEL_POOL_REGISTRY: ModelPoolRegistry = defineDefaultRegistry();
 
 function defineDefaultRegistry(): ModelPoolRegistry {
-  const entry = (modelId: string, reasoning: ModelRouteTuple["reasoning"]): ModelRouteTuple => ({
+  const entry = (
+    modelId: string,
+    reasoning: ModelRouteTuple["reasoning"],
+    serviceTier: ModelRouteTuple["serviceTier"] = "default",
+  ): ModelRouteTuple => ({
     providerId: "codex",
     modelId,
     reasoning,
-    serviceTier: "fast",
+    serviceTier,
   });
+  // Fast mode is never on unless it is asked for in the request that needs it,
+  // so no pipeline or worker route turns it on by default.
   return freezeRegistry(modelPoolRegistrySchema.parse({
     controller: {
-      fast: entry("gpt-5.6-luna", "low"),
-      standard: entry("gpt-5.6-terra", "high"),
-      strong: entry("gpt-5.6-sol", "xhigh"),
+      fast: entry("gpt-5.6-luna", "low", "fast"),
+      standard: entry("gpt-5.6-terra", "high", "fast"),
+      strong: entry("gpt-5.6-sol", "xhigh", "fast"),
     },
     pipeline: {
       fast: entry("gpt-5.6-luna", "high"),
@@ -74,9 +80,9 @@ function defineDefaultRegistry(): ModelPoolRegistry {
       strong: entry("gpt-5.6-sol", "xhigh"),
     },
     background: {
-      fast: entry("gpt-5.6-luna", "low"),
-      standard: entry("gpt-5.6-terra", "medium"),
-      strong: entry("gpt-5.6-sol", "high"),
+      fast: entry("gpt-5.6-luna", "low", "fast"),
+      standard: entry("gpt-5.6-terra", "medium", "fast"),
+      strong: entry("gpt-5.6-sol", "high", "fast"),
     },
   }));
 }

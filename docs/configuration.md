@@ -253,6 +253,11 @@ Use unmistakable placeholders and replace them with values verified for the targ
     "serviceTier": "default",
     "permissionMode": "auto"
   },
+  "stageExecution": {
+    "plan": { "tier": "strong" },
+    "docs": { "tier": "fast", "maxEscalations": 1 },
+    "review": { "providerId": "codex", "model": "gpt-5.6-sol" }
+  },
   "validationCommands": [
     {
       "name": "unit",
@@ -311,7 +316,8 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `alias` | Lowercase letters, numbers, and hyphens; starts alphanumeric; maximum 24 characters. |
 | `githubRepository` | `OWNER/REPOSITORY`; when supplied, must match the live GitHub remote. |
 | `baseBranch` | Non-empty and present in the selected BB source. |
-| `implementation`, `review` | Optional provider/model/reasoning/tier/permission fields. Missing values use BB's resolved defaults. |
+| `implementation`, `review` | Optional provider/model/reasoning/tier/permission fields. When `stageExecution` has no entry for that stage, these are what the stage runs on. |
+| `stageExecution` | Optional per-worker-kind execution table. See [Per-stage model routing](#per-stage-model-routing). |
 | `validationCommands` | Up to 20 owner-authored commands. |
 | `production.targetKey` | Optional shared isolation key: 1–64 lowercase letters, numbers, `.`, `_`, or `-`, starting alphanumeric. When absent, the project id is used. |
 | `production.deployCommands` | One to 20 commands when production is configured. |
@@ -385,6 +391,67 @@ Granting is only ever a button tap, so it cannot be produced by the agent misrea
 - `/approvals off` withdraws all of them.
 
 Every grant, withdrawal, and unattended merge is recorded in an append-only log keyed by project.
+
+## Per-stage model routing
+
+Every worker kind the pipeline runs has its own execution profile: `plan`, `critique`, `implementation`, `review`, `validation`, `docs`, `merge`, `deploy`, and `canary`. Each entry is optional. Anything left out falls back to that stage's declared default tier, so an unconfigured project already behaves sensibly.
+
+Pipeline stages never inherit the conversational controller's execution settings. Retuning the controller cannot change how plans, critiques, or reviews are produced.
+
+### Tiers and defaults
+
+Three tiers name what a stage runs on:
+
+| Tier | Runs on |
+| --- | --- |
+| `fast` | `gpt-5.6-luna` at `low` reasoning |
+| `standard` | `gpt-5.6-terra` at `high` reasoning |
+| `strong` | `gpt-5.6-sol` at `xhigh` reasoning |
+
+Heavy reasoning is spent where judgement is the work; the mechanical stages run cheap:
+
+| Stage | Default tier |
+| --- | --- |
+| `plan`, `critique`, `review` | `strong` |
+| `implementation` | `standard` |
+| `validation`, `docs`, `merge`, `deploy`, `canary` | `fast` |
+
+Only `plan`, `critique`, `implementation`, `review`, and `docs` currently dispatch a model-backed worker. `validation`, `merge`, `deploy`, and `canary` run as deterministic terminal commands today; their entries are configured and validated, and take effect if those stages ever gain a worker.
+
+### Stage fields
+
+| Field | Contract |
+| --- | --- |
+| `tier` | `fast`, `standard`, or `strong`. Absent uses the stage's default above. |
+| `providerId` | Must be a provider the plugin knows, and requires `model`, which it must own. A provider on its own is rejected: the tier already supplies a model, and pairing it with another provider's would fail at dispatch. |
+| `model` | Must be a model that provider offers. Pinning an exact model disables escalation for that stage. |
+| `reasoningLevel` | Overrides the tier's reasoning level. |
+| `serviceTier` | `default` or `fast`. **Off unless set here.** Rejected when the stage's `model` belongs to a provider that does not honour a service tier. |
+| `permissionMode` | `auto`, `accept-edits`, or `full`. |
+| `maxEscalations` | `0`–`2`; how many tiers this stage may climb across retries. `0` disables escalation. Defaults to `2`, or `1` for `merge`, `deploy`, and `canary`. |
+
+An entry is the whole answer for its stage: fields it leaves out come from the tier, not from `implementation` or `review`.
+
+### Escalation on retry
+
+A stage that repeats runs its next attempt one tier stronger, up to `maxEscalations` and never past `strong`. Both a repeated attempt and a repeated plan or review cycle count as the same signal — the stronger of the two decides, so they do not stack. A stage that pins an exact `model` is never substituted.
+
+### Model ids are validated on save and load
+
+A stage naming a model no provider offers, a provider that does not own that model, an unknown provider, a provider given without a model, or a fast service tier that model's provider cannot honour is rejected whenever the policy is parsed. The failure happens at `project enable` and at load, not mid-job when a worker will not start.
+
+The older `implementation` and `review` fields are deliberately exempt: policies stored before this table existed must keep running untouched.
+
+### Measured spend
+
+Every stage attempt records the provider, model, reasoning level, service tier, tier and any escalation, token counts, duration, and cost:
+
+```bash
+bb telegram-agent job spend <job-id>
+bb telegram-agent job spend <job-id> --json
+```
+
+Cost is reported as `unpriced` in the text form, and as a null `costMicroUsd` with `--json`, for any model with no published rate entered in the model catalog. That means "not measured", never "free"; entering the rate is the only step needed to turn measured tokens into measured spend.
 
 ## Validate configuration
 
