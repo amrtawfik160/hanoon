@@ -89,6 +89,7 @@ describe("worker skill role table", () => {
   test("contains exactly the selected manifest skill ids", () => {
     expect(BUNDLED_SKILL_IDS).toEqual([
       "brainstorming",
+      "checking-system-logs",
       "clean-code-guard",
       "dispatching-parallel-agents",
       "docs-guard",

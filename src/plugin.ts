@@ -104,6 +104,8 @@ import { JobMemoryService } from "./services/job-memory-service";
 import { isDisposableTempName } from "./autonomy/disk-space";
 import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
 import { WorkspaceHousekeepingService } from "./services/workspace-housekeeping-service";
+import { AuditService } from "./services/audit-service";
+import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { installSystemMonitors } from "./services/system-monitors";
@@ -1255,6 +1257,18 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     reclaimArmed: () => config.ok && workspaceReclaimEnabled(config.value),
     warn: (message) => bb.log.warn(message),
   });
+  const audits = new AuditService({
+    store,
+    audits: createAuditAccess({ sdk: bb.sdk as never, store, terminal }),
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    // Read-only, so it rides the existing upkeep switch rather than adding one.
+    auditsArmed: () => config.ok && systemUpkeepEnabled(config.value),
+    warn: (message) => bb.log.warn(message),
+  });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
   let systemMonitorsInstalled = false;
   const systemMonitors = {
@@ -2037,6 +2051,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       failureLoop,
       diskHousekeeping,
       workspaceHousekeeping,
+      audits,
       systemMonitors,
       presence,
       laneSnapshots,

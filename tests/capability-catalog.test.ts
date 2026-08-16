@@ -9,6 +9,7 @@ import { CAPABILITY_CATALOG } from "../src/capabilities/catalog";
 
 const EXPECTED_SKILL_ROUTES = {
   brainstorming: "worker",
+  "checking-system-logs": "worker",
   "clean-code-guard": "worker",
   "dispatching-parallel-agents": "hanoon-native",
   "docs-guard": "worker",

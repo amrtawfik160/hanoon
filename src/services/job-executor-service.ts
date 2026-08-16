@@ -80,6 +80,10 @@ export type JobExecutorDependencies = {
     due(now: number): boolean;
     processDue(): Promise<boolean>;
   };
+  audits?: {
+    due(now: number): boolean;
+    processDue(): Promise<boolean>;
+  };
   systemMonitors?: {
     install(): void;
   };
@@ -883,6 +887,10 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // not yield, or it hands in-flight work a turn it would not have had.
         if (deps.workspaceHousekeeping?.due(deps.clock.now())) {
           didWork = await deps.workspaceHousekeeping.processDue() || didWork;
+        }
+        // Read-only daily checks, gated the same way and paced inside themselves.
+        if (deps.audits?.due(deps.clock.now())) {
+          didWork = await deps.audits.processDue() || didWork;
         }
         // Idempotent, and deliberately not a one-shot at activation: pairing
         // can happen long after the executor starts.

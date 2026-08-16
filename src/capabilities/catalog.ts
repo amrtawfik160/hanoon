@@ -53,6 +53,7 @@ export const CONTROLLER_METADATA_TOOL_IDS = [
 
 const WORKER_SKILLS = new Set([
   "brainstorming",
+  "checking-system-logs",
   "clean-code-guard",
   "docs-guard",
   "durable-boundary-audit",
@@ -82,6 +83,7 @@ const MANUAL_SKILLS = new Set(["domain-modeling", "grill-with-docs", "grilling"]
 
 const SKILL_DIGESTS = {
   brainstorming: "74edf03ea6d24ef53db48677b93558d14a979bdf052ca3f57ecdca0c66791608",
+  "checking-system-logs": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245",
   "clean-code-guard": "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2",
   "dispatching-parallel-agents": "1968923066f3b707eb01d1992cdf4c42284c3855f70253b9cd5000ff45fca13c",
   "docs-guard": "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef",

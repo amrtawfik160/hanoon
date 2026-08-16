@@ -36,6 +36,12 @@
       "license": "MIT"
     },
     {
+      "id": "checking-system-logs",
+      "skillPath": "skills/hanoon/checking-system-logs/SKILL.md",
+      "source": "first-party",
+      "license": "first-party"
+    },
+    {
       "id": "clean-code-guard",
       "skillPath": "skills/guards/clean-code-guard/SKILL.md",
       "source": "https://github.com/amElnagdy/guard-skills",
@@ -310,6 +316,10 @@
     {
       "path": "skills/guards/test-guard/SKILL.md",
       "sha256": "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0"
+    },
+    {
+      "path": "skills/hanoon/checking-system-logs/SKILL.md",
+      "sha256": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245"
     },
     {
       "path": "skills/hanoon/durable-boundary-audit/SKILL.md",
