@@ -2,7 +2,7 @@
 
 Capability-routing amendment: [Adaptive Capability Pipeline Specification](adaptive-capability-pipeline.md). That specification supersedes this document's static role-to-skill mapping, skill-only receipt schema, and associated rollout and acceptance wording. The Telegram experience and live-acceptance contracts here remain authoritative where the amendment does not replace them.
 
-Implementation status (2026-08-13): the 23-skill bundle, universal profiles and receipts, least-capability controller bundles, strict guard outcomes, model trials, six recipe graphs, fake-host acceptance, bounded operator projections, and fail-closed promotion reader are implemented. The trusted disposable-live promotion collector and CLI-managed acceptance session described below are not implemented. Live recipe promotion is therefore `not run/incomplete`; a fresh installation starts every adaptive recipe in `shadow`.
+Implementation status (updated 2026-08-16): the 26-skill bundle, universal profiles and receipts, least-capability controller bundles, strict guard outcomes, model trials, six recipe graphs, fake-host acceptance, bounded operator projections, and fail-closed promotion reader are implemented. The trusted disposable-live promotion collector and CLI-managed acceptance session described below are not implemented. Live recipe promotion is therefore `not run/incomplete`; a fresh installation starts every adaptive recipe in `shadow`.
 
 ## Purpose
 

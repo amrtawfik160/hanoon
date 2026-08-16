@@ -25,8 +25,10 @@ const DENIAL_RESPONSE = "The requested command was denied.";
 const OWNER_OVERLAY = "Prefer concise summaries.";
 const REQUIRED_CONTROLLER_INSTRUCTION_SENTINEL = "telegram-agent:controller-instructions:v1";
 const REQUIRED_CONTROLLER_SAFETY_CLAUSES = [
-  "one-use Telegram approval (Allow once/Deny)",
-  "Never merge or deploy by hand, nor approve for them.",
+  "Never merge or deploy by hand",
+  // The agent may now consume an approval, but only the one the owner asked
+  // for in their own words: unasked, the button is still the only way through.
+  "Unasked, wait for their tap.",
   "Installing or connecting an integration, changing a credential, spending money, a destructive external action, or an irreversible external write needs the owner's explicit decision first",
   "Never claim implementation, tests, review, validation, merge, deployment, or production succeeded without same-turn evidence; durable evidence is required.",
 ] as const;
@@ -115,6 +117,10 @@ const EXPECTED_CONTROLLER_TOOL_NAMES = [
   "telegram_agent_access_verify",
   "telegram_agent_answer_thread",
   "telegram_agent_send_media",
+  "telegram_agent_approve_merge",
+  "telegram_agent_resume_project",
+  "telegram_agent_add_reference",
+  "telegram_agent_search_reference",
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
 ] as const;
@@ -129,6 +135,9 @@ const EXPECTED_CONTROLLER_PROFILE_TOOL_NAMES = [
   "telegram_agent_scorecard",
   "telegram_agent_turn_evidence",
   "telegram_agent_respond",
+  // Reachable from every turn now: showing the owner a picture is not a
+  // subject the opening message has to name.
+  "telegram_agent_send_media",
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
 ] as const;

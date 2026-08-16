@@ -37,10 +37,10 @@ const permittedBundleCombinations = Array.from(
   (_, mask) => CONTROLLER_BUNDLE_IDS.filter((_, index) => (mask & (1 << index)) !== 0),
 );
 
-it("partitions all 23 domain tools exactly once and keeps metadata and protocol separate", () => {
+it("partitions all 32 domain tools exactly once and keeps metadata and protocol separate", () => {
   const partition = Object.values(CONTROLLER_TOOL_BUNDLES).flat();
 
-  expect(partition).toHaveLength(23);
+  expect(partition).toHaveLength(32);
   expect(new Set(partition)).toEqual(new Set(CONTROLLER_DOMAIN_TOOL_IDS));
   expect(new Set(partition).size).toBe(partition.length);
   expect(CONTROLLER_METADATA_TOOL_IDS).toEqual([

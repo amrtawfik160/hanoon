@@ -39,6 +39,8 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Live thread insight | "Why is this taking so long?" answers from the thread's current step, todo list, running commands, and latest message — not just its status. |
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
+| Voice notes | Send a Telegram voice note or audio message. Hanoon uses BB's configured transcription service, keeps only the transcript, and tells you plainly when transcription is unavailable. |
+| Reference documents | File project or global specifications, search their passages, and give every pipeline stage a bounded structural map of what governs the work. |
 | Working style | "Be terser" or "always show me the PR link" sticks, without a code change. It can shape tone and habits, never a safety boundary. |
 | Parallel work | "Compare the invoice spike and the billing latency" opens both at once and answers from what comes back. |
 | Self-maintenance | A daily sweep for work needing your decision, a weekly memory audit, and a weekly scorecard of what actually happened. Off by one setting. |
@@ -57,7 +59,7 @@ Every owner-visible reply is one accepted structured finalization, plus what the
 - **Evidence in the same turn.** A claim about current state or completed work must reference evidence the agent gathered during that turn, with compatible proof kinds and a matching subject. Evidence is sealed at a high-water mark when the finalization is accepted, and an answer whose evidence advanced afterwards is refused rather than sent.
 - **Raw prose reaches nothing.** Unstructured assistant prose never becomes a Telegram draft, a stored answer, a conversation digest, an outbox row, a finalization row, or a reply. BB still owns its own provider transcript. Drafts show one of the fixed phase lines, such as "Hanoon is thinking…", never partial output. The one exception is not prose: when BB blocks on a question or an approval, the provider's own prompt, options, and command are what the owner is being asked about, so they are carried through — each field bounded and credential-screened, and the whole interaction downgraded to an unanswerable notice if any field fails the screen.
 - **What was asked in your name comes back.** Messaging a worker thread requires a one-line reason, recorded once the message has actually landed and owed to you until a reply states it. The reply is composed from that record rather than from anything the agent remembered to mention, so it cannot be skipped by wording. Because the record belongs to the agent rather than to one turn, an instruction sent by a turn that then dies is reported on the next reply instead of vanishing with it.
-- **A bounded capability surface.** The controller runs against an enforced manifest of exactly 28 Hanoon capabilities. Denials are decided before any effect, and a stale executor fence or a stale approval is denied rather than retried.
+- **A bounded capability surface.** The controller runs against an enforced manifest of exactly 34 Hanoon capabilities. Denials are decided before any effect, and a stale executor fence or a stale approval is denied rather than retried.
 - **Owner boundaries reach the phone.** A hidden-controller question or BB permission prompt is fetched from BB by exact identity, shown in Telegram, and answered by tap or plain reply. Approvals offer exactly *Allow once* and *Deny*; there is no session-wide grant on the hidden controller path. Your tap commits durably before BB is told, survives a restart, and is retried only for that exact resolution.
 - **One logical reply, recoverable at-least-once transport.** The answer is one durable outbox obligation. Server-directed backoffs, transient failures known not to have sent, and uncertain brand-new sends remain on the same logical outbox row for bounded scheduler retries; an uncertain retry may duplicate the Telegram message, while edits retry against their stored message id. If uncertainty exhausts the retry budget, that same row becomes a vetted delivery-warning obligation with a fresh retry budget instead of disappearing silently. Enqueuing or attempting is never recorded as delivered.
 
@@ -97,7 +99,7 @@ The shipped rollout is conservative: adaptive recipes default to `shadow`, where
 
 ## Bundled agent skills
 
-The plugin bundles 23 skills locally across five manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, and each root retains its own provenance and licence. Agents receive only the verified profile below.
+The plugin bundles 26 skills locally across five manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, and each root retains its own provenance and licence. Agents receive only the verified profile below.
 
 | Verified context | Selected skill ids |
 | --- | --- |
@@ -221,10 +223,10 @@ bb plugin types --check .
 Type checking resolves `@bb/plugin-sdk` through `types/bb-plugin-sdk.d.ts`, which `bb plugin types` regenerates from your installed BB. Building needs only the `bb` CLI.
 
 > [!NOTE]
-> The test suite additionally imports `@bb/plugin-sdk/testing` at runtime. BB does not publish that package to a registry, so `npm test` — and therefore `npm run check`, which runs typecheck, tests, and build together — only works where the package is installed. Type checking and building work from a clean clone.
+> The test suite additionally imports `@bb/plugin-sdk/testing` at runtime. BB does not publish that package to a registry, so `npm test`, and therefore `npm run check`, only works where the package is installed. `npm run check` runs typecheck, tests, the plugin build, artifact verification, and the credential-broker TypeScript build. Type checking and building work from a clean clone.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change boundaries, documentation checks, and pull-request evidence.
 
 ## Project status
 
-Version `0.1.0`, installed directly from a checkout. No package registry, release channel, or open-source license is claimed. Before publishing the repository as open source, the maintainer must add a license that states the intended reuse terms.
+Version `0.1.0`, installed directly from a checkout. There is no package registry or release channel. The repository is licensed under the [MIT License](LICENSE).

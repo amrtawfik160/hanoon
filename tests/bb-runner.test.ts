@@ -153,6 +153,20 @@ function runnerFixture(options: {
   return { calls, runner: new BbRunner(sdk) };
 }
 
+/** The same fixture, with a project that has a specification on file. */
+function briefedRunnerFixture(briefing: string) {
+  const base = runnerFixture();
+  const seen: string[] = [];
+  const runner = new BbRunner(
+    (base.runner as unknown as { sdk: BbPluginApi["sdk"] }).sdk,
+    (projectId) => {
+      seen.push(projectId);
+      return briefing;
+    },
+  );
+  return { calls: base.calls, runner, seen };
+}
+
 function attempt(id: string) {
   return { id, handoffPath: null as string | null, handoffSha256: null as string | null };
 }
@@ -412,4 +426,29 @@ it.each([
   await expect(runner.stopWorker(worker)).rejects.toThrow(/starting|active|stopping|evidence|BB thread/i);
 
   expect(calls.stops).toHaveLength(0);
+});
+
+it("carries the specification briefing into the stages that build against it", async () => {
+  const briefing = "You are building against a filed specification.\n## Product spec (this project)\nBilling";
+  const { calls, runner, seen } = briefedRunnerFixture(briefing);
+
+  await runner.spawnImplementation(selectedJob, attempt("attempt:job_1:1:spawn_implementation"));
+
+  const spawn = calls.spawns[0] as { input: Array<{ type: string; text?: string }> };
+  const text = spawn.input.find((entry) => entry.type === "text")?.text ?? "";
+  expect(text).toContain("Read the attached immutable work order");
+  expect(text).toContain(briefing);
+  // Asked for the job's own project, so one project's spec cannot reach another.
+  expect(seen).toEqual(["proj_1"]);
+});
+
+it("leaves a stage prompt untouched when the project has no specification", async () => {
+  const { calls, runner } = briefedRunnerFixture("");
+
+  await runner.spawnImplementation(selectedJob, attempt("attempt:job_1:2:spawn_implementation"));
+
+  const spawn = calls.spawns[0] as { input: Array<{ type: string; text?: string }> };
+  const text = spawn.input.find((entry) => entry.type === "text")?.text ?? "";
+  expect(text).toContain("Read the attached immutable work order");
+  expect(text.endsWith("Do not commit, push, or open a pull request.")).toBe(true);
 });

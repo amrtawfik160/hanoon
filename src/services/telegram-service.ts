@@ -27,7 +27,9 @@ export type TelegramServiceDeps = {
     | "hasUnreleasedAdmissions"
   >;
   client: (token: string) => TelegramServiceClient;
-  ingress: { handleClaimed(update: TelegramUpdate, now: number): Promise<TelegramIngressOutcome> };
+  ingress: {
+    handleClaimed(update: TelegramUpdate, now: number, signal: AbortSignal): Promise<TelegramIngressOutcome>;
+  };
   getConfig: () =>
     | { ok: true; value: Pick<GlobalConfig, "botToken"> }
     | { ok: false; message: string };
@@ -168,7 +170,11 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
       const claim = deps.store.beginTelegramUpdate(update.update_id, deps.clock.now());
       if (claim === "processed") continue;
       try {
-        const outcome = await deps.ingress.handleClaimed(update, deps.clock.now());
+        const outcome = await deps.ingress.handleClaimed(update, deps.clock.now(), serviceSignal);
+        // Shutdown may cancel a long voice download or transcription. Leave
+        // that claim recoverable instead of acknowledging an owner message
+        // that produced neither a turn nor a notice.
+        if (serviceSignal.aborted) return;
         // An answer already settled this claim in the same commit as the answer
         // itself; completing it again would only fail on a claim it no longer holds.
         if (!outcome.updateSettled) {

@@ -8,6 +8,13 @@ import type { TelegramAgentStore } from "../storage/store";
 const SCAN_INTERVAL_MS = 5 * 60_000;
 const MAX_CANDIDATES_SCANNED = 50;
 
+function legacyContinuationKey(job: {
+  blockedReason: string | null;
+  resumeState: string | null;
+}): string {
+  return `${job.blockedReason ?? "-"}:${job.resumeState ?? "-"}`;
+}
+
 export type JobContinuationDependencies = {
   store: Pick<
     TelegramAgentStore,
@@ -71,14 +78,17 @@ export class JobContinuationService {
       // Attempts only count when they were spent on *this* block. A job that
       // cleared one wall and stopped at a later one starts its ladder over.
       const key = continuationKey(job);
-      const attempts = candidate.key === key ? candidate.attempts : 0;
+      const legacyKey = legacyContinuationKey(job);
+      const sameLegacyWall = candidate.key === legacyKey;
+      const attempts = candidate.key === key || sameLegacyWall ? candidate.attempts : 0;
+      const recordKey = sameLegacyWall ? legacyKey : key;
       const decision = planJobContinuation({ job, attempts });
       if (decision.action === "hold") continue;
       if (decision.action === "escalate") {
         worked = this.escalate(candidate.job, decision.reason, now) || worked;
         continue;
       }
-      worked = this.resume(candidate.job, decision.event, key, now) || worked;
+      worked = this.resume(candidate.job, decision.event, recordKey, now) || worked;
     }
     return worked;
   }

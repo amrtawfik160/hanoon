@@ -105,9 +105,24 @@ export class ApprovalService {
     now = this.clock(),
     identity?: ApprovalIdentity,
   ): ApprovalAcceptResult {
+    return this.acceptByNonceHash(hashSecret(nonceValue), expectedJobVersion, effect, now, identity);
+  }
+
+  /**
+   * The same acceptance for a caller that holds the stored hash rather than the
+   * nonce. The nonce lives only in a Telegram button, so approving a merge the
+   * owner asked for in words has to start from what the store already has.
+   */
+  public acceptByNonceHash(
+    nonceHash: string,
+    expectedJobVersion: number,
+    effect: JobEffect,
+    now = this.clock(),
+    identity?: ApprovalIdentity,
+  ): ApprovalAcceptResult {
     assertNow(now);
     return this.store.acceptApprovalAndEnqueueMerge({
-      nonceHash: hashSecret(nonceValue),
+      nonceHash,
       expectedJobVersion,
       effect,
       now,

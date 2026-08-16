@@ -69,8 +69,10 @@ import { renderJobFinishNote } from "../telegram/finish-note";
 import {
   adjustedConfidence,
   decayedConfidence,
+  cosineSimilarity,
   ftsQuery,
   memoryScore,
+  semanticRanks,
   subjectsContradict,
   MEMORY_DEMOTION,
   MEMORY_REINFORCEMENT,
@@ -102,6 +104,7 @@ import { isUnsafeProviderText } from "../controller/credential-policy";
 import {
   MAX_OWNER_REPLY_CHARS,
   THREAD_ASK_REDACTED,
+  THREAD_ASK_EMPTY,
   composeOwnerReply,
   normalizeThreadAsk,
   normalizeThreadName,
@@ -164,6 +167,14 @@ import {
   type SettleModelRouteTrialInput,
   type SkillReceiptProjection,
 } from "./capability-repository";
+import {
+  ReferenceRepository,
+  type ReferenceDocumentRecord,
+  type ReferencePassageRecord,
+  type ReferenceSectionChange,
+  type SaveReferenceDocumentInput,
+  type SaveReferenceDocumentResult,
+} from "./reference-repository";
 import {
   ControllerEvidenceRepository,
   type AcceptedControllerFinalization,
@@ -352,6 +363,16 @@ export type StoredOutbox = OutboxInput & {
 };
 
 export type ApprovalIdentity = { userId: string; chatId: string };
+/** A question embedded by a named model, for comparing like with like. */
+export type MemoryQueryVector = Readonly<{ model: string; vector: Float32Array }>;
+
+export type MemoryEmbeddingInput = Readonly<{
+  memoryId: string;
+  model: string;
+  vector: Float32Array;
+  now: number;
+}>;
+
 export type ApprovalRecord = {
   jobId: string;
   headSha: string;
@@ -1170,6 +1191,9 @@ type ThreadInteractionRow = {
   answer_json: string | null;
   asked_at: number;
   answered_at: number | null;
+  audience: "owner" | "controller";
+  controller_key: string | null;
+  controller_turn_id: string | null;
 };
 export type ThreadInteractionAnswer =
   | { ok: true; interactionId: string; threadId: string; title: string; label: string }
@@ -1266,6 +1290,13 @@ export class IdempotencyConflictError extends Error {
   public constructor(sourceUpdateId: number) {
     super(`Telegram update ${sourceUpdateId} was replayed with different job input`);
     this.name = "IdempotencyConflictError";
+  }
+}
+
+export class AttemptPersistenceConflictError extends Error {
+  public constructor(attemptId: string, detail: string) {
+    super(`Attempt ${attemptId} could not be persisted: ${detail}`);
+    this.name = "AttemptPersistenceConflictError";
   }
 }
 
@@ -2810,6 +2841,16 @@ export function migrateControllerInteractionStorage(
 }
 
 export interface TelegramAgentStore {
+  saveReferenceDocument(input: SaveReferenceDocumentInput): SaveReferenceDocumentResult;
+  listReferenceDocuments(projectId: string | null): readonly ReferenceDocumentRecord[];
+  searchReferencePassages(input: {
+    query: string;
+    projectId: string | null;
+    limit?: number;
+  }): readonly ReferencePassageRecord[];
+  getReferencePassage(id: string, projectId: string | null): ReferencePassageRecord | null;
+  listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[];
+  deleteReferenceDocument(id: string): boolean;
   createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile;
   appendCapabilityReceipt(input: AppendCapabilityReceiptInput): CapabilityReceipt;
   appendCapabilityTerminalOutcome(input: AppendCapabilityTerminalInput): boolean;
@@ -3091,6 +3132,7 @@ export interface TelegramAgentStore {
     parentThreadId?: string | null;
   }): boolean;
   isControllerOwnedThread(parentThreadId: string | null): boolean;
+  hasPendingThreadInteractionForThread(threadId: string): boolean;
   answerThreadInteraction(input: {
     token: string;
     userId: string;
@@ -3273,6 +3315,9 @@ export interface TelegramAgentStore {
     now: number;
   }): boolean;
   listPausedProjectAdmissions(): { projectId: string; reason: string; pausedAt: number }[];
+  clearProjectAdmissionPauseAsAgent(
+    input: { projectId: string; now: number },
+  ): { outcome: "cleared" } | { outcome: "refused"; reason: string };
   clearProjectAdmissionPause(input: { projectId?: string; now: number }): number;
   listSystemMonitors(): MonitorRecord[];
   cancelSystemMonitors(now: number): number;
@@ -3353,6 +3398,7 @@ export interface TelegramAgentStore {
     limit: number;
     now: number;
     turnId?: string;
+    queryVector?: MemoryQueryVector;
   }): MemoryRecord[];
   curateMemories(input: { now: number }): { decayed: number; tombstoned: number };
   listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[];
@@ -3649,7 +3695,16 @@ export interface TelegramAgentStore {
     ownerChatId?: string | null;
     jobVersion?: number | null;
   }): void;
+  saveMemoryEmbedding(input: MemoryEmbeddingInput): void;
+  listMemoriesNeedingEmbedding(model: string, limit: number): { id: string; subject: string; body: string }[];
   getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null;
+  /** The same approval, found by the job it belongs to rather than by nonce. */
+  findLiveApprovalForJob(
+    jobId: string,
+    now: number,
+  ): { nonceHash: string; record: ApprovalRecord } | null;
+  /** All distinct jobs with a currently usable merge approval. */
+  listLiveMergeApprovals(now: number): readonly { nonceHash: string; record: ApprovalRecord }[];
   getApproval(nonceHash: string): ApprovalState | null;
   consumeApproval(input: {
     nonceHash: string;
@@ -4382,6 +4437,14 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
 
 /** Shown when a message arrives mid-turn and is folded into the running reply. */
 const CONTROLLER_STEER_FOLDED_TEXT = "Got that, and I'm working it into the answer I'm already writing.";
+/** Frozen so the stored payload and the duplicate check compare byte for byte. */
+const FOLDED_ANNOUNCEMENT_PAYLOAD = Object.freeze({
+  text: CONTROLLER_STEER_FOLDED_TEXT,
+  disable_web_page_preview: true,
+});
+function foldedAnnouncementJson(): string {
+  return JSON.stringify(FOLDED_ANNOUNCEMENT_PAYLOAD);
+}
 
 /**
  * The system turn that hands a spawned thread's block to the controller.
@@ -4760,6 +4823,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly controllerInteractionRepository: ControllerInteractionRepository;
   private readonly credentialAccessRepository: CredentialAccessRepository;
   private readonly stageExecutionRepository: StageExecutionRepository;
+  private readonly referenceRepository: ReferenceRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -4774,6 +4838,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.controllerEvidenceRepository = new ControllerEvidenceRepository(db, clock);
     this.credentialAccessRepository = new CredentialAccessRepository(db);
     this.stageExecutionRepository = new StageExecutionRepository(db);
+    this.referenceRepository = new ReferenceRepository(db);
   }
 
   public reconcileCredentialHealth(input: CredentialHealthReconcileInput): CredentialHealthReconcileResult {
@@ -4833,6 +4898,34 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getCredentialHealth(installationId: string): CredentialHealthRecord | null {
     return this.credentialAccessRepository.getCredentialHealth(installationId);
+  }
+
+  public saveReferenceDocument(input: SaveReferenceDocumentInput): SaveReferenceDocumentResult {
+    return this.referenceRepository.saveReferenceDocument(input);
+  }
+
+  public listReferenceDocuments(projectId: string | null): readonly ReferenceDocumentRecord[] {
+    return this.referenceRepository.listReferenceDocuments(projectId);
+  }
+
+  public searchReferencePassages(input: {
+    query: string;
+    projectId: string | null;
+    limit?: number;
+  }): readonly ReferencePassageRecord[] {
+    return this.referenceRepository.searchReferencePassages(input);
+  }
+
+  public getReferencePassage(id: string, projectId: string | null): ReferencePassageRecord | null {
+    return this.referenceRepository.getReferencePassage(id, projectId);
+  }
+
+  public listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[] {
+    return this.referenceRepository.listReferenceChanges(documentId, version);
+  }
+
+  public deleteReferenceDocument(id: string): boolean {
+    return this.referenceRepository.deleteReferenceDocument(id);
   }
 
   public createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile {
@@ -5520,8 +5613,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * sends. The substance is captured here rather than reconstructed later,
    * because this is when the controller knows why it is asking.
    *
-   * An ask that cannot be safely repeated is still recorded, with its text
-   * withheld: the owner learns that his authority was used either way.
+   * An ask that cannot be safely repeated is still recorded with redacted text;
+   * an empty ask is recorded as having no instruction. The owner learns how
+   * their authority was used without unsafe provider text being repeated.
    */
   public recordControllerThreadAsk(input: {
     controllerKey: string;
@@ -5544,7 +5638,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       input.turnId,
       input.threadId,
       input.threadName === null ? null : normalizeThreadName(input.threadName),
-      repeatable ? normalized : THREAD_ASK_REDACTED,
+      normalized.length === 0 ? THREAD_ASK_EMPTY : repeatable ? normalized : THREAD_ASK_REDACTED,
       input.now,
     );
   }
@@ -5590,6 +5684,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            ORDER BY id ASC LIMIT ?
         )`,
     ).run(now, controllerKey, count);
+    this.db.prepare(
+      `DELETE FROM controller_thread_asks
+        WHERE controller_key = ? AND reported_at IS NOT NULL
+          AND id NOT IN (
+            SELECT id FROM controller_thread_asks
+             WHERE controller_key = ? AND reported_at IS NOT NULL
+             ORDER BY id DESC LIMIT 256
+          )`,
+    ).run(controllerKey, controllerKey);
   }
 
   public completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
@@ -7257,7 +7360,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       chatId: controller.telegram_chat_id,
       payload: {
         ...formattedMessage(rendered.text),
-        ...( "reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
+        ...("reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
         disable_web_page_preview: true,
       },
     }, now);
@@ -7428,13 +7531,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     // The answer itself arrives folded into the reply already being written, so
     // without this the owner's message drew no bubble at all and reads in
     // Telegram exactly like being ignored.
+    //
+    // Once, though. Two messages sent seconds apart both fold into the same
+    // running answer, and keying this by the waiting turn gave each its own
+    // row: the owner got the identical sentence twice, which reads like a
+    // stutter rather than an acknowledgement. One undelivered acknowledgement
+    // already says everything a second would.
+    const announcementPending = this.db.prepare(
+      `SELECT 1 FROM outbox
+        WHERE chat_id = ? AND status IN ('pending', 'leased', 'failed')
+          AND payload_json = ? LIMIT 1`,
+    ).get(row.telegramChatId, foldedAnnouncementJson()) !== undefined;
+    if (announcementPending) return;
     persistControllerOutbox(this.db, {
       logicalKey: controllerReplyLogicalKey(input.waitingTurnId, null),
       chatId: row.telegramChatId,
-      payload: {
-        text: CONTROLLER_STEER_FOLDED_TEXT,
-        disable_web_page_preview: true,
-      },
+      payload: FOLDED_ANNOUNCEMENT_PAYLOAD,
     }, input.now);
   }
 
@@ -7658,8 +7770,43 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public isControllerOwnedThread(parentThreadId: string | null): boolean {
     if (parentThreadId === null) return false;
     return this.db.prepare(
-      "SELECT 1 FROM controller_threads WHERE bb_thread_id = ? AND state = 'active'",
+      "SELECT 1 FROM controller_threads WHERE bb_thread_id = ?",
     ).get(parentThreadId) !== undefined;
+  }
+
+  public hasPendingThreadInteractionForThread(threadId: string): boolean {
+    assertControllerIdentifier(threadId, "threadId");
+    return this.db.prepare(
+      "SELECT 1 FROM thread_interactions WHERE thread_id = ? AND state = 'pending' LIMIT 1",
+    ).get(threadId) !== undefined;
+  }
+
+  private activeControllerForParentThread(parentThreadId: string | null): {
+    controllerKey: string;
+    telegramUserId: string;
+    telegramChatId: string;
+  } | null {
+    if (parentThreadId === null) return null;
+    const row = this.db.prepare(
+      `SELECT controller.controller_key, controller.telegram_user_id, controller.telegram_chat_id
+         FROM controller_threads AS controller
+         JOIN owners AS owner
+           ON owner.singleton = 1 AND owner.revoked_at IS NULL
+          AND owner.telegram_user_id = controller.telegram_user_id
+          AND owner.telegram_chat_id = controller.telegram_chat_id
+        WHERE controller.bb_thread_id = ? AND controller.state = 'active'`,
+    ).get(parentThreadId) as {
+      controller_key: string;
+      telegram_user_id: string;
+      telegram_chat_id: string;
+    } | undefined;
+    return row
+      ? {
+          controllerKey: row.controller_key,
+          telegramUserId: row.telegram_user_id,
+          telegramChatId: row.telegram_chat_id,
+        }
+      : null;
   }
 
   public recordThreadInteraction(input: {
@@ -7676,20 +7823,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerText(input.title, "thread title");
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): boolean => {
-      const known = this.db.prepare("SELECT 1 FROM thread_interactions WHERE interaction_id = ?")
-        .get(input.interactionId);
-      if (known) return false;
+      const known = this.db.prepare("SELECT * FROM thread_interactions WHERE interaction_id = ?")
+        .get(input.interactionId) as ThreadInteractionRow | undefined;
+      if (known) return this.retryControllerThreadInteraction(known, input);
       // The routing decision is taken here rather than by the caller, so a
       // future caller cannot put a tappable menu on the owner's phone for a
       // thread the controller started by forgetting to ask.
+      const controller = this.activeControllerForParentThread(input.parentThreadId ?? null);
       const route = routeThreadInteraction({
-        threadOwnedByController: this.isControllerOwnedThread(input.parentThreadId ?? null),
+        threadOwnedByController: controller !== null,
         interaction: input.interaction,
       });
       this.db.prepare(
         `INSERT INTO thread_interactions
-           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at, audience)
-         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)`,
+           (interaction_id, thread_id, title, kind, payload_json, state, answer_json,
+            asked_at, answered_at, audience, controller_key, controller_turn_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?, ?, NULL)`,
       ).run(
         input.interactionId,
         input.threadId,
@@ -7698,9 +7847,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         JSON.stringify(input.interaction),
         input.now,
         route.audience,
+        route.audience === "controller" ? controller?.controllerKey ?? null : null,
       );
       if (route.audience === "controller") {
-        this.askControllerToAnswerThread({ ...input, now: input.now }, route.decisions);
+        if (controller) {
+          this.askControllerToAnswerThread(
+            { ...input, now: input.now },
+            route.decisions,
+            controller,
+          );
+        }
         return true;
       }
       const rendered = renderThreadInteraction(input.title, input.interaction);
@@ -7715,6 +7871,76 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }, input.now);
       return true;
     }).immediate();
+  }
+
+  private retryControllerThreadInteraction(
+    row: ThreadInteractionRow,
+    input: {
+      interactionId: string;
+      threadId: string;
+      title: string;
+      interaction: ThreadInteraction;
+      chatId: string;
+      now: number;
+      parentThreadId?: string | null;
+    },
+  ): boolean {
+    if (row.state !== "pending" || row.audience !== "controller") return false;
+    const controller = this.activeControllerForParentThread(input.parentThreadId ?? null);
+    const interaction = JSON.parse(row.payload_json) as ThreadInteraction;
+    const route = routeThreadInteraction({
+      threadOwnedByController: controller !== null,
+      interaction,
+    });
+    if (
+      controller === null ||
+      route.audience === "owner" ||
+      row.controller_key !== null && row.controller_key !== controller.controllerKey
+    ) {
+      this.routePendingThreadInteractionToOwner(row, interaction, input.chatId, input.now);
+      return true;
+    }
+    if (row.controller_turn_id !== null) {
+      const linked = this.db.prepare("SELECT state FROM controller_turns WHERE id = ?")
+        .get(row.controller_turn_id) as { state: ControllerTurnState } | undefined;
+      if (linked && ["queued", "dispatching", "submitted"].includes(linked.state)) return false;
+    }
+    if (row.controller_key === null) {
+      this.db.prepare(
+        "UPDATE thread_interactions SET controller_key = ? WHERE interaction_id = ? AND state = 'pending'",
+      ).run(controller.controllerKey, row.interaction_id);
+    }
+    return this.askControllerToAnswerThread({
+      interactionId: row.interaction_id,
+      threadId: row.thread_id,
+      title: row.title,
+      interaction,
+      now: input.now,
+    }, route.decisions, controller) !== null;
+  }
+
+  private routePendingThreadInteractionToOwner(
+    row: ThreadInteractionRow,
+    interaction: ThreadInteraction,
+    chatId: string,
+    now: number,
+  ): void {
+    const updated = this.db.prepare(
+      `UPDATE thread_interactions
+          SET audience = 'owner', controller_key = NULL, controller_turn_id = NULL
+        WHERE interaction_id = ? AND state = 'pending' AND audience = 'controller'`,
+    ).run(row.interaction_id);
+    if (updated.changes !== 1) return;
+    const rendered = renderThreadInteraction(row.title, interaction);
+    persistControllerOutbox(this.db, {
+      logicalKey: `thread-interaction:${row.interaction_id}`,
+      chatId,
+      payload: {
+        ...formattedMessage(rendered.text),
+        ...("reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
+        disable_web_page_preview: true,
+      },
+    }, now);
   }
 
   /**
@@ -7733,27 +7959,34 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       now: number;
     },
     decisions: readonly ThreadApprovalDecision[],
-  ): void {
-    const controller = this.db.prepare(
-      "SELECT controller_key, telegram_user_id, telegram_chat_id FROM controller_threads WHERE state = 'active' LIMIT 1",
-    ).get() as { controller_key: string; telegram_user_id: string; telegram_chat_id: string } | undefined;
-    if (!controller) return;
+    controller: {
+      controllerKey: string;
+      telegramUserId: string;
+      telegramChatId: string;
+    },
+  ): string | null {
     const latestUpdate = this.db.prepare(
       "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
     ).get() as { update_id: number };
     try {
-      this.enqueueControllerTurn({
-        controllerKey: controller.controller_key,
-        telegramUserId: controller.telegram_user_id,
-        telegramChatId: controller.telegram_chat_id,
+      const turn = this.enqueueControllerTurn({
+        controllerKey: controller.controllerKey,
+        telegramUserId: controller.telegramUserId,
+        telegramChatId: controller.telegramChatId,
         updateId: Math.max(latestUpdate.update_id + 1, THREAD_FOLLOW_UP_UPDATE_ID_BASE),
         inputText: describeThreadBlockForController(input.threadId, input.title, input.interaction, decisions),
         origin: "system",
         now: input.now,
       });
+      this.db.prepare(
+        `UPDATE thread_interactions SET controller_key = ?, controller_turn_id = ?
+          WHERE interaction_id = ? AND state = 'pending' AND audience = 'controller'`,
+      ).run(controller.controllerKey, turn.id, input.interactionId);
+      return turn.id;
     } catch {
-      // A turn that cannot be queued leaves the interaction pending, so the
-      // next sweep offers it again rather than the thread being forgotten.
+      // The exact controller remains on the pending row. A later observation
+      // retries it, or routes it to the owner if that controller is no longer current.
+      return null;
     }
   }
 
@@ -9120,6 +9353,42 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }));
   }
 
+  /**
+   * Lets the agent lift a brake once per cause, without asking.
+   *
+   * The brake stops a failure loop, and the owner having to type `/resume` was
+   * the loop's real cost: work sat for hours waiting on a message. So the agent
+   * clears it — but only for a cause it has not already cleared. A brake that
+   * re-trips on the same fingerprint is the loop the brake exists to catch, and
+   * that one goes to the owner rather than round again.
+   */
+  public clearProjectAdmissionPauseAsAgent(
+    input: { projectId: string; now: number },
+  ): { outcome: "cleared" } | { outcome: "refused"; reason: string } {
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): { outcome: "cleared" } | { outcome: "refused"; reason: string } => {
+      const live = this.db.prepare(
+        "SELECT fingerprint FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
+      ).get(input.projectId) as { fingerprint: string } | undefined;
+      if (!live) return { outcome: "refused", reason: "That project is not paused." };
+      const clearedBefore = this.db.prepare(
+        `SELECT 1 FROM project_admission_pauses
+          WHERE project_id = ? AND fingerprint = ? AND cleared_at IS NOT NULL LIMIT 1`,
+      ).get(input.projectId, live.fingerprint) !== undefined;
+      if (clearedBefore) {
+        return {
+          outcome: "refused",
+          reason: "The same failure has already been cleared once and came back, so this one is the owner's call.",
+        };
+      }
+      this.db.prepare(
+        "UPDATE project_admission_pauses SET cleared_at = ? WHERE project_id = ? AND cleared_at IS NULL",
+      ).run(input.now, input.projectId);
+      return { outcome: "cleared" };
+    }).immediate();
+  }
+
   /** Clears one project, or every paused project when no id is given. */
   public clearProjectAdmissionPause(input: { projectId?: string; now: number }): number {
     assertNonNegativeInteger(input.now, "now");
@@ -9609,6 +9878,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     /** Links what was recalled to the turn it informed, so the answer's
      *  reception can later reinforce or demote exactly those memories. */
     turnId?: string;
+    /** The question as a vector, when a provider produced one. */
+    queryVector?: MemoryQueryVector;
   }): MemoryRecord[] {
     assertMemoryScope(input.scope);
     if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
@@ -9642,19 +9913,33 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         matched.forEach((row, index) => lexicalRanks.set(row.id, index));
       }
 
+      // Vectors are read only for the model doing the asking. A corpus embedded
+      // by another model is left alone rather than compared, because a
+      // cross-model similarity is a number that looks like a score and is not
+      // one. No provider, or no matching vectors, and this stays empty and the
+      // ranking is exactly what it was before embeddings existed.
+      const semantic = input.queryVector && input.queryVector.model.length > 0
+        ? this.semanticRanksForQuery(live, input.queryVector)
+        : new Map<string, number>();
+
       const ranked = live
         .map((row) => ({
           row,
           score: memoryScore({
             lexicalRank: lexicalRanks.get(row.id) ?? null,
+            semanticRank: semantic.get(row.id) ?? (semantic.size > 0 ? null : undefined),
             importance: row.importance,
             confidence: row.confidence,
             ageMs: input.now - row.created_at,
           }),
         }))
-        // An explicit question only surfaces memories that actually mention it;
-        // an empty question falls back to the strongest standing memories.
-        .filter((candidate) => match === null || lexicalRanks.has(candidate.row.id))
+        // An explicit question surfaces what mentions it *or what means it*:
+        // before the semantic signal existed this dropped every memory the
+        // words missed, which is precisely the "I phrased it differently and it
+        // was not found" complaint. An empty question still falls back to the
+        // strongest standing memories.
+        .filter((candidate) =>
+          match === null || lexicalRanks.has(candidate.row.id) || semantic.has(candidate.row.id))
         .sort((left, right) => right.score - left.score || right.row.created_at - left.row.created_at)
         .slice(0, input.limit);
 
@@ -11411,16 +11696,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           input.now,
         );
       const stored = this.getAttempt(input.id);
-      // The insert is ignored when another row already holds this ordinal, so a
-      // missing row means a conflicting attempt owns it. That can never be
-      // resolved by trying again: report it as the permanent conflict it is
-      // rather than as a transient failure worth twenty more minutes of retries.
-      if (!stored) throw new IdempotencyConflictError(ordinal);
+      // INSERT OR IGNORE can reject any database constraint, not only the
+      // ordinal indexes. Surface that accurately while still classifying it as
+      // permanent: identical retries cannot repair persisted input.
+      if (!stored) {
+        throw new AttemptPersistenceConflictError(
+          input.id,
+          `a database constraint rejected ${input.kind} ordinal ${ordinal}`,
+        );
+      }
       if (
         stored.jobId !== input.jobId || stored.kind !== input.kind || stored.ordinal !== ordinal ||
         stored.reviewLens !== reviewLens || stored.reviewStage !== reviewStage
       ) {
-        throw new IdempotencyConflictError(ordinal);
+        throw new AttemptPersistenceConflictError(input.id, "the existing row has different identity fields");
       }
       return stored;
     });
@@ -13059,6 +13348,116 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.validateApprovalInput(input);
     const create = this.db.transaction(() => this.createApprovalInTransaction(input));
     create();
+  }
+
+  /**
+   * The live approval waiting on one job, found by job rather than by nonce.
+   *
+   * The nonce itself only ever exists inside a Telegram button, which is what
+   * stops the agent approving its own work. When the owner instead types "merge
+   * it", the approval still has to be the one already issued for that job, so
+   * it is looked up here and validated by `getUsableApproval` — every currency,
+   * expiry, and revocation check runs exactly as it does for a button tap.
+   */
+  public findLiveApprovalForJob(
+    jobId: string,
+    now: number,
+  ): { nonceHash: string; record: ApprovalRecord } | null {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    assertNonNegativeInteger(now, "now");
+    const row = this.db.prepare(
+      `SELECT nonce_hash FROM approvals
+        WHERE job_id = ? AND consumed_at IS NULL AND expires_at > ?
+        ORDER BY expires_at DESC LIMIT 1`,
+    ).get(jobId, now) as { nonce_hash: string } | undefined;
+    if (!row) return null;
+    const record = this.getUsableApproval(row.nonce_hash, now);
+    return record ? { nonceHash: row.nonce_hash, record } : null;
+  }
+
+  public listLiveMergeApprovals(
+    now: number,
+  ): readonly { nonceHash: string; record: ApprovalRecord }[] {
+    assertNonNegativeInteger(now, "now");
+    const rows = this.db.prepare(
+      `SELECT nonce_hash FROM approvals
+        WHERE consumed_at IS NULL AND expires_at > ?
+        ORDER BY expires_at DESC, nonce_hash`,
+    ).all(now) as Array<{ nonce_hash: string }>;
+    const seen = new Set<string>();
+    const live: Array<{ nonceHash: string; record: ApprovalRecord }> = [];
+    for (const row of rows) {
+      const record = this.getUsableApproval(row.nonce_hash, now);
+      if (!record || seen.has(record.jobId)) continue;
+      seen.add(record.jobId);
+      live.push({ nonceHash: row.nonce_hash, record });
+    }
+    return live;
+  }
+
+  /**
+   * Similarity ranks for one question, over the vectors written by the same
+   * model that embedded it. Rows embedded by a different model are skipped
+   * rather than compared: their similarity would be meaningless, and silently
+   * meaningless is how the reference system lost its vector recall.
+   */
+  private semanticRanksForQuery(
+    live: readonly MemoryRow[],
+    query: MemoryQueryVector,
+  ): Map<string, number> {
+    const ids = live.map((row) => row.id);
+    if (ids.length === 0) return new Map();
+    const rows = this.db.prepare(
+      `SELECT memory_id, vector FROM memory_embeddings
+        WHERE model = ? AND dimensions = ? AND memory_id IN (${ids.map(() => "?").join(", ")})`,
+    ).all(query.model, query.vector.length, ...ids) as { memory_id: string; vector: Buffer }[];
+    return semanticRanks(rows.map((row) => ({
+      id: row.memory_id,
+      similarity: cosineSimilarity(
+        query.vector,
+        new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4),
+      ),
+    })));
+  }
+
+  /** Stores one memory's vector, replacing any earlier one for that memory. */
+  public saveMemoryEmbedding(input: MemoryEmbeddingInput): void {
+    if (!input.memoryId) throw new TypeError("memoryId must not be empty");
+    if (!input.model || input.model.length > 128) throw new TypeError("model must be a bounded non-empty string");
+    if (input.vector.length === 0 || input.vector.length > 8_192) throw new TypeError("vector length is out of range");
+    assertNonNegativeInteger(input.now, "now");
+    this.db.prepare(
+      `INSERT INTO memory_embeddings (memory_id, model, dimensions, vector, embedded_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(memory_id) DO UPDATE SET
+         model = excluded.model, dimensions = excluded.dimensions,
+         vector = excluded.vector, embedded_at = excluded.embedded_at`,
+    ).run(
+      input.memoryId,
+      input.model,
+      input.vector.length,
+      Buffer.from(input.vector.buffer, input.vector.byteOffset, input.vector.byteLength),
+      input.now,
+    );
+  }
+
+  /**
+   * Live memories with no vector from this model yet. Drives the backfill that
+   * heals a corpus after a provider arrives, returns, or changes.
+   */
+  public listMemoriesNeedingEmbedding(model: string, limit: number): { id: string; subject: string; body: string }[] {
+    if (!model) throw new TypeError("model must not be empty");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new TypeError("limit must be between 1 and 500");
+    return this.db.prepare(
+      `SELECT memories.id AS id, memories.subject AS subject, memories.body AS body
+         FROM memories
+         LEFT JOIN memory_embeddings ON memory_embeddings.memory_id = memories.id
+              AND memory_embeddings.model = ?
+        WHERE memories.forgotten_at IS NULL AND memories.superseded_by IS NULL
+          AND memory_embeddings.memory_id IS NULL
+        ORDER BY memories.created_at DESC
+        LIMIT ?`,
+    ).all(model, limit) as { id: string; subject: string; body: string }[];
   }
 
   public getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null {

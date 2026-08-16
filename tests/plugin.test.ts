@@ -227,10 +227,14 @@ it("re-arms a completed worker reconcile from a live BB thread change", async ()
   });
 });
 
-it("registers both background services and all enqueue-only thread lifecycle handlers", async () => {
+it("registers ingress, execution, and memory backfill services with all enqueue-only thread handlers", async () => {
   const { bb, harness } = await loadPlugin();
   const serviceNames = harness.registrations.services.map((service) => service.name);
-  expect(serviceNames).toEqual(expect.arrayContaining(["telegram-ingress", "job-executor"]));
+  expect(serviceNames).toEqual(expect.arrayContaining([
+    "telegram-ingress",
+    "job-executor",
+    "memory-embeddings",
+  ]));
   expect(harness.registrations.threadEventHandlers).toMatchObject({
     "thread.created": 1,
     "thread.active": 1,

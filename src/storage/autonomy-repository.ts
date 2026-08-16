@@ -824,7 +824,7 @@ export class AutonomyRepository {
   }
 
   /**
-   * Blocked jobs the continuation sweep has not yet handed to the owner, oldest
+   * Stopped jobs the continuation sweep has not yet handed to the owner, oldest
    * first so a job never starves behind a newer one that keeps re-blocking.
    * Jobs already escalated are excluded: the owner has them, and re-deciding
    * every sweep would message them about the same wall repeatedly.
@@ -836,7 +836,7 @@ export class AutonomyRepository {
         `SELECT job.*, ladder.auto_continue_count, ladder.auto_continue_key
            FROM (${JOB_SELECT}) AS job
            JOIN jobs AS ladder ON ladder.id = job.id
-          WHERE job.state = 'blocked' AND ladder.auto_continue_escalated_at IS NULL
+          WHERE job.state IN ('blocked', 'failed') AND ladder.auto_continue_escalated_at IS NULL
           ORDER BY job.updated_at ASC, job.id ASC
           LIMIT ?`,
       )

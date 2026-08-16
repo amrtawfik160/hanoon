@@ -1,6 +1,13 @@
 import Database from "better-sqlite3";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, it } from "vitest";
-import { inspectRuntimeIdentity, type RuntimeIdentity } from "../src/services/runtime-identity";
+import {
+  captureRuntimeIdentity,
+  inspectRuntimeIdentity,
+  type RuntimeIdentity,
+} from "../src/services/runtime-identity";
 
 function identity(overrides: Partial<RuntimeIdentity> = {}): RuntimeIdentity {
   return {
@@ -68,4 +75,21 @@ it("fails closed when the migration identity table is unavailable", () => {
   });
   expect(report.problems).toContain("database migration identity unavailable");
   db.close();
+});
+
+it("treats a symlinked source tree as an unavailable fingerprint instead of crashing activation", () => {
+  const root = mkdtempSync(join(tmpdir(), "telegram-runtime-identity-"));
+  const source = join(root, "real-src");
+  try {
+    writeFileSync(join(root, "package.json"), "{}", "utf8");
+    symlinkSync(root, source, "dir");
+    symlinkSync(source, join(root, "src"), "dir");
+
+    expect(() => captureRuntimeIdentity(root, 1_000)).not.toThrow();
+    const captured = captureRuntimeIdentity(root, 1_000);
+    expect(captured.loadedFingerprint).toBeNull();
+    expect(captured.currentFingerprint()).toBeNull();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -73,6 +73,27 @@ const telegramVideoNoteSchema = z
   })
   .passthrough();
 
+const telegramVoiceSchema = z
+  .object({
+    file_id: z.string().min(1).max(1_024),
+    file_unique_id: z.string().min(1).max(1_024),
+    duration: z.number().int().nonnegative(),
+    mime_type: z.string().max(255).optional(),
+    file_size: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
+const telegramAudioSchema = z
+  .object({
+    file_id: z.string().min(1).max(1_024),
+    file_unique_id: z.string().min(1).max(1_024),
+    duration: z.number().int().nonnegative(),
+    file_name: z.string().max(1_024).optional(),
+    mime_type: z.string().max(255).optional(),
+    file_size: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
 export const telegramMessageSchema = z
   .object({
     message_id: z.number().int(),
@@ -85,6 +106,8 @@ export const telegramMessageSchema = z
     animation: telegramAnimationSchema.optional(),
     video: telegramVideoSchema.optional(),
     video_note: telegramVideoNoteSchema.optional(),
+    voice: telegramVoiceSchema.optional(),
+    audio: telegramAudioSchema.optional(),
     reply_to_message: z
       .object({ message_id: z.number().int() })
       .passthrough()

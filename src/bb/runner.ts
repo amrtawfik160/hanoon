@@ -156,11 +156,27 @@ function spawnRequest(request: Record<string, unknown>): SpawnArgs {
   return request as unknown as SpawnArgs;
 }
 
+/**
+ * What a stage should be told about the specifications governing its project.
+ * Injected rather than read here so the runner keeps its one dependency, and so
+ * a project with nothing filed costs nothing.
+ */
+export type ReferenceBriefingProvider = (projectId: string) => string;
+
 export class BbRunner {
   /** Environments already proven to share history with a given trunk. */
   private readonly ancestryChecked = new Set<string>();
 
-  public constructor(public readonly sdk: BbSdk) {}
+  public constructor(
+    public readonly sdk: BbSdk,
+    private readonly referenceBriefing: ReferenceBriefingProvider = () => "",
+  ) {}
+
+  /** The stage instruction, with the specification briefing when there is one. */
+  private withReferenceBriefing(instruction: string, project: string): string {
+    const briefing = this.referenceBriefing(project);
+    return briefing.length === 0 ? instruction : `${instruction}\n\n${briefing}`;
+  }
 
   /**
    * Refuses to go on when the worktree was cut from a history that can never
@@ -244,9 +260,12 @@ export class BbRunner {
       input: [
         {
           type: "text",
-          text: adopted
-            ? buildAdoptedPrInstruction(artifact, job.adoptedHeadSha!)
-            : buildImplementationInstruction(artifact),
+          text: this.withReferenceBriefing(
+            adopted
+              ? buildAdoptedPrInstruction(artifact, job.adoptedHeadSha!)
+              : buildImplementationInstruction(artifact),
+            project,
+          ),
           mentions: [],
         },
         uploaded,
@@ -293,7 +312,7 @@ export class BbRunner {
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role: "planner" }),
       visibility: "hidden",
       input: [
-        { type: "text", text: prompt, mentions: [] },
+        { type: "text", text: this.withReferenceBriefing(prompt, project), mentions: [] },
         uploadedWorkOrder,
         ...(uploadedCritique ? [uploadedCritique] : []),
       ],
@@ -333,7 +352,10 @@ export class BbRunner {
       input: [
         {
           type: "text",
-          text: "Read the attached immutable work order, plan, and critique contract. Assess the plan independently and return strict JSON only. Request revision only for missing outcome, unbounded scope, missing verification, or an unimplementable plan. Do not request revision for polish or for commit, push, or pull-request steps. Do not inspect the planner conversation or edit files.",
+          text: this.withReferenceBriefing(
+            "Read the attached immutable work order, plan, and critique contract. Assess the plan independently and return strict JSON only. Request revision only for missing outcome, unbounded scope, missing verification, or an unimplementable plan. Do not request revision for polish or for commit, push, or pull-request steps. Do not inspect the planner conversation or edit files.",
+            project,
+          ),
           mentions: [],
         },
         uploadedWorkOrder,
@@ -376,7 +398,10 @@ export class BbRunner {
       input: [
         {
           type: "text",
-          text: `Read the attached immutable work order ${workOrder.filename}, plan ${plan.filename}, and the gitignored PROGRESS.md scratchpad. Keep PROGRESS.md current after meaningful milestones so a replacement worker can continue. Follow both attachments, implement the requested change, verify it, and report the required outcome. Do not commit, push, or open a pull request.`,
+          text: this.withReferenceBriefing(
+            `Read the attached immutable work order ${workOrder.filename}, plan ${plan.filename}, and the gitignored PROGRESS.md scratchpad. Keep PROGRESS.md current after meaningful milestones so a replacement worker can continue. Follow both attachments, implement the requested change, verify it, and report the required outcome. Do not commit, push, or open a pull request.`,
+            project,
+          ),
           mentions: [],
         },
         uploadedWorkOrder,
@@ -447,7 +472,10 @@ export class BbRunner {
       input: [
         {
           type: "text",
-          text: "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes.",
+          text: this.withReferenceBriefing(
+            "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes.",
+            project,
+          ),
           mentions: [],
         },
         uploadedWorkOrder,
@@ -506,7 +534,11 @@ export class BbRunner {
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role }),
       visibility: "hidden",
       input: [
-        { type: "text", text: buildReviewInstruction(artifact), mentions: [] },
+        {
+          type: "text",
+          text: this.withReferenceBriefing(buildReviewInstruction(artifact), project),
+          mentions: [],
+        },
         uploaded,
       ],
       environment: { type: "reuse", environmentId },

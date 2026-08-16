@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { DEFAULT_MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "./autonomy/models";
+import { MAX_CONTROLLER_IDENTITY } from "./controller/instructions";
 import type { CredentialBrokerConfigResult } from "./credentials/config";
 import {
   EXTRACTION_MODELS,
@@ -42,6 +43,10 @@ const globalConfigSchema = z.object({
   controllerPermissionMode: z.enum(CONTROLLER_PERMISSION_MODES)
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode),
   extractionModel: z.enum(EXTRACTION_MODELS).default("inherit"),
+  // Empty means the shipped character. Bounded here as well as at composition
+  // because a setting is the one input to the standing block that no paired
+  // owner has to approve.
+  controllerIdentity: z.string().max(MAX_CONTROLLER_IDENTITY).default(""),
   systemUpkeep: z.enum(["enabled", "disabled"]).default("enabled"),
   // Separate from systemUpkeep on purpose: reclaiming a temporary directory and
   // deleting a branch are not the same risk, so arming one must not arm the other.
@@ -75,6 +80,7 @@ export function parseGlobalConfig(values: {
   controllerServiceTier?: string;
   controllerPermissionMode?: string;
   extractionModel?: string;
+  controllerIdentity?: string;
   systemUpkeep?: string;
   workspaceReclaim?: boolean | string;
   selfDiagnosisEnabled?: boolean | string;

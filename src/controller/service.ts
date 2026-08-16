@@ -298,6 +298,13 @@ export class LunaControllerService {
 
     if (await this.deliverAnsweredInteraction(turn, controller, fence, signal)) return true;
 
+    // A capability the agent asked for mid-turn only reaches it by relaunching
+    // the turn against the expanded profile. Checked before finalization,
+    // because a turn that finalizes first strands the expansion: the relaunch
+    // can only act on a submitted turn, so the agent would ask again next turn,
+    // and the next, never once receiving the tools it asked for.
+    if (this.relaunchForCapabilityContinuation(turn, controller, fence)) return true;
+
     const acceptedBeforeProgress = this.dependencies.store.getAcceptedControllerFinalization(turn.id);
     if (acceptedBeforeProgress) {
       if (this.hasPendingInteraction(controller.controllerKey, turn.id)) return true;
@@ -644,6 +651,36 @@ export class LunaControllerService {
       turnId: turn.id,
     })) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     return true;
+  }
+
+  /**
+   * Requeues a turn whose agent asked for more capability than its profile
+   * carried, so it runs again with the tools it asked for.
+   *
+   * The expansion writes a new profile and marks the turn `requested`; this is
+   * the step that actually hands it over. Without it the request is inert — the
+   * owner watches the agent say "I have asked for the permission" turn after
+   * turn while nothing ever changes, which is what happened for four turns
+   * before this existed.
+   *
+   * The store does the deciding: it relaunches only a submitted turn holding
+   * exactly one unresolved expansion against its current profile, and retires
+   * the BB thread so the next run starts against the new capability set.
+   */
+  private relaunchForCapabilityContinuation(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+  ): boolean {
+    if (turn.capabilityContinuationState !== "requested" || controller.threadId === null) return false;
+    const relaunched = this.dependencies.store.prepareControllerCapabilityContinuation({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: controller.controllerKey,
+      expectedThreadId: controller.threadId,
+    });
+    if (relaunched) this.dependencies.warn?.(`Controller turn ${turn.id} relaunched for requested capability`);
+    return relaunched;
   }
 
   private async reconcileUnknownSend(

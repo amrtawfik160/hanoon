@@ -15,6 +15,13 @@ export type AutonomyHealth = {
   pipelineActive: number;
   controlActive: number;
   oldestQueueAgeMs: number | null;
+  /**
+   * Projects the failure brake is holding. Without this a jam looks
+   * inexplicable from outside: free slots, nothing held, no job admitted. That
+   * is exactly what the brake produces, and exactly how it read for five and a
+   * half hours while the agent hunted for a fault that was not there.
+   */
+  pausedProjects: { projectId: string; reason: string; pausedAtMs: number }[];
   heldResources: {
     total: number;
     project: number;
@@ -81,6 +88,14 @@ export function buildHealthReport(
   const controller = db.prepare(
     "SELECT controller_key, bb_thread_id, state FROM controller_threads LIMIT 1",
   ).get() as { controller_key: string; bb_thread_id: string | null; state: string } | undefined;
+  const pausedProjects = (db.prepare(
+    `SELECT project_id, reason, paused_at FROM project_admission_pauses
+      WHERE cleared_at IS NULL ORDER BY paused_at`,
+  ).all() as { project_id: string; reason: string; paused_at: number }[]).map((row) => ({
+    projectId: row.project_id,
+    reason: row.reason,
+    pausedAtMs: row.paused_at,
+  }));
   const admissions = db.prepare(
     `SELECT
        SUM(CASE WHEN state = 'admitted' THEN 1 ELSE 0 END) AS admitted,
@@ -170,6 +185,7 @@ export function buildHealthReport(
         "SELECT MIN(queued_at) AS oldest FROM job_admissions WHERE state = 'queued'",
         now,
       ),
+      pausedProjects,
       heldResources: {
         total: heldResources.total,
         project: heldResources.project ?? 0,
@@ -203,6 +219,15 @@ export function buildHealthReport(
   if (report.delivery.deadOutbox > 0) report.problems.push(`${report.delivery.deadOutbox} message(s) could not be delivered`);
   if (report.telegram.failedUpdates > 0) report.problems.push(`${report.telegram.failedUpdates} Telegram update(s) failed`);
   if (report.monitors.failed > 0) report.problems.push(`${report.monitors.failed} monitor(s) failed`);
+  // Stated even when nothing else is wrong: a paused project is the whole
+  // explanation for queued work that never starts, and only the owner can lift
+  // it, so the way out belongs in the same line.
+  if (report.autonomy.pausedProjects.length > 0) {
+    report.problems.push(
+      `${report.autonomy.pausedProjects.length} project(s) paused by the failure brake and taking no work; `
+      + "the owner clears one with /resume <name>",
+    );
+  }
   if (!report.memory.searchable) report.problems.push("memory search is unavailable");
   if (report.database.integrity !== "ok") report.problems.push(`database integrity: ${report.database.integrity}`);
   if (report.activation && !report.activation.ok) report.problems.push(...report.activation.problems);

@@ -34,6 +34,7 @@ import {
 import { shellSingleQuote } from "../bb/terminal-command";
 import type { TerminalObservation } from "../bb/terminal-command";
 import { projectTerminalLiveness, workerRegistrationGeneration } from "./worker-liveness";
+import { isMergeInstruction } from "../controller/merge-instruction";
 
 const POST_MERGE_HEAD_COMMAND = (number: number): string =>
   `git ls-remote --exit-code origin refs/pull/${String(number)}/head`;
@@ -256,6 +257,20 @@ function assertNow(now: number): void {
   if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
 }
 
+function instructionNamesJob(text: string, jobId: string): boolean {
+  const escaped = jobId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^A-Za-z0-9_-])${escaped}(?:$|[^A-Za-z0-9_-])`, "u").test(text);
+}
+
+function instructionHasExplicitJobObject(text: string): boolean {
+  const match = /\b(?:merge|land)\s+(?:the\s+job\s+)?([A-Za-z0-9][A-Za-z0-9_-]{2,255})[.!]?$/iu.exec(text.trim());
+  if (!match) return false;
+  return !new Set([
+    "it", "this", "that", "them", "pr", "pull", "change", "changes",
+    "fix", "job", "work", "branch", "thing",
+  ]).has(match[1].toLowerCase());
+}
+
 function safeFailureReason(_value: unknown, fallback: string): string {
   return fallback;
 }
@@ -414,6 +429,67 @@ export class MergeHandler {
       });
       return { outcome: rejected.outcome === "accepted" ? "accepted" : "rejected" };
     }
+  }
+
+  /**
+   * Accepts the merge the owner just asked for in words rather than by tapping.
+   *
+   * The button and this path end in the same place: the same approval row, the
+   * same version fence, the same single `merge_pr` effect, the same audit. What
+   * differs is only how the owner said yes. Nothing here weakens a check: this
+   * method validates the instruction, paired-owner identity, exact named job or
+   * unambiguous sole live approval, version fence, and outstanding approval.
+   * An agent calling it with stale, mismatched, or ambiguous text gets a
+   * refusal rather than a merge.
+   */
+  public approveMergeFromOwnerInstruction(input: {
+    jobId: string;
+    userId: string;
+    chatId: string;
+    instructionText: string;
+  }): MergeCallbackResult {
+    const now = this.clock();
+    assertNow(now);
+    if (!input.jobId) throw new TypeError("jobId is required");
+    if (!isMergeInstruction(input.instructionText)) return { outcome: "rejected" };
+
+    const owner = this.options.store.getOwner();
+    if (!owner || owner.userId !== input.userId || owner.chatId !== input.chatId) {
+      return { outcome: "rejected" };
+    }
+    const liveApprovals = this.options.store.listLiveMergeApprovals(now);
+    const live = liveApprovals.find((candidate) => candidate.record.jobId === input.jobId) ?? null;
+    if (!live) return { outcome: "rejected" };
+    const namedJobs = liveApprovals.filter((candidate) =>
+      instructionNamesJob(input.instructionText, candidate.record.jobId));
+    const requestedNamed = instructionNamesJob(input.instructionText, input.jobId);
+    if (requestedNamed) {
+      if (namedJobs.some((candidate) => candidate.record.jobId !== input.jobId)) {
+        return { outcome: "rejected" };
+      }
+    } else {
+      if (
+        namedJobs.length > 0 ||
+        instructionHasExplicitJobObject(input.instructionText) ||
+        liveApprovals.length !== 1
+      ) return { outcome: "rejected" };
+    }
+    const job = this.options.store.getJob(live.record.jobId);
+    if (!job) return { outcome: "rejected" };
+
+    const accepted = this.approvals.acceptByNonceHash(
+      live.nonceHash,
+      job.version,
+      {
+        idempotencyKey: `${job.id}:${job.version + 1}:merge_pr`,
+        jobId: job.id,
+        kind: "merge_pr",
+        payload: { headSha: live.record.headSha },
+      },
+      now,
+      { userId: input.userId, chatId: input.chatId },
+    );
+    return { outcome: accepted.ok ? "accepted" : "rejected" };
   }
 
   public async handleMergeCallback(input: ApprovalCallbackInput): Promise<MergeCallbackResult> {

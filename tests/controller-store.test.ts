@@ -200,7 +200,10 @@ function expectDuplicateGenerationRepair(
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(64);
+  expect(ALL_MIGRATIONS).toHaveLength(68);
+  expect(ALL_MIGRATIONS[65]).toContain("CREATE TABLE reference_documents");
+  expect(ALL_MIGRATIONS[66]).toContain("thread_interactions ADD COLUMN controller_key");
+  expect(ALL_MIGRATIONS[67]).toContain("CREATE TABLE reference_section_digests");
   expect(ALL_MIGRATIONS[60]).toContain("CREATE TABLE stage_executions");
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
@@ -1919,6 +1922,123 @@ it("hands a spawned thread's question to the controller and leaves the owner alo
   expect(queued?.inputText).toMatch(/blocked and waiting on you/i);
   expect(queued?.inputText).toMatch(/Retry in place/);
   expect(queued?.inputText).toMatch(/telegram_agent_answer_thread/);
+});
+
+it("retries a controller-routed question whose first follow-up enqueue failed", () => {
+  const { bb, store } = fixture();
+  submittedTurn(store, "thr_controller_parent_retry");
+  const db = bb.storage.database();
+  db.exec(`
+    CREATE TRIGGER fail_first_thread_follow_up
+    BEFORE INSERT ON controller_turns
+    WHEN NEW.origin = 'system'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected controller follow-up failure');
+    END
+  `);
+  const input = {
+    interactionId: "pint_retry",
+    threadId: "thr_spawned_retry",
+    title: "Choose the retry",
+    interaction: {
+      kind: "unsupported" as const,
+      interactionId: "pint_retry",
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent_retry",
+  };
+
+  expect(store.recordThreadInteraction(input)).toBe(true);
+  expect(store.getQueuedControllerTurn("owner-7-controller")).toBeNull();
+  db.exec("DROP TRIGGER fail_first_thread_follow_up");
+
+  expect(store.recordThreadInteraction({ ...input, now: 5_001 })).toBe(true);
+  expect(store.getQueuedControllerTurn("owner-7-controller")).toMatchObject({ origin: "system" });
+  expect(db.prepare(
+    "SELECT controller_key, controller_turn_id FROM thread_interactions WHERE interaction_id = ?",
+  ).get(input.interactionId)).toEqual({
+    controller_key: "owner-7-controller",
+    controller_turn_id: expect.stringMatching(/^controller-turn-/),
+  });
+});
+
+it("routes a spawned thread's question back to its exact parent controller", () => {
+  const { bb, store } = fixture();
+  submittedTurn(store, "thr_controller_parent_a");
+  const db = bb.storage.database();
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, bb_thread_id,
+       state, created_at, updated_at
+     ) VALUES ('owner-7-controller-b', '7', '7', 'thr_controller_parent_b', 'active', 4_000, 4_000)`,
+  ).run();
+
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_parent_b",
+    threadId: "thr_spawned_b",
+    title: "Question from B",
+    interaction: { kind: "unsupported", interactionId: "pint_parent_b" },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent_b",
+  })).toBe(true);
+
+  expect(db.prepare(
+    "SELECT controller_key FROM controller_turns WHERE origin = 'system' ORDER BY created_at DESC LIMIT 1",
+  ).get()).toEqual({ controller_key: "owner-7-controller-b" });
+  expect(db.prepare(
+    "SELECT controller_key FROM thread_interactions WHERE interaction_id = 'pint_parent_b'",
+  ).get()).toEqual({ controller_key: "owner-7-controller-b" });
+});
+
+it("does not enqueue a duplicate follow-up while the linked controller turn is live", () => {
+  const { bb, store } = fixture();
+  submittedTurn(store, "thr_controller_parent_live");
+  const input = {
+    interactionId: "pint_live",
+    threadId: "thr_spawned_live",
+    title: "One live question",
+    interaction: { kind: "unsupported" as const, interactionId: "pint_live" },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent_live",
+  };
+  expect(store.recordThreadInteraction(input)).toBe(true);
+  const db = bb.storage.database();
+  const before = db.prepare("SELECT count(*) AS n FROM controller_turns WHERE origin = 'system'").get();
+
+  expect(store.recordThreadInteraction({ ...input, now: 5_001 })).toBe(false);
+  expect(db.prepare("SELECT count(*) AS n FROM controller_turns WHERE origin = 'system'").get()).toEqual(before);
+});
+
+it("moves a pending controller question to the owner after its controller is revoked", () => {
+  const { bb, store } = fixture();
+  submittedTurn(store, "thr_controller_parent_revoked");
+  const input = {
+    interactionId: "pint_revoked",
+    threadId: "thr_spawned_revoked",
+    title: "Question that must not be stranded",
+    interaction: { kind: "unsupported" as const, interactionId: "pint_revoked" },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent_revoked",
+  };
+  expect(store.recordThreadInteraction(input)).toBe(true);
+  expect(store.revokeOwner(5_001)).toBe(true);
+  store.createPairingCode(hashSecret("pair-after-revoke"), 5_002, 10_000);
+  expect(store.pairOwnerWithCode(hashSecret("pair-after-revoke"), "7", "7", 5_003)).toEqual({ ok: true });
+
+  expect(store.hasPendingThreadInteractionForThread(input.threadId)).toBe(true);
+  expect(store.recordThreadInteraction({ ...input, now: 5_004 })).toBe(true);
+  expect(store.getOutbox(`thread-interaction:${input.interactionId}`)).not.toBeNull();
+  expect(bb.storage.database().prepare(
+    "SELECT audience, controller_key, controller_turn_id FROM thread_interactions WHERE interaction_id = ?",
+  ).get(input.interactionId)).toEqual({
+    audience: "owner",
+    controller_key: null,
+    controller_turn_id: null,
+  });
 });
 
 it("still asks the owner about a thread they opened themselves", () => {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { CONTROLLER_TOOL_NAMES, type ControllerToolName } from "../controller/capability-policy";
 import {
   descriptorDigest,
   validateCapabilityCatalog,
@@ -15,36 +16,26 @@ export const TASK_RECIPES = [
   "adopted-pr",
 ] as const;
 
-export const CONTROLLER_DOMAIN_TOOL_IDS = [
-  "telegram_agent_list_projects",
-  "telegram_agent_start_job",
-  "telegram_agent_job_status",
-  "telegram_agent_retry_job",
-  "telegram_agent_cancel_job",
-  "telegram_agent_list_threads",
-  "telegram_agent_thread_status",
-  "telegram_agent_read_thread",
-  "telegram_agent_create_thread",
-  "telegram_agent_send_to_thread",
-  "telegram_agent_request_thread_operation",
-  "telegram_agent_remember",
-  "telegram_agent_recall",
-  "telegram_agent_forget",
-  "telegram_agent_watch",
-  "telegram_agent_list_watches",
-  "telegram_agent_cancel_watch",
-  "telegram_agent_health",
-  "telegram_agent_delegate",
-  "telegram_agent_scorecard",
-  "telegram_agent_set_working_style",
-  "telegram_agent_steer_job",
-  "telegram_agent_adopt_pr",
-] as const;
-
 export const CONTROLLER_PROTOCOL_TOOL_IDS = [
   "telegram_agent_turn_evidence",
   "telegram_agent_respond",
 ] as const;
+
+/**
+ * Every controller tool that is not a protocol tool, derived rather than
+ * listed.
+ *
+ * It used to be a second hand-maintained copy of the allowlist, and it drifted:
+ * seven tools were declared, implemented, documented, and tested while missing
+ * here, so no descriptor existed, no bundle could carry them, and they reached
+ * no session at all. Deriving it means adding a tool to the allowlist cannot
+ * silently fail to produce one.
+ */
+export const CONTROLLER_DOMAIN_TOOL_IDS = CONTROLLER_TOOL_NAMES
+  .filter((name): name is Exclude<ControllerToolName, (typeof CONTROLLER_PROTOCOL_TOOL_IDS)[number]> =>
+    !(CONTROLLER_PROTOCOL_TOOL_IDS as readonly string[]).includes(name));
+
+
 
 export const CONTROLLER_METADATA_TOOL_IDS = [
   "telegram_agent_capabilities",
@@ -413,16 +404,31 @@ export const CONTROLLER_BUNDLE_TOOLS = {
     "telegram_agent_list_projects", "telegram_agent_job_status", "telegram_agent_list_threads",
     "telegram_agent_thread_status", "telegram_agent_read_thread", "telegram_agent_health",
     "telegram_agent_scorecard",
+    // Showing the owner a picture belongs to any turn, not to a subject the
+    // opening message happened to name.
+    "telegram_agent_send_media",
   ],
   "job-control": [
     "telegram_agent_start_job", "telegram_agent_retry_job", "telegram_agent_cancel_job",
     "telegram_agent_steer_job", "telegram_agent_adopt_pr",
+    // Landing work the owner asked to land, and lifting the brake that is
+    // stopping it. Both are job control, and both were unreachable until now.
+    "telegram_agent_approve_merge", "telegram_agent_resume_project",
   ],
-  "thread-control": ["telegram_agent_create_thread", "telegram_agent_send_to_thread"],
-  memory: ["telegram_agent_remember", "telegram_agent_recall", "telegram_agent_forget"],
+  "thread-control": [
+    "telegram_agent_create_thread", "telegram_agent_send_to_thread",
+    "telegram_agent_answer_thread",
+  ],
+  memory: [
+    "telegram_agent_remember", "telegram_agent_recall", "telegram_agent_forget",
+    // A specification the owner handed over is theirs to recall the same way a
+    // standing preference is, so it travels with the memory bundle.
+    "telegram_agent_add_reference", "telegram_agent_search_reference",
+  ],
   monitoring: ["telegram_agent_watch", "telegram_agent_list_watches", "telegram_agent_cancel_watch"],
   operations: [
     "telegram_agent_request_thread_operation", "telegram_agent_delegate", "telegram_agent_set_working_style",
+    "telegram_agent_access_list", "telegram_agent_access_status", "telegram_agent_access_verify",
   ],
   metadata: CONTROLLER_METADATA_TOOL_IDS,
 } as const;

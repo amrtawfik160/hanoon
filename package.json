@@ -31,7 +31,7 @@
     "test:watch": "vitest",
     "eval:controller": "node scripts/eval-controller-outcomes.mjs",
     "eval:answers": "node scripts/eval-controller-answers.mjs",
-    "check": "npm run typecheck && npm test && npm run build",
+    "check": "npm run typecheck && npm test && npm run build && npm run broker:build",
     "verify:artifact": "node scripts/verify-built-artifact.mjs",
     "broker:build": "npm run build --workspace @hanoon/credential-broker",
     "broker:pack": "npm run broker:build && npm pack --workspace @hanoon/credential-broker",
@@ -53,5 +53,8 @@
     "typescript": "^5.7.0",
     "vitest": "^3.2.0",
     "zod": "^4.3.6"
+  },
+  "optionalDependencies": {
+    "@xenova/transformers": "^2.17.2"
   }
 }

@@ -36,6 +36,8 @@ function fileSystemErrorCode(error: unknown): string | null {
   return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : null;
 }
 
+class RuntimeIdentityUnavailableError extends Error {}
+
 function collectFiles(root: string, relativePath: string, identityFiles: string[]): void {
   const absolutePath = join(root, relativePath);
   let fileStats: ReturnType<typeof lstatSync>;
@@ -45,7 +47,9 @@ function collectFiles(root: string, relativePath: string, identityFiles: string[
     if (fileSystemErrorCode(error) === "ENOENT") return;
     throw error;
   }
-  if (fileStats.isSymbolicLink()) throw new Error(`symbolic link in runtime identity: ${relativePath}`);
+  if (fileStats.isSymbolicLink()) {
+    throw new RuntimeIdentityUnavailableError(`symbolic link in runtime identity: ${relativePath}`);
+  }
   if (fileStats.isDirectory()) {
     for (const entry of readdirSync(absolutePath).sort()) {
       collectFiles(root, join(relativePath, entry), identityFiles);
@@ -71,7 +75,7 @@ function fingerprintPluginSource(sourceRoot: string): string | null {
     }
     return hash.digest("hex");
   } catch (error) {
-    if (fileSystemErrorCode(error) !== null) return null;
+    if (error instanceof RuntimeIdentityUnavailableError || fileSystemErrorCode(error) !== null) return null;
     throw error;
   }
 }
