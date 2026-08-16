@@ -200,7 +200,8 @@ function expectDuplicateGenerationRepair(
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(56);
+  expect(ALL_MIGRATIONS).toHaveLength(57);
+  expect(ALL_MIGRATIONS[56]).toContain("CREATE TABLE stage_executions");
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
   expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");

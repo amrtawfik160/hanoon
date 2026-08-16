@@ -307,7 +307,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     expect(uploads.map((upload) => upload.filename)).toEqual(["work-order.md", "critique.json"]);
   });
 
-  it("uses Luna Max for fresh plan and critique spawns, then hands only files to the builder", async () => {
+  it("uses the strong tier for fresh plan and critique spawns, then hands only files to the builder", async () => {
     const { runner, spawns, uploads } = pipelineSdk();
     const planAttempt = { id: "stage:job_1:1:spawn_plan", role: "PLAN" as const, ordinal: 1 };
     const planThread = await runner.spawnPlanner(plannedJob, planAttempt);
@@ -328,9 +328,9 @@ describe("fresh planner, critic, and builder conversations", () => {
     for (const spawn of spawns.slice(0, 2)) {
       expect(spawn).toMatchObject({
         providerId: "codex",
-        model: "gpt-5.6-luna",
-        reasoningLevel: "max",
-        serviceTier: "fast",
+        model: "gpt-5.6-sol",
+        reasoningLevel: "xhigh",
+        serviceTier: "default",
         permissionMode: "auto",
       });
       expect(spawn).not.toHaveProperty("sourceThreadId");
@@ -380,7 +380,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     ]);
   });
 
-  it("spawns docs with Luna Max and a post-docs reviewer as a fresh conversation", async () => {
+  it("spawns docs on the cheap tier and a post-docs reviewer as a fresh conversation", async () => {
     const { runner, spawns, uploads } = pipelineSdk();
     const job = {
       ...plannedJob,
@@ -403,8 +403,8 @@ describe("fresh planner, critic, and builder conversations", () => {
       environment: { type: "reuse", environmentId: "env_plan" },
       providerId: "codex",
       model: "gpt-5.6-luna",
-      reasoningLevel: "max",
-      serviceTier: "fast",
+      reasoningLevel: "low",
+      serviceTier: "default",
       permissionMode: "auto",
       input: [
         { type: "text", text: expect.stringContaining("docs-guard") },

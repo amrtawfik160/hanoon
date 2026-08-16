@@ -111,6 +111,73 @@ it.each([["--help"], ["help"]])("prints actionable command help for %s", async (
   expect(result.stdout).toContain("capability status");
 });
 
+it("reports what every stage of one job ran on and what it consumed", async () => {
+  const { harness, store } = await loadPlugin();
+  store.createJob({ id: "job_spend", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+  store.recordStageExecution({
+    jobId: "job_spend",
+    attemptId: "stage:job_spend:1:spawn_docs",
+    stage: "docs",
+    attemptOrdinal: 2,
+    threadId: "thr_docs",
+    baseTier: "fast",
+    tier: "standard",
+    escalationSteps: 1,
+    source: "default",
+    providerId: "codex",
+    modelId: "gpt-5.6-terra",
+    reasoningLevel: "high",
+    serviceTier: "default",
+    now: 1_000,
+  });
+  store.settleStageExecution({
+    jobId: "job_spend",
+    attemptId: "stage:job_spend:1:spawn_docs",
+    stage: "docs",
+    outcome: "succeeded",
+    usage: {
+      inputTokens: 400,
+      cachedInputTokens: 100,
+      outputTokens: 200,
+      reasoningOutputTokens: 50,
+      totalTokens: 600,
+    },
+    now: 3_000,
+  });
+
+  const result = await harness.behavior.runCli(["job", "spend", "job_spend", "--json"]);
+
+  expect(result.exitCode).toBe(0);
+  expect(parseJson(result.stdout)).toMatchObject({
+    jobId: "job_spend",
+    attempts: 1,
+    escalatedAttempts: 1,
+    totalTokens: 600,
+    costMicroUsd: null,
+    durationMs: 2_000,
+    stages: [{
+      stage: "docs",
+      attempt: 2,
+      tier: "standard",
+      baseTier: "fast",
+      escalated: true,
+      model: "gpt-5.6-terra",
+      serviceTier: "default",
+      totalTokens: 600,
+      outcome: "succeeded",
+    }],
+  });
+});
+
+it("refuses a spend report for a job it does not have", async () => {
+  const { harness } = await loadPlugin();
+
+  const result = await harness.behavior.runCli(["job", "spend", "job_missing", "--json"]);
+
+  expect(result.exitCode).not.toBe(0);
+  expect(`${result.stdout}${result.stderr}`).toContain("Job was not found");
+});
+
 it("reports bounded capability rollout status without inventing live promotion evidence", async () => {
   const { harness, store } = await loadPlugin();
 

@@ -447,6 +447,54 @@ describe("leased effect execution", () => {
     expect(store.getJob(selected.id)).toMatchObject({ state: "creating_implementation" });
   });
 
+  it("records what the implementation stage was dispatched on, escalated by a repeated review cycle", async () => {
+    const { store, db } = storeFixture();
+    const selected = selectedJobForRecovery(store, db, "job_stage_ledger", "creating_implementation");
+    if (!selected) throw new Error("job missing");
+    // No exact model pin, so the stage table's tiered default applies and a
+    // repeated review cycle can escalate it.
+    db.prepare("UPDATE jobs SET review_cycle = 1, policy_json = ? WHERE id = ?").run(
+      JSON.stringify(policyFixture({ implementation: {} })),
+      selected.id,
+    );
+    const effect: JobEffect = {
+      idempotencyKey: `${selected.id}:2:spawn_implementation`,
+      jobId: selected.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, selected.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("spawn effect missing");
+
+    await new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => 1_002,
+      bb: { spawnImplementation: vi.fn(async () => ({ id: "thr_ledger", environmentId: "env_ledger" })) },
+    }).run(claimed);
+
+    expect(store.listStageExecutions(selected.id)).toMatchObject([{
+      stage: "implementation",
+      threadId: "thr_ledger",
+      baseTier: "standard",
+      tier: "strong",
+      escalationSteps: 1,
+      escalated: true,
+      providerId: "codex",
+      modelId: "gpt-5.6-sol",
+      reasoningLevel: "xhigh",
+      serviceTier: "default",
+      source: "default",
+      outcome: null,
+      startedAt: 1_002,
+    }]);
+  });
+
   it("durably escalates a new model route only after two equivalent provider failures", async () => {
     const { store, db } = storeFixture();
     const selected = selectedJobForRecovery(store, db, "job_model_escalation", "creating_implementation");

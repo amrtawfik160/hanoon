@@ -4,18 +4,14 @@ import type {
   GuardEnvelopeAssessment,
   GuardResultEnvelope,
 } from "../capabilities/guards";
+import {
+  executionProfileSchema,
+  stageExecutionPolicySchema,
+  type PipelineStage,
+} from "./stage-execution";
 
-export const executionProfileSchema = z
-  .object({
-    providerId: z.string().min(1).optional(),
-    model: z.string().min(1).optional(),
-    reasoningLevel: z
-      .enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"])
-      .optional(),
-    serviceTier: z.enum(["default", "fast"]).optional(),
-    permissionMode: z.enum(["accept-edits", "auto", "full"]).optional(),
-  })
-  .strict();
+export { executionProfileSchema };
+export type { ExecutionProfile } from "./stage-execution";
 
 export const policyCommandSchema = z
   .object({
@@ -75,6 +71,18 @@ export const projectPolicySchema = z
     baseBranch: z.string().min(1),
     implementation: executionProfileSchema,
     review: executionProfileSchema,
+    /**
+     * Per-worker-kind execution overrides. An absent entry takes the stage's
+     * declared default tier; `implementation` and `review` fall back to the two
+     * profiles above so stored policies keep working untouched.
+     *
+     * Model ids named here are checked against the pipeline catalog whenever a
+     * policy is parsed, so a model no provider offers fails at save and load
+     * rather than when a worker refuses to start. The two profiles above are
+     * deliberately not checked: they predate the catalog and policies already
+     * stored with them must keep running.
+     */
+    stageExecution: stageExecutionPolicySchema.optional(),
     validationCommands: z.array(policyCommandSchema).max(20),
     production: productionPolicySchema.optional(),
     regression: regressionPolicySchema.optional(),
@@ -101,7 +109,6 @@ export const projectPolicySchema = z
     }
   });
 
-export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
 export type PolicyCommand = z.infer<typeof policyCommandSchema>;
 export type ProductionPolicy = z.infer<typeof productionPolicySchema>;
 export type RegressionPolicy = z.infer<typeof regressionPolicySchema>;
@@ -197,7 +204,8 @@ export type JobState =
   | "cancelled"
   | "merged";
 
-export type WorkerKind = "plan" | "critique" | "implementation" | "review" | "validation" | "docs" | "merge" | "deploy" | "canary";
+/** One worker kind per pipeline stage, so every stage has its own model. */
+export type WorkerKind = PipelineStage;
 export type WorkerRecoveryClassification = "never_started" | "no_progress" | "missing" | "crash";
 export type WorkerResourceKind = "bb_thread" | "bb_terminal";
 export type WorkerLivenessState =

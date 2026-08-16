@@ -17,6 +17,7 @@ import {
   type OwnerMemoryImportInput,
   type TelegramAgentStore,
 } from "./storage/store";
+import { summariseStageSpend } from "./storage/stage-execution-repository";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { projectResourceWait } from "./storage/autonomy-repository";
 import {
@@ -170,6 +171,7 @@ Commands:
   project disable <project-id> [--json]
   job list [--limit <1-100>] [--json]
   job show <job-id> [--json]
+  job spend <job-id> [--json]
   job retry <job-id> [--json]
   job cancel <job-id> [--json]
   capability status [recipe] [--json]
@@ -935,6 +937,53 @@ function jobShow(
   return success(output, `${String(output.id)}\t${String(output.state)}\tversion=${String(output.version)}`, json);
 }
 
+/**
+ * What every stage of one job actually ran on, and what it consumed. Tiering is
+ * only worth tuning against observed numbers, so this reads the ledger rather
+ * than restating the policy that happened to be current.
+ */
+function jobSpend(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  json: boolean,
+): PluginCliResult {
+  const jobId = onePositional(parsed, "job spend");
+  if (!deps.store.getJob(jobId)) throw new CliOperationError("Job was not found");
+  const records = deps.store.listStageExecutions(jobId);
+  const summary = summariseStageSpend(records);
+  const stages = records.map((record) => ({
+    stage: record.stage,
+    attempt: record.attemptOrdinal,
+    tier: record.tier,
+    baseTier: record.baseTier,
+    escalated: record.escalated,
+    source: record.source,
+    providerId: record.providerId,
+    model: record.modelId,
+    reasoningLevel: record.reasoningLevel,
+    serviceTier: record.serviceTier,
+    totalTokens: record.usage?.totalTokens ?? null,
+    costMicroUsd: record.costMicroUsd,
+    durationMs: record.durationMs,
+    outcome: record.outcome,
+  }));
+  const lines = stages.map((stage) => [
+    stage.stage,
+    `attempt=${String(stage.attempt)}`,
+    `${stage.providerId}/${stage.model}/${stage.reasoningLevel}`,
+    `tier=${stage.tier}${stage.escalated ? ` (from ${stage.baseTier})` : ""}`,
+    `serviceTier=${stage.serviceTier}`,
+    `tokens=${stage.totalTokens === null ? "unmeasured" : String(stage.totalTokens)}`,
+    `cost=${stage.costMicroUsd === null ? "unpriced" : `${String(stage.costMicroUsd)}µUSD`}`,
+    `durationMs=${stage.durationMs === null ? "open" : String(stage.durationMs)}`,
+  ].join("\t"));
+  return success(
+    { jobId, ...summary, stages },
+    lines.length === 0 ? `No stage attempts recorded for ${jobId}` : lines.join("\n"),
+    json,
+  );
+}
+
 function jobRetry(
   deps: TelegramAgentCliDependencies,
   parsed: ParsedFlags,
@@ -1490,10 +1539,11 @@ async function runJob(
     const parsed = parseFlags(argv.slice(1), JOB_LIST_FLAGS);
     return jobList(deps, parsed, parsed.flags.has("json"));
   }
-  if (subcommand === "show" || subcommand === "retry" || subcommand === "cancel") {
+  if (subcommand === "show" || subcommand === "spend" || subcommand === "retry" || subcommand === "cancel") {
     const parsed = parseFlags(argv.slice(1), JOB_ID_FLAGS);
     const json = parsed.flags.has("json");
     if (subcommand === "show") return jobShow(deps, parsed, json);
+    if (subcommand === "spend") return jobSpend(deps, parsed, json);
     if (subcommand === "retry") return jobRetry(deps, parsed, json);
     return jobCancel(deps, parsed, json);
   }

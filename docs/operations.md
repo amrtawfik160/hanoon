@@ -95,7 +95,11 @@ bb telegram-agent job list
 bb telegram-agent job list --limit 10 --json
 bb telegram-agent job show <job-id>
 bb telegram-agent job show <job-id> --json
+bb telegram-agent job spend <job-id>
+bb telegram-agent job spend <job-id> --json
 ```
+
+`job spend` lists every stage attempt of one job with the provider, model, reasoning level, service tier, tier and any escalation, tokens, duration, and cost, so tiering can be tuned from observed numbers. Cost reads `unpriced` — a null `costMicroUsd` with `--json` — for models with no published rate entered in the catalog.
 
 `job list` returns at most 100 recent jobs; `--limit` accepts `1`–`100`. `job show` returns the bounded stored projection for exactly one job. Its safe projection includes admission state, queue sequence/age/release reason, held resource kind/key pairs, and merge-resource waits, but not raw prompts, secrets, claim owners, lease generations, or unbounded provider logs.
 

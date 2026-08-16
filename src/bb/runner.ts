@@ -23,6 +23,12 @@ import {
 } from "./prompts";
 import { TerminalCommandRunner } from "./terminal-command";
 import type { ModelRoute } from "../capabilities/models";
+import { jobStageExecution } from "../domain/stage-routing";
+import {
+  stageExecutionSpawnArgs,
+  type PipelineStage,
+  type StageTokenUsage,
+} from "../domain/stage-execution";
 
 type BbSdk = BbPluginApi["sdk"];
 type SpawnArgs = Parameters<BbSdk["threads"]["spawn"]>[0];
@@ -84,76 +90,45 @@ function projectId(job: Job, policy: ProjectPolicy): string {
   return job.projectId;
 }
 
-function executionArgs(policy: ProjectPolicy["implementation"]): Record<string, unknown> {
-  const args: Record<string, unknown> = {};
-  const sources: Record<string, "explicit"> = {};
-  for (const field of ["providerId", "model", "reasoningLevel", "serviceTier", "permissionMode"] as const) {
-    const value = policy[field];
-    if (value !== undefined) {
-      args[field] = value;
-      sources[field] = "explicit";
-    }
-  }
-  if (Object.keys(sources).length > 0) args.executionInputSources = sources;
-  return args;
-}
-
-function routeExecutionArgs(
-  route: ModelRoute,
-  permissionMode: ProjectPolicy["implementation"]["permissionMode"],
+/**
+ * The stage's execution tuple, resolved from the project's own per-stage table
+ * with the declared tiered defaults behind it. Pipeline workers pin their own
+ * tuple: retuning the conversational controller must never silently change how
+ * plans, critiques, reviews, and docs are produced.
+ */
+function stageExecutionArgs(
+  job: Job,
+  policy: ProjectPolicy,
+  stage: PipelineStage,
+  attemptOrdinal: number | undefined,
+  capabilityRoute?: ModelRoute,
 ): Record<string, unknown> {
-  return {
-    providerId: route.providerId,
-    model: route.modelId,
-    reasoningLevel: route.reasoning,
-    serviceTier: route.serviceTier,
-    ...(permissionMode === undefined ? {} : { permissionMode }),
-    executionInputSources: {
-      providerId: "explicit",
-      model: "explicit",
-      reasoningLevel: "explicit",
-      serviceTier: "explicit",
-      ...(permissionMode === undefined ? {} : { permissionMode: "explicit" }),
-    },
-  };
+  return stageExecutionSpawnArgs(jobStageExecution({ job, policy, stage, attemptOrdinal, capabilityRoute }));
 }
 
 function workerExecutionArgs(
   job: Job,
-  capability: CapabilityWorkOrderEnvelope | undefined,
-  policy: ProjectPolicy["implementation"],
+  attempt: BbAttempt,
+  policy: ProjectPolicy,
+  stage: Extract<PipelineStage, "implementation" | "review">,
 ): Record<string, unknown> {
-  if (job.routingMode !== "active") return executionArgs(policy);
+  if (job.routingMode !== "active") return stageExecutionArgs(job, policy, stage, attempt.ordinal);
+  const capability = attempt.capabilityProfile;
   if (!capability?.model) throw new TypeError("Active worker dispatch is missing its persisted model route");
-  return routeExecutionArgs(capability.model, policy.permissionMode);
+  return stageExecutionArgs(job, policy, stage, attempt.ordinal, capability.model);
 }
 
 function pipelineExecutionArgs(
   job: Job,
-  capability: CapabilityWorkOrderEnvelope | undefined,
+  attempt: PipelineThreadAttempt,
+  policy: ProjectPolicy,
+  stage: Extract<PipelineStage, "plan" | "critique" | "docs">,
 ): Record<string, unknown> {
-  if (job.routingMode !== "active") return LUNA_MAX_EXECUTION;
+  if (job.routingMode !== "active") return stageExecutionArgs(job, policy, stage, attempt.ordinal);
+  const capability = attempt.capabilityProfile;
   if (!capability?.model) throw new TypeError("Active pipeline dispatch is missing its persisted model route");
-  return routeExecutionArgs(capability.model, "auto");
+  return stageExecutionArgs(job, policy, stage, attempt.ordinal, capability.model);
 }
-
-// Pipeline workers pin their own execution tuple. Retuning the conversational
-// controller must never silently change how plans, critiques, and docs are
-// produced; a worker is bound by its work order and reviewed before any merge.
-const LUNA_MAX_EXECUTION = {
-  providerId: "codex",
-  model: "gpt-5.6-luna",
-  reasoningLevel: "max",
-  serviceTier: "fast",
-  permissionMode: "auto",
-  executionInputSources: {
-    providerId: "explicit",
-    model: "explicit",
-    reasoningLevel: "explicit",
-    serviceTier: "explicit",
-    permissionMode: "explicit",
-  },
-} as const;
 
 function recordHandoff(attempt: BbAttempt, artifact: HandoffArtifact, uploaded: { path: string }): void {
   attempt.handoffPath = uploaded.path;
@@ -259,7 +234,7 @@ export class BbRunner {
           baseBranch: { kind: "named", name: adopted ? job.adoptedBranch! : policy.baseBranch },
         },
       },
-      ...workerExecutionArgs(job, attempt.capabilityProfile, policy.implementation),
+      ...workerExecutionArgs(job, attempt, policy, "implementation"),
     });
     const thread = await this.sdk.threads.spawn(request);
     attempt.threadId = thread.id;
@@ -298,7 +273,7 @@ export class BbRunner {
         ...(uploadedCritique ? [uploadedCritique] : []),
       ],
       environment,
-      ...pipelineExecutionArgs(job, attempt.capabilityProfile),
+      ...pipelineExecutionArgs(job, attempt, policy, "plan"),
     }));
     attempt.threadId = thread.id;
     attempt.environmentId = thread.environmentId;
@@ -341,7 +316,7 @@ export class BbRunner {
         uploadedPacket,
       ],
       environment: { type: "reuse", environmentId },
-      ...pipelineExecutionArgs(job, attempt.capabilityProfile),
+      ...pipelineExecutionArgs(job, attempt, policy, "critique"),
     }));
     attempt.threadId = thread.id;
     attempt.environmentId = thread.environmentId ?? environmentId;
@@ -383,10 +358,45 @@ export class BbRunner {
         uploadedPlan,
       ],
       environment: { type: "reuse", environmentId },
-      ...workerExecutionArgs(job, attempt.capabilityProfile, policy.implementation),
+      ...workerExecutionArgs(job, attempt, policy, "implementation"),
     }));
     attempt.threadId = thread.id;
     return thread;
+  }
+
+  /**
+   * The tokens a worker thread actually consumed. BB reports a running total on
+   * `thread/tokenUsage/updated`, so the last such event is the thread's total.
+   * Returns null when the provider reported no usage at all, which is recorded
+   * as "not measured" rather than as zero.
+   */
+  public async readThreadUsage(threadId: string): Promise<StageTokenUsage | null> {
+    if (!threadId) throw new TypeError("threadId must not be empty");
+    let afterSeq = 0;
+    let usage: StageTokenUsage | null = null;
+    for (let page = 0; page < USAGE_EVENT_PAGES; page += 1) {
+      const rows = await this.sdk.threads.events.list({
+        threadId,
+        afterSeq: String(afterSeq),
+        limit: String(USAGE_EVENT_PAGE_LIMIT),
+      });
+      for (const row of rows) {
+        afterSeq = Math.max(afterSeq, row.seq);
+        if (row.type !== "thread/tokenUsage/updated") continue;
+        const total = row.data.tokenUsage.total;
+        if (!Number.isFinite(total.totalTokens)) continue;
+        if (usage !== null && total.totalTokens < usage.totalTokens) continue;
+        usage = {
+          inputTokens: nonNegative(total.inputTokens),
+          cachedInputTokens: nonNegative(total.cachedInputTokens),
+          outputTokens: nonNegative(total.outputTokens),
+          reasoningOutputTokens: nonNegative(total.reasoningOutputTokens),
+          totalTokens: nonNegative(total.totalTokens),
+        };
+      }
+      if (rows.length < USAGE_EVENT_PAGE_LIMIT) break;
+    }
+    return usage;
   }
 
   public async getThreadOutput(threadId: string): Promise<string> {
@@ -419,7 +429,7 @@ export class BbRunner {
         uploadedPacket,
       ],
       environment: { type: "reuse", environmentId },
-      ...pipelineExecutionArgs(job, attempt.capabilityProfile),
+      ...pipelineExecutionArgs(job, attempt, policy, "docs"),
     }));
     attempt.threadId = thread.id;
     attempt.environmentId = thread.environmentId ?? environmentId;
@@ -475,7 +485,7 @@ export class BbRunner {
         uploaded,
       ],
       environment: { type: "reuse", environmentId },
-      ...workerExecutionArgs(job, attempt.capabilityProfile, policy.review),
+      ...workerExecutionArgs(job, attempt, policy, "review"),
     });
     const thread = await this.sdk.threads.spawn(request);
     attempt.threadId = thread.id;
@@ -557,6 +567,13 @@ export class BbRunner {
 }
 
 const STOPPABLE_WORKER_STATES = new Set<WorkerLiveness["state"]>(["starting", "active", "stopping"]);
+
+const USAGE_EVENT_PAGES = 40;
+const USAGE_EVENT_PAGE_LIMIT = 200;
+
+function nonNegative(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
 
 function requirePullRequestSnapshot(job: Job, snapshot: PullRequestSnapshot): void {
   if (snapshot.outcome !== "available") {
