@@ -283,7 +283,9 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // start_job gained `path`/`separateWork`, create_thread and send_to_thread
   // gained `attachOwnerImage`, watch refuses schedules that poll live work, and
   // watch now distinguishes tool-created watches from evidence-backed CLI work.
-  expect(digest).toBe("a19a230f021d64edc174b96310ad8415ca028216cc2cfa126785a3d43b3f2286");
+  // Re-pinned again when send_to_thread gained the required `ask`: the owner
+  // cannot see the threads, so messaging one now carries the line he is told.
+  expect(digest).toBe("82ba814cc6a30b0b338a7f02df6793cf40e21e3cfbf06e7a218583a0be937eee");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -535,7 +537,7 @@ it("emits the exact runtime projection for every registered Task 6 tool", async 
     },
     {
       name: "telegram_agent_send_to_thread",
-      params: () => ({ threadId: "thr_active", text: "Continue the matrix." }),
+      params: () => ({ threadId: "thr_active", text: "Continue the matrix.", ask: "keep the matrix run going" }),
       expected: () => ({
         outcome: "succeeded",
         proofKinds: ["external_mutation", "thread_state"],
@@ -1969,7 +1971,7 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
 
   const sent = parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_send_to_thread",
-    { threadId: "thr_active", text: "Use the staging database" },
+    { threadId: "thr_active", text: "Use the staging database", ask: "point it at staging so it stops touching live data" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   ));
   expect(sent).toMatchObject({ sent: { threadId: "thr_active" } });
@@ -1977,13 +1979,20 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     threadId: "thr_active",
     input: [{ type: "text", text: "Use the staging database", mentions: [] }],
   }));
+  // Messaging a thread spends the owner's authority, so what was asked is
+  // recorded here and owed to him until the reply states it.
+  expect(store.unreportedControllerThreadAsks("owner-7-controller")).toContainEqual({
+    threadId: "thr_active",
+    threadName: "Fix Cyndra billing",
+    ask: "point it at staging so it stops touching live data",
+  });
 
   // Engaging with a thread is what earns the follow-up, so the thread the agent
   // started and the one it merely messaged are both watched, and messaging the
   // same thread again reuses the watch rather than arming a second one.
   await harness.behavior.callAgentTool(
     "telegram_agent_send_to_thread",
-    { threadId: "thr_active", text: "Report when the tests land" },
+    { threadId: "thr_active", text: "Report when the tests land", ask: "report back once the tests finish" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   );
   expect(store.listMonitors("owner-7-controller", false).map((monitor) => ({
@@ -1998,7 +2007,7 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
 
   await expect(harness.behavior.callAgentTool(
     "telegram_agent_send_to_thread",
-    { threadId: "thr_hidden", text: "leak" },
+    { threadId: "thr_hidden", text: "leak", ask: "should never reach a hidden thread" },
     { threadId: "thr_controller", projectId: "proj_personal" },
   )).resolves.toEqual(structuredToolError("scope_denied"));
 });
@@ -2325,7 +2334,7 @@ it("attaches the owner's Telegram photo when starting or messaging a visible thr
 
   const sent = parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_send_to_thread",
-    { threadId: "thr_active", text: "Here is the screenshot", attachOwnerImage: true },
+    { threadId: "thr_active", text: "Here is the screenshot", ask: "pass on the owner's screenshot", attachOwnerImage: true },
     { threadId: "thr_controller", projectId: "proj_personal" },
   ));
   expect(sent).toMatchObject({ sent: { threadId: "thr_active", imageCount: 1 } });

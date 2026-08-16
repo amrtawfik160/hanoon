@@ -110,3 +110,7 @@ _Avoid_: Best-effort guard, silently skipped skill
 **Guard disposition**:
 The registry-derived classification of a guard finding as `must_fix` or `advisory`; it is recomputed by Hanoon from stable rule identity rather than trusted from reviewer prose.
 _Avoid_: Model-selected blocker, every stylistic note blocks
+
+**Thread ask**:
+The one-line reason the controller gives when it messages a worker thread, recorded once the send lands and owed to the owner until a reply states it. It is the substance of the instruction, not the message text.
+_Avoid_: Tool narration, the sent message, a promise to explain later

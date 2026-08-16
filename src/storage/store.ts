@@ -98,6 +98,15 @@ import {
 } from "../controller/models";
 import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervisor";
 import { MAX_CONTROLLER_OVERLAY } from "../controller/instructions";
+import { isUnsafeProviderText } from "../controller/credential-policy";
+import {
+  MAX_OWNER_REPLY_CHARS,
+  THREAD_ASK_REDACTED,
+  composeOwnerReply,
+  normalizeThreadAsk,
+  normalizeThreadName,
+  type RecordedThreadAsk,
+} from "../controller/thread-ask";
 import {
   nextUnansweredQuestion,
   parseControllerInteraction,
@@ -2891,6 +2900,17 @@ export interface TelegramAgentStore {
     /** The accepted finalization's provider high-water marker, or legacy cursor. */
     bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced";
+  /** Record what the controller asked a worker thread to do, for the owner. */
+  recordControllerThreadAsk(input: {
+    controllerKey: string;
+    turnId: string;
+    threadId: string;
+    threadName: string | null;
+    ask: string;
+    now: number;
+  }): void;
+  /** Asks this controller has not yet told the owner about, oldest first. */
+  unreportedControllerThreadAsks(controllerKey: string): RecordedThreadAsk[];
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
   prepareControllerDispatch(input: ControllerLeaseFence & {
     turnId: string;
@@ -5419,6 +5439,83 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.controllerEvidenceRepository.claimCompletionContinuation(input);
   }
 
+  /**
+   * Record what the controller asked a worker thread to do, at the moment it
+   * sends. The substance is captured here rather than reconstructed later,
+   * because this is when the controller knows why it is asking.
+   *
+   * An ask that cannot be safely repeated is still recorded, with its text
+   * withheld: the owner learns that his authority was used either way.
+   */
+  public recordControllerThreadAsk(input: {
+    controllerKey: string;
+    turnId: string;
+    threadId: string;
+    threadName: string | null;
+    ask: string;
+    now: number;
+  }): void {
+    assertControllerKey(input.controllerKey);
+    assertNonNegativeInteger(input.now, "now");
+    const normalized = normalizeThreadAsk(input.ask);
+    const repeatable = normalized.length > 0 && !isUnsafeProviderText(normalized);
+    this.db.prepare(
+      `INSERT INTO controller_thread_asks
+         (controller_key, turn_id, thread_id, thread_name, ask, recorded_at, reported_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+    ).run(
+      input.controllerKey,
+      input.turnId,
+      input.threadId,
+      input.threadName === null ? null : normalizeThreadName(input.threadName),
+      repeatable ? normalized : THREAD_ASK_REDACTED,
+      input.now,
+    );
+  }
+
+  /**
+   * Asks this controller has not yet told the owner about, oldest first.
+   *
+   * Keyed to the controller rather than one turn, so an ask made by a turn that
+   * died before replying is still waiting on the next reply instead of being
+   * lost with it.
+   *
+   * The read is bounded because the reply that consumes it is. The bound also
+   * caps the "and N more" count, so it is set far above any backlog a replying
+   * controller can build: reaching it needs hundreds of sends without one
+   * completed turn.
+   */
+  public unreportedControllerThreadAsks(controllerKey: string): RecordedThreadAsk[] {
+    assertControllerKey(controllerKey);
+    const rows = this.db.prepare(
+      `SELECT thread_id, thread_name, ask FROM controller_thread_asks
+        WHERE controller_key = ? AND reported_at IS NULL
+        ORDER BY id ASC LIMIT 256`,
+    ).all(controllerKey) as { thread_id: string; thread_name: string | null; ask: string }[];
+    return rows.map((row) => ({
+      threadId: row.thread_id,
+      threadName: row.thread_name,
+      ask: row.ask,
+    }));
+  }
+
+  /**
+   * Mark the oldest `count` unreported asks as told, in the same order the
+   * reply states them. Asks the reply only counted rather than named stay
+   * unreported so the next reply can name them.
+   */
+  private markControllerThreadAsksReported(controllerKey: string, count: number, now: number): void {
+    if (count <= 0) return;
+    this.db.prepare(
+      `UPDATE controller_thread_asks SET reported_at = ?
+        WHERE id IN (
+          SELECT id FROM controller_thread_asks
+           WHERE controller_key = ? AND reported_at IS NULL
+           ORDER BY id ASC LIMIT ?
+        )`,
+    ).run(now, controllerKey, count);
+  }
+
   public completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -5476,6 +5573,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           (accepted.bbEventHighWaterSeq !== null && completionHighWater < accepted.bbEventHighWaterSeq)) {
         return "evidence_advanced" as const;
       }
+      // Composed inside the transaction that delivers it, so marking an ask
+      // told and sending the message that tells him either both happen or
+      // neither do. An ask the owner never hears about is a decision taken in
+      // his name that he cannot see, so it must not be lost to a failed write.
+      const pendingAsks = this.unreportedControllerThreadAsks(turn.controller_key);
+      const reply = composeOwnerReply(accepted.renderedMessage, pendingAsks, MAX_OWNER_REPLY_CHARS);
       const completed = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'completed', response_text = ?, stream_text = '',
@@ -5488,7 +5591,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id = ?`,
       ).run(
-        accepted.renderedMessage,
+        reply.text,
         input.now,
         input.now,
         input.turnId,
@@ -5498,11 +5601,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         accepted.id,
       );
       if (completed.changes !== 1) return "stale" as const;
+      this.markControllerThreadAsksReported(turn.controller_key, reply.reportedCount, input.now);
       this.appendControllerDigestRow({
         controllerKey: turn.controller_key,
         ordinal: turn.ordinal,
         ownerText: turn.input_text,
-        agentText: accepted.renderedMessage,
+        agentText: reply.text,
         now: input.now,
       });
       const consumed = this.db.prepare(
@@ -5512,7 +5616,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       persistControllerOutbox(this.db, {
         logicalKey: controllerReplyLogicalKey(input.turnId, turn.thread_follow_up_json),
         chatId: turn.telegram_chat_id,
-        payload: { text: accepted.renderedMessage, disable_web_page_preview: true },
+        payload: { text: reply.text, disable_web_page_preview: true },
       }, input.now);
       return "completed" as const;
     }).immediate();
