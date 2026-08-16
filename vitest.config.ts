@@ -5,14 +5,19 @@ const SUBPROCESS_SUITES = [
   "tests/controller-outcome-eval.test.ts",
 ];
 
+/** Points `os.tmpdir()` at this run's temp root; see tests/setup/temp-root.ts. */
+const TEMP_ROOT_SETUP = ["./tests/setup/worker-temp-root.ts"];
+
 export default defineConfig({
   test: {
+    globalSetup: ["./tests/setup/temp-root.ts"],
     projects: [
       {
         test: {
           name: "unit",
           include: ["tests/**/*.test.ts"],
           exclude: SUBPROCESS_SUITES,
+          setupFiles: TEMP_ROOT_SETUP,
           sequence: { groupOrder: 0 },
         },
       },
@@ -22,6 +27,7 @@ export default defineConfig({
           include: SUBPROCESS_SUITES,
           pool: "threads",
           poolOptions: { threads: { singleThread: true } },
+          setupFiles: TEMP_ROOT_SETUP,
           sequence: { groupOrder: 1 },
           testTimeout: 130_000,
         },

@@ -50,6 +50,8 @@ For state-machine work, cover the exact state/event transition, idempotency, sta
 
 Never weaken, skip, or replace a failing test with a canned production success path.
 
+A test run owns one temp root. `tests/setup/temp-root.ts` creates it and removes it when the run ends, and `tests/setup/worker-temp-root.ts` points `os.tmpdir()` at it in every test process, so fixtures that never dispose their temp directory (`createFakePluginHost` among them) cannot accumulate on disk. Create fixture directories under `os.tmpdir()` rather than a hard-coded `/tmp`, and let the run root do the cleanup. A run killed outright leaves its root behind; the next run sweeps roots older than an hour. `tests/temp-cleanup.test.ts` fails if a run leaves anything behind.
+
 ## Documentation
 
 Public operator docs live in [`docs/`](docs/README.md). Design history lives under `docs/superpowers/` and is not the source of truth for current commands or settings.
