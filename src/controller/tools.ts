@@ -99,6 +99,7 @@ import {
   controllerFinalizationCorrection,
   controllerFinalizationJsonSchema,
 } from "./finalization-contract";
+import { MAX_THREAD_ASK_CHARS } from "./thread-ask";
 import { BROKER_BINDING_STATES, OPAQUE_ID_PATTERN } from "../credentials/protocol";
 import type { CredentialAccessService } from "../credentials/service";
 
@@ -1765,16 +1766,22 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[9],
-    description: "Send a message to one visible BB thread and let it continue working. If the owner just sent a photo, set attachOwnerImage to pass that image with the message.",
+    description: "Send a message to one visible BB thread and let it continue working. Messaging a thread is a decision made with the owner's authority, so say in `ask` what you are asking for and why: that line is what he is told afterwards. If the owner just sent a photo, set attachOwnerImage to pass that image with the message.",
     experimental_statusLabels: { pending: "Messaging thread", completed: "Messaged thread" },
     parameters: z.object({
       threadId: z.string().min(1).max(256),
       text: z.string().trim().min(1).max(4_000),
+      ask: z.string().trim().min(1).max(MAX_THREAD_ASK_CHARS)
+        .describe("One plain line for the owner: what you are asking this thread to do and why. Not the message text, the substance. He cannot see the threads, so this is all he will know about the instruction you gave in his name. Write it so a wrong instruction is obvious to him."),
       attachOwnerImage: z.boolean().default(false)
         .describe("Attach the photo the owner just sent on this Telegram turn"),
     }).strict(),
     execute: async (params, context) => {
       const controller = authorizedController(dependencies.store, context);
+      // Resolved before the send so a missing turn fails while nothing has
+      // happened yet, rather than after the thread has been instructed.
+      const turn = dependencies.store.getPendingControllerTurn(controller.controllerKey);
+      if (!turn) throw new Error("Messaging a thread requires an active controller turn to report it on");
       const images = params.attachOwnerImage
         ? await ownerTurnImages(dependencies, controller.controllerKey, context.signal)
         : [];
@@ -1784,6 +1791,16 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         text: params.text,
         images,
         signal: context.signal,
+      });
+      // Recorded only once the send has actually landed, so the owner is never
+      // told about an instruction the thread did not receive.
+      dependencies.store.recordControllerThreadAsk({
+        controllerKey: controller.controllerKey,
+        turnId: turn.id,
+        threadId: params.threadId,
+        threadName: sent.sent.threadName,
+        ask: params.ask,
+        now: dependencies.now(),
       });
       // A thread the agent did not start is watchable all the same: what earns
       // the follow-up is having engaged with it, not having created it.
