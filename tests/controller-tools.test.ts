@@ -1916,6 +1916,32 @@ it("reads what a thread is doing so slowness can be explained rather than deflec
   });
 });
 
+it("refuses a project with no stored policy at the scope gate, before the base branch is ever read", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  const spawn = vi.fn(async () => ({ id: "thr_new", environmentId: "env_new" }));
+  harness.sdk.stub("threads.spawn", spawn);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+  });
+
+  // A project the owner never enabled has no stored policy, so it has no base
+  // branch to resolve. Requiring an explicit base branch must not turn that into
+  // a new failure: the scope gate already refuses it, and the tool body — and so
+  // the base-branch lookup — is never reached.
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_create_thread",
+    { projectId: "proj_without_policy", title: "Look at the logs", prompt: "Read the CI log" },
+    { threadId: "thr_controller", projectId: "proj_personal" },
+  )).resolves.toEqual(structuredToolError("scope_denied"));
+
+  expect(spawn).not.toHaveBeenCalled();
+});
+
 it("opens and messages visible threads, and refuses hidden ones", async () => {
   const { bb, harness, store } = fixture({ active: true });
   const spawn = vi.fn(async () => ({ id: "thr_new", environmentId: "env_new" }));
