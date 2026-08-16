@@ -4398,6 +4398,14 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
 
 /** Shown when a message arrives mid-turn and is folded into the running reply. */
 const CONTROLLER_STEER_FOLDED_TEXT = "Got that, and I'm working it into the answer I'm already writing.";
+/** Frozen so the stored payload and the duplicate check compare byte for byte. */
+const FOLDED_ANNOUNCEMENT_PAYLOAD = Object.freeze({
+  text: CONTROLLER_STEER_FOLDED_TEXT,
+  disable_web_page_preview: true,
+});
+function foldedAnnouncementJson(): string {
+  return JSON.stringify(FOLDED_ANNOUNCEMENT_PAYLOAD);
+}
 
 /**
  * The system turn that hands a spawned thread's block to the controller.
@@ -7444,13 +7452,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     // The answer itself arrives folded into the reply already being written, so
     // without this the owner's message drew no bubble at all and reads in
     // Telegram exactly like being ignored.
+    //
+    // Once, though. Two messages sent seconds apart both fold into the same
+    // running answer, and keying this by the waiting turn gave each its own
+    // row: the owner got the identical sentence twice, which reads like a
+    // stutter rather than an acknowledgement. One undelivered acknowledgement
+    // already says everything a second would.
+    const announcementPending = this.db.prepare(
+      `SELECT 1 FROM outbox
+        WHERE chat_id = ? AND status IN ('pending', 'leased', 'failed')
+          AND payload_json = ? LIMIT 1`,
+    ).get(row.telegramChatId, foldedAnnouncementJson()) !== undefined;
+    if (announcementPending) return;
     persistControllerOutbox(this.db, {
       logicalKey: controllerReplyLogicalKey(input.waitingTurnId, null),
       chatId: row.telegramChatId,
-      payload: {
-        text: CONTROLLER_STEER_FOLDED_TEXT,
-        disable_web_page_preview: true,
-      },
+      payload: FOLDED_ANNOUNCEMENT_PAYLOAD,
     }, input.now);
   }
 
