@@ -616,6 +616,13 @@ function authorityWith(
 }
 
 describe("controller capability manifest", () => {
+  it("keeps the public safety docs aligned with the enforced manifest size", () => {
+    const claim = `exactly ${CONTROLLER_TOOL_NAMES.length} Hanoon capabilities`;
+    for (const path of ["README.md", "SECURITY.md", "docs/architecture.md"]) {
+      expect(readFileSync(path, "utf8"), path).toContain(claim);
+    }
+  });
+
   it("does not mutate the proof vocabulary owned by controller models", () => {
     const inspection = JSON.parse(execFileSync(process.execPath, [
       "--input-type=module",

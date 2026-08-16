@@ -16,6 +16,7 @@ Controller settings never override a job's stored project policy.
 - A standard BB project backed by a GitHub repository.
 - A reachable local or cloned BB project source with a named base branch.
 - GitHub CLI (`gh`) authenticated on every source host used by an enabled project.
+- Optional: a BB voice transcription service configured on every BB server host that runs this plugin. Hanoon invokes `bb voice transcribe`; without that service, voice and audio messages receive an unavailable notice and the owner must type the request instead.
 - Optional: `ffmpeg` and `ffprobe` on the PATH of the BB server host. They let the controller sample GIFs and short videos into stills. Without them, clips still arrive; the agent sees Telegram's preview still instead of frames.
 
 The hidden controller uses BB's personal project. That project must have a selected source host, or BB must have exactly one connected host when the personal project has no source binding.

@@ -164,8 +164,8 @@ truth.
   of stubs: section path, one-line title, id. The agent pulls the body by id when
   it decides the stub is worth it.
 
-Two lanes, separate budgets. This is the one idea worth copying wholesale from
-the reference implementation at `/root/github_projects/ai`.
+Two lanes, separate budgets. This is the one idea worth carrying forward from
+the earlier reference implementation.
 
 ### How it reaches the pipeline
 
@@ -371,7 +371,7 @@ Compressed record of what was settled, so the reasoning is not lost.
 
 | Decision | Chosen | Why |
 | --- | --- | --- |
-| Relationship to `/root/github_projects/ai` | Ideas only | Its strengths are breadth and behaviour, not architecture we want. Ours is safer and should stay so. |
+| Relationship to the earlier reference implementation | Ideas only | Its strengths are breadth and behaviour, not architecture we want. Ours is safer and should stay so. |
 | Axes of work | More it can do itself, colleague feel, knows more | Self-improvement and extra channels dropped as lower value for the cost. |
 | Boundary | Stays inside the BB plugin | Containment and recoverability are why the agent is trustworthy. |
 | Evidence rule | Holds unchanged | A second unverified path becomes the path everything drifts into. On inspection the proof kind already existed, so this needs a claim kind rather than a new lane. |
