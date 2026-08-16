@@ -22,6 +22,7 @@ import {
   type ReviewFinding,
 } from "./prompts";
 import { TerminalCommandRunner } from "./terminal-command";
+import { assertSharedTrunkAncestry } from "./worktree-ancestry";
 import type { ModelRoute } from "../capabilities/models";
 
 type BbSdk = BbPluginApi["sdk"];
@@ -181,7 +182,31 @@ function spawnRequest(request: Record<string, unknown>): SpawnArgs {
 }
 
 export class BbRunner {
+  /** Environments already proven to share history with a given trunk. */
+  private readonly ancestryChecked = new Set<string>();
+
   public constructor(public readonly sdk: BbSdk) {}
+
+  /**
+   * Refuses to go on when the worktree was cut from a history that can never
+   * reach `trunk`. Checked once per environment and trunk; a worktree cannot
+   * change its root commit underneath us.
+   */
+  public async assertWorktreeSharesTrunk(
+    environmentId: string,
+    trunk: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const key = `${environmentId} ${trunk}`;
+    if (this.ancestryChecked.has(key)) return;
+    const verdict = await assertSharedTrunkAncestry({
+      runner: new TerminalCommandRunner(this.sdk),
+      environmentId,
+      trunk,
+      signal,
+    });
+    if (verdict.kind === "shared") this.ancestryChecked.add(key);
+  }
 
   private async resolveProjectHost(projectId: string): Promise<string> {
     const projects = await this.sdk.projects.list();

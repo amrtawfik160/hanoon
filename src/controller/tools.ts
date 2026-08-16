@@ -713,6 +713,24 @@ function enabledProject(store: TelegramAgentStore, projectId: string): boolean {
   return stored?.policy.enabled === true && stored.policy.projectId === projectId;
 }
 
+/**
+ * The trunk a new thread's worktree is cut from.
+ *
+ * Read from the project's immutable policy so exploratory threads land on the
+ * same history as guarded jobs. Falling back to BB's default branch is what put
+ * threads on an unrelated root commit, so a missing policy is an error here
+ * rather than a silent default.
+ */
+function projectBaseBranch(store: TelegramAgentStore, projectId: string): string {
+  const baseBranch = store.getProjectPolicy(projectId)?.policy.baseBranch.trim() ?? "";
+  if (baseBranch.length === 0) {
+    throw new Error(
+      "That project has no configured base branch, so a new thread could start on an unrelated history. Set the project's baseBranch policy before starting threads in it.",
+    );
+  }
+  return baseBranch;
+}
+
 async function visibleThreadResolution(
   dependencies: ToolDependencies,
   threadId: string,
@@ -1735,6 +1753,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         hostId,
         title: params.title,
         prompt: params.prompt,
+        baseBranch: projectBaseBranch(dependencies.store, params.projectId),
         images,
         signal: context.signal,
       });
@@ -1979,6 +1998,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
             hostId,
             title: task.title,
             prompt: task.prompt,
+            baseBranch: projectBaseBranch(dependencies.store, task.projectId),
             signal: context.signal,
           });
           threadId = created.thread.id;

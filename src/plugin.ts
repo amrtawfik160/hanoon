@@ -871,6 +871,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         const hosts = await bb.sdk.hosts.list({});
         const host = hosts.find((candidate) => candidate.status === "connected");
         if (!host) throw new Error("No connected BB host can run a memory extraction");
+        // Named rather than default: a memory extraction reads the project's
+        // real history, and BB's default branch may belong to another one.
+        const baseBranch = store.getProjectPolicy(projectId)?.policy.baseBranch.trim() ?? "";
+        if (baseBranch.length === 0) {
+          throw new Error("That project has no configured base branch for a memory extraction worktree");
+        }
         const thread = await bb.sdk.threads.spawn({
           projectId,
           title,
@@ -879,7 +885,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
           environment: {
             type: "host",
             hostId: host.id,
-            workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+            workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: baseBranch } },
           },
           providerId: modelRoute.providerId,
           model: modelRoute.modelId,
@@ -1052,6 +1058,8 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     stopWorker: (worker: Parameters<BbRunner["stopWorker"]>[0]) => bbRunner.stopWorker(worker),
     retireWorker: (resourceId: string, allowMissing: boolean) => bbRunner.retireWorker(resourceId, allowMissing),
     prepareProgressScratchpad: (environmentId: string) => bbRunner.prepareProgressScratchpad(environmentId),
+    assertWorktreeSharesTrunk: (environmentId: string, trunk: string) =>
+      bbRunner.assertWorktreeSharesTrunk(environmentId, trunk),
     getThread: (threadId: string) => bbRunner.getThread(threadId),
     getEnvironmentSnapshot: (environmentId: string, baseBranch: string) => bbRunner.getEnvironmentSnapshot(environmentId, baseBranch),
     getPullRequestSnapshot: (environmentId: string) => bbRunner.getPullRequestSnapshot(environmentId),

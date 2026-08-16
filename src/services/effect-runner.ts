@@ -96,6 +96,8 @@ type BbEffectAdapter = {
   stopWorker?(worker: string | WorkerLiveness): Promise<void>;
   retireWorker?(resourceId: string, allowMissing: boolean): Promise<void>;
   prepareProgressScratchpad?(environmentId: string): Promise<void>;
+  /** Refuses a worktree whose history can never reach the job's base branch. */
+  assertWorktreeSharesTrunk?(environmentId: string, trunk: string): Promise<void>;
   getThread?(threadId: string): Promise<BbThread>;
   getEnvironmentSnapshot?(environmentId: string, baseBranch: string): Promise<EnvironmentSnapshot>;
   getPullRequestSnapshot?(environmentId: string): Promise<unknown>;
@@ -1244,6 +1246,14 @@ export class EffectRunner {
     if (job.state !== "creating_implementation") return;
     const nativeAdapter = this.prepareNativeAdapter(effect, job, "implementation-worktree-created");
     const created = await this.adoptOrSpawn(effect, job, "implementation");
+    // Checked before any work is handed to the worker: a worktree cut from an
+    // unrelated root can never merge into the base branch, and discovering that
+    // after a full implementation and review cycle wastes the whole job.
+    if (this.dependencies.bb?.assertWorktreeSharesTrunk && job.policy) {
+      this.assertFence();
+      await this.dependencies.bb.assertWorktreeSharesTrunk(created.environmentId, job.policy.baseBranch);
+      this.renewOperationFence(effect);
+    }
     if (this.dependencies.bb?.prepareProgressScratchpad) {
       this.assertFence();
       await this.dependencies.bb.prepareProgressScratchpad(created.environmentId);

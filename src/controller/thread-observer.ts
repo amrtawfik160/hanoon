@@ -236,16 +236,26 @@ async function promptWithImages(
   return input;
 }
 
-/** Opens a working thread the owner can watch in BB, on its own worktree. */
+/**
+ * Opens a working thread the owner can watch in BB, on its own worktree.
+ *
+ * `baseBranch` is required rather than defaulted: letting BB pick the project
+ * default is how threads end up on an unrelated history that can never merge
+ * back. The caller must state the trunk it means.
+ */
 export async function createProjectThread(input: {
   sdk: BbSdk;
   projectId: string;
   hostId: string;
   title: string;
   prompt: string;
+  baseBranch: string;
   images?: readonly ThreadImage[];
   signal: AbortSignal;
 }) {
+  if (input.baseBranch.trim().length === 0) {
+    throw new Error("A new project thread requires an explicit base branch");
+  }
   const thread = await input.sdk.threads.spawn({
     projectId: input.projectId,
     title: input.title,
@@ -254,7 +264,7 @@ export async function createProjectThread(input: {
     environment: {
       type: "host",
       hostId: input.hostId,
-      workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+      workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: input.baseBranch } },
     },
   });
   return {

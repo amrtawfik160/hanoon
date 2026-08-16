@@ -7,6 +7,7 @@ import { productionResourceKey, projectResourceKey } from "../src/autonomy/model
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { admitConfirmedJob, policyFixture } from "./helpers";
 import { settleEffectFailure } from "../src/services/job-executor-service";
+import { DisjointHistoryError, disjointHistoryMessage } from "../src/bb/worktree-ancestry";
 import {
   EffectRunner,
   PermanentEffectError,
@@ -254,6 +255,44 @@ describe("leased effect execution", () => {
       implementationThreadId: "thr_recovered_ordinary",
       environmentId: "env_ordinary",
     });
+  });
+
+  it("refuses to start implementation work in a worktree cut from an unrelated history", async () => {
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_disjoint_worktree", "creating_implementation");
+    if (!job) throw new Error("job missing");
+    const effect: JobEffect = {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    };
+    addPendingEffectForRecovery(db, effect);
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_001, 10, 30_000)
+      .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+    if (!claimed) throw new Error("spawn effect missing");
+    const spawnImplementation = vi.fn(async () => ({ id: "thr_disjoint", environmentId: "env_disjoint" }));
+    const prepareProgressScratchpad = vi.fn(async () => undefined);
+    const assertWorktreeSharesTrunk = vi.fn(async () => {
+      throw new DisjointHistoryError("main", disjointHistoryMessage("main"));
+    });
+    const listThreads = vi.fn(async () => ({ threads: [], total: 0 }));
+
+    await expect(new EffectRunner({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      bb: { listThreads, spawnImplementation, prepareProgressScratchpad, assertWorktreeSharesTrunk },
+      now: () => 1_002,
+    }).run(claimed)).rejects.toBeInstanceOf(DisjointHistoryError);
+
+    expect(assertWorktreeSharesTrunk).toHaveBeenCalledWith("env_disjoint", policyFixture().baseBranch);
+    // The worker must not get a scratchpad or be moved into implementing on a
+    // worktree whose commits can never reach the base branch.
+    expect(prepareProgressScratchpad).not.toHaveBeenCalled();
+    expect(store.getJob(job.id)).toMatchObject({ state: "creating_implementation" });
   });
 
   it.each([
