@@ -252,7 +252,7 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
 
 function attemptFor(effect: StoredEffect, job: Job, kind: AttemptRecord["kind"]): {
   id: string;
-  ordinal: number;
+  ordinal: number | "next";
   headSha: string | null;
 } {
   const payload = recordPayload(effect);
@@ -260,7 +260,11 @@ function attemptFor(effect: StoredEffect, job: Job, kind: AttemptRecord["kind"])
   const id = typeof suppliedId === "string" && suppliedId.length > 0
     ? suppliedId
     : `attempt:${effect.idempotencyKey}`;
-  const ordinal = kind === "review" ? Math.max(1, job.reviewCycle + 1) : 1;
+  // A review ordinal is the review cycle, which sibling lenses share. Every
+  // other kind is a plain sequence the store allocates, because each recovery
+  // requeues the stage under a new effect key and so needs a new ordinal; a
+  // constant here silently collided with the attempt the dead worker left.
+  const ordinal = kind === "review" ? Math.max(1, job.reviewCycle + 1) : "next";
   const headSha = fullSha(payload.headSha) ? payload.headSha : job.prHeadSha;
   return { id, ordinal, headSha };
 }
@@ -905,12 +909,11 @@ export class EffectRunner {
       ...(reviewAttemptId ? { id: reviewAttemptId } : {}),
       ...(reviewOrdinal ? { ordinal: reviewOrdinal } : {}),
     };
-    const existingAttempt = this.dependencies.store.getAttempt(attemptInput.id);
     const attempt = this.dependencies.store.createExecutorAttempt({
       id: attemptInput.id,
       jobId: job.id,
       kind,
-      ordinal: existingAttempt?.ordinal ?? attemptInput.ordinal,
+      ordinal: attemptInput.ordinal,
       headSha: attemptInput.headSha,
       reviewLens: kind === "review" ? reviewLens : null,
       reviewStage: kind === "review" ? (finalReview ? "final_review" : "review") : null,

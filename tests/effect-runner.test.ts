@@ -196,6 +196,98 @@ describe("leased effect execution", () => {
       candidate.kind === "spawn_implementation" && candidate.status === "pending")).toBe(true);
   });
 
+  it("spawns a replacement implementation after a worker recovery requeues the stage", async () => {
+    // Every spawn_implementation effect carries a fresh idempotency key, so the
+    // attempt it creates has a fresh id. The second spawn must still be storable:
+    // a job whose first worker died can only be rebuilt by a second attempt.
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_respawn", "creating_implementation");
+    if (!job) throw new Error("job missing");
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const fenceFor = (now: number) => ({
+      store,
+      fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+      now: () => now,
+    });
+    const spawnImplementation = vi.fn(async () => ({ id: "thr_first", environmentId: "env_1" }));
+    const runSpawn = async (idempotencyKey: string, now: number): Promise<void> => {
+      const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, now, 10, 30_000)
+        .find((candidate) => candidate.idempotencyKey === idempotencyKey);
+      if (!claimed) throw new Error(`spawn effect ${idempotencyKey} missing`);
+      await new EffectRunner({ ...fenceFor(now), bb: { spawnImplementation } }).run(claimed);
+    };
+
+    addPendingEffectForRecovery(db, {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    });
+    await runSpawn(`${job.id}:2:spawn_implementation`, 1_002);
+    expect(store.getJob(job.id)).toMatchObject({ state: "implementing", implementationThreadId: "thr_first" });
+
+    // The worker dies silently. Recovery clears the thread and requeues the
+    // stage under a new effect key, exactly as `transitionRecoveringWorker` does.
+    const implementing = store.getJob(job.id)!;
+    store.registerExecutorWorkerRecovery({
+      id: "recovery_respawn",
+      jobId: job.id,
+      expectedVersion: implementing.version,
+      projectId: "proj_1",
+      jobState: "implementing",
+      workerKind: "implementation",
+      resourceId: "thr_first",
+      workerGeneration: 7,
+      classification: "no_progress",
+      signature: "no_progress:implementation:active",
+      retryLimit: 2,
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_003,
+    });
+    const recovering = store.applyExecutorJobEvent({
+      jobId: job.id,
+      expectedVersion: implementing.version,
+      event: {
+        type: "WORKER_RECOVERY_REQUESTED",
+        recoveryId: "recovery_respawn",
+        workerKind: "implementation",
+        resourceId: "thr_first",
+        classification: "no_progress",
+        signature: "no_progress:implementation:active",
+      },
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_004,
+    });
+    expect(recovering?.state).toBe("recovering_worker");
+    db.prepare("UPDATE effects SET status = 'done' WHERE job_id = ? AND kind <> 'recover_worker'").run(job.id);
+    const recoverEffect = store.leaseNextJobEffect({
+      jobId: job.id,
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_005,
+      leaseMs: 30_000,
+    });
+    if (!recoverEffect || recoverEffect.kind !== "recover_worker") throw new Error("recovery effect missing");
+    await new EffectRunner({ ...fenceFor(1_006), bb: { retireWorker: vi.fn(async () => undefined) } })
+      .run(recoverEffect);
+    const requeued = store.listEffectsForJob(job.id)
+      .find((candidate) => candidate.kind === "spawn_implementation" && candidate.status === "pending");
+    if (!requeued) throw new Error("requeued spawn effect missing");
+
+    spawnImplementation.mockResolvedValue({ id: "thr_second", environmentId: "env_1" });
+    await runSpawn(requeued.idempotencyKey, 1_007);
+
+    expect(store.getJob(job.id)).toMatchObject({ state: "implementing", implementationThreadId: "thr_second" });
+    const ordinals = db
+      .prepare("SELECT ordinal FROM attempts WHERE job_id = ? AND kind = 'implementation' ORDER BY ordinal")
+      .all(job.id) as { ordinal: number }[];
+    expect(ordinals.map((row) => row.ordinal)).toEqual([1, 2]);
+  });
+
   it("recovers an ordinary implementation thread by the centralized title bytes", async () => {
     const { store, db } = storeFixture();
     const job = selectedJobForRecovery(store, db, "job_ordinary_recovery", "creating_implementation");
