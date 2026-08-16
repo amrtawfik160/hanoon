@@ -79,6 +79,8 @@ Documentation, final validation, and final review happen before the owner receiv
 
 Every recoverable block already had a resume path in the state machine, but nothing walked it: the owner was the scheduler, and a job that hit one bad minute waited for a tap that might never come. A sweep now decides, for each blocked job, whether it can be driven on, and applies the same guarded `RETRY` or `CONTINUE_REVIEW` the owner's own buttons use. An automatic push therefore cannot reach a state a manual retry could not.
 
+Jobs already blocked when the sweep first shipped are excluded by a one-time backfill that marks them handed-over. They stopped under the old rules against branches and environments that have since moved on, and resuming them would have made the sweep's first act a rerun of history nobody was waiting on.
+
 The ladder is bounded at three attempts against the same block, counted per block rather than per job, so a job that clears one wall and stops at a later one arrives with a full allowance. When the ladder is spent the owner is told once, in plain language, and the job stops being re-decided. Merge and production promotion still need the owner's one-use approval; the sweep never drives past that boundary, nor past an unconfirmed cancellation or a project configuration gap it cannot fix.
 
 Effects that only redraw state the job already holds cannot end a job. A status card that fails to deliver, whether dead-lettered outright or out of retries, is a display problem: blocking the work over it loses real progress and tells the owner nothing, because the block enqueues another status render that fails the same way.

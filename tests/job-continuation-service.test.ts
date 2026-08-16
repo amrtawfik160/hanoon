@@ -215,3 +215,18 @@ it("paces itself instead of sweeping on every executor tick", () => {
   at.now += 1_000;
   expect(service.processDue()).toBe(false);
 });
+
+it("leaves alone a job that was already blocked when the sweep arrived", () => {
+  // Jobs blocked under the old rules stopped days ago against branches and
+  // environments that have since moved on. Resuming them would make the
+  // sweep's first act a rerun of history nobody is waiting on.
+  const store = storeFixture();
+  const job = workingJob(store, 1_000);
+  blockOnDeadEffect(store, job, "spawn_plan", 2_000);
+  // What the backfill migration does to every job blocked before it ran.
+  store.recordContinuationEscalation({ jobId: job.id, now: 2_500 });
+
+  const at = { now: 3_000_000 };
+  expect(serviceFor(store, at).processDue()).toBe(false);
+  expect(store.getJob(job.id)?.state).toBe("blocked");
+});

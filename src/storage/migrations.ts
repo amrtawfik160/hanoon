@@ -2087,6 +2087,19 @@ ALTER TABLE monitors ADD COLUMN stall_notified_at INTEGER
   CHECK (stall_notified_at IS NULL OR stall_notified_at >= 0);
 `] as const;
 
+/**
+ * Jobs already blocked when the continuation sweep arrived are excluded from
+ * it. They stopped under the old rules, days or weeks ago, and their branches,
+ * pull requests, and environments have moved on since; resuming them would be
+ * the sweep's first act rather than its steady state, against work nobody is
+ * waiting on any more. Marking them handed-over reuses the exclusion the sweep
+ * already honours, so only jobs that block from here on climb the ladder.
+ */
+export const JOB_CONTINUATION_BACKFILL_MIGRATIONS = [String.raw`
+UPDATE jobs SET auto_continue_escalated_at = updated_at
+ WHERE state = 'blocked' AND auto_continue_escalated_at IS NULL;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2151,4 +2164,5 @@ export const ALL_MIGRATIONS = [
   ...STAGE_EXECUTION_MIGRATIONS,
   ...JOB_CONTINUATION_MIGRATIONS,
   ...MONITOR_STALL_MIGRATIONS,
+  ...JOB_CONTINUATION_BACKFILL_MIGRATIONS,
 ] as const;
