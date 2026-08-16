@@ -200,7 +200,8 @@ function expectDuplicateGenerationRepair(
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(55);
+  expect(ALL_MIGRATIONS).toHaveLength(56);
+  expect(ALL_MIGRATIONS[55]).toContain("thread_interactions ADD COLUMN audience");
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
   expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");
@@ -1875,4 +1876,152 @@ it("throws and rolls back fail-and-retire when its generation disappears after t
     "SELECT ended_at FROM controller_generations WHERE controller_key = ? AND thread_id = ?",
   ).get(turn.controllerKey, "thr_fail_retire_late_generation")).toEqual({ ended_at: null });
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toEqual(outboxBefore);
+});
+
+// The 1:50am failure: a thread the controller started raised a three-option
+// design question and it arrived on the owner's phone as a menu to tap.
+it("hands a spawned thread's question to the controller and leaves the owner alone", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_design",
+    threadId: "thr_spawned",
+    title: "Tell the owner what I asked a thread to do",
+    interaction: {
+      kind: "user_question",
+      interactionId: "pint_design",
+      questions: [{
+        id: "q1",
+        prompt: "Which shape should the retry take?",
+        shortLabel: "Approach",
+        multiSelect: false,
+        allowFreeText: false,
+        options: [
+          { value: "a", label: "Retry in place", description: null },
+          { value: "b", label: "Fresh thread", description: null },
+        ],
+      }],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent",
+  })).toBe(true);
+
+  expect(store.getOutbox("thread-interaction:pint_design")).toBeNull();
+  const queued = store.getQueuedControllerTurn("owner-7-controller");
+  expect(queued?.origin).toBe("system");
+  expect(queued?.inputText).toMatch(/blocked and waiting on you/i);
+  expect(queued?.inputText).toMatch(/Retry in place/);
+  expect(queued?.inputText).toMatch(/telegram_agent_answer_thread/);
+});
+
+it("still asks the owner about a thread they opened themselves", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_owned",
+    threadId: "thr_owner_started",
+    title: "Owner's own thread",
+    interaction: { kind: "unsupported", interactionId: "pint_owned" },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: null,
+  })).toBe(true);
+
+  expect(store.getOutbox("thread-interaction:pint_owned")).not.toBeNull();
+});
+
+// Merge, deploy, money, and credentials stay the owner's even on a thread the
+// controller started.
+it("keeps a spawned thread's merge approval with the owner", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_merge",
+    threadId: "thr_spawned",
+    title: "Ship the fix",
+    interaction: {
+      kind: "approval",
+      interactionId: "pint_merge",
+      summary: "wants to run:\n\n`gh pr merge 42 --squash`",
+      decisions: ["allow_once", "deny"],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent",
+  })).toBe(true);
+
+  expect(store.getOutbox("thread-interaction:pint_merge")).not.toBeNull();
+});
+
+it("lets the controller answer a block routed to it and refuses one that was not", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+  const approval = (id: string, parentThreadId: string | null) => store.recordThreadInteraction({
+    interactionId: id,
+    threadId: "thr_spawned",
+    title: "Run the suite",
+    interaction: {
+      kind: "approval",
+      interactionId: id,
+      summary: "wants to run:\n\n`npm test`",
+      decisions: ["allow_once", "allow_for_session", "deny"],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId,
+  });
+
+  expect(approval("pint_mine", "thr_controller_parent")).toBe(true);
+  expect(approval("pint_owners", null)).toBe(true);
+
+  expect(store.answerThreadInteractionAsController({
+    interactionId: "pint_mine",
+    threadId: "thr_spawned",
+    decision: "allow_once",
+    now: 6_000,
+  })).toEqual({ ok: true });
+  expect(store.getAnsweredThreadInteraction()).toMatchObject({
+    interactionId: "pint_mine",
+    resolution: { decision: "allow_once", grantedPermissions: null },
+  });
+
+  // The owner's own block is not the controller's to take over.
+  expect(store.answerThreadInteractionAsController({
+    interactionId: "pint_owners",
+    threadId: "thr_spawned",
+    decision: "allow_once",
+    now: 6_001,
+  })).toEqual({ ok: false, reason: "not_controller_routed" });
+});
+
+// A standing grant removes the boundary for everything the thread does next, so
+// the controller may unblock a thread but never hand it one.
+it("refuses a session-wide grant from the controller", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_session",
+    threadId: "thr_spawned",
+    title: "Run the suite",
+    interaction: {
+      kind: "approval",
+      interactionId: "pint_session",
+      summary: "wants to run:\n\n`npm test`",
+      decisions: ["allow_once", "allow_for_session", "deny"],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent",
+  })).toBe(true);
+
+  expect(store.answerThreadInteractionAsController({
+    interactionId: "pint_session",
+    threadId: "thr_spawned",
+    decision: "allow_for_session" as "allow_once",
+    now: 6_000,
+  })).toEqual({ ok: false, reason: "decision_not_allowed" });
 });

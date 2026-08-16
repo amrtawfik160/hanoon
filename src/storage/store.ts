@@ -106,12 +106,14 @@ import {
   renderControllerInteraction,
   renderThreadInteraction,
   parseThreadInteraction,
+  type ThreadApprovalDecision,
   threadDecisionToken,
   type ControllerInteraction,
   type ControllerQuestionAnswers,
   type ControllerQuestion,
   type ThreadInteraction,
 } from "../controller/questions";
+import { routeThreadInteraction } from "../controller/interaction-routing";
 import {
   JOB_SELECT,
   MAX_MERGE_RESULT_JSON,
@@ -3036,13 +3038,22 @@ export interface TelegramAgentStore {
     interaction: ThreadInteraction;
     chatId: string;
     now: number;
+    parentThreadId?: string | null;
   }): boolean;
+  isControllerOwnedThread(parentThreadId: string | null): boolean;
   answerThreadInteraction(input: {
     token: string;
     userId: string;
     chatId: string;
     now: number;
   }): ThreadInteractionAnswer;
+  answerThreadInteractionAsController(input: {
+    interactionId: string;
+    threadId: string;
+    decision?: ThreadApprovalDecision;
+    answers?: ControllerQuestionAnswers;
+    now: number;
+  }): { ok: true } | { ok: false; reason: "unknown" | "not_controller_routed" | "decision_not_allowed" };
   getAnsweredThreadInteraction(): ThreadInteractionDelivery | null;
   markThreadInteractionDelivered(interactionId: string, now: number): boolean;
   discardThreadInteractions(threadId: string, keep: readonly string[], now?: number): number;
@@ -4293,6 +4304,39 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
 
 /** Shown when a message arrives mid-turn and is folded into the running reply. */
 const CONTROLLER_STEER_FOLDED_TEXT = "Got that, and I'm working it into the answer I'm already writing.";
+
+/**
+ * The system turn that hands a spawned thread's block to the controller.
+ *
+ * It carries the question itself, not a pointer to go and read one, because a
+ * turn that has to go looking is a turn that can decide it has nothing to say.
+ * The instruction is explicit that this is the controller's to answer: the
+ * routing already established the owner is not needed.
+ */
+function describeThreadBlockForController(
+  threadId: string,
+  title: string,
+  interaction: ThreadInteraction,
+  decisions: readonly ThreadApprovalDecision[],
+): string {
+  const head = `A thread you started is blocked and waiting on you: ${threadId} (${title}).`;
+  const tail = "Answer it with telegram_agent_answer_thread so the thread continues. " +
+    "This is yours to decide; do not pass it to the owner unless it turns out to need " +
+    "their merge or deploy approval, or an irreversible external action.";
+  if (interaction.kind === "unsupported") {
+    return `${head} I can't read what it is asking, so read the thread in BB to see what it needs. ${tail}`;
+  }
+  if (interaction.kind === "user_question") {
+    const asked = interaction.questions
+      .map((question, index) => {
+        const options = question.options.map((option) => option.label).join(", ");
+        return `${index + 1}. ${question.prompt}${options.length > 0 ? ` Options: ${options}.` : ""}`;
+      })
+      .join("\n");
+    return `${head} It asks:\n${asked}\n${tail}`;
+  }
+  return `${head} It ${interaction.summary}\nYou may answer: ${decisions.join(", ")}.\n${tail}`;
+}
 
 const MAX_CONTROLLER_DISPATCH_RETRY_COUNT = 6;
 const MAX_CONTROLLER_DELIVERY_RECONCILIATION_ATTEMPTS = 3;
@@ -7418,6 +7462,23 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   /** Asks the owner to unblock a thread that is waiting on a decision. */
+  /**
+   * True when the controller started this thread, which is what makes the
+   * thread's questions the controller's to answer.
+   *
+   * Provenance is BB's own parent link rather than anything this plugin keeps:
+   * the controller spawns with `--parent-self`, so the parent is the
+   * controller's own BB thread. A thread the owner opened has no such parent
+   * and stays theirs, which matters because routing their own work away would
+   * silently take it off their phone.
+   */
+  public isControllerOwnedThread(parentThreadId: string | null): boolean {
+    if (parentThreadId === null) return false;
+    return this.db.prepare(
+      "SELECT 1 FROM controller_threads WHERE bb_thread_id = ? AND state = 'active'",
+    ).get(parentThreadId) !== undefined;
+  }
+
   public recordThreadInteraction(input: {
     interactionId: string;
     threadId: string;
@@ -7425,6 +7486,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     interaction: ThreadInteraction;
     chatId: string;
     now: number;
+    parentThreadId?: string | null;
   }): boolean {
     assertControllerIdentifier(input.interactionId, "interactionId");
     assertControllerIdentifier(input.threadId, "threadId");
@@ -7434,10 +7496,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const known = this.db.prepare("SELECT 1 FROM thread_interactions WHERE interaction_id = ?")
         .get(input.interactionId);
       if (known) return false;
+      // The routing decision is taken here rather than by the caller, so a
+      // future caller cannot put a tappable menu on the owner's phone for a
+      // thread the controller started by forgetting to ask.
+      const route = routeThreadInteraction({
+        threadOwnedByController: this.isControllerOwnedThread(input.parentThreadId ?? null),
+        interaction: input.interaction,
+      });
       this.db.prepare(
         `INSERT INTO thread_interactions
-           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)`,
+           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at, audience)
+         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)`,
       ).run(
         input.interactionId,
         input.threadId,
@@ -7445,7 +7514,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.interaction.kind,
         JSON.stringify(input.interaction),
         input.now,
+        route.audience,
       );
+      if (route.audience === "controller") {
+        this.askControllerToAnswerThread({ ...input, now: input.now }, route.decisions);
+        return true;
+      }
       const rendered = renderThreadInteraction(input.title, input.interaction);
       persistControllerOutbox(this.db, {
         logicalKey: `thread-interaction:${input.interactionId}`,
@@ -7458,6 +7532,46 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }, input.now);
       return true;
     }).immediate();
+  }
+
+  /**
+   * Puts a spawned thread's block in front of the controller as its own turn.
+   *
+   * The owner sees nothing here. They asked to hear that a decision was made,
+   * not to be asked to make it, and the controller reports the decision in its
+   * own words when it next speaks.
+   */
+  private askControllerToAnswerThread(
+    input: {
+      interactionId: string;
+      threadId: string;
+      title: string;
+      interaction: ThreadInteraction;
+      now: number;
+    },
+    decisions: readonly ThreadApprovalDecision[],
+  ): void {
+    const controller = this.db.prepare(
+      "SELECT controller_key, telegram_user_id, telegram_chat_id FROM controller_threads WHERE state = 'active' LIMIT 1",
+    ).get() as { controller_key: string; telegram_user_id: string; telegram_chat_id: string } | undefined;
+    if (!controller) return;
+    const latestUpdate = this.db.prepare(
+      "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
+    ).get() as { update_id: number };
+    try {
+      this.enqueueControllerTurn({
+        controllerKey: controller.controller_key,
+        telegramUserId: controller.telegram_user_id,
+        telegramChatId: controller.telegram_chat_id,
+        updateId: Math.max(latestUpdate.update_id + 1, THREAD_FOLLOW_UP_UPDATE_ID_BASE),
+        inputText: describeThreadBlockForController(input.threadId, input.title, input.interaction, decisions),
+        origin: "system",
+        now: input.now,
+      });
+    } catch {
+      // A turn that cannot be queued leaves the interaction pending, so the
+      // next sweep offers it again rather than the thread being forgotten.
+    }
   }
 
   /** Resolves a watched thread's block from a tapped button. */
@@ -7497,6 +7611,64 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         };
       }
       return { ok: false, reason: "stale" };
+    }).immediate();
+  }
+
+  /**
+   * Records the controller's answer to a block on a thread it started.
+   *
+   * The answer joins the same queue the owner's tap uses, so it reaches BB
+   * through one delivery path with one set of retries. Only an interaction
+   * routing already assigned to the controller can be answered here: the owner's
+   * own threads, and the decisions reserved for them, are refused rather than
+   * quietly taken over. A session-wide grant is refused for the same reason it
+   * is never offered, so an answer cannot widen what the thread may do later.
+   */
+  public answerThreadInteractionAsController(input: {
+    interactionId: string;
+    threadId: string;
+    decision?: ThreadApprovalDecision;
+    answers?: ControllerQuestionAnswers;
+    now: number;
+  }): { ok: true } | { ok: false; reason: "unknown" | "not_controller_routed" | "decision_not_allowed" } {
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction(() => {
+      const row = this.db.prepare(
+        "SELECT * FROM thread_interactions WHERE interaction_id = ? AND thread_id = ? AND state = 'pending'",
+      ).get(input.interactionId, input.threadId) as (ThreadInteractionRow & { audience?: string }) | undefined;
+      if (!row) return { ok: false as const, reason: "unknown" as const };
+      if (row.audience !== "controller") {
+        return { ok: false as const, reason: "not_controller_routed" as const };
+      }
+      // The stored payload is the interaction this plugin already validated
+      // when it recorded it, not the provider's raw shape, so it is read back
+      // the same way the owner's tap reads it rather than parsed again.
+      const interaction = JSON.parse(row.payload_json) as ThreadInteraction;
+      if (interaction.kind === "unsupported") {
+        return { ok: false as const, reason: "unknown" as const };
+      }
+      let resolution: Record<string, unknown>;
+      if (interaction.kind === "approval") {
+        const decision = input.decision;
+        if (decision === undefined || decision === "allow_for_session" || !interaction.decisions.includes(decision)) {
+          return { ok: false as const, reason: "decision_not_allowed" as const };
+        }
+        resolution = decision === "deny" ? { decision } : { decision, grantedPermissions: null };
+      } else {
+        const answers = input.answers;
+        if (!answers || nextUnansweredQuestion(interaction.questions, answers) !== null) {
+          return { ok: false as const, reason: "decision_not_allowed" as const };
+        }
+        resolution = { kind: "user_answer", answers };
+      }
+      const updated = this.db.prepare(
+        `UPDATE thread_interactions SET state = 'answered', answer_json = ?, answered_at = ?
+          WHERE interaction_id = ? AND state = 'pending'`,
+      ).run(JSON.stringify(resolution), input.now, input.interactionId);
+      if (updated.changes !== 1) return { ok: false as const, reason: "unknown" as const };
+      return { ok: true as const };
     }).immediate();
   }
 

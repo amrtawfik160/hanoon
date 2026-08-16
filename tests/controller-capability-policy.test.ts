@@ -490,6 +490,23 @@ const EXPECTED_CAPABILITIES = {
     receipt_kind: "observation",
     result_limit: 2_000,
   },
+  telegram_agent_answer_thread: {
+    capability_id: "telegram_agent_answer_thread",
+    schema_version: 1,
+    effect_class: "reversible_external_write",
+    risk_class: "high",
+    data_class: ["thread_metadata"],
+    reversibility: "compensating_action",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "exact_entity",
+    credential_scope: { credential: "bb", audience: "bb-plugin-sdk" },
+    egress: ["bb"],
+    proof_kinds: ["external_mutation", "thread_state"],
+    receipt_kind: "tool_receipt",
+    result_limit: 8_000,
+  },
 } as const satisfies Readonly<Record<ControllerToolName, ControllerCapabilityDescriptor>>;
 
 const SAFE_AUTHORITY: ControllerCapabilityAuthority = {
@@ -600,6 +617,7 @@ describe("controller capability manifest", () => {
       "telegram_agent_access_list",
       "telegram_agent_access_status",
       "telegram_agent_access_verify",
+      "telegram_agent_answer_thread",
     ]);
     expect(CONTROLLER_DATA_CLASSES).toEqual([
       "project_metadata",
