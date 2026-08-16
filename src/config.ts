@@ -43,6 +43,11 @@ const globalConfigSchema = z.object({
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode),
   extractionModel: z.enum(EXTRACTION_MODELS).default("inherit"),
   systemUpkeep: z.enum(["enabled", "disabled"]).default("enabled"),
+  selfDiagnosisEnabled: z.preprocess(
+    (value) => value === true || value === "true",
+    z.boolean().default(false),
+  ),
+  selfDiagnosisProjectId: z.string().trim().max(256).default(""),
   capabilityJobGraph: z.enum(["adaptive", "legacy"]).default("adaptive"),
   controllerCapabilityMode: z.enum(["bundled", "all-tools"]).default("bundled"),
   capabilityModelRouting: z.enum(["adaptive", "strong-only"]).default("adaptive"),
@@ -65,6 +70,8 @@ export function parseGlobalConfig(values: {
   controllerPermissionMode?: string;
   extractionModel?: string;
   systemUpkeep?: string;
+  selfDiagnosisEnabled?: boolean | string;
+  selfDiagnosisProjectId?: string;
   capabilityJobGraph?: string;
   controllerCapabilityMode?: string;
   capabilityModelRouting?: string;
@@ -95,6 +102,10 @@ export function extractionModel(config: GlobalConfig): string | null {
  *  messages can turn it off without losing anything they set themselves. */
 export function systemUpkeepEnabled(config: GlobalConfig): boolean {
   return config.systemUpkeep === "enabled";
+}
+
+export function selfDiagnosisEnabled(config: GlobalConfig): boolean {
+  return config.selfDiagnosisEnabled;
 }
 
 export function controllerExecutionProfile(config: GlobalConfig): ControllerExecutionProfile {

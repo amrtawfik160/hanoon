@@ -22,6 +22,7 @@ import {
   controllerExecutionProfiles,
   credentialBrokerConfigFingerprint,
   parseGlobalConfig,
+  selfDiagnosisEnabled,
   systemUpkeepEnabled,
 } from "./config";
 import { parseCredentialBrokerConfig, type CredentialBrokerConfigResult } from "./credentials/config";
@@ -117,9 +118,177 @@ import {
   inspectRuntimeIdentity,
   type ActivationHealth,
 } from "./services/runtime-identity";
+import {
+  SELF_DIAGNOSIS_SERVICE_NAME,
+  SelfDiagnosisService,
+  findSelfDiagnosisCandidates,
+  type SelfDiagnosisLedger,
+  type SelfDiagnosisLedgerState,
+  type SelfDiagnosisTarget,
+} from "./services/self-diagnosis-service";
+import {
+  buildListSelfDiagnosisPullRequestsCommand,
+  parseOpenSelfDiagnosisPullRequests,
+  publishSelfDiagnosisPullRequest,
+} from "./bb/pr-publish";
 
 function clock(): number {
   return Date.now();
+}
+
+const SELF_DIAGNOSIS_LEDGER_KEY = "self-diagnosis:ledger:v1";
+const SELF_DIAGNOSIS_WORKER_TIMEOUT_MS = 15 * 60_000;
+
+function selfDiagnosisLedger(kv: BbPluginApi["storage"]["kv"]): SelfDiagnosisLedger {
+  return {
+    get: () => kv.get<SelfDiagnosisLedgerState>(SELF_DIAGNOSIS_LEDGER_KEY),
+    set: (state) => kv.set(SELF_DIAGNOSIS_LEDGER_KEY, state),
+  };
+}
+
+async function resolveSelfDiagnosisTarget(
+  sdk: BbPluginApi["sdk"],
+  store: TelegramAgentStore,
+  projectId: string,
+): Promise<SelfDiagnosisTarget | null> {
+  const selected = store.listEnabledProjectPolicies().find(({ policy }) => policy.projectId === projectId);
+  if (!selected || projectId.trim().length === 0) return null;
+  const projects = await sdk.projects.list({});
+  const project = projects.find((candidate) => candidate.id === projectId);
+  if (!project || project.kind !== "standard") return null;
+  const source = project.sources.find((candidate) => candidate.isDefault) ?? (
+    project.sources.length === 1 ? project.sources[0] : undefined
+  );
+  if (!source || source.hostId.trim().length === 0) return null;
+  return {
+    projectId,
+    baseBranch: selected.policy.baseBranch,
+    hostId: source.hostId,
+    cwd: source.path ?? null,
+  };
+}
+
+function selfDiagnosisDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function runSelfDiagnosisWorker(input: {
+  sdk: BbPluginApi["sdk"];
+  target: SelfDiagnosisTarget;
+  diagnosisId: string;
+  prompt: string;
+  modelRoute: ReturnType<typeof backgroundCapabilityModelRoute>;
+  signal: AbortSignal;
+}): Promise<{ diagnosis: unknown; environmentId: string; environmentStatus: unknown }> {
+  const thread = await spawnSelfDiagnosisWorker(input);
+  const environmentId = thread.environmentId;
+  if (!environmentId) throw new Error("Self-diagnosis worker has no environment");
+  await waitForSelfDiagnosisWorker({ sdk: input.sdk, threadId: thread.id, signal: input.signal });
+  return readSelfDiagnosisWorkerResult({
+    sdk: input.sdk,
+    target: input.target,
+    threadId: thread.id,
+    environmentId,
+    signal: input.signal,
+  });
+}
+
+async function spawnSelfDiagnosisWorker(input: {
+  sdk: BbPluginApi["sdk"];
+  target: SelfDiagnosisTarget;
+  diagnosisId: string;
+  prompt: string;
+  modelRoute: ReturnType<typeof backgroundCapabilityModelRoute>;
+}): Promise<Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>> {
+  return input.sdk.threads.spawn({
+    projectId: input.target.projectId,
+    title: `Self-diagnosis ${input.diagnosisId}`,
+    visibility: "hidden",
+    input: [{ type: "text", text: input.prompt, mentions: [] }],
+    environment: {
+      type: "host",
+      hostId: input.target.hostId,
+      workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: input.target.baseBranch } },
+    },
+    providerId: input.modelRoute.providerId,
+    model: input.modelRoute.modelId,
+    reasoningLevel: input.modelRoute.reasoning,
+    serviceTier: input.modelRoute.serviceTier,
+    permissionMode: "auto",
+    executionInputSources: {
+      providerId: "explicit",
+      model: "explicit",
+      reasoningLevel: "explicit",
+      serviceTier: "explicit",
+      permissionMode: "explicit",
+    },
+  });
+}
+
+async function waitForSelfDiagnosisWorker(input: {
+  sdk: BbPluginApi["sdk"];
+  threadId: string;
+  signal: AbortSignal;
+}): Promise<void> {
+  const deadline = Date.now() + SELF_DIAGNOSIS_WORKER_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (input.signal.aborted) throw input.signal.reason ?? new DOMException("Aborted", "AbortError");
+    const current = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
+    if (current.status === "error" || current.runtime.displayStatus === "error") {
+      throw new Error("Self-diagnosis worker ended with an error");
+    }
+    if (current.status === "idle" || current.runtime.displayStatus === "idle") {
+      return;
+    }
+    await selfDiagnosisDelay(1_000, input.signal);
+  }
+  try {
+    await input.sdk.threads.stop({ threadId: input.threadId });
+  } catch {
+    // The worker is auxiliary; a stop failure must not escape to the plugin.
+  }
+  throw new Error("Self-diagnosis worker exceeded its deadline");
+}
+
+async function readSelfDiagnosisWorkerResult(input: {
+  sdk: BbPluginApi["sdk"];
+  target: SelfDiagnosisTarget;
+  threadId: string;
+  environmentId: string;
+  signal: AbortSignal;
+}): Promise<{ diagnosis: unknown; environmentId: string; environmentStatus: unknown }> {
+  const output = await input.sdk.threads.output({ threadId: input.threadId, signal: input.signal });
+  const environmentStatus = await input.sdk.environments.status({
+    environmentId: input.environmentId,
+    mergeBaseBranch: input.target.baseBranch,
+    signal: input.signal,
+  });
+  const diff = await input.sdk.environments.diff({
+    environmentId: input.environmentId,
+    target: "all",
+    mergeBaseBranch: input.target.baseBranch,
+    signal: input.signal,
+  });
+  if (diff.outcome !== "available" || diff.diff.truncated || diff.diff.diff.trim().length === 0) {
+    throw new Error("Self-diagnosis worker produced no reviewable code change");
+  }
+  return {
+    diagnosis: output.output ?? "",
+    environmentId: input.environmentId,
+    environmentStatus,
+  };
 }
 
 function reviewLineageScopeId(jobId: string, reviewStage: string): string {
@@ -194,6 +363,18 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       description: "Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard, and message you when something needs a decision. Turning this off does not touch monitors you set yourself.",
       options: ["enabled", "disabled"],
       default: "enabled",
+    },
+    selfDiagnosisEnabled: {
+      type: "boolean",
+      label: "Self-diagnosis",
+      description: "Off by default. When enabled, inspect persisted controller failures out of band and propose at most one cooled-down draft pull request at a time.",
+      default: false,
+    },
+    selfDiagnosisProjectId: {
+      type: "string",
+      label: "Self-diagnosis project id",
+      description: "The enabled BB project containing this plugin repository. Enabling self-diagnosis requires a plugin reload.",
+      default: "",
     },
     capabilityJobGraph: {
       type: "select",
@@ -1738,6 +1919,60 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   bb.background.service("capability-inventory", {
     start: (signal) => capabilityInventory.run(signal),
   });
+  if (config.ok && selfDiagnosisEnabled(config.value)) {
+    const selfDiagnosis = new SelfDiagnosisService({
+      enabled: () => config.ok && selfDiagnosisEnabled(config.value) && config.value.selfDiagnosisProjectId.trim().length > 0,
+      readCandidates: () => findSelfDiagnosisCandidates(bb.storage.database(), clock()),
+      resolveTarget: () => resolveSelfDiagnosisTarget(
+        bb.sdk,
+        store,
+        config.ok ? config.value.selfDiagnosisProjectId : "",
+      ),
+      ledger: selfDiagnosisLedger(bb.storage.kv),
+      github: {
+        listOpen: async (target) => {
+          const result = await terminal.run({
+            scope: { kind: "host_path", hostId: target.hostId, cwd: target.cwd },
+            title: "Check self-diagnosis draft pull requests",
+            command: buildListSelfDiagnosisPullRequestsCommand(),
+            timeoutMs: 60_000,
+          });
+          if (result.outcome !== "exited" || result.exitCode !== 0) return null;
+          return parseOpenSelfDiagnosisPullRequests(result.output);
+        },
+      },
+      analyze: (input) => {
+        if (!config.ok) throw new Error(config.message);
+        return runSelfDiagnosisWorker({
+          sdk: bb.sdk,
+          target: input.target,
+          diagnosisId: input.diagnosisId,
+          prompt: input.prompt,
+          modelRoute: input.modelRoute,
+          signal: input.signal,
+        });
+      },
+      publish: (input) => publishSelfDiagnosisPullRequest({
+        runner: terminal,
+        baseBranch: input.target.baseBranch,
+        candidate: input.candidate,
+        diagnosisId: input.diagnosisId,
+        diagnosis: input.diagnosis,
+        environmentId: input.environmentId,
+        environmentStatus: input.environmentStatus,
+        signal: input.signal,
+      }),
+      modelRoute: () => {
+        if (!config.ok) throw new Error(config.message);
+        return backgroundCapabilityModelRoute(config.value);
+      },
+      clock: { now: clock },
+      warn: (message) => bb.log.warn(message),
+    });
+    bb.background.service(SELF_DIAGNOSIS_SERVICE_NAME, {
+      start: (signal) => selfDiagnosis.run(signal),
+    });
+  }
   bb.background.service("job-executor", {
     start: (signal) => runJobExecutorService({
       store,
