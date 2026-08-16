@@ -8,7 +8,7 @@
  * question along with the work done answering it. A safety limit that destroys
  * the thing it was protecting has failed at its job.
  *
- * The shape, borrowed from Valor's `agent/tool_budget.py`:
+ * The shape:
  *
  *   - `evaluateEvidenceBudget` is PURE and SYNCHRONOUS. It reads two numbers
  *     and returns a verdict. It writes nothing, sends nothing, and cannot
@@ -23,10 +23,10 @@
  * would mean the only warning arrives after the evidence the answer needed was
  * already refused.
  *
- * Valor makes its thresholds environment-overridable because that is its idiom.
- * This plugin has no `process.env` reads anywhere in `src/`; its idiom is the
- * exported, documented constant that `supervisor.ts` already uses, so that is
- * what these are. Tuning is a one-line edit here rather than a host restart.
+ * These thresholds are exported, documented constants rather than environment
+ * overrides: this plugin has no `process.env` reads anywhere in `src/`, and
+ * `supervisor.ts` already uses the same idiom. Tuning is a one-line edit here
+ * rather than a host restart.
  */
 
 /**

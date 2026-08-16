@@ -7,10 +7,8 @@
  * leak itself is someone else's fix; this is the thing that should have caught
  * it, and would catch the next one, whatever it turns out to be.
  *
- * Valor has two pieces here and this borrows both: a daily read-only check that
- * warns below 10 GB free (`reflections/housekeeping/disk_space_check.py`), and
- * a sweep that ages out known-disposable state
- * (`reflections/housekeeping/disk_reclaim.py`). What it borrows above all is
+ * Two pieces work together: a daily read-only check that warns below 10 GB
+ * free, and a sweep that ages out known-disposable state. What matters most is
  * the sweep's posture: every guard fails CLOSED. A check that cannot answer
  * keeps the candidate. Keeping a stale directory one more day costs a
  * directory; guessing wrong costs someone's data.
@@ -22,9 +20,9 @@
 const GIB = 1024 ** 3;
 
 /**
- * Free space below which the owner is told. Valor warns at 10 GB and that
- * number has held up there: large enough that a build, a checkout, or a day of
- * logs still fits afterwards, small enough not to fire on an ordinary machine.
+ * Free space below which the owner is told. 10 GB is large enough that a
+ * build, a checkout, or a day of logs still fits afterwards, and small enough
+ * not to fire on an ordinary machine.
  */
 export const DISK_LOW_FREE_BYTES = 10 * GIB;
 

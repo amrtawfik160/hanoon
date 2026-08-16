@@ -12,15 +12,15 @@ The controller turn is both the thing deciding and the thing at risk. One turn h
 
 The 15 August evidence-budget incident is the shape of it. A per-turn cap fired, the turn was retired, and the owner's question went with it — there was nothing left to notice the question had been lost, because the noticing and the losing were the same session. That specific hole is now closed (`src/controller/evidence-budget.ts`): the turn degrades to a plain-text answer instead of dying. But the closure is one patch on one failure mode. The structural version of the question is whether steering and doing should be the same session at all.
 
-## What Valor does, and how much of it is real
+## The pattern this draws on, and how much of it is real
 
-Valor separates a PM session that steers from Dev sessions that write. The PM triages, routes to the SDLC pipeline, and never implements code directly — a rule its own postmortem (`docs/postmortems/2026-04-24-pm-sdlc-bypass.md`) had to be rewritten twice to make unambiguous, because any qualifier permitting a bypass gets used to bypass.
+The pattern separates a steering session from the sessions that write. The steering session triages, routes to the delivery pipeline, and never implements code directly — a rule that had to be rewritten twice in its original setting to make it unambiguous, because any qualifier permitting a bypass gets used to bypass.
 
-The split is less complete than it reads. Valor's own `agent/tool_budget.py` says so plainly:
+The split is less complete than it reads. The reference implementation's own budget module says so plainly:
 
 > the D1 topology runs Dev inside the PM session, sharing one counter
 
-So in the topology that actually ships, PM and Dev share a session and a budget. The separation Valor gets is one of *role and instruction*, enforced by persona text and pipeline routing, not one of process or permission. That is worth knowing before adopting it: the version of the split that exists in production is mostly the version Hanoon already has.
+So in the topology that actually ships, the steering and writing roles share a session and a budget. The separation achieved is one of *role and instruction*, enforced by persona text and pipeline routing, not one of process or permission. That is worth knowing before adopting it: the version of the split that exists in production is mostly the version Hanoon already has.
 
 ## What Hanoon already has
 
@@ -30,7 +30,7 @@ Hanoon has the delegation half, and has it structurally rather than by instructi
 - Every controller tool is already classified read or write. `src/capabilities/catalog.ts` marks eleven tools `effectClass: "read"` with `ownerApproval: "never"`, and everything else `write` with `ownerApproval: "conditional"`. Write tools go through capability policy, owner approval, and evidence before they take effect.
 - A controller turn that dies does not take the work with it. Jobs, delegations, monitors, and effects are durable and leased; a retired turn is re-driven by the executor, not lost.
 
-So the question is narrower than "should Hanoon split PM from Dev". It already has. The question is what remains unsplit.
+So the question is narrower than "should Hanoon split steering from writing". It already has. The question is what remains unsplit.
 
 ## What remains unsplit
 
@@ -51,7 +51,7 @@ The full version — a read-only steering session that dispatches to a separate 
 - Evidence spanning two sessions. The finalization contract binds claims to evidence recorded on one turn; work done in a second session has to be attested back, which is a new trust boundary in the one place the design is most careful.
 - Roughly a doubling of the controller state machine, whose current cost is visible in `src/controller/service.ts` and its tests.
 
-Against that, the safety benefit is bounded by what the writer session could do wrong — which is the same set of things, in the same workspace, with the same tools. Splitting the sessions does not remove the native toolset; it moves it. Recommendation: **do not build the full split.** It buys less than it costs, and Valor's own experience is that the enforcement lives in the routing and the permissions rather than in the process boundary.
+Against that, the safety benefit is bounded by what the writer session could do wrong — which is the same set of things, in the same workspace, with the same tools. Splitting the sessions does not remove the native toolset; it moves it. Recommendation: **do not build the full split.** It buys less than it costs, and the recorded experience with it is that the enforcement lives in the routing and the permissions rather than in the process boundary.
 
 ## The smallest version that gets the benefit
 
@@ -69,11 +69,11 @@ Sketch, in the order it would land:
 
 `bb.sdk.threads.spawn` does not accept a tool policy. `disallowedTools` exists in the BB runtime — it is on the internal `thread.start` message in `@bb/plugin-sdk`'s bundled types — but it is not on `CreateThreadRequest`, which is what a plugin can send. So the smallest useful version needs a BB-side change first: `disallowedTools` (or an equivalent) plumbed through `threads.spawn`.
 
-That is the honest state of it. The design question resolves to a small, well-scoped change; the change is blocked on a capability the plugin SDK does not expose yet. Implementing something else in its place — instructing the controller not to use its shell, say — would be the "trivial work may bypass the gate" mistake Valor's postmortem is about: a rule that relies on the model choosing to follow it is not a permission boundary, and calling it one is worse than not having it.
+That is the honest state of it. The design question resolves to a small, well-scoped change; the change is blocked on a capability the plugin SDK does not expose yet. Implementing something else in its place — instructing the controller not to use its shell, say — would be the "trivial work may bypass the gate" mistake described above: a rule that relies on the model choosing to follow it is not a permission boundary, and calling it one is worse than not having it.
 
 ## Recommendation
 
-1. Do not build the full PM/Dev session split. It costs a doubled controller state machine and buys less than it appears to, because the native toolset moves rather than disappears.
+1. Do not build the full steering/writing session split. It costs a doubled controller state machine and buys less than it appears to, because the native toolset moves rather than disappears.
 2. Ask for `disallowedTools` on `threads.spawn` in the BB plugin SDK. It is the single prerequisite.
 3. When it lands, deny native writes on the controller spawn by default, governed by the permission-mode setting the owner already has, with a visible refusal when a turn hits it.
 4. Until then, treat the current default (`permissionMode: "auto"`) as load-bearing, and know that `full` removes the only reviewer standing between a controller turn and the owner's personal workspace.

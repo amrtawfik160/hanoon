@@ -6,13 +6,12 @@
  * join deadline swept it up — which is to say a stalled thread was noticed
  * only when someone happened to look.
  *
- * This borrows two things from Valor. From `session_stall_classifier.py`, the
- * shape: a pure, read-only, three-level verdict that names its reason and can
- * never raise or write anything, so the caller decides what a verdict is worth.
- * From `docs/features/pm-session-liveness.md`, the harder-won lesson: silence
- * is not evidence of death. Valor spent several iterations inferring liveness
- * from timestamps, killed working sessions each time, and ended up killing only
- * on evidence and surfacing everything else to a person.
+ * Two decisions shape this. The first is the form: a pure, read-only,
+ * three-level verdict that names its reason and can never raise or write
+ * anything, so the caller decides what a verdict is worth. The second is the
+ * harder-won lesson behind it: silence is not evidence of death. Inferring
+ * liveness from timestamps kills working sessions, so the only safe rule is to
+ * act on evidence and surface everything else to a person.
  *
  * So nothing here kills anything. The worst verdict available is "tell someone
  * about this one", which is what an agent that cannot see inside a thread is
@@ -20,10 +19,10 @@
  */
 
 /**
- * A thread asked to work and still not started. Valor allows twenty minutes,
- * sized at four times a normal cold start, because a heavy context can spend a
- * long time before its first visible token. The same number holds here: a BB
- * thread has an environment to provision before it can do anything at all.
+ * A thread asked to work and still not started. Twenty minutes, sized at four
+ * times a normal cold start, because a heavy context can spend a long time
+ * before its first visible token, and a BB thread has an environment to
+ * provision before it can do anything at all.
  */
 export const NEVER_STARTED_GRACE_MS = 20 * 60_000;
 
