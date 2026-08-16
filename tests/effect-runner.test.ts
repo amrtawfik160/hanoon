@@ -1743,3 +1743,81 @@ describe("late managed worktree", () => {
     });
   });
 });
+
+describe("recovering the jobs this bug already blocked", () => {
+  it("carries a blocked permanent_effect_failure job back through a plain retry", async () => {
+    // The exact shape the four dead adopted-PR jobs are in: blocked on a
+    // dead-lettered spawn_implementation, admission released, and the first
+    // attempt still holding ordinal 1. Nothing here is repaired by hand.
+    const { store, db } = storeFixture();
+    const job = selectedJobForRecovery(store, db, "job_blocked_recovery", "creating_implementation");
+    if (!job) throw new Error("job missing");
+    const lease = store.acquireExecutorLease("owner-a", 1_001, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    addProductionAdmissionAndClaims(db, job.id, policyFixture(), "owner-a", lease.generation, 1_001, 31_000);
+    const spawnImplementation = vi.fn(async () => ({ id: "thr_first", environmentId: "env_1" }));
+    const runSpawn = async (idempotencyKey: string, now: number): Promise<void> => {
+      const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, now, 10, 30_000)
+        .find((candidate) => candidate.idempotencyKey === idempotencyKey);
+      if (!claimed) throw new Error(`spawn effect ${idempotencyKey} missing`);
+      await new EffectRunner({
+        store,
+        fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+        bb: { spawnImplementation },
+        now: () => now,
+      }).run(claimed);
+    };
+    addPendingEffectForRecovery(db, {
+      idempotencyKey: `${job.id}:2:spawn_implementation`,
+      jobId: job.id,
+      kind: "spawn_implementation",
+      payload: {},
+    });
+    await runSpawn(`${job.id}:2:spawn_implementation`, 1_002);
+    expect(store.getJob(job.id)?.implementationThreadId).toBe("thr_first");
+
+    db.prepare(
+      `UPDATE jobs SET state = 'blocked', blocked_reason = 'permanent_effect_failure',
+         resume_state = 'creating_implementation', implementation_thread_id = NULL,
+         last_error = 'Attempt was not stored', version = version + 1 WHERE id = ?`,
+    ).run(job.id);
+    db.prepare("UPDATE effects SET status = 'dead' WHERE job_id = ?").run(job.id);
+    db.prepare("UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = 'blocked' WHERE job_id = ?")
+      .run(1_003, job.id);
+    // Releasing an admission releases the job's resource claims with it; without
+    // that the project still reads as busy and nothing could ever be readmitted.
+    db.prepare("UPDATE job_resource_claims SET state = 'released', released_at = ? WHERE job_id = ?")
+      .run(1_003, job.id);
+    const blocked = store.getJob(job.id)!;
+
+    // Step one: the owner's retry. It queues rather than transitions, which is
+    // why the job looks untouched at this point.
+    const queued = store.retryFailedJob(blocked.id, blocked.version, 1_004);
+    expect(queued.outcome).toBe("queued");
+    expect(store.getJob(job.id)).toMatchObject({ state: "blocked", updatedAt: blocked.updatedAt });
+
+    // Step two: the scheduler admits it and the RETRY lands.
+    expect(store.tryAdmit({
+      jobId: job.id,
+      maxConcurrentJobs: 8,
+      ownerId: "owner-a",
+      generation: lease.generation,
+      now: 1_005,
+      leaseMs: 30_000,
+    }).outcome).toBe("admitted");
+    expect(store.getJob(job.id)).toMatchObject({ state: "creating_implementation", blockedReason: null });
+
+    // Step three: the requeued stage spawns, which is the step that used to die.
+    const requeued = store.listEffectsForJob(job.id)
+      .find((candidate) => candidate.kind === "spawn_implementation" && candidate.status === "pending");
+    if (!requeued) throw new Error("retry did not requeue the implementation stage");
+    spawnImplementation.mockResolvedValue({ id: "thr_second", environmentId: "env_1" });
+    await runSpawn(requeued.idempotencyKey, 1_006);
+
+    expect(store.getJob(job.id)).toMatchObject({ state: "implementing", implementationThreadId: "thr_second" });
+    const ordinals = db
+      .prepare("SELECT ordinal FROM attempts WHERE job_id = ? AND kind = 'implementation' ORDER BY ordinal")
+      .all(job.id) as { ordinal: number }[];
+    expect(ordinals.map((row) => row.ordinal)).toEqual([1, 2]);
+  });
+});
