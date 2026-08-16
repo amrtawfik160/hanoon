@@ -100,6 +100,13 @@ import {
   controllerFinalizationJsonSchema,
 } from "./finalization-contract";
 import { MAX_THREAD_ASK_CHARS } from "./thread-ask";
+import {
+  MAX_OUTBOUND_CAPTION,
+  boundedCaption,
+  mediaKey,
+  planOutboundMedia,
+  withinOutboundLimit,
+} from "./outbound-media";
 import { BROKER_BINDING_STATES, OPAQUE_ID_PATTERN } from "../credentials/protocol";
 import type { CredentialAccessService } from "../credentials/service";
 
@@ -883,6 +890,7 @@ async function resolveTrustedScope(
     }
     case "telegram_agent_access_list":
     case "telegram_agent_access_status":
+    case "telegram_agent_send_media":
       return globalScope();
     case "telegram_agent_access_verify":
       // Existence is a domain question the service answers with a typed
@@ -1430,6 +1438,17 @@ async function projectTrustedEvidence(
       return {
         outcome: after !== trustedState(resolution).beforeOverlay ? "succeeded" : "observed",
         proofKinds: ["memory_state"],
+        subjectRefs: [`controller:${authorized.controller.controllerKey}`],
+      };
+    }
+    case "telegram_agent_send_media": {
+      // Proof that a picture was delivered, and nothing more. The plugin cannot
+      // read an image, so this must never become evidence that whatever the
+      // picture shows is true.
+      const delivered = typeof domain.messageId === "number";
+      return {
+        outcome: delivered ? "succeeded" : "observed",
+        proofKinds: delivered ? ["external_mutation"] : [],
         subjectRefs: [`controller:${authorized.controller.controllerKey}`],
       };
     }
@@ -2270,6 +2289,77 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       // tap uses carries it to BB, so one set of retries covers both.
       if (answered.ok) dependencies.notify();
       return answered;
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[29],
+    description: "Send the owner a screenshot or screen recording from one of your threads, when a picture answers better than a sentence: a page you just changed, a UI bug, a test failing visually. Give the thread that produced the file and its absolute path on that thread's machine. Send it before your reply, then say in words what it shows. A picture is not proof: it never lets you claim tests, validation, or a deployment succeeded, which still need real evidence.",
+    experimental_statusLabels: { pending: "Sending picture", completed: "Sent picture" },
+    parameters: z.object({
+      threadId: z.string().min(1).max(256).describe("The thread whose machine holds the file."),
+      path: z.string().min(1).max(1_024).describe("Absolute path on that machine. Screenshots and recordings only."),
+      caption: z.string().trim().max(MAX_OUTBOUND_CAPTION).optional()
+        .describe("One short line shown under it. Your reply still carries the actual answer."),
+    }).strict(),
+    execute: async (params, context) => {
+      const authorized = authorizedController(dependencies.store, context);
+      const owner = dependencies.store.getOwner();
+      if (!owner) return { queued: false, reason: "No paired owner to send a picture to." };
+      const decision = planOutboundMedia(params.path);
+      if (!decision.ok) return { queued: false, reason: decision.refusal.reason };
+
+      // The file sits on the machine that thread ran on, which is not always
+      // this one. Resolving the host now means delivery never has to guess, and
+      // a thread with no workspace is refused before anything is queued.
+      const thread = await dependencies.sdk.threads.get({ threadId: params.threadId });
+      if (thread.environmentId === null) {
+        return { queued: false, reason: "That thread has no workspace to read a file from." };
+      }
+      const environment = await dependencies.sdk.environments.get({ environmentId: thread.environmentId });
+
+      // Read now purely to find out whether this can ever be delivered. BB
+      // reports no size without reading, and queueing a file that is missing or
+      // too large would answer "queued" to the agent and then fail silently
+      // where nobody is watching. The bytes are deliberately dropped: delivery
+      // reads them again rather than carrying megabytes through an outbox row
+      // that is rewritten on every retry.
+      const file = await dependencies.sdk.files.read({ hostId: environment.hostId, path: params.path });
+      if (file.contentEncoding !== "base64") {
+        return { queued: false, reason: "That file did not read back as an image or a clip." };
+      }
+      if (!withinOutboundLimit(decision.plan, file.sizeBytes)) {
+        return {
+          queued: false,
+          reason: `That file is ${Math.round(file.sizeBytes / 1024 / 1024)}MB and the limit is `
+            + `${Math.round(decision.plan.maxBytes / 1024 / 1024)}MB. Send a smaller one.`,
+        };
+      }
+
+      // Queued rather than sent, so a failed upload retries on the same durable
+      // path as every other message instead of being lost inside one turn.
+      const caption = boundedCaption(params.caption ?? null);
+      dependencies.store.enqueueOutbox({
+        logicalKey: `controller-media:${authorized.controllerKey}:${mediaKey(params.path, caption)}`,
+        chatId: owner.chatId,
+        payload: {
+          media: {
+            hostId: environment.hostId,
+            path: params.path,
+            field: decision.plan.field,
+            mimeType: decision.plan.mimeType,
+            filename: decision.plan.filename,
+            maxBytes: decision.plan.maxBytes,
+            caption,
+          },
+        },
+      }, dependencies.now());
+      dependencies.notify();
+      return {
+        queued: true,
+        filename: decision.plan.filename,
+        kind: decision.plan.field === "photo" ? "screenshot" : "recording",
+      };
     },
   });
 

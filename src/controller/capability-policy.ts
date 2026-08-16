@@ -34,6 +34,7 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_access_status",
   "telegram_agent_access_verify",
   "telegram_agent_answer_thread",
+  "telegram_agent_send_media",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -599,6 +600,32 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     proof_kinds: ["external_mutation", "thread_state"],
     receipt_kind: "tool_receipt",
     result_limit: 8_000,
+  }),
+  /**
+   * Queues a picture for the owner rather than sending one. The send itself is
+   * the outbox's, exactly as it is for a finalized reply, so a failed upload
+   * retries instead of vanishing and no controller tool has to be irreversible.
+   *
+   * `proof_kinds` is empty on purpose: the plugin cannot see what an image
+   * contains, so an attachment must never stand as evidence that the work it
+   * appears to show succeeded.
+   */
+  telegram_agent_send_media: capability({
+    capability_id: "telegram_agent_send_media",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "medium",
+    data_class: ["controller_finalization"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "bb", audience: "bb-plugin-sdk" },
+    egress: ["bb"],
+    proof_kinds: [],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
   }),
 });
 

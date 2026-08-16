@@ -13,6 +13,61 @@ import {
 } from "./helpers";
 
 describe("Telegram Bot API client", () => {
+  it("uploads a screenshot as multipart, letting fetch own the boundary", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await expect(client.sendMedia(
+      "70",
+      { field: "photo", filename: "checkout.png", mimeType: "image/png", bytes: new Uint8Array([137, 80, 78, 71]) },
+      "the checkout page",
+    )).resolves.toEqual({ message_id: 55 });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/sendPhoto");
+    // Forcing a JSON content-type here would strip the multipart boundary and
+    // Telegram would reject the upload.
+    expect(calls[0].init?.headers).toEqual({});
+    const body = calls[0].init?.body as FormData;
+    expect(body).toBeInstanceOf(FormData);
+    expect(body.get("chat_id")).toBe("70");
+    expect(body.get("caption")).toBe("the checkout page");
+    const file = body.get("photo") as File;
+    expect(file.name).toBe("checkout.png");
+    expect(file.type).toBe("image/png");
+    expect(file.size).toBe(4);
+  });
+
+  it("uploads a recording through sendVideo and omits an absent caption", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 56 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await client.sendMedia(
+      "70",
+      { field: "video", filename: "flow.mp4", mimeType: "video/mp4", bytes: new Uint8Array([0, 0, 0, 1]) },
+      null,
+    );
+
+    expect(calls[0].url).toContain("/sendVideo");
+    const body = calls[0].init?.body as FormData;
+    expect(body.get("caption")).toBeNull();
+    expect((body.get("video") as File).name).toBe("flow.mp4");
+  });
+
   it("resolves and downloads a bounded Telegram file without returning a token-bearing URL", async () => {
     const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

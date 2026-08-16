@@ -12,6 +12,8 @@ import { TelegramApiError, type TelegramDeliveryOutcome } from "./errors";
 export { TelegramApiError } from "./errors";
 
 const ORDINARY_REQUEST_TIMEOUT_MS = 15_000;
+/** A 20MB screen recording over a slow uplink is not a stuck request. */
+const MEDIA_UPLOAD_TIMEOUT_MS = 120_000;
 const MAX_LONG_POLL_TIMEOUT_SECONDS = 50;
 const MAX_ATTEMPTS = 4;
 const MAX_RETRY_DELAY_MS = 30_000;
@@ -48,6 +50,19 @@ type TelegramRequest<T> = {
   maxAttempts?: number;
   parseResult: (apiResult: unknown) => T;
   allowNotModified?: boolean;
+  /**
+   * Bytes to upload alongside the payload. Present only for media sends, which
+   * Telegram takes as multipart rather than JSON.
+   */
+  upload?: TelegramUpload;
+};
+
+export type TelegramUpload = {
+  /** The Telegram field the bytes belong to, `photo` or `video`. */
+  field: "photo" | "video";
+  filename: string;
+  mimeType: string;
+  bytes: Uint8Array;
 };
 
 type AttemptResult = {
@@ -285,6 +300,33 @@ export class TelegramClient {
     });
   }
 
+  /**
+   * Sends bytes with an optional caption. A photo and a video differ only in
+   * the Telegram method and field, so one path covers both and there is one
+   * place where an upload can go wrong.
+   *
+   * The timeout is the upload budget, not the ordinary request budget: bytes
+   * over a slow link legitimately take longer than a text send ever should.
+   */
+  public sendMedia(
+    chatId: string,
+    upload: TelegramUpload,
+    caption: string | null,
+    signal?: AbortSignal,
+  ): Promise<{ message_id: number }> {
+    return this.request({
+      method: upload.field === "photo" ? "sendPhoto" : "sendVideo",
+      payload: {
+        chat_id: chatId,
+        ...(caption === null || caption.length === 0 ? {} : { caption, parse_mode: "HTML" }),
+      },
+      upload,
+      callerSignal: signal,
+      timeoutMs: MEDIA_UPLOAD_TIMEOUT_MS,
+      parseResult: parseSentMessage,
+    });
+  }
+
   public sendChatAction(chatId: string, action: "typing", signal?: AbortSignal): Promise<void> {
     if (action !== "typing") throw new TypeError("Unsupported Telegram chat action");
     return this.request({
@@ -436,10 +478,16 @@ export class TelegramClient {
     if (request.callerSignal?.aborted) throw safeRequestError(requestSignal, request.callerSignal, "not_sent");
     let response: Response;
     try {
+      // A media send carries bytes, which Telegram accepts only as multipart.
+      // fetch sets the multipart boundary itself, so the JSON content-type must
+      // not be forced on it.
+      const body = request.upload
+        ? multipartBody(request.payload, request.upload)
+        : serializedPayload;
       response = await this.fetchFn(`${TELEGRAM_API_ROOT}${this.token}/${request.method}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: serializedPayload,
+        headers: request.upload ? {} : { "content-type": "application/json" },
+        body,
         signal: requestSignal,
       });
     } catch (error) {
@@ -487,6 +535,25 @@ export class TelegramClient {
     if (status >= 400 && status <= 599) return { ok: false, error_code: status };
     throw new TelegramResponseValidationError();
   }
+}
+
+/**
+ * The multipart form Telegram wants for an upload: scalar fields as text parts
+ * and the bytes as a file part. Retries reuse the same `Uint8Array`, so the
+ * body is rebuilt per attempt rather than held as a consumed stream.
+ */
+function multipartBody(payload: Record<string, unknown>, upload: TelegramUpload): FormData {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === undefined || value === null) continue;
+    form.append(key, typeof value === "string" ? value : JSON.stringify(value));
+  }
+  form.append(
+    upload.field,
+    new Blob([upload.bytes as BlobPart], { type: upload.mimeType }),
+    upload.filename,
+  );
+  return form;
 }
 
 function serializePayload(payload: Record<string, unknown>): string {

@@ -19,6 +19,12 @@ type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
 export type JobExecutorTelegram = {
   sendMessage(chatId: string, payload: Record<string, unknown>, signal: AbortSignal): Promise<{ message_id: number }>;
+  sendMedia?(
+    chatId: string,
+    upload: { field: "photo" | "video"; filename: string; mimeType: string; bytes: Uint8Array },
+    caption: string | null,
+    signal: AbortSignal,
+  ): Promise<{ message_id: number }>;
   sendMessageDraft?(chatId: string, draftId: number, text: string, signal: AbortSignal): Promise<void>;
   editMessage(chatId: string, messageId: number, payload: Record<string, unknown>, signal: AbortSignal): Promise<void>;
   answerCallback?(callbackQueryId: string, text: string, signal: AbortSignal): Promise<void>;
@@ -34,6 +40,15 @@ export type JobExecutorDependencies = {
   getTelegramClient?: (token?: string) => JobExecutorTelegram;
   telegramToken?: () => string | undefined;
   reconcileJob?: (job: JobRecord, signal: AbortSignal, fence: EffectFence, resourceId?: string) => Promise<void>;
+  /**
+   * Reads a queued picture off the machine that produced it, at delivery time
+   * rather than at enqueue time: a 20MB clip belongs on disk, not inlined into
+   * an outbox row that is rewritten on every retry.
+   */
+  readHostFile?: (
+    input: Readonly<{ hostId: string; path: string }>,
+    signal: AbortSignal,
+  ) => Promise<{ bytes: Uint8Array; sizeBytes: number }>;
   getWorkerThread?: (threadId: string, signal: AbortSignal) => Promise<BbThreadObservation>;
   scheduler?: Pick<AutonomyScheduler, "run">;
   maxConcurrentJobs?: () => number | null;
@@ -453,6 +468,71 @@ function stableChatDraftId(chatId: string): number {
 function payloadText(item: StoredOutbox): string {
   const text = item.payload.text;
   return typeof text === "string" ? text : "";
+}
+
+export type QueuedMedia = Readonly<{
+  hostId: string;
+  path: string;
+  field: "photo" | "video";
+  mimeType: string;
+  filename: string;
+  maxBytes: number;
+  caption: string | null;
+}>;
+
+/**
+ * Recognises a queued picture, and refuses to half-recognise one. The payload
+ * was written by this plugin, but it has been through JSON and a database
+ * since, so every field is checked rather than assumed.
+ */
+export function readQueuedMedia(item: Pick<StoredOutbox, "payload">): QueuedMedia | null {
+  const media = item.payload.media;
+  if (typeof media !== "object" || media === null) return null;
+  const candidate = media as Record<string, unknown>;
+  const strings = ["hostId", "path", "mimeType", "filename"] as const;
+  if (strings.some((key) => typeof candidate[key] !== "string" || (candidate[key] as string).length === 0)) return null;
+  if (candidate.field !== "photo" && candidate.field !== "video") return null;
+  if (!Number.isSafeInteger(candidate.maxBytes) || (candidate.maxBytes as number) <= 0) return null;
+  if (candidate.caption !== null && typeof candidate.caption !== "string") return null;
+  return {
+    hostId: candidate.hostId as string,
+    path: candidate.path as string,
+    field: candidate.field,
+    mimeType: candidate.mimeType as string,
+    filename: candidate.filename as string,
+    maxBytes: candidate.maxBytes as number,
+    caption: (candidate.caption as string | null) ?? null,
+  };
+}
+
+/**
+ * Reads the bytes and uploads them. A file that has grown past its limit, or
+ * gone, fails the row rather than being sent truncated: an unreadable
+ * screenshot is worth retrying, and worth giving up on, but never worth
+ * delivering as something the owner might misread.
+ */
+async function deliverQueuedMedia(input: Readonly<{
+  deps: JobExecutorDependencies;
+  item: StoredOutbox;
+  media: QueuedMedia;
+  telegram: JobExecutorTelegram;
+  signal: AbortSignal;
+}>): Promise<number> {
+  const { deps, item, media, telegram, signal } = input;
+  if (!telegram.sendMedia || !deps.readHostFile) {
+    throw new TypeError("Queued media delivery is not configured");
+  }
+  const file = await deps.readHostFile({ hostId: media.hostId, path: media.path }, signal);
+  if (file.sizeBytes > media.maxBytes || file.bytes.byteLength === 0) {
+    throw new TypeError("Queued media is empty or larger than its limit");
+  }
+  const sent = await telegram.sendMedia(
+    item.chatId,
+    { field: media.field, filename: media.filename, mimeType: media.mimeType, bytes: file.bytes },
+    media.caption,
+    signal,
+  );
+  return sent.message_id;
 }
 
 function controllerDeliveryPayload(
@@ -1175,6 +1255,24 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             const job = jobId ? deps.store.getJob(jobId) : null;
             const knownMessageId = item.messageId ?? job?.statusMessageId ?? null;
             let deliveredMessageId = knownMessageId;
+            // A queued picture takes none of the text transports below: no
+            // draft, no edit, no reply markup. Handled first so the rest of the
+            // loop keeps reasoning about text only.
+            const media = readQueuedMedia(item);
+            if (media !== null) {
+              deliveredMessageId = await deliverQueuedMedia({
+                deps,
+                item,
+                media,
+                telegram,
+                signal: workAbort.signal,
+              });
+              if (!deps.store.completeOutbox(item.logicalKey, ownerId, lease.generation, deliveredMessageId, deps.clock.now())) {
+                continueAcquiring = true;
+                break;
+              }
+              continue;
+            }
             const callback = callbackId(item.logicalKey);
             const turnId = controllerTurnId(item.logicalKey);
             const controllerTurn = turnId ? deps.store.getControllerTurn(turnId) : null;

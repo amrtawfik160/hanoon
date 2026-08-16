@@ -2042,12 +2042,30 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         return {
           sendMessage: (chatId: string, payload: Record<string, unknown>, signal: AbortSignal) =>
             client.sendMessage(chatId, payload as Parameters<TelegramClient["sendMessage"]>[1], signal),
+          sendMedia: (
+            chatId: string,
+            upload: Parameters<TelegramClient["sendMedia"]>[1],
+            caption: string | null,
+            signal: AbortSignal,
+          ) => client.sendMedia(chatId, upload, caption, signal),
           sendMessageDraft: (chatId: string, draftId: number, text: string, signal: AbortSignal) =>
             client.sendMessageDraft(chatId, draftId, text, signal),
           editMessage: (chatId: string, messageId: number, payload: Record<string, unknown>, signal: AbortSignal) =>
             client.editMessage(chatId, messageId, payload as Parameters<TelegramClient["editMessage"]>[2], signal),
           answerCallback: (callbackQueryId: string, text: string, signal: AbortSignal) =>
             client.answerCallback(callbackQueryId, text, signal),
+        };
+      },
+      readHostFile: async ({ hostId, path }, signal) => {
+        const file = await bb.sdk.files.read({ hostId, path, signal });
+        // Base64 is what makes this safe for binary: a still or a clip decoded
+        // as text would upload corrupted and arrive as a broken image.
+        if (file.contentEncoding !== "base64") {
+          throw new TypeError("Queued media did not read back as binary content");
+        }
+        return {
+          bytes: Uint8Array.from(Buffer.from(file.content, "base64")),
+          sizeBytes: file.sizeBytes,
         };
       },
       releaseOnShutdown: true,

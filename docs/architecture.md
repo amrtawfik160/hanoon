@@ -232,6 +232,16 @@ A watch fires on `idle`, `error`, or `missing`. A thread that wedges reaches non
 
 Visible-thread follow-up currently has two paths. Starting or messaging a thread tries to arm one best-effort courtesy monitor for it; a later explicit watch reuses that row and replaces its instruction. A new thread watch holds for a settling minute, and reaching the armed-monitor cap declines only the courtesy monitor rather than the action that prompted it. Independently, lifecycle observation treats an exact `thread:<id>` reference in durable controller evidence as engagement and can enqueue a follow-up when no monitor owns the landing. This inferred obligation has no monitor row, is absent from monitor listings, and does not consume the armed-monitor cap; read-only thread list and status evidence currently qualifies. Delegated fan-outs use their join record instead of one watch per member.
 
+## Sending the owner a picture
+
+The owner works only from Telegram, so a screenshot of the thing being described is often the shortest true answer available. The agent names a thread and an absolute path on that thread's machine, and the picture reaches the owner with a caption.
+
+What may be sent is decided from the file's own extension and size, never from what the agent says about it: stills and clips only, at the same limits the inbound path already uses. The narrowness is the point — this carries pictures of work, not a way to move files off a host into a chat. Only the file name is shown, so a caption cannot leak the directory layout of the owner's machine.
+
+The tool queues rather than sends. Delivery is the outbox's, exactly as it is for a finalized reply, so a failed upload retries instead of vanishing and no controller capability has to be irreversible. Bytes are read at delivery rather than carried through the outbox row, which would otherwise hold megabytes and rewrite them on every retry. They are also read once at queue time, purely to establish that the file exists and fits: BB reports no size without reading, and queueing an undeliverable file would answer "queued" to the agent and then fail where nobody is watching.
+
+A picture carries no proof kind. The plugin cannot see what an image contains, so an attachment can never stand as evidence that the work it appears to show succeeded; tests, validation, merge, and deployment still need their own durable evidence.
+
 ## Thread notices
 
 The owner drives BB from Telegram, so anything that would wait for a click in the BB app is work that waits forever. A background sweep watches every **top-level** visible thread — a sub-agent's thread is reported to its parent, not to the owner, and a Hanoon pipeline worker is already covered by the job status card — and delivers two things:
