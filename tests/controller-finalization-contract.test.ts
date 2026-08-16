@@ -552,6 +552,28 @@ describe("ordered rejection branches", () => {
       .not.toMatch(/do not finalize/i);
   });
 
+  it.each([
+    "I opened the single PR you asked for, folding every branch into one: https://example.test/pull/6",
+    "I created a pull request for the fold.",
+    "I raised a PR against main.",
+    "I filed an issue for the leftover mentions.",
+  ])("rejects an unbacked report that something was opened: %s", (text) => {
+    // Shipped on 2026-08-16 inside an answer about a different project. Opening
+    // a pull request mutates something outside this conversation, so it is the
+    // same class of assertion as merged or published and needs typed evidence.
+    // Requiring that is also what stops it riding along in an unrelated answer:
+    // the evidence it would have to cite has a subject the question does not.
+    expectRejection(textFinalization(text), emptyFinalizationContext(), "high_impact_text_unclaimed");
+  });
+
+  it("still allows ordinary prose that merely contains the word opened", () => {
+    // The guard must catch the external mutation, not every use of the verb.
+    expect(validateControllerFinalization(
+      textFinalization("I opened the knowledge file and read the two stale comments."),
+      emptyFinalizationContext(),
+    )).toMatchObject({ outcome: "accepted" });
+  });
+
   it("keeps the plain-text guards on a degraded answer", () => {
     // Dropping claims must not become a way to assert a success nothing backs.
     expectRejection(

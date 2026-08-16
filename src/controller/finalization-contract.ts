@@ -277,6 +277,17 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     kinds: ["external_mutation", "pipeline_outcome"],
   },
   {
+    // Opening a pull request, issue or ticket mutates something outside this
+    // conversation, so it belongs with merged and published rather than with
+    // ordinary prose. The object is required, not just the verb: "I opened the
+    // knowledge file" reports reading, while "I opened the PR" reports an act
+    // the owner can be held to. Requiring typed evidence is also what keeps
+    // such a report out of an answer about something else, because the
+    // evidence it must cite carries a subject that answer does not.
+    pattern: /\b(?:opened|created|raised|filed|submitted)\b[^.]{0,40}?\b(?:PRs?|pull\s+requests?|issues?|tickets?)\b/i,
+    kinds: ["external_mutation", "pipeline_outcome"],
+  },
+  {
     pattern: /\b(?:deployed|released|rolled\s+out|promoted|provisioned)\b/i,
     kinds: ["external_mutation", "pipeline_outcome"],
     requiredProofKinds: ["production_outcome"],
