@@ -581,6 +581,15 @@ function jobProjection(job: Job, admission?: { state: string } | null) {
   };
 }
 
+/** Whether the failure brake is holding this job's project, and so its queue. */
+function projectAdmissionIsPaused(
+  store: Pick<TelegramAgentStore, "listPausedProjectAdmissions">,
+  job: Job,
+): boolean {
+  return job.projectId !== null &&
+    store.listPausedProjectAdmissions().some((paused) => paused.projectId === job.projectId);
+}
+
 type JobResolution =
   | { outcome: "job"; job: Job }
   | { outcome: "none" }
@@ -916,6 +925,28 @@ function json(value: unknown): string {
 
 const TERMINAL_JOB_STATES = new Set(["merged", "cancelled", "blocked", "complete", "production_failed"]);
 
+/**
+ * Scheduling observations a retry reports beside the job itself. They describe
+ * the queue rather than the job, so the evidence binding checks them separately
+ * instead of hashing them into the bound projection.
+ */
+const RETRY_SCHEDULING_FLAGS = ["cleaningUp"] as const;
+
+/**
+ * What a retry actually did. A retry that only queues the job leaves it
+ * byte-identical, so without naming the three cases apart the caller cannot
+ * tell work that restarted from work that is waiting from work that nothing
+ * will ever pick up.
+ */
+const RETRY_OUTCOMES = new Set([
+  /** The state machine re-entered the stage during this call. */
+  "resumed",
+  /** Requeued; the executor applies it when the job is next admitted. */
+  "queued",
+  /** Requeued, but the failure brake is holding the project, so the queue is not being served. */
+  "queued_project_paused",
+]);
+
 function recordValue(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -1212,16 +1243,28 @@ function jobProjectionEvidence(
   else if (jobResolution?.outcome === "none" || jobResolution?.outcome === "choose_job") {
     expectedDomain = resolutionProjection(jobResolution);
   }
-  // Resuming a blocked plan or review reports whether the previous attempt is
-  // still cleaning up. That flag is a scheduling observation on top of the
-  // bound projection, so it is compared separately rather than hashed with it.
-  const cleaningUp = mutation === "retry" ? domain.cleaningUp : undefined;
-  if (cleaningUp !== undefined && typeof cleaningUp !== "boolean") {
-    throw new Error("job projection carries a non-boolean cleaningUp flag");
+  // Retrying reports scheduling observations alongside the job: whether the
+  // previous attempt is still cleaning up, whether the state machine actually
+  // resumed, and whether the failure brake is holding the project. These sit on
+  // top of the bound projection, so they are checked separately rather than
+  // hashed with it.
+  const schedulingKeys = new Set<string>();
+  if (mutation === "retry") {
+    for (const key of RETRY_SCHEDULING_FLAGS) {
+      if (domain[key] === undefined) continue;
+      if (typeof domain[key] !== "boolean") throw new Error(`job projection carries a non-boolean ${key} flag`);
+      schedulingKeys.add(key);
+    }
+    if (domain.retryOutcome !== undefined) {
+      if (typeof domain.retryOutcome !== "string" || !RETRY_OUTCOMES.has(domain.retryOutcome)) {
+        throw new Error("job projection carries an unknown retryOutcome");
+      }
+      schedulingKeys.add("retryOutcome");
+    }
   }
-  const boundDomain = cleaningUp === undefined
+  const boundDomain = schedulingKeys.size === 0
     ? domain
-    : Object.fromEntries(Object.entries(domain).filter(([key]) => key !== "cleaningUp"));
+    : Object.fromEntries(Object.entries(domain).filter(([key]) => !schedulingKeys.has(key)));
   if (expectedDomain === null || sha256ControllerJson(expectedDomain) !== sha256ControllerJson(boundDomain)) {
     throw new Error("job projection is not bound to the authorized resolution");
   }
@@ -1636,7 +1679,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[3],
-    description: "Resume a recoverable Telegram Agent job: retry a failed or stuck step, continue a blocked plan or review, finish a reviewed PR when production is not configured, or pick up from review when a PR already exists.",
+    description: "Resume a recoverable Telegram Agent job: retry a failed or stuck step, continue a blocked plan or review, finish a reviewed PR when production is not configured, or pick up from review when a PR already exists. Read `retryOutcome` before answering and say which happened: `resumed` restarted the job now, `queued` restarts it when the job is next admitted, and `queued_project_paused` will not restart at all until the project's failure brake is lifted. A queued retry deliberately leaves the job unchanged, so never read an unchanged job as the retry having failed.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
     execute: (_params, context, resolution) => {
       authorizedController(dependencies.store, context);
@@ -1669,7 +1712,17 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         throw new Error("The requested job is not retryable");
       }
       dependencies.notify();
-      return jobProjection(retryResult.job, retryResult.admission);
+      // A retry that only requeues admission leaves the job byte-identical, so
+      // the caller has no way to read what happened out of the job itself. Name
+      // the case instead of leaving it to be inferred from an unchanged row.
+      return {
+        ...jobProjection(retryResult.job, retryResult.admission),
+        retryOutcome: retryResult.outcome === "retried"
+          ? "resumed"
+          : projectAdmissionIsPaused(dependencies.store, retryResult.job)
+            ? "queued_project_paused"
+            : "queued",
+      };
     },
   });
 
