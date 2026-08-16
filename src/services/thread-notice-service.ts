@@ -3,6 +3,40 @@ import { redactError } from "../errors";
 import { parseThreadInteraction } from "../controller/questions";
 import type { TelegramAgentStore } from "../storage/store";
 
+/**
+ * The HTTP status behind a BB rejection, from a structured field when the error
+ * carries one and from its message when it does not. Null means the shape was
+ * not recognised, which is deliberately treated as retryable: guessing
+ * "permanent" from an unreadable error would drop the owner's answer.
+ */
+function httpStatusOf(error: unknown): number | null {
+  const candidate = error as { status?: unknown; statusCode?: unknown } | null;
+  for (const value of [candidate?.status, candidate?.statusCode]) {
+    if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) return value;
+  }
+  const match = /\bHTTP (\d{3})\b/.exec(error instanceof Error ? error.message : String(error ?? ""));
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * Whether BB has refused this answer in a way no retry can change: the
+ * interaction has already been resolved, or is gone.
+ *
+ * It matters more than it looks. Answers are delivered oldest-first, one at a
+ * time, so an undeliverable one does not merely retry forever — it sits at the
+ * head of the queue and every later tap the owner makes waits behind it. Left
+ * alone it also spins about once a second, which is what stopped the executor
+ * shutting down cleanly.
+ *
+ * A rate limit and a server fault are excluded: those are exactly the cases
+ * where retrying is the right answer.
+ */
+export function isPermanentInteractionRejection(error: unknown): boolean {
+  const status = httpStatusOf(error);
+  if (status === null || status === 408 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
+
 export type WatchedThread = {
   id: string;
   title: string;
@@ -161,7 +195,14 @@ export class ThreadNoticeService {
       await this.dependencies.threads.resolve(answered.threadId, answered.interactionId, answered.resolution);
     } catch (error) {
       this.warn(`Answer for ${answered.threadId} could not be delivered`, error);
-      return false;
+      if (!isPermanentInteractionRejection(error)) return false;
+      // BB will never accept this one, and it is first in a single-file queue.
+      // Settling it discharges an obligation that cannot be met and, far more
+      // importantly, lets every answer queued behind it through.
+      return this.dependencies.store.markThreadInteractionDelivered(
+        answered.interactionId,
+        this.dependencies.clock.now(),
+      );
     }
     return this.dependencies.store.markThreadInteractionDelivered(
       answered.interactionId,
