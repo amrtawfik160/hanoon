@@ -1,5 +1,5 @@
-import { existsSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { expect, it } from "vitest";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import {
@@ -9,23 +9,19 @@ import {
 
 const HOST_DIR_PREFIX = "bb-fake-plugin-host-";
 
-function hostDirectories(): Set<string> {
-  return new Set(
-    readdirSync(tmpdir()).filter((entry) => entry.startsWith(HOST_DIR_PREFIX)),
-  );
-}
-
 // A full run used to leave one ~900KB directory per host in /tmp. 533,000 of
 // them had piled up and filled the machine's disk to 100%.
+//
+// The host's own directory is read off its database handle rather than by
+// diffing /tmp: test files run in parallel workers that share one /tmp, so a
+// scan sees directories other workers are creating at the same moment.
 it("removes the temp directory a fake plugin host allocated", async () => {
-  const before = hostDirectories();
-
   const { bb } = createFakePluginHost({ pluginId: "fake-host-cleanup" });
-  bb.storage.database().prepare("CREATE TABLE probe (id INTEGER PRIMARY KEY)").run();
+  const database = bb.storage.database();
+  database.prepare("CREATE TABLE probe (id INTEGER PRIMARY KEY)").run();
 
-  const created = [...hostDirectories()].filter((entry) => !before.has(entry));
-  expect(created).toHaveLength(1);
-  const createdPath = `${tmpdir()}/${created[0]}`;
+  const createdPath = dirname((database as unknown as { name: string }).name);
+  expect(basename(createdPath).startsWith(HOST_DIR_PREFIX)).toBe(true);
   expect(existsSync(createdPath)).toBe(true);
 
   await disposeTrackedFakePluginHosts();
