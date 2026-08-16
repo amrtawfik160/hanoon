@@ -7,6 +7,7 @@ import { TelegramClient } from "../src/telegram/client";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { admitConfirmedJob, policyFixture, telegramFetch } from "./helpers";
 import { runTelegramService, type TelegramServiceDeps } from "../src/services/telegram-service";
+import { ControllerVoiceService } from "../src/services/controller-voice-service";
 
 let fixtureNumber = 0;
 
@@ -148,6 +149,84 @@ describe("Telegram ingress service", () => {
     expect(store.getNextTelegramOffset()).toBe(13);
     expect(client).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("hands off voice work before processing the next update in the same batch", async () => {
+    const { store, db } = storeFixture();
+    const abort = new AbortController();
+    const client = realClientFactory([
+      { ok: true, result: { id: 123, username: "bot" } },
+      {
+        ok: true,
+        result: [
+          {
+            update_id: 10,
+            message: {
+              message_id: 100,
+              from: { id: 7, is_bot: false },
+              chat: { id: 70, type: "private" },
+              voice: { file_id: "voice-10", file_unique_id: "unique-10", duration: 30 },
+            },
+          },
+          {
+            update_id: 11,
+            message: {
+              message_id: 101,
+              from: { id: 7, is_bot: false },
+              chat: { id: 70, type: "private" },
+              text: "handle this while the voice note transcribes",
+            },
+          },
+        ],
+      },
+      { ok: true, result: [] },
+    ], (pollNumber) => {
+      if (pollNumber === 2) abort.abort();
+    });
+    const ingress = new TelegramIngress({
+      store,
+      telegram: {
+        sendMessage: vi.fn(async () => ({ message_id: 200 })),
+        editMessage: vi.fn(async () => undefined),
+        answerCallback: vi.fn(async () => undefined),
+      },
+    });
+
+    await runTelegramService(
+      serviceDeps(store, client, ingress, () => ({ ok: true, value: { botToken: "123:secret" } })),
+      abort.signal,
+    );
+
+    expect(store.getControllerVoice(10)).toMatchObject({ state: "pending", attempts: 0 });
+    expect(db.prepare(
+      "SELECT input_text FROM controller_turns WHERE telegram_update_id = 11",
+    ).get()).toEqual({ input_text: "handle this while the voice note transcribes" });
+    expect(store.getNextTelegramOffset()).toBe(12);
+
+    const lease = store.acquireExecutorLease("voice-order", 2_000, 30_000);
+    expect(lease.acquired).toBe(true);
+    if (!lease.acquired) return;
+    expect(store.claimNextControllerTurn({
+      ownerId: "voice-order",
+      generation: lease.generation,
+      now: 2_000,
+    })).toBeNull();
+
+    const voice = new ControllerVoiceService({
+      store,
+      voice: {
+        download: async () => new Uint8Array([1, 2, 3]),
+        transcribe: async () => ({ outcome: "transcribed", text: "the earlier voice request" }),
+      },
+      clock: { now: () => 2_001 },
+      ownerId: "voice-order-worker",
+    });
+    await expect(voice.processOne(new AbortController().signal)).resolves.toBe(true);
+    expect(store.claimNextControllerTurn({
+      ownerId: "voice-order",
+      generation: lease.generation,
+      now: 2_001,
+    })).toMatchObject({ updateId: 10, inputText: "the earlier voice request" });
   });
 
   it("leaves an in-flight update claimed when service shutdown aborts ingress", async () => {

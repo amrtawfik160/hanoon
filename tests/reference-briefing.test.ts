@@ -67,12 +67,13 @@ it("marks a global document as applying everywhere", () => {
   expect(referenceBriefingFor(target, "proj_1")).toContain("Company guide (applies to every project)");
 });
 
-it("bounds the complete briefing and says how many filed documents were omitted", () => {
+it("bounds the complete briefing and preserves every filed document identity", () => {
   const target = store();
   const many = Array.from({ length: 30 }, (_, index) => `# Section ${index}\n\nbody text here`).join("\n\n");
+  const identities: string[] = [];
   for (let index = 0; index < 30; index += 1) {
     const title = `Spec ${String(index).padStart(2, "0")}`;
-    target.saveReferenceDocument({
+    const saved = target.saveReferenceDocument({
       scope: "project",
       projectId: "proj_1",
       title,
@@ -80,13 +81,33 @@ it("bounds the complete briefing and says how many filed documents were omitted"
       markdown: many,
       now: 2_000,
     });
+    identities.push(saved.document.id);
   }
 
   const briefing = referenceBriefingFor(target, "proj_1");
 
   expect(briefing).toContain("Spec 00");
-  expect(briefing).toMatch(/… and \d+ more reference documents were omitted/);
+  for (let index = 0; index < 30; index += 1) {
+    expect(briefing, `missing document identity ${index}`).toContain(`Spec ${String(index).padStart(2, "0")}`);
+    expect(briefing, `missing stable document id ${index}`).toContain(identities[index]);
+  }
+  expect(briefing).toContain("v1");
   expect(briefing.length).toBeLessThanOrEqual(MAX_REFERENCE_MAP_CHARACTERS);
+});
+
+it("requires a specification conflict to become a durable owner question", () => {
+  const target = store();
+  target.saveReferenceDocument({
+    scope: "project",
+    projectId: "proj_1",
+    title: "Product spec",
+    source: "telegram:doc_conflict",
+    markdown: SPEC,
+    now: 2_000,
+  });
+
+  const briefing = referenceBriefingFor(target, "proj_1");
+  expect(briefing).toMatch(/AskUserQuestion/);
 });
 
 it("shows the preface of a document that has no headings", () => {

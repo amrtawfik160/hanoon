@@ -3,6 +3,7 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { hashSecret } from "../crypto";
 import type { EffectFence } from "../services/effect-runner";
 import type {
+  ControllerMutationFence,
   TelegramAgentStore,
   ThreadOperation,
   ThreadOperationKind,
@@ -13,7 +14,7 @@ import { encodeCallbackData } from "../telegram/view";
 const OPERATION_TTL_MS = 15 * 60_000;
 const STOPPABLE_STATUSES = new Set(["active", "starting", "stopping"]);
 
-type OperationRequest =
+export type OperationRequest =
   | { kind: "steer_thread"; threadId: string; text: string; signal: AbortSignal }
   | { kind: "stop_thread" | "retry_thread"; threadId: string; signal: AbortSignal };
 
@@ -25,6 +26,13 @@ type Dependencies = {
   clock: { now(): number };
   randomBytes?: (size: number) => Buffer;
 };
+
+export class ThreadOperationFenceLostError extends Error {
+  public constructor() {
+    super("The controller turn changed while preparing the thread operation");
+    this.name = "ThreadOperationFenceLostError";
+  }
+}
 
 function confirmationLabel(kind: ThreadOperationKind): string {
   if (kind === "steer_thread") return "Send steering";
@@ -47,39 +55,50 @@ export class ThreadOperationService {
     this.randomBytes = dependencies.randomBytes ?? nodeRandomBytes;
   }
 
-  public async request(input: OperationRequest) {
+  public async request(input: OperationRequest & { controllerFence: ControllerMutationFence }) {
     const owner = this.dependencies.store.getOwner();
     if (!owner) throw new Error("Thread operations require the paired Telegram owner");
     const thread = await this.dependencies.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
     this.assertEligibleTarget(thread, input.kind);
-    const now = this.dependencies.clock.now();
     const nonce = operationSecret(24, this.randomBytes);
-    const operation = this.dependencies.store.createThreadOperation({
-      id: operationSecret(16, this.randomBytes),
-      nonceHash: hashSecret(nonce),
-      ownerUserId: owner.userId,
-      ownerChatId: owner.chatId,
-      kind: input.kind,
-      threadId: input.threadId,
-      text: input.kind === "steer_thread" ? input.text : null,
-      expiresAt: now + OPERATION_TTL_MS,
-      now,
-    });
+    const operation = this.runControllerMutation(input.controllerFence, (now) =>
+      this.dependencies.store.createThreadOperation({
+        id: operationSecret(16, this.randomBytes),
+        nonceHash: hashSecret(nonce),
+        ownerUserId: owner.userId,
+        ownerChatId: owner.chatId,
+        kind: input.kind,
+        threadId: input.threadId,
+        text: input.kind === "steer_thread" ? input.text : null,
+        expiresAt: now + OPERATION_TTL_MS,
+        now,
+      }));
     try {
       const delivered = await this.dependencies.telegram.sendMessage(
         owner.chatId,
         this.confirmationPayload(operation, nonce, safeTitle(thread.title, thread.id)),
       );
-      const awaiting = this.dependencies.store.markThreadOperationConfirmationSent(
-        operation.id,
-        delivered.message_id,
-        this.dependencies.clock.now(),
-      );
+      const awaiting = this.runControllerMutation(input.controllerFence, (now) =>
+        this.dependencies.store.markThreadOperationConfirmationSent(operation.id, delivered.message_id, now));
       return { id: awaiting.id, kind: awaiting.kind, threadId: awaiting.threadId, state: awaiting.state, expiresAt: awaiting.expiresAt };
     } catch (error) {
-      this.dependencies.store.failThreadOperationConfirmation(operation.id, this.dependencies.clock.now());
+      if (error instanceof ThreadOperationFenceLostError) throw error;
+      this.runControllerMutation(input.controllerFence, (now) =>
+        this.dependencies.store.failThreadOperationConfirmation(operation.id, now));
       throw error;
     }
+  }
+
+  private runControllerMutation<T>(
+    fence: ControllerMutationFence,
+    mutation: (now: number) => T,
+  ): T {
+    const mutationOutcome = this.dependencies.store.runControllerMutation(
+      { ...fence, now: this.dependencies.clock.now() },
+      mutation,
+    );
+    if (mutationOutcome.outcome === "stale") throw new ThreadOperationFenceLostError();
+    return mutationOutcome.mutationValue;
   }
 
   public async processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean> {

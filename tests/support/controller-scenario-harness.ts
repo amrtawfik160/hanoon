@@ -1465,6 +1465,14 @@ async function runExtendedScenario(input: Readonly<{
       kind: "stop_thread",
       threadId: externalTargetThreadId,
       signal,
+      controllerFence: {
+        ownerId: executionOwnerId,
+        generation: lease.generation,
+        now: FIXTURE_NOW,
+        turnId: turn.id,
+        controllerKey: turn.controllerKey,
+        expectedThreadId: toolContext.threadId,
+      },
     });
     if (requestedOperation.state !== "awaiting_confirmation" || operationMessages.length !== 1) {
       throw new Error("fixed stale scenario did not request a production approval-required thread operation");

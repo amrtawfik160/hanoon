@@ -330,7 +330,7 @@ describe("deterministic Telegram views", () => {
       expect(rendered.text).toContain("2 rounds of review fixes");
     });
 
-    it("says plainly when a merge happened without asking", () => {
+    it("says plainly when standing authority starts the merge without asking", () => {
       const rendered = renderJobStatus(jobFixture({
         id: telegramJobId,
         state: "merging",

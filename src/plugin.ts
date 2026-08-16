@@ -69,6 +69,7 @@ import {
   type ReviewHandlerCompletion,
 } from "./services/review-handler";
 import { runTelegramService } from "./services/telegram-service";
+import { ControllerVoiceService } from "./services/controller-voice-service";
 import {
   classifyThreadRecovery,
   projectUnknownWorker,
@@ -377,7 +378,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     systemUpkeep: {
       type: "select",
       label: "Self-maintenance",
-      description: "Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard, and message you when something needs a decision. Turning this off does not touch monitors you set yourself.",
+      description: "Lets the agent run its own stale-work, memory, and scorecard monitors, daily read-only repository audits, and bounded deletion of old allowlisted temporary directories. It messages you when something needs a decision. Turning this off does not touch monitors you set yourself or suppress disk-pressure warnings.",
       options: ["enabled", "disabled"],
       default: "enabled",
     },
@@ -493,6 +494,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   });
   const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()), store);
   const executorNudge = new ExecutorNudge();
+  const voiceNudge = new ExecutorNudge();
   const laneSnapshots = new JobLaneSnapshotProvider();
 
   const reportActivationProblem = (activation: ActivationHealth | null): void => {
@@ -1006,8 +1008,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     store,
     telegram: telegramTransport,
     mergeHandler,
-    onWorkAvailable: () => executorNudge.notify(),
+    onWorkAvailable: () => {
+      executorNudge.notify();
+      voiceNudge.notify();
+    },
     health,
+  });
+  const controllerVoice = new ControllerVoiceService({
+    store,
     voice: {
       download: (fileId, maxBytes, signal) => {
         if (!config.ok) throw new Error(config.message);
@@ -1015,6 +1023,10 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       },
       transcribe: transcribeWithBb,
     },
+    clock: { now: clock },
+    onWorkAvailable: () => executorNudge.notify(),
+    waitForWork: (milliseconds, signal) => voiceNudge.wait(milliseconds, signal),
+    warn: (message) => bb.log.warn(message),
   });
   const controllerAdapter = new BbControllerAdapter({
     sdk: bb.sdk,
@@ -2004,6 +2016,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       },
       warn: (message) => bb.log.warn(message),
     }, signal),
+  });
+  bb.background.service("controller-voice", {
+    start: (signal) => controllerVoice.run(signal),
   });
   bb.background.service("capability-inventory", {
     start: (signal) => capabilityInventory.run(signal),

@@ -38,8 +38,10 @@ function save(repo: ReferenceRepository, markdown: string, overrides: Record<str
   });
 }
 
-it("ships exact section digests as the newest append-only migration", () => {
-  expect(ALL_MIGRATIONS[ALL_MIGRATIONS.length - 1]).toContain("CREATE TABLE reference_section_digests");
+it("keeps exact section digests in the append-only migration history", () => {
+  expect(ALL_MIGRATIONS.some((migration) =>
+    migration.includes("CREATE TABLE reference_section_digests"),
+  )).toBe(true);
 });
 
 it("stores a document as a map plus retrievable passages", () => {

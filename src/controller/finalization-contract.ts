@@ -278,8 +278,12 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
     kinds: ["execution_result"],
   },
   {
-    pattern: /\b(?:shipped|merged|published|configured|enabled|activated|launched|landed)\b/i,
+    pattern: /\b(?:shipped|published|configured|enabled|activated|launched)\b/i,
     kinds: ["external_mutation", "pipeline_outcome"],
+  },
+  {
+    pattern: /\b(?:merged|landed)\b/i,
+    kinds: ["pipeline_outcome"],
   },
   {
     // Opening a pull request, issue or ticket mutates something outside this

@@ -221,11 +221,36 @@ it("renders level-five and level-six headings when the budget permits", () => {
 });
 
 it("says how many sections it dropped rather than appearing to end early", () => {
-  const many = Array.from({ length: 40 }, (_, index) => `# Section ${index}\n\nbody`).join("\n\n");
+  const many = [
+    "# Governing section\n\nbody",
+    ...Array.from({ length: 40 }, (_, index) => `## Detail ${index}\n\nbody`),
+  ].join("\n\n");
   const rendered = renderReferenceMap(buildReferenceMap(parseReferenceSections(many)), 120);
 
   expect(rendered).toMatch(/… and \d+ more sections$/);
   expect(rendered.length).toBeLessThanOrEqual(120);
+});
+
+it("keeps every top-level section discoverable instead of cutting off the tail", () => {
+  const many = Array.from(
+    { length: 18 },
+    (_, index) => [
+      `# Governing section ${String(index).padStart(2, "0")}`,
+      "",
+      "body",
+      "",
+      `## Detail ${index}`,
+      "",
+      "detail body",
+    ].join("\n"),
+  ).join("\n\n");
+  const rendered = renderReferenceMap(buildReferenceMap(parseReferenceSections(many)), 260);
+
+  for (let index = 0; index < 18; index += 1) {
+    expect(rendered, `missing top-level section ${index}`).toContain(String(index).padStart(2, "0"));
+  }
+  expect(rendered).toMatch(/… and 18 more sections$/);
+  expect(rendered.length).toBeLessThanOrEqual(260);
 });
 
 it("maps a document preface even when it has no headings", () => {

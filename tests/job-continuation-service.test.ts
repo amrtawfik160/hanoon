@@ -274,3 +274,45 @@ it("keeps counting a pre-upgrade two-part continuation key instead of resetting 
     now: 3_000_000,
   });
 });
+
+it("does not spend another continuation attempt while the same retry is already queued", () => {
+  const recordAutoContinue = vi.fn();
+  const onWorkAvailable = vi.fn();
+  const service = new JobContinuationService({
+    store: {
+      listContinuationCandidates: () => [{
+        job: {
+          id: "job_waiting",
+          version: 7,
+          state: "blocked",
+          blockedReason: "permanent_effect_failure",
+          resumeState: "implementing",
+          lastError: "transient",
+          prNumber: null,
+          reviewCycle: 0,
+          implementationThreadId: "thr_impl",
+          cancelRequestedAt: null,
+          policy: policyFixture(),
+          deliveryMode: "full",
+        },
+        attempts: 1,
+        key: "permanent_effect_failure:implementing:transient",
+      }],
+      recordAutoContinue,
+      retryFailedJob: () => ({ outcome: "already_queued" }),
+      requeueReviewAdmission: () => ({ outcome: "unavailable" }),
+      recordContinuationEscalation: vi.fn(),
+      listEnabledProjectPolicies: () => [],
+      getOwner: () => null,
+      getControllerForOwner: () => null,
+      enqueueControllerTurn: vi.fn(),
+    } as never,
+    clock: { now: () => 3_000_000 },
+    issueUpdateId: (now) => now,
+    onWorkAvailable,
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(recordAutoContinue).not.toHaveBeenCalled();
+  expect(onWorkAvailable).not.toHaveBeenCalled();
+});

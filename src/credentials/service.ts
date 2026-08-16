@@ -33,7 +33,7 @@ import type {
   CredentialHealthRecord,
   CredentialReceiptRecord,
 } from "../storage/credential-access-repository";
-import type { TelegramAgentStore } from "../storage/store";
+import type { ControllerMutationFence, TelegramAgentStore } from "../storage/store";
 import type { AuthorizedControllerCapability } from "../controller/capability-executor";
 
 export type CredentialAccessStore = Pick<
@@ -48,6 +48,7 @@ export type CredentialAccessStore = Pick<
   | "markCredentialOperationAmbiguous"
   | "getCredentialReceipt"
   | "getCredentialHealth"
+  | "runControllerMutation"
 >;
 
 /** The narrow slice of `CredentialBrokerClient` this service actually calls. */
@@ -179,7 +180,10 @@ export class CredentialAccessService {
    * complete secret-free snapshot, and reports bounded readiness plus at
    * most one selected binding. Never resolves a credential.
    */
-  public async status(input: Readonly<{ bindingId?: string }>): Promise<CredentialAccessStatusResult> {
+  public async status(input: Readonly<{
+    bindingId?: string;
+    authorized?: AuthorizedControllerCapability;
+  }>): Promise<CredentialAccessStatusResult> {
     const config = this.deps.config();
     const trustKernelReady = this.deps.trustKernelReady();
     const controllerPermissionMode = this.deps.controllerPermissionMode();
@@ -194,7 +198,7 @@ export class CredentialAccessService {
     }
 
     const installationId = config.value.installationId;
-    await this.refreshDiagnosticHealth(installationId);
+    await this.refreshDiagnosticHealth(installationId, input.authorized);
     const healthRecord = this.deps.store.getCredentialHealth(installationId);
     const readiness = evaluateCredentialFullReadiness({
       trustKernelReady,
@@ -242,14 +246,17 @@ export class CredentialAccessService {
     if (!binding) return { outcome: "denied", reason: "unknown_binding" };
 
     const envelope = this.buildVerifyEnvelope(installationId, binding, input.authorized);
-    const prepared = this.deps.store.prepareCredentialVerificationOperation({
-      ownerId: input.authorized.fence.ownerId,
-      generation: input.authorized.fence.generation,
-      now,
-      installationId,
-      turnId: input.authorized.turn.id,
-      envelope,
-    });
+    const preparedWrite = this.runControllerMutation(input.authorized, (boundaryNow) =>
+      this.deps.store.prepareCredentialVerificationOperation({
+        ownerId: input.authorized.fence.ownerId,
+        generation: input.authorized.fence.generation,
+        now: boundaryNow,
+        installationId,
+        turnId: input.authorized.turn.id,
+        envelope,
+      }));
+    if (preparedWrite.outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
+    const prepared = preparedWrite.mutationValue;
     if (prepared.outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
     if (prepared.outcome === "digest_mismatch") return { outcome: "failed", failureClass: "local_error" };
     if (prepared.outcome === "completed") {
@@ -271,11 +278,21 @@ export class CredentialAccessService {
     const toSend = prepared.outcome === "reconcile_required" ? prepared.operation.envelope : envelope;
     const callOutcome = await this.deps.client.call(toSend);
     if (callOutcome.outcome === "ambiguous") {
-      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: toSend.requestId, now: this.deps.now() });
+      if (this.runControllerMutation(input.authorized, (boundaryNow) =>
+        this.deps.store.markCredentialOperationAmbiguous({
+          installationId,
+          requestId: toSend.requestId,
+          now: boundaryNow,
+        })).outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
       return { outcome: "ambiguous" };
     }
     if (callOutcome.outcome === "failed") {
-      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: toSend.requestId, now: this.deps.now() });
+      if (this.runControllerMutation(input.authorized, (boundaryNow) =>
+        this.deps.store.markCredentialOperationAmbiguous({
+          installationId,
+          requestId: toSend.requestId,
+          now: boundaryNow,
+        })).outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
       return { outcome: "failed", failureClass: "local_error" };
     }
 
@@ -288,19 +305,27 @@ export class CredentialAccessService {
       now: this.deps.now(),
     });
     if (staticRecheck.state !== "ready") {
-      this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: toSend.requestId, now: this.deps.now() });
+      if (this.runControllerMutation(input.authorized, (boundaryNow) =>
+        this.deps.store.markCredentialOperationAmbiguous({
+          installationId,
+          requestId: toSend.requestId,
+          now: boundaryNow,
+        })).outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
       return { outcome: "denied", reason: staticRecheck.state };
     }
 
-    const completed = this.deps.store.completeCredentialVerificationOperation({
-      ownerId: input.authorized.fence.ownerId,
-      generation: input.authorized.fence.generation,
-      now: this.deps.now(),
-      installationId,
-      turnId: input.authorized.turn.id,
-      requestId: toSend.requestId,
-      response: callOutcome.response,
-    });
+    const completedWrite = this.runControllerMutation(input.authorized, (boundaryNow) =>
+      this.deps.store.completeCredentialVerificationOperation({
+        ownerId: input.authorized.fence.ownerId,
+        generation: input.authorized.fence.generation,
+        now: boundaryNow,
+        installationId,
+        turnId: input.authorized.turn.id,
+        requestId: toSend.requestId,
+        response: callOutcome.response,
+      }));
+    if (completedWrite.outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
+    const completed = completedWrite.mutationValue;
     if (completed.outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
     if (completed.outcome === "identity_mismatch" || completed.outcome === "not_found") {
       return { outcome: "failed", failureClass: "local_error" };
@@ -322,23 +347,65 @@ export class CredentialAccessService {
     return this.finalizeVerifyResult(installationId, binding, facts);
   }
 
-  private async refreshDiagnosticHealth(installationId: string): Promise<void> {
+  private async refreshDiagnosticHealth(
+    installationId: string,
+    authorized?: AuthorizedControllerCapability,
+  ): Promise<void> {
     if (!this.deps.client) return;
     const now = this.deps.now();
     const fresh = this.buildHealthEnvelope(installationId, now);
-    const prepared = this.deps.store.prepareCredentialDiagnosticOperation({ installationId, envelope: fresh, now });
+    const preparedWrite = authorized
+      ? this.runControllerMutation(authorized, (boundaryNow) =>
+        this.deps.store.prepareCredentialDiagnosticOperation({
+          installationId,
+          envelope: fresh,
+          now: boundaryNow,
+        }))
+      : { outcome: "applied" as const, mutationValue: this.deps.store.prepareCredentialDiagnosticOperation({
+        installationId,
+        envelope: fresh,
+        now,
+      }) };
+    if (preparedWrite.outcome === "stale") return;
+    const prepared = preparedWrite.mutationValue;
     if (prepared.outcome === "digest_mismatch" || prepared.outcome === "completed") return;
     // A still-outstanding earlier attempt must be reconciled by resending its
     // exact stored envelope; only a genuinely fresh state creates a new one.
     const toSend = prepared.outcome === "reconcile_required" ? prepared.operation.envelope : fresh;
     const callOutcome = await this.deps.client.call(toSend);
     if (callOutcome.outcome === "succeeded") {
-      this.deps.store.completeCredentialDiagnosticOperation({
-        installationId, requestId: toSend.requestId, response: callOutcome.response, now: this.deps.now(),
+      const complete = (boundaryNow: number) => this.deps.store.completeCredentialDiagnosticOperation({
+        installationId,
+        requestId: toSend.requestId,
+        response: callOutcome.response,
+        now: boundaryNow,
       });
+      if (authorized) this.runControllerMutation(authorized, complete);
+      else complete(this.deps.now());
       return;
     }
-    this.deps.store.markCredentialOperationAmbiguous({ installationId, requestId: toSend.requestId, now: this.deps.now() });
+    const mark = (boundaryNow: number) => this.deps.store.markCredentialOperationAmbiguous({
+      installationId,
+      requestId: toSend.requestId,
+      now: boundaryNow,
+    });
+    if (authorized) this.runControllerMutation(authorized, mark);
+    else mark(this.deps.now());
+  }
+
+  private runControllerMutation<T>(
+    authorized: AuthorizedControllerCapability,
+    mutation: (now: number) => T,
+  ) {
+    if (authorized.controller.threadId === null) return { outcome: "stale" as const };
+    const fence: ControllerMutationFence = {
+      ...authorized.fence,
+      now: this.deps.now(),
+      turnId: authorized.turn.id,
+      controllerKey: authorized.controller.controllerKey,
+      expectedThreadId: authorized.controller.threadId,
+    };
+    return this.deps.store.runControllerMutation(fence, mutation);
   }
 
   private buildHealthEnvelope(installationId: string, now: number): BrokerRequestEnvelope {

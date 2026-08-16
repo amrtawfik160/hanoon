@@ -17,6 +17,7 @@ import {
   type MemoryRecord,
   type MonitorRecord,
   type MemoryQueryVector,
+  type ControllerMutationFence,
   type TelegramAgentStore,
   type JobControlKind,
 } from "../storage/store";
@@ -52,7 +53,7 @@ import {
   controllerToolsForBundles,
   type ControllerToolBundleId,
 } from "../capabilities/controller-bundles";
-import type { ThreadOperationService } from "./operations";
+import { ThreadOperationFenceLostError, type ThreadOperationService } from "./operations";
 import {
   assertProjectHostScope,
   assertVisibleThreadScope,
@@ -136,6 +137,7 @@ type ToolDependencies = {
     userId: string;
     chatId: string;
     instructionText: string;
+    controllerFence: ControllerMutationFence;
   }>) => { outcome: "accepted" | "rejected" };
   health(now: number): unknown;
   notify(): void;
@@ -375,6 +377,25 @@ function authorizedController(
     throw new Error("This tool call is not authorized for the durable Telegram controller");
   }
   return controller;
+}
+
+function runControllerMutation<T>(
+  dependencies: ToolDependencies,
+  authorized: AuthorizedControllerCapability,
+  context: Pick<PluginAgentToolContext, "threadId">,
+  mutation: (now: number) => T,
+): T {
+  const mutationOutcome = dependencies.store.runControllerMutation({
+    ...authorized.fence,
+    now: dependencies.now(),
+    turnId: authorized.turn.id,
+    controllerKey: authorized.controller.controllerKey,
+    expectedThreadId: context.threadId,
+  }, mutation);
+  if (mutationOutcome.outcome === "stale") {
+    throw new ControllerCapabilityAuthorizationError("fence_lost");
+  }
+  return mutationOutcome.mutationValue;
 }
 
 function authorizedControllerCapabilityContext(
@@ -683,21 +704,24 @@ function followUpWatchInstruction(threadId: string, title: string | null): strin
  */
 function armFollowUpWatch(
   dependencies: ToolDependencies,
-  controllerKey: string,
+  authorized: AuthorizedControllerCapability,
+  context: Pick<PluginAgentToolContext, "threadId">,
   threadId: string,
   title: string | null,
 ): void {
-  const now = dependencies.now();
   try {
-    if (dependencies.store.ensureThreadWatch({
-      controllerKey,
-      threadId,
-      instruction: followUpWatchInstruction(threadId, title),
-      dueAt: now + THREAD_WATCH_SETTLE_MS,
-      now,
-      mode: "courtesy",
-    }) === null) return;
-  } catch {
+    const monitor = runControllerMutation(dependencies, authorized, context, (now) =>
+      dependencies.store.ensureThreadWatch({
+        controllerKey: authorized.controller.controllerKey,
+        threadId,
+        instruction: followUpWatchInstruction(threadId, title),
+        dueAt: now + THREAD_WATCH_SETTLE_MS,
+        now,
+        mode: "courtesy",
+      }));
+    if (monitor === null) return;
+  } catch (error) {
+    if (error instanceof ControllerCapabilityAuthorizationError) throw error;
     return;
   }
   dependencies.notify();
@@ -1444,7 +1468,10 @@ async function projectTrustedEvidence(
       return {
         outcome: "observed",
         proofKinds: ["retrieved_content"],
-        subjectRefs: refIds(domain.passages, "reference-passage"),
+        subjectRefs: objectArray(domain.passages).flatMap((passage) =>
+          typeof passage.id === "string"
+            ? [`reference-passage:${encodeURIComponent(passage.id)}`]
+            : []),
       };
     case "telegram_agent_forget": {
       const forgotten = domain.forgotten === true;
@@ -1536,10 +1563,10 @@ async function projectTrustedEvidence(
     }
     case "telegram_agent_approve_merge": {
       // Proof only that the merge was enqueued on the owner's instruction.
-      const merged = domain.merged === true;
+      const queued = domain.approvalAccepted === true && domain.mergeQueued === true;
       return {
-        outcome: merged ? "succeeded" : "observed",
-        proofKinds: merged ? ["job_state", "external_mutation"] : [],
+        outcome: queued ? "succeeded" : "observed",
+        proofKinds: queued ? ["job_state"] : [],
         subjectRefs: typeof domain.jobId === "string" ? [`job:${domain.jobId}`] : [],
       };
     }
@@ -1691,7 +1718,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       path: z.enum(["full", "small_fix"]).optional(),
       separateWork: z.boolean().default(false),
     }).strict(),
-    execute: (params, context, resolution) => {
+    execute: (params, context, resolution, authorized) => {
       authorizedController(dependencies.store, context);
       const existing = dependencies.store.findOpenJobByProjectAndTask(params.projectId, params.task);
       if (existing) {
@@ -1710,13 +1737,14 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
             : "Inspect or retry the open job before creating separate work.",
         };
       }
-      const job = dependencies.store.createConfirmedControllerJob({
-        controllerThreadId: context.threadId,
-        projectId: params.projectId,
-        task: params.task,
-        path: params.path,
-        now: dependencies.now(),
-      });
+      const job = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.createConfirmedControllerJob({
+          controllerThreadId: context.threadId,
+          projectId: params.projectId,
+          task: params.task,
+          path: params.path,
+          now,
+        }));
       trustedState(resolution).createdJobId = job.id;
       dependencies.notify();
       return { ...jobProjection(job, dependencies.store.getAdmission(job.id)), existing: false };
@@ -1727,7 +1755,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[2],
     description: "Read one exact durable job status, or return bounded job choices when no id uniquely resolves.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
-    execute: (_params, context, resolution) => {
+    execute: (_params, context, resolution, authorized) => {
       authorizedController(dependencies.store, context);
       const jobResolution = trustedState(resolution).jobResolution!;
       return jobResolution.outcome === "job"
@@ -1740,14 +1768,15 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[3],
     description: "Resume a recoverable Telegram Agent job: retry a failed or stuck step, continue a blocked plan or review, finish a reviewed PR when production is not configured, or pick up from review when a PR already exists. Read `retryOutcome` before answering and say which happened: `resumed` restarted the job now, `queued` accepted the retry into admission but has not restarted it, and `queued_project_paused` will not restart at all until the project's failure brake is lifted. Other scheduler conditions can keep a retry queued, so inspect health if it stays there. A queued retry deliberately leaves the job unchanged, so never read an unchanged job as the retry having failed.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
-    execute: (_params, context, resolution) => {
+    execute: (_params, context, resolution, authorized) => {
       authorizedController(dependencies.store, context);
       const jobResolution = trustedState(resolution).jobResolution!;
       if (jobResolution.outcome !== "job") return resolutionProjection(jobResolution);
       const job = jobResolution.job;
       if (job.cancelRequestedAt !== null) throw new Error("The requested job is not retryable");
       if (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job)) {
-        const queued = dependencies.store.requeueReviewAdmission(job.id, job.version, dependencies.now());
+        const queued = runControllerMutation(dependencies, authorized, context, (now) =>
+          dependencies.store.requeueReviewAdmission(job.id, job.version, now));
         if (queued.outcome === "unavailable") throw new Error("The requested job is not retryable");
         const current = dependencies.store.getJob(job.id) ?? job;
         if (queued.outcome !== "still_cleaning_up") dependencies.notify();
@@ -1759,7 +1788,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       if (job.state !== "failed" && !isResumablePermanentFailure(job)) {
         throw new Error("The requested job is not retryable");
       }
-      const retryResult = dependencies.store.retryFailedJob(job.id, job.version, dependencies.now());
+      const retryResult = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.retryFailedJob(job.id, job.version, now));
       if (retryResult.outcome === "unavailable") {
         // `retryFailedJob` reports a lost version race and an unretryable state
         // the same way. Tell them apart so a concurrent write is never reported
@@ -1789,7 +1819,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[4],
     description: "Request cancellation of a nonterminal Telegram Agent job. Completion remains executor-fenced.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
-    execute: (_params, context, resolution) => {
+    execute: (_params, context, resolution, authorized) => {
       authorizedController(dependencies.store, context);
       const jobResolution = trustedState(resolution).jobResolution!;
       if (jobResolution.outcome !== "job") return resolutionProjection(jobResolution);
@@ -1801,9 +1831,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       }
       if (job.cancelRequestedAt !== null) return jobProjection(job, dependencies.store.getAdmission(job.id));
       const activeWorkers = dependencies.store.getCurrentWorkerLiveness(job.id);
-      const updated = dependencies.store.applyJobEvent(job.id, job.version, activeWorkers === null
-        ? { type: "CANCEL_REQUESTED" }
-        : { type: "CANCEL_REQUESTED", activeWorker: activeWorkers[0] ?? null, activeWorkers }, dependencies.now());
+      const updated = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.applyJobEvent(job.id, job.version, activeWorkers === null
+          ? { type: "CANCEL_REQUESTED" }
+          : { type: "CANCEL_REQUESTED", activeWorker: activeWorkers[0] ?? null, activeWorkers }, now));
       dependencies.notify();
       return jobProjection(updated, dependencies.store.getAdmission(updated.id));
     },
@@ -1874,7 +1905,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       attachOwnerImage: z.boolean().default(false)
         .describe("Attach the photo the owner just sent on this Telegram turn"),
     }).strict(),
-    execute: async (params, context, resolution) => {
+    execute: async (params, context, resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
       const hostId = trustedState(resolution).hostIds?.[params.projectId];
       if (!hostId) throw new Error("The authorized project host is unavailable");
@@ -1892,7 +1923,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         signal: context.signal,
       });
       trustedState(resolution).createdThreadId = created.thread.id;
-      armFollowUpWatch(dependencies, controller.controllerKey, created.thread.id, params.title);
+      armFollowUpWatch(dependencies, authorized, context, created.thread.id, params.title);
       return created;
     },
   });
@@ -1909,7 +1940,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       attachOwnerImage: z.boolean().default(false)
         .describe("Attach the photo the owner just sent on this Telegram turn"),
     }).strict(),
-    execute: async (params, context) => {
+    execute: async (params, context, _resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
       // Resolved before the send so a missing turn fails while nothing has
       // happened yet, rather than after the thread has been instructed.
@@ -1927,17 +1958,30 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       });
       // Recorded only once the send has actually landed, so the owner is never
       // told about an instruction the thread did not receive.
-      dependencies.store.recordControllerThreadAsk({
-        controllerKey: controller.controllerKey,
-        turnId: turn.id,
-        threadId: params.threadId,
-        threadName: sent.sent.threadName,
-        ask: params.ask,
-        now: dependencies.now(),
+      runControllerMutation(dependencies, authorized, context, (now) => {
+        dependencies.store.recordControllerThreadAsk({
+          controllerKey: controller.controllerKey,
+          turnId: turn.id,
+          threadId: params.threadId,
+          threadName: sent.sent.threadName,
+          ask: params.ask,
+          now,
+        });
+        // A thread the agent did not start is watchable all the same: what
+        // earns the follow-up is having engaged with it, not having created it.
+        try {
+          dependencies.store.ensureThreadWatch({
+            controllerKey: controller.controllerKey,
+            threadId: params.threadId,
+            instruction: followUpWatchInstruction(params.threadId, null),
+            dueAt: now + THREAD_WATCH_SETTLE_MS,
+            now,
+            mode: "courtesy",
+          });
+        } catch {
+          // The ask is authoritative; the courtesy monitor remains best effort.
+        }
       });
-      // A thread the agent did not start is watchable all the same: what earns
-      // the follow-up is having engaged with it, not having created it.
-      armFollowUpWatch(dependencies, controller.controllerKey, params.threadId, null);
       return sent;
     },
   });
@@ -1950,9 +1994,27 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       kind: z.enum(["stop_thread", "retry_thread"]),
       threadId: z.string().min(1).max(256),
     }).strict(),
-    execute: async (params, context, resolution) => {
+    execute: async (params, context, resolution, authorized) => {
       authorizedController(dependencies.store, context);
-      const operation = await dependencies.threadOperations.request({ ...params, signal: context.signal });
+      let operation: Awaited<ReturnType<ThreadOperationService["request"]>>;
+      try {
+        operation = await dependencies.threadOperations.request({
+          ...params,
+          signal: context.signal,
+          controllerFence: {
+            ...authorized.fence,
+            now: dependencies.now(),
+            turnId: authorized.turn.id,
+            controllerKey: authorized.controller.controllerKey,
+            expectedThreadId: context.threadId,
+          },
+        });
+      } catch (error) {
+        if (error instanceof ThreadOperationFenceLostError) {
+          throw new ControllerCapabilityAuthorizationError("fence_lost");
+        }
+        throw error;
+      }
       if (recordValue(operation) && typeof (operation as { id?: unknown }).id === "string") {
         trustedState(resolution).operationId = (operation as { id: string }).id;
       }
@@ -1971,17 +2033,18 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       projectId: z.string().min(1).max(256).optional(),
       importance: z.number().min(0).max(1).optional(),
     }).strict(),
-    execute: (params, context, resolution) => {
+    execute: (params, context, resolution, authorized) => {
       authorizedController(dependencies.store, context);
-      const memory = dependencies.store.rememberMemory({
-        scope: params.projectId ?? OWNER_MEMORY_SCOPE,
-        kind: params.kind,
-        subject: params.subject,
-        body: params.body,
-        importance: params.importance,
-        source: "agent",
-        now: dependencies.now(),
-      });
+      const memory = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.rememberMemory({
+          scope: params.projectId ?? OWNER_MEMORY_SCOPE,
+          kind: params.kind,
+          subject: params.subject,
+          body: params.body,
+          importance: params.importance,
+          source: "agent",
+          now,
+        }));
       trustedState(resolution).memoryId = memory.id;
       return { remembered: { id: memory.id, subject: memory.subject, scope: memory.scope } };
     },
@@ -1996,20 +2059,22 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       projectId: z.string().min(1).max(256).optional(),
       limit: z.number().int().min(1).max(20).default(8),
     }).strict(),
-    execute: async (params, context) => {
+    execute: async (params, context, _resolution, authorized) => {
       authorizedController(dependencies.store, context);
       // Embedded first so the search reaches memories that mean the question
       // without sharing its words. A null vector is the ordinary no-model case
       // and simply leaves the search word-based.
       const vector = await dependencies.embedMemoryQuery?.(params.query) ?? null;
       return {
-        memories: dependencies.store.recallMemories({
-          scope: params.projectId ?? OWNER_MEMORY_SCOPE,
-          query: params.query,
-          limit: params.limit,
-          now: dependencies.now(),
-          queryVector: vector ?? undefined,
-        }).map(memoryProjection),
+        memories: runControllerMutation(dependencies, authorized, context, (now) =>
+          dependencies.store.recallMemories({
+            scope: params.projectId ?? OWNER_MEMORY_SCOPE,
+            query: params.query,
+            limit: params.limit,
+            now,
+            turnId: authorized.turn.id,
+            queryVector: vector ?? undefined,
+          })).map(memoryProjection),
       };
     },
   });
@@ -2019,9 +2084,12 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     description: "Forget one memory by id, when the owner says it is wrong or no longer applies.",
     experimental_statusLabels: { pending: "Forgetting", completed: "Forgot" },
     parameters: z.object({ id: z.string().min(1).max(256) }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, _resolution, authorized) => {
       authorizedController(dependencies.store, context);
-      return { forgotten: dependencies.store.forgetMemory({ id: params.id, now: dependencies.now() }) };
+      return {
+        forgotten: runControllerMutation(dependencies, authorized, context, (now) =>
+          dependencies.store.forgetMemory({ id: params.id, now })),
+      };
     },
   });
 
@@ -2041,34 +2109,34 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         instruction: z.string().trim().min(1).max(1_000),
       }).strict(),
     ]),
-    execute: (params, context, resolution) => {
+    execute: (params, context, resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
       if (params.kind === "schedule" && isLiveWorkPollingSchedule(params.instruction)) {
         throw new Error(
           "A repeating schedule cannot poll live work. Watch the worker BB thread with thread_idle; job progress is already event-driven.",
         );
       }
-      const now = dependencies.now();
-      const monitor = params.kind === "thread_idle"
-        // A thread already watched for the agent keeps its one watch and takes
-        // the instruction the agent just wrote, rather than gaining a second
-        // watch that would wake it twice for the same landing.
-        ? dependencies.store.ensureThreadWatch({
-          controllerKey: controller.controllerKey,
-          threadId: params.threadId,
-          instruction: params.instruction,
-          dueAt: now + THREAD_WATCH_SETTLE_MS,
-          now,
-          mode: "explicit",
-        })
-        : dependencies.store.createMonitor({
-          controllerKey: controller.controllerKey,
-          kind: "schedule",
-          cron: params.cron,
-          instruction: params.instruction,
-          dueAt: requireCronOccurrence(params.cron, now),
-          now,
-        });
+      const monitor = runControllerMutation(dependencies, authorized, context, (now) =>
+        params.kind === "thread_idle"
+          // A thread already watched for the agent keeps its one watch and
+          // takes the instruction the agent just wrote, rather than gaining a
+          // second watch that would wake it twice for the same landing.
+          ? dependencies.store.ensureThreadWatch({
+            controllerKey: controller.controllerKey,
+            threadId: params.threadId,
+            instruction: params.instruction,
+            dueAt: now + THREAD_WATCH_SETTLE_MS,
+            now,
+            mode: "explicit",
+          })
+          : dependencies.store.createMonitor({
+            controllerKey: controller.controllerKey,
+            kind: "schedule",
+            cron: params.cron,
+            instruction: params.instruction,
+            dueAt: requireCronOccurrence(params.cron, now),
+            now,
+          }));
       if (monitor === null) throw new Error("That watch could not be armed; cancel one you no longer need first");
       trustedState(resolution).monitorId = monitor.id;
       dependencies.notify();
@@ -2094,14 +2162,11 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[16],
     description: "Cancel one monitor by id.",
     parameters: z.object({ id: z.string().min(1).max(256) }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, _resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
       return {
-        cancelled: dependencies.store.cancelControllerMonitor(
-          controller.controllerKey,
-          params.id,
-          dependencies.now(),
-        ),
+        cancelled: runControllerMutation(dependencies, authorized, context, (now) =>
+          dependencies.store.cancelControllerMonitor(controller.controllerKey, params.id, now)),
       };
     },
   });
@@ -2130,16 +2195,17 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         prompt: z.string().trim().min(1).max(4_000),
       }).strict()).min(1).max(4),
     }).strict(),
-    execute: async (params, context, resolution) => {
+    execute: async (params, context, resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
       // The delegation is recorded before anything is spawned, so a failure
       // partway through leaves threads that are still joined and reported
       // rather than orphans nobody is waiting on.
-      const delegation = dependencies.store.createDelegation({
-        controllerKey: controller.controllerKey,
-        instruction: params.instruction,
-        now: dependencies.now(),
-      });
+      const delegation = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.createDelegation({
+          controllerKey: controller.controllerKey,
+          instruction: params.instruction,
+          now,
+        }));
       trustedState(resolution).delegationId = delegation.id;
       const started: { threadId: string; title: string; projectId: string }[] = [];
       for (const task of params.tasks) {
@@ -2159,10 +2225,12 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           threadId = created.thread.id;
         } catch (error) {
           if (started.length === 0) {
-            dependencies.store.cancelDelegation(delegation.id, dependencies.now());
+            runControllerMutation(dependencies, authorized, context, (now) =>
+              dependencies.store.cancelDelegation(delegation.id, now));
             throw error;
           }
-          dependencies.store.sealDelegation({ id: delegation.id, now: dependencies.now() });
+          runControllerMutation(dependencies, authorized, context, (now) =>
+            dependencies.store.sealDelegation({ id: delegation.id, now }));
           dependencies.notify();
           return {
             outcome: "partial",
@@ -2174,18 +2242,20 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         // A rejected member means the join already fired or the delegation
         // closed; recording it as started would promise a result nobody will
         // ever deliver.
-        if (!dependencies.store.addDelegationThread({
-          delegationId: delegation.id,
-          threadId,
-          projectId: task.projectId,
-          title: task.title,
-          now: dependencies.now(),
-        })) break;
+        if (!runControllerMutation(dependencies, authorized, context, (now) =>
+          dependencies.store.addDelegationThread({
+            delegationId: delegation.id,
+            threadId,
+            projectId: task.projectId,
+            title: task.title,
+            now,
+          }))) break;
         started.push({ threadId, title: task.title, projectId: task.projectId });
       }
       // Sealed only once every member is durably recorded, so the executor
       // cannot join a fan-out that is still being published.
-      dependencies.store.sealDelegation({ id: delegation.id, now: dependencies.now() });
+      runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.sealDelegation({ id: delegation.id, now }));
       dependencies.notify();
       return {
         outcome: started.length === params.tasks.length ? "delegated" : "partial",
@@ -2217,13 +2287,14 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     parameters: z.object({
       text: z.string().max(MAX_CONTROLLER_OVERLAY),
     }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, _resolution, authorized) => {
       authorizedController(dependencies.store, context);
       return {
-        workingStyle: dependencies.store.setControllerOverlay({
-          text: params.text,
-          now: dependencies.now(),
-        }),
+        workingStyle: runControllerMutation(dependencies, authorized, context, (now) =>
+          dependencies.store.setControllerOverlay({
+            text: params.text,
+            now,
+          })),
       };
     },
   });
@@ -2265,68 +2336,70 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[23],
     description: "Send a clear owner follow-up into the current admitted implementation instead of creating another job. Use this for corrections, constraints, and extra acceptance details that belong to work already underway.",
-      experimental_statusLabels: { pending: "Updating implementation", completed: "Implementation updated" },
-      parameters: z.object({
-        jobId: z.string().min(1).max(256).optional(),
-        text: z.string().trim().min(1).max(4_000),
-      }).strict(),
-      execute: (params, context) => {
-        const controller = authorizedController(dependencies.store, context);
-        const candidates = dependencies.store.listJobs(100).filter((job) =>
-          (job.state === "implementing" || job.state === "remediating") &&
-          job.implementationThreadId !== null && job.cancelRequestedAt === null &&
-          dependencies.store.getAdmission(job.id)?.state === "admitted"
-        );
-        const job = params.jobId === undefined
-          ? (candidates.length === 1 ? candidates[0] : null)
-          : candidates.find((candidate) => candidate.id === params.jobId) ?? null;
-        if (!job) {
-          return candidates.length > 1 && params.jobId === undefined
-            ? { outcome: "choose_job", candidates: candidates.slice(0, 8).map(candidateProjection) }
-            : { outcome: "no_steerable_job", candidates: [] };
-        }
-        const turn = dependencies.store.getPendingControllerTurn(controller.controllerKey);
-        if (!turn || job.implementationThreadId === null) throw new Error("The controller turn cannot steer this job");
-        const steered = dependencies.store.enqueueSteeringEffect(
+    experimental_statusLabels: { pending: "Updating implementation", completed: "Implementation updated" },
+    parameters: z.object({
+      jobId: z.string().min(1).max(256).optional(),
+      text: z.string().trim().min(1).max(4_000),
+    }).strict(),
+    execute: (params, context, _resolution, authorized) => {
+      const controller = authorizedController(dependencies.store, context);
+      const candidates = dependencies.store.listJobs(100).filter((job) =>
+        (job.state === "implementing" || job.state === "remediating") &&
+        job.implementationThreadId !== null && job.cancelRequestedAt === null &&
+        dependencies.store.getAdmission(job.id)?.state === "admitted"
+      );
+      const job = params.jobId === undefined
+        ? (candidates.length === 1 ? candidates[0] : null)
+        : candidates.find((candidate) => candidate.id === params.jobId) ?? null;
+      if (!job) {
+        return candidates.length > 1 && params.jobId === undefined
+          ? { outcome: "choose_job", candidates: candidates.slice(0, 8).map(candidateProjection) }
+          : { outcome: "no_steerable_job", candidates: [] };
+      }
+      const turn = dependencies.store.getPendingControllerTurn(controller.controllerKey);
+      if (!turn || job.implementationThreadId === null) throw new Error("The controller turn cannot steer this job");
+      const steered = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.enqueueSteeringEffect(
           job.id,
           turn.updateId,
-          job.implementationThreadId,
+          job.implementationThreadId!,
           params.text,
-          dependencies.now(),
-        );
-        if (!steered) throw new Error("The implementation is no longer steerable");
-        dependencies.notify();
-        return { steered: true, ...jobProjection(job, dependencies.store.getAdmission(job.id)) };
+          now,
+        ));
+      if (!steered) throw new Error("The implementation is no longer steerable");
+      dependencies.notify();
+      return { steered: true, ...jobProjection(job, dependencies.store.getAdmission(job.id)) };
     },
   });
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[24],
     description: "Adopt an existing open, non-draft pull request as a guarded full job. The plugin verifies the selected repository, base branch, PR identity, exact remote head, and a deterministic local branch before queuing review and finish work. Planning and critique are recorded as skipped.",
-      experimental_statusLabels: { pending: "Verifying pull request", completed: "Adopted pull request" },
-      parameters: z.object({
-        projectId: z.string().min(1).max(256),
-        prNumber: z.number().int().positive(),
-        task: z.string().trim().min(1).max(4_000).default("Review and finish the existing pull request"),
-      }).strict(),
-      execute: async (params, context) => {
-        authorizedController(dependencies.store, context);
-        const policyRecord = dependencies.store.getProjectPolicy(params.projectId);
-        if (!policyRecord?.policy.enabled) throw new Error("Selected project is not enabled");
-        const projects = await dependencies.sdk.projects.list();
-        const project = projects.find((candidate) => candidate.id === params.projectId);
-        if (!project || project.kind !== "standard") throw new Error("Selected project cannot host an adopted pull request");
-        const source = project.sources.find((candidate) => candidate.isDefault) ??
-          (project.sources.length === 1 ? project.sources[0] : undefined);
-        if (!source?.hostId || !source.path) throw new Error("Selected project has no unambiguous local source");
-        const adopted = await adoptPullRequest({
-          runner: new TerminalCommandRunner(dependencies.sdk),
-          scope: { kind: "host_path", hostId: source.hostId, cwd: source.path },
-          policy: policyRecord.policy,
-          prNumber: params.prNumber,
-          signal: context.signal,
-        });
-        const job = dependencies.store.createAdoptedControllerJob({
+    experimental_statusLabels: { pending: "Verifying pull request", completed: "Adopted pull request" },
+    parameters: z.object({
+      projectId: z.string().min(1).max(256),
+      prNumber: z.number().int().positive(),
+      task: z.string().trim().min(1).max(4_000).default("Review and finish the existing pull request"),
+    }).strict(),
+    execute: async (params, context, _resolution, authorized) => {
+      authorizedController(dependencies.store, context);
+      const policyRecord = dependencies.store.getProjectPolicy(params.projectId);
+      if (!policyRecord?.policy.enabled) throw new Error("Selected project is not enabled");
+      const projects = await dependencies.sdk.projects.list();
+      const project = projects.find((candidate) => candidate.id === params.projectId);
+      if (!project || project.kind !== "standard") throw new Error("Selected project cannot host an adopted pull request");
+      const source = project.sources.find((candidate) => candidate.isDefault) ??
+        (project.sources.length === 1 ? project.sources[0] : undefined);
+      if (!source?.hostId || !source.path) throw new Error("Selected project has no unambiguous local source");
+      const adopted = await adoptPullRequest({
+        runner: new TerminalCommandRunner(dependencies.sdk),
+        scope: { kind: "host_path", hostId: source.hostId, cwd: source.path },
+        policy: policyRecord.policy,
+        prNumber: params.prNumber,
+        signal: context.signal,
+      });
+      const job = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.createAdoptedControllerJob({
           controllerThreadId: context.threadId,
           projectId: params.projectId,
           task: params.task,
@@ -2334,9 +2407,9 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           prUrl: adopted.prUrl,
           headSha: adopted.headSha,
           branchName: adopted.branchName,
-          now: dependencies.now(),
-        });
-        dependencies.notify();
+          now,
+        }));
+      dependencies.notify();
       return { ...jobProjection(job, dependencies.store.getAdmission(job.id)), adopted: true };
     },
   });
@@ -2361,9 +2434,9 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     parameters: z.object({
       bindingId: z.string().regex(OPAQUE_ID_PATTERN).max(128).optional(),
     }).strict(),
-    execute: async (params) => {
+    execute: async (params, _context, _resolution, authorized) => {
       if (!dependencies.credentialAccess) return { readiness: { state: "disabled", checks: [] }, health: null, binding: null };
-      return await dependencies.credentialAccess.status(params);
+      return await dependencies.credentialAccess.status({ ...params, authorized });
     },
   });
 
@@ -2393,15 +2466,16 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         freeText: z.string().max(2_000).optional(),
       }).strict()).optional().describe("For a question, keyed by question id."),
     }).strict(),
-    execute: async (params, context) => {
+    execute: async (params, context, _resolution, authorized) => {
       authorizedController(dependencies.store, context);
-      const answered = dependencies.store.answerThreadInteractionAsController({
-        threadId: params.threadId,
-        interactionId: params.interactionId,
-        decision: params.decision,
-        answers: params.answers,
-        now: dependencies.now(),
-      });
+      const answered = runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.answerThreadInteractionAsController({
+          threadId: params.threadId,
+          interactionId: params.interactionId,
+          decision: params.decision,
+          answers: params.answers,
+          now,
+        }));
       // The answer is queued, not sent here: the same delivery path the owner's
       // tap uses carries it to BB, so one set of retries covers both.
       if (answered.ok) dependencies.notify();
@@ -2419,8 +2493,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       caption: z.string().trim().max(MAX_OUTBOUND_CAPTION).optional()
         .describe("One short line shown under it. Your reply still carries the actual answer."),
     }).strict(),
-    execute: async (params, context) => {
-      const authorized = authorizedController(dependencies.store, context);
+    execute: async (params, context, _resolution, authorized) => {
+      authorizedController(dependencies.store, context);
       const owner = dependencies.store.getOwner();
       if (!owner) return { queued: false, reason: "No paired owner to send a picture to." };
       const decision = planOutboundMedia(params.path);
@@ -2456,21 +2530,22 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       // Queued rather than sent, so a failed upload retries on the same durable
       // path as every other message instead of being lost inside one turn.
       const caption = boundedCaption(params.caption ?? null);
-      dependencies.store.enqueueOutbox({
-        logicalKey: `controller-media:${authorized.controllerKey}:${mediaKey(params.path, caption)}`,
-        chatId: owner.chatId,
-        payload: {
-          media: {
-            hostId: environment.hostId,
-            path: params.path,
-            field: decision.plan.field,
-            mimeType: decision.plan.mimeType,
-            filename: decision.plan.filename,
-            maxBytes: decision.plan.maxBytes,
-            caption,
+      runControllerMutation(dependencies, authorized, context, (now) =>
+        dependencies.store.enqueueOutbox({
+          logicalKey: `controller-media:${authorized.controller.controllerKey}:${mediaKey(params.path, caption)}`,
+          chatId: owner.chatId,
+          payload: {
+            media: {
+              hostId: environment.hostId,
+              path: params.path,
+              field: decision.plan.field,
+              mimeType: decision.plan.mimeType,
+              filename: decision.plan.filename,
+              maxBytes: decision.plan.maxBytes,
+              caption,
+            },
           },
-        },
-      }, dependencies.now());
+        }, now));
       dependencies.notify();
       return {
         queued: true,
@@ -2482,25 +2557,26 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[30],
-    description: "Land a job the owner explicitly told you to merge or land. Use it at once for an unambiguous instruction about a job waiting on approval. A generic instruction works only when exactly one job is waiting; when several are waiting, the owner must name the job. Deployment language is not merge approval. Everything the pipeline checks still runs; this replaces their tap, nothing else.",
-    experimental_statusLabels: { pending: "Landing the work", completed: "Landed" },
+    description: "Queue the guarded merge for a job the owner explicitly told you to merge or land. Use it at once for an unambiguous instruction about a job waiting on approval. A generic instruction works only when exactly one job is waiting; when several are waiting, the owner must name the job. Deployment language is not merge approval. Everything the pipeline checks still runs; this replaces their tap, nothing else, and does not mean the merge has landed.",
+    experimental_statusLabels: { pending: "Queuing the merge", completed: "Merge queued" },
     parameters: z.object({
       jobId: z.string().min(1).max(256).describe("The job waiting on merge approval."),
     }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, _resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
       const approve = dependencies.approveMergeFromOwnerInstruction;
-      if (!approve) return { merged: false, reason: "Merging is not configured." };
+      if (!approve) return { approvalAccepted: false, mergeQueued: false, reason: "Merging is not configured." };
       const owner = dependencies.store.getOwner();
-      if (!owner) return { merged: false, reason: "No paired owner." };
+      if (!owner) return { approvalAccepted: false, mergeQueued: false, reason: "No paired owner." };
 
       // The authority comes from the owner's own words, read here rather than
       // taken from the agent's account of them. A system turn never carries it:
       // a monitor notice quoting "merge it" must not be able to approve a merge.
-      const turn = dependencies.store.getPendingControllerTurn(controller.controllerKey);
+      const turn = authorized.turn;
       if (!turn || turn.origin !== "owner" || !isMergeInstruction(turn.inputText)) {
         return {
-          merged: false,
+          approvalAccepted: false,
+          mergeQueued: false,
           reason: "The owner has not asked for this in their message, so the approval still has to be theirs.",
         };
       }
@@ -2509,11 +2585,18 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         userId: owner.userId,
         chatId: owner.chatId,
         instructionText: turn.inputText,
+        controllerFence: {
+          ...authorized.fence,
+          now: dependencies.now(),
+          turnId: turn.id,
+          controllerKey: controller.controllerKey,
+          expectedThreadId: context.threadId,
+        },
       });
       dependencies.notify();
       return result.outcome === "accepted"
-        ? { merged: true, jobId: params.jobId }
-        : { merged: false, reason: "That job is not waiting for a merge approval right now." };
+        ? { approvalAccepted: true, mergeQueued: true, jobId: params.jobId }
+        : { approvalAccepted: false, mergeQueued: false, reason: "That job is not waiting for a merge approval right now." };
     },
   });
 
@@ -2524,11 +2607,15 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     parameters: z.object({
       projectId: z.string().min(1).max(256),
     }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, _resolution, authorized) => {
       authorizedController(dependencies.store, context);
       const outcome = dependencies.store.clearProjectAdmissionPauseAsAgent({
         projectId: params.projectId,
+        ...authorized.fence,
         now: dependencies.now(),
+        turnId: authorized.turn.id,
+        controllerKey: authorized.controller.controllerKey,
+        expectedThreadId: context.threadId,
       });
       if (outcome.outcome === "cleared") dependencies.notify();
       return outcome.outcome === "cleared"
@@ -2547,16 +2634,27 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       source: z.string().trim().min(1).max(1_024),
       projectId: z.string().min(1).max(256).optional(),
     }).strict(),
-    execute: (params, context) => {
+    execute: (params, context, _resolution, authorized) => {
       authorizedController(dependencies.store, context);
-      const saved = dependencies.store.saveReferenceDocument({
+      if (authorized.turn.origin !== "owner") {
+        return {
+          stored: false,
+          reason: "Only a reference supplied in the owner's own message can be filed.",
+        };
+      }
+      const saved = dependencies.store.saveControllerReferenceDocument({
         scope: params.projectId === undefined ? "global" : "project",
         projectId: params.projectId ?? null,
         title: params.title,
         source: params.source,
         markdown: params.text,
+        ...authorized.fence,
         now: dependencies.now(),
+        turnId: authorized.turn.id,
+        controllerKey: authorized.controller.controllerKey,
+        expectedThreadId: context.threadId,
       });
+      if (saved === null) throw new ControllerCapabilityAuthorizationError("fence_lost");
       return {
         stored: true,
         documentId: saved.document.id,
@@ -2688,13 +2786,25 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     }).strict(),
     execute: (params, context) => {
       const { controller, turn, profile } = authorizedControllerCapabilityContext(dependencies.store, context);
-      const expansion = dependencies.store.requestControllerCapabilityExpansion({
-        controllerKey: controller.controllerKey,
-        turnId: turn.id,
-        expectedProfileId: profile.id,
-        bundleIds: params.bundleIds,
-        now: dependencies.now(),
-      });
+      const mutation = turn.leaseOwner !== null && turn.leaseGeneration !== null
+        ? dependencies.store.runControllerMutation({
+          ownerId: turn.leaseOwner,
+          generation: turn.leaseGeneration,
+          now: dependencies.now(),
+          turnId: turn.id,
+          controllerKey: controller.controllerKey,
+          expectedThreadId: context.threadId,
+        }, (now) => dependencies.store.requestControllerCapabilityExpansion({
+          controllerKey: controller.controllerKey,
+          turnId: turn.id,
+          expectedProfileId: profile.id,
+          bundleIds: params.bundleIds,
+          now,
+        }))
+        : { outcome: "stale" as const };
+      const expansion = mutation.outcome === "applied"
+        ? mutation.mutationValue
+        : { outcome: "denied" as const, reasonCode: "fence_lost" };
       dependencies.notify();
       return json(expansion.outcome === "resume_required"
         ? {

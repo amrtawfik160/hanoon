@@ -39,11 +39,11 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Live thread insight | "Why is this taking so long?" answers from the thread's current step, todo list, running commands, and latest message — not just its status. |
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
-| Voice notes | Send a Telegram voice note or audio message. Hanoon uses BB's configured transcription service, keeps only the transcript, and tells you plainly when transcription is unavailable. |
+| Voice notes | Send a Telegram voice note or audio message. Hanoon durably queues transcription without storing the audio bytes, keeps later messages in order, and tells you plainly when transcription is unavailable or too long for one message. |
 | Reference documents | File project or global specifications, search their passages, and give every pipeline stage a bounded structural map of what governs the work. |
 | Working style | "Be terser" or "always show me the PR link" sticks, without a code change. It can shape tone and habits, never a safety boundary. |
 | Parallel work | "Compare the invoice spike and the billing latency" opens both at once and answers from what comes back. |
-| Self-maintenance | A daily sweep for work needing your decision, a weekly memory audit, and a weekly scorecard of what actually happened. Off by one setting. |
+| Self-maintenance | Daily stale-work and read-only repository audits, bounded cleanup of old allowlisted plugin temporary directories, a weekly memory audit, and a weekly scorecard. Off by one setting; disk-pressure warnings remain active. |
 | Monitors | "Tell me when this finishes and open a PR", or "every weekday at 9, summarise the overnight runs." |
 | Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. A block it cannot render is still reported, so nothing waits on you in silence. |
 | Answers you can check | Every reply is an accepted structured finalization backed by evidence gathered in that same turn. Raw model prose never becomes an answer, and a claim without compatible evidence is rejected rather than sent. |

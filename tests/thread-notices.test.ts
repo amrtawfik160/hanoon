@@ -418,6 +418,47 @@ it("does not announce a Hanoon pipeline worker as a generic thread notice", asyn
   expect(store.getOutbox("thread:thr_plan:idle")).toBeNull();
 });
 
+it("routes a pipeline worker's specification question durably to the owner", async () => {
+  const store = fixture();
+  const title = "Telegram abcdefghijklmnopqrstuv plan abcdefghijklmnopqrstuv:3:spawn_plan";
+  const worker = watched({ id: "thr_plan", title, status: "active" });
+  const interaction: PendingThreadInteraction = {
+    id: "pint_spec_conflict",
+    status: "pending",
+    payload: {
+      kind: "user_question",
+      questions: [{
+        id: "spec_resolution",
+        prompt: "The owner request conflicts with Billing > Refunds. Which requirement should govern?",
+        multiSelect: false,
+        allowFreeText: true,
+        options: [
+          { value: "filed", label: "Filed specification", description: null },
+          { value: "request", label: "Current request", description: null },
+        ],
+      }],
+    },
+  };
+  const notices = service(store, { threads: [worker], interactions: [interaction] });
+
+  await expect(notices.service.processDue()).resolves.toBe(true);
+  expect(store.getOutbox("thread-interaction:pint_spec_conflict")?.payload.text)
+    .toContain("Billing &gt; Refunds");
+
+  expect(store.answerThreadInteraction({
+    token: questionOptionToken("pint_spec_conflict", "spec_resolution", "filed"),
+    userId: "7",
+    chatId: "7",
+    now: 4_000,
+  }).ok).toBe(true);
+  const delivery = service(store, { threads: [], now: () => 4_100 });
+  await expect(delivery.service.processDue()).resolves.toBe(true);
+  expect(delivery.resolve).toHaveBeenCalledWith("thr_plan", "pint_spec_conflict", {
+    kind: "user_answer",
+    answers: { spec_resolution: { selected: ["filed"] } },
+  });
+});
+
 it("keeps a title with markdown markers from breaking the finished notice", async () => {
   const store = fixture();
   const title = "Fix *this* and login_bug_now";

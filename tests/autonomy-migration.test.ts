@@ -81,7 +81,7 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 52);
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 54);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -126,6 +126,8 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 49]).toContain("CREATE TABLE reference_documents");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 50]).toContain("ADD COLUMN controller_key");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 51]).toContain("CREATE TABLE reference_section_digests");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 52]).toContain("CREATE TABLE project_admission_pause_clear_history");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 53]).toContain("CREATE TABLE controller_voice_inbox");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {

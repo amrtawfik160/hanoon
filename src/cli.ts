@@ -182,6 +182,7 @@ Commands:
   job list [--limit <1-100>] [--json]
   job show <job-id> [--json]
   job spend <job-id> [--json]
+  job retry <job-id> [--json]
   job cancel <job-id> [--json]
   capability status [recipe] [--json]
   capability inventory [--host <scope>] [--limit <1-100>] [--json]
@@ -1006,7 +1007,7 @@ function jobRetry(
   if (retryResult.outcome === "unavailable") throw new CliOperationError("Job is not retryable");
   deps.notify?.();
   const output = safeJob(deps.store, retryResult.job, deps.now());
-  const message = retryResult.outcome === "queued"
+  const message = retryResult.outcome !== "retried"
     ? `Retry queued for ${jobId}`
     : `Retried ${jobId} (${retryResult.job.state})`;
   return success(output, message, json);

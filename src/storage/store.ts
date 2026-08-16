@@ -302,13 +302,58 @@ export type ControllerCapabilityExpansionResult =
 
 export type ReviewAdmissionResult =
   | { outcome: "queued"; admission: JobAdmission }
+  | { outcome: "already_queued"; admission: JobAdmission }
   | { outcome: "still_cleaning_up"; admission: JobAdmission }
   | { outcome: "unavailable" };
 
 export type RetryJobResult =
   | { outcome: "retried"; job: Job; admission: JobAdmission }
   | { outcome: "queued"; job: Job; admission: JobAdmission }
+  | { outcome: "already_queued"; job: Job; admission: JobAdmission }
   | { outcome: "unavailable" };
+
+export type ControllerMutationFence = ControllerLeaseFence & Readonly<{
+  turnId: string;
+  controllerKey: string;
+  expectedThreadId: string;
+}>;
+
+export type ControllerMutationResult<T> =
+  | Readonly<{ outcome: "applied"; mutationValue: T }>
+  | Readonly<{ outcome: "stale" }>;
+
+export type ControllerVoiceWork = Readonly<{
+  updateId: number;
+  controllerKey: string;
+  ordinal: number;
+  telegramUserId: string;
+  telegramChatId: string;
+  fileId: string;
+  mimeType: string;
+  sizeBytes: number | null;
+  durationSeconds: number;
+  caption: string | null;
+  state: "pending" | "processing" | "completed";
+  attempts: number;
+  claimOwner: string | null;
+  claimGeneration: number;
+  claimExpiresAt: number | null;
+  outcome: string | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}>;
+
+export type ControllerVoiceClaim = ControllerVoiceWork & Readonly<{
+  state: "processing";
+  claimOwner: string;
+  claimExpiresAt: number;
+}>;
+
+export type ControllerVoiceSettlement =
+  | Readonly<{ outcome: "completed"; settlement: "turn" | "notice" | "discarded" }>
+  | Readonly<{ outcome: "stale" }>;
 
 export type ThreadOperationKind = "steer_thread" | "stop_thread" | "retry_thread";
 export type ThreadOperationState =
@@ -390,7 +435,7 @@ export type ApprovalConsumeResult =
   | { ok: false; reason: "missing" | "expired" | "consumed" | "revoked" };
 export type ApprovalAcceptResult =
   | { ok: true; jobId: string; headSha: string }
-  | { ok: false; reason: "missing" | "expired" | "consumed" | "revoked" | "version_conflict" };
+  | { ok: false; reason: "missing" | "expired" | "consumed" | "revoked" | "version_conflict" | "fence_lost" };
 export type CallbackRecord = {
   callbackId: string;
   jobId: string | null;
@@ -1274,6 +1319,28 @@ type TelegramUpdateRow = {
   claim_owner: string | null;
   claim_generation: number | null;
   claim_expires_at: number | null;
+};
+type ControllerVoiceRow = {
+  update_id: number;
+  controller_key: string;
+  ordinal: number;
+  telegram_user_id: string;
+  telegram_chat_id: string;
+  file_id: string;
+  mime_type: string;
+  file_size_bytes: number | null;
+  duration_seconds: number;
+  caption: string | null;
+  state: ControllerVoiceWork["state"];
+  attempts: number;
+  claim_owner: string | null;
+  claim_generation: number;
+  claim_expires_at: number | null;
+  outcome: string | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
 };
 
 const THREAD_OPERATION_KINDS: ReadonlySet<ThreadOperationKind> = new Set([
@@ -2841,7 +2908,14 @@ export function migrateControllerInteractionStorage(
 }
 
 export interface TelegramAgentStore {
+  runControllerMutation<T>(
+    input: ControllerMutationFence,
+    mutation: (now: number) => T,
+  ): ControllerMutationResult<T>;
   saveReferenceDocument(input: SaveReferenceDocumentInput): SaveReferenceDocumentResult;
+  saveControllerReferenceDocument(
+    input: SaveReferenceDocumentInput & ControllerMutationFence,
+  ): SaveReferenceDocumentResult | null;
   listReferenceDocuments(projectId: string | null): readonly ReferenceDocumentRecord[];
   searchReferencePassages(input: {
     query: string;
@@ -3316,7 +3390,7 @@ export interface TelegramAgentStore {
   }): boolean;
   listPausedProjectAdmissions(): { projectId: string; reason: string; pausedAt: number }[];
   clearProjectAdmissionPauseAsAgent(
-    input: { projectId: string; now: number },
+    input: { projectId: string } & ControllerMutationFence,
   ): { outcome: "cleared" } | { outcome: "refused"; reason: string };
   clearProjectAdmissionPause(input: { projectId?: string; now: number }): number;
   listSystemMonitors(): MonitorRecord[];
@@ -3717,9 +3791,50 @@ export interface TelegramAgentStore {
     effect: JobEffect;
     now: number;
     identity?: ApprovalIdentity;
+    controllerFence?: ControllerMutationFence;
   }): ApprovalAcceptResult;
   revokeApprovals(jobId: string, reason: string, now: number): number;
   beginTelegramUpdate(updateId: number, now: number): "process" | "processed";
+  queueControllerVoice(input: {
+    updateId: number;
+    controllerKey: string;
+    telegramUserId: string;
+    telegramChatId: string;
+    fileId: string;
+    mimeType: string;
+    sizeBytes: number | null;
+    durationSeconds: number;
+    caption: string | null;
+    now: number;
+  }): "queued" | "replay";
+  claimNextControllerVoice(input: {
+    ownerId: string;
+    now: number;
+    leaseMs?: number;
+  }): ControllerVoiceClaim | null;
+  completeControllerVoiceWithTurn(input: {
+    updateId: number;
+    ownerId: string;
+    generation: number;
+    inputText: string;
+    now: number;
+  }): ControllerVoiceSettlement;
+  completeControllerVoiceWithNotice(input: {
+    updateId: number;
+    ownerId: string;
+    generation: number;
+    notice: string;
+    reason: string;
+    now: number;
+  }): ControllerVoiceSettlement;
+  releaseControllerVoice(input: {
+    updateId: number;
+    ownerId: string;
+    generation: number;
+    error: string;
+    now: number;
+  }): boolean;
+  getControllerVoice(updateId: number): ControllerVoiceWork | null;
   completeTelegramUpdate(updateId: number, outcome: string, now: number): void;
   failTelegramUpdate(updateId: number, error: string, now: number): void;
   abandonTelegramUpdate(updateId: number, error: string, now: number): void;
@@ -4613,6 +4728,31 @@ function parseOutbox(row: OutboxRow): StoredOutbox {
   };
 }
 
+function parseControllerVoice(row: ControllerVoiceRow): ControllerVoiceWork {
+  return {
+    updateId: row.update_id,
+    controllerKey: row.controller_key,
+    ordinal: row.ordinal,
+    telegramUserId: row.telegram_user_id,
+    telegramChatId: row.telegram_chat_id,
+    fileId: row.file_id,
+    mimeType: row.mime_type,
+    sizeBytes: row.file_size_bytes,
+    durationSeconds: row.duration_seconds,
+    caption: row.caption,
+    state: row.state,
+    attempts: row.attempts,
+    claimOwner: row.claim_owner,
+    claimGeneration: row.claim_generation,
+    claimExpiresAt: row.claim_expires_at,
+    outcome: row.outcome,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at,
+  };
+}
+
 function parseWorkerLiveness(row: WorkerLivenessRow): WorkerLiveness {
   return {
     jobId: row.job_id,
@@ -4845,6 +4985,34 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.credentialAccessRepository.reconcileCredentialHealth(input);
   }
 
+  /**
+   * Runs one synchronous controller mutation behind the executor and exact-turn
+   * fence. The authority check and write share one immediate transaction, so a
+   * superseded generation cannot commit local state after losing its lease.
+   */
+  public runControllerMutation<T>(
+    input: ControllerMutationFence,
+    mutation: (now: number) => T,
+  ): ControllerMutationResult<T> {
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    return this.db.transaction((): ControllerMutationResult<T> => {
+      const boundaryNow = this.currentNow();
+      if (!this.canMutateControllerTurn({ ...input, now: boundaryNow })) {
+        return { outcome: "stale" };
+      }
+      const mutationValue = mutation(boundaryNow);
+      if (
+        (typeof mutationValue === "object" && mutationValue !== null || typeof mutationValue === "function") &&
+        typeof (mutationValue as { then?: unknown }).then === "function"
+      ) {
+        throw new TypeError("controller mutations must be synchronous");
+      }
+      return { outcome: "applied", mutationValue };
+    }).immediate();
+  }
+
   public listCredentialBindings(input: Readonly<{
     installationId: string;
     state?: BrokerBindingState;
@@ -4902,6 +5070,27 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public saveReferenceDocument(input: SaveReferenceDocumentInput): SaveReferenceDocumentResult {
     return this.referenceRepository.saveReferenceDocument(input);
+  }
+
+  /** A controller reference write whose authority is checked in the same transaction as the write. */
+  public saveControllerReferenceDocument(
+    input: SaveReferenceDocumentInput & ControllerMutationFence,
+  ): SaveReferenceDocumentResult | null {
+    assertControllerIdentifier(input.turnId, "turnId");
+    assertControllerKey(input.controllerKey);
+    assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    return this.db.transaction((): SaveReferenceDocumentResult | null => {
+      const boundaryNow = this.currentNow();
+      if (!this.canMutateControllerTurn({ ...input, now: boundaryNow })) return null;
+      return this.referenceRepository.saveReferenceDocument({
+        scope: input.scope,
+        projectId: input.projectId,
+        title: input.title,
+        source: input.source,
+        markdown: input.markdown,
+        now: boundaryNow,
+      });
+    }).immediate();
   }
 
   public listReferenceDocuments(projectId: string | null): readonly ReferenceDocumentRecord[] {
@@ -5169,6 +5358,57 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  private ensureControllerForOwner(input: {
+    controllerKey: string;
+    telegramUserId: string;
+    telegramChatId: string;
+    now: number;
+  }): void {
+    const owner = this.getOwner();
+    if (!owner || owner.userId !== input.telegramUserId || owner.chatId !== input.telegramChatId) {
+      throw new TypeError("controller owner is not the active paired owner");
+    }
+    const controller = this.db
+      .prepare("SELECT * FROM controller_threads WHERE controller_key = ?")
+      .get(input.controllerKey) as ControllerThreadRow | undefined;
+    if (controller && (
+      controller.telegram_user_id !== input.telegramUserId ||
+      controller.telegram_chat_id !== input.telegramChatId
+    )) {
+      throw new TypeError("controller key belongs to a different Telegram owner");
+    }
+    if (controller?.state === "revoked") {
+      this.db.prepare(
+        `UPDATE controller_threads
+            SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
+                state = 'pending_spawn', pending_spawn_token = NULL,
+                capability_subject_id = NULL, capability_profile_id = NULL,
+                capability_profile_revision = 0,
+                last_error = NULL, updated_at = ?
+          WHERE controller_key = ? AND state = 'revoked'`,
+      ).run(input.now, input.controllerKey);
+    }
+    if (!controller) {
+      this.db.prepare(
+        `INSERT INTO controller_threads (
+           controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+         ) VALUES (?, ?, ?, 'pending_spawn', ?, ?)`,
+      ).run(input.controllerKey, input.telegramUserId, input.telegramChatId, input.now, input.now);
+    }
+  }
+
+  /** Allocates across ready turns and voice reservations so intake order cannot be inverted. */
+  private nextControllerOrdinal(controllerKey: string): number {
+    const next = this.db.prepare(
+      `SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM (
+         SELECT ordinal FROM controller_turns WHERE controller_key = ?
+         UNION ALL
+         SELECT ordinal FROM controller_voice_inbox WHERE controller_key = ?
+       )`,
+    ).get(controllerKey, controllerKey) as { ordinal: number };
+    return next.ordinal;
+  }
+
   public enqueueControllerTurn(input: {
     controllerKey: string;
     telegramUserId: string;
@@ -5204,10 +5444,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     );
 
     return this.db.transaction((): ControllerTurnRecord => {
-      const owner = this.getOwner();
-      if (!owner || owner.userId !== input.telegramUserId || owner.chatId !== input.telegramChatId) {
-        throw new TypeError("controller owner is not the active paired owner");
-      }
+      this.ensureControllerForOwner(input);
 
       const existing = this.db
         .prepare("SELECT * FROM controller_turns WHERE telegram_update_id = ?")
@@ -5232,37 +5469,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         return parseControllerTurn(existing);
       }
 
-      const controller = this.db
-        .prepare("SELECT * FROM controller_threads WHERE controller_key = ?")
-        .get(input.controllerKey) as ControllerThreadRow | undefined;
-      if (controller && (
-        controller.telegram_user_id !== input.telegramUserId ||
-        controller.telegram_chat_id !== input.telegramChatId
-      )) {
-        throw new TypeError("controller key belongs to a different Telegram owner");
-      }
-      if (controller?.state === "revoked") {
-        this.db.prepare(
-          `UPDATE controller_threads
-              SET project_id = NULL, host_id = NULL, bb_thread_id = NULL,
-                  state = 'pending_spawn', pending_spawn_token = NULL,
-                  capability_subject_id = NULL, capability_profile_id = NULL,
-                  capability_profile_revision = 0,
-                  last_error = NULL, updated_at = ?
-            WHERE controller_key = ? AND state = 'revoked'`,
-        ).run(input.now, input.controllerKey);
-      }
-      if (!controller) {
-        this.db.prepare(
-          `INSERT INTO controller_threads (
-             controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
-           ) VALUES (?, ?, ?, 'pending_spawn', ?, ?)`,
-        ).run(input.controllerKey, input.telegramUserId, input.telegramChatId, input.now, input.now);
-      }
-
-      const next = this.db
-        .prepare("SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM controller_turns WHERE controller_key = ?")
-        .get(input.controllerKey) as { ordinal: number };
+      const ordinal = this.nextControllerOrdinal(input.controllerKey);
       const id = `controller-turn-${input.updateId}`;
       this.db.prepare(
         `INSERT INTO controller_turns (
@@ -5276,7 +5483,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         id,
         input.updateId,
         input.controllerKey,
-        next.ordinal,
+        ordinal,
         input.inputText,
         image?.fileId ?? null,
         image?.fileName ?? null,
@@ -5820,6 +6027,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE turn.state = 'queued'
             AND turn.delivery_state = 'none'
             AND turn.next_dispatch_at <= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM controller_voice_inbox AS voice
+               WHERE voice.controller_key = turn.controller_key
+                 AND voice.state <> 'completed'
+                 AND voice.ordinal <= turn.ordinal
+            )
             AND NOT EXISTS (
               SELECT 1 FROM controller_turns AS active
                WHERE active.controller_key = turn.controller_key
@@ -9363,18 +9576,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * that one goes to the owner rather than round again.
    */
   public clearProjectAdmissionPauseAsAgent(
-    input: { projectId: string; now: number },
+    input: { projectId: string } & ControllerMutationFence,
   ): { outcome: "cleared" } | { outcome: "refused"; reason: string } {
     assertControllerIdentifier(input.projectId, "projectId");
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): { outcome: "cleared" } | { outcome: "refused"; reason: string } => {
+      const boundaryNow = this.currentNow();
+      if (!this.canMutateControllerTurn({ ...input, now: boundaryNow })) {
+        return { outcome: "refused", reason: "The controller turn is no longer current." };
+      }
       const live = this.db.prepare(
         "SELECT fingerprint FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
-      ).get(input.projectId) as { fingerprint: string } | undefined;
+      ).get(input.projectId) as { fingerprint: string | null } | undefined;
       if (!live) return { outcome: "refused", reason: "That project is not paused." };
+      if (live.fingerprint === null) {
+        return { outcome: "refused", reason: "This pause has no durable failure fingerprint, so it is the owner's call." };
+      }
       const clearedBefore = this.db.prepare(
-        `SELECT 1 FROM project_admission_pauses
-          WHERE project_id = ? AND fingerprint = ? AND cleared_at IS NOT NULL LIMIT 1`,
+        `SELECT 1 FROM project_admission_pause_clear_history
+          WHERE project_id = ? AND fingerprint = ? LIMIT 1`,
       ).get(input.projectId, live.fingerprint) !== undefined;
       if (clearedBefore) {
         return {
@@ -9384,7 +9604,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }
       this.db.prepare(
         "UPDATE project_admission_pauses SET cleared_at = ? WHERE project_id = ? AND cleared_at IS NULL",
-      ).run(input.now, input.projectId);
+      ).run(boundaryNow, input.projectId);
+      this.db.prepare(
+        `INSERT INTO project_admission_pause_clear_history (
+           project_id, fingerprint, cleared_at, cleared_by
+         ) VALUES (?, ?, ?, 'agent')`,
+      ).run(input.projectId, live.fingerprint, boundaryNow);
       return { outcome: "cleared" };
     }).immediate();
   }
@@ -9392,15 +9617,33 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   /** Clears one project, or every paused project when no id is given. */
   public clearProjectAdmissionPause(input: { projectId?: string; now: number }): number {
     assertNonNegativeInteger(input.now, "now");
-    if (input.projectId === undefined) {
+    if (input.projectId !== undefined) assertControllerIdentifier(input.projectId, "projectId");
+    return this.db.transaction((): number => {
+      if (input.projectId === undefined) {
+        this.db.prepare(
+          `INSERT OR IGNORE INTO project_admission_pause_clear_history (
+             project_id, fingerprint, cleared_at, cleared_by
+           )
+           SELECT project_id, fingerprint, ?, 'owner'
+             FROM project_admission_pauses
+            WHERE cleared_at IS NULL AND fingerprint IS NOT NULL`,
+        ).run(input.now);
+        return this.db.prepare(
+          "UPDATE project_admission_pauses SET cleared_at = ? WHERE cleared_at IS NULL",
+        ).run(input.now).changes;
+      }
+      this.db.prepare(
+        `INSERT OR IGNORE INTO project_admission_pause_clear_history (
+           project_id, fingerprint, cleared_at, cleared_by
+         )
+         SELECT project_id, fingerprint, ?, 'owner'
+           FROM project_admission_pauses
+          WHERE project_id = ? AND cleared_at IS NULL AND fingerprint IS NOT NULL`,
+      ).run(input.now, input.projectId);
       return this.db.prepare(
-        "UPDATE project_admission_pauses SET cleared_at = ? WHERE cleared_at IS NULL",
-      ).run(input.now).changes;
-    }
-    assertControllerIdentifier(input.projectId, "projectId");
-    return this.db.prepare(
-      "UPDATE project_admission_pauses SET cleared_at = ? WHERE project_id = ? AND cleared_at IS NULL",
-    ).run(input.now, input.projectId).changes;
+        "UPDATE project_admission_pauses SET cleared_at = ? WHERE project_id = ? AND cleared_at IS NULL",
+      ).run(input.now, input.projectId).changes;
+    }).immediate();
   }
 
   public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {
@@ -11130,7 +11373,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (admission.state === "draining") return { outcome: "still_cleaning_up", admission };
     if (admission.state === "queued") {
       return admission.resumeEvent === "CONTINUE_REVIEW"
-        ? { outcome: "queued", admission }
+        ? { outcome: "already_queued", admission }
         : { outcome: "unavailable" };
     }
     if (admission.state !== "released") return { outcome: "unavailable" };
@@ -11170,7 +11413,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (admission.state === "queued") {
         if (admission.resumeEvent !== "RETRY") return { outcome: "unavailable" };
         this.markOwnerRecoveryRequeuedInTransaction(job.id, now);
-        return { outcome: "queued", job, admission };
+        return { outcome: "already_queued", job, admission };
       }
       if (admission.state === "released") {
         const queued = queueAdmissionInTransaction(this.db, {
@@ -13556,6 +13799,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     effect: JobEffect;
     now: number;
     identity?: ApprovalIdentity;
+    controllerFence?: ControllerMutationFence;
   }): ApprovalAcceptResult {
     assertSha256Hex(input.nonceHash);
     if (!Number.isInteger(input.expectedJobVersion) || input.expectedJobVersion < 1) {
@@ -13572,6 +13816,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
     const accept = this.db.transaction((): ApprovalAcceptResult => {
       const boundaryNow = this.currentNow();
+      if (input.controllerFence && !this.canMutateControllerTurn({
+        ...input.controllerFence,
+        now: boundaryNow,
+      })) return { ok: false, reason: "fence_lost" };
       const row = this.readApproval(input.nonceHash);
       if (!row) return { ok: false, reason: "missing" };
       if (row.consumed_at !== null) {
@@ -14261,6 +14509,263 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       return "process";
     });
     return begin();
+  }
+
+  /**
+   * Commits a voice-note handoff and the Telegram update acknowledgement as
+   * one unit. Polling may advance only after the slow work is independently
+   * recoverable.
+   */
+  public queueControllerVoice(input: {
+    updateId: number;
+    controllerKey: string;
+    telegramUserId: string;
+    telegramChatId: string;
+    fileId: string;
+    mimeType: string;
+    sizeBytes: number | null;
+    durationSeconds: number;
+    caption: string | null;
+    now: number;
+  }): "queued" | "replay" {
+    assertNonNegativeInteger(input.updateId, "updateId");
+    assertControllerKey(input.controllerKey);
+    assertCanonicalPositiveDecimal(input.telegramUserId, "telegramUserId");
+    assertCanonicalPositiveDecimal(input.telegramChatId, "telegramChatId");
+    if (typeof input.fileId !== "string" || input.fileId.length < 1 || input.fileId.length > 512) {
+      throw new TypeError("voice fileId is invalid");
+    }
+    if (typeof input.mimeType !== "string" || input.mimeType.length < 1 || input.mimeType.length > 255) {
+      throw new TypeError("voice mimeType is invalid");
+    }
+    if (input.sizeBytes !== null) assertNonNegativeInteger(input.sizeBytes, "voice sizeBytes");
+    assertNonNegativeInteger(input.durationSeconds, "voice durationSeconds");
+    if (input.caption !== null && (typeof input.caption !== "string" || input.caption.length > 4_000)) {
+      throw new TypeError("voice caption is invalid");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    const claimGeneration = this.claimedUpdates.get(input.updateId);
+    if (claimGeneration === undefined) throw new UpdateClaimConflictError(input.updateId);
+
+    const queue = this.db.transaction((): "queued" | "replay" => {
+      const update = this.db.prepare(
+        `SELECT status, claim_owner, claim_generation, claim_expires_at
+           FROM telegram_updates WHERE update_id = ?`,
+      ).get(input.updateId) as TelegramUpdateRow | undefined;
+      if (
+        !update || update.status !== "processing" || update.claim_owner !== this.claimOwner ||
+        update.claim_generation !== claimGeneration || update.claim_expires_at === null ||
+        update.claim_expires_at <= input.now
+      ) throw new UpdateClaimConflictError(input.updateId);
+
+      this.ensureControllerForOwner(input);
+      const existing = this.db.prepare(
+        "SELECT * FROM controller_voice_inbox WHERE update_id = ?",
+      ).get(input.updateId) as ControllerVoiceRow | undefined;
+      if (existing) {
+        if (
+          existing.controller_key !== input.controllerKey ||
+          existing.telegram_user_id !== input.telegramUserId ||
+          existing.telegram_chat_id !== input.telegramChatId ||
+          existing.file_id !== input.fileId || existing.mime_type !== input.mimeType ||
+          existing.file_size_bytes !== input.sizeBytes ||
+          existing.duration_seconds !== input.durationSeconds || existing.caption !== input.caption
+        ) throw new IdempotencyConflictError(input.updateId);
+      } else {
+        const ordinal = this.nextControllerOrdinal(input.controllerKey);
+        this.db.prepare(
+          `INSERT INTO controller_voice_inbox (
+             update_id, controller_key, ordinal, telegram_user_id, telegram_chat_id,
+             file_id, mime_type, file_size_bytes, duration_seconds, caption,
+             state, attempts, claim_owner, claim_generation, claim_expires_at,
+             outcome, last_error, created_at, updated_at, completed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, 0, NULL, NULL, NULL, ?, ?, NULL)`,
+        ).run(
+          input.updateId,
+          input.controllerKey,
+          ordinal,
+          input.telegramUserId,
+          input.telegramChatId,
+          input.fileId,
+          input.mimeType,
+          input.sizeBytes,
+          input.durationSeconds,
+          input.caption,
+          input.now,
+          input.now,
+        );
+      }
+      const completed = this.db.prepare(
+        `UPDATE telegram_updates
+            SET status = 'processed', outcome = 'voice_queued', last_error = NULL,
+                processed_at = ?, claim_owner = NULL, claim_expires_at = NULL
+          WHERE update_id = ? AND status = 'processing' AND claim_owner = ?
+            AND claim_generation = ? AND claim_expires_at > ?`,
+      ).run(input.now, input.updateId, this.claimOwner, claimGeneration, input.now);
+      if (completed.changes !== 1) throw new UpdateClaimConflictError(input.updateId);
+      advanceTelegramCursor(this.db);
+      return existing ? "replay" : "queued";
+    });
+    const queueOutcome = queue.immediate();
+    this.claimedUpdates.delete(input.updateId);
+    return queueOutcome;
+  }
+
+  public claimNextControllerVoice(input: {
+    ownerId: string;
+    now: number;
+    leaseMs?: number;
+  }): ControllerVoiceClaim | null {
+    assertControllerIdentifier(input.ownerId, "voice ownerId");
+    assertNonNegativeInteger(input.now, "now");
+    const leaseMs = input.leaseMs ?? 300_000;
+    if (!Number.isInteger(leaseMs) || leaseMs < 1 || leaseMs > 600_000) {
+      throw new TypeError("voice leaseMs is invalid");
+    }
+    return this.db.transaction((): ControllerVoiceClaim | null => {
+      const candidate = this.db.prepare(
+        `SELECT * FROM controller_voice_inbox
+          WHERE state = 'pending' OR (state = 'processing' AND claim_expires_at <= ?)
+          ORDER BY update_id ASC LIMIT 1`,
+      ).get(input.now) as ControllerVoiceRow | undefined;
+      if (!candidate) return null;
+      const generation = candidate.claim_generation + 1;
+      const expiresAt = input.now + leaseMs;
+      const claimed = this.db.prepare(
+        `UPDATE controller_voice_inbox
+            SET state = 'processing', attempts = attempts + 1,
+                claim_owner = ?, claim_generation = ?, claim_expires_at = ?,
+                last_error = NULL, updated_at = ?
+          WHERE update_id = ?
+            AND (state = 'pending' OR (state = 'processing' AND claim_expires_at <= ?))`,
+      ).run(input.ownerId, generation, expiresAt, input.now, candidate.update_id, input.now);
+      if (claimed.changes !== 1) return null;
+      const row = this.db.prepare(
+        "SELECT * FROM controller_voice_inbox WHERE update_id = ?",
+      ).get(candidate.update_id) as ControllerVoiceRow;
+      return parseControllerVoice(row) as ControllerVoiceClaim;
+    }).immediate();
+  }
+
+  public completeControllerVoiceWithTurn(input: {
+    updateId: number;
+    ownerId: string;
+    generation: number;
+    inputText: string;
+    now: number;
+  }): ControllerVoiceSettlement {
+    assertControllerText(input.inputText, "controller voice transcript");
+    return this.settleControllerVoice(input, (row, now) => {
+      const turn = this.enqueueControllerTurn({
+        controllerKey: row.controller_key,
+        telegramUserId: row.telegram_user_id,
+        telegramChatId: row.telegram_chat_id,
+        updateId: row.update_id,
+        inputText: input.inputText,
+        now,
+      });
+      // The reservation was allocated when Telegram accepted the voice note.
+      // The turn is created only after transcription so its capability profile
+      // reflects the real words, then moved to that reserved conversation slot
+      // before this transaction becomes visible.
+      const moved = this.db.prepare(
+        `UPDATE controller_turns
+            SET ordinal = ?, created_at = ?, updated_at = ?
+          WHERE id = ? AND controller_key = ? AND state = 'queued' AND ordinal = ?`,
+      ).run(row.ordinal, row.created_at, now, turn.id, row.controller_key, turn.ordinal);
+      if (moved.changes !== 1) throw new Error("voice turn reservation changed before settlement");
+      return "turn";
+    });
+  }
+
+  public completeControllerVoiceWithNotice(input: {
+    updateId: number;
+    ownerId: string;
+    generation: number;
+    notice: string;
+    reason: string;
+    now: number;
+  }): ControllerVoiceSettlement {
+    assertControllerText(input.notice, "controller voice notice");
+    assertSafeFailureSummary(input.reason);
+    return this.settleControllerVoice(input, (row, now) => {
+      persistControllerOutbox(this.db, {
+        logicalKey: `controller-voice:${row.update_id}:notice`,
+        chatId: row.telegram_chat_id,
+        payload: { text: input.notice, disable_web_page_preview: true },
+      }, now);
+      return "notice";
+    }, input.reason);
+  }
+
+  private settleControllerVoice(
+    input: { updateId: number; ownerId: string; generation: number; now: number },
+    settle: (row: ControllerVoiceRow, now: number) => "turn" | "notice",
+    outcome = "transcribed",
+  ): ControllerVoiceSettlement {
+    assertNonNegativeInteger(input.updateId, "updateId");
+    assertControllerIdentifier(input.ownerId, "voice ownerId");
+    assertNonNegativeInteger(input.generation, "voice generation");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): ControllerVoiceSettlement => {
+      const row = this.db.prepare(
+        `SELECT * FROM controller_voice_inbox
+          WHERE update_id = ? AND state = 'processing' AND claim_owner = ?
+            AND claim_generation = ? AND claim_expires_at > ?`,
+      ).get(input.updateId, input.ownerId, input.generation, input.now) as ControllerVoiceRow | undefined;
+      if (!row) return { outcome: "stale" };
+      const owner = this.getOwner();
+      const settlementKind = owner?.userId === row.telegram_user_id && owner.chatId === row.telegram_chat_id
+        ? settle(row, input.now)
+        : "discarded";
+      const completed = this.db.prepare(
+        `UPDATE controller_voice_inbox
+            SET state = 'completed', claim_owner = NULL, claim_expires_at = NULL,
+                outcome = ?, last_error = NULL, completed_at = ?, updated_at = ?
+          WHERE update_id = ? AND state = 'processing' AND claim_owner = ?
+            AND claim_generation = ? AND claim_expires_at > ?`,
+      ).run(
+        settlementKind === "discarded" ? "owner_changed" : outcome,
+        input.now,
+        input.now,
+        input.updateId,
+        input.ownerId,
+        input.generation,
+        input.now,
+      );
+      return completed.changes === 1
+        ? { outcome: "completed", settlement: settlementKind }
+        : { outcome: "stale" };
+    }).immediate();
+  }
+
+  public releaseControllerVoice(input: {
+    updateId: number;
+    ownerId: string;
+    generation: number;
+    error: string;
+    now: number;
+  }): boolean {
+    assertNonNegativeInteger(input.updateId, "updateId");
+    assertControllerIdentifier(input.ownerId, "voice ownerId");
+    assertNonNegativeInteger(input.generation, "voice generation");
+    assertSafeFailureSummary(input.error);
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE controller_voice_inbox
+          SET state = 'pending', claim_owner = NULL, claim_expires_at = NULL,
+              last_error = ?, updated_at = ?
+        WHERE update_id = ? AND state = 'processing' AND claim_owner = ?
+          AND claim_generation = ?`,
+    ).run(input.error, input.now, input.updateId, input.ownerId, input.generation).changes === 1;
+  }
+
+  public getControllerVoice(updateId: number): ControllerVoiceWork | null {
+    assertNonNegativeInteger(updateId, "updateId");
+    const row = this.db.prepare(
+      "SELECT * FROM controller_voice_inbox WHERE update_id = ?",
+    ).get(updateId) as ControllerVoiceRow | undefined;
+    return row ? parseControllerVoice(row) : null;
   }
 
   public completeTelegramUpdate(updateId: number, outcome: string, now: number): void {

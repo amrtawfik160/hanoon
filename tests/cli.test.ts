@@ -106,6 +106,7 @@ it.each([["--help"], ["help"]])("prints actionable command help for %s", async (
   expect(result.exitCode).toBe(0);
   expect(result.stderr).toBe("");
   expect(result.stdout).toContain("job show <job-id>");
+  expect(result.stdout).toContain("job retry <job-id>");
   expect(result.stdout).toContain("project list");
   expect(result.stdout).toContain("doctor [project-id]");
   expect(result.stdout).toContain("capability status");

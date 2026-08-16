@@ -184,6 +184,46 @@ function mergeFixture(options: {
   return { db, store, approvals, issued, handler, collectGateInput, mergePullRequest, commandRunner, now: clock };
 }
 
+function typedMergeControllerFence(fixture: ReturnType<typeof mergeFixture>) {
+  fixture.store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "70",
+    updateId: 900,
+    inputText: "merge it",
+    now: NOW,
+  });
+  const turn = fixture.store.claimNextControllerTurn({
+    ownerId: LEASE_OWNER,
+    generation: LEASE_GENERATION,
+    now: NOW,
+  });
+  if (!turn) throw new Error("controller turn unavailable");
+  expect(fixture.store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: LEASE_OWNER,
+    generation: LEASE_GENERATION,
+    now: NOW,
+    projectId: "proj_controller",
+    hostId: "host_controller",
+    threadId: "thr_controller",
+  })).toBe(true);
+  expect(fixture.store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: LEASE_OWNER,
+    generation: LEASE_GENERATION,
+    now: NOW,
+  })).toBe(true);
+  return {
+    ownerId: LEASE_OWNER,
+    generation: LEASE_GENERATION,
+    now: NOW,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
+  };
+}
+
 function addWaitingApproval(
   fixture: ReturnType<typeof mergeFixture>,
   jobId = "job_2",
@@ -485,6 +525,7 @@ describe("fresh Telegram merge execution", () => {
       userId: "7",
       chatId: "70",
       instructionText: "merge it",
+      controllerFence: typedMergeControllerFence(fixture),
     })).toEqual({ outcome: "accepted" });
     expect(fixture.store.getJob("job_1")?.state).toBe("merging");
   });
@@ -498,6 +539,7 @@ describe("fresh Telegram merge execution", () => {
       userId: "7",
       chatId: "70",
       instructionText: "merge it",
+      controllerFence: typedMergeControllerFence(fixture),
     })).toEqual({ outcome: "rejected" });
     expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
     expect(fixture.store.getJob("job_2")?.state).toBe("awaiting_merge_approval");
@@ -512,6 +554,7 @@ describe("fresh Telegram merge execution", () => {
       userId: "7",
       chatId: "70",
       instructionText: "merge job_2",
+      controllerFence: typedMergeControllerFence(fixture),
     })).toEqual({ outcome: "accepted" });
     expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
     expect(fixture.store.getJob("job_2")?.state).toBe("merging");
@@ -526,6 +569,7 @@ describe("fresh Telegram merge execution", () => {
       userId: "7",
       chatId: "70",
       instructionText: "merge job_2",
+      controllerFence: typedMergeControllerFence(fixture),
     })).toEqual({ outcome: "rejected" });
     expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
     expect(fixture.store.getJob("job_2")?.state).toBe("awaiting_merge_approval");

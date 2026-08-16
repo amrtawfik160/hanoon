@@ -52,9 +52,11 @@ export function buildReviewFormatCorrectionPrompt(): string {
  * every job pays this, including jobs that never touch the spec, so it is small
  * on purpose: enough to know a section exists, never enough to read it.
  */
-export const MAX_REFERENCE_MAP_CHARACTERS = 1_200;
+export const MAX_REFERENCE_MAP_CHARACTERS = 2_400;
 
 export type ReferenceBriefing = {
+  id: string;
+  version: number;
   title: string;
   scope: "global" | "project";
   /** Already rendered and budgeted by the caller. */
@@ -77,16 +79,20 @@ export type ReferenceBriefing = {
  */
 export function buildReferenceBriefing(
   briefings: readonly ReferenceBriefing[],
-  omittedDocuments = 0,
+  omittedDocuments: readonly ReferenceBriefing[] = [],
 ): string {
-  if (briefings.length === 0 && omittedDocuments === 0) return "";
+  if (briefings.length === 0 && omittedDocuments.length === 0) return "";
+  const identity = (briefing: ReferenceBriefing): string => {
+    const label = briefing.scope === "global" ? "global" : "project";
+    return `${briefing.title} [${label}; ${briefing.id}; v${briefing.version}]`;
+  };
   const sections = briefings.map((briefing) => {
     const label = briefing.scope === "global" ? "applies to every project" : "this project";
-    return `## ${briefing.title} (${label})\n${briefing.map}`;
+    return `## ${briefing.title} (${label}) [id: ${briefing.id}; v${briefing.version}]\n${briefing.map}`;
   });
-  if (omittedDocuments > 0) {
+  if (omittedDocuments.length > 0) {
     sections.push(
-      `… and ${omittedDocuments} more reference ${omittedDocuments === 1 ? "document was" : "documents were"} omitted to stay within the prompt budget.`,
+      `Maps omitted to stay within the prompt budget; these references are still filed: ${omittedDocuments.map(identity).join("; ")}`,
     );
   }
   return [
@@ -97,7 +103,8 @@ export function buildReferenceBriefing(
     ...sections,
     "",
     "If the specification disagrees with your instruction about what to build or what rule holds,",
-    "stop and report the conflict, naming the section. If it disagrees only about how to build it,",
+    "stop and use AskUserQuestion to ask the owner which requirement governs, naming the document and section; do not merely report the conflict.",
+    "If it disagrees only about how to build it,",
     "note it and carry on: the instruction wins on method, the specification wins on nothing silently.",
   ].join("\n");
 }

@@ -2,7 +2,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
-import { ThreadOperationService } from "../src/controller/operations";
+import { ThreadOperationService, type OperationRequest } from "../src/controller/operations";
 import { openStore } from "../src/storage/store";
 import { parseCallbackData } from "../src/telegram/view";
 import type { SendMessagePayload } from "../src/telegram/types";
@@ -14,6 +14,41 @@ function fixture() {
   const store = openStore(bb.storage, bb.storage.kv, () => 1_000);
   store.createPairingCode(hashSecret("pair-operation"), 1_000, 10_000);
   expect(store.pairOwnerWithCode(hashSecret("pair-operation"), "7", "7", 1_001)).toEqual({ ok: true });
+  store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 701,
+    inputText: "Stop the target thread",
+    now: 1_000,
+  });
+  const lease = store.acquireExecutorLease("executor", 1_000, 30_000);
+  if (!lease.acquired) throw new Error("controller lease unavailable");
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 1_000 });
+  if (!turn) throw new Error("controller turn unavailable");
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: "executor",
+    generation: lease.generation,
+    now: 1_000,
+    projectId: "proj_controller",
+    hostId: "host_controller",
+    threadId: "thr_controller",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: "executor",
+    generation: lease.generation,
+    now: 1_000,
+  })).toBe(true);
+  const controllerFence = {
+    ownerId: "executor",
+    generation: lease.generation,
+    now: 1_000,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
+  };
   const send = vi.fn(async () => ({ ok: true as const }));
   const stop = vi.fn(async () => ({ ok: true as const }));
   const sdk = {
@@ -44,13 +79,15 @@ function fixture() {
     clock: { now: () => 1_000 },
     randomBytes: (size) => Buffer.alloc(size, 7),
   });
-  return { bb, store, sdk, telegram, service, send, stop };
+  const request = (input: OperationRequest) =>
+    service.request({ ...input, controllerFence });
+  return { bb, store, sdk, telegram, service, request, send, stop, controllerFence };
 }
 
 it("binds one steer confirmation to the paired owner, message, target, and nonce hash", async () => {
-  const { bb, store, telegram, service } = fixture();
+  const { bb, store, telegram, request } = fixture();
 
-  const requested = await service.request({
+  const requested = await request({
     kind: "steer_thread",
     threadId: "thr_target",
     text: "Focus on the failing test",
@@ -100,8 +137,8 @@ it("binds one steer confirmation to the paired owner, message, target, and nonce
 });
 
 it("executes one confirmed steer under the singleton fence and cannot replay it", async () => {
-  const { store, service, send } = fixture();
-  const requested = await service.request({
+  const { store, service, request, send, controllerFence } = fixture();
+  const requested = await request({
     kind: "steer_thread",
     threadId: "thr_target",
     text: "Focus on the failing test",
@@ -116,9 +153,11 @@ it("executes one confirmed steer under the singleton fence and cannot replay it"
     messageId: 601,
     now: 1_100,
   }).ok).toBe(true);
-  const lease = store.acquireExecutorLease("executor", 1_100, 30_000);
-  if (!lease.acquired) throw new Error("executor lease unavailable");
-  const fence = { ownerId: "executor", generation: lease.generation, signal: AbortSignal.timeout(1_000) };
+  const fence = {
+    ownerId: controllerFence.ownerId,
+    generation: controllerFence.generation,
+    signal: AbortSignal.timeout(1_000),
+  };
 
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
   await expect(service.processOne(fence, fence.signal)).resolves.toBe(false);
@@ -141,13 +180,13 @@ it("executes one confirmed steer under the singleton fence and cannot replay it"
 });
 
 it("rejects hidden BB targets before issuing a confirmation", async () => {
-  const { sdk, telegram, service } = fixture();
+  const { sdk, telegram, request } = fixture();
   vi.mocked(sdk.threads.get).mockResolvedValueOnce(makeThreadResponse({
     id: "thr_hidden",
     visibility: "hidden",
   }));
 
-  await expect(service.request({
+  await expect(request({
     kind: "stop_thread",
     threadId: "thr_hidden",
     signal: AbortSignal.timeout(1_000),
@@ -156,8 +195,8 @@ it("rejects hidden BB targets before issuing a confirmation", async () => {
 });
 
 it("invalidates an outstanding confirmation when the owner is revoked", async () => {
-  const { store, service } = fixture();
-  const requested = await service.request({
+  const { store, request } = fixture();
+  const requested = await request({
     kind: "stop_thread",
     threadId: "thr_target",
     signal: AbortSignal.timeout(1_000),
