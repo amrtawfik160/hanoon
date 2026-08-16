@@ -91,12 +91,35 @@ named base branch, which is why jobs were less affected than ad-hoc threads.
 - The check runs once per environment, in `EffectRunner.spawnImplementation`,
   before the worker is given a scratchpad or the job moves to `implementing`.
 
+## The trunk
+
+The live line previously had no trunk branch, which is why BB fell back to
+`main`. It now has one: `trunk`, assembled on 2026-08-16 from
+
+- `c11da25`, the fullest existing live tip at 277 commits,
+- `6ea6ef8`, the base-branch and ancestry fix described above,
+- `a5da950`, merged cleanly with no file overlap against the work already in
+  `c11da25`.
+
+`npm run check` on the assembled result is green: typecheck clean, 3793 tests
+across 134 files, build and artifact verification pass.
+
+Two live tips were **not** merged, because each conflicts with the trunk:
+
+| Tip | Conflicting files |
+| --- | --- |
+| `930e235` | `src/plugin.ts` |
+| `ba2710b` | `scripts/eval-controller-answers.mjs`, `src/eval/answer-contract.ts`, `src/eval/eval-integrity.ts`, `tests/answer-contract.test.ts`, `tests/eval-integrity-race.test.ts` |
+
+Both conflict against `c11da25` as well, so neither was caused by the fix
+commit. They are set aside rather than abandoned: the work is intact on its own
+branches and can be merged once the conflicts are resolved deliberately.
+
 ## What is still open
 
-`main` is still disjoint. Reconciling it changes published history and is the
-owner's call. The options, with their risks and undo costs, are in
-[`docs/main-reconciliation-options.md`](main-reconciliation-options.md).
+`main` is unchanged and still disjoint. Reconciling it, if it is ever wanted,
+is covered in [`docs/main-reconciliation-options.md`](main-reconciliation-options.md).
 
-Until that is decided, every project policy `baseBranch` must name a branch on
-the live line. Pointing it at `main` will make the new guard refuse every job,
-which is the intended behaviour but is not a fix.
+Every project policy `baseBranch` must name `trunk`. Pointing it at `main` will
+make the ancestry guard refuse every job, which is the intended behaviour but is
+not a fix.

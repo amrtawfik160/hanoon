@@ -3,8 +3,24 @@
 Background is in [`docs/repository-history.md`](repository-history.md). In short:
 `main` (`85b8e6a`, 6 commits) and every branch carrying real work have no common
 ancestor. This document lists the ways to reconcile them, what each risks, and
-what it costs to undo. **Nothing here has been done.** Choosing between these
-changes published history and is the owner's call.
+what it costs to undo.
+
+## Status: Option A taken, 2026-08-16
+
+The live line was given a trunk branch, `trunk`, and `main` was left exactly as
+it stands. Nothing was rewritten and no published history changed. How `trunk`
+was assembled, and which tips were left out, is recorded in
+[`docs/repository-history.md`](repository-history.md).
+
+Two steps remain and are deliberately not automated:
+
+- Point every project policy `baseBranch` at `trunk`. This is a settings edit,
+  not a code change, which is why the trunk name is not hardcoded anywhere.
+- Decide whether `trunk` becomes the GitHub default branch. `main` is still the
+  default today.
+
+Options B, C and D below stay available and unblocked. They are recorded so that
+if one ever becomes necessary, the reasoning does not have to be rebuilt.
 
 ## Facts the choice rests on
 
@@ -12,27 +28,29 @@ changes published history and is the owner's call.
   and is not protected, so nothing on GitHub blocks any option below.
 - `main` contains no file that is absent from the live line. Nothing is lost by
   any option below; the disagreement is only about ancestry.
-- The live line has **no trunk branch**. It exists only as `bb/*` thread branches
-  and `backup/*` branches. The fullest single ref is `c11da25` (277 commits),
-  which still does not contain three in-flight tips: `a5da950`, `930e235`, `ba2710b`.
+- The live line's trunk is `trunk` (281 commits). Before 2026-08-16 it had no
+  trunk branch at all, which is what made BB fall back to `main`.
+- `930e235` and `ba2710b` are still outside `trunk`, each because of merge
+  conflicts recorded in [`docs/repository-history.md`](repository-history.md).
 - Four merged pull requests (#1–#4) are attached to `main`'s history. There are
   no open pull requests.
 - 19 of the 21 active worktrees are checked out on live-line branches.
 
-## Precondition for every option
+## Precondition for the remaining options
 
-Two steps first, whichever option is chosen:
+Two steps first, if B, C or D is ever chosen:
 
-1. Pick the integration tip and merge the three stragglers into it, so one ref
-   genuinely contains all the work. Without this, any option below silently
-   leaves work behind.
-2. Push backup refs for `main` and the chosen tip before touching anything, so
-   every option's undo is a fetch rather than a recovery.
+1. Merge `930e235` and `ba2710b` into `trunk`, resolving their conflicts
+   deliberately, so one ref genuinely contains all the work. Without this, any
+   option below silently leaves work behind.
+2. Push backup refs for `main` and `trunk` before touching anything, so every
+   option's undo is a fetch rather than a recovery.
 
 ## Option A — Name the live line as trunk, leave `main` alone
 
-Create a branch (for example `trunk`) at the integration tip, push it, and make
-it the GitHub default. `main` stays exactly as it is, as a historical branch.
+Create a branch (`trunk`) at the integration tip, push it, and make it the GitHub
+default. `main` stays exactly as it is, as a historical branch. This is the
+option that was taken, except that the GitHub default has not been switched yet.
 
 - **Risk: low.** No published history is rewritten. The repository keeps two
   unrelated branches, which is untidy and needs explaining to anyone new. Every
@@ -92,14 +110,9 @@ continuous history.
   publish repeats the squash-onto-an-unrelated-root pattern that caused this.
 - **Cost to undo: none.** This is the current state.
 
-## Recommendation
+## Why Option A was chosen
 
-Option A. It unblocks work immediately, is the only option that rewrites nothing,
-and its undo is a single settings change. It also leaves Options B and C
-available later, once the live line has a stable trunk and there is time to do
-the merge carefully. Option D is not worth its risk given that no content is
-actually missing from either side.
-
-The single question for the owner is therefore: **may we designate the live line
-as the default branch and leave `main` in place as history, or do you want `main`
-itself rewritten to carry the real work?**
+It unblocks work immediately, is the only option that rewrites nothing, and its
+undo is a single settings change. It also leaves Options B and C available later,
+once the trunk is stable and there is time to do the merge carefully. Option D is
+not worth its risk given that no content is actually missing from either side.
