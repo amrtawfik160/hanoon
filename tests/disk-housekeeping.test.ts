@@ -5,6 +5,7 @@ import {
   DISK_CRITICAL_FREE_BYTES,
   DISK_LOW_FREE_BYTES,
   DISPOSABLE_TEMP_MIN_AGE_MS,
+  isDisposableTempName,
   planDiskReclaim,
   type TempEntryObservation,
 } from "../src/autonomy/disk-space";
@@ -12,6 +13,7 @@ import { hashSecret } from "../src/crypto";
 import {
   DISK_RECLAIM_BATCH,
   DISK_SCAN_INTERVAL_MS,
+  DISK_STARTUP_DELAY_MS,
   DiskHousekeepingService,
   type TempDirectoryAccess,
 } from "../src/services/disk-housekeeping-service";
@@ -290,6 +292,25 @@ it("still warns when the temp directory itself cannot be read", async () => {
   expect(outcome.notified).toBe(true);
 });
 
+it("never walks the temp directory on the executor's first ticks", async () => {
+  // The walk is the slowest thing here and a leak makes it slower. On the
+  // first tick it would land on top of whatever the owner asked for while the
+  // plugin was down, and nothing about it is urgent to the minute.
+  const { store } = fixture("startup");
+  let now = NOW;
+  const access = temp({ list: vi.fn(async () => [entry({ name: "hanoon-old" })]) });
+  const subject = service(store, access, { now: () => now });
+
+  await subject.processDue();
+  now = NOW + DISK_STARTUP_DELAY_MS - 1;
+  await subject.processDue();
+  expect(access.list).not.toHaveBeenCalled();
+
+  now = NOW + DISK_STARTUP_DELAY_MS;
+  await subject.processDue();
+  expect(access.list).toHaveBeenCalledTimes(1);
+});
+
 it("sweeps daily, not on every executor tick", async () => {
   const { store } = fixture("paced");
   let now = NOW;
@@ -297,12 +318,22 @@ it("sweeps daily, not on every executor tick", async () => {
   const subject = service(store, access, { now: () => now });
 
   await subject.processDue();
+  now = NOW + DISK_STARTUP_DELAY_MS;
+  await subject.processDue();
   await subject.processDue();
   expect(access.list).toHaveBeenCalledTimes(1);
 
-  now = NOW + DISK_SCAN_INTERVAL_MS;
+  now += DISK_SCAN_INTERVAL_MS;
   await subject.processDue();
   expect(access.list).toHaveBeenCalledTimes(2);
+});
+
+it("only asks the age of names it could act on", () => {
+  // The planner rejects a foreign name before it ever looks at its age, so a
+  // caller may skip the syscall — and cannot widen the list by doing so.
+  expect(isDisposableTempName("bb-fake-plugin-host-abc")).toBe(true);
+  expect(isDisposableTempName("systemd-private-9f2")).toBe(false);
+  expect(isDisposableTempName("hanoon-")).toBe(false);
 });
 
 it("never lets a broken sweep fail the executor tick", async () => {

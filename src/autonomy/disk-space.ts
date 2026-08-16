@@ -140,6 +140,20 @@ export type ReclaimPlan = Readonly<{
   kept: readonly Readonly<{ name: string; reason: string }>[];
 }>;
 
+/**
+ * Whether a name is one this project could have created. Exported so a caller
+ * reading the filesystem can skip the cost of stat-ing entries that were never
+ * candidates — a temp directory holding a leak has hundreds of thousands of
+ * entries, and one syscall each is the difference between a sweep and a stall.
+ * The planner applies this again regardless; a caller cannot widen it.
+ */
+export function isDisposableTempName(name: string): boolean {
+  // A prefix match with nothing after it is the shared parent name, not one
+  // instance of it, and is never a candidate.
+  if (DISPOSABLE_TEMP_PREFIXES.includes(name)) return false;
+  return DISPOSABLE_TEMP_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
+
 function keepReason(
   entry: TempEntryObservation,
   now: number,
@@ -147,10 +161,7 @@ function keepReason(
 ): string | null {
   if (entry.isSymbolicLink) return "symlink";
   if (!entry.isDirectory) return "not_a_directory";
-  if (!DISPOSABLE_TEMP_PREFIXES.some((prefix) => entry.name.startsWith(prefix))) return "not_ours";
-  // Belt and braces: a prefix match with nothing after it is the shared parent
-  // name, not one instance of it, and is never a candidate.
-  if (DISPOSABLE_TEMP_PREFIXES.includes(entry.name)) return "not_ours";
+  if (!isDisposableTempName(entry.name)) return "not_ours";
   if (entry.modifiedAt === null || !Number.isFinite(entry.modifiedAt)) return "age_unknown";
   if (now - entry.modifiedAt < minAgeMs) return "too_young";
   return null;

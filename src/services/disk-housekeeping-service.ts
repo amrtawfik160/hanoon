@@ -17,6 +17,17 @@ import type { TelegramAgentStore } from "../storage/store";
 export const DISK_SCAN_INTERVAL_MS = 24 * 60 * 60_000;
 
 /**
+ * How long after startup the first sweep waits.
+ *
+ * Not politeness. A temp directory holding a leak has hundreds of thousands of
+ * entries in it, and walking them is the slowest thing this service does — on
+ * the executor's first tick it lands squarely on top of whatever the owner
+ * asked for while the plugin was down. Nothing here is urgent to the minute,
+ * so it waits until the machine has caught up with itself.
+ */
+export const DISK_STARTUP_DELAY_MS = 5 * 60_000;
+
+/**
  * How long a warning stays given. A day, so pressure that persists is
  * mentioned again tomorrow rather than every tick, and so a warning about a
  * problem the owner is already fixing does not follow them around.
@@ -73,14 +84,18 @@ export type DiskHousekeepingOutcome = Readonly<{
  * the executor down with it.
  */
 export class DiskHousekeepingService {
-  private lastScanAt = Number.NEGATIVE_INFINITY;
+  private nextScanAt: number | null = null;
 
   public constructor(private readonly dependencies: DiskHousekeepingDependencies) {}
 
   public async processDue(): Promise<boolean> {
     const now = this.dependencies.clock.now();
-    if (now - this.lastScanAt < DISK_SCAN_INTERVAL_MS) return false;
-    this.lastScanAt = now;
+    if (this.nextScanAt === null) {
+      this.nextScanAt = now + DISK_STARTUP_DELAY_MS;
+      return false;
+    }
+    if (now < this.nextScanAt) return false;
+    this.nextScanAt = now + DISK_SCAN_INTERVAL_MS;
     try {
       const outcome = await this.sweep(now);
       return outcome.removed.length > 0 || outcome.notified;

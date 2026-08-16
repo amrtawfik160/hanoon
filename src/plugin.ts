@@ -99,6 +99,7 @@ import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
 import { ThreadNoticeService } from "./services/thread-notice-service";
 import { JobMemoryService } from "./services/job-memory-service";
+import { isDisposableTempName } from "./autonomy/disk-space";
 import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { installSystemMonitors } from "./services/system-monitors";
@@ -973,11 +974,17 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         const entries = await readdir(tmpdir(), { withFileTypes: true });
         return Promise.all(entries.map(async (entry) => {
           let modifiedAt: number | null = null;
-          try {
-            // lstat, not stat: a symlink's own timestamps, never its target's.
-            modifiedAt = (await lstat(join(tmpdir(), entry.name))).mtimeMs;
-          } catch {
-            // Unreadable reads as unknown age, which the planner keeps.
+          // Only the names that could be candidates are worth a syscall. A
+          // temp directory holding a leak has hundreds of thousands of
+          // entries, and the planner rejects a foreign name before it ever
+          // looks at its age.
+          if (isDisposableTempName(entry.name)) {
+            try {
+              // lstat, not stat: a symlink's own timestamps, never its target's.
+              modifiedAt = (await lstat(join(tmpdir(), entry.name))).mtimeMs;
+            } catch {
+              // Unreadable reads as unknown age, which the planner keeps.
+            }
           }
           return {
             name: entry.name,
