@@ -171,7 +171,25 @@ describe("job state machine", () => {
     const result = transition(job, { type: "CANCEL_REQUESTED" }, 2_000);
 
     expect(result.job.cancelRequestedAt).toBe(2_000);
-    expect(result.effects.map((item) => item.kind)).toEqual(["revoke_approvals"]);
+    expect(result.effects.map((item) => item.kind)).not.toContain("stop_thread");
+  });
+
+  it("settles cancellation immediately when no worker is left to stop", () => {
+    const result = transition(stateJob("failed", { resumeState: "critiquing" }), { type: "CANCEL_REQUESTED" }, 2_000);
+
+    expect(result.job).toMatchObject({ state: "cancelled", cancelRequestedAt: 2_000 });
+    expect(result.effects.map((item) => item.kind)).toEqual(["revoke_approvals", "render_status"]);
+  });
+
+  it("keeps a cancellation open while its active worker is still being stopped", () => {
+    const result = transition(
+      stateJob("implementing"),
+      { type: "CANCEL_REQUESTED", activeWorker: activeWorkerFixture() },
+      2_000,
+    );
+
+    expect(result.job.state).toBe("implementing");
+    expect(result.effects.map((item) => item.kind)).toEqual(["revoke_approvals", "stop_thread"]);
   });
 
   it("stops only the supplied active worker resource during cancellation", () => {
@@ -197,7 +215,7 @@ describe("job state machine", () => {
   it("suppresses non-cancellation effects after cancellation was requested", () => {
     const cancelledRequest = transition(
       stateJob("implementing"),
-      { type: "CANCEL_REQUESTED" },
+      { type: "CANCEL_REQUESTED", activeWorker: activeWorkerFixture() },
       2_000,
     ).job;
 

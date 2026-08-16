@@ -5,3 +5,7 @@ coverage/
 .env
 .env.*
 !.env.example
+vendor/
+.superpowers/
+docs/superpowers/
+task-*-report.md

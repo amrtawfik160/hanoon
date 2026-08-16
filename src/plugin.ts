@@ -38,6 +38,7 @@ import { ThreadNoticeService } from "./services/thread-notice-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
+import { StageOutputCorrections, stageOutputCorrection } from "./services/pipeline-stage-output";
 import { runProductionStage } from "./services/production-runner";
 
 function clock(): number {
@@ -84,6 +85,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const store = openStore(bb.storage);
   const executorNudge = new ExecutorNudge();
+  const stageCorrections = new StageOutputCorrections();
   let config = parseGlobalConfig(await settings.get());
   if (!config.ok) bb.status.needsConfiguration(config.message);
 
@@ -511,6 +513,18 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         return;
       }
       if (!fenceCurrent()) return;
+      // A worker turn that dies early still reads as idle, so its preamble would settle the stage.
+      // Re-ask the same thread a bounded number of times before failing the job on bad output.
+      const correction = stageOutputCorrection(pipelineRole, output);
+      if (correction !== null && stageCorrections.consume(currentPipelineAttempt.id)) {
+        try {
+          await bbRunner.sendSteering(resourceId, correction);
+          return;
+        } catch {
+          // Fall through and settle, which fails the stage with its usual error.
+        }
+      }
+      if (!fenceCurrent()) return;
       settlePipelineStageOutput({
         store,
         job: current,
@@ -519,6 +533,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         fence: { ownerId: fence.ownerId, generation: fence.generation },
         now: clock(),
       });
+      stageCorrections.clear(currentPipelineAttempt.id);
       return;
     }
 

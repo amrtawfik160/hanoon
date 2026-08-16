@@ -10,20 +10,25 @@ You need BB `0.36` or newer, npm, and the toolchains required by the tests. Inst
 npm ci
 ```
 
-Run a focused Vitest file while developing:
+Refresh the SDK declarations for your installed BB, then type check and build:
+
+```bash
+bb plugin types .
+npm run typecheck
+npm run build
+```
+
+`types/bb-plugin-sdk.d.ts` is committed and is what `@bb/plugin-sdk` resolves to during type checking, so both commands work from a clean clone.
+
+Running the tests needs one thing this repository cannot ship. The suite imports `@bb/plugin-sdk/testing` — the fake plugin host — at runtime, and BB does not publish that package to a registry. Install it from your BB distribution before running:
 
 ```bash
 npx vitest run tests/controller-service.test.ts
-```
-
-Run the complete gate before committing:
-
-```bash
 npm run check
 bb plugin types --check .
 ```
 
-The full check performs TypeScript validation, the complete Vitest suite, and a BB plugin build. The SDK check confirms the vendored plugin declarations still match the installed BB contract.
+`npm run check` performs TypeScript validation, the complete Vitest suite, and a BB plugin build; the middle step is the one that needs the package. The SDK check confirms the committed declarations still match the installed BB contract. Pull requests should state which of these were run and their results.
 
 ## Change boundaries
 

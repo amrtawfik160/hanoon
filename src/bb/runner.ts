@@ -121,8 +121,43 @@ function spawnRequest(request: Record<string, unknown>): SpawnArgs {
   return request as unknown as SpawnArgs;
 }
 
+const ENVIRONMENT_SETTLE_POLLS = 20;
+const ENVIRONMENT_SETTLE_INTERVAL_MS = 500;
+
+function settledEnvironmentId(thread: { environmentId?: string | null }): string | null {
+  const environmentId = thread.environmentId;
+  return typeof environmentId === "string" && environmentId.length > 0 ? environmentId : null;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class BbRunner {
   public constructor(public readonly sdk: BbSdk) {}
+
+  /**
+   * BB attaches a managed worktree after `threads.spawn` resolves, so a fresh
+   * thread can come back with a null environment id. Callers treat a missing
+   * environment as a permanent failure, so poll the thread briefly and return
+   * it once BB has bound the environment the spawn already asked for.
+   */
+  private async spawnThread(request: SpawnArgs): Promise<ThreadResult> {
+    const thread = await this.sdk.threads.spawn(request);
+    if (settledEnvironmentId(thread) !== null) return thread;
+    for (let poll = 0; poll < ENVIRONMENT_SETTLE_POLLS; poll += 1) {
+      await delay(ENVIRONMENT_SETTLE_INTERVAL_MS);
+      let current: Awaited<ReturnType<BbSdk["threads"]["get"]>>;
+      try {
+        current = await this.sdk.threads.get({ threadId: thread.id });
+      } catch {
+        continue;
+      }
+      const environmentId = settledEnvironmentId(current);
+      if (environmentId !== null) return { ...thread, environmentId };
+    }
+    return thread;
+  }
 
   private async resolveProjectHost(projectId: string): Promise<string> {
     const projects = await this.sdk.projects.list();
@@ -174,7 +209,7 @@ export class BbRunner {
       },
       ...executionArgs(policy.implementation),
     });
-    const thread = await this.sdk.threads.spawn(request);
+    const thread = await this.spawnThread(request);
     attempt.threadId = thread.id;
     return thread;
   }
@@ -201,7 +236,7 @@ export class BbRunner {
           hostId: await this.resolveProjectHost(project),
           workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: policy.baseBranch } },
         };
-    const thread = await this.sdk.threads.spawn(spawnRequest({
+    const thread = await this.spawnThread(spawnRequest({
       projectId: project,
       title: `Telegram ${job.id} plan ${attempt.id}`,
       visibility: "visible",
@@ -238,7 +273,7 @@ export class BbRunner {
     const uploadedWorkOrder = await this.upload(project, workOrder);
     const uploadedPlan = await this.upload(project, plan);
     const uploadedPacket = await this.upload(project, packet);
-    const thread = await this.sdk.threads.spawn(spawnRequest({
+    const thread = await this.spawnThread(spawnRequest({
       projectId: project,
       parentThreadId: planAttempt.threadId,
       title: `Telegram ${job.id} critique ${attempt.id}`,
@@ -281,7 +316,7 @@ export class BbRunner {
     const uploadedWorkOrder = await this.upload(project, workOrder);
     const uploadedPlan = await this.upload(project, plan);
     recordHandoff(attempt, workOrder, uploadedWorkOrder);
-    const thread = await this.sdk.threads.spawn(spawnRequest({
+    const thread = await this.spawnThread(spawnRequest({
       projectId: project,
       parentThreadId: planAttempt.threadId,
       title: `Telegram ${job.id} implementation ${attempt.id}`,
@@ -317,7 +352,7 @@ export class BbRunner {
     const packet = buildDocsPacket(job);
     const uploadedWorkOrder = await this.upload(project, workOrder);
     const uploadedPacket = await this.upload(project, packet);
-    const thread = await this.sdk.threads.spawn(spawnRequest({
+    const thread = await this.spawnThread(spawnRequest({
       projectId: project,
       parentThreadId,
       title: `Telegram ${job.id} docs ${attempt.id}`,
@@ -380,7 +415,7 @@ export class BbRunner {
       environment: { type: "reuse", environmentId },
       ...executionArgs(policy.review),
     });
-    const thread = await this.sdk.threads.spawn(request);
+    const thread = await this.spawnThread(request);
     attempt.threadId = thread.id;
     return thread;
   }

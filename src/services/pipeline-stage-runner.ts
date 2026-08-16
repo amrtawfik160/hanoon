@@ -4,6 +4,7 @@ import {
   buildPlanArtifact,
   parseCritiqueResult,
 } from "../bb/pipeline-handoffs";
+import { MIN_PLAN_OUTPUT_CHARS } from "./pipeline-stage-output";
 import type { Job } from "../domain/models";
 import type { PipelineStageAttempt, TelegramAgentStore } from "../storage/store";
 
@@ -53,6 +54,7 @@ export function settlePipelineStageOutput(input: {
   if (attempt.role === "PLAN") {
     let artifact;
     try {
+      if (output.trim().length < MIN_PLAN_OUTPUT_CHARS) throw new TypeError("plan output is an unfinished turn");
       artifact = buildPlanArtifact(output);
     } catch {
       return invalidStageOutput(store, job, attempt, fence, now);

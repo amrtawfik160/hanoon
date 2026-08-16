@@ -20,8 +20,8 @@ it("builds a bounded work order with the request, policy, workflow, and report c
   expect(text).toContain("Fix the failing Telegram handoff.");
   expect(text).toContain("proj_1");
   expect(text).toContain("main");
-  expect(text).toContain("investigate");
-  expect(text).toContain("regression");
+  expect(text).toContain("exactly what the original request asks for");
+  expect(text).toContain("tests covering the behavior it describes");
   expect(text).toContain("commit");
   expect(text).toContain("push");
   expect(text).toContain("pull request");

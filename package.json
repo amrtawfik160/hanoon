@@ -2,15 +2,16 @@
   "name": "bb-plugin-telegram-agent",
   "version": "0.1.0",
   "type": "module",
-  "private": true,
   "engines": {
     "bb": ">=0.36",
     "bbPluginSdk": "^0.4.1"
   },
   "bb": {
     "name": "Telegram Agent",
-    "description": "Talk to a configurable Codex controller and run reviewed BB implementation jobs from Telegram.",
-    "branding": { "icon": "Bot" },
+    "description": "Run BB from Telegram: an agent with memory and monitors, plus reviewed implementation jobs.",
+    "branding": {
+      "icon": "Bot"
+    },
     "server": "./server.ts",
     "skills": []
   },
@@ -22,7 +23,6 @@
     "check": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
-    "@bb/plugin-sdk": "file:vendor/bb-plugin-sdk-0.4.1.tgz",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
@@ -33,5 +33,10 @@
     "typescript": "^5.7.0",
     "vitest": "^3.2.0",
     "zod": "^4.3.6"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amrtawfik160/hanoon.git"
   }
 }

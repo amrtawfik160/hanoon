@@ -1,6 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
-import { BbRunner } from "../src/bb/runner";
+import { BbRunner, type PipelineThreadAttempt } from "../src/bb/runner";
 import { activeWorkerFixture, jobFixture, policyFixture } from "./helpers";
 
 type SdkCalls = {
@@ -44,6 +44,8 @@ function runnerFixture(options: {
   projects?: unknown[];
   pullRequest?: unknown;
   statusHeadSha?: string;
+  spawnEnvironmentId?: string | null;
+  environmentSettlesAfterGets?: number;
 } = {}) {
   const calls: SdkCalls = {
     attachments: [],
@@ -80,7 +82,10 @@ function runnerFixture(options: {
     threads: {
       spawn: vi.fn(async (args: unknown) => {
         calls.spawns.push(args);
-        return { id: "thr_created", environmentId: "env_1" };
+        return {
+          id: "thr_created",
+          environmentId: options.spawnEnvironmentId === undefined ? "env_1" : options.spawnEnvironmentId,
+        };
       }),
       fork: vi.fn(async (args: unknown) => {
         calls.forks.push(args);
@@ -96,7 +101,13 @@ function runnerFixture(options: {
       }),
       get: vi.fn(async (args: unknown) => {
         calls.gets.push(args);
-        return { id: "thr_i", status: "idle" };
+        const settlesAfter = options.environmentSettlesAfterGets;
+        if (settlesAfter === undefined) return { id: "thr_i", status: "idle" };
+        return {
+          id: "thr_created",
+          status: "idle",
+          environmentId: calls.gets.length >= settlesAfter ? "env_1" : null,
+        };
       }),
     },
     environments: {
@@ -163,6 +174,20 @@ it("spawns implementation in a visible managed worktree and records the immutabl
   expect(calls.forks).toHaveLength(0);
   expect(implementationAttempt.handoffPath).toBe("attachments/work-order.md");
   expect(implementationAttempt.handoffSha256).toMatch(/^[0-9a-f]{64}$/);
+});
+
+it("waits for the environment BB attaches after the spawn call returns", async () => {
+  const { calls, runner } = runnerFixture({ spawnEnvironmentId: null, environmentSettlesAfterGets: 2 });
+  const planAttempt: PipelineThreadAttempt = { id: "attempt_plan_1", role: "PLAN", ordinal: 1 };
+
+  const thread = await runner.spawnPlanner(
+    jobFixture({ projectId: "proj_1", policy: policyFixture(), environmentId: null }),
+    planAttempt,
+  );
+
+  expect(calls.gets).toHaveLength(2);
+  expect(thread.environmentId).toBe("env_1");
+  expect(planAttempt.environmentId).toBe("env_1");
 });
 
 it.each([

@@ -9,6 +9,7 @@ import {
 } from "../src/bb/pipeline-handoffs";
 import { openStore } from "../src/storage/store";
 import { settlePipelineStageOutput } from "../src/services/pipeline-stage-runner";
+import { StageOutputCorrections, stageOutputCorrection } from "../src/services/pipeline-stage-output";
 import { jobFixture, policyFixture } from "./helpers";
 
 function pipelineSdk() {
@@ -53,6 +54,11 @@ function pipelineSdk() {
   } as unknown as BbPluginApi["sdk"];
   return { runner: new BbRunner(sdk), spawns, uploads };
 }
+
+const substantivePlan = `# Plan\n\n${Array.from(
+  { length: 24 },
+  (_unused, index) => `${index + 1}. Step ${index + 1}: change the module, then prove it with a regression test.`,
+).join("\n")}\n`;
 
 const plannedJob = jobFixture({
   state: "planning",
@@ -286,7 +292,7 @@ describe("fresh planner, critic, and builder conversations", () => {
       store,
       job,
       attempt,
-      output: "# Plan\n\n1. Add a regression test.\n",
+      output: substantivePlan,
       fence,
       now: 1_006,
     })).toEqual({ outcome: "advanced", nextState: "critiquing" });
@@ -368,5 +374,70 @@ describe("fresh planner, critic, and builder conversations", () => {
       now: 1_018,
     })).toEqual({ outcome: "advanced", nextState: "resolving_docs_head" });
     expect(store.getJob(job.id)).toMatchObject({ state: "resolving_docs_head", prHeadSha: null });
+  });
+
+  it("rejects a planner preamble left behind by a turn that ended early", () => {
+    const { bb } = createFakePluginHost({ pluginId: "telegram-agent-plan-preamble" });
+    const store = openStore(bb.storage);
+    const draft = store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+    const selected = store.applyJobEvent(draft.id, draft.version, {
+      type: "PROJECT_SELECTED",
+      projectId: "proj_1",
+      policyVersion: 1,
+      policy: policyFixture(),
+    }, 1_001);
+    let job = store.applyJobEvent(draft.id, selected.version, { type: "CONFIRMED" }, 1_002);
+    const lease = store.acquireExecutorLease("executor", 1_003, 30_000);
+    if (!lease.acquired) throw new Error("lease missing");
+    const fence = { ownerId: "executor", generation: lease.generation };
+    let attempt = store.createPipelineStageAttempt({
+      id: "stage_plan_1",
+      jobId: job.id,
+      role: "PLAN",
+      ordinal: 1,
+      inputSha256: "a".repeat(64),
+      ...fence,
+      now: 1_004,
+    });
+    store.bindPipelineStageThread({ id: attempt.id, threadId: "thr_plan", environmentId: "env_plan", ...fence, now: 1_005 });
+    job = store.applyJobEvent(job.id, job.version, {
+      type: "PLAN_CREATED",
+      attemptId: attempt.id,
+      threadId: "thr_plan",
+      environmentId: "env_plan",
+    }, 1_005);
+    attempt = store.getPipelineStageAttempt(attempt.id)!;
+
+    expect(settlePipelineStageOutput({
+      store,
+      job,
+      attempt,
+      output: "The work order is 89 lines. I am now grounding the plan in the repository; I will not execute its commit steps in this turn.",
+      fence,
+      now: 1_006,
+    })).toEqual({ outcome: "invalid", error: "plan returned invalid bounded output" });
+    expect(store.getJob(job.id)?.state).toBe("failed");
+  });
+});
+
+describe("stage output corrections", () => {
+  it("re-asks an unfinished plan, fenced critique JSON, and empty docs, then accepts valid output", () => {
+    expect(stageOutputCorrection("PLAN", "I will start planning now.")).toMatch(/entire final output/i);
+    expect(stageOutputCorrection("PLAN", substantivePlan)).toBeNull();
+    expect(stageOutputCorrection("CRITIQUE", '```json\n{"verdict":"pass"}\n```')).toMatch(/strict JSON only/i);
+    expect(stageOutputCorrection("CRITIQUE", "The plan looks fine to me.")).toMatch(/strict JSON only/i);
+    expect(stageOutputCorrection("CRITIQUE", '{"verdict":"pass","summary":"Complete and testable"}')).toBeNull();
+    expect(stageOutputCorrection("DOCS", "   ")).toMatch(/documentation report/i);
+    expect(stageOutputCorrection("DOCS", "# Docs gate\n\nNo changes needed.\n")).toBeNull();
+  });
+
+  it("bounds corrective re-asks per attempt", () => {
+    const corrections = new StageOutputCorrections();
+    expect(corrections.consume("stage_plan_1")).toBe(true);
+    expect(corrections.consume("stage_plan_1")).toBe(true);
+    expect(corrections.consume("stage_plan_1")).toBe(false);
+    expect(corrections.consume("stage_plan_2")).toBe(true);
+    corrections.clear("stage_plan_1");
+    expect(corrections.consume("stage_plan_1")).toBe(true);
   });
 });

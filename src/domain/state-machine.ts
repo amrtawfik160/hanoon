@@ -155,12 +155,16 @@ function retryEffect(job: Job, effects: JobEffect[], resumeState: JobState): voi
   emitEffect(job, effects, kind, job.prHeadSha ? { headSha: job.prHeadSha } : {});
 }
 
+function hasActiveWorker(job: Job, worker: WorkerLiveness | null | undefined): boolean {
+  return !!worker && worker.jobId === job.id && ACTIVE_WORKER_STATES.has(worker.state);
+}
+
 function stopActiveWorker(
   job: Job,
   effects: JobEffect[],
   worker: WorkerLiveness | null | undefined,
 ): void {
-  if (!worker || worker.jobId !== job.id || !ACTIVE_WORKER_STATES.has(worker.state)) return;
+  if (!hasActiveWorker(job, worker) || !worker) return;
   emitEffect(job, effects, "stop_thread", {
     generation: worker.generation,
     resourceId: worker.resourceId,
@@ -180,6 +184,13 @@ function applyCancellation(
     job.cancelRequestedAt = now;
     emitEffect(job, effects, "revoke_approvals");
     stopActiveWorker(job, effects, event.activeWorker);
+  }
+  // Stopping a worker is the only path that reports CANCEL_CONFIRMED. With no worker to stop
+  // there is nothing left to confirm, so settle here; otherwise the job keeps a cancellation
+  // it can never finish and counts as active against every later job.
+  if (!hasActiveWorker(job, event.activeWorker)) {
+    job.state = "cancelled";
+    emitEffect(job, effects, "render_status");
   }
   return finish(job, effects, now);
 }

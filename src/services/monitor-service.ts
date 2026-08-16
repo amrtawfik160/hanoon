@@ -1,6 +1,8 @@
-import { CronExpressionParser } from "cron-parser";
+import { nextCronOccurrence } from "./cron";
 import { redactError } from "../errors";
 import type { MonitorRecord, TelegramAgentStore } from "../storage/store";
+
+export { nextCronOccurrence };
 
 export type MonitorThreads = {
   status(threadId: string): Promise<"idle" | "active" | "starting" | "stopping" | "error" | "missing">;
@@ -24,13 +26,6 @@ const MONITOR_BATCH = 20;
 const MONITOR_UPDATE_ID_BASE = 2_000_000_000;
 const MONITOR_CLOCK_EPOCH_MS = 1_700_000_000_000;
 
-export function nextCronOccurrence(cron: string, after: number): number | null {
-  try {
-    return CronExpressionParser.parse(cron, { currentDate: new Date(after) }).next().getTime();
-  } catch {
-    return null;
-  }
-}
 
 function firedPrompt(monitor: MonitorRecord, reason: string): string {
   return `A monitor you set has fired.\n\nWhy: ${reason}\nWhat you said to do: ${monitor.instruction}\n\n` +
