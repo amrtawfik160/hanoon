@@ -35,6 +35,7 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_access_verify",
   "telegram_agent_answer_thread",
   "telegram_agent_send_media",
+  "telegram_agent_approve_merge",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -624,6 +625,30 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     credential_scope: { credential: "bb", audience: "bb-plugin-sdk" },
     egress: ["bb"],
     proof_kinds: [],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
+  }),
+  /**
+   * Landing work the owner asked for in words instead of by tapping. The
+   * approval row, version fence, merge effect, and audit are the button's; only
+   * the owner's way of saying yes differs. It is a durable local write for the
+   * same reason `telegram_agent_respond` is: it enqueues the merge the pipeline
+   * then performs, and the manifest admits no irreversible capability.
+   */
+  telegram_agent_approve_merge: capability({
+    capability_id: "telegram_agent_approve_merge",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "high",
+    data_class: ["job_control"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["job_state", "external_mutation"],
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
   }),

@@ -100,6 +100,7 @@ import {
   controllerFinalizationJsonSchema,
 } from "./finalization-contract";
 import { MAX_THREAD_ASK_CHARS } from "./thread-ask";
+import { isMergeInstruction } from "./merge-instruction";
 import {
   MAX_OUTBOUND_CAPTION,
   boundedCaption,
@@ -123,6 +124,15 @@ type ToolDependencies = {
   evidenceProjector?: ControllerEvidenceReconciler;
   threadOperations: Pick<ThreadOperationService, "request">;
   downloadImage?: (fileId: string, maxBytes: number, signal?: AbortSignal) => Promise<Uint8Array>;
+  /**
+   * Lands a merge the owner asked for in words. Absent exactly when merging is
+   * unconfigured, in which case the tool refuses rather than claiming a merge.
+   */
+  approveMergeFromOwnerInstruction?: (input: Readonly<{
+    jobId: string;
+    userId: string;
+    chatId: string;
+  }>) => { outcome: "accepted" | "rejected" };
   health(now: number): unknown;
   notify(): void;
   now(): number;
@@ -891,6 +901,7 @@ async function resolveTrustedScope(
     case "telegram_agent_access_list":
     case "telegram_agent_access_status":
     case "telegram_agent_send_media":
+    case "telegram_agent_approve_merge":
       return globalScope();
     case "telegram_agent_access_verify":
       // Existence is a domain question the service answers with a typed
@@ -1439,6 +1450,15 @@ async function projectTrustedEvidence(
         outcome: after !== trustedState(resolution).beforeOverlay ? "succeeded" : "observed",
         proofKinds: ["memory_state"],
         subjectRefs: [`controller:${authorized.controller.controllerKey}`],
+      };
+    }
+    case "telegram_agent_approve_merge": {
+      // Proof only that the merge was enqueued on the owner's instruction.
+      const merged = domain.merged === true;
+      return {
+        outcome: merged ? "succeeded" : "observed",
+        proofKinds: merged ? ["job_state", "external_mutation"] : [],
+        subjectRefs: typeof domain.jobId === "string" ? [`job:${domain.jobId}`] : [],
       };
     }
     case "telegram_agent_send_media": {
@@ -2360,6 +2380,38 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         filename: decision.plan.filename,
         kind: decision.plan.field === "photo" ? "screenshot" : "recording",
       };
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[30],
+    description: "Land a job the owner just told you to land. Use it the moment they say merge it, ship it, or deploy it about a job waiting on approval: their word is the approval, so do not send them a button and do not ask again. It only works while that job is actually waiting for approval and only on the owner's own instruction, so a refusal means one of those was not true. Everything the pipeline checks still ran; this replaces their tap, nothing else.",
+    experimental_statusLabels: { pending: "Landing the work", completed: "Landed" },
+    parameters: z.object({
+      jobId: z.string().min(1).max(256).describe("The job waiting on merge approval."),
+    }).strict(),
+    execute: (params, context) => {
+      const controller = authorizedController(dependencies.store, context);
+      const approve = dependencies.approveMergeFromOwnerInstruction;
+      if (!approve) return { merged: false, reason: "Merging is not configured." };
+      const owner = dependencies.store.getOwner();
+      if (!owner) return { merged: false, reason: "No paired owner." };
+
+      // The authority comes from the owner's own words, read here rather than
+      // taken from the agent's account of them. A system turn never carries it:
+      // a monitor notice quoting "merge it" must not be able to approve a merge.
+      const turn = dependencies.store.getPendingControllerTurn(controller.controllerKey);
+      if (!turn || turn.origin !== "owner" || !isMergeInstruction(turn.inputText)) {
+        return {
+          merged: false,
+          reason: "The owner has not asked for this in their message, so the approval still has to be theirs.",
+        };
+      }
+      const result = approve({ jobId: params.jobId, userId: owner.userId, chatId: owner.chatId });
+      dependencies.notify();
+      return result.outcome === "accepted"
+        ? { merged: true, jobId: params.jobId }
+        : { merged: false, reason: "That job is not waiting for a merge approval right now." };
     },
   });
 

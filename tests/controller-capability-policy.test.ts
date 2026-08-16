@@ -526,6 +526,23 @@ const EXPECTED_CAPABILITIES = {
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
   },
+  telegram_agent_approve_merge: {
+    capability_id: "telegram_agent_approve_merge",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "high",
+    data_class: ["job_control"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["job_state", "external_mutation"],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
+  },
 } as const satisfies Readonly<Record<ControllerToolName, ControllerCapabilityDescriptor>>;
 
 const SAFE_AUTHORITY: ControllerCapabilityAuthority = {
@@ -638,6 +655,7 @@ describe("controller capability manifest", () => {
       "telegram_agent_access_verify",
       "telegram_agent_answer_thread",
       "telegram_agent_send_media",
+      "telegram_agent_approve_merge",
     ]);
     expect(CONTROLLER_DATA_CLASSES).toEqual([
       "project_metadata",

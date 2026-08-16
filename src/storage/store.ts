@@ -3643,6 +3643,11 @@ export interface TelegramAgentStore {
     jobVersion?: number | null;
   }): void;
   getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null;
+  /** The same approval, found by the job it belongs to rather than by nonce. */
+  findLiveApprovalForJob(
+    jobId: string,
+    now: number,
+  ): { nonceHash: string; record: ApprovalRecord } | null;
   getApproval(nonceHash: string): ApprovalState | null;
   consumeApproval(input: {
     nonceHash: string;
@@ -13043,6 +13048,31 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.validateApprovalInput(input);
     const create = this.db.transaction(() => this.createApprovalInTransaction(input));
     create();
+  }
+
+  /**
+   * The live approval waiting on one job, found by job rather than by nonce.
+   *
+   * The nonce itself only ever exists inside a Telegram button, which is what
+   * stops the agent approving its own work. When the owner instead types "merge
+   * it", the approval still has to be the one already issued for that job, so
+   * it is looked up here and validated by `getUsableApproval` — every currency,
+   * expiry, and revocation check runs exactly as it does for a button tap.
+   */
+  public findLiveApprovalForJob(
+    jobId: string,
+    now: number,
+  ): { nonceHash: string; record: ApprovalRecord } | null {
+    if (!jobId) throw new TypeError("jobId must not be empty");
+    assertNonNegativeInteger(now, "now");
+    const row = this.db.prepare(
+      `SELECT nonce_hash FROM approvals
+        WHERE job_id = ? AND consumed_at IS NULL AND expires_at > ?
+        ORDER BY expires_at DESC LIMIT 1`,
+    ).get(jobId, now) as { nonce_hash: string } | undefined;
+    if (!row) return null;
+    const record = this.getUsableApproval(row.nonce_hash, now);
+    return record ? { nonceHash: row.nonce_hash, record } : null;
   }
 
   public getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null {

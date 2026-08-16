@@ -313,7 +313,7 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // The renderer inserts the paragraph break, so the contract has to say so.
   expect(metadata[22].description).toMatch(/own paragraph/);
   // 29 manifest capabilities plus the two capability metadata tools.
-  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(32);
+  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(33);
 
   const byName = new Map(registrations.map((tool) => [tool.name, tool]));
   const parsed = (name: string, params: unknown) => {

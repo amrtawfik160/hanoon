@@ -416,6 +416,52 @@ export class MergeHandler {
     }
   }
 
+  /**
+   * Accepts the merge the owner just asked for in words rather than by tapping.
+   *
+   * The button and this path end in the same place: the same approval row, the
+   * same version fence, the same single `merge_pr` effect, the same audit. What
+   * differs is only how the owner said yes. Nothing here weakens a check —
+   * `findLiveApprovalForJob` returns nothing unless an approval is genuinely
+   * outstanding for that job, so an agent calling this without one gets a
+   * refusal rather than a merge.
+   *
+   * The caller is responsible for establishing that the owner actually asked;
+   * this method establishes everything else.
+   */
+  public approveMergeFromOwnerInstruction(input: {
+    jobId: string;
+    userId: string;
+    chatId: string;
+  }): MergeCallbackResult {
+    const now = this.clock();
+    assertNow(now);
+    if (!input.jobId) throw new TypeError("jobId is required");
+
+    const owner = this.options.store.getOwner();
+    if (!owner || owner.userId !== input.userId || owner.chatId !== input.chatId) {
+      return { outcome: "rejected" };
+    }
+    const live = this.options.store.findLiveApprovalForJob(input.jobId, now);
+    if (!live) return { outcome: "rejected" };
+    const job = this.options.store.getJob(live.record.jobId);
+    if (!job) return { outcome: "rejected" };
+
+    const accepted = this.approvals.acceptByNonceHash(
+      live.nonceHash,
+      job.version,
+      {
+        idempotencyKey: `${job.id}:${job.version + 1}:merge_pr`,
+        jobId: job.id,
+        kind: "merge_pr",
+        payload: { headSha: live.record.headSha },
+      },
+      now,
+      { userId: input.userId, chatId: input.chatId },
+    );
+    return { outcome: accepted.ok ? "accepted" : "rejected" };
+  }
+
   public async handleMergeCallback(input: ApprovalCallbackInput): Promise<MergeCallbackResult> {
     return this.handleApprovalCallback(input);
   }

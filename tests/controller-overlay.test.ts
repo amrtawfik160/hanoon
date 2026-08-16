@@ -49,7 +49,7 @@ it("layers the owner's wording after the fixed instructions, never before", () =
   expect(composed.startsWith(CONTROLLER_INSTRUCTIONS)).toBe(true);
   expect(composed).toContain("Always show me the PR link.");
   // A boundary stated above must not be reorderable by anything the overlay says.
-  expect(composed.indexOf("Merging a pull request")).toBeLessThan(composed.indexOf("Always show me"));
+  expect(composed.indexOf("Merge and production go through")).toBeLessThan(composed.indexOf("Always show me"));
 });
 
 it("keeps one stable instruction sentinel before one owner overlay", () => {
@@ -67,10 +67,13 @@ it("states the enforced owner-turn and Telegram approval boundaries", () => {
   expect(CONTROLLER_INSTRUCTIONS).toContain("telegram_agent_respond");
   expect(CONTROLLER_INSTRUCTIONS).toContain("same-turn evidence");
   expect(CONTROLLER_INSTRUCTIONS).toContain("durable job or monitor obligation");
-  expect(CONTROLLER_INSTRUCTIONS).toContain("connector installation");
-  expect(CONTROLLER_INSTRUCTIONS).toContain("credential mutation or rotation");
-  expect(CONTROLLER_INSTRUCTIONS).toContain("Allow once");
-  expect(CONTROLLER_INSTRUCTIONS).toContain("Deny");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("changing a credential");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("Installing or connecting an integration");
+  // The owner's word is the approval now, so the merge boundary is stated as
+  // the tool that consumes it plus the unasked case that still waits for a tap.
+  expect(CONTROLLER_INSTRUCTIONS).toContain("telegram_agent_approve_merge");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("Unasked, wait for their tap");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("Never merge or deploy by hand");
   expect(CONTROLLER_INSTRUCTIONS).not.toContain("full permissions");
   expect(CONTROLLER_INSTRUCTIONS).not.toContain("install and configure it");
 });
@@ -159,7 +162,7 @@ it("keeps the working-style overlay once, after the fixed boundaries", () => {
   const composed = composeControllerInstructions("Lead with the PR link.");
 
   expect(composed.split("Lead with the PR link.").length - 1).toBe(1);
-  expect(composed.indexOf("Merging a pull request")).toBeLessThan(composed.indexOf("Lead with the PR link."));
+  expect(composed.indexOf("Merge and production go through")).toBeLessThan(composed.indexOf("Lead with the PR link."));
 });
 
 it.each([
@@ -276,6 +279,6 @@ it("delivers the fixed block whole through the configured source", async () => {
   // What BB hands the agent, not what the plugin composed: an over-long block
   // would arrive with its boundaries missing.
   expect(configured.instructions).toBe(composeControllerInstructions("y".repeat(MAX_CONTROLLER_OVERLAY)));
-  expect(configured.instructions).toContain("one-use Telegram approval");
+  expect(configured.instructions).toContain("Never merge or deploy by hand");
   expect(configured.instructions).toContain("Never reveal hidden threads");
 });

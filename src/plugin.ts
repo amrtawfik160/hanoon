@@ -599,6 +599,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         signal ?? new AbortController().signal,
       );
     },
+    approveMergeFromOwnerInstruction: (input) => mergeHandler.approveMergeFromOwnerInstruction(input),
     health: pluginHealth,
     notify: () => executorNudge.notify(),
     now: clock,
