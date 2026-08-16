@@ -122,7 +122,7 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 36]).toContain("controller_generation_quarantine");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 37]).toContain("one_open_controller_generation");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 38]).toContain("delivery_state");
-  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 40]).toContain("CREATE TABLE stage_executions");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 44]).toContain("CREATE TABLE stage_executions");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {
