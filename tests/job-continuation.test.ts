@@ -124,8 +124,45 @@ it("rejects a nonsensical attempt count rather than guessing", () => {
 });
 
 it("counts attempts per block, so a job blocking somewhere new starts fresh", () => {
-  const planning = continuationKey({ blockedReason: "plan_limit", resumeState: null });
-  const reviewing = continuationKey({ blockedReason: "review_limit", resumeState: "reviewing" });
+  const planning = continuationKey({ state: "blocked", blockedReason: "plan_limit", resumeState: null });
+  const reviewing = continuationKey({ state: "blocked", blockedReason: "review_limit", resumeState: "reviewing" });
   expect(planning).not.toBe(reviewing);
-  expect(continuationKey({ blockedReason: "plan_limit", resumeState: null })).toBe(planning);
+  expect(continuationKey({ state: "blocked", blockedReason: "plan_limit", resumeState: null })).toBe(planning);
+});
+
+it("retries a job that failed mid-stage, which is what stalled PR 895", () => {
+  // "BB environment observation is unavailable" is a transient read, and the
+  // stage is still there to re-enter. This sat failed for good because the
+  // sweep only looked at blocked jobs.
+  expect(planJobContinuation({
+    job: blockedJob({ state: "failed", resumeState: "implementing" }),
+    attempts: 0,
+  })).toEqual({ action: "resume", event: "RETRY" });
+});
+
+it("bounds a failing job by the same ladder as a blocked one", () => {
+  const job = blockedJob({ state: "failed", resumeState: "implementing" });
+  expect(planJobContinuation({ job, attempts: MAX_AUTO_CONTINUES - 1 }).action).toBe("resume");
+  expect(planJobContinuation({ job, attempts: MAX_AUTO_CONTINUES }).action).toBe("escalate");
+});
+
+it("hands over a failure with nowhere to resume from", () => {
+  expect(planJobContinuation({
+    job: blockedJob({ state: "failed", resumeState: null }),
+    attempts: 0,
+  }).action).toBe("escalate");
+});
+
+it("holds a failed job the owner is cancelling", () => {
+  expect(planJobContinuation({
+    job: blockedJob({ state: "failed", resumeState: "implementing", cancelRequestedAt: 1 }),
+    attempts: 0,
+  })).toEqual({ action: "hold" });
+});
+
+it("counts a failure separately from a block at the same stage", () => {
+  // Otherwise a job that failed in reviewing, recovered, then blocked in
+  // reviewing would arrive with the failure's attempts already spent.
+  expect(continuationKey({ state: "failed", blockedReason: null, resumeState: "reviewing" }))
+    .not.toBe(continuationKey({ state: "blocked", blockedReason: null, resumeState: "reviewing" }));
 });

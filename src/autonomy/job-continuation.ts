@@ -54,8 +54,8 @@ export type ContinuationDecision =
  * Without this a job that blocked in planning, recovered, built a PR, and then
  * blocked in review would arrive at review with its ladder already spent.
  */
-export function continuationKey(job: Pick<Job, "blockedReason" | "resumeState">): string {
-  return `${job.blockedReason ?? "-"}:${job.resumeState ?? "-"}`;
+export function continuationKey(job: Pick<Job, "state" | "blockedReason" | "resumeState">): string {
+  return `${job.state}:${job.blockedReason ?? "-"}:${job.resumeState ?? "-"}`;
 }
 
 /** The owner has to fix the project's configuration; retrying cannot. */
@@ -76,7 +76,7 @@ export function planJobContinuation(input: {
   if (!Number.isInteger(attempts) || attempts < 0) {
     throw new TypeError("attempts must be a non-negative integer");
   }
-  if (job.state !== "blocked") return { action: "hold" };
+  if (job.state !== "blocked" && job.state !== "failed") return { action: "hold" };
 
   // A cancellation in flight is the owner's decision already made. Resuming
   // here would race their intent and restart work they asked to stop.
@@ -93,6 +93,21 @@ export function planJobContinuation(input: {
   }
   if (job.blockedReason === "configuration") {
     return { action: "escalate", reason: CONFIGURATION_ESCALATION };
+  }
+
+  // A failed job is the plainest case there is: something broke mid-stage and
+  // the stage is still there to re-enter. It was excluded only because this
+  // swept blocked jobs, so a job that failed on a transient BB read sat failed
+  // for good while `retryFailedJob` — which has always accepted exactly this —
+  // was never offered it.
+  if (job.state === "failed") {
+    if (job.resumeState === null) {
+      return { action: "escalate", reason: UNRECOVERABLE_ESCALATION };
+    }
+    if (attempts >= MAX_AUTO_CONTINUES) {
+      return { action: "escalate", reason: EXHAUSTED_ESCALATION };
+    }
+    return { action: "resume", event: "RETRY" };
   }
 
   const event = resumeEventFor(job);
