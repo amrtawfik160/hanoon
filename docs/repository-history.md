@@ -111,9 +111,13 @@ Two live tips were **not** merged, because each conflicts with the trunk:
 | `930e235` | `src/plugin.ts` |
 | `ba2710b` | `scripts/eval-controller-answers.mjs`, `src/eval/answer-contract.ts`, `src/eval/eval-integrity.ts`, `tests/answer-contract.test.ts`, `tests/eval-integrity-race.test.ts` |
 
-Both conflict against `c11da25` as well, so neither was caused by the fix
-commit. They are set aside rather than abandoned: the work is intact on its own
-branches and can be merged once the conflicts are resolved deliberately.
+Both conflict against `c11da25` as well, so neither was caused by the fix commit.
+
+These two are **outstanding, not abandoned**. The work is intact on its own
+branches and nothing is lost. They are deliberately not being rebased yet:
+`930e235` conflicts in `src/plugin.ts`, which in-flight work is still editing, so
+rebasing today would only buy a second round of the same conflicts. Both get
+rebased onto `trunk` as their own task once the in-flight work lands.
 
 ## What is still open
 
