@@ -5,6 +5,7 @@ import {
   auditDigest,
   type AuditResult,
 } from "../src/autonomy/audit-contract";
+import { DEBT_SCAN_SCOPE } from "../src/autonomy/audits/tech-debt";
 
 function findings(auditId: string, count: number): AuditResult {
   return {
@@ -18,11 +19,12 @@ function findings(auditId: string, count: number): AuditResult {
   };
 }
 
-const CLEAN: AuditResult = { auditId: "tech-debt", status: "ok", findings: [] };
+const CLEAN_DEBT: AuditResult = { auditId: "tech-debt", status: "ok", findings: [], scope: DEBT_SCAN_SCOPE };
+const CLEAN_DOCS: AuditResult = { auditId: "docs-staleness", status: "ok", findings: [] };
 
 it("says nothing when every audit came back clean", () => {
   // A daily check that reports "all fine" every day is a daily interruption.
-  expect(auditDigest({ project: "hanoon", results: [CLEAN, { ...CLEAN, auditId: "docs-staleness" }] }))
+  expect(auditDigest({ project: "hanoon", results: [CLEAN_DEBT, CLEAN_DOCS] }))
     .toBeNull();
 });
 
@@ -31,10 +33,19 @@ it("says nothing when there were no audits at all", () => {
 });
 
 it("names the project and each audit that found something", () => {
-  const text = auditDigest({ project: "hanoon", results: [findings("docs-staleness", 2), CLEAN] });
+  const text = auditDigest({ project: "hanoon", results: [findings("docs-staleness", 2), CLEAN_DEBT] });
   expect(text).toContain("hanoon");
   expect(text).toMatch(/docs/i);
   expect(text).toMatch(/\b2\b/);
+});
+
+it("qualifies a clean bounded debt scan when another audit makes the digest visible", () => {
+  const text = auditDigest({
+    project: "hanoon",
+    results: [CLEAN_DEBT, findings("bug-backlog", 1)],
+  }) ?? "";
+
+  expect(text).toContain(`tech-debt: no findings in ${DEBT_SCAN_SCOPE}.`);
 });
 
 it("caps how many findings one audit can put in the message", () => {

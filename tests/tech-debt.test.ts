@@ -28,6 +28,13 @@ it("names which kinds a file carries", () => {
   expect(found[0]?.detail).toContain("HACK");
 });
 
+it("states the bounded scan scope in its findings", () => {
+  const found = analyseTechDebt({ markers: [marker("src/a.ts")] });
+  expect(found[0]?.detail).toContain("tracked source files only");
+  expect(found[0]?.detail).toContain("prose");
+  expect(found[0]?.detail).toContain("generated");
+});
+
 it("puts the worst file first, because the digest only shows the first few", () => {
   const found = analyseTechDebt({
     markers: [

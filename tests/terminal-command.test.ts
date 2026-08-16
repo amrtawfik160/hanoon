@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { TerminalCommandRunner } from "../src/bb/terminal-command";
+import { parseCommandJson, TerminalCommandRunner } from "../src/bb/terminal-command";
 
 type TerminalSdk = {
   terminals: {
@@ -29,6 +29,19 @@ afterEach(() => {
 });
 
 describe("TerminalCommandRunner", () => {
+  test("parses JSON after terminal control sequences without changing printable content", () => {
+    const title = "Issue ; [brackets] \\ escapes and } braces";
+    const output = `\u001b[?25l;?\u001b[?25h${JSON.stringify([{ title }])}`;
+
+    expect(parseCommandJson(output, "audit: bug backlog")).toEqual([{ title }]);
+  });
+
+  test("describes a missing JSON payload in terms the audit can report", () => {
+    expect(() => parseCommandJson("\u001b[?25l;? not JSON", "audit: bug backlog")).toThrow(
+      "audit: bug backlog: command output did not contain a valid JSON payload",
+    );
+  });
+
   test("captures a command result before BB removes scrollback for an exited terminal", async () => {
     let marker: string | null = null;
     let statusReads = 0;
