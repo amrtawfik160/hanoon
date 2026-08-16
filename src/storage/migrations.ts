@@ -1953,6 +1953,30 @@ UPDATE controller_turns
  WHERE state = 'dispatching';
 `] as const;
 
+export const THREAD_INTERACTION_AUDIENCE_MIGRATIONS = [String.raw`
+ALTER TABLE thread_interactions ADD COLUMN audience TEXT NOT NULL DEFAULT 'owner';
+`] as const;
+
+// What the controller asked a worker thread to do, recorded when it sends so
+// the owner can be told afterwards. Keyed to the controller rather than the
+// turn: an ask stays unreported until it actually reaches the owner, so a turn
+// that dies after sending still surfaces it on the next reply.
+export const CONTROLLER_THREAD_ASK_MIGRATIONS = [String.raw`
+CREATE TABLE controller_thread_asks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  thread_id TEXT NOT NULL,
+  thread_name TEXT,
+  ask TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  reported_at INTEGER
+);
+CREATE INDEX controller_thread_asks_unreported
+  ON controller_thread_asks(controller_key, id)
+  WHERE reported_at IS NULL;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2009,4 +2033,6 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_GENERATION_QUARANTINE_MIGRATIONS,
   ...CONTROLLER_GENERATION_INVARIANT_MIGRATIONS,
   ...CONTROLLER_DELIVERY_STATE_MIGRATIONS,
+  ...THREAD_INTERACTION_AUDIENCE_MIGRATIONS,
+  ...CONTROLLER_THREAD_ASK_MIGRATIONS,
 ] as const;

@@ -4,6 +4,7 @@ import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import { buildHealthReport } from "../src/services/health-report";
 import type { JobLaneSnapshot } from "../src/services/job-lane-runner";
+import { EXPECTED_MIGRATION_ID, type RuntimeIdentity } from "../src/services/runtime-identity";
 
 const NOW = 1_800_000_000_000;
 const EMPTY_LANES: JobLaneSnapshot = { pipelineActive: 0, controlActive: 0, busyJobIds: [] };
@@ -40,6 +41,53 @@ it("names what is wrong when the executor has stopped", () => {
 
   expect(report.ok).toBe(false);
   expect(report.problems).toContain("the executor lease is not current");
+});
+
+it("makes a stale activation visible in the existing health report", () => {
+  const { db, store } = fixture();
+  expect(store.acquireExecutorLease("executor", NOW, 30_000).acquired).toBe(true);
+  const runtime: RuntimeIdentity = {
+    sourceRoot: "/registered/plugin",
+    loadedAt: NOW - 10_000,
+    loadedFingerprint: "old-build",
+    expectedMigrationId: EXPECTED_MIGRATION_ID,
+    currentFingerprint: () => "new-build",
+  };
+
+  const report = buildHealthReport(db, NOW, 2, EMPTY_LANES, runtime);
+
+  expect(report.ok).toBe(false);
+  expect(report.activation).toMatchObject({
+    sourceRoot: "/registered/plugin",
+    sourceChanged: true,
+    expectedMigrationId: EXPECTED_MIGRATION_ID,
+    appliedMigrationId: EXPECTED_MIGRATION_ID,
+  });
+  expect(report.problems).toContain("source changed since activation; reload required");
+});
+
+it("surfaces a stale executor heartbeat even while its lease still looks current", () => {
+  const { db, store } = fixture();
+  expect(store.acquireExecutorLease("executor", NOW - 60_000, 120_000).acquired).toBe(true);
+
+  const report = buildHealthReport(db, NOW, 2, EMPTY_LANES);
+
+  expect(report).toMatchObject({
+    ok: false,
+    executor: {
+      current: false,
+      heartbeatAt: NOW - 60_000,
+      heartbeatAgeMs: 60_000,
+      heartbeatStale: true,
+    },
+  });
+  expect(report.problems).toContain("the executor heartbeat is stale");
+
+  db.prepare("UPDATE executor_lease SET lease_expires_at = ? WHERE singleton = 1").run(NOW - 1);
+  expect(buildHealthReport(db, NOW, 2, EMPTY_LANES).problems).toEqual(expect.arrayContaining([
+    "the executor lease is not current",
+    "the executor heartbeat is stale",
+  ]));
 });
 
 it("surfaces undelivered messages and failed Telegram updates", () => {

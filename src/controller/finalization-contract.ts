@@ -39,6 +39,9 @@ export type PersistedFinalizationRejectionCode = Exclude<
 >;
 type EvidenceRef = `evidence:${number}`;
 
+/** One blank line, so each segment lands as its own paragraph in Telegram. */
+const SEGMENT_SEPARATOR = "\n\n";
+
 const boundedSegmentText = z.string().refine(
   (text) => Array.from(text).length <= 4_000,
   "segment text must be at most 4000 characters",
@@ -131,18 +134,18 @@ const CORRECTIONS: Record<FinalizationRejectionCode, string> = {
   invalid_contract: "Return one valid bounded finalization without unsafe material.",
   accepted_already: "This turn already has an accepted finalization.",
   revision_limit: "The finalization revision limit has been reached.",
-  evidence_limit_exceeded: "The evidence limit was exceeded; do not finalize this turn.",
+  evidence_limit_exceeded: "This turn's evidence budget is full, so no further claim can be verified. Answer the owner in plain text segments with no claim segments.",
   duplicate_evidence_reference: "Remove duplicate evidence references within each claim.",
   evidence_missing: "Reference only evidence available to this turn.",
   subject_mismatch: "Use evidence whose subject exactly matches the claim subject.",
-  proof_incompatible: "Use proof and outcomes compatible with every claim.",
-  owner_boundary_missing: "Use needs_owner only for an active owner boundary.",
+  proof_incompatible: "Source report: set kind observed_state, outcome observed, source subjectRef/evidenceRefs, and text \"The thread reports X. Confidence: medium.\" Keep success there; use answered for an offer. Direct success needs outcome succeeded and matching proof.",
+  owner_boundary_missing: "Use answered for a conditional offer, for example \"I can start the guarded promotion if you approve.\" Use needs_owner only when this turn has an active owner question or approval boundary.",
   obligation_forbidden: "Remove obligations from answered or needs_owner finalizations.",
   obligation_missing: "A deferred finalization requires a durable obligation.",
   obligation_not_live: "Reference only live obligations for a deferred finalization.",
   invocation_in_flight: "Wait for the current mutating capability invocation to settle before finalizing.",
   process_only: "Replace process intent with a direct answer or durable deferred obligation.",
-  high_impact_text_unclaimed: "Move high-impact success assertions into evidence-backed claim segments.",
+  high_impact_text_unclaimed: "Source report: use kind observed_state, outcome observed, source subjectRef/evidenceRefs, and text \"The thread reports X. Confidence: medium.\" For a topic/offer use non-assertive text. Direct success needs outcome succeeded and matching proof.",
 };
 
 export function controllerFinalizationCorrection(code: FinalizationRejectionCode): string {
@@ -186,6 +189,7 @@ const PREDICATE_TOKEN = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
 const PREDICATE_CHAIN_WORDS = new Set([
   "am", "is", "are", "was", "were", "be", "been", "being",
   "do", "does", "did", "have", "has", "had",
+  "go", "goes", "going", "went",
   "can", "could", "will", "would", "shall", "should", "may", "might", "must",
   "not", "never", "no", "longer", "cannot", "can't", "don't", "doesn't", "didn't",
   "isn't", "aren't", "wasn't", "weren't", "hasn't", "haven't", "hadn't", "won't",
@@ -209,6 +213,19 @@ const LOCAL_REPORTING_SUBJECT_WORDS = new Set(["ci", "pipeline", "review"]);
 const LOCAL_PROTECTED_SUBJECT_WORDS = new Set(["ci", "pipeline", "review", "deployment", "release"]);
 const LOCAL_SUCCESS_VERB_WORD = /^(?:pass(?:ed)?|succeed(?:ed)?|complete(?:d)?|finish(?:ed)?|fail(?:ed)?|live|green)$/i;
 const NON_RESULT_TEST_SCOPE_WORD = /^(?:can|could|may|might|will|would|shall|should|must|if|when|whenever|unless|to|through)$/i;
+const ATTRIBUTION_SOURCE = "(?:(?:the|this|that|its)\\s+)?(?:(?:thread|branch|job|agent|source|build|ci|pipeline|review)(?:['’]s\\s+(?:(?:latest|closing)\\s+)?message)?|(?:(?:latest|closing)\\s+)?message|report|log)";
+const ATTRIBUTION_VERB = "(?:reports?|reported|says?|said|states?|stated|shows?|showed|records?|recorded|indicates?|indicated|notes?|noted|lists?|listed|describes?|described)";
+const ATTRIBUTION_MARKER = new RegExp(
+  `\\b(?:according\\s+to\\s+${ATTRIBUTION_SOURCE}|${ATTRIBUTION_SOURCE}\\s+${ATTRIBUTION_VERB})\\b`,
+  "gi",
+);
+const ATTRIBUTION_SCOPE_BREAK = /\b(?:and|but|then|while|whereas)\s+(?:i|we)\b/i;
+const EXPLICIT_ATTRIBUTION_CONFIDENCE = /\bconfidence\s*:\s*(?:low|medium|high)\b/i;
+const NON_RESULT_RELATIVE_SUBJECT = /\b(?:anything|nothing(?:\s+(?:it|they))?)\s+$/i;
+const NON_RESULT_RELATIVE_PREDICATE = /^(?:takes?|goes?|stays?|remains?|sits?|waits?|belongs?|becomes?|triggers?|starts?|runs?|lands?|applies?|counts?)$/i;
+const NON_RESULT_RELATIVE_FILLER = /^(?:here|there|in|into|on|onto|from|through|within)$/i;
+const LIVE_TOPIC_NOUNS = new Set(["branch", "branches", "directory", "directories", "environment", "environments", "worktree", "worktrees"]);
+const NON_AFFIRMATIVE_RESULT_TRANSITION = /\b(?:can|could|may|might|should|will|would)\s+(?:bring|make|put|take)\s+(?:(?:a|an|the|this|that)\s+)?(?:[a-z0-9_-]+\s+){0,2}$/i;
 const MAX_PREDICATE_CONTEXT_CHARS = 256;
 const OPERATIONAL_DEFAULT_IGNORABLES = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\ufe00-\ufe0f\ufe20-\ufe2f\uffa0]/gu;
 const MIXED_SCRIPT_CONFUSABLES: ReadonlyMap<string, string> = new Map([
@@ -448,8 +465,18 @@ const OPERATIONAL_ASSERTIONS: readonly OperationalAssertion[] = [
   },
 ];
 
+/**
+ * A segment is a paragraph, so the renderer owns the break between segments.
+ * Joining on the empty string delivered glued prose ("...the hard way.New one
+ * when you want a check") because nothing asked the model to carry its own
+ * separators. Edges are trimmed so stray whitespace cannot collapse the break,
+ * newlines inside a segment survive, and the bound is measured on the joined
+ * text so the separators this adds cannot push a message past Telegram's limit.
+ */
 export function renderControllerFinalization(candidate: ControllerFinalization): string {
-  const renderedMessage = candidate.segments.map((segment) => segment.text).join("");
+  const renderedMessage = candidate.segments
+    .map((segment) => segment.text.trim())
+    .join(SEGMENT_SEPARATOR);
   if (Array.from(renderedMessage).length > 4_000) {
     throw new TypeError("final message exceeds 4000 characters");
   }
@@ -634,6 +661,7 @@ function hasNonAffirmativeScope(prefix: string): boolean {
 function matchHasNonAffirmativePolarity(clause: string, match: OperationalMatch): boolean {
   const { context, beforePredicate, predicatePrefix } = predicatePrefixBeforeMatch(clause, match);
   if (NON_AFFIRMATIVE_OPERATIONAL_PREFIX.test(predicatePrefix)) return true;
+  if (NON_AFFIRMATIVE_RESULT_TRANSITION.test(context)) return true;
   if (hasNonAffirmativeScope(context)) return true;
   if (hasNonAffirmativeScope(beforePredicate)) return true;
   return false;
@@ -651,6 +679,27 @@ function localPredicateTokens(text: string): LocalPredicateToken[] {
   return [...text.matchAll(PREDICATE_TOKEN)].map((token) => ({
     word: token[0]!.toLowerCase(),
   }));
+}
+
+function isLiveTopicModifier(clause: string, match: OperationalMatch): boolean {
+  if (clause.slice(match.start, match.end).trim().toLowerCase() !== "live") return false;
+  const nextToken = localPredicateTokens(clause.slice(match.end))[0]?.word;
+  return nextToken !== undefined && LIVE_TOPIC_NOUNS.has(nextToken);
+}
+
+function isRelativeClauseModifier(clause: string, match: OperationalMatch): boolean {
+  if (!NON_RESULT_RELATIVE_SUBJECT.test(predicateContextBeforeMatch(clause, match))) return false;
+  const following = localPredicateTokens(clause.slice(match.end, match.end + MAX_PREDICATE_CONTEXT_CHARS));
+  let predicateIndex = 0;
+  while (predicateIndex < following.length && NON_RESULT_RELATIVE_FILLER.test(following[predicateIndex]!.word)) {
+    predicateIndex += 1;
+  }
+  return predicateIndex <= 2
+    && NON_RESULT_RELATIVE_PREDICATE.test(following[predicateIndex]?.word ?? "");
+}
+
+function matchIsNonResultMention(clause: string, match: OperationalMatch): boolean {
+  return isLiveTopicModifier(clause, match) || isRelativeClauseModifier(clause, match);
 }
 
 function isLocalAdverb(token: string): boolean {
@@ -996,7 +1045,8 @@ function operationalMatchesIn(clause: string): OperationalMatch[] {
   const applied = matches.map((match) => applySubjectEntitlement(clause, match));
   const entitled = applied.filter((match): match is OperationalMatch => match !== null);
   return entitled.filter((match) => {
-    return !matchHasNonAffirmativePolarity(clause, match);
+    return !matchIsNonResultMention(clause, match)
+      && !matchHasNonAffirmativePolarity(clause, match);
   });
 }
 
@@ -1245,6 +1295,28 @@ function finalizationSegmentSpans(candidate: ControllerFinalization): Finalizati
   return spans;
 }
 
+function latestAttributionMarkerEnd(prefix: string): number | null {
+  const scanner = new RegExp(ATTRIBUTION_MARKER.source, ATTRIBUTION_MARKER.flags);
+  let latestEnd: number | null = null;
+  for (const marker of prefix.matchAll(scanner)) {
+    latestEnd = (marker.index ?? 0) + marker[0].length;
+  }
+  return latestEnd;
+}
+
+function claimAttributesOperationalMatch(
+  claim: ControllerClaim,
+  clause: string,
+  match: OperationalMatch,
+): boolean {
+  if (claim.kind !== "observed_state") return false;
+  if (claim.outcome !== "observed" && claim.outcome !== "uncertain") return false;
+  if (!EXPLICIT_ATTRIBUTION_CONFIDENCE.test(claim.text)) return false;
+  const prefix = predicateContextBeforeMatch(clause, match);
+  const markerEnd = latestAttributionMarkerEnd(prefix);
+  return markerEnd !== null && !ATTRIBUTION_SCOPE_BREAK.test(prefix.slice(markerEnd));
+}
+
 /**
  * The owner reads the rendered concatenation, so an operational assertion must
  * be located there rather than screened independently per segment. A match that
@@ -1268,6 +1340,7 @@ function hasIncompatibleClaimText(
       const onlyClaimSpan = touched.length === 1 ? touched[0]! : null;
       const onlySegment = onlyClaimSpan?.segment ?? null;
       if (!onlyClaimSpan || !onlySegment || onlySegment.type !== "claim") return true;
+      if (claimAttributesOperationalMatch(onlySegment, clause, match)) continue;
       if (!match.assertion.kinds.includes(onlySegment.kind) || onlySegment.outcome !== "succeeded") return true;
       const rows = evidenceRows(onlySegment, context);
       const claimRange: ProductionClaimRange = {
@@ -1327,13 +1400,33 @@ function renderCandidate(candidate: ControllerFinalization): string | null {
   }
 }
 
+/**
+ * Every fail-closed scan reads two renderings of the same finalization.
+ *
+ * The boundary-free concatenation stays primary, so a callback or credential
+ * split across two segments is still caught exactly as it was before segments
+ * gained a paragraph break, and the declared rejection order is unchanged.
+ * The delivered text is then scanned too, because inserting a break can form an
+ * assertion the concatenation hides — "deploy" and "succeeded" in adjacent
+ * segments read as one sentence only once the separator sits between them.
+ */
+function boundaryFreeRendering(candidate: ControllerFinalization): string {
+  return candidate.segments.map((segment) => segment.text.trim()).join("");
+}
+
 function contextRejectionCode(
+  candidate: ControllerFinalization,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
   if (context.acceptedAlready) return "accepted_already";
   if (context.invocationInFlight) return "invocation_in_flight";
   if (context.revisionCount >= 8) return "revision_limit";
-  if (context.evidenceLimitExceeded) return "evidence_limit_exceeded";
+  // A saturated budget means the evidence set is truncated, so a claim resting
+  // on it cannot be trusted. A plain answer rests on nothing and still lands:
+  // blocking it too left a turn that needed no evidence unable to reply at all.
+  if (context.evidenceLimitExceeded && claims(candidate).length > 0) {
+    return "evidence_limit_exceeded";
+  }
   return null;
 }
 
@@ -1371,7 +1464,7 @@ function semanticRejectionCode(
   renderedMessage: string,
   context: ControllerFinalizationValidationContext,
 ): FinalizationRejectionCode | null {
-  return contextRejectionCode(context)
+  return contextRejectionCode(candidate, context)
     ?? claimRejectionCode(candidate, renderedMessage, context)
     ?? dispositionRejectionCode(candidate, context)
     ?? (isProcessOnly(candidate, renderedMessage) ? "process_only" : null)
@@ -1388,9 +1481,15 @@ export function validateControllerFinalization(
   const candidate = parsed.data;
   const renderedMessage = renderCandidate(candidate);
   if (renderedMessage === null) return rejected("invalid_contract", fixedStorageProjection());
-  const unsafeProjection = unsafeStorageProjection(candidate, renderedMessage);
-  if (unsafeProjection) return rejected("invalid_contract", unsafeProjection);
-  const rejectionCode = semanticRejectionCode(candidate, renderedMessage, context);
-  if (rejectionCode) return rejected(rejectionCode, candidate);
+  const scanned = boundaryFreeRendering(candidate);
+  const readings = scanned === renderedMessage ? [scanned] : [scanned, renderedMessage];
+  for (const reading of readings) {
+    const unsafeProjection = unsafeStorageProjection(candidate, reading);
+    if (unsafeProjection) return rejected("invalid_contract", unsafeProjection);
+  }
+  for (const reading of readings) {
+    const rejectionCode = semanticRejectionCode(candidate, reading, context);
+    if (rejectionCode) return rejected(rejectionCode, candidate);
+  }
   return { outcome: "accepted", candidate, renderedMessage };
 }

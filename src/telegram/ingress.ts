@@ -20,6 +20,7 @@ import {
 import { detectStandingInstruction } from "../controller/context";
 import { containsCredentialLikeText } from "../domain/state-machine";
 import type { HealthReport } from "../services/health-report";
+import { activationSummary } from "../services/runtime-identity";
 import {
   telegramUpdateSchema,
   type SendMessagePayload,
@@ -311,19 +312,19 @@ export class TelegramIngress {
       const replyMessageId = message.reply_to_message?.message_id ?? null;
       if (command === "status" && commandArgument === null && replyMessageId === null) {
         const jobs = this.store.listControlJobs("status", 8);
-        await this.telegram.sendMessage(identity.chatId, renderJobStatusSummary({
+        await this.telegram.sendMessage(identity.chatId, this.withExecutorHealthWarning(renderJobStatusSummary({
           jobs: jobs.map((job) => ({ job, admission: this.store.getAdmission(job.id) })),
           total: this.store.countControlJobs("status"),
-        }));
+        }), now));
         return;
       }
       const resolution = this.resolveControlJob(command, commandArgument, replyMessageId);
       if (resolution.outcome === "choose") {
         if (command === "status") {
-          await this.telegram.sendMessage(identity.chatId, renderJobStatusSummary({
+          await this.telegram.sendMessage(identity.chatId, this.withExecutorHealthWarning(renderJobStatusSummary({
             jobs: resolution.jobs.map((job) => ({ job, admission: this.store.getAdmission(job.id) })),
             total: resolution.total,
-          }));
+          }), now));
         } else {
           await this.telegram.sendMessage(
             identity.chatId,
@@ -879,9 +880,13 @@ export class TelegramIngress {
     if (!this.health) return "Health reporting is unavailable.";
     const report = this.health(now);
     const paused = this.pausedLine();
+    const activation = report.activation === null
+      ? []
+      : [`Activation: ${report.activation.ok ? "current" : "ACTIVATION MISMATCH"} (${activationSummary(report.activation)})`];
     if (report.ok && paused === null) {
       return [
         "All good.",
+        ...activation,
         `Executor: running (generation ${report.executor.generation ?? "none"})`,
         `Queue: ${report.work.pendingEffects} job step(s), ${report.delivery.pendingOutbox} message(s) waiting`,
         `Watching: ${report.monitors.armed} monitor(s)`,
@@ -889,6 +894,7 @@ export class TelegramIngress {
       ].join("\n");
     }
     return [
+      ...activation,
       report.problems.length > 0
         ? `Problems:\n${report.problems.map((problem) => `- ${problem}`).join("\n")}`
         : "Running, but not everything is taking work.",
@@ -896,6 +902,24 @@ export class TelegramIngress {
       `Executor: ${report.executor.current ? "running" : "not running"}`,
       `Queue: ${report.work.pendingEffects} job step(s), ${report.delivery.pendingOutbox} message(s) waiting`,
     ].join("\n");
+  }
+
+  private withExecutorHealthWarning(payload: SendMessagePayload, now: number): SendMessagePayload {
+    if (!this.health) return payload;
+    try {
+      const report = this.health(now);
+      if (report.executor.current) return payload;
+      const problem = report.executor.heartbeatStale
+        ? "the executor heartbeat is stale"
+        : report.problems.find((candidate) => candidate.startsWith("the executor "));
+      return {
+        ...payload,
+        text: `Executor warning: ${problem ?? "the executor is not running"}.\n\n${payload.text}`,
+      };
+    } catch {
+      // Status remains useful if the optional health probe itself is unavailable.
+      return payload;
+    }
   }
 
   private async sendProjects(chatId: string): Promise<void> {

@@ -510,16 +510,21 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
       const claimed = this.db.prepare(
         `UPDATE controller_turns
             SET completion_continuations = 1, dispatch_after_seq = ?, bb_event_seq = ?,
-                evidence_event_seq = ?, stream_text = '', stream_phase = 'thinking', updated_at = ?
+                evidence_event_seq = ?, stream_text = '', stream_phase = 'thinking',
+                delivery_state = 'intent', dispatch_kind = 'send',
+                dispatch_correlation_id = ?, dispatch_retry_count = 0,
+                delivery_reconcile_attempts = 0, next_dispatch_at = 0,
+                last_error = NULL, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id IS NULL AND steer_reservation_turn_id IS NULL
-            AND completion_continuations = 0
+            AND completion_continuations = 0 AND delivery_state = 'none'
             AND evidence_event_seq = ?`,
       ).run(
         input.bbHighWaterSeq,
         input.bbHighWaterSeq,
         input.bbHighWaterSeq,
+        `controller-continuation:${input.turnId}:1`,
         input.now,
         input.turnId,
         input.controllerKey,

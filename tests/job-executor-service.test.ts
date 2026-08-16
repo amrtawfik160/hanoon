@@ -1682,6 +1682,151 @@ describe("singleton job executor", () => {
     expect(waitForWork).toHaveBeenCalledWith(1_000, expect.any(AbortSignal));
   });
 
+  it("keeps heartbeating and drains unrelated work while one provider RPC never settles", async () => {
+    // Regression: on 2026-08-15 one hung provider call left the live executor
+    // heartbeat stale and all unrelated dispatch stopped until restart.
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const { db, store } = fixture();
+    const abort = new AbortController();
+    let releaseProvider!: () => void;
+    let markProviderStarted!: () => void;
+    const providerStarted = new Promise<void>((resolve) => {
+      markProviderStarted = resolve;
+    });
+    const stuckProviderCall = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const unrelatedWork = vi.fn(async () => false);
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => Date.now() },
+      controller: {
+        reconcile: vi.fn(async () => {
+          markProviderStarted();
+          await stuckProviderCall;
+          return false;
+        }),
+        processOne: vi.fn(async () => false),
+      },
+      operations: { processOne: unrelatedWork },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => Date.now() }),
+      waitForWork: async (_milliseconds, signal) => {
+        if (signal.aborted) return;
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      },
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    try {
+      await providerStarted;
+      const acquiredHeartbeat = (db.prepare(
+        "SELECT heartbeat_at FROM executor_lease WHERE singleton = 1",
+      ).get() as { heartbeat_at: number }).heartbeat_at;
+
+      await vi.advanceTimersByTimeAsync(10_001);
+
+      const renewedHeartbeat = (db.prepare(
+        "SELECT heartbeat_at FROM executor_lease WHERE singleton = 1",
+      ).get() as { heartbeat_at: number }).heartbeat_at;
+      expect(renewedHeartbeat).toBeGreaterThan(acquiredHeartbeat);
+      expect(unrelatedWork).toHaveBeenCalled();
+    } finally {
+      abort.abort();
+      releaseProvider();
+      await vi.runAllTimersAsync();
+      await execution;
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a blocked controller pass from the independent stall timer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5_000);
+    const { store } = fixture();
+    const abort = new AbortController();
+    let reconcilePasses = 0;
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => Date.now() },
+      controller: {
+        reconcile: vi.fn(async (_fence, signal) => {
+          reconcilePasses += 1;
+          if (reconcilePasses === 1) {
+            await new Promise<void>((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+            });
+          }
+          abort.abort();
+          return true;
+        }),
+        processOne: vi.fn(async () => false),
+        nextStallDeadlineMs: () => 25,
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => Date.now() }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    try {
+      await vi.advanceTimersByTimeAsync(30);
+      await execution;
+
+      expect(reconcilePasses).toBe(2);
+    } finally {
+      abort.abort();
+      await vi.runAllTimersAsync();
+      await execution;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not carry a reconciled turn's stall deadline into the next dispatch", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5_000);
+    const { store } = fixture();
+    const abort = new AbortController();
+    let oldTurnPending = true;
+    let releaseDispatch!: () => void;
+    let markDispatchStarted!: (signal: AbortSignal) => void;
+    const dispatchStarted = new Promise<AbortSignal>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const dispatch = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => Date.now() },
+      controller: {
+        reconcile: vi.fn(async () => {
+          oldTurnPending = false;
+          return true;
+        }),
+        processOne: vi.fn(async (_fence, signal) => {
+          markDispatchStarted(signal);
+          await dispatch;
+          return true;
+        }),
+        nextStallDeadlineMs: () => oldTurnPending ? 25 : null,
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => Date.now() }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    try {
+      const processSignal = await dispatchStarted;
+      await vi.advanceTimersByTimeAsync(30);
+
+      expect(processSignal.aborted).toBe(false);
+    } finally {
+      abort.abort();
+      releaseDispatch();
+      await vi.runAllTimersAsync();
+      await execution;
+      vi.useRealTimers();
+    }
+  });
+
   it("streams a submitted controller turn through one ephemeral Telegram draft", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);

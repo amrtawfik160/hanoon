@@ -180,12 +180,12 @@ function parseToolJson(value: unknown): Record<string, unknown> {
 }
 
 describe("credential access capability manifest", () => {
-  it("extends the trust-kernel manifest from 25 to exactly 28 registered domain tools", () => {
+  it("adds exactly three credential tools at their fixed manifest positions", () => {
     const fixture = toolFixture();
     const registered = fixture.harness.registrations.agentTools.map((tool) => tool.name);
     expect(registered).toEqual(ALL_CONTROLLER_TOOL_NAMES);
-    expect(CONTROLLER_TOOL_NAMES).toHaveLength(28);
-    expect(CONTROLLER_TOOL_NAMES.slice(25)).toEqual([
+    expect(CONTROLLER_TOOL_NAMES).toHaveLength(29);
+    expect(CONTROLLER_TOOL_NAMES.slice(25, 28)).toEqual([
       "telegram_agent_access_list",
       "telegram_agent_access_status",
       "telegram_agent_access_verify",

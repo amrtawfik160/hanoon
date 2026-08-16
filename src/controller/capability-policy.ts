@@ -33,6 +33,7 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_access_list",
   "telegram_agent_access_status",
   "telegram_agent_access_verify",
+  "telegram_agent_answer_thread",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -575,6 +576,29 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     proof_kinds: ["health_snapshot"],
     receipt_kind: "observation",
     result_limit: 2_000,
+  }),
+  // Unblocking a thread the controller started. The effect lands in BB rather
+  // than the outside world, and the thread itself is what acts afterwards, so
+  // this is the same class of write as sending the thread a message. It is
+  // deliberately not `approval: "bb_interaction"`: routing here already means
+  // the decision was found to be the controller's, and requiring the owner
+  // again would restore the 1:50am menu this exists to remove.
+  telegram_agent_answer_thread: capability({
+    capability_id: "telegram_agent_answer_thread",
+    schema_version: 1,
+    effect_class: "reversible_external_write",
+    risk_class: "high",
+    data_class: ["thread_metadata"],
+    reversibility: "compensating_action",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "exact_entity",
+    credential_scope: { credential: "bb", audience: "bb-plugin-sdk" },
+    egress: ["bb"],
+    proof_kinds: ["external_mutation", "thread_state"],
+    receipt_kind: "tool_receipt",
+    result_limit: 8_000,
   }),
 });
 

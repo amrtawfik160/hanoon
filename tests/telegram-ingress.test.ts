@@ -4,6 +4,7 @@ import { expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { hashSecret } from "../src/crypto";
 import type { ProjectPolicy } from "../src/domain/models";
+import { buildHealthReport } from "../src/services/health-report";
 import { TelegramIngress } from "../src/telegram/ingress";
 import { TelegramApiError } from "../src/telegram/errors";
 import type {
@@ -19,6 +20,7 @@ import {
   threadDecisionToken,
   type ControllerInteraction,
 } from "../src/controller/questions";
+import { EXPECTED_MIGRATION_ID, type RuntimeIdentity } from "../src/services/runtime-identity";
 import { admitConfirmedJob, policyFixture } from "./helpers";
 
 type SentMessage = {
@@ -523,6 +525,38 @@ it("uses last project only for deterministic /projects ordering", async () => {
 
   expect(fixture.store.getActiveJob()).toBeNull();
   expect(fixture.telegram.sent[0]?.payload.text).toBe("Enabled projects:\nother-project\ncyndra");
+});
+
+it("makes an activation mismatch explicit in /health", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  expect(fixture.store.acquireExecutorLease("executor", 2_000, 30_000).acquired).toBe(true);
+  const runtime: RuntimeIdentity = {
+    sourceRoot: "/registered/plugin",
+    loadedAt: 1_000,
+    loadedFingerprint: "old-build",
+    expectedMigrationId: EXPECTED_MIGRATION_ID,
+    currentFingerprint: () => "new-build",
+  };
+  const ingress = new TelegramIngress({
+    store: fixture.store,
+    telegram: fixture.telegram,
+    health: (now) => buildHealthReport(
+      fixture.db,
+      now,
+      2,
+      { pipelineActive: 0, controlActive: 0, busyJobIds: [] },
+      runtime,
+    ),
+  });
+
+  await ingress.handleClaimed(messageUpdate(12, 7, 70, "/health"), 2_000);
+
+  expect(fixture.telegram.sent[0]?.payload.text).toEqual(expect.stringContaining("ACTIVATION MISMATCH"));
+  expect(fixture.telegram.sent[0]?.payload.text).toEqual(expect.stringContaining("source=/registered/plugin"));
+  expect(fixture.telegram.sent[0]?.payload.text).toEqual(expect.stringContaining("build=old-build"));
+  expect(fixture.telegram.sent[0]?.payload.text).toEqual(
+    expect.stringContaining(`schema=${EXPECTED_MIGRATION_ID}/${EXPECTED_MIGRATION_ID}`),
+  );
 });
 
 it("binds the selected policy version and queues without spawning", async () => {
@@ -1087,6 +1121,25 @@ it("steers only an admitted job with the exact status reply identity", async () 
   ]);
   expect(fixture.store.listEffectsForJob(queuedId).filter((effect) => effect.kind === "steer_implementation")).toHaveLength(0);
   expect(fixture.store.getControllerForOwner("7", "70")).not.toBeNull();
+});
+
+it("surfaces a stale executor heartbeat in the status summary", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  expect(fixture.store.acquireExecutorLease("executor", 1_000, 30_000).acquired).toBe(true);
+  const ingress = new TelegramIngress({
+    store: fixture.store,
+    telegram: fixture.telegram,
+    health: (now) => buildHealthReport(
+      fixture.db,
+      now,
+      2,
+      { pipelineActive: 0, controlActive: 0, busyJobIds: [] },
+    ),
+  });
+
+  await ingress.handleClaimed(messageUpdate(826, 7, 70, "/status"), 40_001);
+
+  expect(statusPayload(fixture).text).toContain("Executor warning: the executor heartbeat is stale.");
 });
 
 function parkedControllerInteraction(

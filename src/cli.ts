@@ -28,6 +28,7 @@ import { TASK_RECIPES, type TaskRecipe } from "./domain/recipes";
 import { BROKER_BINDING_STATES, type BrokerBindingState } from "./credentials/protocol";
 import type { CredentialReadinessCheck } from "./credentials/topology";
 import type { CredentialAccessService } from "./credentials/service";
+import { activationSummary, type ActivationHealth } from "./services/runtime-identity";
 
 type BbSdk = BbPluginApi["sdk"];
 
@@ -49,6 +50,7 @@ export type TelegramAgentCliDependencies = {
     modelRouting: "adaptive" | "strong-only";
   }>;
   credentialAccess: Pick<CredentialAccessService, "list" | "status">;
+  runtime: () => ActivationHealth;
   unpairNonceKey: string;
   recordOperatorAudit(input: Readonly<{
     schemaVersion: 1;
@@ -1030,6 +1032,14 @@ async function doctor(
   json: boolean,
 ): Promise<PluginCliResult> {
   const checks: DoctorCheck[] = [];
+  const activation = deps.runtime();
+  addCheck(
+    checks,
+    "plugin activation",
+    activation.ok,
+    activationSummary(activation),
+    `${activationSummary(activation)}; ${activation.problems.join("; ")}`,
+  );
   addCheck(checks, "token presence", Boolean(deps.getBotToken()), "configured", "missing");
   addCheck(checks, "owner pairing", deps.store.getOwner() !== null, "paired", "not paired");
   if (projectId === undefined) {

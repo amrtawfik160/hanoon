@@ -91,6 +91,7 @@ export class LunaControllerService {
   }
 
   public async processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
+    if (this.dependencies.adapter.hasPendingMutation?.() === true) return true;
     const now = this.dependencies.clock.now();
     const turn = this.dependencies.store.claimNextControllerTurn(fenceAt(fence, now));
     if (!turn) return false;
@@ -246,14 +247,18 @@ export class LunaControllerService {
     let controller = this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
     if (!controller) return recoveredDispatch;
     let pending = this.dependencies.store.getPendingControllerTurn(controller.controllerKey);
-    if (pending?.state === "dispatching" && pending.deliveryState === "intent") {
+    if (pending && pending.deliveryState === "intent" &&
+        (pending.state === "dispatching" ||
+          (pending.state === "submitted" && pending.acceptedFinalizationId === null))) {
       this.dependencies.store.markControllerDeliveryUnknown({
         ...fenceAt(fence, this.dependencies.clock.now()),
         turnId: pending.id,
       });
       pending = this.dependencies.store.getControllerTurn(pending.id);
     }
-    if (pending?.state === "dispatching" && pending.deliveryState === "delivery_unknown") {
+    if (pending && pending.deliveryState === "delivery_unknown" &&
+        (pending.state === "dispatching" ||
+          (pending.state === "submitted" && pending.acceptedFinalizationId === null))) {
       if (pending.nextDispatchAt > this.dependencies.clock.now()) return recoveredDispatch;
       return this.reconcileUnknownDelivery(pending, controller, fence, signal);
     }
@@ -578,7 +583,7 @@ export class LunaControllerService {
   ): Promise<boolean> {
     if (signal.aborted) return true;
     if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
-      return this.recordUnknownDeliveryPending(turn, fence, signal);
+      return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     }
     return turn.dispatchKind === "spawn"
       ? this.reconcileUnknownSpawn(turn, controller, fence, signal)
@@ -595,14 +600,14 @@ export class LunaControllerService {
       if (!this.dependencies.store.markControllerTurnSubmitted({
         ...fenceAt(fence, this.dependencies.clock.now()),
         turnId: turn.id,
-      })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+      })) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
       return true;
     }
     if (
       turn.dispatchCorrelationId === null ||
       controller.threadId !== null ||
       controller.pendingSpawnToken !== turn.dispatchCorrelationId
-    ) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    ) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     let candidate: ControllerLocation | null;
     try {
       candidate = await this.dependencies.adapter.findSpawnCandidate(
@@ -612,10 +617,10 @@ export class LunaControllerService {
         turn.modelFallbackIndex,
       );
     } catch {
-      return this.recordUnknownDeliveryPending(turn, fence, signal);
+      return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     }
     if (!candidate || candidate.spawnToken !== turn.dispatchCorrelationId) {
-      return this.recordUnknownDeliveryPending(turn, fence, signal);
+      return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     }
     if (!this.dependencies.store.reserveControllerSpawn({
       controllerKey: controller.controllerKey,
@@ -623,16 +628,16 @@ export class LunaControllerService {
       projectId: candidate.projectId,
       hostId: candidate.hostId,
       now: this.dependencies.clock.now(),
-    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    })) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     if (!this.dependencies.store.markControllerSpawned({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       ...candidate,
-    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    })) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     if (!this.dependencies.store.markControllerTurnSubmitted({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
-    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    })) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     return true;
   }
 
@@ -642,10 +647,13 @@ export class LunaControllerService {
     fence: EffectFence,
     signal: AbortSignal,
   ): Promise<boolean> {
+    const expectedCorrelation = turn.state === "submitted"
+      ? `controller-continuation:${turn.id}:1`
+      : `controller-dispatch:${turn.id}`;
     if (
-      turn.dispatchKind !== "send" || turn.dispatchCorrelationId !== `controller-dispatch:${turn.id}` ||
+      turn.dispatchKind !== "send" || turn.dispatchCorrelationId !== expectedCorrelation ||
       controller.threadId === null
-    ) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    ) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     let observation: ControllerEventObservation;
     try {
       observation = normalizeControllerEventObservation(await this.dependencies.adapter.events(
@@ -654,33 +662,42 @@ export class LunaControllerService {
         signal,
       ));
     } catch {
-      return this.recordUnknownDeliveryPending(turn, fence, signal);
+      return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     }
     if (!Number.isSafeInteger(observation.latestSeq) || observation.latestSeq < turn.dispatchAfterSeq) {
-      return this.recordUnknownDeliveryPending(turn, fence, signal);
+      return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     }
     const applied = observation.inputAccepted || observation.assistantOutputObserved ||
       observation.toolActivityObserved || observation.completed || observation.failure?.inputAccepted === true;
-    if (!applied) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    if (!applied) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     if (!this.dependencies.store.markControllerTurnSubmitted({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       dispatchAfterSeq: turn.dispatchAfterSeq,
-    })) return this.recordUnknownDeliveryPending(turn, fence, signal);
+    })) return this.recordUnknownDeliveryPending(turn, controller, fence, signal);
     return true;
   }
 
-  private recordUnknownDeliveryPending(
+  private async recordUnknownDeliveryPending(
     turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
     fence: EffectFence,
     signal: AbortSignal,
-  ): boolean {
+  ): Promise<boolean> {
     if (signal.aborted) return true;
-    this.dependencies.store.recordControllerDeliveryReconciliationPending({
+    const outcome = this.dependencies.store.recordControllerDeliveryReconciliationPending({
       ...fenceAt(fence, this.dependencies.clock.now()),
       turnId: turn.id,
       retryAfterMs: controllerDispatchBackoffMs(turn.deliveryReconcileAttempts),
     });
+    if (outcome === "recovery_required") {
+      return this.beginFreshRecovery(
+        turn,
+        controller,
+        fence,
+        "correction delivery could not be reconciled",
+      );
+    }
     return true;
   }
 
@@ -709,9 +726,12 @@ export class LunaControllerService {
       );
       if (!reconciliation) return "fatal";
       if (reconciliation.outcome === "stale") return "stale";
-      if (reconciliation.outcome === "limit_exceeded") {
-        return "fatal";
-      }
+      // A saturated evidence budget bounds what this turn may still ingest, not
+      // whether it may answer. Killing the turn here destroyed the owner's
+      // message and retired the conversation over a budget the turn had not
+      // spent. The cap stays marked, so later polls short-circuit cheaply and
+      // the finalizer refuses fresh claims while a plain answer still lands.
+      if (reconciliation.outcome === "limit_exceeded") return "ready";
       if (reconciliation.reconciliationIncomplete !== null) return "retry";
       if (reconciliation.targetSeq !== highWater) return "stale";
       return "ready";
@@ -1062,6 +1082,7 @@ export class LunaControllerService {
     terminalFailureCode: ControllerFailureCode = "recovery_exhausted",
   ): Promise<boolean> {
     if (!controller.threadId) return true;
+    if (this.dependencies.adapter.hasPendingMutation?.() === true) return true;
     let highWater: number;
     try {
       highWater = await this.dependencies.adapter.latestSeq(controller.threadId, signal);
@@ -1115,14 +1136,29 @@ export class LunaControllerService {
         turn.modelFallbackIndex,
       );
     } catch {
-      return this.beginFreshRecovery(
-        turn,
-        controller,
-        fence,
-        "correction outcome was uncertain",
-        terminalFailureCode,
-      );
+      if (signal.aborted && this.dependencies.adapter.hasPendingMutation?.() !== true) {
+        return this.beginFreshRecovery(
+          turn,
+          controller,
+          fence,
+          "correction outcome was uncertain",
+          terminalFailureCode,
+        );
+      }
+      if (!this.dependencies.store.markControllerDeliveryUnknown({
+        ...fenceAt(fence, this.dependencies.clock.now()),
+        turnId: turn.id,
+      })) return true;
+      const unknown = this.dependencies.store.getControllerTurn(turn.id);
+      return unknown?.state === "submitted" && unknown.deliveryState === "delivery_unknown"
+        ? this.reconcileUnknownDelivery(unknown, controller, fence, signal)
+        : true;
     }
+    this.dependencies.store.markControllerTurnSubmitted({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      dispatchAfterSeq: highWater,
+    });
     return true;
   }
 

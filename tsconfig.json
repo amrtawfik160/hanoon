@@ -7,7 +7,10 @@
     "lib": ["ES2022", "DOM"],
     "types": ["node", "vitest/globals"],
     "paths": {
-      "@bb/plugin-sdk": ["./types/bb-plugin-sdk.d.ts"]
+      "@bb/plugin-sdk": ["./types/bb-plugin-sdk.d.ts"],
+      "@bb/plugin-sdk-testing-actual": [
+        "./node_modules/@bb/plugin-sdk/bundled-types/bb-plugin-sdk-testing.d.ts"
+      ]
     },
     "noEmit": true,
     "skipLibCheck": false

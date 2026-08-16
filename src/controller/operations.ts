@@ -161,6 +161,9 @@ export class ThreadOperationService {
     await this.dependencies.sdk.threads.continueAfterRateLimit({
       threadId: operation.threadId,
       failedRequestId: recovery.candidate.failedRequestId,
+      // The owner asked for this retry, so it is theirs rather than the
+      // provider-retry plugin's automatic resumption.
+      mode: "manual",
     });
     return "Retry requested";
   }

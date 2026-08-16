@@ -98,6 +98,15 @@ import {
 } from "../controller/models";
 import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervisor";
 import { MAX_CONTROLLER_OVERLAY } from "../controller/instructions";
+import { isUnsafeProviderText } from "../controller/credential-policy";
+import {
+  MAX_OWNER_REPLY_CHARS,
+  THREAD_ASK_REDACTED,
+  composeOwnerReply,
+  normalizeThreadAsk,
+  normalizeThreadName,
+  type RecordedThreadAsk,
+} from "../controller/thread-ask";
 import {
   nextUnansweredQuestion,
   parseControllerInteraction,
@@ -106,12 +115,14 @@ import {
   renderControllerInteraction,
   renderThreadInteraction,
   parseThreadInteraction,
+  type ThreadApprovalDecision,
   threadDecisionToken,
   type ControllerInteraction,
   type ControllerQuestionAnswers,
   type ControllerQuestion,
   type ThreadInteraction,
 } from "../controller/questions";
+import { routeThreadInteraction } from "../controller/interaction-routing";
 import {
   JOB_SELECT,
   MAX_MERGE_RESULT_JSON,
@@ -406,9 +417,10 @@ export type ControllerFailureCode =
   | "owner_message_delivery_exhausted"
   | "owner_message_delivery_unresolved"
   | "owner_message_waiting_for_fresh_generation"
+  | "owner_message_requeued"
   | "image_preparation_failed";
 
-export type ControllerDeliveryReconciliationResult = "pending" | "failed" | "stale";
+export type ControllerDeliveryReconciliationResult = "pending" | "failed" | "recovery_required" | "stale";
 
 export type ControllerGeneration = {
   id: string;
@@ -2888,6 +2900,17 @@ export interface TelegramAgentStore {
     /** The accepted finalization's provider high-water marker, or legacy cursor. */
     bbHighWaterSeq: number;
   }): "completed" | "stale" | "evidence_advanced";
+  /** Record what the controller asked a worker thread to do, for the owner. */
+  recordControllerThreadAsk(input: {
+    controllerKey: string;
+    turnId: string;
+    threadId: string;
+    threadName: string | null;
+    ask: string;
+    now: number;
+  }): void;
+  /** Asks this controller has not yet told the owner about, oldest first. */
+  unreportedControllerThreadAsks(controllerKey: string): RecordedThreadAsk[];
   claimNextControllerTurn(fence: ControllerLeaseFence & { leaseMs?: number }): ControllerTurnRecord | null;
   prepareControllerDispatch(input: ControllerLeaseFence & {
     turnId: string;
@@ -3035,13 +3058,22 @@ export interface TelegramAgentStore {
     interaction: ThreadInteraction;
     chatId: string;
     now: number;
+    parentThreadId?: string | null;
   }): boolean;
+  isControllerOwnedThread(parentThreadId: string | null): boolean;
   answerThreadInteraction(input: {
     token: string;
     userId: string;
     chatId: string;
     now: number;
   }): ThreadInteractionAnswer;
+  answerThreadInteractionAsController(input: {
+    interactionId: string;
+    threadId: string;
+    decision?: ThreadApprovalDecision;
+    answers?: ControllerQuestionAnswers;
+    now: number;
+  }): { ok: true } | { ok: false; reason: "unknown" | "not_controller_routed" | "decision_not_allowed" };
   getAnsweredThreadInteraction(): ThreadInteractionDelivery | null;
   markThreadInteractionDelivered(interactionId: string, now: number): boolean;
   discardThreadInteractions(threadId: string, keep: readonly string[], now?: number): number;
@@ -3730,13 +3762,17 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     row.next_dispatch_at,
     "next_dispatch_at",
   );
+  const continuationCorrelationId = `controller-continuation:${row.id}:1`;
+  const continuationDelivery = row.state === "submitted" && completionContinuations === 1 &&
+    row.dispatch_kind === "send" && row.dispatch_correlation_id === continuationCorrelationId;
   if (row.delivery_state === "intent" && (
-    row.state !== "dispatching" || row.dispatch_kind === null || row.dispatch_correlation_id === null
+    (row.state !== "dispatching" && !continuationDelivery) ||
+    row.dispatch_kind === null || row.dispatch_correlation_id === null
   )) {
     throw new Error("Persisted controller dispatch intent is incomplete");
   }
   if (row.delivery_state === "delivery_unknown" &&
-      row.state !== "dispatching" && row.state !== "failed") {
+      row.state !== "dispatching" && row.state !== "failed" && !continuationDelivery) {
     throw new Error("Persisted unknown controller delivery has an invalid turn state");
   }
   return {
@@ -4268,18 +4304,59 @@ function matchThreadInteractionToken(
 }
 
 const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> = {
-  unknown: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
-  stalled: "That controller turn stopped making progress after its recovery attempts, so I ended it safely.",
-  budget_exceeded: "That controller turn reached its safety budget, so I stopped it.",
-  oauth_expired: "The controller provider sign-in has expired. Reconnect that provider before asking it to continue.",
-  provider_rejected: "The controller provider rejected its current model or account configuration. Fix those provider settings before trying again.",
-  recovery_exhausted: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
+  // Every line here is read by the owner in place of the answer they asked for,
+  // so each one has to be true for the single path that reaches it and has to
+  // say what became of their message. A resend is invited only where nothing
+  // ran, so taking it up cannot repeat an action.
+  unknown: "I couldn't finish that one, so your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.",
+  stalled: "That one stopped making progress after I tried again, so I ended it safely. Your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.",
+  budget_exceeded: "That one reached its safety limit, so I stopped it. Your message didn't get a full answer. Nothing was repeated. Send it again and I'll pick it up.",
+  oauth_expired: "The provider sign-in has expired, so I couldn't answer your message. Reconnect that provider, then send your message again.",
+  provider_rejected: "The provider refused its current model or account settings, so I couldn't answer your message. Fix those provider settings, then send your message again.",
+  recovery_exhausted: "I tried that again and still couldn't finish it, so your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.",
   owner_message_delivery_uncertain: "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
   owner_message_delivery_exhausted: "I couldn't confirm whether my previous message reached you after repeated attempts. It may be missing or duplicated; open BB to inspect the result.",
   owner_message_delivery_unresolved: "I preserved that message, but could not confirm whether it was delivered. I did not repeat it. Please review the conversation before trying again.",
   owner_message_waiting_for_fresh_generation: "I kept your message queued because that controller is still busy. If it does not free up soon, I’ll continue in a fresh conversation.",
+  owner_message_requeued: "I couldn't finish that one, but nothing had started yet, so I've put your message back and I'm picking it up again in a fresh conversation. Nothing was repeated.",
   image_preparation_failed: "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.",
 };
+
+/** Shown when a message arrives mid-turn and is folded into the running reply. */
+const CONTROLLER_STEER_FOLDED_TEXT = "Got that, and I'm working it into the answer I'm already writing.";
+
+/**
+ * The system turn that hands a spawned thread's block to the controller.
+ *
+ * It carries the question itself, not a pointer to go and read one, because a
+ * turn that has to go looking is a turn that can decide it has nothing to say.
+ * The instruction is explicit that this is the controller's to answer: the
+ * routing already established the owner is not needed.
+ */
+function describeThreadBlockForController(
+  threadId: string,
+  title: string,
+  interaction: ThreadInteraction,
+  decisions: readonly ThreadApprovalDecision[],
+): string {
+  const head = `A thread you started is blocked and waiting on you: ${threadId} (${title}).`;
+  const tail = "Answer it with telegram_agent_answer_thread so the thread continues. " +
+    "This is yours to decide; do not pass it to the owner unless it turns out to need " +
+    "their merge or deploy approval, or an irreversible external action.";
+  if (interaction.kind === "unsupported") {
+    return `${head} I can't read what it is asking, so read the thread in BB to see what it needs. ${tail}`;
+  }
+  if (interaction.kind === "user_question") {
+    const asked = interaction.questions
+      .map((question, index) => {
+        const options = question.options.map((option) => option.label).join(", ");
+        return `${index + 1}. ${question.prompt}${options.length > 0 ? ` Options: ${options}.` : ""}`;
+      })
+      .join("\n");
+    return `${head} It asks:\n${asked}\n${tail}`;
+  }
+  return `${head} It ${interaction.summary}\nYou may answer: ${decisions.join(", ")}.\n${tail}`;
+}
 
 const MAX_CONTROLLER_DISPATCH_RETRY_COUNT = 6;
 const MAX_CONTROLLER_DELIVERY_RECONCILIATION_ATTEMPTS = 3;
@@ -5362,6 +5439,83 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.controllerEvidenceRepository.claimCompletionContinuation(input);
   }
 
+  /**
+   * Record what the controller asked a worker thread to do, at the moment it
+   * sends. The substance is captured here rather than reconstructed later,
+   * because this is when the controller knows why it is asking.
+   *
+   * An ask that cannot be safely repeated is still recorded, with its text
+   * withheld: the owner learns that his authority was used either way.
+   */
+  public recordControllerThreadAsk(input: {
+    controllerKey: string;
+    turnId: string;
+    threadId: string;
+    threadName: string | null;
+    ask: string;
+    now: number;
+  }): void {
+    assertControllerKey(input.controllerKey);
+    assertNonNegativeInteger(input.now, "now");
+    const normalized = normalizeThreadAsk(input.ask);
+    const repeatable = normalized.length > 0 && !isUnsafeProviderText(normalized);
+    this.db.prepare(
+      `INSERT INTO controller_thread_asks
+         (controller_key, turn_id, thread_id, thread_name, ask, recorded_at, reported_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+    ).run(
+      input.controllerKey,
+      input.turnId,
+      input.threadId,
+      input.threadName === null ? null : normalizeThreadName(input.threadName),
+      repeatable ? normalized : THREAD_ASK_REDACTED,
+      input.now,
+    );
+  }
+
+  /**
+   * Asks this controller has not yet told the owner about, oldest first.
+   *
+   * Keyed to the controller rather than one turn, so an ask made by a turn that
+   * died before replying is still waiting on the next reply instead of being
+   * lost with it.
+   *
+   * The read is bounded because the reply that consumes it is. The bound also
+   * caps the "and N more" count, so it is set far above any backlog a replying
+   * controller can build: reaching it needs hundreds of sends without one
+   * completed turn.
+   */
+  public unreportedControllerThreadAsks(controllerKey: string): RecordedThreadAsk[] {
+    assertControllerKey(controllerKey);
+    const rows = this.db.prepare(
+      `SELECT thread_id, thread_name, ask FROM controller_thread_asks
+        WHERE controller_key = ? AND reported_at IS NULL
+        ORDER BY id ASC LIMIT 256`,
+    ).all(controllerKey) as { thread_id: string; thread_name: string | null; ask: string }[];
+    return rows.map((row) => ({
+      threadId: row.thread_id,
+      threadName: row.thread_name,
+      ask: row.ask,
+    }));
+  }
+
+  /**
+   * Mark the oldest `count` unreported asks as told, in the same order the
+   * reply states them. Asks the reply only counted rather than named stay
+   * unreported so the next reply can name them.
+   */
+  private markControllerThreadAsksReported(controllerKey: string, count: number, now: number): void {
+    if (count <= 0) return;
+    this.db.prepare(
+      `UPDATE controller_thread_asks SET reported_at = ?
+        WHERE id IN (
+          SELECT id FROM controller_thread_asks
+           WHERE controller_key = ? AND reported_at IS NULL
+           ORDER BY id ASC LIMIT ?
+        )`,
+    ).run(now, controllerKey, count);
+  }
+
   public completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
     turnId: string;
     controllerKey: string;
@@ -5419,17 +5573,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           (accepted.bbEventHighWaterSeq !== null && completionHighWater < accepted.bbEventHighWaterSeq)) {
         return "evidence_advanced" as const;
       }
+      // Composed inside the transaction that delivers it, so marking an ask
+      // told and sending the message that tells him either both happen or
+      // neither do. An ask the owner never hears about is a decision taken in
+      // his name that he cannot see, so it must not be lost to a failed write.
+      const pendingAsks = this.unreportedControllerThreadAsks(turn.controller_key);
+      const reply = composeOwnerReply(accepted.renderedMessage, pendingAsks, MAX_OWNER_REPLY_CHARS);
       const completed = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'completed', response_text = ?, stream_text = '',
                 stream_phase = 'complete', last_error = NULL, lease_owner = NULL,
                 lease_generation = NULL, private_draft_item_id = NULL,
-                private_draft_text = '', completed_at = ?, updated_at = ?
+                private_draft_text = '', delivery_state = 'none',
+                delivery_reconcile_attempts = 0, next_dispatch_at = 0,
+                completed_at = ?, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id = ?`,
       ).run(
-        accepted.renderedMessage,
+        reply.text,
         input.now,
         input.now,
         input.turnId,
@@ -5439,11 +5601,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         accepted.id,
       );
       if (completed.changes !== 1) return "stale" as const;
+      this.markControllerThreadAsksReported(turn.controller_key, reply.reportedCount, input.now);
       this.appendControllerDigestRow({
         controllerKey: turn.controller_key,
         ordinal: turn.ordinal,
         ownerText: turn.input_text,
-        agentText: accepted.renderedMessage,
+        agentText: reply.text,
         now: input.now,
       });
       const consumed = this.db.prepare(
@@ -5453,7 +5616,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       persistControllerOutbox(this.db, {
         logicalKey: controllerReplyLogicalKey(input.turnId, turn.thread_follow_up_json),
         chatId: turn.telegram_chat_id,
-        payload: { text: accepted.renderedMessage, disable_web_page_preview: true },
+        payload: { text: reply.text, disable_web_page_preview: true },
       }, input.now);
       return "completed" as const;
     }).immediate();
@@ -5592,7 +5755,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             SET delivery_state = 'delivery_unknown',
                 last_error = 'Controller delivery outcome is unknown',
                 next_dispatch_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'dispatching' AND delivery_state = 'intent'
+          WHERE id = ? AND delivery_state = 'intent'
+            AND (
+              state = 'dispatching' OR (
+                state = 'submitted' AND completion_continuations = 1
+                AND dispatch_kind = 'send'
+                AND dispatch_correlation_id = 'controller-continuation:' || id || ':1'
+              )
+            )
             AND lease_owner = ? AND lease_generation = ?`,
       ).run(
         input.now,
@@ -5615,7 +5785,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction((): ControllerDeliveryReconciliationResult => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale";
       const row = this.db.prepare(
-        `SELECT turn.controller_key, turn.delivery_reconcile_attempts,
+        `SELECT turn.controller_key, turn.state, turn.delivery_reconcile_attempts,
                 turn.thread_follow_up_json, controller.telegram_chat_id,
                 controller.bb_thread_id, controller.pending_spawn_token
            FROM controller_turns AS turn
@@ -5623,11 +5793,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
             AND owners.telegram_user_id = controller.telegram_user_id
             AND owners.telegram_chat_id = controller.telegram_chat_id
-          WHERE turn.id = ? AND turn.state = 'dispatching'
+          WHERE turn.id = ? AND (
+              turn.state = 'dispatching' OR (
+                turn.state = 'submitted' AND turn.completion_continuations = 1
+                AND turn.dispatch_kind = 'send'
+                AND turn.dispatch_correlation_id = 'controller-continuation:' || turn.id || ':1'
+              )
+            )
             AND turn.delivery_state = 'delivery_unknown'
             AND turn.lease_owner = ? AND turn.lease_generation = ?`,
       ).get(input.turnId, input.ownerId, input.generation) as {
         controller_key: string;
+        state: "dispatching" | "submitted";
         delivery_reconcile_attempts: number;
         thread_follow_up_json: string | null;
         telegram_chat_id: string;
@@ -5637,6 +5814,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!row) return "stale";
       const attempts = row.delivery_reconcile_attempts + 1;
       if (attempts >= MAX_CONTROLLER_DELIVERY_RECONCILIATION_ATTEMPTS) {
+        if (row.state === "submitted") {
+          const released = this.db.prepare(
+            `UPDATE controller_turns
+                SET delivery_state = 'none', delivery_reconcile_attempts = ?,
+                    next_dispatch_at = 0,
+                    last_error = 'Controller correction delivery could not be reconciled',
+                    updated_at = ?
+              WHERE id = ? AND state = 'submitted'
+                AND delivery_state = 'delivery_unknown'
+                AND lease_owner = ? AND lease_generation = ?`,
+          ).run(
+            attempts,
+            input.now,
+            input.turnId,
+            input.ownerId,
+            input.generation,
+          );
+          return released.changes === 1 ? "recovery_required" : "stale";
+        }
         const failed = this.db.prepare(
           `UPDATE controller_turns
               SET state = 'failed', delivery_reconcile_attempts = ?,
@@ -5676,7 +5872,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             SET delivery_reconcile_attempts = ?,
                 last_error = 'Controller delivery reconciliation is pending',
                 next_dispatch_at = ?, updated_at = ?
-          WHERE id = ? AND state = 'dispatching'
+          WHERE id = ? AND state IN ('dispatching', 'submitted')
             AND delivery_state = 'delivery_unknown'
             AND lease_owner = ? AND lease_generation = ?`,
       ).run(
@@ -5688,12 +5884,23 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.generation,
       );
       if (pending.changes !== 1) return "stale";
-      persistControllerOutbox(this.db, controllerFailureOutbox(
-        input.turnId,
-        row.telegram_chat_id,
-        "owner_message_delivery_uncertain",
-        row.thread_follow_up_json,
-      ), input.now);
+      persistControllerOutbox(
+        this.db,
+        row.state === "dispatching"
+          ? controllerFailureOutbox(
+            input.turnId,
+            row.telegram_chat_id,
+            "owner_message_delivery_uncertain",
+            row.thread_follow_up_json,
+          )
+          : controllerPhaseOutbox(
+            input.turnId,
+            row.telegram_chat_id,
+            "connecting",
+            row.thread_follow_up_json,
+          ),
+        input.now,
+      );
       return "pending";
     }).immediate();
   }
@@ -5943,7 +6150,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
             AND owners.telegram_user_id = controller.telegram_user_id
             AND owners.telegram_chat_id = controller.telegram_chat_id
-          WHERE turn.state = 'dispatching'
+          WHERE (
+              turn.state = 'dispatching' OR (
+                turn.state = 'submitted' AND turn.delivery_state IN ('intent', 'delivery_unknown')
+                AND turn.completion_continuations = 1 AND turn.dispatch_kind = 'send'
+                AND turn.dispatch_correlation_id = 'controller-continuation:' || turn.id || ':1'
+              )
+            )
             AND (turn.lease_owner <> ? OR turn.lease_generation <> ?)
           ORDER BY turn.created_at ASC, turn.ordinal ASC LIMIT 1`,
       ).get(fence.ownerId, fence.generation) as (ControllerTurnRow & { telegram_chat_id: string }) | undefined;
@@ -5977,7 +6190,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                 next_dispatch_at = ?,
                 last_error = 'Controller delivery requires reconciliation after lease loss',
                 updated_at = ?
-          WHERE id = ? AND state = 'dispatching'
+          WHERE id = ? AND state IN ('dispatching', 'submitted')
             AND delivery_state IN ('intent', 'delivery_unknown')`,
       ).run(
         fence.ownerId,
@@ -6131,6 +6344,32 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       const turn = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?")
         .get(input.turnId) as ControllerTurnRow | undefined;
+      if (turn?.state === "submitted") {
+        if (
+          turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation ||
+          turn.completion_continuations !== 1 || turn.dispatch_kind !== "send" ||
+          turn.dispatch_correlation_id !== `controller-continuation:${input.turnId}:1` ||
+          (turn.delivery_state !== "intent" && turn.delivery_state !== "delivery_unknown") ||
+          turn.dispatch_after_seq !== dispatchAfterSeq
+        ) return false;
+        return this.db.prepare(
+          `UPDATE controller_turns
+              SET delivery_state = 'none', delivery_reconcile_attempts = 0,
+                  next_dispatch_at = 0, last_error = NULL, updated_at = ?
+            WHERE id = ? AND state = 'submitted'
+              AND lease_owner = ? AND lease_generation = ?
+              AND delivery_state IN ('intent', 'delivery_unknown')
+              AND completion_continuations = 1 AND dispatch_kind = 'send'
+              AND dispatch_correlation_id = ? AND dispatch_after_seq = ?`,
+        ).run(
+          input.now,
+          input.turnId,
+          input.ownerId,
+          input.generation,
+          `controller-continuation:${input.turnId}:1`,
+          dispatchAfterSeq,
+        ).changes === 1;
+      }
       if (
         !turn || turn.state !== "dispatching" || turn.lease_owner !== input.ownerId ||
         turn.lease_generation !== input.generation
@@ -6182,9 +6421,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         );
         if (configured.changes !== 1) return false;
       }
+      // The evidence cursor starts where this turn's own message entered the
+      // thread, exactly as the continuation path sets all three together. Left
+      // at 0 it rescans the whole conversation on every turn, so each turn
+      // re-ingests its predecessors' items and the per-turn row count climbs
+      // with conversation length until it crosses the evidence cap.
       const updated = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'submitted', dispatch_after_seq = ?, bb_event_seq = ?,
+                evidence_event_seq = ?,
                 stream_phase = 'connecting', submitted_at = ?,
                 delivery_state = 'none', delivery_reconcile_attempts = 0,
                 next_dispatch_at = 0, last_error = NULL,
@@ -6205,6 +6450,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                  )
             )`,
       ).run(
+        dispatchAfterSeq,
         dispatchAfterSeq,
         dispatchAfterSeq,
         input.now,
@@ -6374,7 +6620,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                 dispatch_after_seq = 0, bb_event_seq = 0, evidence_event_seq = 0,
                 completion_continuations = 2, input_accepted = 0,
                 model_fallback_index = ?, stream_text = '', stream_phase = 'queued',
-                submitted_at = NULL, last_error = ?, updated_at = ?
+                submitted_at = NULL, delivery_state = 'none',
+                delivery_reconcile_attempts = 0, next_dispatch_at = 0,
+                last_error = ?, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
             AND lease_owner = ? AND lease_generation = ?
             AND accepted_finalization_id IS NULL AND completion_continuations < 2`,
@@ -7098,6 +7346,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       agentText: folded,
       now: input.now,
     });
+    // The answer itself arrives folded into the reply already being written, so
+    // without this the owner's message drew no bubble at all and reads in
+    // Telegram exactly like being ignored.
+    persistControllerOutbox(this.db, {
+      logicalKey: controllerReplyLogicalKey(input.waitingTurnId, null),
+      chatId: row.telegramChatId,
+      payload: {
+        text: CONTROLLER_STEER_FOLDED_TEXT,
+        disable_web_page_preview: true,
+      },
+    }, input.now);
   }
 
   private retryUnappliedControllerSteer(input: ControllerSteerSettlementInput): void {
@@ -7307,6 +7566,23 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   /** Asks the owner to unblock a thread that is waiting on a decision. */
+  /**
+   * True when the controller started this thread, which is what makes the
+   * thread's questions the controller's to answer.
+   *
+   * Provenance is BB's own parent link rather than anything this plugin keeps:
+   * the controller spawns with `--parent-self`, so the parent is the
+   * controller's own BB thread. A thread the owner opened has no such parent
+   * and stays theirs, which matters because routing their own work away would
+   * silently take it off their phone.
+   */
+  public isControllerOwnedThread(parentThreadId: string | null): boolean {
+    if (parentThreadId === null) return false;
+    return this.db.prepare(
+      "SELECT 1 FROM controller_threads WHERE bb_thread_id = ? AND state = 'active'",
+    ).get(parentThreadId) !== undefined;
+  }
+
   public recordThreadInteraction(input: {
     interactionId: string;
     threadId: string;
@@ -7314,6 +7590,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     interaction: ThreadInteraction;
     chatId: string;
     now: number;
+    parentThreadId?: string | null;
   }): boolean {
     assertControllerIdentifier(input.interactionId, "interactionId");
     assertControllerIdentifier(input.threadId, "threadId");
@@ -7323,10 +7600,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const known = this.db.prepare("SELECT 1 FROM thread_interactions WHERE interaction_id = ?")
         .get(input.interactionId);
       if (known) return false;
+      // The routing decision is taken here rather than by the caller, so a
+      // future caller cannot put a tappable menu on the owner's phone for a
+      // thread the controller started by forgetting to ask.
+      const route = routeThreadInteraction({
+        threadOwnedByController: this.isControllerOwnedThread(input.parentThreadId ?? null),
+        interaction: input.interaction,
+      });
       this.db.prepare(
         `INSERT INTO thread_interactions
-           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)`,
+           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at, audience)
+         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)`,
       ).run(
         input.interactionId,
         input.threadId,
@@ -7334,7 +7618,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.interaction.kind,
         JSON.stringify(input.interaction),
         input.now,
+        route.audience,
       );
+      if (route.audience === "controller") {
+        this.askControllerToAnswerThread({ ...input, now: input.now }, route.decisions);
+        return true;
+      }
       const rendered = renderThreadInteraction(input.title, input.interaction);
       persistControllerOutbox(this.db, {
         logicalKey: `thread-interaction:${input.interactionId}`,
@@ -7347,6 +7636,46 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }, input.now);
       return true;
     }).immediate();
+  }
+
+  /**
+   * Puts a spawned thread's block in front of the controller as its own turn.
+   *
+   * The owner sees nothing here. They asked to hear that a decision was made,
+   * not to be asked to make it, and the controller reports the decision in its
+   * own words when it next speaks.
+   */
+  private askControllerToAnswerThread(
+    input: {
+      interactionId: string;
+      threadId: string;
+      title: string;
+      interaction: ThreadInteraction;
+      now: number;
+    },
+    decisions: readonly ThreadApprovalDecision[],
+  ): void {
+    const controller = this.db.prepare(
+      "SELECT controller_key, telegram_user_id, telegram_chat_id FROM controller_threads WHERE state = 'active' LIMIT 1",
+    ).get() as { controller_key: string; telegram_user_id: string; telegram_chat_id: string } | undefined;
+    if (!controller) return;
+    const latestUpdate = this.db.prepare(
+      "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
+    ).get() as { update_id: number };
+    try {
+      this.enqueueControllerTurn({
+        controllerKey: controller.controller_key,
+        telegramUserId: controller.telegram_user_id,
+        telegramChatId: controller.telegram_chat_id,
+        updateId: Math.max(latestUpdate.update_id + 1, THREAD_FOLLOW_UP_UPDATE_ID_BASE),
+        inputText: describeThreadBlockForController(input.threadId, input.title, input.interaction, decisions),
+        origin: "system",
+        now: input.now,
+      });
+    } catch {
+      // A turn that cannot be queued leaves the interaction pending, so the
+      // next sweep offers it again rather than the thread being forgotten.
+    }
   }
 
   /** Resolves a watched thread's block from a tapped button. */
@@ -7386,6 +7715,64 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         };
       }
       return { ok: false, reason: "stale" };
+    }).immediate();
+  }
+
+  /**
+   * Records the controller's answer to a block on a thread it started.
+   *
+   * The answer joins the same queue the owner's tap uses, so it reaches BB
+   * through one delivery path with one set of retries. Only an interaction
+   * routing already assigned to the controller can be answered here: the owner's
+   * own threads, and the decisions reserved for them, are refused rather than
+   * quietly taken over. A session-wide grant is refused for the same reason it
+   * is never offered, so an answer cannot widen what the thread may do later.
+   */
+  public answerThreadInteractionAsController(input: {
+    interactionId: string;
+    threadId: string;
+    decision?: ThreadApprovalDecision;
+    answers?: ControllerQuestionAnswers;
+    now: number;
+  }): { ok: true } | { ok: false; reason: "unknown" | "not_controller_routed" | "decision_not_allowed" } {
+    assertControllerIdentifier(input.interactionId, "interactionId");
+    assertControllerIdentifier(input.threadId, "threadId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction(() => {
+      const row = this.db.prepare(
+        "SELECT * FROM thread_interactions WHERE interaction_id = ? AND thread_id = ? AND state = 'pending'",
+      ).get(input.interactionId, input.threadId) as (ThreadInteractionRow & { audience?: string }) | undefined;
+      if (!row) return { ok: false as const, reason: "unknown" as const };
+      if (row.audience !== "controller") {
+        return { ok: false as const, reason: "not_controller_routed" as const };
+      }
+      // The stored payload is the interaction this plugin already validated
+      // when it recorded it, not the provider's raw shape, so it is read back
+      // the same way the owner's tap reads it rather than parsed again.
+      const interaction = JSON.parse(row.payload_json) as ThreadInteraction;
+      if (interaction.kind === "unsupported") {
+        return { ok: false as const, reason: "unknown" as const };
+      }
+      let resolution: Record<string, unknown>;
+      if (interaction.kind === "approval") {
+        const decision = input.decision;
+        if (decision === undefined || decision === "allow_for_session" || !interaction.decisions.includes(decision)) {
+          return { ok: false as const, reason: "decision_not_allowed" as const };
+        }
+        resolution = decision === "deny" ? { decision } : { decision, grantedPermissions: null };
+      } else {
+        const answers = input.answers;
+        if (!answers || nextUnansweredQuestion(interaction.questions, answers) !== null) {
+          return { ok: false as const, reason: "decision_not_allowed" as const };
+        }
+        resolution = { kind: "user_answer", answers };
+      }
+      const updated = this.db.prepare(
+        `UPDATE thread_interactions SET state = 'answered', answer_json = ?, answered_at = ?
+          WHERE interaction_id = ? AND state = 'pending'`,
+      ).run(JSON.stringify(resolution), input.now, input.interactionId);
+      if (updated.changes !== 1) return { ok: false as const, reason: "unknown" as const };
+      return { ok: true as const };
     }).immediate();
   }
 
@@ -7737,7 +8124,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `UPDATE controller_turns
             SET state = 'failed', last_error = ?, stream_text = '', stream_phase = 'failed',
                 lease_owner = NULL, lease_generation = NULL,
-                completed_at = ?,
+                delivery_state = 'none', delivery_reconcile_attempts = 0,
+                next_dispatch_at = 0, completed_at = ?,
                 capability_continuation_state = CASE
                   WHEN capability_continuation_state IN ('requested', 'relaunching') THEN 'blocked'
                   ELSE capability_continuation_state
@@ -7772,6 +8160,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE controller_key = ? AND thread_id = ? AND ended_at IS NULL`,
       ).run(input.now, "retired", input.controllerKey, input.expectedThreadId);
       if (generationRetired.changes !== 1) throw new Error("Controller generation changed during fail-and-retire");
+      const requeued = this.requeueUntouchedOwnerMessage(row, input.failureCode ?? "unknown", input.now);
       // The owner-facing notice is a fixed internally mapped safe message,
       // never caller prose: an arbitrary text could equal or leak the accepted
       // rendered message or a credential. The internal `error` stays out of the
@@ -7779,12 +8168,72 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const outbox = controllerFailureOutbox(
         input.turnId,
         row.telegram_chat_id,
-        input.failureCode ?? "unknown",
+        requeued ? "owner_message_requeued" : input.failureCode ?? "unknown",
         row.thread_follow_up_json,
       );
       persistControllerOutbox(this.db, outbox, input.now);
       return "retired";
     }).immediate();
+  }
+
+  /**
+   * Put an owner message back only when the failed turn provably cost nothing.
+   *
+   * A turn that opened no tool, recorded no evidence, reserved no receipt and
+   * had no accepted answer cannot have done anything worth not repeating, so
+   * replaying it is safe. `input_accepted` is deliberately not part of that
+   * test: turns have run dozens of tool calls with it still 0, so trusting it
+   * would replay real work. An image is left out because the retry would carry
+   * only the text, which is not the message the owner sent.
+   *
+   * Only an unclassified or recovery-exhausted failure is replayed. An expired
+   * sign-in or a rejected provider would fail again the same way until the
+   * owner fixes it, and the delivery codes describe a message whose fate is
+   * already uncertain. The replacement records where it came from, so a second
+   * failure asks the owner instead of looping.
+   */
+  private requeueUntouchedOwnerMessage(
+    row: ControllerTurnRow & { telegram_chat_id: string },
+    failureCode: ControllerFailureCode,
+    now: number,
+  ): boolean {
+    if (failureCode !== "unknown" && failureCode !== "recovery_exhausted") return false;
+    if (row.origin !== "owner" || row.image_file_id !== null) return false;
+    if (row.recovery_source_turn_id !== null) return false;
+    if (row.tool_calls !== 0 || row.accepted_finalization_id !== null) return false;
+    const touched = this.db.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM controller_evidence WHERE turn_id = ?) AS evidence,
+         (SELECT COUNT(*) FROM tool_receipts WHERE turn_id = ?) AS receipts`,
+    ).get(row.id, row.id) as { evidence: number; receipts: number };
+    if (touched.evidence !== 0 || touched.receipts !== 0) return false;
+    const latestUpdate = this.db.prepare(
+      "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
+    ).get() as { update_id: number };
+    try {
+      const replacement = this.enqueueControllerTurn({
+        controllerKey: row.controller_key,
+        telegramUserId: this.requiredOwnerForController(row.controller_key).userId,
+        telegramChatId: row.telegram_chat_id,
+        updateId: Math.max(latestUpdate.update_id + 1, THREAD_FOLLOW_UP_UPDATE_ID_BASE),
+        inputText: row.input_text,
+        origin: "owner",
+        now,
+      });
+      this.db.prepare(
+        "UPDATE controller_turns SET recovery_source_turn_id = ? WHERE id = ? AND state = 'queued'",
+      ).run(row.id, replacement.id);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private requiredOwnerForController(controllerKey: string): { userId: string; chatId: string } {
+    const owner = this.db.prepare(
+      "SELECT telegram_user_id, telegram_chat_id FROM controller_threads WHERE controller_key = ?",
+    ).get(controllerKey) as { telegram_user_id: string; telegram_chat_id: string };
+    return { userId: owner.telegram_user_id, chatId: owner.telegram_chat_id };
   }
 
   public listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[] {

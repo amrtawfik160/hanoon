@@ -877,7 +877,9 @@ it("hands a message sent mid-answer to the thread already writing it", async () 
   expect(adapter.steer).toHaveBeenCalledWith("thr_controller", "in review i mean not in progress", signal);
   expect(store.getControllerTurn(correction.id)?.state).toBe("completed");
   // The running answer still owns the reply; the correction gets no second one.
-  expect(store.getOutbox(`controller:${correction.id}:reply`)).toBeNull();
+  // A folded message still draws a bubble, so the owner can see it landed.
+  expect(store.getOutbox(`controller:${correction.id}:reply`)?.payload.text)
+    .toMatch(/already writing/i);
   expect(store.getControllerTurn(running.id)?.state).toBe("submitted");
 });
 

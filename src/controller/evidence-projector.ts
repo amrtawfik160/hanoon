@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { posix, win32 } from "node:path";
+import { withAbortDeadline } from "../async";
 import type { TelegramAgentStore } from "../storage/store";
 import type {
   ControllerEvidenceOutcome,
@@ -12,6 +13,7 @@ import {
 import { CONTROLLER_TOOL_NAMES } from "./capability-policy";
 import {
   CONTROLLER_EVENT_PAGE_LIMIT,
+  CONTROLLER_PROVIDER_RPC_TIMEOUT_MS,
   MAX_CONTROLLER_EVENT_PAGES,
 } from "./bb-controller";
 import type {
@@ -497,16 +499,18 @@ export class ControllerEvidenceProjector {
     controller: ControllerThreadRecord,
     signal: AbortSignal,
   ): Promise<string> {
-    const thread = await this.dependencies.sdk.threads.get({ threadId: controller.threadId!, signal });
+    const thread = await withAbortDeadline(signal, CONTROLLER_PROVIDER_RPC_TIMEOUT_MS, (roundTripSignal) =>
+      this.dependencies.sdk.threads.get({ threadId: controller.threadId!, signal: roundTripSignal }));
     if (!thread || thread.id !== controller.threadId || thread.projectId !== controller.projectId ||
       thread.environmentId === null) {
       throw new ControllerEvidenceProjectorError("source_identity_invalid");
     }
     signal.throwIfAborted();
-    const environment = await this.dependencies.sdk.environments.get({
-      environmentId: thread.environmentId,
-      signal,
-    });
+    const environment = await withAbortDeadline(signal, CONTROLLER_PROVIDER_RPC_TIMEOUT_MS, (roundTripSignal) =>
+      this.dependencies.sdk.environments.get({
+        environmentId: thread.environmentId!,
+        signal: roundTripSignal,
+      }));
     if (!environment || environment.id !== thread.environmentId ||
       environment.projectId !== controller.projectId || environment.hostId !== controller.hostId ||
       environment.status !== "ready" || environment.workspaceProvisionType !== "personal" ||
@@ -625,12 +629,16 @@ export class ControllerEvidenceProjector {
     cursor: number,
   ): Promise<readonly ThreadEventRow[]> {
     request.signal.throwIfAborted();
-    return await this.dependencies.sdk.threads.events.list({
-      threadId: request.threadId,
-      afterSeq: String(cursor),
-      limit: String(CONTROLLER_EVENT_PAGE_LIMIT),
-      signal: request.signal,
-    });
+    return await withAbortDeadline(
+      request.signal,
+      CONTROLLER_PROVIDER_RPC_TIMEOUT_MS,
+      (roundTripSignal) => this.dependencies.sdk.threads.events.list({
+        threadId: request.threadId,
+        afterSeq: String(cursor),
+        limit: String(CONTROLLER_EVENT_PAGE_LIMIT),
+        signal: roundTripSignal,
+      }),
+    );
   }
 
   private projectPage(
