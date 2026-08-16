@@ -119,6 +119,49 @@ branches and nothing is lost. They are deliberately not being rebased yet:
 rebasing today would only buy a second round of the same conflicts. Both get
 rebased onto `trunk` as their own task once the in-flight work lands.
 
+## What decides the base of a new worktree
+
+Measured on 2026-08-16 by spawning throwaway threads and reading the base BB
+recorded for each in its own `environments` table.
+
+A spawn that passes an explicit base gets it. A spawn that does not is resolved
+against **`origin/main`**, from a per-project `default_branch` of `main` that BB
+holds itself. That value tracks the repository's default branch on GitHub. It is
+not read from any local checkout, which is why two plausible local levers were
+tried and **neither had any effect**:
+
+| Change | Effect on a new worktree's base |
+| --- | --- |
+| Project source path moved to `trunk` | None. Still `origin/main`. |
+| Underlying clone's checked-out branch moved to `trunk` | None. Still `origin/main`. |
+| `bb thread spawn --base-branch trunk` | Works. Base recorded as `trunk`. |
+
+The project source path `/root/github_projects/telegram-bb-agent-plugin` is
+itself a worktree of a shared clone, not a clone of its own, so its branch has no
+bearing on this. It is left detached at the trunk tip so it does not hold the
+`trunk` branch name.
+
+So until the GitHub default branch changes, **every spawn on this project must
+pass `--base-branch trunk` explicitly.** A spawn that omits it lands on the
+disjoint history and the ancestry guard refuses the job, which is the guard
+working rather than a new fault.
+
+### Undoing the local branch moves
+
+Neither of these affects worktree provisioning; they are recorded only so the
+machine can be put back exactly as it was. The clone and the source path were
+moved onto `trunk` so their contents match the live work instead of a six-commit
+dead history.
+
+```
+git -C /root/.bb-server/personal-workspaces/env_tbzyg9qsu2/bb-plugin-telegram-agent checkout main
+git -C /root/github_projects/telegram-bb-agent-plugin checkout feature/telegram-agent-implementation
+```
+
+If the first command reports that `main` is checked out elsewhere, `git worktree
+list` names the holder; detach it with `git -C <that path> checkout --detach` and
+run it again.
+
 ## What is still open
 
 `main` is unchanged and still disjoint. Reconciling it, if it is ever wanted,

@@ -12,12 +12,20 @@ it stands. Nothing was rewritten and no published history changed. How `trunk`
 was assembled, and which tips were left out, is recorded in
 [`docs/repository-history.md`](repository-history.md).
 
-Two steps remain and are deliberately not automated:
+One step remains, and it is the one that actually stops threads being cut from
+the wrong history: **decide whether `trunk` becomes the GitHub default branch.**
+`main` is still the default today.
 
-- Point every project policy `baseBranch` at `trunk`. This is a settings edit,
-  not a code change, which is why the trunk name is not hardcoded anywhere.
-- Decide whether `trunk` becomes the GitHub default branch. `main` is still the
-  default today.
+That turned out not to be cosmetic. BB resolves a no-base spawn against
+`origin/main`, from a project default branch it tracks from GitHub. Neither
+moving the project source path nor moving the underlying clone onto `trunk`
+changed it; both were tried and measured. Until the GitHub default changes, every
+spawn on this project has to pass `--base-branch trunk` explicitly. The evidence
+is in [`docs/repository-history.md`](repository-history.md).
+
+Repointing project policy `baseBranch` values is *not* on this list. No policy
+row exists for this repository, and the six that do exist belong to other
+repositories where `main` is the correct trunk.
 
 Options B, C and D below stay available and unblocked. They are recorded so that
 if one ever becomes necessary, the reasoning does not have to be rebuilt.
