@@ -66,6 +66,12 @@
       "license": "MIT"
     },
     {
+      "id": "driving-bb",
+      "skillPath": "skills/hanoon/driving-bb/SKILL.md",
+      "source": "first-party",
+      "license": "first-party"
+    },
+    {
       "id": "durable-boundary-audit",
       "skillPath": "skills/hanoon/durable-boundary-audit/SKILL.md",
       "source": "first-party",
@@ -320,6 +326,10 @@
     {
       "path": "skills/hanoon/checking-system-logs/SKILL.md",
       "sha256": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245"
+    },
+    {
+      "path": "skills/hanoon/driving-bb/SKILL.md",
+      "sha256": "d832f8f9122a9715cc28eb1a00ca87b3636cbc29be37dd12b02bd8ccdab56049"
     },
     {
       "path": "skills/hanoon/durable-boundary-audit/SKILL.md",

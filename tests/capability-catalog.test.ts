@@ -14,6 +14,7 @@ const EXPECTED_SKILL_ROUTES = {
   "dispatching-parallel-agents": "hanoon-native",
   "docs-guard": "worker",
   "domain-modeling": "manual-only",
+  "driving-bb": "worker",
   "durable-boundary-audit": "worker",
   "executing-plans": "hanoon-native",
   "finishing-a-development-branch": "hanoon-native",

@@ -45,6 +45,15 @@ export const CONTROLLER_BUNDLE_IDS = [
 ] as const satisfies readonly ControllerToolBundleId[];
 
 export const CONTROLLER_DEFAULT_SKILLS = [
+  // The agent is told to use the `bb` CLI for anything its own tools do not
+  // cover, and until this was attached it had no description of one command.
+  // It is a default rather than an intent match because the need for it shows
+  // up mid-turn, once a tool has already come back short.
+  //
+  // Listed first so this order matches the profile path's, which sorts by
+  // capability id: the two ways a turn can be configured should not hand the
+  // agent the same skills in two different orders.
+  "driving-bb",
   "human-friendly-coding-communication",
   "proportional-development-workflow",
 ] as const satisfies readonly CapabilitySkillId[];

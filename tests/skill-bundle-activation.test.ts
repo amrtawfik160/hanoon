@@ -114,7 +114,7 @@ test("rejects a corrupted locked skill before the BB host is accessed", async ()
 test("verifies the real committed bundle", () => {
   const verified = verifySkillBundle(repositoryRoot);
 
-  expect(verified.skillIds).toHaveLength(25);
+  expect(verified.skillIds).toHaveLength(26);
   expect(verified.skillIds).toEqual(expect.arrayContaining([
     "brainstorming",
     "clean-code-guard",

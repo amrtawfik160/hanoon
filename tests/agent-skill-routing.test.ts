@@ -94,6 +94,7 @@ describe("worker skill role table", () => {
       "dispatching-parallel-agents",
       "docs-guard",
       "domain-modeling",
+      "driving-bb",
       "durable-boundary-audit",
       "executing-plans",
       "finishing-a-development-branch",

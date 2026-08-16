@@ -50,6 +50,7 @@ const deliverySkillIds = ["pr-writer"];
 const discoverySkillIds = ["domain-modeling", "grill-with-docs", "grilling"];
 const hanoonSkillIds = [
   "checking-system-logs",
+  "driving-bb",
   "durable-boundary-audit",
   "human-friendly-coding-communication",
   "proportional-development-workflow",

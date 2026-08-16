@@ -988,6 +988,7 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   expect(selected.tools.map((tool) => tool.name)).toHaveLength(minimumTools.length);
   expect(new Set(selected.tools.map((tool) => tool.name))).toEqual(new Set(minimumTools));
   expect(selected.skills).toEqual([
+    "driving-bb",
     "human-friendly-coding-communication",
     "proportional-development-workflow",
   ]);

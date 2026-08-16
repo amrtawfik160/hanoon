@@ -85,11 +85,13 @@ it.each(permittedBundleCombinations.map((bundleIds) => [bundleIds]))(
 
 it("loads manual discovery skills only for an explicit slash invocation", () => {
   expect(controllerSkillsForTurn("Help me think this through")).toEqual([
+    "driving-bb",
     "human-friendly-coding-communication",
     "proportional-development-workflow",
   ]);
   for (const command of ["/grill-with-docs", "/grilling", "/domain-modeling"]) {
     expect(controllerSkillsForTurn(`${command} design the workflow`)).toEqual([
+      "driving-bb",
       "human-friendly-coding-communication",
       "proportional-development-workflow",
       ...CONTROLLER_MANUAL_DISCOVERY_SKILLS,

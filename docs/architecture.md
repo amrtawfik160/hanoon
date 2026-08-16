@@ -232,6 +232,14 @@ A watch fires on `idle`, `error`, or `missing`. A thread that wedges reaches non
 
 Visible-thread follow-up currently has two paths. Starting or messaging a thread tries to arm one best-effort courtesy monitor for it; a later explicit watch reuses that row and replaces its instruction. A new thread watch holds for a settling minute, and reaching the armed-monitor cap declines only the courtesy monitor rather than the action that prompted it. Independently, lifecycle observation treats an exact `thread:<id>` reference in durable controller evidence as engagement and can enqueue a follow-up when no monitor owns the landing. This inferred obligation has no monitor row, is absent from monitor listings, and does not consume the armed-monitor cap; read-only thread list and status evidence currently qualifies. Delegated fan-outs use their join record instead of one watch per member.
 
+## Driving BB from the shell
+
+The agent's own tools cover jobs, threads, watches, and memory. Everything else BB can do it does from the shell, with the owner's authority on the owner's machine, because anything that would wait for a click in the BB app waits forever.
+
+It was told to do that from the first day and given no description of a single command, so it had to guess names and flags. The `driving-bb` skill is attached to every turn by default rather than matched on intent: the need for it shows up mid-turn, once a tool has already come back short, which is too late for a skill that loads on the opening message.
+
+It carries what the tools do not — terminals for anything long-running, environments and diffs, automations, machines and models, exposing a running server so the remote owner can open it — and one rule above the rest: never poll. `bb thread wait` and a terminal's `--contains` wait already exist, and a sleep loop around `bb thread show` burns the owner's tokens while competing with the work it is watching for the same event loop.
+
 ## Sending the owner a picture
 
 The owner works only from Telegram, so a screenshot of the thing being described is often the shortest true answer available. The agent names a thread and an absolute path on that thread's machine, and the picture reaches the owner with a caption.

@@ -563,6 +563,7 @@ async function assertProductionWiring(
     pendingTurn ? EXPECTED_CONTROLLER_PROFILE_TOOL_NAMES : EXPECTED_CONTROLLER_TOOL_NAMES,
   );
   expect(configured.skills).toEqual([
+    "driving-bb",
     "human-friendly-coding-communication",
     "proportional-development-workflow",
     ...(pendingTurn ? [] : ["grill-with-docs", "grilling", "domain-modeling"]),

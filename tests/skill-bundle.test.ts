@@ -27,6 +27,7 @@ const deliveryIds = ["pr-writer"] as const;
 const discoveryIds = ["domain-modeling", "grill-with-docs", "grilling"] as const;
 const hanoonIds = [
   "checking-system-logs",
+  "driving-bb",
   "durable-boundary-audit",
   "human-friendly-coding-communication",
   "proportional-development-workflow",
