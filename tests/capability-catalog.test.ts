@@ -5,7 +5,13 @@ import {
   validateCapabilityCatalog,
   type CapabilityDescriptor,
 } from "../src/capabilities/contracts";
-import { CAPABILITY_CATALOG } from "../src/capabilities/catalog";
+import {
+  CAPABILITY_CATALOG,
+  CONTROLLER_BUNDLE_TOOLS,
+  CONTROLLER_METADATA_TOOL_IDS,
+  CONTROLLER_PROTOCOL_TOOL_IDS,
+} from "../src/capabilities/catalog";
+import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
 
 const EXPECTED_SKILL_ROUTES = {
   brainstorming: "worker",
@@ -135,4 +141,22 @@ describe("capability catalog", () => {
     expect(descriptorDigest({ ...descriptor, digest: "0".repeat(64) }))
       .toBe(descriptorDigest(descriptor));
   });
+});
+
+it("leaves no controller tool unreachable from every profile", () => {
+  // The fault this exists to stop, which shipped three times before it did:
+  // a tool declared in the allowlist, implemented, documented, and tested,
+  // but absent from every bundle. Profiles select bundles and bundles carry
+  // tools, so such a tool reaches no session at all. Nothing else notices —
+  // the registration-versus-manifest check compares the allowlist against
+  // itself, and a grep for the name finds all of it.
+  const bundled = new Set<string>(Object.values(CONTROLLER_BUNDLE_TOOLS).flat());
+  const alwaysOn = new Set<string>([
+    ...CONTROLLER_METADATA_TOOL_IDS,
+    ...CONTROLLER_PROTOCOL_TOOL_IDS,
+  ]);
+  const unreachable = (CONTROLLER_TOOL_NAMES as readonly string[])
+    .filter((name) => !bundled.has(name) && !alwaysOn.has(name));
+
+  expect(unreachable).toEqual([]);
 });

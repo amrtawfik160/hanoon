@@ -133,6 +133,9 @@ const EXPECTED_CONTROLLER_PROFILE_TOOL_NAMES = [
   "telegram_agent_scorecard",
   "telegram_agent_turn_evidence",
   "telegram_agent_respond",
+  // Reachable from every turn now: showing the owner a picture is not a
+  // subject the opening message has to name.
+  "telegram_agent_send_media",
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
 ] as const;
