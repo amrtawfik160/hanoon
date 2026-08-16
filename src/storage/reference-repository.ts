@@ -79,9 +79,13 @@ type PassageRow = {
   body: string;
 };
 
+function identityTitle(title: string): string {
+  return title.normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
 function documentId(scope: ReferenceScope, projectId: string | null, title: string): string {
   return createHash("sha256")
-    .update(`reference:${scope}:${projectId ?? ""}:${title}`, "utf8")
+    .update(`reference:${scope}:${projectId ?? ""}:${identityTitle(title)}`, "utf8")
     .digest("base64url")
     .slice(0, 24);
 }
@@ -120,11 +124,19 @@ function toPassage(row: PassageRow): ReferencePassageRecord {
  * specification, and retrieval would happily quote the dead one.
  */
 function sectionDigests(markdown: string): Map<string, string> {
-  const digests = new Map<string, string>();
+  const bodies = new Map<string, string[]>();
   for (const section of parseReferenceSections(markdown)) {
-    if (section.path.length === 0) continue;
-    const path = section.path.join(PATH_SEPARATOR);
-    digests.set(path, createHash("sha256").update(section.body, "utf8").digest("hex").slice(0, 16));
+    const path = section.path.length === 0 ? "(document preface)" : section.path.join(PATH_SEPARATOR);
+    const existing = bodies.get(path);
+    if (existing) existing.push(section.body);
+    else bodies.set(path, [section.body]);
+  }
+  const digests = new Map<string, string>();
+  for (const [path, sectionBodies] of bodies) {
+    digests.set(
+      path,
+      createHash("sha256").update(sectionBodies.join("\n\n"), "utf8").digest("hex").slice(0, 16),
+    );
   }
   return digests;
 }
@@ -152,21 +164,28 @@ export class ReferenceRepository {
     const passages = buildReferencePassages(sections);
     if (passages.length === 0) throw new TypeError("reference document has no readable text");
 
-    const id = documentId(scope, projectId, title);
+    const candidateId = documentId(scope, projectId, title);
     const map = buildReferenceMap(sections);
     const nextDigests = sectionDigests(input.markdown);
 
     return this.db.transaction((): SaveReferenceDocumentResult => {
-      const existing = this.db.prepare("SELECT * FROM reference_documents WHERE id = ?")
-        .get(id) as DocumentRow | undefined;
+      const identity = identityTitle(title);
+      const identityRows = (projectId === null
+        ? this.db.prepare("SELECT * FROM reference_documents WHERE scope = ? AND project_id IS NULL").all(scope)
+        : this.db.prepare("SELECT * FROM reference_documents WHERE scope = ? AND project_id = ?").all(scope, projectId)
+      ) as DocumentRow[];
+      const matches = identityRows.filter((row) => identityTitle(row.title) === identity);
+      if (matches.length > 1) throw new TypeError("reference document identity is ambiguous");
+      const existing = matches[0];
+      const id = existing?.id ?? candidateId;
       const version = existing ? existing.version + 1 : 1;
       const changes = existing ? this.changesAgainst(id, nextDigests) : [];
 
       if (existing) {
         this.db.prepare("DELETE FROM reference_passages WHERE document_id = ?").run(id);
         this.db.prepare(
-          "UPDATE reference_documents SET source = ?, version = ?, map_json = ?, ingested_at = ? WHERE id = ?",
-        ).run(input.source, version, JSON.stringify(map), input.now, id);
+          "UPDATE reference_documents SET title = ?, source = ?, version = ?, map_json = ?, ingested_at = ? WHERE id = ?",
+        ).run(title, input.source, version, JSON.stringify(map), input.now, id);
       } else {
         this.db.prepare(
           `INSERT INTO reference_documents (id, scope, project_id, title, source, version, map_json, ingested_at)
@@ -187,6 +206,12 @@ export class ReferenceRepository {
         );
       }
 
+      this.db.prepare("DELETE FROM reference_section_digests WHERE document_id = ?").run(id);
+      const insertDigest = this.db.prepare(
+        "INSERT INTO reference_section_digests (document_id, section_path, digest) VALUES (?, ?, ?)",
+      );
+      for (const [path, digest] of nextDigests) insertDigest.run(id, path, digest);
+
       const recordChange = this.db.prepare(
         `INSERT INTO reference_document_changes (document_id, version, section_path, change, recorded_at)
          VALUES (?, ?, ?, ?, ?)`,
@@ -201,21 +226,16 @@ export class ReferenceRepository {
   }
 
   /**
-   * Which sections moved, derived from the stored passages rather than a kept
-   * copy of the old document. Sections that only exist in one version are added
-   * or removed; a section in both whose text differs is changed.
+   * Which exact source sections moved. An installation upgraded from the first
+   * reference schema has no baseline, so its first replacement seeds one and
+   * makes no historical claim it cannot prove.
    */
   private changesAgainst(id: string, next: Map<string, string>): readonly ReferenceSectionChange[] {
     const rows = this.db.prepare(
-      "SELECT section_path, body FROM reference_passages WHERE document_id = ? ORDER BY rowid",
-    ).all(id) as Array<{ section_path: string; body: string }>;
-    const previous = new Map<string, string[]>();
-    for (const row of rows) {
-      if (row.section_path.length === 0) continue;
-      const bodies = previous.get(row.section_path);
-      if (bodies) bodies.push(row.body);
-      else previous.set(row.section_path, [row.body]);
-    }
+      "SELECT section_path, digest FROM reference_section_digests WHERE document_id = ?",
+    ).all(id) as Array<{ section_path: string; digest: string }>;
+    if (rows.length === 0) return [];
+    const previous = new Map(rows.map((row) => [row.section_path, row.digest]));
     const changes: ReferenceSectionChange[] = [];
     for (const path of previous.keys()) {
       if (!next.has(path)) changes.push({ sectionPath: path, change: "removed" });
@@ -223,15 +243,9 @@ export class ReferenceRepository {
     for (const path of next.keys()) {
       if (!previous.has(path)) changes.push({ sectionPath: path, change: "added" });
     }
-    // A section present in both is compared on the text that was actually
-    // stored, so reformatting that changed no words reads as unchanged.
-    for (const [path, bodies] of previous) {
+    for (const [path, digest] of previous) {
       if (!next.has(path)) continue;
-      const storedDigest = createHash("sha256")
-        .update(bodies.join("\n\n"), "utf8")
-        .digest("hex")
-        .slice(0, 16);
-      if (storedDigest !== next.get(path)) changes.push({ sectionPath: path, change: "changed" });
+      if (digest !== next.get(path)) changes.push({ sectionPath: path, change: "changed" });
     }
     return changes.sort((left, right) => left.sectionPath.localeCompare(right.sectionPath));
   }
@@ -254,12 +268,17 @@ export class ReferenceRepository {
     return rows.map(toRecord);
   }
 
-  public getReferencePassage(id: string): ReferencePassageRecord | null {
+  public getReferencePassage(id: string, projectId: string | null): ReferencePassageRecord | null {
+    const scoped = projectId === null
+      ? "d.scope = 'global'"
+      : "((d.scope = 'project' AND d.project_id = ?) OR d.scope = 'global')";
+    const parameters: unknown[] = [id];
+    if (projectId !== null) parameters.push(projectId);
     const row = this.db.prepare(
       `SELECT p.*, d.title AS title FROM reference_passages p
          JOIN reference_documents d ON d.id = p.document_id
-        WHERE p.id = ?`,
-    ).get(id) as PassageRow | undefined;
+        WHERE p.id = ? AND ${scoped}`,
+    ).get(...parameters) as PassageRow | undefined;
     return row ? toPassage(row) : null;
   }
 
@@ -306,6 +325,13 @@ export class ReferenceRepository {
   }
 
   public deleteReferenceDocument(id: string): boolean {
-    return this.db.prepare("DELETE FROM reference_documents WHERE id = ?").run(id).changes > 0;
+    return this.db.transaction((): boolean => {
+      const exists = this.db.prepare("SELECT 1 FROM reference_documents WHERE id = ?").get(id);
+      if (!exists) return false;
+      this.db.prepare("DELETE FROM reference_document_changes WHERE document_id = ?").run(id);
+      this.db.prepare("DELETE FROM reference_section_digests WHERE document_id = ?").run(id);
+      this.db.prepare("DELETE FROM reference_passages WHERE document_id = ?").run(id);
+      return this.db.prepare("DELETE FROM reference_documents WHERE id = ?").run(id).changes > 0;
+    })();
   }
 }

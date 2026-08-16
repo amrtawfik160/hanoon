@@ -2171,6 +2171,30 @@ CREATE TABLE reference_document_changes (
 );
 `] as const;
 
+/**
+ * Exact per-section baselines for change reporting. Passages may combine short
+ * descendants for retrieval, so reconstructing section history from them can
+ * invent changes even when the source document is byte-for-byte identical.
+ */
+export const REFERENCE_DOCUMENT_REPAIR_MIGRATIONS = [String.raw`
+CREATE TABLE reference_section_digests (
+  document_id TEXT NOT NULL REFERENCES reference_documents(id) ON DELETE CASCADE,
+  section_path TEXT NOT NULL,
+  digest TEXT NOT NULL CHECK (length(digest) = 16),
+  PRIMARY KEY (document_id, section_path)
+);
+`] as const;
+
+/** Exact controller provenance and retry linkage for worker-thread questions. */
+export const CONTROLLER_THREAD_ROUTING_REPAIR_MIGRATIONS = [String.raw`
+ALTER TABLE thread_interactions ADD COLUMN controller_key TEXT
+  REFERENCES controller_threads(controller_key);
+ALTER TABLE thread_interactions ADD COLUMN controller_turn_id TEXT
+  REFERENCES controller_turns(id);
+CREATE INDEX thread_interactions_controller_retry
+  ON thread_interactions(audience, state, controller_key);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2238,4 +2262,6 @@ export const ALL_MIGRATIONS = [
   ...JOB_CONTINUATION_BACKFILL_MIGRATIONS,
   ...MEMORY_EMBEDDING_MIGRATIONS,
   ...REFERENCE_DOCUMENT_MIGRATIONS,
+  ...CONTROLLER_THREAD_ROUTING_REPAIR_MIGRATIONS,
+  ...REFERENCE_DOCUMENT_REPAIR_MIGRATIONS,
 ] as const;

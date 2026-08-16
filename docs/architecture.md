@@ -127,7 +127,7 @@ The BB manifest registers five local skill roots. Four are vendored from reviewe
 | `skills/discovery` | [mattpocock/skills](https://github.com/mattpocock/skills), pinned `1.2.3` at revision `84fdeffd12f2ee307994d1eb6feb48173b6e0502` | MIT | `grill-with-docs`, `grilling`, `domain-modeling` |
 | `skills/hanoon` | first-party | first-party | `human-friendly-coding-communication`, `proportional-development-workflow` |
 
-A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. All 23 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
+A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. All 26 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
 
 The existing single `bb.agents.configure` callback keeps the controller and worker boundaries separate. Its exact role-selection matrix is:
 
@@ -220,7 +220,7 @@ Each answered turn writes its digest entry in the same transaction that records 
 
 ## Memory
 
-Memories are typed (`preference`, `fact`, `decision`, `correction`), scoped to the owner globally or to one project, and ranked by a deterministic blend of BM25 relevance, recency decay, importance, and confidence. Ranking runs entirely inside SQLite through an FTS5 index: no embedding service, no API key, and no vector files to reconcile. A memory write commits in the same transaction as the row it indexes.
+Memories are typed (`preference`, `fact`, `decision`, `correction`), scoped to the owner globally or to one project, and start with a deterministic blend of BM25 relevance, recency decay, importance, and confidence. A background local embedding service backfills semantic vectors without an API key. Semantic similarity contributes 30 percent only when both the query and memory already have vectors; otherwise the original score is unchanged. An owner query never initializes or downloads the model inline. A memory write commits in the same transaction as the FTS5 row it indexes, while vector backfill is independently retryable.
 
 Restating a subject supersedes its predecessor instead of overwriting it, so corrections keep their history. Credential-shaped text is refused at the write, and the owner's explicit standing instructions ("always…", "never…", "remember that…") are captured at intake so they survive even if the answer itself fails.
 

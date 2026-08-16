@@ -288,7 +288,9 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned again when retry_job began reporting `retryOutcome`: a queued
   // retry leaves the job unchanged, so the description now tells the agent to
   // read the outcome rather than read an unchanged job as a failed retry.
-  expect(digest).toBe("0f5e560ddd7a1a65ef70cb16f5341a41173eb53317e7bdf5222e5a9958bd7d18");
+  // Re-pinned when `queued` stopped promising that admission alone guarantees
+  // execution; scheduler health can still hold an admitted retry.
+  expect(digest).toBe("26a90ac7a4c4645e48aad08b9f59b0606186af91464f665c96d753962c41c252");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",

@@ -165,7 +165,7 @@ const REFERENCE_SEARCH_FLAGS: Record<string, FlagSpec> = {
   limit: { kind: "value" },
 };
 const REFERENCE_LIST_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG, project: { kind: "value" } };
-const REFERENCE_SHOW_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+const REFERENCE_SHOW_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG, project: { kind: "value" } };
 
 const MAX_COLLECTION_SIZE = 100;
 const MAX_ACCESS_LIST_LIMIT = 10;
@@ -182,7 +182,6 @@ Commands:
   job list [--limit <1-100>] [--json]
   job show <job-id> [--json]
   job spend <job-id> [--json]
-  job retry <job-id> [--json]
   job cancel <job-id> [--json]
   capability status [recipe] [--json]
   capability inventory [--host <scope>] [--limit <1-100>] [--json]
@@ -192,6 +191,7 @@ Commands:
   capability rollback <recipe> [--json]
   access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
   access status [binding-id] [--json]
+  reference <search|show|list> ... [--project <project-id>] [--json]
   doctor [project-id] [--json]
 `;
 const CREDENTIAL_TEXT = [
@@ -1361,6 +1361,7 @@ async function runAccess(
 async function runReference(
   deps: TelegramAgentCliDependencies,
   argv: readonly string[],
+  context: PluginCliContext,
 ): Promise<PluginCliResult> {
   if (argv.length === 0) throw new CliInputError("reference requires a subcommand");
   const subcommand = argv[0];
@@ -1370,9 +1371,10 @@ async function runReference(
     const query = onePositional(parsed, "query");
     const limit = readOptionalInteger(parsed, "limit", "--limit", 1, MAX_REFERENCE_SEARCH_RESULTS)
       ?? MAX_REFERENCE_SEARCH_RESULTS;
+    const projectId = referenceProjectScope(parsed, context);
     const passages = deps.store.searchReferencePassages({
       query,
-      projectId: parsed.values.get("project") ?? null,
+      projectId,
       limit,
     });
     return success(
@@ -1387,7 +1389,8 @@ async function runReference(
   if (subcommand === "show") {
     const parsed = parseFlags(argv.slice(1), REFERENCE_SHOW_FLAGS);
     const json = parsed.flags.has("json");
-    const passage = deps.store.getReferencePassage(onePositional(parsed, "passage-id"));
+    const projectId = referenceProjectScope(parsed, context);
+    const passage = deps.store.getReferencePassage(onePositional(parsed, "passage-id"), projectId);
     if (passage === null) throw new CliOperationError("No such passage");
     return success(passage, `${passage.documentTitle}\t${passage.sectionPath}\n${passage.body}`, json);
   }
@@ -1395,7 +1398,7 @@ async function runReference(
     const parsed = parseFlags(argv.slice(1), REFERENCE_LIST_FLAGS);
     const json = parsed.flags.has("json");
     noPositionals(parsed);
-    const documents = deps.store.listReferenceDocuments(parsed.values.get("project") ?? null);
+    const documents = deps.store.listReferenceDocuments(referenceProjectScope(parsed, context));
     return success(
       { documents },
       documents.length === 0
@@ -1406,6 +1409,15 @@ async function runReference(
     );
   }
   throw new CliInputError(`Unknown reference subcommand ${subcommand}`);
+}
+
+function referenceProjectScope(parsed: ParsedFlags, context: PluginCliContext): string | null {
+  const requested = parsed.values.get("project") ?? null;
+  const bound = context.projectId ?? null;
+  if (bound !== null && requested !== null && requested !== bound) {
+    throw new CliInputError("--project must match the invoking thread's project");
+  }
+  return bound ?? requested;
 }
 
 function capabilityRecipe(value: string, label: string): TaskRecipe {
@@ -1657,7 +1669,7 @@ export async function runTelegramAgentCli(
     if (command === "job") return await runJob(deps, argv.slice(1));
     if (command === "capability") return await runCapability(deps, argv.slice(1));
     if (command === "access") return await runAccess(deps, argv.slice(1));
-    if (command === "reference") return await runReference(deps, argv.slice(1));
+    if (command === "reference") return await runReference(deps, argv.slice(1), context);
     if (command === "doctor") {
       const parsed = parseFlags(argv.slice(1), DOCTOR_FLAGS);
       if (parsed.positionals.length > 1) throw new CliInputError("doctor accepts at most one project-id");

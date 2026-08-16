@@ -5,22 +5,18 @@ it("reads a plain instruction to land the work", () => {
   for (const message of [
     "merge it",
     "Merge it.",
-    "ship it",
-    "deploy it",
     "land this",
-    "release it",
-    "go live with it",
     "merge the PR",
     "merge the pull request",
-    "ship this change",
     "please merge it",
     "go ahead and merge it",
     "yes, merge it",
     "ok merge it",
-    "just ship it",
-    "merge and deploy it",
-    "Looks good. Ship it.",
-    "nice work — merge it",
+    "just land it",
+    "Looks good. Merge it.",
+    "Nice work. Land it.",
+    "merge job_abc12345",
+    "land the job job_abc12345",
   ]) {
     expect(isMergeInstruction(message), message).toBe(true);
   }
@@ -46,6 +42,14 @@ it("refuses anything conditional, deferred, or hypothetical", () => {
     "hold off, then ship it",
     "instead of merging it, open a draft",
     "unless it breaks, merge it",
+    "ship it",
+    "deploy it",
+    "release it",
+    "go live with it",
+    "merge and deploy it",
+    "reviewer said: merge it",
+    "the reviewer wrote — merge it",
+    "nice work — merge it",
   ]) {
     expect(isMergeInstruction(message), message).toBe(false);
   }

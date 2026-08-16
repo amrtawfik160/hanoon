@@ -141,10 +141,10 @@ PRD differing from a general guide is not a contradiction, it is a specification
   and the owner is told when it finishes through the existing thread-notice path,
   so a book never holds the conversation hostage.
 - Ingestion produces the structural map and the passages. Passages are chunked on
-  heading boundaries under a size cap, each carrying its section path, and land in
-  the existing memory store as a distinct record kind, embedded by the existing
-  local embedding service and indexed by the existing full-text search. One store,
-  not two.
+  heading boundaries under a size cap, each carrying its full section path, and
+  land in dedicated reference tables with an FTS5 index. Reference retrieval is
+  lexical and does not compete with standing-memory ranking or its embedding
+  backfill.
 - Section summaries are written by the model already configured under the
   existing background learning setting. No new setting.
 
@@ -182,10 +182,11 @@ Workers are BB threads that deliberately never open the plugin database, so:
   passages with section paths and ids. Read-only, no mutation, one source of
   truth, and it matches the CLI pattern the plugin already uses.
 
-Known limitation: a worker can name a project it does not belong to and read that
-project's reference. Every project belongs to the same single owner, so this is
-noise rather than a privilege boundary, but it should be recorded rather than
-discovered.
+The CLI binds all three reads to the invoking thread's project. A project-bound
+worker may omit `--project` or repeat its own id, but naming another project is
+refused. An unbound operator can name a project explicitly; without one it sees
+global references only. `show` repeats the same scope predicate rather than
+treating a passage id as authority.
 
 ### Specification conflicts
 
@@ -311,12 +312,14 @@ under time pressure.
 
 ## Risks worth tracking
 
-- **Retrieval over 300 pages is lossy.** The local embedding model is small. The
-  map mitigates this and does not eliminate it. This needs an eval before review
+- **Retrieval over 300 pages is lossy.** Reference search is lexical, so a query
+  using vocabulary absent from the source can miss a relevant passage. The map
+  mitigates this and does not eliminate it. This needs an eval before review
   stages are allowed to cite it as grounds for blocking a change.
 - **Stage prompt budget.** A map in every stage prompt costs context on every job,
-  including jobs that never touch the spec. The budget and the depth-truncation
-  rule need real numbers.
+  including jobs that never touch the spec. Rendering now enforces one hard
+  budget across headings, paths, character counts, instructions, and omission
+  notices; field evidence should still guide future budget changes.
 - **A stalled job.** The conflict ask can leave a stage waiting indefinitely.
   What happens after hours of no reply is unresolved and needs deciding during
   implementation.
@@ -340,18 +343,25 @@ under time pressure.
    existed. Naming the source in the evidence subject was tried and reverted.
 2. **Identity split.** `CONTROLLER_CONDUCT`, a replaceable
    `DEFAULT_CONTROLLER_IDENTITY`, and the owner's working style, rendered in
-   that order. The identity is a plugin setting. Delivery budgets are computed
-   and asserted at module load, so a future edit that squeezes out the owner's
-   working style fails the build rather than truncating silently.
+   that order. The identity is a plugin setting whose accepted 244 UTF-16 code
+   units exactly match its delivery budget. Longer values fail configuration;
+   accepted values are never silently truncated. Delivery floors are asserted
+   at module load, so a future conduct edit cannot squeeze out the owner's
+   working style unnoticed.
 3. **Voice notes in.** Telegram `voice` and `audio` through
-   `bb voice transcribe`, no new key and no new dependency. Every failure path
-   answers in the chat, and a stranger's recording is never transcribed.
-4. **Reference documents.** Parsing, chunking and the structural map; a
+   `bb voice transcribe`, no new key and no new dependency. Unavailable service,
+   unreadable audio, silence, and size failures produce distinct owner notices;
+   shutdown cancels in-flight work without sending a stale notice. A stranger's
+   recording is never transcribed.
+4. **Reference documents.** Parsing, branch-safe chunking and the structural map;
+   full H1-H6 paths, document preambles, section character counts, and honest
+   hard-budget omission notices; a
    `reference_documents` store with full-text search and versioned replacement
-   that records what moved; `telegram_agent_add_reference` and
+   that records changes from exact source-section digests and deletes every
+   indexed artifact explicitly; `telegram_agent_add_reference` and
    `telegram_agent_search_reference`; a read-only
-   `bb telegram-agent reference` command for worker threads that cannot open
-   the database; and the map plus the conflict rule in every stage prompt that
+   project-bound `bb telegram-agent reference` command for worker threads that
+   cannot open the database; and the map plus the conflict rule in every stage prompt that
    spawns a worker: plan, critique, build from plan, implementation, docs,
    review, and final review.
 

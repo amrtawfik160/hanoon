@@ -11,6 +11,7 @@ import {
   voiceTooLargeToTranscribe,
   voiceUnavailableNotice,
   type ControllerVoiceNote,
+  type VoiceTranscription,
 } from "../src/telegram/voice";
 
 let fixtureNumber = 0;
@@ -52,7 +53,7 @@ function voiceUpdate(
 }
 
 function fixture(options: {
-  transcribe?: (input: { bytes: Uint8Array; mimeType: string }) => Promise<string | null>;
+  transcribe?: (input: { bytes: Uint8Array; mimeType: string; signal: AbortSignal }) => Promise<VoiceTranscription>;
   download?: () => Promise<Uint8Array>;
   withVoiceService?: boolean;
 } = {}) {
@@ -64,7 +65,10 @@ function fixture(options: {
   ).run("7", "70", 1_000);
   const telegram = new FakeTelegram();
   const download = vi.fn(options.download ?? (async () => new Uint8Array([1, 2, 3])));
-  const transcribe = vi.fn(options.transcribe ?? (async () => "ship the redirect fix"));
+  const transcribe = vi.fn(options.transcribe ?? (async () => ({
+    outcome: "transcribed" as const,
+    text: "ship the redirect fix",
+  })));
   const ingress = new TelegramIngress({
     store,
     telegram,
@@ -81,7 +85,6 @@ const NOTE: ControllerVoiceNote = {
   mimeType: "audio/ogg",
   sizeBytes: 1_000,
   durationSeconds: 4,
-  kind: "voice",
 };
 
 it("reads a voice note and an audio file, defaulting the type Telegram omits", () => {
@@ -95,7 +98,6 @@ it("reads a voice note and an audio file, defaulting the type Telegram omits", (
     mimeType: "audio/ogg",
     sizeBytes: null,
     durationSeconds: 3,
-    kind: "voice",
   });
   expect(controllerVoiceFromMessage({
     message_id: 1,
@@ -107,7 +109,6 @@ it("reads a voice note and an audio file, defaulting the type Telegram omits", (
     mimeType: "audio/mpeg",
     sizeBytes: 42,
     durationSeconds: 9,
-    kind: "audio",
   });
   expect(controllerVoiceFromMessage({
     message_id: 1,
@@ -186,13 +187,51 @@ it("distinguishes a recording it could not fetch from one it could not hear", as
   expect(unreadable.telegram.texts).toEqual([voiceUnavailableNotice("unreadable")]);
   expect(unreadable.turnTexts()).toEqual([]);
 
-  const silent = fixture({ transcribe: async () => null });
+  const silent = fixture({ transcribe: async () => ({ outcome: "empty" }) });
   await silent.ingress.handleClaimed(
     voiceUpdate(14, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
     2_000,
   );
   expect(silent.telegram.texts).toEqual([voiceUnavailableNotice("empty")]);
   expect(silent.turnTexts()).toEqual([]);
+});
+
+it("reports the production transcriber being unavailable even though its adapter is registered", async () => {
+  const test = fixture({ transcribe: async () => ({ outcome: "unavailable" }) });
+
+  await test.ingress.handleClaimed(
+    voiceUpdate(17, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
+    2_000,
+  );
+
+  expect(test.telegram.texts).toEqual([voiceUnavailableNotice("no_service")]);
+  expect(test.turnTexts()).toEqual([]);
+});
+
+it("cancels in-flight transcription with service shutdown and sends no stale notice", async () => {
+  let started!: () => void;
+  const transcribing = new Promise<void>((resolve) => { started = resolve; });
+  const test = fixture({
+    transcribe: async ({ signal }): Promise<VoiceTranscription> => {
+      started();
+      return await new Promise<never>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  const shutdown = new AbortController();
+
+  const pending = test.ingress.handleClaimed(
+    voiceUpdate(18, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
+    2_000,
+    shutdown.signal,
+  );
+  await transcribing;
+  shutdown.abort(new Error("service stopped"));
+  await expect(pending).resolves.toEqual({ updateSettled: false });
+
+  expect(test.telegram.texts).toEqual([]);
+  expect(test.turnTexts()).toEqual([]);
 });
 
 it("refuses an over-long recording before spending a download on it", async () => {

@@ -184,6 +184,18 @@ function mergeFixture(options: {
   return { db, store, approvals, issued, handler, collectGateInput, mergePullRequest, commandRunner, now: clock };
 }
 
+function addWaitingApproval(
+  fixture: ReturnType<typeof mergeFixture>,
+  jobId = "job_2",
+  headSha = MOVED,
+): void {
+  fixture.store.createJob({ id: jobId, sourceUpdateId: 2, requestText: "other merge", now: NOW });
+  fixture.db.prepare(
+    "UPDATE jobs SET state = 'awaiting_merge_approval', pr_head_sha = ?, version = 3, updated_at = ? WHERE id = ?",
+  ).run(headSha, NOW, jobId);
+  fixture.approvals.issue(jobId, headSha, NOW);
+}
+
 async function acceptApproval(fixture: ReturnType<typeof mergeFixture>) {
   return fixture.handler.handleApprovalCallback({
     callbackId: "callback_1",
@@ -465,6 +477,60 @@ async function staleOldApprovalAndCreateNewEffect() {
 }
 
 describe("fresh Telegram merge execution", () => {
+  it("accepts an unqualified typed approval only when exactly one job is waiting", () => {
+    const fixture = mergeFixture();
+
+    expect(fixture.handler.approveMergeFromOwnerInstruction({
+      jobId: "job_1",
+      userId: "7",
+      chatId: "70",
+      instructionText: "merge it",
+    })).toEqual({ outcome: "accepted" });
+    expect(fixture.store.getJob("job_1")?.state).toBe("merging");
+  });
+
+  it("rejects an ambiguous typed approval when two jobs are waiting", () => {
+    const fixture = mergeFixture();
+    addWaitingApproval(fixture);
+
+    expect(fixture.handler.approveMergeFromOwnerInstruction({
+      jobId: "job_1",
+      userId: "7",
+      chatId: "70",
+      instructionText: "merge it",
+    })).toEqual({ outcome: "rejected" });
+    expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
+    expect(fixture.store.getJob("job_2")?.state).toBe("awaiting_merge_approval");
+  });
+
+  it("binds an explicit typed approval to the named waiting job", () => {
+    const fixture = mergeFixture();
+    addWaitingApproval(fixture);
+
+    expect(fixture.handler.approveMergeFromOwnerInstruction({
+      jobId: "job_2",
+      userId: "7",
+      chatId: "70",
+      instructionText: "merge job_2",
+    })).toEqual({ outcome: "accepted" });
+    expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
+    expect(fixture.store.getJob("job_2")?.state).toBe("merging");
+  });
+
+  it("rejects a tool-selected job that differs from the one the owner named", () => {
+    const fixture = mergeFixture();
+    addWaitingApproval(fixture);
+
+    expect(fixture.handler.approveMergeFromOwnerInstruction({
+      jobId: "job_1",
+      userId: "7",
+      chatId: "70",
+      instructionText: "merge job_2",
+    })).toEqual({ outcome: "rejected" });
+    expect(fixture.store.getJob("job_1")?.state).toBe("awaiting_merge_approval");
+    expect(fixture.store.getJob("job_2")?.state).toBe("awaiting_merge_approval");
+  });
+
   it("uses the concrete validation receipt for callback and merge-handler head truth", async () => {
     const fixture = mergeFixture();
     const gate = gateInput({

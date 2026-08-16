@@ -26,6 +26,13 @@ import {
  */
 export const MAX_AUTO_CONTINUES = 3;
 
+const OWNER_GATED_RESUME_STATES: ReadonlySet<Job["state"]> = new Set([
+  "awaiting_merge_approval",
+  "merging",
+  "deploying",
+  "verifying_production",
+]);
+
 export type ContinuationJob = Pick<
   Job,
   | "state"
@@ -81,6 +88,12 @@ export function planJobContinuation(input: {
   // A cancellation in flight is the owner's decision already made. Resuming
   // here would race their intent and restart work they asked to stop.
   if (job.cancelRequestedAt !== null) return { action: "hold" };
+
+  // A background retry must never replay merge or production authority. Those
+  // stages resume only through the guarded owner-approved pipeline.
+  if (job.resumeState !== null && OWNER_GATED_RESUME_STATES.has(job.resumeState)) {
+    return { action: "hold" };
+  }
 
   // These two exist precisely to reach the owner. Driving past them would
   // defeat the boundary they encode.

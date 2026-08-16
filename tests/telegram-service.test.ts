@@ -150,6 +150,30 @@ describe("Telegram ingress service", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("leaves an in-flight update claimed when service shutdown aborts ingress", async () => {
+    const { store, db } = storeFixture();
+    const abort = new AbortController();
+    const client = realClientFactory([
+      { ok: true, result: { id: 123, username: "bot" } },
+      { ok: true, result: [{ update_id: 10 }] },
+    ]);
+    const ingress = {
+      handleClaimed: vi.fn(async () => {
+        abort.abort();
+        return { updateSettled: false };
+      }),
+    };
+
+    await runTelegramService(
+      serviceDeps(store, client, ingress, () => ({ ok: true, value: { botToken: "123:secret" } })),
+      abort.signal,
+    );
+
+    expect(store.getNextTelegramOffset()).toBe(0);
+    expect(db.prepare("SELECT status FROM telegram_updates WHERE update_id = 10").get())
+      .toEqual({ status: "processing" });
+  });
+
   it("lets the pure service persist a Start transition without any BB worker capability", async () => {
     const { store } = storeFixture();
     const draft = store.createJob({ id: "abcdefghijklmnopqrstuv", sourceUpdateId: 1, requestText: "work", now: 1_000 });

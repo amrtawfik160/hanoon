@@ -71,6 +71,21 @@ it("refuses empty text without loading a model at all", async () => {
   expect(load).not.toHaveBeenCalled();
 });
 
+it("keeps an owner query word-based until the background service has loaded the model", async () => {
+  const load = vi.fn(async () => extractor);
+  const f = fakeStore();
+  f.setPending([{ id: "old1", subject: "a", body: "b" }]);
+  const service = new MemoryEmbeddingService({
+    store: f.store, clock: { now: () => 1_000_000 }, loadExtractor: load,
+  });
+
+  await expect(service.embedIfReady("owner query")).resolves.toBeNull();
+  expect(load).not.toHaveBeenCalled();
+  await expect(service.processDue()).resolves.toBe(true);
+  await expect(service.embedIfReady("owner query")).resolves.toEqual(new Float32Array([0.1, 0.2, 0.3]));
+  expect(load).toHaveBeenCalledTimes(1);
+});
+
 it("backfills memories written before the model existed", async () => {
   const f = fakeStore();
   f.setPending([
@@ -91,6 +106,26 @@ it("backfills memories written before the model existed", async () => {
   now += 61_000;
   await expect(service.processDue()).resolves.toBe(true);
   expect(f.saved.map((s) => s.memoryId)).toEqual(["old1", "old2", "old3"]);
+});
+
+it("continues past one memory the model cannot embed", async () => {
+  const f = fakeStore();
+  f.setPending([
+    { id: "poison", subject: "poison", body: "bad" },
+    { id: "healthy", subject: "healthy", body: "good" },
+  ]);
+  const selectiveExtractor = async (text: string, _options: unknown) => {
+    if (text.includes("poison")) throw new Error("unsupported input");
+    return { data: [0.1, 0.2, 0.3] };
+  };
+  const service = new MemoryEmbeddingService({
+    store: f.store,
+    clock: { now: () => 1_000_000 },
+    loadExtractor: async () => selectiveExtractor,
+  });
+
+  await expect(service.processDue()).resolves.toBe(true);
+  expect(f.saved.map((entry) => entry.memoryId)).toEqual(["healthy"]);
 });
 
 it("does not sweep when there is nothing to embed or no model", async () => {

@@ -135,6 +135,7 @@ type ToolDependencies = {
     jobId: string;
     userId: string;
     chatId: string;
+    instructionText: string;
   }>) => { outcome: "accepted" | "rejected" };
   health(now: number): unknown;
   notify(): void;
@@ -968,7 +969,7 @@ const RETRY_SCHEDULING_FLAGS = ["cleaningUp"] as const;
 const RETRY_OUTCOMES = new Set([
   /** The state machine re-entered the stage during this call. */
   "resumed",
-  /** Requeued; the executor applies it when the job is next admitted. */
+  /** Requeued in admission; execution has not restarted and other scheduler conditions may still hold it. */
   "queued",
   /** Requeued, but the failure brake is holding the project, so the queue is not being served. */
   "queued_project_paused",
@@ -1737,7 +1738,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[3],
-    description: "Resume a recoverable Telegram Agent job: retry a failed or stuck step, continue a blocked plan or review, finish a reviewed PR when production is not configured, or pick up from review when a PR already exists. Read `retryOutcome` before answering and say which happened: `resumed` restarted the job now, `queued` restarts it when the job is next admitted, and `queued_project_paused` will not restart at all until the project's failure brake is lifted. A queued retry deliberately leaves the job unchanged, so never read an unchanged job as the retry having failed.",
+    description: "Resume a recoverable Telegram Agent job: retry a failed or stuck step, continue a blocked plan or review, finish a reviewed PR when production is not configured, or pick up from review when a PR already exists. Read `retryOutcome` before answering and say which happened: `resumed` restarted the job now, `queued` accepted the retry into admission but has not restarted it, and `queued_project_paused` will not restart at all until the project's failure brake is lifted. Other scheduler conditions can keep a retry queued, so inspect health if it stays there. A queued retry deliberately leaves the job unchanged, so never read an unchanged job as the retry having failed.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
     execute: (_params, context, resolution) => {
       authorizedController(dependencies.store, context);
@@ -2481,7 +2482,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[30],
-    description: "Land a job the owner just told you to land. Use it the moment they say merge it, ship it, or deploy it about a job waiting on approval: their word is the approval, so do not send them a button and do not ask again. It only works while that job is actually waiting for approval and only on the owner's own instruction, so a refusal means one of those was not true. Everything the pipeline checks still ran; this replaces their tap, nothing else.",
+    description: "Land a job the owner explicitly told you to merge or land. Use it at once for an unambiguous instruction about a job waiting on approval. A generic instruction works only when exactly one job is waiting; when several are waiting, the owner must name the job. Deployment language is not merge approval. Everything the pipeline checks still runs; this replaces their tap, nothing else.",
     experimental_statusLabels: { pending: "Landing the work", completed: "Landed" },
     parameters: z.object({
       jobId: z.string().min(1).max(256).describe("The job waiting on merge approval."),
@@ -2503,7 +2504,12 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           reason: "The owner has not asked for this in their message, so the approval still has to be theirs.",
         };
       }
-      const result = approve({ jobId: params.jobId, userId: owner.userId, chatId: owner.chatId });
+      const result = approve({
+        jobId: params.jobId,
+        userId: owner.userId,
+        chatId: owner.chatId,
+        instructionText: turn.inputText,
+      });
       dependencies.notify();
       return result.outcome === "accepted"
         ? { merged: true, jobId: params.jobId }

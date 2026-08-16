@@ -31,6 +31,9 @@ export const THREAD_ASK_BULLET = "- ";
 /** Shown in place of an ask whose text could not be safely repeated. */
 export const THREAD_ASK_REDACTED = "(instruction withheld, it could not be safely repeated)";
 
+/** Shown when the send contained no instruction text at all. */
+export const THREAD_ASK_EMPTY = "(no instruction text was provided)";
+
 /** Shown when a thread has no title, so the line still names its target. */
 export const THREAD_ASK_UNNAMED_THREAD = "a thread";
 
@@ -57,7 +60,10 @@ export type RecordedThreadAsk = Readonly<{
 
 function collapsedToOneLine(text: string, maxChars: number): string {
   const collapsed = text.replace(/\s+/gu, " ").trim();
-  return Array.from(collapsed).slice(0, maxChars).join("");
+  if (collapsed.length <= maxChars) return collapsed;
+  const kept = collapsed.slice(0, maxChars);
+  const last = kept.charCodeAt(kept.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? kept.slice(0, -1) : kept;
 }
 
 /**
@@ -79,7 +85,7 @@ function threadLabel(ask: RecordedThreadAsk): string {
 }
 
 function askLine(ask: RecordedThreadAsk): string {
-  const substance = ask.ask.trim().length === 0 ? THREAD_ASK_REDACTED : ask.ask.trim();
+  const substance = ask.ask.trim().length === 0 ? THREAD_ASK_EMPTY : ask.ask.trim();
   return `${THREAD_ASK_BULLET}${threadLabel(ask)}: ${substance}`;
 }
 
@@ -123,7 +129,7 @@ export function renderThreadAskReport(
       ...(remaining > 0 ? [remainderLine(remaining)] : []),
     ];
     const block = `\n\n${lines.join("\n")}`;
-    if (Array.from(block).length <= budgetChars) return { block, reportedCount: listed };
+    if (block.length <= budgetChars) return { block, reportedCount: listed };
   }
   return null;
 }
@@ -159,10 +165,10 @@ export function composeOwnerReply(
 ): ComposedOwnerReply {
   const note = conditions.evidenceBudgetSpent ? `\n\n${EVIDENCE_SPENT_OWNER_NOTICE}` : "";
   // The answer outranks the note: if both will not fit, the note is what goes.
-  const head = Array.from(`${acceptedMessage}${note}`).length <= maxChars
+  const head = `${acceptedMessage}${note}`.length <= maxChars
     ? `${acceptedMessage}${note}`
     : acceptedMessage;
-  const budget = maxChars - Array.from(head).length;
+  const budget = maxChars - head.length;
   const report = budget > 0 ? renderThreadAskReport(asks, budget) : null;
   if (report === null) return { text: head, reportedCount: 0 };
   return { text: `${head}${report.block}`, reportedCount: report.reportedCount };

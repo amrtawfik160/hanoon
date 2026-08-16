@@ -29,6 +29,13 @@ it("lifts a memory that matches by meaning when the words miss entirely", () => 
   expect(wordsMissed).toBeGreaterThan(wordsMissedNoVector);
 });
 
+it("never rewards a missing vector over an otherwise identical semantic hit", () => {
+  const embedded = memoryScore({ ...BASE, lexicalRank: 0, semanticRank: 0 });
+  const notYetEmbedded = memoryScore({ ...BASE, lexicalRank: 0, semanticRank: null });
+
+  expect(embedded).toBeGreaterThan(notYetEmbedded);
+});
+
 it("still puts a memory matching both above one matching only by meaning", () => {
   const both = memoryScore({ ...BASE, lexicalRank: 0, semanticRank: 0 });
   const meaningOnly = memoryScore({ ...BASE, lexicalRank: null, semanticRank: 0 });

@@ -75,12 +75,20 @@ export type ReferenceBriefing = {
  * every stale library name in a 300 page document earns the feature a place in
  * the settings page marked off.
  */
-export function buildReferenceBriefing(briefings: readonly ReferenceBriefing[]): string {
-  if (briefings.length === 0) return "";
+export function buildReferenceBriefing(
+  briefings: readonly ReferenceBriefing[],
+  omittedDocuments = 0,
+): string {
+  if (briefings.length === 0 && omittedDocuments === 0) return "";
   const sections = briefings.map((briefing) => {
     const label = briefing.scope === "global" ? "applies to every project" : "this project";
     return `## ${briefing.title} (${label})\n${briefing.map}`;
   });
+  if (omittedDocuments > 0) {
+    sections.push(
+      `… and ${omittedDocuments} more reference ${omittedDocuments === 1 ? "document was" : "documents were"} omitted to stay within the prompt budget.`,
+    );
+  }
   return [
     "You are building against a filed specification. These are its sections, not its text.",
     "Read a section with `bb telegram-agent reference search \"<words>\" --project <project-id> --json`,",

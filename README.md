@@ -39,6 +39,8 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Live thread insight | "Why is this taking so long?" answers from the thread's current step, todo list, running commands, and latest message — not just its status. |
 | Thread management | Open a thread to explore something, message a running one to answer its question or redirect it, stop or retry with a one-tap confirmation. |
 | Memory | "Always deploy on weekday mornings" is kept and applied later. Ask what it knows, or tell it to forget. Secrets are refused, never stored. |
+| Voice notes | Send a Telegram voice note or audio message. Hanoon uses BB's configured transcription service, keeps only the transcript, and tells you plainly when transcription is unavailable. |
+| Reference documents | File project or global specifications, search their passages, and give every pipeline stage a bounded structural map of what governs the work. |
 | Working style | "Be terser" or "always show me the PR link" sticks, without a code change. It can shape tone and habits, never a safety boundary. |
 | Parallel work | "Compare the invoice spike and the billing latency" opens both at once and answers from what comes back. |
 | Self-maintenance | A daily sweep for work needing your decision, a weekly memory audit, and a weekly scorecard of what actually happened. Off by one setting. |
@@ -97,7 +99,7 @@ The shipped rollout is conservative: adaptive recipes default to `shadow`, where
 
 ## Bundled agent skills
 
-The plugin bundles 23 skills locally across five manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, and each root retains its own provenance and licence. Agents receive only the verified profile below.
+The plugin bundles 26 skills locally across five manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, and each root retains its own provenance and licence. Agents receive only the verified profile below.
 
 | Verified context | Selected skill ids |
 | --- | --- |
@@ -221,10 +223,10 @@ bb plugin types --check .
 Type checking resolves `@bb/plugin-sdk` through `types/bb-plugin-sdk.d.ts`, which `bb plugin types` regenerates from your installed BB. Building needs only the `bb` CLI.
 
 > [!NOTE]
-> The test suite additionally imports `@bb/plugin-sdk/testing` at runtime. BB does not publish that package to a registry, so `npm test` — and therefore `npm run check`, which runs typecheck, tests, and build together — only works where the package is installed. Type checking and building work from a clean clone.
+> The test suite additionally imports `@bb/plugin-sdk/testing` at runtime. BB does not publish that package to a registry, so `npm test`, and therefore `npm run check`, only works where the package is installed. `npm run check` runs typecheck, tests, the plugin build, artifact verification, and the credential-broker TypeScript build. Type checking and building work from a clean clone.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change boundaries, documentation checks, and pull-request evidence.
 
 ## Project status
 
-Version `0.1.0`, installed directly from a checkout. No package registry, release channel, or open-source license is claimed. Before publishing the repository as open source, the maintainer must add a license that states the intended reuse terms.
+Version `0.1.0`, installed directly from a checkout. There is no package registry or release channel. The repository is licensed under the [MIT License](LICENSE).

@@ -157,6 +157,26 @@ it("delivers the whole conduct block even at the largest identity and working st
     .toBeGreaterThanOrEqual(400);
 });
 
+it("accepts only controller identities that can be delivered whole", () => {
+  const longest = "y".repeat(MAX_CONTROLLER_IDENTITY);
+
+  expect(MAX_CONTROLLER_IDENTITY).toBe(deliveredControllerIdentityBudget());
+  expect(resolveControllerIdentity(longest)).toBe(longest);
+  expect(() => resolveControllerIdentity(`${longest}y`)).toThrow(/at most/);
+
+  const accepted = parseGlobalConfig({
+    botToken: "t",
+    bbAppBaseUrl: "",
+    controllerIdentity: longest,
+  });
+  expect(accepted.ok).toBe(true);
+  expect(parseGlobalConfig({
+    botToken: "t",
+    bbAppBaseUrl: "",
+    controllerIdentity: `${longest}y`,
+  }).ok).toBe(false);
+});
+
 it("stores, replaces, and clears the working style", () => {
   const { store } = fixture();
 

@@ -73,6 +73,7 @@ The same plugin settings page controls subsequent turns in the hidden conversati
 | Controller reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` |
 | Controller service tier | `fast`, `default` | `default` |
 | Controller permission mode | `auto`, `accept-edits`, `full` | `auto` |
+| Agent identity | Empty, or up to 244 UTF-16 code units | Shipped identity |
 
 The model selects its provider: `claude-*` models run on Claude Code, `gpt-*` models on Codex. Service tier is a Codex-only input and is not sent for Claude models.
 
@@ -81,6 +82,8 @@ Each new Telegram message starts with the primary model. The ordered fallbacks a
 Changing the model to one owned by the other provider retires the live BB conversation thread, because a thread cannot switch providers. The next message opens a replacement seeded with the recent conversation, so the change costs a pause rather than the conversation.
 
 Saved values apply when the next controller turn starts, including later turns in the existing durable conversation. They do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode.
+
+Agent identity replaces only who the controller is and how it sounds. Fixed conduct and safety boundaries remain above it. The 244-unit limit is the exact delivery budget: accepted identity text is delivered whole rather than silently shortened. Leave it empty to use the shipped identity.
 
 ### Capability routing controls
 

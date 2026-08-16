@@ -21,15 +21,17 @@ export type ControllerVoiceNote = {
   mimeType: string;
   sizeBytes: number | null;
   durationSeconds: number;
-  /** A voice note is speech to the owner; an audio file may be music. */
-  kind: "voice" | "audio";
 };
+
+export type VoiceTranscription =
+  | Readonly<{ outcome: "transcribed"; text: string }>
+  | Readonly<{ outcome: "empty" | "unavailable" | "failed" }>;
 
 export type VoiceTranscriber = (input: {
   bytes: Uint8Array;
   mimeType: string;
   signal: AbortSignal;
-}) => Promise<string | null>;
+}) => Promise<VoiceTranscription>;
 
 /** Telegram omits the type on some clients; opus in ogg is what it sends. */
 const DEFAULT_VOICE_MIME_TYPE = "audio/ogg";
@@ -42,7 +44,6 @@ export function controllerVoiceFromMessage(message: TelegramMessage): Controller
       mimeType: voice.mime_type ?? DEFAULT_VOICE_MIME_TYPE,
       sizeBytes: voice.file_size ?? null,
       durationSeconds: voice.duration,
-      kind: "voice",
     };
   }
   const audio = message.audio;
@@ -52,7 +53,6 @@ export function controllerVoiceFromMessage(message: TelegramMessage): Controller
     mimeType: audio.mime_type ?? DEFAULT_VOICE_MIME_TYPE,
     sizeBytes: audio.file_size ?? null,
     durationSeconds: audio.duration,
-    kind: "audio",
   };
 }
 
@@ -77,7 +77,7 @@ export function voiceUnavailableNotice(reason: VoiceUnavailableReason): string {
     case "unreadable":
       return "I could not read that recording. Please send it again, or type it.";
     case "no_service":
-      return "I cannot transcribe voice notes on this install: BB has no voice service configured. Please type it instead.";
+      return "BB voice transcription is unavailable on this installation. Please type it instead.";
   }
 }
 
@@ -91,8 +91,16 @@ function runCommand(
   return new Promise((resolve, reject) => {
     const child = spawn(file, [...args], { stdio: ["ignore", "pipe", "pipe"] });
     const stdout: Buffer[] = [];
+    let settled = false;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      settle();
+    };
     const onAbort = () => {
       child.kill("SIGKILL");
+      finish(() => reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError")));
     };
     if (signal.aborted) {
       onAbort();
@@ -104,28 +112,33 @@ function runCommand(
     // message, and an unread pipe stalls the child once it fills.
     child.stderr.on("data", () => undefined);
     child.once("error", (error) => {
-      signal.removeEventListener("abort", onAbort);
-      reject(error);
+      finish(() => reject(error));
     });
     child.once("close", (code) => {
-      signal.removeEventListener("abort", onAbort);
-      resolve({ code, stdout: Buffer.concat(stdout).toString("utf8") });
+      finish(() => resolve({ code, stdout: Buffer.concat(stdout).toString("utf8") }));
     });
   });
 }
 
-/** The one field of `bb voice transcribe --json` this needs. */
-export function parseTranscript(stdout: string): string | null {
+function transcriptResult(stdout: string): VoiceTranscription {
   try {
     const parsed: unknown = JSON.parse(stdout);
-    if (parsed === null || typeof parsed !== "object") return null;
+    if (parsed === null || typeof parsed !== "object") return { outcome: "failed" };
     const text = (parsed as { text?: unknown }).text;
-    if (typeof text !== "string") return null;
+    if (typeof text !== "string") return { outcome: "failed" };
     const trimmed = text.trim();
-    return trimmed.length === 0 ? null : trimmed;
+    return trimmed.length === 0
+      ? { outcome: "empty" }
+      : { outcome: "transcribed", text: trimmed };
   } catch {
-    return null;
+    return { outcome: "failed" };
   }
+}
+
+/** The one field of `bb voice transcribe --json` this needs. */
+export function parseTranscript(stdout: string): string | null {
+  const result = transcriptResult(stdout);
+  return result.outcome === "transcribed" ? result.text : null;
 }
 
 /**
@@ -136,21 +149,30 @@ export function parseTranscript(stdout: string): string | null {
  * one that has not is told plainly.
  */
 export const transcribeWithBb: VoiceTranscriber = async (input) => {
-  const directory = await mkdtemp(join(tmpdir(), "telegram-agent-voice-"));
-  const sourcePath = join(directory, "note.bin");
+  let directory: string | null = null;
   try {
+    if (input.signal.aborted) {
+      throw input.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+    }
+    directory = await mkdtemp(join(tmpdir(), "telegram-agent-voice-"));
+    const sourcePath = join(directory, "note.bin");
     await writeFile(sourcePath, input.bytes);
     const result = await runCommand(
       "bb",
       ["voice", "transcribe", sourcePath, "--type", input.mimeType, "--json"],
       input.signal,
     );
-    return result.code === 0 ? parseTranscript(result.stdout) : null;
+    return result.code === 0 ? transcriptResult(result.stdout) : { outcome: "unavailable" };
   } catch {
-    // A missing `bb` on PATH and a failed transcription are the same answer to
-    // the caller: nothing was heard, so say so rather than guessing at words.
-    return null;
+    if (input.signal.aborted) {
+      throw input.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+    }
+    // A missing CLI or unavailable provider means this installation cannot
+    // currently transcribe; it is distinct from a silent recording.
+    return { outcome: "unavailable" };
   } finally {
-    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    if (directory !== null) {
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 };

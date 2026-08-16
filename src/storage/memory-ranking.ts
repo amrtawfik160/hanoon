@@ -1,6 +1,6 @@
-// Ranking runs entirely in SQLite: no embedding service, no API key, no vector
-// files to reconcile. A memory is worth surfacing when it matches the words the
-// owner used, was written recently, matters, and has not been contradicted.
+// The base rank runs entirely in SQLite. Optional local vectors add one bounded
+// semantic signal without an API key; when either side has no compatible
+// vector, the exact word-based score remains authoritative.
 
 export const MEMORY_HALF_LIFE_MS = 45 * 86_400_000;
 const LEXICAL_WEIGHT = 0.45;
@@ -54,20 +54,19 @@ function reciprocalRank(rank: number | null | undefined): number {
  * lexical signal is: one freakishly close vector should not be able to outvote
  * recency and importance together.
  *
- * When no vector is available the weights are renormalised over the signals
- * that are, so a corpus with no embeddings ranks *exactly* as it did before
- * they existed. That is the property that makes this safe to ship half-built:
- * absent vectors are not a degraded ranking, they are the previous ranking.
+ * When no vector is available the original score is returned unchanged. When
+ * one is available, semantic rank receives a fixed share of that same unit
+ * scale. That keeps embedded and unembedded rows comparable while preserving
+ * the exact pre-embedding ranking for a word-only corpus.
  */
 export function memoryScore(candidate: MemoryCandidate): number {
   const semanticAvailable = candidate.semanticRank !== null && candidate.semanticRank !== undefined;
-  const weighted = LEXICAL_WEIGHT * reciprocalRank(candidate.lexicalRank) +
+  const base = LEXICAL_WEIGHT * reciprocalRank(candidate.lexicalRank) +
     RECENCY_WEIGHT * recencyScore(candidate.ageMs) +
     IMPORTANCE_WEIGHT * candidate.importance +
-    CONFIDENCE_WEIGHT * candidate.confidence +
-    (semanticAvailable ? SEMANTIC_WEIGHT * reciprocalRank(candidate.semanticRank) : 0);
-  const divisor = semanticAvailable ? 1 : 1 - SEMANTIC_WEIGHT;
-  return weighted / divisor;
+    CONFIDENCE_WEIGHT * candidate.confidence;
+  if (!semanticAvailable) return base;
+  return base * (1 - SEMANTIC_WEIGHT) + SEMANTIC_WEIGHT * reciprocalRank(candidate.semanticRank);
 }
 
 /**

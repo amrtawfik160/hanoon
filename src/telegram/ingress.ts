@@ -48,6 +48,7 @@ import {
   voiceTooLargeToTranscribe,
   voiceUnavailableNotice,
   type ControllerVoiceNote,
+  type VoiceTranscription,
   type VoiceTranscriber,
 } from "./voice";
 
@@ -242,14 +243,18 @@ export class TelegramIngress {
     }
   }
 
-  public async handleClaimed(update: TelegramUpdate, now: number): Promise<TelegramIngressOutcome> {
+  public async handleClaimed(
+    update: TelegramUpdate,
+    now: number,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<TelegramIngressOutcome> {
     if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
     const parsed = telegramUpdateSchema.safeParse(update);
     if (!parsed.success) return UPDATE_STILL_CLAIMED;
     if (parsed.data.message) {
       // Only the answer path settles its own claim; every other message route
       // simply falls out, which is the ordinary "caller still owns it" case.
-      return await this.handleMessage(parsed.data.message, parsed.data.update_id, now) ?? UPDATE_STILL_CLAIMED;
+      return await this.handleMessage(parsed.data.message, parsed.data.update_id, now, signal) ?? UPDATE_STILL_CLAIMED;
     }
     if (parsed.data.callback_query) {
       await this.handleCallback(parsed.data.callback_query, parsed.data.update_id, now);
@@ -261,6 +266,7 @@ export class TelegramIngress {
     message: TelegramMessage,
     updateId: number,
     now: number,
+    signal: AbortSignal,
   ): Promise<TelegramIngressOutcome | void> {
     const identity = privateHumanIdentity(message.from, message.chat);
     const image = controllerImageFromMessage(message);
@@ -304,7 +310,9 @@ export class TelegramIngress {
       await this.sendPlain(identity.chatId, "That clip is larger than Telegram lets me download. Please send a shorter video, a GIF, or a few screenshots.");
       return;
     }
-    const spoken = voiceNote === null ? undefined : await this.transcribeVoiceNote(voiceNote, identity.chatId);
+    const spoken = voiceNote === null
+      ? undefined
+      : await this.transcribeVoiceNote(voiceNote, identity.chatId, signal);
     if (voiceNote !== null && spoken === undefined) return;
     // A caption sent alongside a recording is the owner narrowing what they
     // meant, so it leads rather than being replaced by the transcript.
@@ -986,7 +994,9 @@ export class TelegramIngress {
   private async transcribeVoiceNote(
     note: ControllerVoiceNote,
     chatId: string,
+    signal: AbortSignal,
   ): Promise<string | undefined> {
+    if (signal.aborted) return undefined;
     if (!this.voice) {
       await this.sendPlain(chatId, voiceUnavailableNotice("no_service"));
       return undefined;
@@ -999,29 +1009,36 @@ export class TelegramIngress {
     let bytes: Uint8Array;
     try {
       bytes = await withAbortDeadline(
-        new AbortController().signal,
+        signal,
         VOICE_DOWNLOAD_TIMEOUT_MS,
         (signal) => voice.download(note.fileId, MAX_CONTROLLER_VOICE_BYTES, signal),
       );
     } catch {
+      if (signal.aborted) return undefined;
       await this.sendPlain(chatId, voiceUnavailableNotice("unreadable"));
       return undefined;
     }
-    let transcript: string | null;
+    let transcript: VoiceTranscription;
     try {
       transcript = await withAbortDeadline(
-        new AbortController().signal,
+        signal,
         VOICE_TRANSCRIBE_TIMEOUT_MS,
         (signal) => voice.transcribe({ bytes, mimeType: note.mimeType, signal }),
       );
     } catch {
-      transcript = null;
+      if (signal.aborted) return undefined;
+      transcript = { outcome: "failed" };
     }
-    if (transcript === null) {
-      await this.sendPlain(chatId, voiceUnavailableNotice("empty"));
+    if (transcript.outcome !== "transcribed") {
+      const reason = transcript.outcome === "unavailable"
+        ? "no_service"
+        : transcript.outcome === "empty"
+          ? "empty"
+          : "unreadable";
+      await this.sendPlain(chatId, voiceUnavailableNotice(reason));
       return undefined;
     }
-    return transcript;
+    return transcript.text;
   }
 
   private setStatusMessageAndOutbox(

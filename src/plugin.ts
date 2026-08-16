@@ -79,6 +79,7 @@ import {
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
+import { MAX_CONTROLLER_IDENTITY } from "./controller/instructions";
 import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
 import {
   BbControllerAdapter,
@@ -370,7 +371,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       type: "string",
       label: "Agent identity",
       description:
-        "Who the agent is and how it sounds, replacing the shipped character. It can change voice and manner; it can never move a safety boundary. Leave empty for the default.",
+        `Who the agent is and how it sounds, replacing the shipped character. It can change voice and manner; it can never move a safety boundary. Up to ${MAX_CONTROLLER_IDENTITY} characters; leave empty for the default.`,
       default: "",
     },
     systemUpkeep: {
@@ -611,7 +612,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
     approveMergeFromOwnerInstruction: (input) => mergeHandler.approveMergeFromOwnerInstruction(input),
     embedMemoryQuery: async (query) => {
-      const vector = await memoryEmbeddings.embed(query);
+      const vector = await memoryEmbeddings.embedIfReady(query);
       return vector === null ? null : { model: memoryEmbeddings.model, vector };
     },
     health: pluginHealth,
@@ -2006,6 +2007,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   });
   bb.background.service("capability-inventory", {
     start: (signal) => capabilityInventory.run(signal),
+  });
+  bb.background.service("memory-embeddings", {
+    start: (signal) => memoryEmbeddings.run(signal),
   });
   if (config.ok && selfDiagnosisEnabled(config.value)) {
     const selfDiagnosis = new SelfDiagnosisService({

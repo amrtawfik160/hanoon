@@ -132,6 +132,7 @@ const PERMANENT_EFFECT_ERROR_NAMES = new Set([
   "UnauthorizedError",
   "SchemaValidationError",
   "IdempotencyConflictError",
+  "AttemptPersistenceConflictError",
   "VersionConflictError",
   "ActiveJobConflictError",
   "IllegalTransitionError",

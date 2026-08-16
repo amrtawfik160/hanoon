@@ -110,6 +110,22 @@ it("holds an unconfirmed cancellation, which exists to reach the owner", () => {
   })).toEqual({ action: "hold" });
 });
 
+it.each([
+  "awaiting_merge_approval",
+  "merging",
+  "deploying",
+  "verifying_production",
+] as const)("never automatically re-drives the owner-gated %s stage", (resumeState) => {
+  expect(planJobContinuation({
+    job: blockedJob({
+      state: "failed",
+      blockedReason: "permanent_effect_failure",
+      resumeState,
+    }),
+    attempts: 0,
+  })).toEqual({ action: "hold" });
+});
+
 it("holds any job that is not blocked", () => {
   expect(planJobContinuation({
     job: blockedJob({ state: "implementing" }),

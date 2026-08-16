@@ -58,6 +58,31 @@ it("finds a passage for the project a worker names", async () => {
   expect(passages[0].body).toContain("a refund is always a new document");
 });
 
+it("binds every reference read to the invoking worker's project", async () => {
+  const { harness } = await loadPlugin();
+  const context = { threadId: "thr_worker", projectId: "proj_1" };
+
+  const search = await harness.behavior.runCli(
+    ["reference", "search", "refund", "--json"],
+    context,
+  );
+  expect(search.exitCode).toBe(0);
+  const passages = parseJson(search.stdout).passages as Array<Record<string, string>>;
+  expect(passages).toHaveLength(1);
+
+  const shown = await harness.behavior.runCli(
+    ["reference", "show", passages[0].id, "--json"],
+    context,
+  );
+  expect(shown.exitCode).toBe(0);
+
+  const mismatched = await harness.behavior.runCli(
+    ["reference", "search", "refund", "--project", "proj_2", "--json"],
+    context,
+  );
+  expect(mismatched.exitCode).toBe(2);
+});
+
 it("gives another project nothing, rather than another project's specification", async () => {
   const { harness } = await loadPlugin();
 
@@ -67,15 +92,22 @@ it("gives another project nothing, rather than another project's specification",
   expect(parseJson(result.stdout).passages).toEqual([]);
 });
 
-it("shows one passage in full by id and refuses an unknown one", async () => {
+it("shows one passage in scope by id and refuses unknown or out-of-scope ids", async () => {
   const { harness } = await loadPlugin();
   const found = parseJson(
     (await harness.behavior.runCli(["reference", "search", "refund", "--project", "proj_1", "--json"])).stdout,
   ).passages as Array<Record<string, string>>;
 
-  const shown = await harness.behavior.runCli(["reference", "show", found[0].id, "--json"]);
+  const shown = await harness.behavior.runCli([
+    "reference", "show", found[0].id, "--project", "proj_1", "--json",
+  ]);
   expect(shown.exitCode).toBe(0);
   expect(parseJson(shown.stdout).body).toBe(found[0].body);
+
+  const hidden = await harness.behavior.runCli([
+    "reference", "show", found[0].id, "--project", "proj_2", "--json",
+  ]);
+  expect(hidden.exitCode).toBe(1);
 
   const missing = await harness.behavior.runCli(["reference", "show", "nope", "--json"]);
   expect(missing.exitCode).toBe(1);

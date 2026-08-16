@@ -1194,7 +1194,9 @@ describe("singleton job executor", () => {
     });
   });
 
-  it("dead-letters schema and idempotency conflicts without transient retries", async () => {
+  it.each(["IdempotencyConflictError", "AttemptPersistenceConflictError"])(
+    "dead-letters permanent %s failures without transient retries",
+    async (errorName) => {
     const { store, db } = fixture();
     const controller = prepareExecutorTestJob(store);
     db.prepare(
@@ -1202,7 +1204,7 @@ describe("singleton job executor", () => {
        VALUES ('job_1:2:one', 'job_1', 'render_status', '{}', 'pending', 0, 1000, 1000, 1000)`,
     ).run();
     const abort = new AbortController();
-    const conflict = Object.assign(new Error("duplicate idempotency key"), { name: "IdempotencyConflictError" });
+    const conflict = Object.assign(new Error("permanent persistence conflict"), { name: errorName });
     const deps: JobExecutorDependencies = {
       store,
       clock: { now: () => 1_000 },
@@ -1217,7 +1219,8 @@ describe("singleton job executor", () => {
       status: "dead",
       attempts: 1,
     });
-  });
+    },
+  );
 
   it("releases the singleton lease on an explicit clean shutdown", async () => {
     const { store } = fixture();

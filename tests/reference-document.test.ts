@@ -71,13 +71,29 @@ it("returns nothing for an empty document rather than an empty section", () => {
   expect(parseReferenceSections("   \n  ")).toEqual([]);
 });
 
-it("bounds how deep a heading trail goes", () => {
+it("keeps the complete Markdown heading trail through level six", () => {
   const deep = ["# a", "## b", "### c", "#### d", "##### e", "###### f", "", "body"].join("\n");
   const sections = parseReferenceSections(deep);
   const last = sections[sections.length - 1];
 
   expect(last.path).toHaveLength(MAX_SECTION_DEPTH);
-  expect(last.path).toEqual(["c", "d", "e", "f"]);
+  expect(last.path).toEqual(["a", "b", "c", "d", "e", "f"]);
+});
+
+it("does not let an unmatched code fence hide every later heading", () => {
+  const sections = parseReferenceSections([
+    "# Before",
+    "",
+    "```sh",
+    "unfinished example",
+    "",
+    "# After",
+    "",
+    "Still part of the document.",
+  ].join("\n"));
+
+  expect(sections.map((section) => section.path)).toEqual([["Before"], ["After"]]);
+  expect(sections[1].body).toBe("Still part of the document.");
 });
 
 it("numbers passages in document order and carries the section path", () => {
@@ -102,6 +118,34 @@ it("never folds a short sibling section under the previous heading", () => {
   ));
 
   expect(passages.map((passage) => passage.path)).toEqual([["Billing"], ["Access"]]);
+});
+
+it("does not fold across sibling branches after folding a nested child", () => {
+  const passages = buildReferencePassages(parseReferenceSections([
+    "# Billing",
+    "",
+    "Billing rules are deliberately long enough to remain the parent passage on their own.",
+    "",
+    "## Refunds",
+    "",
+    "Refund rule.",
+    "",
+    "### Window",
+    "",
+    "Thirty days.",
+    "",
+    "## Invoices",
+    "",
+    "Immutable.",
+  ].join("\n")));
+
+  expect(passages.map((passage) => passage.path)).toEqual([
+    ["Billing"],
+    ["Billing", "Invoices"],
+  ]);
+  expect(passages[0].body).toContain("Refund rule.");
+  expect(passages[0].body).toContain("Thirty days.");
+  expect(passages[0].body).not.toContain("Immutable.");
 });
 
 it("splits a long section on blank lines, never mid-sentence", () => {
@@ -139,24 +183,41 @@ it("maps what exists without what it says", () => {
   const map = buildReferenceMap(parseReferenceSections(SPEC));
 
   expect(map.map((entry) => entry.path.join(" > "))).toEqual([
+    "",
     "Billing",
     "Billing > Refunds",
     "Billing > Refunds > Partial refunds",
     "Access",
   ]);
-  expect(map[0].characters).toBe("Invoices are immutable once issued.".length);
-  // The preamble has no heading, so it is not a place in the document.
-  expect(map.some((entry) => entry.path.length === 0)).toBe(false);
+  expect(map[0]).toEqual({
+    path: [],
+    level: 0,
+    characters: "Overview text before any heading.".length,
+  });
+  expect(map[1].characters).toBe("Invoices are immutable once issued.".length);
 });
 
 it("drops the deepest headings first so the document's shape survives a small budget", () => {
   const map = buildReferenceMap(parseReferenceSections(SPEC));
 
-  expect(renderReferenceMap(map, 200)).toBe("Billing\n  Refunds\n    Partial refunds\nAccess");
-  // Every level still present, one depth shallower.
-  expect(renderReferenceMap(map, 24)).toBe("Billing\n  Refunds\nAccess");
-  // Too tight for that, so only the top level, and Access is still there.
-  expect(renderReferenceMap(map, 20)).toBe("Billing\nAccess");
+  const full = renderReferenceMap(map, 300);
+  expect(full).toContain(`(document preface) (${"Overview text before any heading.".length} chars)`);
+  expect(full).toContain(`Billing (${"Invoices are immutable once issued.".length} chars)`);
+  expect(full).toContain("    Partial refunds (25 chars)");
+
+  const shallower = renderReferenceMap(map, 100);
+  expect(shallower).toContain("Billing (35 chars)");
+  expect(shallower).toContain("Access (36 chars)");
+  expect(shallower).not.toContain("Partial refunds");
+  expect(shallower.length).toBeLessThanOrEqual(100);
+});
+
+it("renders level-five and level-six headings when the budget permits", () => {
+  const deep = ["# a", "## b", "### c", "#### d", "##### e", "###### f", "", "body"].join("\n");
+  const rendered = renderReferenceMap(buildReferenceMap(parseReferenceSections(deep)), 400);
+
+  expect(rendered).toContain("        e (0 chars)");
+  expect(rendered).toContain("          f (4 chars)");
 });
 
 it("says how many sections it dropped rather than appearing to end early", () => {
@@ -167,6 +228,15 @@ it("says how many sections it dropped rather than appearing to end early", () =>
   expect(rendered.length).toBeLessThanOrEqual(120);
 });
 
-it("renders nothing for a document with no headings", () => {
-  expect(renderReferenceMap(buildReferenceMap(parseReferenceSections("just prose")), 100)).toBe("");
+it("maps a document preface even when it has no headings", () => {
+  expect(renderReferenceMap(buildReferenceMap(parseReferenceSections("just prose")), 100))
+    .toBe("(document preface) (10 chars)");
+});
+
+it("never exceeds its budget, even when the budget cannot fit one label", () => {
+  const map = buildReferenceMap(parseReferenceSections("# A very long title\n\nbody"));
+
+  for (const budget of [0, 1, 8, 20, 40]) {
+    expect(renderReferenceMap(map, budget).length).toBeLessThanOrEqual(budget);
+  }
 });

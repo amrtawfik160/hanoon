@@ -1,5 +1,5 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { MAX_AUTO_CONTINUES } from "../src/autonomy/job-continuation";
 import { JobContinuationService } from "../src/services/job-continuation-service";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
@@ -229,4 +229,48 @@ it("leaves alone a job that was already blocked when the sweep arrived", () => {
   const at = { now: 3_000_000 };
   expect(serviceFor(store, at).processDue()).toBe(false);
   expect(store.getJob(job.id)?.state).toBe("blocked");
+});
+
+it("keeps counting a pre-upgrade two-part continuation key instead of resetting its ladder", () => {
+  const legacyKey = "permanent_effect_failure:implementing";
+  const recordAutoContinue = vi.fn();
+  const service = new JobContinuationService({
+    store: {
+      listContinuationCandidates: () => [{
+        job: {
+          id: "job_legacy",
+          version: 7,
+          state: "blocked",
+          blockedReason: "permanent_effect_failure",
+          resumeState: "implementing",
+          lastError: "transient",
+          prNumber: null,
+          reviewCycle: 0,
+          implementationThreadId: "thr_impl",
+          cancelRequestedAt: null,
+          policy: policyFixture(),
+          deliveryMode: "full",
+        },
+        attempts: 2,
+        key: legacyKey,
+      }],
+      recordAutoContinue,
+      retryFailedJob: () => ({ outcome: "queued" }),
+      requeueReviewAdmission: () => ({ outcome: "unavailable" }),
+      recordContinuationEscalation: vi.fn(),
+      listEnabledProjectPolicies: () => [],
+      getOwner: () => null,
+      getControllerForOwner: () => null,
+      enqueueControllerTurn: vi.fn(),
+    } as never,
+    clock: { now: () => 3_000_000 },
+    issueUpdateId: (now) => now,
+  });
+
+  expect(service.processDue()).toBe(true);
+  expect(recordAutoContinue).toHaveBeenCalledWith({
+    jobId: "job_legacy",
+    key: legacyKey,
+    now: 3_000_000,
+  });
 });

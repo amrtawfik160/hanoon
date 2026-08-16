@@ -16,31 +16,24 @@
  * merge, so anything hedged, negated, or merely *about* merging must not match.
  */
 
-/** The verbs that mean "land it", each requiring an explicit object. */
-const LAND_VERB = "(?:merge|ship|deploy|land|release|push\\s+(?:it|this)\\s+live|go\\s+live)";
+/** Only repository integration verbs belong here; deployment is separate authority. */
+const LAND_VERB = "(?:merge|land)";
 
 /**
  * An imperative aimed at the work in hand. The object is required: "merge it",
  * "ship this", "deploy the PR" — never a bare "merge", which is as likely to be
  * a topic as a command.
  */
-const OBJECT = "(?:it|this|that|them|the\\s+(?:pr|pull\\s+request|change|changes|fix|job|work|branch|thing))";
+const JOB_ID = "[A-Za-z0-9][A-Za-z0-9_-]{2,255}";
+const OBJECT =
+  `(?:the\\s+job\\s+${JOB_ID}|${JOB_ID}|it|this|that|them|the\\s+(?:pr|pull\\s+request|change|changes|fix|job|work|branch|thing))`;
 
 const APPROVE_LEAD =
-  "(?:please\\s+|now\\s+|just\\s+|go\\s+ahead\\s+and\\s+|yes[,\\s]+|ok(?:ay)?[,\\s]+|sure[,\\s]+)*";
-
-/** "go live *with* it" reads as an instruction exactly as "ship it" does. */
-const PREPOSITION = "(?:\\s+with)?";
-
-/**
- * Where a fresh clause may begin. Dashes and colons are included because praise
- * before the instruction is how people actually write ("nice work — merge it").
- * A comma is not: a comma-led clause is far more often a condition's tail.
- */
-const CLAUSE_START = "(?:^|[.!?;:\\n\\u2013\\u2014]\\s*|\\s+[-\\u2013\\u2014]\\s+)";
+  "(?:(?:please|now|just)\\s+|go\\s+ahead\\s+and\\s+|(?:yes|ok(?:ay)?|sure)[,!\\s]+)*";
+const POSITIVE_PREFIX = "(?:(?:looks\\s+good|nice\\s+work|all\\s+good|approved)[.!]\\s+)?";
 
 const MERGE_INSTRUCTION = new RegExp(
-  `${CLAUSE_START}${APPROVE_LEAD}${LAND_VERB}(?:\\s+and\\s+${LAND_VERB})*${PREPOSITION}\\s+${OBJECT}\\b`,
+  `^${POSITIVE_PREFIX}${APPROVE_LEAD}${LAND_VERB}\\s+${OBJECT}[.!]?$`,
   "iu",
 );
 

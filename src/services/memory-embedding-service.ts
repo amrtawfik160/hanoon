@@ -1,4 +1,5 @@
 import type { TelegramAgentStore } from "../storage/store";
+import { abortableSleep } from "../async";
 
 /**
  * Turns memory text into vectors, on this machine, so recall can find a memory
@@ -82,8 +83,22 @@ export class MemoryEmbeddingService {
     if (trimmed.length === 0) return null;
     const extractor = await this.extract();
     if (!extractor) return null;
+    return this.embedWith(extractor, trimmed);
+  }
+
+  /**
+   * Query-time embedding only when the background service has already loaded
+   * the optional model. It never initiates a model download on the owner's turn.
+   */
+  public async embedIfReady(text: string): Promise<Float32Array | null> {
+    const trimmed = typeof text === "string" ? text.trim() : "";
+    if (trimmed.length === 0 || !this.loaded || !this.extractor) return null;
+    return this.embedWith(this.extractor, trimmed);
+  }
+
+  private async embedWith(extractor: Extractor, text: string): Promise<Float32Array | null> {
     try {
-      const output = await extractor(trimmed.slice(0, 4_000), { pooling: "mean", normalize: true });
+      const output = await extractor(text.slice(0, 4_000), { pooling: "mean", normalize: true });
       const vector = Float32Array.from(output.data);
       return vector.length > 0 ? vector : null;
     } catch (error) {
@@ -130,8 +145,26 @@ export class MemoryEmbeddingService {
     let embedded = 0;
     for (const memory of pending) {
       if (await this.embedMemory(memory)) embedded += 1;
-      else break;
     }
     return embedded > 0;
+  }
+
+  /** Owns the slow optional-model work for the plugin lifetime. */
+  public async run(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      try {
+        await this.processDue();
+      } catch (error) {
+        this.dependencies.warn?.(
+          `Memory embedding backfill failed: ${error instanceof Error ? error.message.slice(0, 160) : "unknown"}`,
+        );
+      }
+      try {
+        await abortableSleep(BACKFILL_INTERVAL_MS, signal);
+      } catch {
+        if (signal.aborted) return;
+        throw new Error("Memory embedding backfill sleep failed");
+      }
+    }
   }
 }

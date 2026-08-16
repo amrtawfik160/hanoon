@@ -13,8 +13,8 @@
  * billing exists before it knows to ask about billing.
  */
 
-/** Deep enough for a real specification, shallow enough to stay legible. */
-export const MAX_SECTION_DEPTH = 4;
+/** Markdown defines six heading levels, and the root must survive in every path. */
+export const MAX_SECTION_DEPTH = 6;
 
 /**
  * Passages are retrieved and pasted into a worker's context, so this is a
@@ -36,15 +36,31 @@ export type ReferenceSection = {
 };
 
 export type ReferencePassage = {
-  /** Stable within one document version: `4.2` style ordinal path. */
+  /** Stable within one document version: a one-based passage number. */
   ordinal: string;
   path: readonly string[];
   body: string;
 };
 
 const HEADING = /^(#{1,6})\s+(.+?)\s*#*\s*$/;
-/** A fence toggles verbatim mode; a `#` inside one is code, not a heading. */
-const FENCE = /^\s*(?:```|~~~)/;
+const FENCE_OPEN = /^\s*(`{3,}|~{3,})/;
+
+type Fence = Readonly<{ marker: "`" | "~"; length: number }>;
+
+function closesFence(line: string, fence: Fence): boolean {
+  const trimmed = line.trim();
+  if (trimmed.length < fence.length) return false;
+  if ([...trimmed].some((character) => character !== fence.marker)) return false;
+  return trimmed.length >= fence.length;
+}
+
+function closedFenceAt(lines: readonly string[], index: number): Fence | null {
+  const opening = FENCE_OPEN.exec(lines[index]);
+  if (opening === null) return null;
+  const marker = opening[1][0] as "`" | "~";
+  const fence = { marker, length: opening[1].length } as const;
+  return lines.slice(index + 1).some((line) => closesFence(line, fence)) ? fence : null;
+}
 
 function normalizeHeading(raw: string): string {
   return raw.replace(/\s+/g, " ").trim().slice(0, 200);
@@ -65,7 +81,8 @@ export function parseReferenceSections(markdown: string): readonly ReferenceSect
     level: 0,
     lines: [],
   };
-  let fenced = false;
+  let fence: Fence | null = null;
+  const lines = markdown.split(/\r?\n/);
 
   const flush = () => {
     const body = current.lines.join("\n").trim();
@@ -74,9 +91,20 @@ export function parseReferenceSections(markdown: string): readonly ReferenceSect
     }
   };
 
-  for (const line of markdown.split(/\r?\n/)) {
-    if (FENCE.test(line)) fenced = !fenced;
-    const heading = fenced ? null : HEADING.exec(line);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (fence !== null) {
+      current.lines.push(line);
+      if (closesFence(line, fence)) fence = null;
+      continue;
+    }
+    const openingFence = closedFenceAt(lines, index);
+    if (openingFence !== null) {
+      fence = openingFence;
+      current.lines.push(line);
+      continue;
+    }
+    const heading = HEADING.exec(line);
     if (heading === null) {
       current.lines.push(line);
       continue;
@@ -87,7 +115,7 @@ export function parseReferenceSections(markdown: string): readonly ReferenceSect
     while (trail.length > 0 && trail[trail.length - 1].level >= level) trail.pop();
     trail.push({ level, title });
     current = {
-      path: trail.slice(-MAX_SECTION_DEPTH).map((entry) => entry.title),
+      path: trail.map((entry) => entry.title),
       level,
       lines: [],
     };
@@ -144,12 +172,18 @@ export function buildReferencePassages(
   limit = MAX_PASSAGE_CHARACTERS,
 ): readonly ReferencePassage[] {
   const passages: ReferencePassage[] = [];
+  let previousSectionPath: readonly string[] | null = null;
   for (const section of sections) {
-    if (section.body.length === 0) continue;
+    if (section.body.length === 0) {
+      previousSectionPath = section.path;
+      continue;
+    }
     const previous = passages[passages.length - 1];
     if (
       previous !== undefined &&
+      previousSectionPath !== null &&
       descendsFrom(previous.path, section.path) &&
+      descendsFrom(previousSectionPath, section.path) &&
       section.body.length < MIN_PASSAGE_CHARACTERS &&
       previous.body.length + section.body.length <= limit
     ) {
@@ -157,11 +191,13 @@ export function buildReferencePassages(
         ...previous,
         body: `${previous.body}\n\n${section.body}`,
       };
+      previousSectionPath = section.path;
       continue;
     }
     for (const body of splitBody(section.body, limit)) {
       passages.push({ ordinal: String(passages.length + 1), path: section.path, body });
     }
+    previousSectionPath = section.path;
   }
   return passages;
 }
@@ -178,13 +214,40 @@ export type ReferenceMapEntry = {
  * always affordable to carry.
  */
 export function buildReferenceMap(sections: readonly ReferenceSection[]): readonly ReferenceMapEntry[] {
-  return sections
-    .filter((section) => section.path.length > 0)
-    .map((section) => ({
-      path: section.path,
-      level: section.level,
-      characters: section.body.length,
-    }));
+  return sections.map((section) => ({
+    path: section.path,
+    level: section.level,
+    characters: section.body.length,
+  }));
+}
+
+function renderMapEntry(entry: ReferenceMapEntry): string {
+  const label = entry.path.length === 0
+    ? "(document preface)"
+    : `${"  ".repeat(Math.max(0, entry.level - 1))}${entry.path[entry.path.length - 1]}`;
+  return `${label} (${entry.characters} chars)`;
+}
+
+function omissionLine(count: number): string {
+  return `… and ${count} more ${count === 1 ? "section" : "sections"}`;
+}
+
+function tinyOmission(count: number, budget: number): string {
+  if (budget <= 0) return "";
+  const full = omissionLine(count);
+  if (full.length <= budget) return full;
+  const compact = `… +${count}`;
+  if (compact.length <= budget) return compact;
+  return "…".slice(0, budget);
+}
+
+function renderSelection(
+  selected: readonly ReferenceMapEntry[],
+  omitted: number,
+): string {
+  const lines = selected.map(renderMapEntry);
+  if (omitted > 0) lines.push(omissionLine(omitted));
+  return lines.join("\n");
 }
 
 /**
@@ -198,25 +261,16 @@ export function renderReferenceMap(
   entries: readonly ReferenceMapEntry[],
   budget: number,
 ): string {
-  if (entries.length === 0) return "";
+  if (entries.length === 0 || budget <= 0) return "";
   for (let depth = MAX_SECTION_DEPTH; depth >= 1; depth -= 1) {
-    const lines = entries
-      .filter((entry) => entry.level <= depth)
-      .map((entry) => `${"  ".repeat(Math.max(0, entry.level - 1))}${entry.path[entry.path.length - 1]}`);
-    const rendered = lines.join("\n");
+    const selected = entries.filter((entry) => entry.level === 0 || entry.level <= depth);
+    const rendered = renderSelection(selected, entries.length - selected.length);
     if (rendered.length <= budget) return rendered;
   }
-  const topLevel = entries.filter((entry) => entry.level <= 1).map((entry) => entry.path[0]);
-  // Even the top level can overflow on a document with hundreds of chapters.
-  // Saying how many were dropped keeps the agent from reading the shortfall as
-  // "the document ends here".
-  const kept: string[] = [];
-  let used = 0;
-  for (const title of topLevel) {
-    if (used + title.length + 1 > budget - 40) break;
-    kept.push(title);
-    used += title.length + 1;
+  const topLevel = entries.filter((entry) => entry.level <= 1);
+  for (let kept = topLevel.length; kept >= 0; kept -= 1) {
+    const rendered = renderSelection(topLevel.slice(0, kept), entries.length - kept);
+    if (rendered.length <= budget) return rendered;
   }
-  const dropped = topLevel.length - kept.length;
-  return dropped > 0 ? `${kept.join("\n")}\n… and ${dropped} more sections` : kept.join("\n");
+  return tinyOmission(entries.length, budget);
 }

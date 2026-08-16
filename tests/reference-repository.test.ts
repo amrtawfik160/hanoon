@@ -38,8 +38,8 @@ function save(repo: ReferenceRepository, markdown: string, overrides: Record<str
   });
 }
 
-it("ships the reference tables as the newest migration", () => {
-  expect(ALL_MIGRATIONS[ALL_MIGRATIONS.length - 1]).toContain("CREATE TABLE reference_documents");
+it("ships exact section digests as the newest append-only migration", () => {
+  expect(ALL_MIGRATIONS[ALL_MIGRATIONS.length - 1]).toContain("CREATE TABLE reference_section_digests");
 });
 
 it("stores a document as a map plus retrievable passages", () => {
@@ -141,19 +141,59 @@ it("reports no change when only the formatting moved", () => {
   expect(rewrapped.changes).toEqual([]);
 });
 
-it("fetches one passage by id and forgets a document on request", () => {
+it("reports no phantom changes when nested short sections are ingested identically", () => {
+  const { repo } = repository();
+  const nested = [
+    "# Billing",
+    "",
+    "A sufficiently long parent section keeps its own passage while child sections remain exact.",
+    "",
+    "## Refunds",
+    "",
+    "Short refund rule.",
+    "",
+    "### Window",
+    "",
+    "Thirty days.",
+  ].join("\n");
+  save(repo, nested);
+
+  const repeated = save(repo, nested, { now: 3_000 });
+
+  expect(repeated.document.version).toBe(2);
+  expect(repeated.changes).toEqual([]);
+});
+
+it("treats title casing as display text, not a second document identity", () => {
+  const { repo } = repository();
+  const first = save(repo, SPEC, { title: "Product Spec" });
+
+  const second = save(repo, SPEC, { title: "product spec", now: 3_000 });
+
+  expect(second.document.id).toBe(first.document.id);
+  expect(second.document.version).toBe(2);
+  expect(second.document.title).toBe("product spec");
+  expect(repo.listReferenceDocuments("proj_1")).toHaveLength(1);
+});
+
+it("fetches one passage by id and explicitly forgets every indexed artifact", () => {
   const { repo, db } = repository();
   const saved = save(repo, SPEC);
+  save(repo, SPEC.replace("immutable", "permanent"), { now: 3_000 });
   const hit = repo.searchReferencePassages({ query: "refund", projectId: "proj_1" })[0];
 
-  expect(repo.getReferencePassage(hit.id)?.body).toBe(hit.body);
-  expect(repo.getReferencePassage("nope")).toBeNull();
+  expect(repo.getReferencePassage(hit.id, "proj_1")?.body).toBe(hit.body);
+  expect(repo.getReferencePassage(hit.id, "proj_2")).toBeNull();
+  expect(repo.getReferencePassage(hit.id, null)).toBeNull();
+  expect(repo.getReferencePassage("nope", "proj_1")).toBeNull();
 
   expect(repo.deleteReferenceDocument(saved.document.id)).toBe(true);
   expect(repo.deleteReferenceDocument(saved.document.id)).toBe(false);
   expect(repo.searchReferencePassages({ query: "refund", projectId: "proj_1" })).toEqual([]);
-  // The passages go with it rather than being left behind unreachable.
   expect(db.prepare("SELECT count(*) AS n FROM reference_passages").get()).toEqual({ n: 0 });
+  expect(db.prepare("SELECT count(*) AS n FROM reference_passages_fts").get()).toEqual({ n: 0 });
+  expect(db.prepare("SELECT count(*) AS n FROM reference_section_digests").get()).toEqual({ n: 0 });
+  expect(db.prepare("SELECT count(*) AS n FROM reference_document_changes").get()).toEqual({ n: 0 });
 });
 
 it("returns nothing for a query with no searchable words", () => {

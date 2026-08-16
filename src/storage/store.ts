@@ -104,6 +104,7 @@ import { isUnsafeProviderText } from "../controller/credential-policy";
 import {
   MAX_OWNER_REPLY_CHARS,
   THREAD_ASK_REDACTED,
+  THREAD_ASK_EMPTY,
   composeOwnerReply,
   normalizeThreadAsk,
   normalizeThreadName,
@@ -1190,6 +1191,9 @@ type ThreadInteractionRow = {
   answer_json: string | null;
   asked_at: number;
   answered_at: number | null;
+  audience: "owner" | "controller";
+  controller_key: string | null;
+  controller_turn_id: string | null;
 };
 export type ThreadInteractionAnswer =
   | { ok: true; interactionId: string; threadId: string; title: string; label: string }
@@ -1286,6 +1290,13 @@ export class IdempotencyConflictError extends Error {
   public constructor(sourceUpdateId: number) {
     super(`Telegram update ${sourceUpdateId} was replayed with different job input`);
     this.name = "IdempotencyConflictError";
+  }
+}
+
+export class AttemptPersistenceConflictError extends Error {
+  public constructor(attemptId: string, detail: string) {
+    super(`Attempt ${attemptId} could not be persisted: ${detail}`);
+    this.name = "AttemptPersistenceConflictError";
   }
 }
 
@@ -2837,7 +2848,7 @@ export interface TelegramAgentStore {
     projectId: string | null;
     limit?: number;
   }): readonly ReferencePassageRecord[];
-  getReferencePassage(id: string): ReferencePassageRecord | null;
+  getReferencePassage(id: string, projectId: string | null): ReferencePassageRecord | null;
   listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[];
   deleteReferenceDocument(id: string): boolean;
   createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile;
@@ -3121,6 +3132,7 @@ export interface TelegramAgentStore {
     parentThreadId?: string | null;
   }): boolean;
   isControllerOwnedThread(parentThreadId: string | null): boolean;
+  hasPendingThreadInteractionForThread(threadId: string): boolean;
   answerThreadInteraction(input: {
     token: string;
     userId: string;
@@ -3691,6 +3703,8 @@ export interface TelegramAgentStore {
     jobId: string,
     now: number,
   ): { nonceHash: string; record: ApprovalRecord } | null;
+  /** All distinct jobs with a currently usable merge approval. */
+  listLiveMergeApprovals(now: number): readonly { nonceHash: string; record: ApprovalRecord }[];
   getApproval(nonceHash: string): ApprovalState | null;
   consumeApproval(input: {
     nonceHash: string;
@@ -4902,8 +4916,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.referenceRepository.searchReferencePassages(input);
   }
 
-  public getReferencePassage(id: string): ReferencePassageRecord | null {
-    return this.referenceRepository.getReferencePassage(id);
+  public getReferencePassage(id: string, projectId: string | null): ReferencePassageRecord | null {
+    return this.referenceRepository.getReferencePassage(id, projectId);
   }
 
   public listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[] {
@@ -5599,8 +5613,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * sends. The substance is captured here rather than reconstructed later,
    * because this is when the controller knows why it is asking.
    *
-   * An ask that cannot be safely repeated is still recorded, with its text
-   * withheld: the owner learns that his authority was used either way.
+   * An ask that cannot be safely repeated is still recorded with redacted text;
+   * an empty ask is recorded as having no instruction. The owner learns how
+   * their authority was used without unsafe provider text being repeated.
    */
   public recordControllerThreadAsk(input: {
     controllerKey: string;
@@ -5623,7 +5638,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       input.turnId,
       input.threadId,
       input.threadName === null ? null : normalizeThreadName(input.threadName),
-      repeatable ? normalized : THREAD_ASK_REDACTED,
+      normalized.length === 0 ? THREAD_ASK_EMPTY : repeatable ? normalized : THREAD_ASK_REDACTED,
       input.now,
     );
   }
@@ -5669,6 +5684,15 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            ORDER BY id ASC LIMIT ?
         )`,
     ).run(now, controllerKey, count);
+    this.db.prepare(
+      `DELETE FROM controller_thread_asks
+        WHERE controller_key = ? AND reported_at IS NOT NULL
+          AND id NOT IN (
+            SELECT id FROM controller_thread_asks
+             WHERE controller_key = ? AND reported_at IS NOT NULL
+             ORDER BY id DESC LIMIT 256
+          )`,
+    ).run(controllerKey, controllerKey);
   }
 
   public completeControllerTurnFromFinalization(input: ControllerLeaseFence & {
@@ -7336,7 +7360,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       chatId: controller.telegram_chat_id,
       payload: {
         ...formattedMessage(rendered.text),
-        ...( "reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
+        ...("reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
         disable_web_page_preview: true,
       },
     }, now);
@@ -7746,8 +7770,43 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public isControllerOwnedThread(parentThreadId: string | null): boolean {
     if (parentThreadId === null) return false;
     return this.db.prepare(
-      "SELECT 1 FROM controller_threads WHERE bb_thread_id = ? AND state = 'active'",
+      "SELECT 1 FROM controller_threads WHERE bb_thread_id = ?",
     ).get(parentThreadId) !== undefined;
+  }
+
+  public hasPendingThreadInteractionForThread(threadId: string): boolean {
+    assertControllerIdentifier(threadId, "threadId");
+    return this.db.prepare(
+      "SELECT 1 FROM thread_interactions WHERE thread_id = ? AND state = 'pending' LIMIT 1",
+    ).get(threadId) !== undefined;
+  }
+
+  private activeControllerForParentThread(parentThreadId: string | null): {
+    controllerKey: string;
+    telegramUserId: string;
+    telegramChatId: string;
+  } | null {
+    if (parentThreadId === null) return null;
+    const row = this.db.prepare(
+      `SELECT controller.controller_key, controller.telegram_user_id, controller.telegram_chat_id
+         FROM controller_threads AS controller
+         JOIN owners AS owner
+           ON owner.singleton = 1 AND owner.revoked_at IS NULL
+          AND owner.telegram_user_id = controller.telegram_user_id
+          AND owner.telegram_chat_id = controller.telegram_chat_id
+        WHERE controller.bb_thread_id = ? AND controller.state = 'active'`,
+    ).get(parentThreadId) as {
+      controller_key: string;
+      telegram_user_id: string;
+      telegram_chat_id: string;
+    } | undefined;
+    return row
+      ? {
+          controllerKey: row.controller_key,
+          telegramUserId: row.telegram_user_id,
+          telegramChatId: row.telegram_chat_id,
+        }
+      : null;
   }
 
   public recordThreadInteraction(input: {
@@ -7764,20 +7823,22 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerText(input.title, "thread title");
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction((): boolean => {
-      const known = this.db.prepare("SELECT 1 FROM thread_interactions WHERE interaction_id = ?")
-        .get(input.interactionId);
-      if (known) return false;
+      const known = this.db.prepare("SELECT * FROM thread_interactions WHERE interaction_id = ?")
+        .get(input.interactionId) as ThreadInteractionRow | undefined;
+      if (known) return this.retryControllerThreadInteraction(known, input);
       // The routing decision is taken here rather than by the caller, so a
       // future caller cannot put a tappable menu on the owner's phone for a
       // thread the controller started by forgetting to ask.
+      const controller = this.activeControllerForParentThread(input.parentThreadId ?? null);
       const route = routeThreadInteraction({
-        threadOwnedByController: this.isControllerOwnedThread(input.parentThreadId ?? null),
+        threadOwnedByController: controller !== null,
         interaction: input.interaction,
       });
       this.db.prepare(
         `INSERT INTO thread_interactions
-           (interaction_id, thread_id, title, kind, payload_json, state, answer_json, asked_at, answered_at, audience)
-         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)`,
+           (interaction_id, thread_id, title, kind, payload_json, state, answer_json,
+            asked_at, answered_at, audience, controller_key, controller_turn_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?, ?, NULL)`,
       ).run(
         input.interactionId,
         input.threadId,
@@ -7786,9 +7847,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         JSON.stringify(input.interaction),
         input.now,
         route.audience,
+        route.audience === "controller" ? controller?.controllerKey ?? null : null,
       );
       if (route.audience === "controller") {
-        this.askControllerToAnswerThread({ ...input, now: input.now }, route.decisions);
+        if (controller) {
+          this.askControllerToAnswerThread(
+            { ...input, now: input.now },
+            route.decisions,
+            controller,
+          );
+        }
         return true;
       }
       const rendered = renderThreadInteraction(input.title, input.interaction);
@@ -7803,6 +7871,76 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       }, input.now);
       return true;
     }).immediate();
+  }
+
+  private retryControllerThreadInteraction(
+    row: ThreadInteractionRow,
+    input: {
+      interactionId: string;
+      threadId: string;
+      title: string;
+      interaction: ThreadInteraction;
+      chatId: string;
+      now: number;
+      parentThreadId?: string | null;
+    },
+  ): boolean {
+    if (row.state !== "pending" || row.audience !== "controller") return false;
+    const controller = this.activeControllerForParentThread(input.parentThreadId ?? null);
+    const interaction = JSON.parse(row.payload_json) as ThreadInteraction;
+    const route = routeThreadInteraction({
+      threadOwnedByController: controller !== null,
+      interaction,
+    });
+    if (
+      controller === null ||
+      route.audience === "owner" ||
+      row.controller_key !== null && row.controller_key !== controller.controllerKey
+    ) {
+      this.routePendingThreadInteractionToOwner(row, interaction, input.chatId, input.now);
+      return true;
+    }
+    if (row.controller_turn_id !== null) {
+      const linked = this.db.prepare("SELECT state FROM controller_turns WHERE id = ?")
+        .get(row.controller_turn_id) as { state: ControllerTurnState } | undefined;
+      if (linked && ["queued", "dispatching", "submitted"].includes(linked.state)) return false;
+    }
+    if (row.controller_key === null) {
+      this.db.prepare(
+        "UPDATE thread_interactions SET controller_key = ? WHERE interaction_id = ? AND state = 'pending'",
+      ).run(controller.controllerKey, row.interaction_id);
+    }
+    return this.askControllerToAnswerThread({
+      interactionId: row.interaction_id,
+      threadId: row.thread_id,
+      title: row.title,
+      interaction,
+      now: input.now,
+    }, route.decisions, controller) !== null;
+  }
+
+  private routePendingThreadInteractionToOwner(
+    row: ThreadInteractionRow,
+    interaction: ThreadInteraction,
+    chatId: string,
+    now: number,
+  ): void {
+    const updated = this.db.prepare(
+      `UPDATE thread_interactions
+          SET audience = 'owner', controller_key = NULL, controller_turn_id = NULL
+        WHERE interaction_id = ? AND state = 'pending' AND audience = 'controller'`,
+    ).run(row.interaction_id);
+    if (updated.changes !== 1) return;
+    const rendered = renderThreadInteraction(row.title, interaction);
+    persistControllerOutbox(this.db, {
+      logicalKey: `thread-interaction:${row.interaction_id}`,
+      chatId,
+      payload: {
+        ...formattedMessage(rendered.text),
+        ...("reply_markup" in rendered ? { reply_markup: rendered.reply_markup } : {}),
+        disable_web_page_preview: true,
+      },
+    }, now);
   }
 
   /**
@@ -7821,27 +7959,34 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       now: number;
     },
     decisions: readonly ThreadApprovalDecision[],
-  ): void {
-    const controller = this.db.prepare(
-      "SELECT controller_key, telegram_user_id, telegram_chat_id FROM controller_threads WHERE state = 'active' LIMIT 1",
-    ).get() as { controller_key: string; telegram_user_id: string; telegram_chat_id: string } | undefined;
-    if (!controller) return;
+    controller: {
+      controllerKey: string;
+      telegramUserId: string;
+      telegramChatId: string;
+    },
+  ): string | null {
     const latestUpdate = this.db.prepare(
       "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
     ).get() as { update_id: number };
     try {
-      this.enqueueControllerTurn({
-        controllerKey: controller.controller_key,
-        telegramUserId: controller.telegram_user_id,
-        telegramChatId: controller.telegram_chat_id,
+      const turn = this.enqueueControllerTurn({
+        controllerKey: controller.controllerKey,
+        telegramUserId: controller.telegramUserId,
+        telegramChatId: controller.telegramChatId,
         updateId: Math.max(latestUpdate.update_id + 1, THREAD_FOLLOW_UP_UPDATE_ID_BASE),
         inputText: describeThreadBlockForController(input.threadId, input.title, input.interaction, decisions),
         origin: "system",
         now: input.now,
       });
+      this.db.prepare(
+        `UPDATE thread_interactions SET controller_key = ?, controller_turn_id = ?
+          WHERE interaction_id = ? AND state = 'pending' AND audience = 'controller'`,
+      ).run(controller.controllerKey, turn.id, input.interactionId);
+      return turn.id;
     } catch {
-      // A turn that cannot be queued leaves the interaction pending, so the
-      // next sweep offers it again rather than the thread being forgotten.
+      // The exact controller remains on the pending row. A later observation
+      // retries it, or routes it to the owner if that controller is no longer current.
+      return null;
     }
   }
 
@@ -11551,16 +11696,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           input.now,
         );
       const stored = this.getAttempt(input.id);
-      // The insert is ignored when another row already holds this ordinal, so a
-      // missing row means a conflicting attempt owns it. That can never be
-      // resolved by trying again: report it as the permanent conflict it is
-      // rather than as a transient failure worth twenty more minutes of retries.
-      if (!stored) throw new IdempotencyConflictError(ordinal);
+      // INSERT OR IGNORE can reject any database constraint, not only the
+      // ordinal indexes. Surface that accurately while still classifying it as
+      // permanent: identical retries cannot repair persisted input.
+      if (!stored) {
+        throw new AttemptPersistenceConflictError(
+          input.id,
+          `a database constraint rejected ${input.kind} ordinal ${ordinal}`,
+        );
+      }
       if (
         stored.jobId !== input.jobId || stored.kind !== input.kind || stored.ordinal !== ordinal ||
         stored.reviewLens !== reviewLens || stored.reviewStage !== reviewStage
       ) {
-        throw new IdempotencyConflictError(ordinal);
+        throw new AttemptPersistenceConflictError(input.id, "the existing row has different identity fields");
       }
       return stored;
     });
@@ -13224,6 +13373,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!row) return null;
     const record = this.getUsableApproval(row.nonce_hash, now);
     return record ? { nonceHash: row.nonce_hash, record } : null;
+  }
+
+  public listLiveMergeApprovals(
+    now: number,
+  ): readonly { nonceHash: string; record: ApprovalRecord }[] {
+    assertNonNegativeInteger(now, "now");
+    const rows = this.db.prepare(
+      `SELECT nonce_hash FROM approvals
+        WHERE consumed_at IS NULL AND expires_at > ?
+        ORDER BY expires_at DESC, nonce_hash`,
+    ).all(now) as Array<{ nonce_hash: string }>;
+    const seen = new Set<string>();
+    const live: Array<{ nonceHash: string; record: ApprovalRecord }> = [];
+    for (const row of rows) {
+      const record = this.getUsableApproval(row.nonce_hash, now);
+      if (!record || seen.has(record.jobId)) continue;
+      seen.add(record.jobId);
+      live.push({ nonceHash: row.nonce_hash, record });
+    }
+    return live;
   }
 
   /**

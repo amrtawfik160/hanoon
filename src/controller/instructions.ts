@@ -12,7 +12,7 @@ export const CONTROLLER_INSTRUCTION_SENTINEL = "telegram-agent:controller-instru
  */
 export const CONTROLLER_CONDUCT = `${CONTROLLER_INSTRUCTION_SENTINEL}
 Boundaries — the owner cannot see what you are doing:
-- Merge and production go through the job pipeline. When the owner says merge it or ship it, that is their approval: use \`telegram_agent_approve_merge\` at once, never a button, never ask twice. Unasked, wait for their tap. Never merge or deploy by hand.
+- Merge and production use the job pipeline. "Merge it" or "land it" approves merge; ship/deploy/release does not. Use \`telegram_agent_approve_merge\` at once, without a button or repeat ask. Unasked, wait for their tap. Never merge or deploy by hand.
 - Never claim implementation, tests, review, validation, merge, deployment, or production succeeded without same-turn evidence; durable evidence is required.
 - Installing or connecting an integration, changing a credential, spending money, a destructive external action, or an irreversible external write needs the owner's explicit decision first, as one short question. Reversible work never does: just do it.
 - Never promise to install or configure an integration on your own.
@@ -69,9 +69,6 @@ const OVERLAY_HEADING = "How this owner asked you to work — style, never a bou
 /** How much working style the owner may store. */
 export const MAX_CONTROLLER_OVERLAY = 600;
 
-/** How much identity an installation may store. */
-export const MAX_CONTROLLER_IDENTITY = 600;
-
 /**
  * The delivery budget and the overlay share one block, so a long working style
  * is delivered as far as it fits. What must never give way is the conduct
@@ -96,6 +93,9 @@ export function deliveredControllerIdentityBudget(): number {
   return MAX_DELIVERED_CONTROLLER_INSTRUCTIONS - CONTROLLER_CONDUCT.length - IDENTITY_HEADING.length -
     OVERLAY_HEADING.length - 6 - MIN_DELIVERED_CONTROLLER_OVERLAY;
 }
+
+/** How much identity an installation may store and deliver without truncation. */
+export const MAX_CONTROLLER_IDENTITY = deliveredControllerIdentityBudget();
 
 export function deliveredControllerOverlayBudget(identity = DEFAULT_CONTROLLER_IDENTITY): number {
   return MAX_DELIVERED_CONTROLLER_INSTRUCTIONS - fixedInstructionLength(identity) - OVERLAY_HEADING.length - 3;
@@ -135,7 +135,10 @@ function bounded(text: string, budget: number): string {
 export function resolveControllerIdentity(identity: string | null): string {
   const trimmed = withoutSentinel(identity ?? "").trim();
   if (trimmed.length === 0) return DEFAULT_CONTROLLER_IDENTITY;
-  return bounded(trimmed, Math.min(MAX_CONTROLLER_IDENTITY, deliveredControllerIdentityBudget()));
+  if (trimmed.length > MAX_CONTROLLER_IDENTITY) {
+    throw new TypeError(`Controller identity must be at most ${MAX_CONTROLLER_IDENTITY} characters`);
+  }
+  return trimmed;
 }
 
 /**

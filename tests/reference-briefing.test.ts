@@ -47,6 +47,7 @@ it("tells a stage what exists, how to read it, and what to do with a conflict", 
   expect(briefing).toContain("bb telegram-agent reference show");
   // The section text itself is never in the prompt, only its shape.
   expect(briefing).not.toContain("Invoices are immutable once issued.");
+  expect(briefing.length).toBeLessThanOrEqual(MAX_REFERENCE_MAP_CHARACTERS);
   // The conflict rule, stated as the what-versus-how line it actually is.
   expect(briefing).toMatch(/what to build or what rule holds/);
   expect(briefing).toMatch(/disagrees only about how to build it/);
@@ -66,10 +67,11 @@ it("marks a global document as applying everywhere", () => {
   expect(referenceBriefingFor(target, "proj_1")).toContain("Company guide (applies to every project)");
 });
 
-it("shares one budget across documents rather than granting it to each", () => {
+it("bounds the complete briefing and says how many filed documents were omitted", () => {
   const target = store();
   const many = Array.from({ length: 30 }, (_, index) => `# Section ${index}\n\nbody text here`).join("\n\n");
-  for (const title of ["Spec one", "Spec two", "Spec three"]) {
+  for (let index = 0; index < 30; index += 1) {
+    const title = `Spec ${String(index).padStart(2, "0")}`;
     target.saveReferenceDocument({
       scope: "project",
       projectId: "proj_1",
@@ -82,15 +84,12 @@ it("shares one budget across documents rather than granting it to each", () => {
 
   const briefing = referenceBriefingFor(target, "proj_1");
 
-  expect(briefing).toContain("Spec one");
-  expect(briefing).toContain("Spec three");
-  // Three documents share the map budget; the fixed instructions around it are
-  // what the rest of the length is.
-  const mapPortion = briefing.split("\n").filter((line) => line.startsWith("Section")).join("\n");
-  expect(mapPortion.length).toBeLessThanOrEqual(MAX_REFERENCE_MAP_CHARACTERS);
+  expect(briefing).toContain("Spec 00");
+  expect(briefing).toMatch(/… and \d+ more reference documents were omitted/);
+  expect(briefing.length).toBeLessThanOrEqual(MAX_REFERENCE_MAP_CHARACTERS);
 });
 
-it("leaves out a document that has no headings to show", () => {
+it("shows the preface of a document that has no headings", () => {
   const target = store();
   target.saveReferenceDocument({
     scope: "project",
@@ -101,7 +100,24 @@ it("leaves out a document that has no headings to show", () => {
     now: 2_000,
   });
 
-  expect(referenceBriefingFor(target, "proj_1")).toBe("");
+  const briefing = referenceBriefingFor(target, "proj_1");
+  expect(briefing).toContain("Loose notes");
+  expect(briefing).toContain("(document preface) (40 chars)");
+});
+
+it("honours smaller caller budgets without cutting a sentence in half", () => {
+  const target = store();
+  target.saveReferenceDocument({
+    scope: "project",
+    projectId: "proj_1",
+    title: "Product spec",
+    source: "telegram:doc_1",
+    markdown: SPEC,
+    now: 2_000,
+  });
+
+  expect(referenceBriefingFor(target, "proj_1", 200)).toBe("");
+  expect(referenceBriefingFor(target, "proj_1", 700).length).toBeLessThanOrEqual(700);
 });
 
 it("never shows one project the specification of another", () => {

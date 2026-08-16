@@ -50,7 +50,7 @@ If the broker client's private key may have leaked, treat it as a compromised cr
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally under the five manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, and `skills/hanoon`; operators do not install another runtime skill plugin. The catalog has 23 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+Skills are committed locally under the five manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, and `skills/hanoon`; operators do not install another runtime skill plugin. The catalog has 26 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
 
 Run the deterministic integrity gate from the repository root:
 
@@ -81,6 +81,18 @@ Memories are bounded per scope; when the bound is reached the weakest is dropped
 An invalid cron expression is rejected when the monitor is created. A schedule that later cannot be advanced is marked failed and reported by `/health` rather than retried forever.
 
 Asking what the agent is watching lists durable monitor rows only. Starting or messaging a thread tries to arm a best-effort courtesy monitor; at the armed-monitor cap the action still succeeds without that monitor. Lifecycle handling can also infer engagement from durable controller evidence containing the exact `thread:<id>` reference and enqueue a follow-up without a monitor row. That inferred follow-up is absent from the watch list and does not consume the armed-monitor cap; thread list and status reads currently produce qualifying evidence too. The armed count in `/health` therefore covers monitors, not every possible lifecycle follow-up. Its next-due time covers schedules only, since a thread watch waits on its thread rather than on the clock.
+
+## Reference documents
+
+Reference documents are filed by the paired owner in Telegram and may govern one project or every project. Worker threads read them through the read-only CLI:
+
+```bash
+bb telegram-agent reference list [--project <project-id>] [--json]
+bb telegram-agent reference search "<query>" [--project <project-id>] [--limit <1-8>] [--json]
+bb telegram-agent reference show <passage-id> [--project <project-id>] [--json]
+```
+
+Inside a project-bound BB thread, the invoking project is authoritative: omitting `--project` uses that project, and naming a different one is refused. An unbound operator may name a project explicitly; omitting it reads only global references. `show` applies the same scope check as `search` and `list`, so a passage id is not a scope bypass.
 
 ## Thread notices
 
