@@ -37,6 +37,8 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_send_media",
   "telegram_agent_approve_merge",
   "telegram_agent_resume_project",
+  "telegram_agent_add_reference",
+  "telegram_agent_search_reference",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -674,6 +676,42 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     proof_kinds: ["job_state"],
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
+  }),
+  telegram_agent_add_reference: capability({
+    capability_id: "telegram_agent_add_reference",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "low",
+    data_class: ["owner_memory"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["memory_state"],
+    receipt_kind: "tool_receipt",
+    result_limit: 8_000,
+  }),
+  telegram_agent_search_reference: capability({
+    capability_id: "telegram_agent_search_reference",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["owner_memory"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    // A specification is something the agent read, not something it observed
+    // about our systems, so it carries the same proof as any outside reading.
+    proof_kinds: ["retrieved_content"],
+    receipt_kind: "observation",
+    result_limit: 8_000,
   }),
 });
 

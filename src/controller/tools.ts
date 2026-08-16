@@ -143,6 +143,8 @@ type ToolDependencies = {
   credentialAccess?: CredentialAccessService;
   /** Current persisted controller provider; undefined means configuration is invalid. */
   controllerProviderId?: () => string | undefined;
+  /** Configured replacement identity; empty or absent delivers the shipped one. */
+  controllerIdentity?: () => string | undefined;
 };
 
 type EvidenceIndexDescriptor = Readonly<{
@@ -826,6 +828,16 @@ async function resolveTrustedScope(
         ? globalScope()
         : exactScope([`project:${projectId}`], enabledProject(dependencies.store, projectId));
     }
+    case "telegram_agent_add_reference":
+    case "telegram_agent_search_reference": {
+      const projectId = params.projectId as string | undefined;
+      // A global reference has no project to authorize against; a project one
+      // is authorized exactly like a project memory, so one project's
+      // specification can never be read from inside another.
+      return projectId === undefined || projectId === null
+        ? globalScope()
+        : exactScope([`project:${projectId}`], enabledProject(dependencies.store, projectId));
+    }
     case "telegram_agent_thread_status":
     case "telegram_agent_read_thread":
     case "telegram_agent_send_to_thread":
@@ -1376,6 +1388,20 @@ async function projectTrustedEvidence(
     }
     case "telegram_agent_recall":
       return { outcome: "observed", proofKinds: ["memory_state"], subjectRefs: refIds(domain.memories, "memory") };
+    case "telegram_agent_add_reference":
+      return {
+        outcome: domain.stored === true ? "succeeded" : "observed",
+        proofKinds: ["memory_state"],
+        subjectRefs: typeof domain.documentId === "string" ? [`reference:${domain.documentId}`] : [],
+      };
+    case "telegram_agent_search_reference":
+      // Retrieved rather than observed: this is what a document says, which is
+      // never evidence about our own systems having done anything.
+      return {
+        outcome: "observed",
+        proofKinds: ["retrieved_content"],
+        subjectRefs: refIds(domain.passages, "reference-passage"),
+      };
     case "telegram_agent_forget": {
       const forgotten = domain.forgotten === true;
       return { outcome: forgotten ? "succeeded" : "observed", proofKinds: ["memory_state"], subjectRefs: resolution.scope.entityRefs };
@@ -2171,7 +2197,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[22],
     register: () => bb.agents.registerTool({
       name: CONTROLLER_TOOL_NAMES[22],
-      description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in.",
+      description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in. What you read outside our systems, from a search or a page, is an external_reading claim: it can say what the source said, and never that a job, a check, a deployment, or anything of ours succeeded.",
       parameters: controllerFinalizationJsonSchema,
       execute: (candidate, context) => executeControllerFinalizer(
         dependencies,
@@ -2452,6 +2478,69 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     },
   });
 
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[32],
+    description: "File a specification the owner gave you, so the work done on that project is done against it. Give the whole document text. Sending it again under the same title replaces it and reports which sections moved: there is never a second live copy of one spec. Omit projectId only for something that genuinely applies everywhere, like a company style guide.",
+    experimental_statusLabels: { pending: "Filing the specification", completed: "Specification filed" },
+    parameters: z.object({
+      title: z.string().trim().min(1).max(256),
+      text: z.string().min(1).max(4_000_000),
+      source: z.string().trim().min(1).max(1_024),
+      projectId: z.string().min(1).max(256).optional(),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const saved = dependencies.store.saveReferenceDocument({
+        scope: params.projectId === undefined ? "global" : "project",
+        projectId: params.projectId ?? null,
+        title: params.title,
+        source: params.source,
+        markdown: params.text,
+        now: dependencies.now(),
+      });
+      return {
+        stored: true,
+        documentId: saved.document.id,
+        title: saved.document.title,
+        version: saved.document.version,
+        passages: saved.passageCount,
+        sections: saved.document.map.length,
+        changes: saved.changes,
+      };
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[33],
+    description: "Search the specifications filed for a project, and the global ones, for what they actually say. Use it before answering anything the spec governs and before planning work on that project. What comes back is what a document says, never proof that any of our own work succeeded.",
+    experimental_statusLabels: { pending: "Reading the specification", completed: "Specification read" },
+    parameters: z.object({
+      query: z.string().trim().min(1).max(512),
+      projectId: z.string().min(1).max(256).optional(),
+      // Three passages of the maximum size plus their paths sit inside this
+      // capability's 8000 character result bound; more would be truncated
+      // mid-passage, which reads as the specification saying something it does
+      // not.
+      limit: z.number().int().min(1).max(3).optional(),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const hits = dependencies.store.searchReferencePassages({
+        query: params.query,
+        projectId: params.projectId ?? null,
+        limit: params.limit ?? 3,
+      });
+      return {
+        passages: hits.map((passage) => ({
+          id: passage.id,
+          document: passage.documentTitle,
+          section: passage.sectionPath,
+          body: passage.body,
+        })),
+      };
+    },
+  });
+
   const registeredToolNames = pendingRegistrations.map((registration) => registration.name);
   const assertProtocolToolsProjected = (projectedToolNames: readonly string[]): void => {
     if (CONTROLLER_PROTOCOL_TOOL_IDS.some((toolName) =>
@@ -2642,7 +2731,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         return {
           tools: projectedToolNames,
           skills,
-          instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
+          instructions: composeControllerInstructions(
+          dependencies.store.getControllerOverlay(),
+          dependencies.controllerIdentity?.() ?? null,
+        ),
         };
       }
       // A migrated in-flight turn has no profile. Keep its historical surface
@@ -2652,7 +2744,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       return {
         tools: compatibilityToolNames,
         skills: [...CONTROLLER_DEFAULT_SKILLS, ...CONTROLLER_MANUAL_DISCOVERY_SKILLS],
-        instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
+        instructions: composeControllerInstructions(
+          dependencies.store.getControllerOverlay(),
+          dependencies.controllerIdentity?.() ?? null,
+        ),
       };
     }
     const title = parseWorkerThreadTitle(context.thread.title);

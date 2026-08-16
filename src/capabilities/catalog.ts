@@ -419,7 +419,12 @@ export const CONTROLLER_BUNDLE_TOOLS = {
     "telegram_agent_create_thread", "telegram_agent_send_to_thread",
     "telegram_agent_answer_thread",
   ],
-  memory: ["telegram_agent_remember", "telegram_agent_recall", "telegram_agent_forget"],
+  memory: [
+    "telegram_agent_remember", "telegram_agent_recall", "telegram_agent_forget",
+    // A specification the owner handed over is theirs to recall the same way a
+    // standing preference is, so it travels with the memory bundle.
+    "telegram_agent_add_reference", "telegram_agent_search_reference",
+  ],
   monitoring: ["telegram_agent_watch", "telegram_agent_list_watches", "telegram_agent_cancel_watch"],
   operations: [
     "telegram_agent_request_thread_operation", "telegram_agent_delegate", "telegram_agent_set_working_style",

@@ -1,6 +1,7 @@
 # Reference documents, voice notes, and identity
 
-Status: proposed, not started. Design settled 2026-08-16.
+Status: built and tested on 2026-08-16, except the gaps named under
+[What is not built](#what-is-not-built). Design settled the same day.
 
 ## Why
 
@@ -9,12 +10,14 @@ cannot be spoken to, it cannot be given a specification to work against, it has
 no identity beyond a tone overlay, and nothing it reads from outside our own
 machines can become part of an answer.
 
-The last one is the quiet blocker. The hidden controller already has the shell,
-the `bb` CLI, every installed skill and MCP server, and whatever web tools its
-provider ships with. It is not short of ways to act. It is short of ways for
-what it finds to count. Our finalization contract only accepts evidence from our
-own tools, so a page the controller read or a search its provider ran cannot back
-a claim, and the agent correctly refuses to say what it saw.
+The last one is the quiet blocker, though not in the way it first appears. The
+hidden controller already has the shell, the `bb` CLI, every installed skill and
+MCP server, and whatever web tools its provider ships with. Its searches and
+page fetches are already projected into evidence as `retrieved_content`
+(`src/controller/evidence-projector.ts:282-321`). What is missing is one row in
+`CLAIM_PROOFS`: `retrieved_content` backs no claim kind except `uncertainty`
+(`src/controller/finalization-contract.ts:114-122`), so the agent can only ever
+say it is unsure about what it read. It cannot state what a source said.
 
 This design adds four things: voice notes in, reference documents the whole
 pipeline works against, a proof kind for readings from outside, and an identity
@@ -200,28 +203,58 @@ disagreement about **how to build it** is not.
 This means a job can now stall waiting on a tap. That is a real behavioural
 change and the reason the "what versus how" line is load-bearing.
 
-## 3. Outside readings as evidence
+## 3. Outside readings as claims
 
-A new proof kind. It records the source identity, being a URL, a file path, or a
-document section id, when it was captured, and a bounded excerpt of what was
-actually read.
+Most of this already exists. What follows is what is actually missing, verified
+against the source rather than assumed.
 
-- The agent records one by calling a small tool when it wants an outside reading
-  to count. Provider-native web search results are recorded this way. We build no
-  search.
-- An answer backed by an outside reading names the source in the reply, so the
-  owner can see at a glance that this came from outside our machines.
-- Reference document passages are a sub-case: source is the document and section,
-  capture time is ingestion time.
+### What is already there
 
-One hard rule, enforced in the finalization contract rather than in prose:
+- `retrieved_content` is a declared proof kind (`src/controller/proof-kinds.d.ts`).
+- Native `webSearch`, `webFetch` and `imageView` items are projected into
+  durable evidence with that proof kind, automatically, with no tool call from
+  the agent (`src/controller/evidence-projector.ts:282-321`).
+- The hard rule this design was going to add is **already enforced, by
+  omission**. `retrieved_content` appears in no entry of `CLAIM_PROOFS` other
+  than `uncertainty`, so an outside reading structurally cannot back a claim
+  about a project, job, thread, monitor, pipeline, or deployment. That is good
+  design that predates this document, and it should be locked with a test rather
+  than left to survive by accident.
+
+### What is missing
+
+**A claim kind for what a source said.** Today the only affirmative use of
+`retrieved_content` is an `uncertainty` claim, so the agent must frame every
+external reading as doubt. It cannot say what a library's documentation states,
+even having read it. This adds one claim kind whose compatible proofs are
+exactly `{retrieved_content}`.
+
+**A source the owner can see, but not in storage.** An earlier draft of this
+design proposed putting a fetched page's URL into its evidence subject, so a
+claim about a page would be filed under the page rather than under the opaque
+`bb-item:<id>` (`src/controller/evidence-projector.ts:232`). That was tried and
+reverted. The projector hashes every request and result precisely so a token in
+a query string cannot become durable, and
+`tests/controller-evidence-projector.test.ts` already asserts by name that a
+fetched url never reaches the database. Weakening that for inspection
+convenience is the wrong trade.
+
+So the source reaches the owner where it always did: in the words of the claim,
+which the agent writes and which are delivered. The durable subject stays
+opaque. If filing ever needs to be more legible, the honest route is a subject
+derived from the fetched content rather than from the request.
+
+Reference document passages are the same shape: `retrieved_content`, with the
+document and section as the subject.
+
+The rule stays exactly as it is:
 
 > An outside reading can never be the only thing backing a claim about our own
 > systems, jobs, threads, machines, or deliveries.
 
 It can say what a library's documentation states. It cannot say a deploy
-succeeded. Without this, a plausible blog post becomes evidence about production,
-which is exactly what the evidence contract exists to prevent.
+succeeded. It already cannot. The work is keeping it that way while making the
+first half possible.
 
 ## 4. Identity and conduct
 
@@ -249,6 +282,33 @@ can.
 The default identity must not claim abilities that depend on optional setup, or a
 fresh install introduces itself as something it is not.
 
+## What is not built
+
+Everything below was in the design and is deliberately absent from the shipped
+work. None of it is blocked; each is a slice that was not worth guessing at
+under time pressure.
+
+- **A document sent as a Telegram attachment.** The front door for the
+  motivating case is missing. Filing a specification works today by pointing the
+  agent at a path it can already read, or by passing the text, and a PDF or
+  Markdown file attached to a chat message is still ignored. Doing it well needs
+  a decision about where a 300 page upload lands before anyone has said which
+  project it belongs to, and that decision is worth making deliberately rather
+  than at the end of a long session.
+- **Inline versus background ingestion.** Ingest is synchronous. A very large
+  document will hold its turn rather than handing off to a job with a completion
+  notice.
+- **One-line summaries in the structural map.** The map carries the heading tree
+  and the size of each section, which needs no model. Summaries would say
+  roughly what each section holds, and would cost a model pass per section on
+  every ingest.
+- **Stub recall in conversation.** Passages do not auto-inject as stubs into a
+  chat turn. The agent reaches them by searching, which it is told to do. The
+  two-lane ranking that keeps standing preferences from being crowded out is
+  therefore not yet needed and not yet written.
+- **PDF.** Unresolved exactly as stated below. Markdown and plain text are what
+  the parser handles.
+
 ## Risks worth tracking
 
 - **Retrieval over 300 pages is lossy.** The local embedding model is small. The
@@ -271,20 +331,29 @@ fresh install introduces itself as something it is not.
   wrongly raised conflict costs one tap, which is survivable, but the rate should
   be observable.
 
-## Shape of the work
+## What was built
 
-Four pieces, in dependency order. The first two are independent of everything
-else and could land in either order.
-
-1. **Outside readings.** The proof kind, the recording tool, the finalization
-   rule, the source named in replies.
-2. **Identity split.** Conduct, identity, and working style as three ordered
-   layers, with a replaceable default identity.
-3. **Voice notes in.** Ingress, download, `bb voice transcribe`, plain message
-   when unavailable.
-4. **Reference documents.** Ingestion and map, passage store and stub recall in
-   conversation, then map in stage prompts, then the search CLI and the conflict
-   rule.
+1. **Outside readings.** The `external_reading` claim kind, compatible with
+   `retrieved_content` and nothing else, plus a test that states the
+   prohibition directly rather than deriving it from the same table it guards.
+   Smaller than it first looked: the proof kind and the projection already
+   existed. Naming the source in the evidence subject was tried and reverted.
+2. **Identity split.** `CONTROLLER_CONDUCT`, a replaceable
+   `DEFAULT_CONTROLLER_IDENTITY`, and the owner's working style, rendered in
+   that order. The identity is a plugin setting. Delivery budgets are computed
+   and asserted at module load, so a future edit that squeezes out the owner's
+   working style fails the build rather than truncating silently.
+3. **Voice notes in.** Telegram `voice` and `audio` through
+   `bb voice transcribe`, no new key and no new dependency. Every failure path
+   answers in the chat, and a stranger's recording is never transcribed.
+4. **Reference documents.** Parsing, chunking and the structural map; a
+   `reference_documents` store with full-text search and versioned replacement
+   that records what moved; `telegram_agent_add_reference` and
+   `telegram_agent_search_reference`; a read-only
+   `bb telegram-agent reference` command for worker threads that cannot open
+   the database; and the map plus the conflict rule in every stage prompt that
+   spawns a worker: plan, critique, build from plan, implementation, docs,
+   review, and final review.
 
 ## Decisions and why
 
@@ -295,7 +364,7 @@ Compressed record of what was settled, so the reasoning is not lost.
 | Relationship to `/root/github_projects/ai` | Ideas only | Its strengths are breadth and behaviour, not architecture we want. Ours is safer and should stay so. |
 | Axes of work | More it can do itself, colleague feel, knows more | Self-improvement and extra channels dropped as lower value for the cost. |
 | Boundary | Stays inside the BB plugin | Containment and recoverability are why the agent is trustworthy. |
-| Evidence rule | Holds, with new proof kinds | A second unverified path becomes the path everything drifts into. |
+| Evidence rule | Holds unchanged | A second unverified path becomes the path everything drifts into. On inspection the proof kind already existed, so this needs a claim kind rather than a new lane. |
 | Where abilities live | Both native and installed, split by a rule | If the owner's answer depends on it, it needs a declared capability and a proof kind. Exploration can stay on the plain shell. |
 | Web search | Not our problem | Every provider ships one. Only the evidence gap was ours. |
 | Voice | In only | Replies carry links and ids that read better than they listen, and speech out means another key. |

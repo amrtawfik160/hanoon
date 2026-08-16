@@ -44,6 +44,8 @@ import { environmentWorktreeIsClean, resolvePrHead, runValidation } from "./bb/v
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { TelegramClient, TelegramFileTooLargeError } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
+import { transcribeWithBb } from "./telegram/voice";
+import { referenceBriefingFor } from "./reference/briefing";
 import { openStore, type TelegramAgentStore } from "./storage/store";
 import { AutonomyRepository } from "./storage/autonomy-repository";
 import { DEFAULT_MAX_CONCURRENT_JOBS } from "./autonomy/models";
@@ -364,6 +366,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       options: [...EXTRACTION_MODELS],
       default: "inherit",
     },
+    controllerIdentity: {
+      type: "string",
+      label: "Agent identity",
+      description:
+        "Who the agent is and how it sounds, replacing the shipped character. It can change voice and manner; it can never move a safety boundary. Leave empty for the default.",
+      default: "",
+    },
     systemUpkeep: {
       type: "select",
       label: "Self-maintenance",
@@ -612,6 +621,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     controllerProviderId: () => config.ok
       ? controllerProviderFor(controllerExecutionProfile(config.value).model)
       : undefined,
+    // Read per resolution rather than captured, so an edited identity reaches
+    // the next turn the same way an edited model does.
+    controllerIdentity: () => config.ok ? config.value.controllerIdentity : undefined,
   };
   registerControllerTools(bb, toolDependencies);
 
@@ -662,6 +674,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
       { name: "capability", summary: "Inspect capability evidence and control recipe rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
       { name: "access", summary: "Inspect read-only credential broker bindings and status", usage: "bb telegram-agent access <list|status> [binding-id] [--json]" },
+      { name: "reference", summary: "Read the specifications filed for a project", usage: "bb telegram-agent reference <search|show|list> ... [--project <project-id>] [--json]" },
       { name: "doctor", summary: "Check Telegram, BB, host, provider, GitHub, and credential broker readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
     ],
     run: (argv, context) => runTelegramAgentCli({
@@ -702,7 +715,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       notify: () => executorNudge.notify(),
     }, argv, context),
   });
-  const bbRunner = new BbRunner(bb.sdk);
+  const bbRunner = new BbRunner(
+    bb.sdk,
+    // Read per spawn rather than captured, so a specification filed today
+    // reaches the stage that starts a minute later.
+    (projectId) => referenceBriefingFor(store, projectId),
+  );
   const createReviewHandler = (
     invocation: ReviewInvocation,
     expectedVersion: number,
@@ -989,6 +1007,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     mergeHandler,
     onWorkAvailable: () => executorNudge.notify(),
     health,
+    voice: {
+      download: (fileId, maxBytes, signal) => {
+        if (!config.ok) throw new Error(config.message);
+        return telegramForToken(config.value.botToken).downloadFile(fileId, maxBytes, signal);
+      },
+      transcribe: transcribeWithBb,
+    },
   });
   const controllerAdapter = new BbControllerAdapter({
     sdk: bb.sdk,

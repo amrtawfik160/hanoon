@@ -2121,6 +2121,56 @@ CREATE TABLE memory_embeddings (
 CREATE INDEX memory_embeddings_model ON memory_embeddings (model, memory_id);
 `] as const;
 
+export const REFERENCE_DOCUMENT_MIGRATIONS = [String.raw`
+CREATE TABLE reference_documents (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+  project_id TEXT,
+  title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 256),
+  source TEXT NOT NULL CHECK (length(source) BETWEEN 1 AND 1024),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  map_json TEXT NOT NULL,
+  ingested_at INTEGER NOT NULL CHECK (ingested_at >= 0),
+  CHECK ((scope = 'project') = (project_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX reference_documents_identity
+  ON reference_documents (scope, ifnull(project_id, ''), title);
+CREATE INDEX reference_documents_scope ON reference_documents (scope, project_id);
+CREATE TABLE reference_passages (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES reference_documents(id) ON DELETE CASCADE,
+  ordinal TEXT NOT NULL,
+  section_path TEXT NOT NULL,
+  body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 8192)
+);
+CREATE INDEX reference_passages_document ON reference_passages (document_id, ordinal);
+CREATE VIRTUAL TABLE reference_passages_fts USING fts5(
+  section_path, body, content='reference_passages', content_rowid='rowid', tokenize='porter unicode61'
+);
+CREATE TRIGGER reference_passages_fts_insert AFTER INSERT ON reference_passages BEGIN
+  INSERT INTO reference_passages_fts (rowid, section_path, body)
+    VALUES (new.rowid, new.section_path, new.body);
+END;
+CREATE TRIGGER reference_passages_fts_delete AFTER DELETE ON reference_passages BEGIN
+  INSERT INTO reference_passages_fts (reference_passages_fts, rowid, section_path, body)
+    VALUES ('delete', old.rowid, old.section_path, old.body);
+END;
+CREATE TRIGGER reference_passages_fts_update AFTER UPDATE ON reference_passages BEGIN
+  INSERT INTO reference_passages_fts (reference_passages_fts, rowid, section_path, body)
+    VALUES ('delete', old.rowid, old.section_path, old.body);
+  INSERT INTO reference_passages_fts (rowid, section_path, body)
+    VALUES (new.rowid, new.section_path, new.body);
+END;
+CREATE TABLE reference_document_changes (
+  document_id TEXT NOT NULL REFERENCES reference_documents(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK (version >= 2),
+  section_path TEXT NOT NULL,
+  change TEXT NOT NULL CHECK (change IN ('added', 'removed', 'changed')),
+  recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
+  PRIMARY KEY (document_id, version, section_path)
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2187,4 +2237,5 @@ export const ALL_MIGRATIONS = [
   ...MONITOR_STALL_MIGRATIONS,
   ...JOB_CONTINUATION_BACKFILL_MIGRATIONS,
   ...MEMORY_EMBEDDING_MIGRATIONS,
+  ...REFERENCE_DOCUMENT_MIGRATIONS,
 ] as const;

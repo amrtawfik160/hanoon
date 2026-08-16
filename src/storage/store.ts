@@ -167,6 +167,14 @@ import {
   type SkillReceiptProjection,
 } from "./capability-repository";
 import {
+  ReferenceRepository,
+  type ReferenceDocumentRecord,
+  type ReferencePassageRecord,
+  type ReferenceSectionChange,
+  type SaveReferenceDocumentInput,
+  type SaveReferenceDocumentResult,
+} from "./reference-repository";
+import {
   ControllerEvidenceRepository,
   type AcceptedControllerFinalization,
   type ControllerEvidenceInput,
@@ -2815,6 +2823,16 @@ export function migrateControllerInteractionStorage(
 }
 
 export interface TelegramAgentStore {
+  saveReferenceDocument(input: SaveReferenceDocumentInput): SaveReferenceDocumentResult;
+  listReferenceDocuments(projectId: string | null): readonly ReferenceDocumentRecord[];
+  searchReferencePassages(input: {
+    query: string;
+    projectId: string | null;
+    limit?: number;
+  }): readonly ReferencePassageRecord[];
+  getReferencePassage(id: string): ReferencePassageRecord | null;
+  listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[];
+  deleteReferenceDocument(id: string): boolean;
   createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile;
   appendCapabilityReceipt(input: AppendCapabilityReceiptInput): CapabilityReceipt;
   appendCapabilityTerminalOutcome(input: AppendCapabilityTerminalInput): boolean;
@@ -4784,6 +4802,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly controllerInteractionRepository: ControllerInteractionRepository;
   private readonly credentialAccessRepository: CredentialAccessRepository;
   private readonly stageExecutionRepository: StageExecutionRepository;
+  private readonly referenceRepository: ReferenceRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -4798,6 +4817,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.controllerEvidenceRepository = new ControllerEvidenceRepository(db, clock);
     this.credentialAccessRepository = new CredentialAccessRepository(db);
     this.stageExecutionRepository = new StageExecutionRepository(db);
+    this.referenceRepository = new ReferenceRepository(db);
   }
 
   public reconcileCredentialHealth(input: CredentialHealthReconcileInput): CredentialHealthReconcileResult {
@@ -4857,6 +4877,34 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getCredentialHealth(installationId: string): CredentialHealthRecord | null {
     return this.credentialAccessRepository.getCredentialHealth(installationId);
+  }
+
+  public saveReferenceDocument(input: SaveReferenceDocumentInput): SaveReferenceDocumentResult {
+    return this.referenceRepository.saveReferenceDocument(input);
+  }
+
+  public listReferenceDocuments(projectId: string | null): readonly ReferenceDocumentRecord[] {
+    return this.referenceRepository.listReferenceDocuments(projectId);
+  }
+
+  public searchReferencePassages(input: {
+    query: string;
+    projectId: string | null;
+    limit?: number;
+  }): readonly ReferencePassageRecord[] {
+    return this.referenceRepository.searchReferencePassages(input);
+  }
+
+  public getReferencePassage(id: string): ReferencePassageRecord | null {
+    return this.referenceRepository.getReferencePassage(id);
+  }
+
+  public listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[] {
+    return this.referenceRepository.listReferenceChanges(documentId, version);
+  }
+
+  public deleteReferenceDocument(id: string): boolean {
+    return this.referenceRepository.deleteReferenceDocument(id);
   }
 
   public createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile {

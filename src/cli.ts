@@ -17,6 +17,7 @@ import {
   type OwnerMemoryImportInput,
   type TelegramAgentStore,
 } from "./storage/store";
+import { MAX_REFERENCE_SEARCH_RESULTS } from "./storage/reference-repository";
 import { summariseStageSpend } from "./storage/stage-execution-repository";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { projectResourceWait } from "./storage/autonomy-repository";
@@ -158,6 +159,13 @@ const ACCESS_LIST_FLAGS: Record<string, FlagSpec> = {
   limit: { kind: "value" },
 };
 const ACCESS_STATUS_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+const REFERENCE_SEARCH_FLAGS: Record<string, FlagSpec> = {
+  json: JSON_FLAG,
+  project: { kind: "value" },
+  limit: { kind: "value" },
+};
+const REFERENCE_LIST_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG, project: { kind: "value" } };
+const REFERENCE_SHOW_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
 
 const MAX_COLLECTION_SIZE = 100;
 const MAX_ACCESS_LIST_LIMIT = 10;
@@ -1341,6 +1349,65 @@ async function runAccess(
   throw new CliInputError(`Unknown access subcommand ${subcommand}`);
 }
 
+/**
+ * How a pipeline worker reads the specification it is building against. It is a
+ * command rather than a tool because a worker is a separate BB thread that
+ * never opens this plugin's database, and rather than a file on disk because a
+ * second copy of a specification is a copy that drifts.
+ *
+ * Read-only by construction: there is no reference subcommand here that writes.
+ * Filing a document is the owner's act, through Telegram.
+ */
+async function runReference(
+  deps: TelegramAgentCliDependencies,
+  argv: readonly string[],
+): Promise<PluginCliResult> {
+  if (argv.length === 0) throw new CliInputError("reference requires a subcommand");
+  const subcommand = argv[0];
+  if (subcommand === "search") {
+    const parsed = parseFlags(argv.slice(1), REFERENCE_SEARCH_FLAGS);
+    const json = parsed.flags.has("json");
+    const query = onePositional(parsed, "query");
+    const limit = readOptionalInteger(parsed, "limit", "--limit", 1, MAX_REFERENCE_SEARCH_RESULTS)
+      ?? MAX_REFERENCE_SEARCH_RESULTS;
+    const passages = deps.store.searchReferencePassages({
+      query,
+      projectId: parsed.values.get("project") ?? null,
+      limit,
+    });
+    return success(
+      { passages },
+      passages.length === 0
+        ? "no matching passage"
+        : passages.map((passage) =>
+          `${passage.id}\t${passage.documentTitle}\t${passage.sectionPath}\n${passage.body}`).join("\n\n"),
+      json,
+    );
+  }
+  if (subcommand === "show") {
+    const parsed = parseFlags(argv.slice(1), REFERENCE_SHOW_FLAGS);
+    const json = parsed.flags.has("json");
+    const passage = deps.store.getReferencePassage(onePositional(parsed, "passage-id"));
+    if (passage === null) throw new CliOperationError("No such passage");
+    return success(passage, `${passage.documentTitle}\t${passage.sectionPath}\n${passage.body}`, json);
+  }
+  if (subcommand === "list") {
+    const parsed = parseFlags(argv.slice(1), REFERENCE_LIST_FLAGS);
+    const json = parsed.flags.has("json");
+    noPositionals(parsed);
+    const documents = deps.store.listReferenceDocuments(parsed.values.get("project") ?? null);
+    return success(
+      { documents },
+      documents.length === 0
+        ? "no reference document"
+        : documents.map((document) =>
+          `${document.title}\t${document.scope}\tv${document.version}\t${document.map.length} sections`).join("\n"),
+      json,
+    );
+  }
+  throw new CliInputError(`Unknown reference subcommand ${subcommand}`);
+}
+
 function capabilityRecipe(value: string, label: string): TaskRecipe {
   if (!(TASK_RECIPES as readonly string[]).includes(value)) {
     throw new CliInputError(`${label} must be one of ${RECIPE_PROMOTION_ORDER.join(", ")}`);
@@ -1590,6 +1657,7 @@ export async function runTelegramAgentCli(
     if (command === "job") return await runJob(deps, argv.slice(1));
     if (command === "capability") return await runCapability(deps, argv.slice(1));
     if (command === "access") return await runAccess(deps, argv.slice(1));
+    if (command === "reference") return await runReference(deps, argv.slice(1));
     if (command === "doctor") {
       const parsed = parseFlags(argv.slice(1), DOCTOR_FLAGS);
       if (parsed.positionals.length > 1) throw new CliInputError("doctor accepts at most one project-id");

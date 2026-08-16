@@ -23,6 +23,7 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, readonly ControllerProofKind[]> 
   execution_result: ["command_result", "tool_result"],
   workspace_change: ["workspace_change"],
   external_mutation: ["external_mutation"],
+  external_reading: ["retrieved_content"],
   pipeline_outcome: ["pipeline_outcome", "production_outcome"],
   health_assessment: ["health_snapshot"],
   uncertainty: CONTROLLER_PROOF_KINDS,
@@ -120,6 +121,7 @@ describe("controller finalization public contract", () => {
       "execution_result",
       "workspace_change",
       "external_mutation",
+      "external_reading",
       "pipeline_outcome",
       "health_assessment",
       "uncertainty",
@@ -808,6 +810,28 @@ describe("claim proof compatibility", () => {
       evidenceRow("evidence:1", "command_result", "succeeded"),
       evidenceRow("evidence:2", "tool_result", "succeeded", "job:someone_else"),
     ), "subject_mismatch");
+  });
+
+  // The generated matrix above derives from this file's own copy of
+  // CLAIM_PROOFS, so widening `observed_state` in both places would turn a
+  // rejection into an acceptance with every test still green. This states the
+  // prohibition directly, so that edit fails saying what it broke.
+  it("never lets an outside reading back a claim about our own systems", () => {
+    const ownSystemKinds = [
+      "observed_state",
+      "execution_result",
+      "workspace_change",
+      "external_mutation",
+      "pipeline_outcome",
+      "health_assessment",
+    ] as const satisfies readonly ControllerClaimKind[];
+    for (const kind of ownSystemKinds) {
+      expectRejection(
+        claimFinalization({ kind, outcome: "uncertain" }),
+        contextWithEvidence(evidenceRow("evidence:1", "retrieved_content")),
+        "proof_incompatible",
+      );
+    }
   });
 });
 

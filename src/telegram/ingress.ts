@@ -41,6 +41,20 @@ import { TelegramRequestError } from "./client";
 import { TelegramApiError } from "./errors";
 import { MAX_CONTROLLER_IMAGE_BYTES, isMotionMedia } from "../controller/models";
 import { captionlessPromptFor, clipTooLargeForDownload, controllerImageFromMessage } from "./image";
+import { withAbortDeadline } from "../async";
+import {
+  MAX_CONTROLLER_VOICE_BYTES,
+  controllerVoiceFromMessage,
+  voiceTooLargeToTranscribe,
+  voiceUnavailableNotice,
+  type ControllerVoiceNote,
+  type VoiceTranscriber,
+} from "./voice";
+
+/** Telegram's own file endpoint; slow enough to bound, never slow for a note. */
+const VOICE_DOWNLOAD_TIMEOUT_MS = 30_000;
+/** A transcriber that has not answered by now is not going to. */
+const VOICE_TRANSCRIBE_TIMEOUT_MS = 120_000;
 
 export type TelegramIngressTransport = {
   sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }>;
@@ -75,6 +89,15 @@ export type TelegramIngressOptions = {
   mergeHandler?: Pick<MergeHandler, "handleApprovalCallback">;
   onWorkAvailable?: () => void;
   health?: (now: number) => HealthReport;
+  /**
+   * Absent means this install cannot hear a voice note, and the owner is told
+   * so rather than left with silence. Download and transcription are separate
+   * because only the second one depends on BB having a voice service.
+   */
+  voice?: {
+    download(fileId: string, maxBytes: number, signal: AbortSignal): Promise<Uint8Array>;
+    transcribe: VoiceTranscriber;
+  };
 };
 
 const PRIVATE_ID = /^[1-9][0-9]*$/;
@@ -191,6 +214,7 @@ export class TelegramIngress {
   private readonly mergeHandler: Pick<MergeHandler, "handleApprovalCallback"> | null;
   private readonly onWorkAvailable: () => void;
   private readonly health: ((now: number) => HealthReport) | null;
+  private readonly voice: TelegramIngressOptions["voice"] | null;
 
   public constructor(options: TelegramIngressOptions);
   public constructor(store: TelegramAgentStore, telegram: TelegramIngressTransport);
@@ -205,6 +229,7 @@ export class TelegramIngress {
       this.mergeHandler = optionsOrStore.mergeHandler ?? null;
       this.onWorkAvailable = optionsOrStore.onWorkAvailable ?? (() => undefined);
       this.health = optionsOrStore.health ?? null;
+      this.voice = optionsOrStore.voice ?? null;
     } else {
       if (!telegram) throw new TypeError("Telegram ingress requires a Telegram client");
       this.store = optionsOrStore;
@@ -213,6 +238,7 @@ export class TelegramIngress {
       this.mergeHandler = null;
       this.onWorkAvailable = () => undefined;
       this.health = null;
+      this.voice = null;
     }
   }
 
@@ -238,10 +264,14 @@ export class TelegramIngress {
   ): Promise<TelegramIngressOutcome | void> {
     const identity = privateHumanIdentity(message.from, message.chat);
     const image = controllerImageFromMessage(message);
+    const voiceNote = controllerVoiceFromMessage(message);
     const text = message.text ?? (image ? message.caption ?? captionlessPromptFor(image) : undefined);
-    if (text === undefined) return;
+    // A recording carries no text yet, so it is the one message shape allowed
+    // past here without one. Its words arrive below, after the sender is known
+    // to be the owner: transcription is work, and a stranger does not get it.
+    if (text === undefined && voiceNote === null) return;
 
-    const pairingCode = this.pairingCode(text);
+    const pairingCode = text === undefined ? null : this.pairingCode(text);
     if (pairingCode !== null) {
       if (!identity) {
         this.audit("unauthorized_message", updateId, message.from, message.chat);
@@ -274,7 +304,18 @@ export class TelegramIngress {
       await this.sendPlain(identity.chatId, "That clip is larger than Telegram lets me download. Please send a shorter video, a GIF, or a few screenshots.");
       return;
     }
-    const normalized = boundedText(text);
+    const spoken = voiceNote === null ? undefined : await this.transcribeVoiceNote(voiceNote, identity.chatId);
+    if (voiceNote !== null && spoken === undefined) return;
+    // A caption sent alongside a recording is the owner narrowing what they
+    // meant, so it leads rather than being replaced by the transcript.
+    const said = spoken === undefined
+      ? text
+      : message.caption
+        ? `${message.caption}\n\n${spoken}`
+        : spoken;
+    if (said === undefined) return;
+
+    const normalized = boundedText(said);
     if (normalized === null) return;
 
     const commandMatch = /^\/(\w+)(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?$/.exec(normalized);
@@ -934,6 +975,53 @@ export class TelegramIngress {
 
   private async sendPlain(chatId: string, text: string): Promise<void> {
     await this.telegram.sendMessage(chatId, { text, disable_web_page_preview: true });
+  }
+
+  /**
+   * The owner's words, or undefined once they have been told why there are
+   * none. Every failure here is answered in the chat: a recording that vanishes
+   * silently is worse than one that cannot be read, because the owner has no
+   * way to tell the difference between ignored and unheard.
+   */
+  private async transcribeVoiceNote(
+    note: ControllerVoiceNote,
+    chatId: string,
+  ): Promise<string | undefined> {
+    if (!this.voice) {
+      await this.sendPlain(chatId, voiceUnavailableNotice("no_service"));
+      return undefined;
+    }
+    if (voiceTooLargeToTranscribe(note)) {
+      await this.sendPlain(chatId, voiceUnavailableNotice("too_large"));
+      return undefined;
+    }
+    const voice = this.voice;
+    let bytes: Uint8Array;
+    try {
+      bytes = await withAbortDeadline(
+        new AbortController().signal,
+        VOICE_DOWNLOAD_TIMEOUT_MS,
+        (signal) => voice.download(note.fileId, MAX_CONTROLLER_VOICE_BYTES, signal),
+      );
+    } catch {
+      await this.sendPlain(chatId, voiceUnavailableNotice("unreadable"));
+      return undefined;
+    }
+    let transcript: string | null;
+    try {
+      transcript = await withAbortDeadline(
+        new AbortController().signal,
+        VOICE_TRANSCRIBE_TIMEOUT_MS,
+        (signal) => voice.transcribe({ bytes, mimeType: note.mimeType, signal }),
+      );
+    } catch {
+      transcript = null;
+    }
+    if (transcript === null) {
+      await this.sendPlain(chatId, voiceUnavailableNotice("empty"));
+      return undefined;
+    }
+    return transcript;
   }
 
   private setStatusMessageAndOutbox(
