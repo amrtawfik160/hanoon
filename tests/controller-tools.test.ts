@@ -285,7 +285,10 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // watch now distinguishes tool-created watches from evidence-backed CLI work.
   // Re-pinned again when send_to_thread gained the required `ask`: the owner
   // cannot see the threads, so messaging one now carries the line he is told.
-  expect(digest).toBe("82ba814cc6a30b0b338a7f02df6793cf40e21e3cfbf06e7a218583a0be937eee");
+  // Re-pinned again when retry_job began reporting `retryOutcome`: a queued
+  // retry leaves the job unchanged, so the description now tells the agent to
+  // read the outcome rather than read an unchanged job as a failed retry.
+  expect(digest).toBe("0f5e560ddd7a1a65ef70cb16f5341a41173eb53317e7bdf5222e5a9958bd7d18");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -2736,4 +2739,107 @@ it("retries a blocked plan and cancels a blocked job from the controller", async
     controllerToolContext,
   )) as { job: { state: string; cancelRequested: boolean } };
   expect(cancelled.job.cancelRequested).toBe(true);
+});
+
+it("tells the controller a retry is parked behind the failure brake, not resumed", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_300,
+  });
+  const created = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_start_job",
+    { projectId: "proj_1", task: "finish the adopted pull request" },
+    controllerToolContext,
+  )) as { job: { id: string } };
+  const db = bb.storage.database();
+  db.prepare(
+    `UPDATE jobs SET state = 'blocked', blocked_reason = 'permanent_effect_failure',
+       resume_state = 'creating_implementation', last_error = 'spawn_implementation gave up' WHERE id = ?`,
+  ).run(created.job.id);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = 'blocked' WHERE job_id = ?")
+    .run(10_250, created.job.id);
+  expect(store.pauseProjectAdmission({
+    projectId: "proj_1",
+    reason: "four jobs failed the same way",
+    fingerprint: "proj_1:permanent_effect_failure",
+    now: 10_260,
+  })).toBe(true);
+  const before = store.getJob(created.job.id)!;
+
+  const retried = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_retry_job",
+    { jobId: created.job.id },
+    controllerToolContext,
+  )) as { job: { state: string; updatedAt: number }; retryOutcome: string };
+
+  // The job is deliberately untouched here, which is exactly why the caller has
+  // to be told the difference between "resumed" and "queued behind a brake".
+  expect(retried.job).toMatchObject({ state: before.state, updatedAt: before.updatedAt });
+  expect(retried.retryOutcome).toBe("queued_project_paused");
+  expect(store.getAdmission(created.job.id)?.resumeEvent).toBe("RETRY");
+});
+
+it("distinguishes a retry merely queued from one held by the failure brake", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_300,
+  });
+  const created = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_start_job",
+    { projectId: "proj_1", task: "finish the adopted pull request" },
+    controllerToolContext,
+  )) as { job: { id: string } };
+  const db = bb.storage.database();
+  db.prepare(
+    `UPDATE jobs SET state = 'blocked', blocked_reason = 'permanent_effect_failure',
+       resume_state = 'creating_implementation', last_error = 'Attempt was not stored' WHERE id = ?`,
+  ).run(created.job.id);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = 'blocked' WHERE job_id = ?")
+    .run(10_250, created.job.id);
+
+  const retried = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_retry_job",
+    { jobId: created.job.id },
+    controllerToolContext,
+  )) as { retryOutcome: string };
+
+  // No brake here, so this retry is genuinely waiting its turn rather than
+  // parked forever. Reporting it as paused would send the owner after a brake
+  // that does not exist.
+  expect(retried.retryOutcome).toBe("queued");
+  expect(store.getAdmission(created.job.id)?.resumeEvent).toBe("RETRY");
+});
+
+it("reports a retry the state machine actually applied as resumed", async () => {
+  const { bb, harness, store, activate, deactivate } = fixture({ active: true });
+  deactivate();
+  queueControllerCandidate(store, "job_resumed_retry", "proj_resumed", "failed");
+  activate();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_300,
+  });
+
+  const retried = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_retry_job",
+    { jobId: "job_resumed_retry" },
+    controllerToolContext,
+  )) as { job: { state: string }; retryOutcome: string };
+
+  expect(retried.retryOutcome).toBe("resumed");
+  expect(retried.job.state).not.toBe("failed");
 });

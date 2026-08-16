@@ -657,7 +657,14 @@ export type ExecutorAttemptInput = ExecutorFence & Readonly<{
   id: string;
   jobId: string;
   kind: AttemptRecord["kind"];
-  ordinal: number;
+  /**
+   * `"next"` allocates the next free ordinal for this job and kind inside the
+   * insert's own transaction. Review attempts pass a number because their
+   * ordinal is the review cycle and sibling lenses deliberately share it;
+   * implementation attempts have no such meaning to carry, so they must not
+   * pick a number outside the transaction that enforces its uniqueness.
+   */
+  ordinal: number | "next";
   headSha?: string | null;
   reviewLens?: AttemptRecord["reviewLens"];
   reviewStage?: AttemptRecord["reviewStage"];
@@ -11509,7 +11516,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public createExecutorAttempt(input: ExecutorAttemptInput): AttemptRecord | null {
     this.assertExecutorFence(input);
     if (!input.id || !input.jobId) throw new TypeError("attempt identity is required");
-    if (!Number.isInteger(input.ordinal) || input.ordinal < 1) {
+    if (input.ordinal !== "next" && (!Number.isInteger(input.ordinal) || input.ordinal < 1)) {
       throw new TypeError("attempt ordinal must be a positive integer");
     }
     if (input.headSha !== undefined && input.headSha !== null) assertFullSha(input.headSha, "headSha");
@@ -11522,6 +11529,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       : null;
     const create = this.db.transaction((): AttemptRecord | null => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
+      // Replaying one effect must reuse its own row rather than claim a second
+      // ordinal, so an existing id settles the ordinal before allocation does.
+      const replayed = this.getAttempt(input.id);
+      const ordinal = replayed?.ordinal
+        ?? (input.ordinal === "next" ? this.nextAttemptOrdinal(input.jobId, input.kind) : input.ordinal);
       this.db
         .prepare(
           `INSERT OR IGNORE INTO attempts (
@@ -11534,17 +11546,21 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           input.kind,
           reviewLens,
           reviewStage,
-          input.ordinal,
+          ordinal,
           input.headSha ?? null,
           input.now,
         );
       const stored = this.getAttempt(input.id);
-      if (!stored) throw new Error("Attempt was not stored");
+      // The insert is ignored when another row already holds this ordinal, so a
+      // missing row means a conflicting attempt owns it. That can never be
+      // resolved by trying again: report it as the permanent conflict it is
+      // rather than as a transient failure worth twenty more minutes of retries.
+      if (!stored) throw new IdempotencyConflictError(ordinal);
       if (
-        stored.jobId !== input.jobId || stored.kind !== input.kind || stored.ordinal !== input.ordinal ||
+        stored.jobId !== input.jobId || stored.kind !== input.kind || stored.ordinal !== ordinal ||
         stored.reviewLens !== reviewLens || stored.reviewStage !== reviewStage
       ) {
-        throw new IdempotencyConflictError(input.ordinal);
+        throw new IdempotencyConflictError(ordinal);
       }
       return stored;
     });
