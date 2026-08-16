@@ -35,11 +35,19 @@ export const DISK_STARTUP_DELAY_MS = 5 * 60_000;
 export const DISK_NOTICE_DEDUP_MS = 24 * 60 * 60_000;
 
 /**
- * Most one pass will remove. A leak measured in hundreds of thousands is worth
- * several days of visible, bounded progress rather than one unlink storm that
- * holds the executor for hours the first time it runs.
+ * Most one pass will remove.
+ *
+ * Two costs pull against each other. A leak is measured in thousands, so a
+ * bound low enough to be gentle takes weeks to drain one — 12,000 directories
+ * were still on this machine the morning after the incident, which at 500 a day
+ * is most of a month. Against that, each removal is one small directory, so a
+ * few thousand of them is seconds of I/O rather than the hours a full leak
+ * would take.
+ *
+ * So: a few days to drain a real backlog, and never an unlink storm holding the
+ * executor the first time it runs.
  */
-export const DISK_RECLAIM_BATCH = 500;
+export const DISK_RECLAIM_BATCH = 2_000;
 
 export type TempDirectoryAccess = {
   /** One level of the temp root. Never recursive: only the top names matter. */
