@@ -171,14 +171,19 @@ const REASON_WORDS: Record<ThreadStallReason, string> = {
  */
 export function threadStallNotice(input: Readonly<{
   threadId: string;
-  title: string;
+  /** Null for a watch, which stores no title; the agent reads one from the thread. */
+  title: string | null;
   instruction: string;
   verdict: ThreadStallVerdict;
   quietForMs: number;
 }>): string {
   const minutes = Math.round(input.quietForMs / 60_000);
-  return "A thread you delegated work to has stopped making progress.\n\n" +
-    `Thread: ${input.title} (${input.threadId})\n` +
+  const where = input.title === null ? input.threadId : `${input.title} (${input.threadId})`;
+  // Neutral about how the thread came to be watched: a watch can follow work
+  // the agent started or work the owner did, and claiming it was delegated
+  // would be false half the time.
+  return "A thread you are following has stopped making progress.\n\n" +
+    `Thread: ${where}\n` +
     `What you asked for: ${input.instruction}\n` +
     `What it looks like: ${REASON_WORDS[input.verdict.reason]}, for about ${minutes} minutes.\n\n` +
     "Read the thread before you decide anything: what it is doing now, what it last said, and whether it is " +

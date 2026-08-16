@@ -303,3 +303,121 @@ it("declines a courtesy watch at the armed cap rather than failing the action", 
     mode: "courtesy",
   })).toBeNull();
 });
+
+/** A thread stuck like the real one found wedged at `stopping` for eleven days. */
+function wedged(quietForMs: number) {
+  return {
+    status: "stopping",
+    runtimeStatus: "stopping",
+    startedAt: NOW - quietForMs,
+    updatedAt: NOW - quietForMs,
+    hasPendingInteraction: false,
+    hostReconnectGraceExpiresAt: null,
+  };
+}
+
+function watchingService(
+  store: ReturnType<typeof openStore>,
+  observe: () => Promise<ReturnType<typeof wedged> | null>,
+  now = () => NOW,
+) {
+  return new MonitorService({
+    store,
+    threads: { status: async () => "active" as const, output: async () => "", observe },
+    clock: { now },
+  });
+}
+
+function armWatch(store: ReturnType<typeof openStore>, instruction: string) {
+  store.createMonitor({
+    controllerKey: CONTROLLER_KEY,
+    kind: "thread_idle",
+    threadId: "thr_wedged",
+    instruction,
+    dueAt: null,
+    now: NOW,
+  });
+}
+
+it("reports a watched thread that wedged instead of ever settling", async () => {
+  // A watch fires on idle, error, or missing. A wedged thread reaches none of
+  // them, so before this the watch stayed armed and silent forever.
+  const { store } = fixture();
+  armWatch(store, "Tell me when the deploy lands.");
+
+  await expect(watchingService(store, async () => wedged(3 * 60 * 60_000)).processDue()).resolves.toBe(true);
+
+  const turns = store.listControllerTurns(CONTROLLER_KEY, 10);
+  expect(turns).toHaveLength(1);
+  expect(turns[0]?.inputText).toContain("stopped making progress");
+  expect(turns[0]?.inputText).toContain("thr_wedged");
+  expect(turns[0]?.inputText).toContain("Tell me when the deploy lands.");
+});
+
+it("leaves the watch armed so a wedged thread that recovers still reports", async () => {
+  const { store } = fixture();
+  armWatch(store, "Tell me when it lands.");
+
+  await watchingService(store, async () => wedged(3 * 60 * 60_000)).processDue();
+
+  expect(store.listArmedMonitors(10)).toHaveLength(1);
+});
+
+it("reports one stall per watch rather than one per sweep", async () => {
+  const { store } = fixture();
+  armWatch(store, "Tell me when it lands.");
+  let at = NOW;
+  const monitor = watchingService(store, async () => wedged(3 * 60 * 60_000), () => at);
+
+  for (let sweep = 0; sweep < 4; sweep += 1) {
+    await monitor.processDue();
+    at += 5 * 60_000;
+  }
+
+  expect(store.listControllerTurns(CONTROLLER_KEY, 10)).toHaveLength(1);
+});
+
+it("says nothing about a watched thread that is merely working", async () => {
+  const { store } = fixture();
+  armWatch(store, "Tell me when it lands.");
+
+  await expect(watchingService(store, async () => ({
+    ...wedged(60_000),
+    status: "active",
+    runtimeStatus: "active",
+  })).processDue()).resolves.toBe(false);
+
+  expect(store.listControllerTurns(CONTROLLER_KEY, 10)).toHaveLength(0);
+});
+
+it("does not spend a BB round-trip per watch on every executor tick", async () => {
+  const { store } = fixture();
+  armWatch(store, "Tell me when it lands.");
+  let at = NOW;
+  const observe = vi.fn(async () => wedged(3 * 60 * 60_000));
+  const monitor = new MonitorService({
+    store,
+    threads: { status: async () => "active" as const, output: async () => "", observe },
+    clock: { now: () => at },
+  });
+
+  await monitor.processDue();
+  at += 1_000;
+  await monitor.processDue();
+  at += 1_000;
+  await monitor.processDue();
+
+  expect(observe).toHaveBeenCalledTimes(1);
+});
+
+it("treats an unreadable thread as no evidence of a stall", async () => {
+  const { store } = fixture();
+  armWatch(store, "Tell me when it lands.");
+
+  await expect(watchingService(store, async () => {
+    throw new Error("host is unreachable");
+  }).processDue()).resolves.toBe(false);
+
+  expect(store.listControllerTurns(CONTROLLER_KEY, 10)).toHaveLength(0);
+  expect(store.listArmedMonitors(10)).toHaveLength(1);
+});

@@ -64,6 +64,9 @@ flowchart LR
     Patch --> Test
     Critique -->|limit| Blocked
     Patch -->|cycle limit| Blocked
+    Blocked -->|sweep resumes a plan block| Plan
+    Blocked -->|sweep resumes a review block| Review
+    Blocked -->|ladder spent| Owner[Owner is told]
 ```
 
 The planner writes a bounded plan artifact. Its verification section must reproduce the policy's exact commands in a table that expects exit code `0`, or use the exact explicit-skip line when the policy has no commands. The critic receives the work order and plan as immutable project attachments in a fresh BB thread. The implementation worker receives the accepted plan without inheriting the planner's provider conversation.
@@ -71,6 +74,14 @@ The planner writes a bounded plan artifact. Its verification section must reprod
 After implementation produces a pull request, deterministic validation runs before fresh review threads are spawned in the same BB environment. Full jobs require independent quality and risk verdicts; small fixes require only the quality verdict. The group cannot advance until every required lens has durable evidence for the exact head. A reviewer never forks or resumes the implementation conversation. A changes-requested verdict returns bounded findings to the implementation thread; a new pull-request head requires new validation and another fresh review group.
 
 Documentation, final validation, and final review happen before the owner receives a one-use merge approval when production is configured. Documentation may be skipped only with a strict report and an observed clean, empty documentation diff. If production is not configured, a successful final review completes the job at the reviewed pull request. A small-fix job skips planning, critique, documentation, and final review, but still must pass deterministic validation and one independent quality review. An adopted pull request records planning and critique as honestly skipped after verifying its repository, base branch, URL, remote head, and deterministic local branch, then enters the normal full validation/review/finish path. Merge, deploy, and canary each produce separate durable receipts. A successful merge followed by a failed deploy or canary is recorded as `production_failed`; the plugin does not claim completion. It runs the policy's rollback command when one is configured, in the failing stage, before reporting.
+
+### Carrying a blocked job onward
+
+Every recoverable block already had a resume path in the state machine, but nothing walked it: the owner was the scheduler, and a job that hit one bad minute waited for a tap that might never come. A sweep now decides, for each blocked job, whether it can be driven on, and applies the same guarded `RETRY` or `CONTINUE_REVIEW` the owner's own buttons use. An automatic push therefore cannot reach a state a manual retry could not.
+
+The ladder is bounded at three attempts against the same block, counted per block rather than per job, so a job that clears one wall and stops at a later one arrives with a full allowance. When the ladder is spent the owner is told once, in plain language, and the job stops being re-decided. Merge and production promotion still need the owner's one-use approval; the sweep never drives past that boundary, nor past an unconfirmed cancellation or a project configuration gap it cannot fix.
+
+Effects that only redraw state the job already holds cannot end a job. A status card that fails to deliver, whether dead-lettered outright or out of retries, is a display problem: blocking the work over it loses real progress and tells the owner nothing, because the block enqueues another status render that fails the same way.
 
 ## Adaptive capability control plane
 
@@ -215,6 +226,8 @@ Restating a subject supersedes its predecessor instead of overwriting it, so cor
 
 A monitor is a durable obligation, not a reminder. It watches a BB thread for completion or failure, or fires on a cron schedule. Thread watches are event-driven: BB realtime and lifecycle events wake the executor instead of waiting for the next idle poll. Firing is claimed before it happens, so a crash mid-fire cannot double-book it; a one-shot watch retires and a schedule re-arms for its next occurrence. The agent receives its own instruction back as an ordinary turn, acts on it, and reports to the owner. Schedules are for clock time, not for polling whether a thread or job has moved.
 
+A watch fires on `idle`, `error`, or `missing`. A thread that wedges reaches none of them — stuck provisioning, quiet for hours, or on a machine that never came back — so a watch alone would stay armed and silent over it forever, and work the agent started would simply be forgotten. Each armed watch is therefore also checked for a stall, on the same read-only three-level verdict the delegation join uses, and a stalled thread is reported to the agent once. The watch stays armed: the thread may still land, and this is a nudge to go and look, not a ruling that the work is over. Observing costs BB round-trips and the sweep runs on every executor tick, so the check is paced well inside the stall threshold rather than run every pass.
+
 Visible-thread follow-up currently has two paths. Starting or messaging a thread tries to arm one best-effort courtesy monitor for it; a later explicit watch reuses that row and replaces its instruction. A new thread watch holds for a settling minute, and reaching the armed-monitor cap declines only the courtesy monitor rather than the action that prompted it. Independently, lifecycle observation treats an exact `thread:<id>` reference in durable controller evidence as engagement and can enqueue a follow-up when no monitor owns the landing. This inferred obligation has no monitor row, is absent from monitor listings, and does not consume the armed-monitor cap; read-only thread list and status evidence currently qualifies. Delegated fan-outs use their join record instead of one watch per member.
 
 ## Thread notices
@@ -272,6 +285,8 @@ An owner-visible reply is one accepted structured finalization, plus what the co
 Memory only grew when the agent chose to write something down, which meant it never learned the things it most needed: that a check always fails here for a known reason, that a repo enforces a convention, that work keeps going wrong in the same place.
 
 A finished job is where those lessons live, so it is the one place the plugin spends inference of its own. When a job reaches a genuinely terminal outcome — merged, complete, blocked, or production-failed — it is enrolled for a single extraction. **`failed` is deliberately excluded: a failed job is still retryable, and a lesson drawn from an attempt that later succeeds is a wrong lesson.**
+
+For the same reason, a `blocked` job counts as terminal only once nothing will resume it. Plan-limit and review-limit blocks never enrol, and a dead-lettered-effect block waits until the continuation sweep has spent its ladder and handed the job to the owner.
 
 Enrolment scans for terminal jobs that have never been learned from rather than firing at the transition. That leaves the job state machine untouched and makes enrolment self-healing: a job finished during a restart is picked up on the next pass.
 

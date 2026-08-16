@@ -42,6 +42,7 @@ export type MonitorServiceDependencies = {
     | "getDelegation"
     | "settleDelegationThread"
     | "claimDelegationThreadStall"
+    | "claimMonitorStall"
     | "recordDelegationFired"
     | "failDelegation"
   >;
@@ -58,6 +59,13 @@ const DELEGATION_BATCH = 10;
 export const DELEGATION_JOIN_TIMEOUT_MS = 6 * 60 * 60_000;
 const MAX_JOINED_PROMPT = 3_500;
 export const DELEGATION_SWEEP_MS = 15_000;
+/**
+ * How often a watched thread is checked for a stall. Observing costs two BB
+ * round-trips per armed watch, and `processDue` runs on every executor tick, so
+ * an unpaced check would spend far more on watching than on working. Two
+ * minutes against a 45-minute stall threshold detects the same stalls.
+ */
+export const WATCH_STALL_SWEEP_MS = 2 * 60_000;
 // Firing enqueues an ordinary controller turn, which is keyed by Telegram update
 // id. Ids are derived from the clock so they stay above real Telegram ids
 // (~2.2e8) and keep climbing across restarts, and a counter breaks same-
@@ -122,6 +130,7 @@ export class MonitorService {
   /** Negative infinity, not 0: the first sweep must never be gated by how
    *  close the clock happens to be to the epoch. */
   private lastDelegationSweep = Number.NEGATIVE_INFINITY;
+  private lastWatchStallSweep = Number.NEGATIVE_INFINITY;
 
   public constructor(private readonly dependencies: MonitorServiceDependencies) {}
 
@@ -135,6 +144,9 @@ export class MonitorService {
     const owner = this.dependencies.store.getOwner();
     if (!owner) return false;
     const monitors = this.dependencies.store.listArmedMonitors(MONITOR_BATCH);
+    const sweepAt = this.dependencies.clock.now();
+    const stallSweepDue = sweepAt - this.lastWatchStallSweep >= WATCH_STALL_SWEEP_MS;
+    if (stallSweepDue) this.lastWatchStallSweep = sweepAt;
     let fired = false;
     for (const monitor of monitors) {
       const now = this.dependencies.clock.now();
@@ -145,11 +157,64 @@ export class MonitorService {
         this.dependencies.warn?.(`Monitor ${monitor.id} could not be checked: ${redactError(error).slice(0, 200)}`);
         continue;
       }
-      if (reason === null) continue;
+      if (reason === null) {
+        // Not settled — but a thread that wedges never will be, and the watch
+        // would stay armed and silent over it forever.
+        if (stallSweepDue) fired = await this.escalateStalledWatch(monitor, owner, now) || fired;
+        continue;
+      }
       if (!this.fire(monitor, reason, owner, now)) continue;
       fired = true;
     }
     return fired;
+  }
+
+  /**
+   * Reports a watched thread that has stopped making progress without reaching
+   * a status its watch could fire on. The watch is deliberately left armed: the
+   * thread may still land, and this is a nudge to go and look, not a verdict
+   * that the work is over.
+   */
+  private async escalateStalledWatch(
+    monitor: MonitorRecord,
+    owner: { userId: string; chatId: string },
+    now: number,
+  ): Promise<boolean> {
+    if (monitor.kind !== "thread_idle" || !monitor.threadId) return false;
+    if (monitor.stallNotifiedAt !== null) return false;
+    if (!this.dependencies.threads.observe) return false;
+    let observation: DelegatedThreadObservation | null = null;
+    try {
+      observation = await this.dependencies.threads.observe(monitor.threadId);
+    } catch (error) {
+      // Unreadable is not evidence of a stall, and one unobservable thread must
+      // not cost the rest of the sweep.
+      this.dependencies.warn?.(
+        `Watched thread ${monitor.threadId} could not be observed: ${redactError(error).slice(0, 200)}`,
+      );
+      return false;
+    }
+    const verdict = classifyThreadStall({ observation, now });
+    if (verdict.level !== "stalled") return false;
+    // Claim first: a crash between the message and the mark would replay it.
+    if (!this.dependencies.store.claimMonitorStall({ id: monitor.id, now })) return false;
+    this.dependencies.store.enqueueControllerTurn({
+      controllerKey: monitor.controllerKey,
+      telegramUserId: owner.userId,
+      telegramChatId: owner.chatId,
+      updateId: this.issueUpdateId(now),
+      inputText: threadStallNotice({
+        threadId: monitor.threadId,
+        // A watch stores no title, and the agent can read one from the thread.
+        title: null,
+        instruction: monitor.instruction,
+        verdict,
+        quietForMs: observation === null ? 0 : Math.max(0, now - observation.updatedAt),
+      }),
+      origin: "system",
+      now,
+    });
+    return true;
   }
 
   /**

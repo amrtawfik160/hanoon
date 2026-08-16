@@ -112,6 +112,7 @@ import { installSystemMonitors } from "./services/system-monitors";
 import { ProductionHealthService } from "./services/production-health-service";
 import { RegressionWatchService } from "./services/regression-watch-service";
 import { FailureLoopService } from "./services/failure-loop-service";
+import { JobContinuationService } from "./services/job-continuation-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
@@ -1188,6 +1189,16 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
     warn: (message) => bb.log.warn(message),
   });
+  const jobContinuation = new JobContinuationService({
+    store,
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    onWorkAvailable: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
   const diskHousekeeping = new DiskHousekeepingService({
     store,
     temp: {
@@ -2049,6 +2060,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       productionHealth,
       regressionWatch,
       failureLoop,
+      jobContinuation,
       diskHousekeeping,
       workspaceHousekeeping,
       audits,

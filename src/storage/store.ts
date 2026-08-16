@@ -149,6 +149,7 @@ import {
   type AdmissionAttemptInput,
   type ClaimAdoptionInput,
   type AdmissionWriteInput,
+  type JobContinuationCandidate,
 } from "./autonomy-repository";
 import {
   CapabilityRepository,
@@ -454,6 +455,8 @@ export type MonitorRecord = {
   fireCount: number;
   lastFiredAt: number | null;
   lastError: string | null;
+  /** When this watch's one stall report was sent, if its thread ever wedged. */
+  stallNotifiedAt: number | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -1283,6 +1286,13 @@ const FENCED_JOB_EVENT_TYPES: ReadonlySet<JobEvent["type"]> = new Set([
   "WORKER_RECOVERY_REQUESTED",
   "WORKER_RECOVERY_REQUEUED",
 ]);
+/**
+ * Effects that only redraw what the job already knows. They carry the pipeline
+ * nowhere, so exhausting their retries is a display problem, not grounds for
+ * abandoning the work: one job died to a Telegram 400 for a status card whose
+ * text had not changed.
+ */
+const COSMETIC_EFFECT_KINDS: ReadonlySet<string> = new Set(["render_status"]);
 const PRODUCTION_LIFECYCLE_EVENT_TYPES: ReadonlySet<JobEvent["type"]> = new Set([
   "DEPLOY_SUCCEEDED",
   "DEPLOY_FAILED",
@@ -3315,6 +3325,8 @@ export interface TelegramAgentStore {
     threadId: string;
     now: number;
   }): boolean;
+  /** The same claim for a watched thread that wedged instead of settling. */
+  claimMonitorStall(input: { id: string; now: number }): boolean;
   sealDelegation(input: { id: string; now: number }): boolean;
   recordDelegationFired(input: { id: string; now: number }): boolean;
   failDelegation(input: { id: string; error: string; now: number }): boolean;
@@ -3455,6 +3467,9 @@ export interface TelegramAgentStore {
   listCurrentHeldMergeResourceClaims(input: CurrentHeldMergeResourceClaimsInput): JobResourceClaim[];
   adoptHeldClaims(input: ClaimAdoptionInput): boolean;
   listActiveJobs(limit: number): Job[];
+  listContinuationCandidates(limit: number): JobContinuationCandidate[];
+  recordAutoContinue(input: { jobId: string; key: string; now: number }): void;
+  recordContinuationEscalation(input: { jobId: string; now: number }): void;
   findJobByStatusMessageId(messageId: number): Job | null;
   tryAdmit(input: AdmissionAttemptInput): AdmissionAttempt;
   applyJobEvent(jobId: string, expectedVersion: number, event: JobEvent, now: number): Job;
@@ -3988,6 +4003,7 @@ type MonitorRow = {
   fire_count: number;
   last_fired_at: number | null;
   last_error: string | null;
+  stall_notified_at: number | null;
   created_at: number;
   updated_at: number;
   system_key: string | null;
@@ -4184,6 +4200,7 @@ function parseMonitor(row: MonitorRow): MonitorRecord {
     fireCount: row.fire_count,
     lastFiredAt: row.last_fired_at,
     lastError: row.last_error,
+    stallNotifiedAt: row.stall_notified_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -9269,6 +9286,23 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).run(input.state, summary, input.now, input.delegationId, input.threadId).changes === 1;
   }
 
+  /**
+   * Claims the one stall report a watched thread gets. A watch fires only when
+   * its thread reaches idle, error, or missing; a thread that wedges reaches
+   * none of them, so without this the watch stays armed and silent forever and
+   * the agent never follows up on work it started.
+   */
+  public claimMonitorStall(input: { id: string; now: number }): boolean {
+    assertControllerIdentifier(input.id, "monitor id");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE monitors
+          SET stall_notified_at = ?, updated_at = ?
+        WHERE id = ? AND kind = 'thread_idle'
+          AND state = 'armed' AND stall_notified_at IS NULL`,
+    ).run(input.now, input.now, input.id).changes === 1;
+  }
+
   public claimDelegationThreadStall(input: {
     delegationId: string;
     threadId: string;
@@ -9343,6 +9377,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           -- live job, and enrolling it here would then bar the eventual merge
           -- — the outcome actually worth learning from — from ever enrolling.
           AND NOT (state = 'blocked' AND blocked_reason IN ('review_limit', 'plan_limit'))
+          -- Same reasoning, now that the continuation sweep resumes a
+          -- dead-lettered effect too. Such a job is only finished once the
+          -- ladder is spent and it has been handed to the owner.
+          AND NOT (state = 'blocked' AND blocked_reason = 'permanent_effect_failure'
+                   AND auto_continue_escalated_at IS NULL)
           AND id NOT IN (SELECT job_id FROM job_memory_extractions)
         ORDER BY updated_at ASC LIMIT ?`,
     ).all(...outcomes, limit) as { id: string; state: string; project_id: string }[];
@@ -10896,6 +10935,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.autonomyRepository.listActiveJobs(limit);
   }
 
+  public listContinuationCandidates(limit: number): JobContinuationCandidate[] {
+    return this.autonomyRepository.listContinuationCandidates(limit);
+  }
+
+  public recordAutoContinue(input: { jobId: string; key: string; now: number }): void {
+    this.autonomyRepository.recordAutoContinue(input);
+  }
+
+  public recordContinuationEscalation(input: { jobId: string; now: number }): void {
+    this.autonomyRepository.recordContinuationEscalation(input);
+  }
+
   public findJobByStatusMessageId(messageId: number): Job | null {
     return this.autonomyRepository.findJobByStatusMessageId(messageId);
   }
@@ -12325,7 +12376,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
                AND lease_generation = ? AND lease_expires_at > ?`,
           )
           .run(error, now, key, ownerId, generation, now);
-        if (updated.changes === 1) this.markJobPermanentFailure(effect.job_id, error, now);
+        if (updated.changes === 1) this.settleJobForDeadEffect(effect, error, now);
         return updated.changes === 1;
       }
       return this.db
@@ -12356,7 +12407,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
              AND lease_generation = ? AND lease_expires_at > ?`,
         )
         .run(status, error, nextAttemptAt, now, key, ownerId, generation, now);
-      if (updated.changes === 1 && status === "dead") this.markJobPermanentFailureFromOutbox(key, error, now);
+      // Exhausting 20 delivery attempts of a status card says Telegram is
+      // unreachable, not that the work is unsound. See `deadLetterOutbox`.
       return updated.changes === 1;
     }).immediate();
   }
@@ -12411,7 +12463,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
              AND lease_generation = ? AND lease_expires_at > ?`,
         )
         .run(error, now, key, ownerId, generation, now);
-      if (updated.changes === 1) this.markJobPermanentFailure(effect.job_id, error, now);
+      if (updated.changes === 1) this.settleJobForDeadEffect(effect, error, now);
       return updated.changes === 1;
     }).immediate();
   }
@@ -12431,7 +12483,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
              AND lease_generation = ? AND lease_expires_at > ?`,
         )
         .run(error, now, key, ownerId, generation, now);
-      if (updated.changes === 1) this.markJobPermanentFailureFromOutbox(key, error, now);
+      // The only job-bound outbox is the Telegram status card, which is a
+      // redraw of state the job already holds. Failing the job over it loses
+      // real work to a cosmetic delivery error, and tells the owner nothing:
+      // the block enqueues another status render, which fails the same way.
       return updated.changes === 1;
     }).immediate();
   }
@@ -14746,6 +14801,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       this.executorLeaseIsCurrent(ownerId, generation, now);
   }
 
+  /**
+   * An effect has just gone dead, either dead-lettered outright or out of
+   * retries. Both routes reach here so the question "does this cost the job?"
+   * is answered in one place: a cosmetic effect carries the pipeline nowhere,
+   * so losing it is a display problem, not grounds for abandoning the work.
+   */
+  private settleJobForDeadEffect(effect: { job_id: string; kind: string }, error: string, now: number): void {
+    if (COSMETIC_EFFECT_KINDS.has(effect.kind)) return;
+    this.markJobPermanentFailure(effect.job_id, error, now);
+  }
+
   private markJobPermanentFailure(jobId: string, error: string, now: number): void {
     const job = this.readJobById(jobId);
     if (!job || ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) return;
@@ -14785,10 +14851,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }
   }
 
-  private markJobPermanentFailureFromOutbox(key: string, error: string, now: number): void {
-    const match = /^job:([^:]+):status$/.exec(key);
-    if (match) this.markJobPermanentFailure(match[1], error, now);
-  }
 
   private readJobById(jobId: string): Job | null {
     return readJobById(this.db, jobId);

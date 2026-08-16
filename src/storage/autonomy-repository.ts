@@ -126,6 +126,13 @@ type ClaimRow = {
 
 export type AdmissionWriteMode = "queue" | "requeue";
 
+/** A blocked job with the ladder state that decides whether to drive it on. */
+export type JobContinuationCandidate = Readonly<{
+  job: Job;
+  attempts: number;
+  key: string | null;
+}>;
+
 const ADMISSION_STATES: ReadonlySet<AdmissionState> = new Set([
   "queued",
   "admitted",
@@ -814,5 +821,59 @@ export class AutonomyRepository {
       )
       .all(limit) as JobRow[];
     return rows.map(parseJobRow);
+  }
+
+  /**
+   * Blocked jobs the continuation sweep has not yet handed to the owner, oldest
+   * first so a job never starves behind a newer one that keeps re-blocking.
+   * Jobs already escalated are excluded: the owner has them, and re-deciding
+   * every sweep would message them about the same wall repeatedly.
+   */
+  public listContinuationCandidates(requestedLimit: number): JobContinuationCandidate[] {
+    const limit = boundedLimit(requestedLimit, MAX_AUTONOMY_ROWS);
+    const rows = this.db
+      .prepare(
+        `SELECT job.*, ladder.auto_continue_count, ladder.auto_continue_key
+           FROM (${JOB_SELECT}) AS job
+           JOIN jobs AS ladder ON ladder.id = job.id
+          WHERE job.state = 'blocked' AND ladder.auto_continue_escalated_at IS NULL
+          ORDER BY job.updated_at ASC, job.id ASC
+          LIMIT ?`,
+      )
+      .all(limit) as (JobRow & { auto_continue_count: number; auto_continue_key: string | null })[];
+    return rows.map((row) => ({
+      job: parseJobRow(row),
+      attempts: row.auto_continue_count,
+      key: row.auto_continue_key,
+    }));
+  }
+
+  /**
+   * Counts one automatic resume against `key`. A different key means the job
+   * moved on and stopped somewhere else, so the count restarts at one rather
+   * than inheriting an unrelated block's total.
+   */
+  public recordAutoContinue(input: { jobId: string; key: string; now: number }): void {
+    assertIdentifier(input.jobId, "jobId", 256);
+    assertIdentifier(input.key, "key", 256);
+    assertNonNegativeInteger(input.now, "now");
+    this.db
+      .prepare(
+        `UPDATE jobs
+            SET auto_continue_count = CASE WHEN auto_continue_key = ? THEN auto_continue_count + 1 ELSE 1 END,
+                auto_continue_key = ?,
+                updated_at = ?
+          WHERE id = ?`,
+      )
+      .run(input.key, input.key, input.now, input.jobId);
+  }
+
+  /** Marks the ladder spent so the owner is told once, not once per sweep. */
+  public recordContinuationEscalation(input: { jobId: string; now: number }): void {
+    assertIdentifier(input.jobId, "jobId", 256);
+    assertNonNegativeInteger(input.now, "now");
+    this.db
+      .prepare("UPDATE jobs SET auto_continue_escalated_at = ?, updated_at = ? WHERE id = ?")
+      .run(input.now, input.now, input.jobId);
   }
 }

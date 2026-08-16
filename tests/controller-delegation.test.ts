@@ -401,7 +401,7 @@ function stallService(
 
 function stallTurns(store: ReturnType<typeof fixture>["store"]) {
   return store.listControllerTurns(CONTROLLER_KEY, 20)
-    .filter((turn) => turn.inputText.startsWith("A thread you delegated work to has stopped"));
+    .filter((turn) => turn.inputText.startsWith("A thread you are following has stopped"));
 }
 
 it("reports a wedged member long before the join deadline", async () => {

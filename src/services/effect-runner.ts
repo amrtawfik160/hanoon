@@ -272,13 +272,23 @@ function threadResultId(result: { id?: unknown }): string {
   return result.id;
 }
 
+/**
+ * Retryable, deliberately. A managed worktree attaches to its thread a few
+ * seconds *after* the spawn call returns, so an absent environment id is normal
+ * timing rather than a broken thread. Treating it as permanent killed every job
+ * at its first spawn and blocked the whole pipeline.
+ *
+ * Every site that reads an environment id off a thread shares that timing, so
+ * they share this error: an adopted thread is as likely to be mid-attach as a
+ * freshly spawned one.
+ */
+export function environmentNotAttachedYet(where: string): Error {
+  return new Error(`${where} has no environment id yet`);
+}
+
 export function threadResultEnvironment(result: { environmentId?: unknown }): string {
   if (typeof result.environmentId !== "string" || result.environmentId.length === 0) {
-    // Retryable, deliberately. A managed worktree attaches to its thread a few
-    // seconds *after* the spawn call returns, so an absent environment id here
-    // is normal timing rather than a broken thread. Treating it as permanent
-    // killed every job at its first spawn and blocked the whole pipeline.
-    throw new Error("BB thread has no environment id yet");
+    throw environmentNotAttachedYet("BB thread");
   }
   return result.environmentId;
 }
@@ -958,7 +968,7 @@ export class EffectRunner {
           candidate.parentThreadId !== expectedParent
         ) throw new PermanentEffectError("matching BB thread has a structurally mismatched owner");
         const environmentId = candidate.environmentId ?? job.environmentId;
-        if (!environmentId) throw new PermanentEffectError("matching BB thread has no environment id");
+        if (!environmentId) throw environmentNotAttachedYet("matching BB thread");
         this.updateExecutorAttempt(job.id, attempt.id, { threadId: candidate.id });
         this.settleRecoveredModelRoute(
           attempt.id,
@@ -1079,7 +1089,7 @@ export class EffectRunner {
       throw new PermanentEffectError("planner thread parent ownership is invalid");
     }
     const environmentId = candidate.environmentId ?? job.environmentId;
-    if (!environmentId) throw new PermanentEffectError("pipeline thread has no environment id");
+    if (!environmentId) throw environmentNotAttachedYet("pipeline thread");
     if (job.environmentId && environmentId !== job.environmentId) {
       throw new PermanentEffectError("pipeline thread environment ownership is invalid");
     }

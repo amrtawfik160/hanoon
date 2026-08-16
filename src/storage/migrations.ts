@@ -2064,6 +2064,29 @@ CREATE TABLE stage_executions (
 CREATE INDEX stage_executions_by_job ON stage_executions(job_id, started_at, id);
 `] as const;
 
+/**
+ * The ladder that lets a blocked job resume itself. `auto_continue_key` names
+ * which block the count belongs to, so a job that clears one wall and stops at
+ * a later one arrives with a full allowance rather than an exhausted one.
+ */
+export const JOB_CONTINUATION_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN auto_continue_count INTEGER NOT NULL DEFAULT 0
+  CHECK (auto_continue_count >= 0);
+ALTER TABLE jobs ADD COLUMN auto_continue_key TEXT;
+ALTER TABLE jobs ADD COLUMN auto_continue_escalated_at INTEGER
+  CHECK (auto_continue_escalated_at IS NULL OR auto_continue_escalated_at >= 0);
+`] as const;
+
+/**
+ * Reported-once marker for a watched thread that wedged. A stalled thread stays
+ * stalled on every sweep, so without it one stuck thread becomes an alarm every
+ * fifteen seconds.
+ */
+export const MONITOR_STALL_MIGRATIONS = [String.raw`
+ALTER TABLE monitors ADD COLUMN stall_notified_at INTEGER
+  CHECK (stall_notified_at IS NULL OR stall_notified_at >= 0);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2126,4 +2149,6 @@ export const ALL_MIGRATIONS = [
   ...HOUSEKEEPING_NOTICE_MIGRATIONS,
   ...DELEGATION_STALL_MIGRATIONS,
   ...STAGE_EXECUTION_MIGRATIONS,
+  ...JOB_CONTINUATION_MIGRATIONS,
+  ...MONITOR_STALL_MIGRATIONS,
 ] as const;

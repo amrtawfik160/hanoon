@@ -889,9 +889,9 @@ describe("leased effect execution", () => {
   it("dead-letters the twentieth transient failure and blocks the owning job", () => {
     const { store, db } = storeFixture();
     const effect: JobEffect = {
-      idempotencyKey: "job_1:2:render_status",
+      idempotencyKey: "job_1:2:spawn_plan",
       jobId: "job_1",
-      kind: "render_status",
+      kind: "spawn_plan",
       payload: {},
     };
     addJobEffect(store, db, effect);
@@ -910,6 +910,29 @@ describe("leased effect execution", () => {
       attempts: 20,
     });
     expect(store.getJob("job_1")?.blockedReason).toBe("permanent_effect_failure");
+  });
+
+  it("spends a status card's retries without costing the job", () => {
+    // Redrawing the status card carries the pipeline nowhere, so exhausting its
+    // retries says Telegram is unreachable, not that the work is unsound.
+    const { store, db } = storeFixture();
+    const effect: JobEffect = {
+      idempotencyKey: "job_1:2:render_status",
+      jobId: "job_1",
+      kind: "render_status",
+      payload: {},
+    };
+    addJobEffect(store, db, effect);
+    const current = fence(store);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const claimed = leaseEffectsForTest(store, current.ownerId, current.generation, 1_000 + attempt, 1, 100);
+      expect(claimed).toHaveLength(1);
+      expect(store.failEffect(effect.idempotencyKey, current.ownerId, current.generation, "bounded failure", 1_001 + attempt, 1_000 + attempt)).toBe(true);
+    }
+    expect(db.prepare("SELECT status FROM effects WHERE idempotency_key = ?").get(effect.idempotencyKey))
+      .toEqual({ status: "dead" });
+    expect(store.getJob("job_1")?.blockedReason).toBeNull();
+    expect(store.getJob("job_1")?.state).not.toBe("blocked");
   });
 
   it("turns a permanent post-merge effect failure into a production incident", () => {

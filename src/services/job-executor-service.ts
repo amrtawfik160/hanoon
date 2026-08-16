@@ -73,6 +73,9 @@ export type JobExecutorDependencies = {
   failureLoop?: {
     processDue(): boolean;
   };
+  jobContinuation?: {
+    processDue(): boolean;
+  };
   diskHousekeeping?: {
     processDue(): Promise<boolean>;
   };
@@ -877,6 +880,12 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // brake does not get one more job admitted into the same failure.
         if (deps.failureLoop) {
           didWork = deps.failureLoop.processDue() || didWork;
+        }
+        // After the failure brake and before the scheduler: a project that just
+        // tripped the brake must not have its blocked jobs pushed back in, and
+        // anything this does requeue should be admitted on this same tick.
+        if (deps.jobContinuation) {
+          didWork = deps.jobContinuation.processDue() || didWork;
         }
         // Runs when something has already gone wrong elsewhere, so it is paced
         // daily inside itself and never allowed to fail the tick.
