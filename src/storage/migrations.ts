@@ -2014,6 +2014,13 @@ CREATE TABLE housekeeping_notices (
 );
 `] as const;
 
+// A stalled member is escalated once, not on every sweep. Durable, because the
+// alternative is an in-memory flag that a restart turns back into a fresh
+// alarm about a thread that was already reported.
+export const DELEGATION_STALL_MIGRATIONS = [String.raw`
+ALTER TABLE delegation_threads ADD COLUMN stall_notified_at INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2073,4 +2080,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_THREAD_ASK_MIGRATIONS,
   ...CONTROLLER_EVIDENCE_STEER_MIGRATIONS,
   ...HOUSEKEEPING_NOTICE_MIGRATIONS,
+  ...DELEGATION_STALL_MIGRATIONS,
 ] as const;

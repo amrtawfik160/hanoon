@@ -1,3 +1,8 @@
+import {
+  classifyThreadStall,
+  threadStallNotice,
+  type DelegatedThreadObservation,
+} from "../autonomy/thread-stall";
 import { redactError } from "../errors";
 import { nextCronOccurrence } from "./cron";
 
@@ -17,6 +22,12 @@ export type MonitorThreads = {
   status(threadId: string): Promise<MonitorThreadStatus>;
   /** The thread's final output, used to summarise a settled delegation member. */
   output(threadId: string): Promise<string>;
+  /**
+   * Enough of a running thread to tell working from wedged. Optional: a host
+   * that cannot answer it simply gets no stall detection, rather than a sweep
+   * that fails.
+   */
+  observe?(threadId: string): Promise<DelegatedThreadObservation | null>;
 };
 
 export type MonitorServiceDependencies = {
@@ -30,6 +41,7 @@ export type MonitorServiceDependencies = {
     | "listOpenDelegations"
     | "getDelegation"
     | "settleDelegationThread"
+    | "claimDelegationThreadStall"
     | "recordDelegationFired"
     | "failDelegation"
   >;
@@ -45,7 +57,7 @@ const DELEGATION_BATCH = 10;
 // still produces an answer the same day.
 export const DELEGATION_JOIN_TIMEOUT_MS = 6 * 60 * 60_000;
 const MAX_JOINED_PROMPT = 3_500;
-const DELEGATION_SWEEP_MS = 15_000;
+export const DELEGATION_SWEEP_MS = 15_000;
 // Firing enqueues an ordinary controller turn, which is keyed by Telegram update
 // id. Ids are derived from the clock so they stay above real Telegram ids
 // (~2.2e8) and keep climbing across restarts, and a counter breaks same-
@@ -163,6 +175,10 @@ export class MonitorService {
       await this.settleMembers(delegation, now);
       const current = this.dependencies.store.getDelegation(delegation.id);
       if (!current || current.state !== "open") continue;
+      // After settling, so a member that has just landed is never reported as
+      // wedged, and before the join, so a stall is raised long before the
+      // deadline that would otherwise be the first anyone hears of it.
+      if (await this.escalateStalledMembers(current, owner, now)) fired = true;
       const expired = now - current.createdAt >= DELEGATION_JOIN_TIMEOUT_MS;
       // A delegation the tool never finished publishing — the process died
       // between creating it and recording its first member — would otherwise
@@ -233,6 +249,65 @@ export class MonitorService {
         now,
       });
     }
+  }
+
+  /**
+   * Notices a member that has stopped making progress and hands the agent one
+   * turn to deal with it. Nothing is killed and nothing is restarted from here:
+   * from outside a thread, wedged and thinking hard look identical, and only
+   * reading it tells them apart. So the agent is asked to look and choose —
+   * unstick the thread, or tell the owner what is blocked.
+   *
+   * A member is reported once. A wedged thread stays wedged on every sweep, so
+   * without the claim one stall would become an alarm every fifteen seconds.
+   */
+  private async escalateStalledMembers(
+    delegation: DelegationRecord,
+    owner: { userId: string; chatId: string },
+    now: number,
+  ): Promise<boolean> {
+    if (!this.dependencies.threads.observe) return false;
+    let escalated = false;
+    for (const member of delegation.threads) {
+      if (member.state !== "running" || member.stallNotifiedAt !== null) continue;
+      let observation: DelegatedThreadObservation | null = null;
+      try {
+        observation = await this.dependencies.threads.observe(member.threadId);
+      } catch (error) {
+        // Unreadable is not evidence of a stall. One member that cannot be
+        // observed costs that member's detection, not the sweep.
+        this.dependencies.warn?.(
+          `Delegated thread ${member.threadId} could not be observed: ${redactError(error).slice(0, 200)}`,
+        );
+        continue;
+      }
+      const verdict = classifyThreadStall({ observation, now });
+      if (verdict.level !== "stalled") continue;
+      // Claim first: a crash between the message and the mark would otherwise
+      // replay the alarm.
+      if (!this.dependencies.store.claimDelegationThreadStall({
+        delegationId: delegation.id,
+        threadId: member.threadId,
+        now,
+      })) continue;
+      this.dependencies.store.enqueueControllerTurn({
+        controllerKey: delegation.controllerKey,
+        telegramUserId: owner.userId,
+        telegramChatId: owner.chatId,
+        updateId: this.issueUpdateId(now),
+        inputText: threadStallNotice({
+          threadId: member.threadId,
+          title: member.title,
+          instruction: delegation.instruction,
+          verdict,
+          quietForMs: observation === null ? 0 : Math.max(0, now - observation.updatedAt),
+        }),
+        origin: "system",
+        now,
+      });
+      escalated = true;
+    }
+    return escalated;
   }
 
   private async dueReason(monitor: MonitorRecord, now: number): Promise<string | null> {

@@ -838,6 +838,19 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         const result = await bb.sdk.threads.output({ threadId });
         return result.output ?? "";
       },
+      observe: async (threadId) => {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.deletedAt !== null || thread.archivedAt !== null) return null;
+        const interactions = await bb.sdk.threads.interactions.list({ threadId });
+        return {
+          status: thread.status,
+          runtimeStatus: thread.runtime.displayStatus,
+          startedAt: thread.createdAt,
+          updatedAt: thread.updatedAt,
+          hasPendingInteraction: interactions.some((interaction) => interaction.status === "pending"),
+          hostReconnectGraceExpiresAt: thread.runtime.hostReconnectGraceExpiresAt ?? null,
+        };
+      },
     },
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),

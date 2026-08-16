@@ -513,6 +513,8 @@ export type DelegationThreadRecord = {
   /** Bounded excerpt of the thread's final output; null until it settles. */
   summary: string | null;
   settledAt: number | null;
+  /** When this member's stall was escalated, so it is escalated only once. */
+  stallNotifiedAt: number | null;
 };
 
 /**
@@ -3283,6 +3285,15 @@ export interface TelegramAgentStore {
     summary: string | null;
     now: number;
   }): boolean;
+  /**
+   * Claims the right to escalate one member's stall. True only for the caller
+   * that got there first, so a wedged thread is reported once, not every sweep.
+   */
+  claimDelegationThreadStall(input: {
+    delegationId: string;
+    threadId: string;
+    now: number;
+  }): boolean;
   sealDelegation(input: { id: string; now: number }): boolean;
   recordDelegationFired(input: { id: string; now: number }): boolean;
   failDelegation(input: { id: string; error: string; now: number }): boolean;
@@ -4013,6 +4024,7 @@ type DelegationThreadRow = {
   state: string;
   summary: string | null;
   settled_at: number | null;
+  stall_notified_at: number | null;
 };
 
 const DELEGATION_STATES: ReadonlySet<string> = new Set<DelegationState>([
@@ -4035,6 +4047,7 @@ function parseDelegationThread(row: DelegationThreadRow): DelegationThreadRecord
     state: row.state as DelegationThreadState,
     summary: row.summary,
     settledAt: row.settled_at,
+    stallNotifiedAt: row.stall_notified_at,
   };
 }
 
@@ -8886,6 +8899,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           SET state = ?, summary = ?, settled_at = ?
         WHERE delegation_id = ? AND thread_id = ? AND state = 'running'`,
     ).run(input.state, summary, input.now, input.delegationId, input.threadId).changes === 1;
+  }
+
+  public claimDelegationThreadStall(input: {
+    delegationId: string;
+    threadId: string;
+    now: number;
+  }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE delegation_threads
+          SET stall_notified_at = ?
+        WHERE delegation_id = ? AND thread_id = ?
+          AND state = 'running' AND stall_notified_at IS NULL`,
+    ).run(input.now, input.delegationId, input.threadId).changes === 1;
   }
 
   /**
