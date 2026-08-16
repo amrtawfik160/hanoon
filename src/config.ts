@@ -43,6 +43,12 @@ const globalConfigSchema = z.object({
     .default(DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode),
   extractionModel: z.enum(EXTRACTION_MODELS).default("inherit"),
   systemUpkeep: z.enum(["enabled", "disabled"]).default("enabled"),
+  // Separate from systemUpkeep on purpose: reclaiming a temporary directory and
+  // deleting a branch are not the same risk, so arming one must not arm the other.
+  workspaceReclaim: z.preprocess(
+    (value) => value === true || value === "true",
+    z.boolean().default(false),
+  ),
   selfDiagnosisEnabled: z.preprocess(
     (value) => value === true || value === "true",
     z.boolean().default(false),
@@ -70,6 +76,7 @@ export function parseGlobalConfig(values: {
   controllerPermissionMode?: string;
   extractionModel?: string;
   systemUpkeep?: string;
+  workspaceReclaim?: boolean | string;
   selfDiagnosisEnabled?: boolean | string;
   selfDiagnosisProjectId?: string;
   capabilityJobGraph?: string;
@@ -102,6 +109,10 @@ export function extractionModel(config: GlobalConfig): string | null {
  *  messages can turn it off without losing anything they set themselves. */
 export function systemUpkeepEnabled(config: GlobalConfig): boolean {
   return config.systemUpkeep === "enabled";
+}
+
+export function workspaceReclaimEnabled(config: GlobalConfig): boolean {
+  return config.workspaceReclaim;
 }
 
 export function selfDiagnosisEnabled(config: GlobalConfig): boolean {

@@ -24,6 +24,7 @@ import {
   parseGlobalConfig,
   selfDiagnosisEnabled,
   systemUpkeepEnabled,
+  workspaceReclaimEnabled,
 } from "./config";
 import { parseCredentialBrokerConfig, type CredentialBrokerConfigResult } from "./credentials/config";
 import { CredentialBrokerClient } from "./credentials/broker-client";
@@ -102,6 +103,8 @@ import { ThreadNoticeService } from "./services/thread-notice-service";
 import { JobMemoryService } from "./services/job-memory-service";
 import { isDisposableTempName } from "./autonomy/disk-space";
 import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
+import { WorkspaceHousekeepingService } from "./services/workspace-housekeeping-service";
+import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { installSystemMonitors } from "./services/system-monitors";
 import { ProductionHealthService } from "./services/production-health-service";
@@ -363,6 +366,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       description: "Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard, and message you when something needs a decision. Turning this off does not touch monitors you set yourself.",
       options: ["enabled", "disabled"],
       default: "enabled",
+    },
+    workspaceReclaim: {
+      type: "boolean",
+      label: "Reclaim finished worktrees and branches",
+      description: "Off by default. When enabled, a daily sweep removes worktrees whose thread has finished and deletes branches whose work is already in the trunk. Uncommitted work is saved first, and anything it cannot prove is finished is kept and reported.",
+      default: false,
     },
     selfDiagnosisEnabled: {
       type: "boolean",
@@ -1228,6 +1237,24 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     reclaimArmed: () => config.ok && systemUpkeepEnabled(config.value),
     warn: (message) => bb.log.warn(message),
   });
+  const workspaceHousekeeping = new WorkspaceHousekeepingService({
+    store,
+    workspace: createWorkspaceAccess({
+      sdk: bb.sdk as never,
+      store,
+      terminal,
+      warn: (message) => bb.log.warn(message),
+    }),
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    // Its own switch, not the general upkeep one: reclaiming a temporary
+    // directory and deleting a branch are not the same risk. Off by default.
+    reclaimArmed: () => config.ok && workspaceReclaimEnabled(config.value),
+    warn: (message) => bb.log.warn(message),
+  });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
   let systemMonitorsInstalled = false;
   const systemMonitors = {
@@ -2009,6 +2036,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       regressionWatch,
       failureLoop,
       diskHousekeeping,
+      workspaceHousekeeping,
       systemMonitors,
       presence,
       laneSnapshots,

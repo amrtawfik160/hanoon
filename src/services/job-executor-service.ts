@@ -76,6 +76,10 @@ export type JobExecutorDependencies = {
   diskHousekeeping?: {
     processDue(): Promise<boolean>;
   };
+  workspaceHousekeeping?: {
+    due(now: number): boolean;
+    processDue(): Promise<boolean>;
+  };
   systemMonitors?: {
     install(): void;
   };
@@ -874,6 +878,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // daily inside itself and never allowed to fail the tick.
         if (deps.diskHousekeeping) {
           didWork = await deps.diskHousekeeping.processDue() || didWork;
+        }
+        // Daily, so the due check is synchronous: a tick that owes nothing must
+        // not yield, or it hands in-flight work a turn it would not have had.
+        if (deps.workspaceHousekeeping?.due(deps.clock.now())) {
+          didWork = await deps.workspaceHousekeeping.processDue() || didWork;
         }
         // Idempotent, and deliberately not a one-shot at activation: pairing
         // can happen long after the executor starts.
