@@ -69,8 +69,10 @@ import { renderJobFinishNote } from "../telegram/finish-note";
 import {
   adjustedConfidence,
   decayedConfidence,
+  cosineSimilarity,
   ftsQuery,
   memoryScore,
+  semanticRanks,
   subjectsContradict,
   MEMORY_DEMOTION,
   MEMORY_REINFORCEMENT,
@@ -352,6 +354,16 @@ export type StoredOutbox = OutboxInput & {
 };
 
 export type ApprovalIdentity = { userId: string; chatId: string };
+/** A question embedded by a named model, for comparing like with like. */
+export type MemoryQueryVector = Readonly<{ model: string; vector: Float32Array }>;
+
+export type MemoryEmbeddingInput = Readonly<{
+  memoryId: string;
+  model: string;
+  vector: Float32Array;
+  now: number;
+}>;
+
 export type ApprovalRecord = {
   jobId: string;
   headSha: string;
@@ -3346,6 +3358,7 @@ export interface TelegramAgentStore {
     limit: number;
     now: number;
     turnId?: string;
+    queryVector?: MemoryQueryVector;
   }): MemoryRecord[];
   curateMemories(input: { now: number }): { decayed: number; tombstoned: number };
   listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[];
@@ -3642,6 +3655,8 @@ export interface TelegramAgentStore {
     ownerChatId?: string | null;
     jobVersion?: number | null;
   }): void;
+  saveMemoryEmbedding(input: MemoryEmbeddingInput): void;
+  listMemoriesNeedingEmbedding(model: string, limit: number): { id: string; subject: string; body: string }[];
   getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null;
   /** The same approval, found by the job it belongs to rather than by nonce. */
   findLiveApprovalForJob(
@@ -9607,6 +9622,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     /** Links what was recalled to the turn it informed, so the answer's
      *  reception can later reinforce or demote exactly those memories. */
     turnId?: string;
+    /** The question as a vector, when a provider produced one. */
+    queryVector?: MemoryQueryVector;
   }): MemoryRecord[] {
     assertMemoryScope(input.scope);
     if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
@@ -9640,19 +9657,33 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         matched.forEach((row, index) => lexicalRanks.set(row.id, index));
       }
 
+      // Vectors are read only for the model doing the asking. A corpus embedded
+      // by another model is left alone rather than compared, because a
+      // cross-model similarity is a number that looks like a score and is not
+      // one. No provider, or no matching vectors, and this stays empty and the
+      // ranking is exactly what it was before embeddings existed.
+      const semantic = input.queryVector && input.queryVector.model.length > 0
+        ? this.semanticRanksForQuery(live, input.queryVector)
+        : new Map<string, number>();
+
       const ranked = live
         .map((row) => ({
           row,
           score: memoryScore({
             lexicalRank: lexicalRanks.get(row.id) ?? null,
+            semanticRank: semantic.get(row.id) ?? (semantic.size > 0 ? null : undefined),
             importance: row.importance,
             confidence: row.confidence,
             ageMs: input.now - row.created_at,
           }),
         }))
-        // An explicit question only surfaces memories that actually mention it;
-        // an empty question falls back to the strongest standing memories.
-        .filter((candidate) => match === null || lexicalRanks.has(candidate.row.id))
+        // An explicit question surfaces what mentions it *or what means it*:
+        // before the semantic signal existed this dropped every memory the
+        // words missed, which is precisely the "I phrased it differently and it
+        // was not found" complaint. An empty question still falls back to the
+        // strongest standing memories.
+        .filter((candidate) =>
+          match === null || lexicalRanks.has(candidate.row.id) || semantic.has(candidate.row.id))
         .sort((left, right) => right.score - left.score || right.row.created_at - left.row.created_at)
         .slice(0, input.limit);
 
@@ -13073,6 +13104,71 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!row) return null;
     const record = this.getUsableApproval(row.nonce_hash, now);
     return record ? { nonceHash: row.nonce_hash, record } : null;
+  }
+
+  /**
+   * Similarity ranks for one question, over the vectors written by the same
+   * model that embedded it. Rows embedded by a different model are skipped
+   * rather than compared: their similarity would be meaningless, and silently
+   * meaningless is how the reference system lost its vector recall.
+   */
+  private semanticRanksForQuery(
+    live: readonly MemoryRow[],
+    query: MemoryQueryVector,
+  ): Map<string, number> {
+    const ids = live.map((row) => row.id);
+    if (ids.length === 0) return new Map();
+    const rows = this.db.prepare(
+      `SELECT memory_id, vector FROM memory_embeddings
+        WHERE model = ? AND dimensions = ? AND memory_id IN (${ids.map(() => "?").join(", ")})`,
+    ).all(query.model, query.vector.length, ...ids) as { memory_id: string; vector: Buffer }[];
+    return semanticRanks(rows.map((row) => ({
+      id: row.memory_id,
+      similarity: cosineSimilarity(
+        query.vector,
+        new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4),
+      ),
+    })));
+  }
+
+  /** Stores one memory's vector, replacing any earlier one for that memory. */
+  public saveMemoryEmbedding(input: MemoryEmbeddingInput): void {
+    if (!input.memoryId) throw new TypeError("memoryId must not be empty");
+    if (!input.model || input.model.length > 128) throw new TypeError("model must be a bounded non-empty string");
+    if (input.vector.length === 0 || input.vector.length > 8_192) throw new TypeError("vector length is out of range");
+    assertNonNegativeInteger(input.now, "now");
+    this.db.prepare(
+      `INSERT INTO memory_embeddings (memory_id, model, dimensions, vector, embedded_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(memory_id) DO UPDATE SET
+         model = excluded.model, dimensions = excluded.dimensions,
+         vector = excluded.vector, embedded_at = excluded.embedded_at`,
+    ).run(
+      input.memoryId,
+      input.model,
+      input.vector.length,
+      Buffer.from(input.vector.buffer, input.vector.byteOffset, input.vector.byteLength),
+      input.now,
+    );
+  }
+
+  /**
+   * Live memories with no vector from this model yet. Drives the backfill that
+   * heals a corpus after a provider arrives, returns, or changes.
+   */
+  public listMemoriesNeedingEmbedding(model: string, limit: number): { id: string; subject: string; body: string }[] {
+    if (!model) throw new TypeError("model must not be empty");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new TypeError("limit must be between 1 and 500");
+    return this.db.prepare(
+      `SELECT memories.id AS id, memories.subject AS subject, memories.body AS body
+         FROM memories
+         LEFT JOIN memory_embeddings ON memory_embeddings.memory_id = memories.id
+              AND memory_embeddings.model = ?
+        WHERE memories.forgotten_at IS NULL AND memories.superseded_by IS NULL
+          AND memory_embeddings.memory_id IS NULL
+        ORDER BY memories.created_at DESC
+        LIMIT ?`,
+    ).all(model, limit) as { id: string; subject: string; body: string }[];
   }
 
   public getUsableApproval(nonceHash: string, now: number): ApprovalRecord | null {

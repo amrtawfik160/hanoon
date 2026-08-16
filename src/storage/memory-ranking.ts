@@ -10,9 +10,26 @@ const CONFIDENCE_WEIGHT = 0.1;
 // Reciprocal rank keeps the lexical signal bounded, so one freakishly good BM25
 // score cannot drown out recency and importance the way a raw score would.
 const RECIPROCAL_RANK_K = 4;
+/**
+ * Meaning is worth about as much as words: a question rarely reuses the
+ * phrasing of the answer, and the two signals disagree in useful ways.
+ */
+const SEMANTIC_WEIGHT = 0.3;
+/**
+ * Below this, two texts are unrelated. Cosine on sentence embeddings puts
+ * genuinely unrelated pairs well under a third, and admitting them would let a
+ * question with no real answer still return its nearest miss.
+ */
+export const MEMORY_SEMANTIC_FLOOR = 0.35;
 
 export type MemoryCandidate = {
   lexicalRank: number | null;
+  /**
+   * Rank by meaning rather than words, when vectors are available. Null when
+   * they are not, which is the ordinary case: no embedding provider, a memory
+   * written before one existed, or a corpus embedded by a different model.
+   */
+  semanticRank?: number | null;
   importance: number;
   confidence: number;
   ageMs: number;
@@ -22,14 +39,77 @@ export function recencyScore(ageMs: number): number {
   return 0.5 ** (Math.max(0, ageMs) / MEMORY_HALF_LIFE_MS);
 }
 
-export function memoryScore(candidate: MemoryCandidate): number {
-  const lexical = candidate.lexicalRank === null
+function reciprocalRank(rank: number | null | undefined): number {
+  return rank === null || rank === undefined
     ? 0
-    : RECIPROCAL_RANK_K / (RECIPROCAL_RANK_K + candidate.lexicalRank);
-  return LEXICAL_WEIGHT * lexical +
+    : RECIPROCAL_RANK_K / (RECIPROCAL_RANK_K + rank);
+}
+
+/**
+ * Scores one memory against the question.
+ *
+ * The semantic term is what lets "what did I say about shipping on Fridays"
+ * reach a memory phrased "never deploy at the end of the week". It is folded in
+ * as another reciprocal rank rather than a raw cosine, for the same reason the
+ * lexical signal is: one freakishly close vector should not be able to outvote
+ * recency and importance together.
+ *
+ * When no vector is available the weights are renormalised over the signals
+ * that are, so a corpus with no embeddings ranks *exactly* as it did before
+ * they existed. That is the property that makes this safe to ship half-built:
+ * absent vectors are not a degraded ranking, they are the previous ranking.
+ */
+export function memoryScore(candidate: MemoryCandidate): number {
+  const semanticAvailable = candidate.semanticRank !== null && candidate.semanticRank !== undefined;
+  const weighted = LEXICAL_WEIGHT * reciprocalRank(candidate.lexicalRank) +
     RECENCY_WEIGHT * recencyScore(candidate.ageMs) +
     IMPORTANCE_WEIGHT * candidate.importance +
-    CONFIDENCE_WEIGHT * candidate.confidence;
+    CONFIDENCE_WEIGHT * candidate.confidence +
+    (semanticAvailable ? SEMANTIC_WEIGHT * reciprocalRank(candidate.semanticRank) : 0);
+  const divisor = semanticAvailable ? 1 : 1 - SEMANTIC_WEIGHT;
+  return weighted / divisor;
+}
+
+/**
+ * Cosine similarity, and a refusal to compare vectors that cannot be compared.
+ *
+ * Different models produce different dimensions, and a corpus embedded by one
+ * model against a query embedded by another yields a number that looks like a
+ * score and means nothing. The reference system this follows lost its vector
+ * recall exactly that way — a 768-dimension provider querying a 1536-dimension
+ * corpus, degrading silently per query — so a mismatch here returns null and
+ * the caller falls back to words rather than trusting a meaningless figure.
+ */
+export function cosineSimilarity(left: Float32Array, right: Float32Array): number | null {
+  if (left.length === 0 || left.length !== right.length) return null;
+  let dot = 0;
+  let leftMagnitude = 0;
+  let rightMagnitude = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    dot += left[index] * right[index];
+    leftMagnitude += left[index] * left[index];
+    rightMagnitude += right[index] * right[index];
+  }
+  if (leftMagnitude === 0 || rightMagnitude === 0) return null;
+  const similarity = dot / (Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude));
+  return Number.isFinite(similarity) ? similarity : null;
+}
+
+/**
+ * Ranks memories by similarity, strongest first, dropping anything too distant
+ * to be worth surfacing. Without the floor an unrelated memory still earns a
+ * rank purely by being the least unrelated one present.
+ */
+export function semanticRanks(
+  scored: readonly { id: string; similarity: number | null }[],
+): Map<string, number> {
+  const ranks = new Map<string, number>();
+  scored
+    .filter((entry): entry is { id: string; similarity: number } =>
+      entry.similarity !== null && entry.similarity >= MEMORY_SEMANTIC_FLOOR)
+    .sort((left, right) => right.similarity - left.similarity)
+    .forEach((entry, index) => ranks.set(entry.id, index));
+  return ranks;
 }
 
 // Ranking already down-weights an old memory through recencyScore. Decay is a

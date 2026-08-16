@@ -2100,6 +2100,27 @@ UPDATE jobs SET auto_continue_escalated_at = updated_at
  WHERE state = 'blocked' AND auto_continue_escalated_at IS NULL;
 `] as const;
 
+/**
+ * One vector per memory, tagged with the model and dimension that produced it.
+ *
+ * The tag is the point. A corpus embedded by one model and queried by another
+ * yields a similarity that looks like a score and means nothing, and the
+ * reference system this follows lost its vector recall exactly that way. Recall
+ * compares only vectors whose model matches the one asking, so switching models
+ * degrades to words rather than to nonsense, and the old rows stay for a
+ * backfill instead of being silently trusted.
+ */
+export const MEMORY_EMBEDDING_MIGRATIONS = [String.raw`
+CREATE TABLE memory_embeddings (
+  memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+  model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 128),
+  dimensions INTEGER NOT NULL CHECK (dimensions BETWEEN 1 AND 8192),
+  vector BLOB NOT NULL,
+  embedded_at INTEGER NOT NULL CHECK (embedded_at >= 0)
+);
+CREATE INDEX memory_embeddings_model ON memory_embeddings (model, memory_id);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2165,4 +2186,5 @@ export const ALL_MIGRATIONS = [
   ...JOB_CONTINUATION_MIGRATIONS,
   ...MONITOR_STALL_MIGRATIONS,
   ...JOB_CONTINUATION_BACKFILL_MIGRATIONS,
+  ...MEMORY_EMBEDDING_MIGRATIONS,
 ] as const;
