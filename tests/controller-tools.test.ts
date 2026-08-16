@@ -306,12 +306,14 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   });
   expect(metadata[22]).toEqual({
     name: "telegram_agent_respond",
-    description: "Submit one bounded evidence-backed final response for the current controller turn.",
+    description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in.",
     statusLabels: null,
     schema: controllerFinalizationJsonSchema,
   });
-  // 28 manifest capabilities plus the two capability metadata tools.
-  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(30);
+  // The renderer inserts the paragraph break, so the contract has to say so.
+  expect(metadata[22].description).toMatch(/own paragraph/);
+  // 29 manifest capabilities plus the two capability metadata tools.
+  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(31);
 
   const byName = new Map(registrations.map((tool) => [tool.name, tool]));
   const parsed = (name: string, params: unknown) => {

@@ -200,11 +200,12 @@ function expectDuplicateGenerationRepair(
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(56);
+  expect(ALL_MIGRATIONS).toHaveLength(57);
+  expect(ALL_MIGRATIONS[55]).toContain("thread_interactions ADD COLUMN audience");
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
   expect(ALL_MIGRATIONS[44]).toContain("CREATE TABLE credential_bindings");
-  expect(ALL_MIGRATIONS[55]).toContain("CREATE TABLE controller_thread_asks");
+  expect(ALL_MIGRATIONS[56]).toContain("CREATE TABLE controller_thread_asks");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_threads");
   expect(ALL_MIGRATIONS[3]).toContain("CREATE TABLE controller_turns");
   expect(ALL_MIGRATIONS[4]).toContain("dispatch_after_seq");
@@ -1068,6 +1069,36 @@ function submittedTurn(store: ReturnType<typeof openStore>, threadId: string) {
   return { store, turn, fence };
 }
 
+// A turn's evidence cursor has to start where its own message entered the
+// thread. Left at 0 it rescans the whole conversation every turn, so the row
+// count climbs with conversation length until it crosses the evidence cap and
+// a turn that needed no evidence at all dies of the budget.
+it("starts a submitted turn's evidence cursor at its own dispatch baseline", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(771, "what do you mean"));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ...fence,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_evidence_baseline",
+  })).toBe(true);
+
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ...fence,
+    dispatchAfterSeq: 1_528,
+  })).toBe(true);
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    dispatchAfterSeq: 1_528,
+    bbEventSeq: 1_528,
+    evidenceEventSeq: 1_528,
+  });
+});
+
 it("atomically fails and retires a submitted controller turn with a safe notice", () => {
   const { bb, store } = fixture();
   const { turn, fence } = submittedTurn(store, "thr_fail_retire");
@@ -1100,27 +1131,23 @@ it("atomically fails and retires a submitted controller turn with a safe notice"
   expect(generations[0]).toMatchObject({ ended_at: 2_000, end_reason: "retired" });
   // The owner-facing notice is a fixed internally mapped safe message; the
   // caller's bounded internal `error` never reaches the Telegram payload.
+  // This turn opened no tool and recorded no evidence, so its message is put
+  // back rather than apologised for.
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload).toMatchObject({
-    text: "I couldn't complete that controller turn safely after recovery. No action was repeated.",
+    text: "I couldn't finish that one, but nothing had started yet, so I've put your message back and I'm picking it up again in a fresh conversation. Nothing was repeated.",
     disable_web_page_preview: true,
   });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toContain("projector ran out");
 });
 
-it.each([
-  ["stalled", /stopped making progress/i],
-  ["budget_exceeded", /safety budget/i],
-  ["oauth_expired", /sign-in has expired/i],
-  ["provider_rejected", /provider settings/i],
-  ["recovery_exhausted", /after recovery/i],
-  ["owner_message_delivery_uncertain", /preserved.*message/i],
-  ["owner_message_delivery_exhausted", /couldn't confirm.*previous message.*missing or duplicated/i],
-  ["owner_message_delivery_unresolved", /did not repeat.*review the conversation/i],
-  ["owner_message_waiting_for_fresh_generation", /kept.*message queued.*fresh conversation/i],
-  ["image_preparation_failed", /couldn't read that image safely/i],
-] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
-  const { store } = fixture();
+// A turn that did nothing may have its message put back, which changes the
+// notice. Pass `didWork` to read the copy for a turn that cannot be replayed.
+function failureNotice(failureCode: ControllerFailureCode, didWork = true): string {
+  const { bb, store } = fixture();
   const { turn, fence } = submittedTurn(store, `thr_failure_code_${failureCode}`);
+  if (didWork) {
+    bb.storage.database().prepare("UPDATE controller_turns SET tool_calls = 4 WHERE id = ?").run(turn.id);
+  }
 
   expect(store.failAndRetireControllerTurn({
     ...fence,
@@ -1128,13 +1155,148 @@ it.each([
     controllerKey: turn.controllerKey,
     expectedThreadId: `thr_failure_code_${failureCode}`,
     error: "bounded internal summary",
-    failureCode: failureCode satisfies ControllerFailureCode,
+    failureCode,
   })).toBe("retired");
 
   const text = store.getOutbox(`controller:${turn.id}:reply`)?.payload.text;
-  expect(text).toMatch(expectedText);
-  expect(text).not.toMatch(/resend your request/i);
+  expect(text).toBeTypeOf("string");
   expect(text).not.toContain("bounded internal summary");
+  return text as string;
+}
+
+it.each([
+  ["stalled", /stopped making progress/i],
+  ["budget_exceeded", /safety limit/i],
+  ["oauth_expired", /sign-in has expired/i],
+  ["provider_rejected", /provider settings/i],
+  ["recovery_exhausted", /tried that again/i],
+  ["unknown", /couldn't finish/i],
+  ["owner_message_delivery_uncertain", /preserved.*message/i],
+  ["owner_message_delivery_exhausted", /couldn't confirm.*previous message.*missing or duplicated/i],
+  ["owner_message_delivery_unresolved", /did not repeat.*review the conversation/i],
+  ["owner_message_waiting_for_fresh_generation", /kept.*message queued.*fresh conversation/i],
+  ["image_preparation_failed", /couldn't read that image safely/i],
+] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
+  expect(failureNotice(failureCode)).toMatch(expectedText);
+});
+
+// The owner reads this instead of the answer they asked for, so it has to say
+// what became of their message. "unknown" used to borrow the recovery sentence
+// and claim a recovery that never ran.
+it("gives an unclassified failure its own copy that claims no recovery", () => {
+  const unknown = failureNotice("unknown");
+  expect(unknown).not.toBe(failureNotice("recovery_exhausted"));
+  expect(unknown).not.toMatch(/after recovery|tried that again|retried/i);
+});
+
+it.each([
+  "unknown",
+  "recovery_exhausted",
+  "stalled",
+  "budget_exceeded",
+  "oauth_expired",
+  "provider_rejected",
+] as const)("tells the owner what became of their message for %s", (failureCode) => {
+  const text = failureNotice(failureCode);
+  expect(text).toMatch(/your message|send it again|send your message again/i);
+});
+
+// Nothing ran, so inviting a resend cannot repeat an action.
+it.each(["unknown", "recovery_exhausted", "stalled", "budget_exceeded"] as const)(
+  "invites a safe resend for %s",
+  (failureCode) => {
+    expect(failureNotice(failureCode)).toMatch(/send it again/i);
+    expect(failureNotice(failureCode)).toMatch(/nothing was repeated/i);
+  },
+);
+
+// Turn 326 died 249ms after it arrived having done nothing at all, and the
+// owner's message went with it. A message that provably cost nothing can be
+// put back rather than apologised for.
+it("requeues an owner message when the failed turn did nothing", () => {
+  const { store } = fixture();
+  const { turn, fence } = submittedTurn(store, "thr_requeue_untouched");
+
+  expect(store.failAndRetireControllerTurn({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_requeue_untouched",
+    error: "bounded internal summary",
+  })).toBe("retired");
+
+  const replacement = store.listControllerTurns("owner-7-controller", 10)
+    .find((candidate) => candidate.id !== turn.id);
+  expect(replacement).toMatchObject({
+    state: "queued",
+    inputText: turn.inputText,
+    origin: "owner",
+    recoverySourceTurnId: turn.id,
+  });
+  const text = store.getOutbox(`controller:${turn.id}:reply`)?.payload.text;
+  expect(text).toMatch(/picking it up again/i);
+  expect(text).not.toMatch(/send it again/i);
+});
+
+it.each([
+  ["a tool ran", (db: ReturnType<typeof fixture>["bb"]["storage"], id: string) =>
+    db.database().prepare("UPDATE controller_turns SET tool_calls = 9 WHERE id = ?").run(id)],
+  // Self-reference is enough to mark it as already replaced once, and it keeps
+  // the foreign key pointing at a turn that exists.
+  ["it was already a replacement", (db: ReturnType<typeof fixture>["bb"]["storage"], id: string) =>
+    db.database().prepare("UPDATE controller_turns SET recovery_source_turn_id = ? WHERE id = ?").run(id, id)],
+  ["it carried an image", (db: ReturnType<typeof fixture>["bb"]["storage"], id: string) =>
+    db.database().prepare(
+      `UPDATE controller_turns
+          SET image_file_id = 'file_1', image_file_name = 'shot.png',
+              image_mime_type = 'image/png', image_size_bytes = 1024, image_kind = 'image'
+        WHERE id = ?`,
+    ).run(id)],
+])("never requeues an owner message when %s", (_reason, taint) => {
+  const { bb, store } = fixture();
+  const { turn, fence } = submittedTurn(store, "thr_requeue_blocked");
+  taint(bb.storage, turn.id);
+
+  expect(store.failAndRetireControllerTurn({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_requeue_blocked",
+    error: "bounded internal summary",
+  })).toBe("retired");
+
+  expect(store.listControllerTurns("owner-7-controller", 10)).toHaveLength(1);
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).toMatch(/send it again/i);
+});
+
+// A provider that refused once refuses again, so replaying only loops.
+it.each(["oauth_expired", "provider_rejected"] as const)(
+  "never requeues an owner message for %s",
+  (failureCode) => {
+    const { store } = fixture();
+    const { turn, fence } = submittedTurn(store, `thr_no_requeue_${failureCode}`);
+
+    expect(store.failAndRetireControllerTurn({
+      ...fence,
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      expectedThreadId: `thr_no_requeue_${failureCode}`,
+      error: "bounded internal summary",
+      failureCode,
+    })).toBe("retired");
+
+    expect(store.listControllerTurns("owner-7-controller", 10)).toHaveLength(1);
+  },
+);
+
+// These describe a message whose delivery is unconfirmed, so a resend could
+// duplicate an action that already happened.
+it.each([
+  "owner_message_delivery_uncertain",
+  "owner_message_delivery_exhausted",
+  "owner_message_delivery_unresolved",
+] as const)("never invites a resend for %s", (failureCode) => {
+  expect(failureNotice(failureCode)).not.toMatch(/send it again|resend/i);
 });
 
 it("persists acceptance and a bounded private draft without projecting the draft", () => {
@@ -1200,6 +1362,37 @@ it("atomically retires an accepted broken generation into one restart-safe recov
     completionContinuations: 2,
     privateDraftText: "Bounded unfinished answer",
   });
+});
+
+// The owner asked a real question at 1:42am, it was folded into the running
+// answer, and no bubble appeared at all. From Telegram that is identical to
+// being ignored, so a folded message has to leave something visible behind.
+it("acknowledges an owner message folded into the running answer", () => {
+  const { store } = fixture();
+  const { turn: running, fence } = submittedTurn(store, "thr_folded_ack");
+  const waiting = store.enqueueControllerTurn(
+    turnInput(78_010, "yeah but if hanoon started a new thread and gave it the context"),
+  );
+  expect(store.reserveControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    expectedThreadId: "thr_folded_ack",
+  })).toBe(true);
+
+  expect(store.settleControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    outcome: "applied",
+  })).toBe("settled");
+
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "completed" });
+  const notice = store.getOutbox(`controller:${waiting.id}:reply`);
+  expect(notice?.payload.text).toMatch(/answer i'm already writing|already writing/i);
+  expect(notice?.chatId).toBe("7");
 });
 
 it("preserves an ambiguously steered owner message and inherits exact receipts", () => {
@@ -1282,7 +1475,7 @@ it("lets a durable acceptance win an unaccepted fail-and-retire attempt", () => 
   })).toBe("retired");
   expect(store.getControllerTurn(turn.id)).toMatchObject({ state: "failed" });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
-    .toBe("I couldn't complete that controller turn safely after recovery. No action was repeated.");
+    .toBe("I couldn't finish that one, so your message didn't get an answer. Nothing was repeated. Send it again and I'll pick it up.");
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
     .not.toContain("SECRET accepted answer");
   expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({ consumedAt: null });
@@ -1684,4 +1877,152 @@ it("throws and rolls back fail-and-retire when its generation disappears after t
     "SELECT ended_at FROM controller_generations WHERE controller_key = ? AND thread_id = ?",
   ).get(turn.controllerKey, "thr_fail_retire_late_generation")).toEqual({ ended_at: null });
   expect(store.getOutbox(`controller:${turn.id}:reply`)).toEqual(outboxBefore);
+});
+
+// The 1:50am failure: a thread the controller started raised a three-option
+// design question and it arrived on the owner's phone as a menu to tap.
+it("hands a spawned thread's question to the controller and leaves the owner alone", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_design",
+    threadId: "thr_spawned",
+    title: "Tell the owner what I asked a thread to do",
+    interaction: {
+      kind: "user_question",
+      interactionId: "pint_design",
+      questions: [{
+        id: "q1",
+        prompt: "Which shape should the retry take?",
+        shortLabel: "Approach",
+        multiSelect: false,
+        allowFreeText: false,
+        options: [
+          { value: "a", label: "Retry in place", description: null },
+          { value: "b", label: "Fresh thread", description: null },
+        ],
+      }],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent",
+  })).toBe(true);
+
+  expect(store.getOutbox("thread-interaction:pint_design")).toBeNull();
+  const queued = store.getQueuedControllerTurn("owner-7-controller");
+  expect(queued?.origin).toBe("system");
+  expect(queued?.inputText).toMatch(/blocked and waiting on you/i);
+  expect(queued?.inputText).toMatch(/Retry in place/);
+  expect(queued?.inputText).toMatch(/telegram_agent_answer_thread/);
+});
+
+it("still asks the owner about a thread they opened themselves", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_owned",
+    threadId: "thr_owner_started",
+    title: "Owner's own thread",
+    interaction: { kind: "unsupported", interactionId: "pint_owned" },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: null,
+  })).toBe(true);
+
+  expect(store.getOutbox("thread-interaction:pint_owned")).not.toBeNull();
+});
+
+// Merge, deploy, money, and credentials stay the owner's even on a thread the
+// controller started.
+it("keeps a spawned thread's merge approval with the owner", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_merge",
+    threadId: "thr_spawned",
+    title: "Ship the fix",
+    interaction: {
+      kind: "approval",
+      interactionId: "pint_merge",
+      summary: "wants to run:\n\n`gh pr merge 42 --squash`",
+      decisions: ["allow_once", "deny"],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent",
+  })).toBe(true);
+
+  expect(store.getOutbox("thread-interaction:pint_merge")).not.toBeNull();
+});
+
+it("lets the controller answer a block routed to it and refuses one that was not", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+  const approval = (id: string, parentThreadId: string | null) => store.recordThreadInteraction({
+    interactionId: id,
+    threadId: "thr_spawned",
+    title: "Run the suite",
+    interaction: {
+      kind: "approval",
+      interactionId: id,
+      summary: "wants to run:\n\n`npm test`",
+      decisions: ["allow_once", "allow_for_session", "deny"],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId,
+  });
+
+  expect(approval("pint_mine", "thr_controller_parent")).toBe(true);
+  expect(approval("pint_owners", null)).toBe(true);
+
+  expect(store.answerThreadInteractionAsController({
+    interactionId: "pint_mine",
+    threadId: "thr_spawned",
+    decision: "allow_once",
+    now: 6_000,
+  })).toEqual({ ok: true });
+  expect(store.getAnsweredThreadInteraction()).toMatchObject({
+    interactionId: "pint_mine",
+    resolution: { decision: "allow_once", grantedPermissions: null },
+  });
+
+  // The owner's own block is not the controller's to take over.
+  expect(store.answerThreadInteractionAsController({
+    interactionId: "pint_owners",
+    threadId: "thr_spawned",
+    decision: "allow_once",
+    now: 6_001,
+  })).toEqual({ ok: false, reason: "not_controller_routed" });
+});
+
+// A standing grant removes the boundary for everything the thread does next, so
+// the controller may unblock a thread but never hand it one.
+it("refuses a session-wide grant from the controller", () => {
+  const { store } = fixture();
+  submittedTurn(store, "thr_controller_parent");
+  expect(store.recordThreadInteraction({
+    interactionId: "pint_session",
+    threadId: "thr_spawned",
+    title: "Run the suite",
+    interaction: {
+      kind: "approval",
+      interactionId: "pint_session",
+      summary: "wants to run:\n\n`npm test`",
+      decisions: ["allow_once", "allow_for_session", "deny"],
+    },
+    chatId: "7",
+    now: 5_000,
+    parentThreadId: "thr_controller_parent",
+  })).toBe(true);
+
+  expect(store.answerThreadInteractionAsController({
+    interactionId: "pint_session",
+    threadId: "thr_spawned",
+    decision: "allow_for_session" as "allow_once",
+    now: 6_000,
+  })).toEqual({ ok: false, reason: "decision_not_allowed" });
 });

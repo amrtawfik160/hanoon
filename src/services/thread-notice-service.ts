@@ -31,6 +31,7 @@ export type ThreadNoticeServiceDependencies = {
     | "getAnsweredThreadInteraction"
     | "markThreadInteractionDelivered"
     | "discardThreadInteractions"
+    | "isControllerOwnedThread"
   >;
   threads: ThreadNoticeThreads;
   clock: { now(): number };
@@ -93,20 +94,26 @@ export class ThreadNoticeService {
       return didWork;
     }
     for (const thread of threads) {
-      // A sub-agent's thread is the parent's business, not the owner's; they
-      // asked to hear about the work they started, not each step inside it.
-      if (thread.parentThreadId !== null) continue;
       // Pipeline workers already have a job status card. Announcing their
       // internal titles as "finished" is noise the owner cannot act on.
       if (parseWorkerThreadTitle(thread.title) !== null) continue;
-      if (this.dependencies.store.observeThread({
-        threadId: thread.id,
-        title: thread.title,
-        status: thread.status,
-        userId: owner.userId,
-        chatId: owner.chatId,
-        now,
-      }) !== null) didWork = true;
+      // A sub-agent's thread is the parent's business, not the owner's; they
+      // asked to hear about the work they started, not each step inside it. A
+      // thread the controller started is the exception, because the controller
+      // is reachable: its block goes to the controller rather than being
+      // dropped. A worker under a job stays the pipeline's business.
+      const isChild = thread.parentThreadId !== null;
+      if (isChild && !this.dependencies.store.isControllerOwnedThread(thread.parentThreadId)) continue;
+      if (!isChild) {
+        if (this.dependencies.store.observeThread({
+          threadId: thread.id,
+          title: thread.title,
+          status: thread.status,
+          userId: owner.userId,
+          chatId: owner.chatId,
+          now,
+        }) !== null) didWork = true;
+      }
       if (!BLOCKABLE_STATUSES.has(thread.status)) continue;
       didWork = await this.checkBlocked(thread, owner.chatId) || didWork;
     }
@@ -139,6 +146,9 @@ export class ThreadNoticeService {
         interaction,
         chatId,
         now: this.dependencies.clock.now(),
+        // Provenance travels with the interaction; the store decides who
+        // answers, so no caller can route around it.
+        parentThreadId: thread.parentThreadId,
       })) asked = true;
     }
     return asked;

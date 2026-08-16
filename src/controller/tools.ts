@@ -810,6 +810,7 @@ async function resolveTrustedScope(
     case "telegram_agent_read_thread":
     case "telegram_agent_send_to_thread":
     case "telegram_agent_request_thread_operation":
+    case "telegram_agent_answer_thread":
       return visibleThreadResolution(dependencies, String(params.threadId), context);
     case "telegram_agent_create_thread": {
       const projectId = String(params.projectId);
@@ -1313,6 +1314,7 @@ async function projectTrustedEvidence(
         subjectRefs: [`thread:${threadId}`, `project:${expectedProjectId}`],
       };
     }
+    case "telegram_agent_answer_thread":
     case "telegram_agent_send_to_thread": {
       const threadId = resolution.scope.entityRefs[0]?.slice("thread:".length);
       const visible = threadId
@@ -2113,7 +2115,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[22],
     register: () => bb.agents.registerTool({
       name: CONTROLLER_TOOL_NAMES[22],
-      description: "Submit one bounded evidence-backed final response for the current controller turn.",
+      description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in.",
       parameters: controllerFinalizationJsonSchema,
       execute: (candidate, context) => executeControllerFinalizer(
         dependencies,
@@ -2238,6 +2240,36 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     execute: async (params, _context, _resolution, authorized) => {
       if (!dependencies.credentialAccess) return { outcome: "denied", reason: "disabled" };
       return await dependencies.credentialAccess.verify({ bindingId: params.bindingId, authorized });
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[28],
+    description: "Answer a block on a thread you started, so it carries on working. Use it when a system turn tells you one of your threads is waiting: pass decision for an approval, or answers for a question. Threads you started are yours to run end to end; the owner is not asked. Refused for a thread the owner opened themselves, and for the decisions reserved to them.",
+    experimental_statusLabels: { pending: "Answering thread", completed: "Answered thread" },
+    parameters: z.object({
+      threadId: z.string().min(1).max(256),
+      interactionId: z.string().min(1).max(256),
+      decision: z.enum(["allow_once", "deny"]).optional()
+        .describe("For an approval. A session-wide grant is never available."),
+      answers: z.record(z.string(), z.object({
+        selected: z.array(z.string()).min(1),
+        freeText: z.string().max(2_000).optional(),
+      }).strict()).optional().describe("For a question, keyed by question id."),
+    }).strict(),
+    execute: async (params, context) => {
+      authorizedController(dependencies.store, context);
+      const answered = dependencies.store.answerThreadInteractionAsController({
+        threadId: params.threadId,
+        interactionId: params.interactionId,
+        decision: params.decision,
+        answers: params.answers,
+        now: dependencies.now(),
+      });
+      // The answer is queued, not sent here: the same delivery path the owner's
+      // tap uses carries it to BB, so one set of retries covers both.
+      if (answered.ok) dependencies.notify();
+      return answered;
     },
   });
 

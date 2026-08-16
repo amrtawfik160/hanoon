@@ -726,9 +726,12 @@ export class LunaControllerService {
       );
       if (!reconciliation) return "fatal";
       if (reconciliation.outcome === "stale") return "stale";
-      if (reconciliation.outcome === "limit_exceeded") {
-        return "fatal";
-      }
+      // A saturated evidence budget bounds what this turn may still ingest, not
+      // whether it may answer. Killing the turn here destroyed the owner's
+      // message and retired the conversation over a budget the turn had not
+      // spent. The cap stays marked, so later polls short-circuit cheaply and
+      // the finalizer refuses fresh claims while a plain answer still lands.
+      if (reconciliation.outcome === "limit_exceeded") return "ready";
       if (reconciliation.reconciliationIncomplete !== null) return "retry";
       if (reconciliation.targetSeq !== highWater) return "stale";
       return "ready";
