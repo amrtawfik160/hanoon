@@ -36,6 +36,7 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_answer_thread",
   "telegram_agent_send_media",
   "telegram_agent_approve_merge",
+  "telegram_agent_resume_project",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -649,6 +650,28 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     credential_scope: { credential: "none", audience: "none" },
     egress: ["none"],
     proof_kinds: ["job_state", "external_mutation"],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
+  }),
+  /**
+   * Lifting the failure brake, which the agent could only ever ask for. Bounded
+   * in the store to one clear per cause, so the brake still catches the loop it
+   * exists to catch while the owner stops being the way through it.
+   */
+  telegram_agent_resume_project: capability({
+    capability_id: "telegram_agent_resume_project",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "high",
+    data_class: ["job_control"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["job_state"],
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
   }),

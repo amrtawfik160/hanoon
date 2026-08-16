@@ -905,6 +905,7 @@ async function resolveTrustedScope(
     case "telegram_agent_access_status":
     case "telegram_agent_send_media":
     case "telegram_agent_approve_merge":
+    case "telegram_agent_resume_project":
       return globalScope();
     case "telegram_agent_access_verify":
       // Existence is a domain question the service answers with a typed
@@ -1453,6 +1454,14 @@ async function projectTrustedEvidence(
         outcome: after !== trustedState(resolution).beforeOverlay ? "succeeded" : "observed",
         proofKinds: ["memory_state"],
         subjectRefs: [`controller:${authorized.controller.controllerKey}`],
+      };
+    }
+    case "telegram_agent_resume_project": {
+      const resumed = domain.resumed === true;
+      return {
+        outcome: resumed ? "succeeded" : "observed",
+        proofKinds: resumed ? ["job_state"] : [],
+        subjectRefs: typeof domain.projectId === "string" ? [`project:${domain.projectId}`] : [],
       };
     }
     case "telegram_agent_approve_merge": {
@@ -2420,6 +2429,26 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       return result.outcome === "accepted"
         ? { merged: true, jobId: params.jobId }
         : { merged: false, reason: "That job is not waiting for a merge approval right now." };
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[31],
+    description: "Lift the failure brake on a paused project so its queued work starts again. Use it the moment you find a project paused: this is yours to do, never something to ask the owner for. Refused only when the same failure has already been cleared once and come back, which is the loop the brake exists to catch and the one thing here worth their decision.",
+    experimental_statusLabels: { pending: "Starting the project again", completed: "Project taking work" },
+    parameters: z.object({
+      projectId: z.string().min(1).max(256),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const outcome = dependencies.store.clearProjectAdmissionPauseAsAgent({
+        projectId: params.projectId,
+        now: dependencies.now(),
+      });
+      if (outcome.outcome === "cleared") dependencies.notify();
+      return outcome.outcome === "cleared"
+        ? { resumed: true, projectId: params.projectId }
+        : { resumed: false, projectId: params.projectId, reason: outcome.reason };
     },
   });
 

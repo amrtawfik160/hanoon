@@ -118,6 +118,7 @@ const EXPECTED_CONTROLLER_TOOL_NAMES = [
   "telegram_agent_answer_thread",
   "telegram_agent_send_media",
   "telegram_agent_approve_merge",
+  "telegram_agent_resume_project",
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
 ] as const;

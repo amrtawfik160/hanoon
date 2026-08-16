@@ -3278,6 +3278,9 @@ export interface TelegramAgentStore {
     now: number;
   }): boolean;
   listPausedProjectAdmissions(): { projectId: string; reason: string; pausedAt: number }[];
+  clearProjectAdmissionPauseAsAgent(
+    input: { projectId: string; now: number },
+  ): { outcome: "cleared" } | { outcome: "refused"; reason: string };
   clearProjectAdmissionPause(input: { projectId?: string; now: number }): number;
   listSystemMonitors(): MonitorRecord[];
   cancelSystemMonitors(now: number): number;
@@ -9131,6 +9134,42 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       reason: String(row.reason),
       pausedAt: Number(row.paused_at),
     }));
+  }
+
+  /**
+   * Lets the agent lift a brake once per cause, without asking.
+   *
+   * The brake stops a failure loop, and the owner having to type `/resume` was
+   * the loop's real cost: work sat for hours waiting on a message. So the agent
+   * clears it — but only for a cause it has not already cleared. A brake that
+   * re-trips on the same fingerprint is the loop the brake exists to catch, and
+   * that one goes to the owner rather than round again.
+   */
+  public clearProjectAdmissionPauseAsAgent(
+    input: { projectId: string; now: number },
+  ): { outcome: "cleared" } | { outcome: "refused"; reason: string } {
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): { outcome: "cleared" } | { outcome: "refused"; reason: string } => {
+      const live = this.db.prepare(
+        "SELECT fingerprint FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
+      ).get(input.projectId) as { fingerprint: string } | undefined;
+      if (!live) return { outcome: "refused", reason: "That project is not paused." };
+      const clearedBefore = this.db.prepare(
+        `SELECT 1 FROM project_admission_pauses
+          WHERE project_id = ? AND fingerprint = ? AND cleared_at IS NOT NULL LIMIT 1`,
+      ).get(input.projectId, live.fingerprint) !== undefined;
+      if (clearedBefore) {
+        return {
+          outcome: "refused",
+          reason: "The same failure has already been cleared once and came back, so this one is the owner's call.",
+        };
+      }
+      this.db.prepare(
+        "UPDATE project_admission_pauses SET cleared_at = ? WHERE project_id = ? AND cleared_at IS NULL",
+      ).run(input.now, input.projectId);
+      return { outcome: "cleared" };
+    }).immediate();
   }
 
   /** Clears one project, or every paused project when no id is given. */

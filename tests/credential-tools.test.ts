@@ -184,7 +184,7 @@ describe("credential access capability manifest", () => {
     const fixture = toolFixture();
     const registered = fixture.harness.registrations.agentTools.map((tool) => tool.name);
     expect(registered).toEqual(ALL_CONTROLLER_TOOL_NAMES);
-    expect(CONTROLLER_TOOL_NAMES).toHaveLength(31);
+    expect(CONTROLLER_TOOL_NAMES).toHaveLength(32);
     expect(CONTROLLER_TOOL_NAMES.slice(25, 28)).toEqual([
       "telegram_agent_access_list",
       "telegram_agent_access_status",
