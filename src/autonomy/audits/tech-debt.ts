@@ -22,6 +22,27 @@ import { VENDORED_DOC_PREFIXES } from "./docs-staleness";
 /** The markers this looks for. Widening this is a deliberate, tested change. */
 export const DEBT_MARKERS: readonly string[] = Object.freeze(["TODO", "FIXME", "HACK", "XXX"]);
 
+/**
+ * The access layer searches tracked source files only. These trees are excluded
+ * there and here so the command scope and the finding scope cannot disagree.
+ */
+export const DEBT_EXCLUDED_PREFIXES: readonly string[] = Object.freeze([
+  ...VENDORED_DOC_PREFIXES,
+  "node_modules/",
+  "vendor/",
+  "types/",
+  "dist/",
+  "build/",
+  "coverage/",
+  ".next/",
+  "out/",
+]);
+
+export const DEBT_SCAN_SCOPE = [
+  "tracked source files only",
+  "(prose, dependencies, vendored, generated, and type-only trees excluded)",
+].join(" ");
+
 export type DebtMarker = {
   path: string;
   line: number;
@@ -30,12 +51,7 @@ export type DebtMarker = {
 };
 
 /** Code this repository carries but did not write, so its debt is not ours. */
-const SKIPPED_PREFIXES: readonly string[] = Object.freeze([
-  ...VENDORED_DOC_PREFIXES,
-  "node_modules/",
-  "vendor/",
-  "types/",
-]);
+const SKIPPED_PREFIXES: readonly string[] = DEBT_EXCLUDED_PREFIXES;
 
 export function analyseTechDebt(input: Readonly<{
   markers: readonly DebtMarker[];
@@ -61,6 +77,6 @@ export function analyseTechDebt(input: Readonly<{
     .map(([path, entry]): AuditFinding => ({
       auditId: "tech-debt",
       subject: path,
-      detail: `${entry.count} marker${entry.count === 1 ? "" : "s"} (${[...entry.kinds].sort().join(", ")})`,
+      detail: `${entry.count} marker${entry.count === 1 ? "" : "s"} in ${DEBT_SCAN_SCOPE} (${[...entry.kinds].sort().join(", ")})`,
     }));
 }

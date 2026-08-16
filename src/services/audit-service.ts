@@ -2,7 +2,7 @@ import { auditDigest, type AuditResult } from "../autonomy/audit-contract";
 import { analyseBugBacklog, type BacklogIssue } from "../autonomy/audits/bug-backlog";
 import { analyseDocsStaleness, type DocObservation } from "../autonomy/audits/docs-staleness";
 import { analysePrReviewFindings, type ReviewThread } from "../autonomy/audits/pr-review-findings";
-import { analyseTechDebt, type DebtMarker } from "../autonomy/audits/tech-debt";
+import { analyseTechDebt, DEBT_SCAN_SCOPE, type DebtMarker } from "../autonomy/audits/tech-debt";
 import { redactError } from "../errors";
 import type { TelegramAgentStore } from "../storage/store";
 
@@ -115,9 +115,13 @@ export class AuditService {
         const { docs, trackedPaths } = await this.dependencies.audits.readDocs(project);
         return analyseDocsStaleness({ docs, trackedPaths });
       }),
-      await this.run("tech-debt", async () => analyseTechDebt({
-        markers: await this.dependencies.audits.readDebtMarkers(project),
-      })),
+      await this.run(
+        "tech-debt",
+        async () => analyseTechDebt({
+          markers: await this.dependencies.audits.readDebtMarkers(project),
+        }),
+        DEBT_SCAN_SCOPE,
+      ),
       await this.run("bug-backlog", async () => analyseBugBacklog({
         issues: await this.dependencies.audits.readBugBacklog(project),
         now,
@@ -131,14 +135,21 @@ export class AuditService {
   private async run(
     auditId: string,
     body: () => Promise<readonly AuditResult["findings"][number][]>,
+    scope?: string,
   ): Promise<AuditResult> {
     try {
       const findings = await body();
       return findings.length === 0
-        ? { auditId, status: "ok", findings: [] }
-        : { auditId, status: "findings", findings };
+        ? { auditId, status: "ok", findings: [], ...(scope === undefined ? {} : { scope }) }
+        : { auditId, status: "findings", findings, ...(scope === undefined ? {} : { scope }) };
     } catch (error) {
-      return { auditId, status: "error", findings: [], error: redactError(error).slice(0, 120) };
+      return {
+        auditId,
+        status: "error",
+        findings: [],
+        error: redactError(error).slice(0, 120),
+        ...(scope === undefined ? {} : { scope }),
+      };
     }
   }
 

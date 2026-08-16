@@ -27,9 +27,11 @@ export type AuditFinding = {
 };
 
 export type AuditResult =
-  | { auditId: string; status: "ok"; findings: readonly AuditFinding[] }
-  | { auditId: string; status: "findings"; findings: readonly AuditFinding[] }
-  | { auditId: string; status: "error"; findings: readonly AuditFinding[]; error: string };
+  // A scoped clean result is qualified when a digest is already visible, but
+  // it does not turn an otherwise clean day into a daily interruption.
+  | { auditId: string; status: "ok"; findings: readonly AuditFinding[]; scope?: string }
+  | { auditId: string; status: "findings"; findings: readonly AuditFinding[]; scope?: string }
+  | { auditId: string; status: "error"; findings: readonly AuditFinding[]; error: string; scope?: string };
 
 /** Most one audit may contribute, so a single noisy check cannot fill a message. */
 export const AUDIT_FINDINGS_PER_AUDIT_CAP = 5;
@@ -69,6 +71,11 @@ export function auditDigest(input: Readonly<{
       `${result.auditId}: ${result.findings.length} found. ${body}` +
       (omitted > 0 ? ` (${held(omitted)}).` : "."),
     );
+  }
+
+  for (const result of input.results) {
+    if (result.status !== "ok" || result.scope === undefined) continue;
+    lines.push(`${result.auditId}: no findings in ${result.scope}.`);
   }
 
   for (const result of failed) {

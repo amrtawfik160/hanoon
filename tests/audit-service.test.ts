@@ -46,6 +46,15 @@ it("stays quiet on a clean day", async () => {
   expect(store.enqueueControllerTurn).not.toHaveBeenCalled();
 });
 
+it("labels a clean debt result with the bounded scan scope", async () => {
+  const { svc } = service();
+  const outcome = await svc.sweep(NOW);
+  expect(outcome.results.find((result) => result.auditId === "tech-debt")).toMatchObject({
+    status: "ok",
+    scope: expect.stringContaining("tracked source files only"),
+  });
+});
+
 it("reports one digest when an audit finds something", async () => {
   const { svc, store } = service({
     readDebtMarkers: async () => [{ path: "src/a.ts", line: 1, kind: "TODO", text: "TODO: x" }],
