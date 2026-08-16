@@ -104,20 +104,42 @@ The live line previously had no trunk branch, which is why BB fell back to
 `npm run check` on the assembled result is green: typecheck clean, 3793 tests
 across 134 files, build and artifact verification pass.
 
-Two live tips were **not** merged, because each conflicts with the trunk:
+### The consolidation of 2026-08-16
 
-| Tip | Conflicting files |
+Every branch carrying unmerged work was then merged into `trunk`, so one ref
+holds all of it:
+
+| Branch | What it carried |
 | --- | --- |
-| `930e235` | `src/plugin.ts` |
-| `ba2710b` | `scripts/eval-controller-answers.mjs`, `src/eval/answer-contract.ts`, `src/eval/eval-integrity.ts`, `tests/answer-contract.test.ts`, `tests/eval-integrity-race.test.ts` |
+| `bb/consolidated-harness-fixes` | spawned-thread questions kept with the controller, plus the fake-host disposal fix |
+| `bb/consolidate-tonight-branches-onto-trunk-…` | the test temp-directory leak fix |
+| `bb/bring-…-harness-safeguards-into-hanoon-…` | disk-pressure sweep, wedged-delegation notice, spent-evidence degrade |
+| `bb/per-stage-model-routing-for-the-job-pipeline-…` | per-stage model routing and the `stage_executions` ledger |
+| `bb/self-diagnosis-…` (`930e235`) | default-off diagnosis of persisted controller failures |
+| `bb/write-hanoon-reliability-design-spec-…` | the reliability design and plan documents |
 
-Both conflict against `c11da25` as well, so neither was caused by the fix commit.
+Four conflicts were resolved rather than taken from one side:
 
-These two are **outstanding, not abandoned**. The work is intact on its own
-branches and nothing is lost. They are deliberately not being rebased yet:
-`930e235` conflicts in `src/plugin.ts`, which in-flight work is still editing, so
-rebasing today would only buy a second round of the same conflicts. Both get
-rebased onto `trunk` as their own task once the in-flight work lands.
+- **`vitest.config.ts`** — two different temp-directory leak fixes. Both are
+  kept; one redirects `os.tmpdir()`, the other disposes fake plugin hosts.
+- **`src/controller/service.ts`** — a saturated evidence budget now returns
+  `spent` rather than `ready`, because the branch that added `degradeSpentEvidence`
+  also added the only caller that reaches it. Returning `ready` would have left
+  that path dead.
+- **The migration list** — both sides appended tables. All are kept, with
+  `stage_executions` last so no index already applied by a live database moves.
+- **`src/plugin.ts`** — two independent import blocks, both kept.
+
+`ba2710b` was **not** merged, and does not need to be. Its change is already on
+`trunk` as `87bd35b`, with a byte-identical diffstat, and `bea07ab` then hardened
+it further. Merging `ba2710b` now would revert that hardening. The earlier note
+that it was "outstanding" was measured by commit identity rather than by content.
+
+`LICENSE` was restored. The live line never carried one; it existed only on the
+published root and the rescue branch.
+
+`npm run check` on the consolidated result is green: typecheck clean, 3970 tests
+across 143 files, build and artifact verification pass.
 
 ## What decides the base of a new worktree
 
@@ -164,8 +186,13 @@ run it again.
 
 ## What is still open
 
-`main` is unchanged and still disjoint. Reconciling it, if it is ever wanted,
-is covered in [`docs/main-reconciliation-options.md`](main-reconciliation-options.md).
+`main` is no longer disjoint. A `-s ours` merge on 2026-08-16 recorded `main` as
+an ancestor of `trunk` while keeping `trunk`'s tree byte-for-byte identical, so
+merging `trunk` into `main` is now a fast-forward with no conflicts. Nothing
+published was rewritten and the four merged pull requests stay reachable. The
+remaining decision is only *when* to fast-forward `main`, and whether to make
+`trunk` the GitHub default; see
+[`docs/main-reconciliation-options.md`](main-reconciliation-options.md).
 
 Every project policy `baseBranch` must name `trunk`. Pointing it at `main` will
 make the ancestry guard refuse every job, which is the intended behaviour but is

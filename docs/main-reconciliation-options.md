@@ -5,12 +5,25 @@ Background is in [`docs/repository-history.md`](repository-history.md). In short
 ancestor. This document lists the ways to reconcile them, what each risks, and
 what it costs to undo.
 
-## Status: Option A taken, 2026-08-16
+## Status: Option A taken, then the ancestry closed, 2026-08-16
 
 The live line was given a trunk branch, `trunk`, and `main` was left exactly as
 it stands. Nothing was rewritten and no published history changed. How `trunk`
-was assembled, and which tips were left out, is recorded in
+was assembled is recorded in
 [`docs/repository-history.md`](repository-history.md).
+
+**The disjointness is now closed.** `git merge -s ours --allow-unrelated-histories main`
+on `trunk` recorded `main` as an ancestor while keeping `trunk`'s tree
+byte-for-byte identical — the tree hash before and after the merge is the same
+commit-for-commit, so not one file changed. `main` is now reachable from `trunk`,
+which means:
+
+- Merging `trunk` into `main` is a **fast-forward with no conflicts**, whenever
+  that is wanted. Option B's "resolve every file by hand" cost is gone.
+- Nothing published was rewritten, so Option C's risks were not taken.
+- The four merged pull requests remain reachable from `main`.
+
+To publish, when ready: `git checkout main && git merge --ff-only trunk && git push`.
 
 One step remains, and it is the one that actually stops threads being cut from
 the wrong history: **decide whether `trunk` becomes the GitHub default branch.**
