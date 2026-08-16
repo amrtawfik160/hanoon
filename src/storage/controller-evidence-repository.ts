@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { CONTROLLER_EVIDENCE_LIMIT } from "../controller/evidence-budget";
 import {
   CONTROLLER_PROOF_KINDS,
   type ControllerLeaseFence,
@@ -202,7 +203,10 @@ type EvidenceInsertFields = Readonly<{
   observedAt: number;
 }>;
 
-const MAX_EVIDENCE_ROWS = 128;
+// One number, two readers: this transaction enforces it, and the evidence
+// budget warns as a turn approaches it. They must never drift apart, so the
+// budget owns the constant and this is the same value under the local name.
+const MAX_EVIDENCE_ROWS = CONTROLLER_EVIDENCE_LIMIT;
 const CURRENT_CONTROLLER_FINALIZATION_ENVELOPE_VERSION = 2;
 const MAX_RECEIPT_RESULT_BYTES = 8_000;
 const MAX_PROOF_KINDS = 8;
@@ -346,6 +350,12 @@ export class ControllerEvidenceRepository implements ControllerNativeEvidenceWri
         WHERE turn_id = ? ORDER BY id ASC LIMIT ?`,
     ).all(turnId, Math.min(limit, MAX_EVIDENCE_ROWS)) as ControllerEvidenceRow[];
     return rows.map(parseEvidenceRow);
+  }
+
+  /** How much of the turn's evidence budget is spent, for the budget check. */
+  public count(turnId: string): number {
+    assertBoundedString(turnId, "turnId");
+    return this.evidenceCount(turnId);
   }
 
   public get(turnId: string, evidenceId: number): ControllerEvidenceRecord | null {

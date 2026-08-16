@@ -1977,6 +1977,54 @@ CREATE INDEX controller_thread_asks_unreported
   WHERE reported_at IS NULL;
 `] as const;
 
+// Two more reasons a turn can be steered, both about the evidence budget: one
+// as it nears the cap, one once the cap has refused a write. The reason column
+// carries a CHECK, which SQLite cannot widen in place, so the table is rebuilt
+// with its rows carried over.
+export const CONTROLLER_EVIDENCE_STEER_MIGRATIONS = [String.raw`
+CREATE TABLE controller_supervisor_steer_attempts_v2 (
+  turn_id TEXT NOT NULL REFERENCES controller_turns(id),
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  reason TEXT NOT NULL CHECK (reason IN (
+    'tool_budget', 'token_budget', 'command_failures', 'evidence_budget', 'evidence_spent')),
+  thread_id TEXT NOT NULL,
+  input_text TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'unknown')),
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  PRIMARY KEY (turn_id, reason),
+  CHECK ((state = 'pending' AND settled_at IS NULL) OR
+         (state IN ('applied', 'unknown') AND settled_at IS NOT NULL))
+);
+INSERT INTO controller_supervisor_steer_attempts_v2
+  SELECT * FROM controller_supervisor_steer_attempts;
+DROP TABLE controller_supervisor_steer_attempts;
+ALTER TABLE controller_supervisor_steer_attempts_v2
+  RENAME TO controller_supervisor_steer_attempts;
+CREATE INDEX controller_supervisor_steer_attempts_pending
+  ON controller_supervisor_steer_attempts(turn_id, state);
+`] as const;
+
+// Upkeep the agent does for itself has to be able to say something once and
+// then stay quiet. A notice claimed here is a notice already given, until its
+// window expires.
+export const HOUSEKEEPING_NOTICE_MIGRATIONS = [String.raw`
+CREATE TABLE housekeeping_notices (
+  notice_key TEXT PRIMARY KEY,
+  detail TEXT NOT NULL,
+  claimed_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+`] as const;
+
+// A stalled member is escalated once, not on every sweep. Durable, because the
+// alternative is an in-memory flag that a restart turns back into a fresh
+// alarm about a thread that was already reported.
+export const DELEGATION_STALL_MIGRATIONS = [String.raw`
+ALTER TABLE delegation_threads ADD COLUMN stall_notified_at INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2035,4 +2083,7 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_DELIVERY_STATE_MIGRATIONS,
   ...THREAD_INTERACTION_AUDIENCE_MIGRATIONS,
   ...CONTROLLER_THREAD_ASK_MIGRATIONS,
+  ...CONTROLLER_EVIDENCE_STEER_MIGRATIONS,
+  ...HOUSEKEEPING_NOTICE_MIGRATIONS,
+  ...DELEGATION_STALL_MIGRATIONS,
 ] as const;

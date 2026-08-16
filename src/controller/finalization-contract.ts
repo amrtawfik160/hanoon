@@ -1414,6 +1414,15 @@ function boundaryFreeRendering(candidate: ControllerFinalization): string {
   return candidate.segments.map((segment) => segment.text.trim()).join("");
 }
 
+/**
+ * A turn whose evidence budget was refused a write has an incomplete record of
+ * what it did, so it may no longer make evidence-backed claims. It may still
+ * answer: a claim-free finalization asserts nothing the record has to support,
+ * and every plain-text guard below still applies to it, so a degraded answer
+ * cannot smuggle in an unbacked success assertion.
+ *
+ * Blocking that answer too is what turned a spent budget into a lost question.
+ */
 function contextRejectionCode(
   candidate: ControllerFinalization,
   context: ControllerFinalizationValidationContext,

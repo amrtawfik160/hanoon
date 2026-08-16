@@ -73,6 +73,9 @@ export type JobExecutorDependencies = {
   failureLoop?: {
     processDue(): boolean;
   };
+  diskHousekeeping?: {
+    processDue(): Promise<boolean>;
+  };
   systemMonitors?: {
     install(): void;
   };
@@ -866,6 +869,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // brake does not get one more job admitted into the same failure.
         if (deps.failureLoop) {
           didWork = deps.failureLoop.processDue() || didWork;
+        }
+        // Runs when something has already gone wrong elsewhere, so it is paced
+        // daily inside itself and never allowed to fail the tick.
+        if (deps.diskHousekeeping) {
+          didWork = await deps.diskHousekeeping.processDue() || didWork;
         }
         // Idempotent, and deliberately not a one-shot at activation: pairing
         // can happen long after the executor starts.

@@ -1,5 +1,8 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { createHash } from "node:crypto";
+import { lstat, readdir, rm, statfs } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { createSecret } from "./crypto";
 import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes";
 import { CAPABILITY_BY_ID } from "./capabilities/catalog";
@@ -96,6 +99,8 @@ import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
 import { ThreadNoticeService } from "./services/thread-notice-service";
 import { JobMemoryService } from "./services/job-memory-service";
+import { isDisposableTempName } from "./autonomy/disk-space";
+import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { installSystemMonitors } from "./services/system-monitors";
 import { ProductionHealthService } from "./services/production-health-service";
@@ -856,6 +861,19 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         const result = await bb.sdk.threads.output({ threadId });
         return result.output ?? "";
       },
+      observe: async (threadId) => {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.deletedAt !== null || thread.archivedAt !== null) return null;
+        const interactions = await bb.sdk.threads.interactions.list({ threadId });
+        return {
+          status: thread.status,
+          runtimeStatus: thread.runtime.displayStatus,
+          startedAt: thread.createdAt,
+          updatedAt: thread.updatedAt,
+          hasPendingInteraction: interactions.some((interaction) => interaction.status === "pending"),
+          hostReconnectGraceExpiresAt: thread.runtime.hostReconnectGraceExpiresAt ?? null,
+        };
+      },
     },
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
@@ -975,6 +993,57 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
       return healthUpdateId;
     },
+    warn: (message) => bb.log.warn(message),
+  });
+  const diskHousekeeping = new DiskHousekeepingService({
+    store,
+    temp: {
+      list: async () => {
+        const entries = await readdir(tmpdir(), { withFileTypes: true });
+        return Promise.all(entries.map(async (entry) => {
+          let modifiedAt: number | null = null;
+          // Only the names that could be candidates are worth a syscall. A
+          // temp directory holding a leak has hundreds of thousands of
+          // entries, and the planner rejects a foreign name before it ever
+          // looks at its age.
+          if (isDisposableTempName(entry.name)) {
+            try {
+              // lstat, not stat: a symlink's own timestamps, never its target's.
+              modifiedAt = (await lstat(join(tmpdir(), entry.name))).mtimeMs;
+            } catch {
+              // Unreadable reads as unknown age, which the planner keeps.
+            }
+          }
+          return {
+            name: entry.name,
+            isDirectory: entry.isDirectory(),
+            isSymbolicLink: entry.isSymbolicLink(),
+            modifiedAt,
+          };
+        }));
+      },
+      remove: async (name) => {
+        // Rebuilt from the temp root and the bare name the planner returned, so
+        // nothing a directory listing could contain can reach outside it.
+        await rm(join(tmpdir(), basename(name)), { recursive: true, force: false });
+      },
+      usage: async () => {
+        const stats = await statfs(tmpdir());
+        return {
+          freeBytes: Number(stats.bavail) * Number(stats.bsize),
+          totalBytes: Number(stats.blocks) * Number(stats.bsize),
+        };
+      },
+    },
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    // Deleting is upkeep the agent does unprompted, so it rides the one switch
+    // the owner already has for that rather than a knob of its own. Warnings
+    // are read-only and are never gated.
+    reclaimArmed: () => config.ok && systemUpkeepEnabled(config.value),
     warn: (message) => bb.log.warn(message),
   });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
@@ -1679,6 +1748,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       productionHealth,
       regressionWatch,
       failureLoop,
+      diskHousekeeping,
       systemMonitors,
       presence,
       laneSnapshots,

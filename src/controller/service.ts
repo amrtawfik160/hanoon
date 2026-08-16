@@ -25,7 +25,8 @@ import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
 import { normalizeControllerEventObservation, projectControllerStream } from "./stream";
 import type { ControllerEventObservation } from "./bb-controller";
 import { buildTurnContext, composeTurnInput } from "./context";
-import { evaluateSupervisor } from "./supervisor";
+import { evaluateEvidenceBudget, EVIDENCE_SPENT_STEER } from "./evidence-budget";
+import { evaluateSupervisor, type SupervisorReason } from "./supervisor";
 import {
   ControllerEvidenceProjectorError,
   type ControllerEvidenceReconciler,
@@ -345,6 +346,10 @@ export class LunaControllerService {
     if (evidenceOutcome === "stale") return true;
     if (evidenceOutcome === "fatal") {
       this.failAndRetire(turn, controller, fence, "Controller evidence could not be reconciled safely");
+      return true;
+    }
+    if (evidenceOutcome === "spent" &&
+        await this.degradeSpentEvidence(turn.id, controller, fence, signal, true)) {
       return true;
     }
     turn = this.dependencies.store.getControllerTurn(turn.id);
@@ -706,7 +711,7 @@ export class LunaControllerService {
     turn: ControllerTurnRecord,
     fence: EffectFence,
     signal: AbortSignal,
-  ): Promise<"ready" | "retry" | "stale" | "fatal"> {
+  ): Promise<"ready" | "retry" | "stale" | "fatal" | "spent"> {
     let highWater: number;
     try {
       highWater = await this.dependencies.adapter.latestSeq(controller.threadId!, signal);
@@ -729,9 +734,9 @@ export class LunaControllerService {
       // A saturated evidence budget bounds what this turn may still ingest, not
       // whether it may answer. Killing the turn here destroyed the owner's
       // message and retired the conversation over a budget the turn had not
-      // spent. The cap stays marked, so later polls short-circuit cheaply and
-      // the finalizer refuses fresh claims while a plain answer still lands.
-      if (reconciliation.outcome === "limit_exceeded") return "ready";
+      // spent. Reporting it as spent steers the turn to finalize in plain text
+      // while the finalizer refuses fresh claims, so the answer still lands.
+      if (reconciliation.outcome === "limit_exceeded") return "spent";
       if (reconciliation.reconciliationIncomplete !== null) return "retry";
       if (reconciliation.targetSeq !== highWater) return "stale";
       return "ready";
@@ -1200,45 +1205,13 @@ export class LunaControllerService {
       // which has answered every earlier message too.
       totalTokens: Math.max(0, turn.totalTokens - (turn.tokenBaseline ?? turn.totalTokens)),
       commandFailures: turn.commandFailures,
+      evidenceRows: this.dependencies.store.countControllerEvidence(turnId),
       steersIssued: turn.supervisorSteers,
       steeredReasons: turn.supervisorReasons,
     });
     if (decision.kind === "continue") return false;
     if (decision.kind === "steer") {
-      const claim = this.dependencies.store.claimControllerSupervisorSteer({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId,
-        controllerKey: turn.controllerKey,
-        expectedThreadId: controller.threadId,
-        reason: decision.reason,
-        inputText: decision.text,
-      });
-      if (claim === "stale" || claim === "settled") return true;
-      const attempt = this.dependencies.store.getControllerSupervisorSteerAttempt(turnId, decision.reason);
-      if (!attempt) return true;
-      if (claim === "pending") return this.reconcilePendingSupervisorSteer(turnId, fence, signal);
-
-      let outcome: "applied" | "unknown" = "unknown";
-      try {
-        if (!signal.aborted) {
-          await this.dependencies.adapter.steer(attempt.threadId, attempt.inputText, signal);
-          outcome = "applied";
-        }
-      } catch {
-        // The provider boundary is ambiguous. Reconcile once when the
-        // adapter can prove whether this idempotency key landed; otherwise
-        // settle unknown so a successor never replays it.
-        const reconciled = await this.reconcileProviderSteer(attempt, signal);
-        outcome = reconciled === "applied" ? "applied" : "unknown";
-      }
-      const settled = this.dependencies.store.settleControllerSupervisorSteer({
-        ...fenceAt(fence, this.dependencies.clock.now()),
-        turnId,
-        controllerKey: turn.controllerKey,
-        reason: decision.reason,
-        outcome,
-      });
-      return settled === "settled" || settled === "stale";
+      return this.issueSupervisorSteer(turn, controller, fence, signal, decision.reason, decision.text);
     }
     if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
     this.failAndRetire(
@@ -1249,6 +1222,105 @@ export class LunaControllerService {
       "budget_exceeded",
     );
     return true;
+  }
+
+  /**
+   * A turn whose evidence budget has been refused a write. It cannot make
+   * claims any more, but it can still answer, so it is told to land a plain
+   * answer rather than being retired with the owner's question inside it.
+   *
+   * Deliberately not routed through `evaluateSupervisor`: the two-steer ration
+   * exists to stop a model being nagged, and this is not a nag. It is the one
+   * instruction that decides whether the owner hears anything at all, so it
+   * must not be starved by two earlier nudges. Claiming the steer is what
+   * makes it happen once — a spent budget stays spent on every later poll.
+   */
+  private async degradeSpentEvidence(
+    turnId: string,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+    writeRefused: boolean,
+  ): Promise<boolean> {
+    // Re-read: the reconciliation that reported the refusal is what marked the
+    // turn, so any copy taken before it is behind on the one field this reads.
+    const turn = this.dependencies.store.getControllerTurn(turnId);
+    if (!turn || turn.state !== "submitted" || controller.threadId === null ||
+        turn.acceptedFinalizationId !== null ||
+        this.dependencies.store.getAcceptedControllerFinalization(turn.id) !== null) return false;
+    const verdict = evaluateEvidenceBudget({
+      recorded: this.dependencies.store.countControllerEvidence(turn.id),
+      // Either source proves a refusal: the mark the write left behind, or the
+      // reconciliation that has just reported one. Reading only the mark would
+      // put this on the wrong side of the write it is reacting to.
+      limitExceeded: writeRefused || turn.evidenceLimitExceededAt !== null,
+    });
+    if (verdict.kind !== "spent") return false;
+    if (turn.supervisorReasons.includes("evidence_spent")) return false;
+    this.dependencies.warn?.(JSON.stringify({
+      event: "controller_evidence_budget_spent",
+      turnId: turn.id,
+      controllerThreadId: controller.threadId,
+      reason: verdict.reason,
+    }));
+    return this.issueSupervisorSteer(
+      turn,
+      controller,
+      fence,
+      signal,
+      "evidence_spent",
+      EVIDENCE_SPENT_STEER,
+    );
+  }
+
+  /**
+   * Claim, send, and settle one steer. Returns true when the caller should stop
+   * reconciling this turn, which is every outcome except a claim that was never
+   * this executor's to make.
+   */
+  private async issueSupervisorSteer(
+    turn: ControllerTurnRecord,
+    controller: ControllerThreadRecord,
+    fence: EffectFence,
+    signal: AbortSignal,
+    reason: SupervisorReason,
+    text: string,
+  ): Promise<boolean> {
+    if (controller.threadId === null) return false;
+    const claim = this.dependencies.store.claimControllerSupervisorSteer({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      expectedThreadId: controller.threadId,
+      reason,
+      inputText: text,
+    });
+    if (claim === "stale" || claim === "settled") return true;
+    const attempt = this.dependencies.store.getControllerSupervisorSteerAttempt(turn.id, reason);
+    if (!attempt) return true;
+    if (claim === "pending") return this.reconcilePendingSupervisorSteer(turn.id, fence, signal);
+
+    let outcome: "applied" | "unknown" = "unknown";
+    try {
+      if (!signal.aborted) {
+        await this.dependencies.adapter.steer(attempt.threadId, attempt.inputText, signal);
+        outcome = "applied";
+      }
+    } catch {
+      // The provider boundary is ambiguous. Reconcile once when the
+      // adapter can prove whether this idempotency key landed; otherwise
+      // settle unknown so a successor never replays it.
+      const reconciled = await this.reconcileProviderSteer(attempt, signal);
+      outcome = reconciled === "applied" ? "applied" : "unknown";
+    }
+    const settled = this.dependencies.store.settleControllerSupervisorSteer({
+      ...fenceAt(fence, this.dependencies.clock.now()),
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      reason,
+      outcome,
+    });
+    return settled === "settled" || settled === "stale";
   }
 
   private async spawnOrAdopt(

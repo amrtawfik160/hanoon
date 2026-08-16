@@ -552,6 +552,15 @@ describe("ordered rejection branches", () => {
       .not.toMatch(/do not finalize/i);
   });
 
+  it("keeps the plain-text guards on a degraded answer", () => {
+    // Dropping claims must not become a way to assert a success nothing backs.
+    expectRejection(
+      textFinalization("I deployed the fix to production."),
+      emptyFinalizationContext({ evidenceLimitExceeded: true }),
+      "high_impact_text_unclaimed",
+    );
+  });
+
   it("rejects duplicate evidence references within one claim", () => {
     const candidate = claimFinalization({ evidenceRefs: ["evidence:1", "evidence:1"] });
     expectRejection(candidate, contextWithEvidence(evidenceRow("evidence:1", "project_state")), "duplicate_evidence_reference");

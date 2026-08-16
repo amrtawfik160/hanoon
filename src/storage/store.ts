@@ -516,6 +516,8 @@ export type DelegationThreadRecord = {
   /** Bounded excerpt of the thread's final output; null until it settles. */
   summary: string | null;
   settledAt: number | null;
+  /** When this member's stall was escalated, so it is escalated only once. */
+  stallNotifiedAt: number | null;
 };
 
 /**
@@ -2884,6 +2886,8 @@ export interface TelegramAgentStore {
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite;
   listControllerEvidence(turnId: string, limit: number): ControllerEvidenceRecord[];
+  /** Evidence rows recorded so far, which is what the evidence budget reads. */
+  countControllerEvidence(turnId: string): number;
   getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null;
   proposeControllerFinalization(
     input: ControllerFinalizationProposalInput,
@@ -3226,6 +3230,16 @@ export interface TelegramAgentStore {
     now: number;
     dedupMs: number;
   }): boolean;
+  /**
+   * True the first time a housekeeping notice is claimed inside its window.
+   * The agent's own upkeep speaks once and then stays quiet.
+   */
+  claimHousekeepingNotice(input: {
+    key: string;
+    detail: string;
+    now: number;
+    dedupMs: number;
+  }): boolean;
   pauseProjectAdmission(input: {
     projectId: string;
     reason: string;
@@ -3281,6 +3295,15 @@ export interface TelegramAgentStore {
     threadId: string;
     state: Exclude<DelegationThreadState, "running">;
     summary: string | null;
+    now: number;
+  }): boolean;
+  /**
+   * Claims the right to escalate one member's stall. True only for the caller
+   * that got there first, so a wedged thread is reported once, not every sweep.
+   */
+  claimDelegationThreadStall(input: {
+    delegationId: string;
+    threadId: string;
     now: number;
   }): boolean;
   sealDelegation(input: { id: string; now: number }): boolean;
@@ -4017,6 +4040,7 @@ type DelegationThreadRow = {
   state: string;
   summary: string | null;
   settled_at: number | null;
+  stall_notified_at: number | null;
 };
 
 const DELEGATION_STATES: ReadonlySet<string> = new Set<DelegationState>([
@@ -4039,6 +4063,7 @@ function parseDelegationThread(row: DelegationThreadRow): DelegationThreadRecord
     state: row.state as DelegationThreadState,
     summary: row.summary,
     settledAt: row.settled_at,
+    stallNotifiedAt: row.stall_notified_at,
   };
 }
 
@@ -5417,6 +5442,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.controllerEvidenceRepository.list(turnId, limit);
   }
 
+  public countControllerEvidence(turnId: string): number {
+    return this.controllerEvidenceRepository.count(turnId);
+  }
+
   public getControllerEvidence(turnId: string, evidenceId: number): ControllerEvidenceRecord | null {
     return this.controllerEvidenceRepository.get(turnId, evidenceId);
   }
@@ -5528,7 +5557,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const turn = this.db.prepare(
         `SELECT turn.controller_key, turn.ordinal, turn.input_text,
                 turn.accepted_finalization_id, turn.thread_follow_up_json,
-                controller.telegram_chat_id
+                turn.evidence_limit_exceeded_at, controller.telegram_chat_id
            FROM controller_turns AS turn
            JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
            JOIN owners ON owners.singleton = 1 AND owners.revoked_at IS NULL
@@ -5553,6 +5582,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input_text: string;
         accepted_finalization_id: number;
         thread_follow_up_json: string | null;
+        evidence_limit_exceeded_at: number | null;
         telegram_chat_id: string;
       } | undefined;
       if (!turn) return "stale" as const;
@@ -5578,7 +5608,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       // neither do. An ask the owner never hears about is a decision taken in
       // his name that he cannot see, so it must not be lost to a failed write.
       const pendingAsks = this.unreportedControllerThreadAsks(turn.controller_key);
-      const reply = composeOwnerReply(accepted.renderedMessage, pendingAsks, MAX_OWNER_REPLY_CHARS);
+      const reply = composeOwnerReply(accepted.renderedMessage, pendingAsks, MAX_OWNER_REPLY_CHARS, {
+        evidenceBudgetSpent: turn.evidence_limit_exceeded_at !== null,
+      });
       const completed = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'completed', response_text = ?, stream_text = '',
@@ -8986,6 +9018,29 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     })();
   }
 
+  public claimHousekeepingNotice(input: {
+    key: string;
+    detail: string;
+    now: number;
+    dedupMs: number;
+  }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    assertNonNegativeInteger(input.dedupMs, "dedupMs");
+    const key = assertMemoryText(input.key, 120, "housekeeping notice key");
+    const detail = assertMemoryText(input.detail || "-", 500, "housekeeping notice detail");
+    return this.db.transaction((): boolean => {
+      this.db.prepare("DELETE FROM housekeeping_notices WHERE expires_at <= ?").run(input.now);
+      if (this.db.prepare("SELECT notice_key FROM housekeeping_notices WHERE notice_key = ?").get(key)) {
+        return false;
+      }
+      this.db.prepare(
+        `INSERT INTO housekeeping_notices (notice_key, detail, claimed_at, expires_at)
+         VALUES (?, ?, ?, ?)`,
+      ).run(key, detail, input.now, input.now + input.dedupMs);
+      return true;
+    })();
+  }
+
   public pauseProjectAdmission(input: {
     projectId: string;
     reason: string;
@@ -9189,6 +9244,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           SET state = ?, summary = ?, settled_at = ?
         WHERE delegation_id = ? AND thread_id = ? AND state = 'running'`,
     ).run(input.state, summary, input.now, input.delegationId, input.threadId).changes === 1;
+  }
+
+  public claimDelegationThreadStall(input: {
+    delegationId: string;
+    threadId: string;
+    now: number;
+  }): boolean {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.prepare(
+      `UPDATE delegation_threads
+          SET stall_notified_at = ?
+        WHERE delegation_id = ? AND thread_id = ?
+          AND state = 'running' AND stall_notified_at IS NULL`,
+    ).run(input.now, input.delegationId, input.threadId).changes === 1;
   }
 
   /**
