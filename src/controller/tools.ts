@@ -16,6 +16,7 @@ import {
   parsePersistedMergeEvidence,
   type MemoryRecord,
   type MonitorRecord,
+  type MemoryQueryVector,
   type TelegramAgentStore,
   type JobControlKind,
 } from "../storage/store";
@@ -124,6 +125,8 @@ type ToolDependencies = {
   evidenceProjector?: ControllerEvidenceReconciler;
   threadOperations: Pick<ThreadOperationService, "request">;
   downloadImage?: (fileId: string, maxBytes: number, signal?: AbortSignal) => Promise<Uint8Array>;
+  /** Embeds a recall question. Absent, or null, leaves the search word-based. */
+  embedMemoryQuery?: (query: string) => Promise<MemoryQueryVector | null>;
   /**
    * Lands a merge the owner asked for in words. Absent exactly when merging is
    * unconfigured, in which case the tool refuses rather than claiming a merge.
@@ -1904,14 +1907,19 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       projectId: z.string().min(1).max(256).optional(),
       limit: z.number().int().min(1).max(20).default(8),
     }).strict(),
-    execute: (params, context) => {
+    execute: async (params, context) => {
       authorizedController(dependencies.store, context);
+      // Embedded first so the search reaches memories that mean the question
+      // without sharing its words. A null vector is the ordinary no-model case
+      // and simply leaves the search word-based.
+      const vector = await dependencies.embedMemoryQuery?.(params.query) ?? null;
       return {
         memories: dependencies.store.recallMemories({
           scope: params.projectId ?? OWNER_MEMORY_SCOPE,
           query: params.query,
           limit: params.limit,
           now: dependencies.now(),
+          queryVector: vector ?? undefined,
         }).map(memoryProjection),
       };
     },
