@@ -1437,6 +1437,10 @@ export class EffectRunner {
       ...this.capabilityStatusContext(job),
       ...extra,
       workerLiveness: this.dependencies.store.getWorkerLiveness(job.id),
+      // Without this the card cannot tell a job queued behind another from one
+      // genuinely waiting on the owner, so every queued job asked them to tap
+      // Start for work that was already confirmed and about to run itself.
+      admission: this.dependencies.store.getAdmission(job.id),
       resourceWait: job.policy === null ? [] : projectResourceWait({
         jobId: job.id,
         policy: job.policy,

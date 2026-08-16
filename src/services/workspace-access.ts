@@ -161,10 +161,16 @@ export function createWorkspaceAccess(input: Readonly<{
       // Named after the worktree so two rescues cannot overwrite each other.
       const name = path.replaceAll(/[^A-Za-z0-9._-]/g, "_");
       const destination = `${RESCUE_DIR}/${name}.patch`;
+      // Double quotes, not single: `$HOME` has to be expanded by the shell on
+      // the host that owns the worktree, and single-quoting it made every
+      // rescue redirect into a directory literally named `$HOME`. `mkdir` was
+      // unquoted and did expand, so the directory appeared and every write into
+      // it failed — which is exactly how it read in the logs. The name is
+      // already reduced to [A-Za-z0-9._-], so it is safe unquoted here.
       const result = await run(
         project,
         "preserve uncommitted work",
-        `mkdir -p ${RESCUE_DIR} && git -C ${shellSingleQuote(path)} diff HEAD > ${shellSingleQuote(destination)}`,
+        `mkdir -p "${RESCUE_DIR}" && git -C ${shellSingleQuote(path)} diff HEAD > "${destination}"`,
       );
       if (result.outcome !== "exited" || result.exitCode !== 0) {
         throw new Error(`could not write ${destination}`);

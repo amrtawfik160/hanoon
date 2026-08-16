@@ -35,6 +35,10 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_access_verify",
   "telegram_agent_answer_thread",
   "telegram_agent_send_media",
+  "telegram_agent_approve_merge",
+  "telegram_agent_resume_project",
+  "telegram_agent_add_reference",
+  "telegram_agent_search_reference",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -626,6 +630,88 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     proof_kinds: [],
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
+  }),
+  /**
+   * Landing work the owner asked for in words instead of by tapping. The
+   * approval row, version fence, merge effect, and audit are the button's; only
+   * the owner's way of saying yes differs. It is a durable local write for the
+   * same reason `telegram_agent_respond` is: it enqueues the merge the pipeline
+   * then performs, and the manifest admits no irreversible capability.
+   */
+  telegram_agent_approve_merge: capability({
+    capability_id: "telegram_agent_approve_merge",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "high",
+    data_class: ["job_control"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["job_state", "external_mutation"],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
+  }),
+  /**
+   * Lifting the failure brake, which the agent could only ever ask for. Bounded
+   * in the store to one clear per cause, so the brake still catches the loop it
+   * exists to catch while the owner stops being the way through it.
+   */
+  telegram_agent_resume_project: capability({
+    capability_id: "telegram_agent_resume_project",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "high",
+    data_class: ["job_control"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["job_state"],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
+  }),
+  telegram_agent_add_reference: capability({
+    capability_id: "telegram_agent_add_reference",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "low",
+    data_class: ["owner_memory"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["memory_state"],
+    receipt_kind: "tool_receipt",
+    result_limit: 8_000,
+  }),
+  telegram_agent_search_reference: capability({
+    capability_id: "telegram_agent_search_reference",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["owner_memory"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    // A specification is something the agent read, not something it observed
+    // about our systems, so it carries the same proof as any outside reading.
+    proof_kinds: ["retrieved_content"],
+    receipt_kind: "observation",
+    result_limit: 8_000,
   }),
 });
 

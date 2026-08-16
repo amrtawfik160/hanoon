@@ -45,14 +45,27 @@ it("routes an ordinary command approval to the controller without a standing gra
   expect(route).toEqual({ audience: "controller", decisions: ["allow_once", "deny"] });
 });
 
+it("fails closed when a command approval is not positively known to be local", () => {
+  expect(routeThreadInteraction({
+    threadOwnedByController: true,
+    interaction: approval("wants to run:\n\n`acme production promote`", ["allow_once", "deny"]),
+  })).toEqual({ audience: "owner", reason: "unclassified_approval" });
+});
+
 it.each([
   ["wants to run:\n\n`gh pr merge 42 --squash`", "merge_or_deploy"],
   ["wants to run:\n\n`git push origin main`", "merge_or_deploy"],
+  ["wants to run:\n\n`git push origin trunk`", "merge_or_deploy"],
   ["wants to run:\n\n`vercel deploy --prod`", "merge_or_deploy"],
+  ["wants to run:\n\n`vercel --prod`", "merge_or_deploy"],
   ["wants to run:\n\n`terraform apply`", "merge_or_deploy"],
   ["wants to run:\n\n`npm publish`", "irreversible_external_action"],
+  ["wants to run:\n\n`pnpm publish`", "irreversible_external_action"],
+  ["wants to run:\n\n`yarn npm publish`", "irreversible_external_action"],
   ["wants to run:\n\n`gh auth login`", "irreversible_external_action"],
   ["wants to run:\n\n`curl -X POST https://api.example.com/charge`", "irreversible_external_action"],
+  ["wants to run:\n\n`curl --request POST https://api.example.com/charge`", "irreversible_external_action"],
+  ["wants to run:\n\n`gh api repos/acme/app --method DELETE`", "irreversible_external_action"],
   ["wants to run:\n\n`stripe charges create --amount 5000`", "irreversible_external_action"],
 ])("keeps %s with the owner", (summary, reason) => {
   expect(routeThreadInteraction({

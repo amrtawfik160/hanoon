@@ -66,6 +66,7 @@ export type ThreadNoticeServiceDependencies = {
     | "markThreadInteractionDelivered"
     | "discardThreadInteractions"
     | "isControllerOwnedThread"
+    | "hasPendingThreadInteractionForThread"
   >;
   threads: ThreadNoticeThreads;
   clock: { now(): number };
@@ -137,7 +138,11 @@ export class ThreadNoticeService {
       // is reachable: its block goes to the controller rather than being
       // dropped. A worker under a job stays the pipeline's business.
       const isChild = thread.parentThreadId !== null;
-      if (isChild && !this.dependencies.store.isControllerOwnedThread(thread.parentThreadId)) continue;
+      if (
+        isChild &&
+        !this.dependencies.store.isControllerOwnedThread(thread.parentThreadId) &&
+        !this.dependencies.store.hasPendingThreadInteractionForThread(thread.id)
+      ) continue;
       if (!isChild) {
         if (this.dependencies.store.observeThread({
           threadId: thread.id,

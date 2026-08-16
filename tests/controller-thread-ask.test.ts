@@ -3,6 +3,7 @@ import { expect, it } from "vitest";
 import {
   MAX_LISTED_THREAD_ASKS,
   THREAD_ASK_HEADING,
+  THREAD_ASK_EMPTY,
   THREAD_ASK_REDACTED,
   THREAD_ASK_UNNAMED_THREAD,
   composeOwnerReply,
@@ -120,6 +121,17 @@ it("drops the report rather than pushing the owner's message over the limit", ()
   expect(composeOwnerReply("done", asks, 4)).toEqual({ text: "done", reportedCount: 0 });
 });
 
+it("budgets Telegram's UTF-16 characters rather than undercounting emoji", () => {
+  const accepted = "x".repeat(4_062);
+  const composed = composeOwnerReply(accepted, [{
+    threadId: "thr_emoji",
+    threadName: "E",
+    ask: "😀".repeat(6),
+  }], 4_096);
+
+  expect(composed.text.length).toBeLessThanOrEqual(4_096);
+});
+
 it("never alters the reply the evidence gate accepted", () => {
   const accepted = "The build is still running.";
   const composed = composeOwnerReply(
@@ -217,4 +229,61 @@ it("reports that an ask was made even when its text cannot be safely repeated", 
   const reply = ownerReplyFor(store, turn.id);
   expect(reply).toContain(`- Deploy: ${THREAD_ASK_REDACTED}`);
   expect(reply).not.toContain("sk-ant-api03");
+});
+
+it("distinguishes an empty ask from text withheld for safety", () => {
+  const { store, fence } = fixture();
+  const turn = submitTurn(store, fence, 601, "Send an empty follow-up");
+  store.recordControllerThreadAsk({
+    controllerKey: "owner-7-controller",
+    turnId: turn.id,
+    threadId: "thr_empty",
+    threadName: "Empty thread",
+    ask: "   ",
+    now: 2_000,
+  });
+
+  completeTurnThroughFinalization(store, fence, {
+    turnId: turn.id,
+    controllerKey: "owner-7-controller",
+    responseText: "The send completed.",
+  });
+
+  const reply = ownerReplyFor(store, turn.id);
+  expect(reply).toContain(`- Empty thread: ${THREAD_ASK_EMPTY}`);
+  expect(reply).not.toContain(THREAD_ASK_REDACTED);
+});
+
+it("retains only the latest 256 reported asks without deleting unreported work", () => {
+  const { bb, store, fence } = fixture();
+  const turn = submitTurn(store, fence, 701, "Report the latest ask");
+  const db = bb.storage.database();
+  const insert = db.prepare(
+    `INSERT INTO controller_thread_asks
+       (controller_key, turn_id, thread_id, thread_name, ask, recorded_at, reported_at)
+     VALUES ('owner-7-controller', ?, ?, 'Old thread', 'already reported', ?, ?)`,
+  );
+  for (let index = 0; index < 300; index += 1) {
+    insert.run(turn.id, `thr_old_${index}`, 1_000 + index, 1_500 + index);
+  }
+  store.recordControllerThreadAsk({
+    controllerKey: "owner-7-controller",
+    turnId: turn.id,
+    threadId: "thr_new",
+    threadName: "New thread",
+    ask: "still owed",
+    now: 2_000,
+  });
+  expect(store.unreportedControllerThreadAsks("owner-7-controller")).toHaveLength(1);
+
+  completeTurnThroughFinalization(store, fence, {
+    turnId: turn.id,
+    controllerKey: "owner-7-controller",
+    responseText: "Done.",
+  });
+
+  expect(db.prepare(
+    "SELECT count(*) AS n FROM controller_thread_asks WHERE controller_key = 'owner-7-controller'",
+  ).get()).toEqual({ n: 256 });
+  expect(store.unreportedControllerThreadAsks("owner-7-controller")).toEqual([]);
 });

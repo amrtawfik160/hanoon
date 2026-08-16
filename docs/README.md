@@ -9,6 +9,7 @@ Telegram Agent gives one private Telegram owner full control of their BB install
 - [Agent experience and proven autonomy design](designs/agent-experience-autonomy.md) — approved architecture for role-selected skills, evidence-backed Telegram updates, and executable live acceptance.
 - [Credential and access platform design](designs/hanoon-credential-access-platform.md) — planned vault, identity, browser-session, MFA, lifecycle, and real-verification trust boundaries.
 - [Credential broker foundation design](designs/hanoon-credential-broker-foundation.md) — first planned access slice: an isolated typed broker, 1Password binding verification, and secret-free receipts.
+- [Reference documents, voice notes, and identity](designs/reference-documents-voice-and-identity.md) — built behavior, constraints, and deferred work for these owner-facing capabilities.
 - [Repository history](repository-history.md) — why `main` shares no ancestor with the work, how it happened, and the base-branch and ancestry guards that stop it recurring.
 - [Reconciling `main`](main-reconciliation-options.md) — the open owner decision, with each option's risk and undo cost.
 - [Contributing](../CONTRIBUTING.md) — development setup and change requirements.

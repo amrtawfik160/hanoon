@@ -114,3 +114,31 @@ _Avoid_: Model-selected blocker, every stylistic note blocks
 **Thread ask**:
 The one-line reason the controller gives when it messages a worker thread, recorded once the send lands and owed to the owner until a reply states it. It is the substance of the instruction, not the message text.
 _Avoid_: Tool narration, the sent message, a promise to explain later
+
+**Reference document**:
+A specification the owner gives Hanoon to consult, scoped to one project or globally. It informs work but is not itself an executable instruction.
+_Avoid_: Uploaded file, attachment, knowledge base
+
+**Structural map**:
+A bounded heading tree with each section's path and one-line summary, used to show agents what a reference document contains before retrieving its body.
+_Avoid_: Summary, table of contents
+
+**Passage**:
+A retrievable part of a reference document carrying its full section path. It is the unit of search and citation.
+_Avoid_: Chunk, excerpt, snippet
+
+**Outside reading**:
+A durable record that the agent read material outside Hanoon's tools, including its source, capture time, and a bounded excerpt.
+_Avoid_: Search result, fetched page, tool output
+
+**Specification conflict**:
+A disagreement between a reference document and the current instruction about what to build or which rule governs. A disagreement about implementation details is not one.
+_Avoid_: Mismatch, discrepancy, contradiction
+
+**Conduct layer**:
+The fixed, non-overridable instructions that define the agent's behavioural boundaries.
+_Avoid_: System prompt, persona, guardrails
+
+**Identity layer**:
+The replaceable instructions that define who the agent is and how it communicates, without changing its conduct layer.
+_Avoid_: Persona, character, prompt

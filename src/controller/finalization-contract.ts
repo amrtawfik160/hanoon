@@ -8,6 +8,7 @@ export const CONTROLLER_CLAIM_KINDS = [
   "execution_result",
   "workspace_change",
   "external_mutation",
+  "external_reading",
   "pipeline_outcome",
   "health_assessment",
   "uncertainty",
@@ -116,6 +117,10 @@ const CLAIM_PROOFS: Record<ControllerClaimKind, ReadonlySet<ControllerProofKind>
   execution_result: new Set(["command_result", "tool_result"]),
   workspace_change: new Set(["workspace_change"]),
   external_mutation: new Set(["external_mutation"]),
+  // Reading a source is the one claim a retrieval can carry. Keeping
+  // `retrieved_content` out of every other row is what stops a page the agent
+  // read from standing in for our own systems having done anything.
+  external_reading: new Set(["retrieved_content"]),
   pipeline_outcome: new Set(["pipeline_outcome", "production_outcome"]),
   health_assessment: new Set(["health_snapshot"]),
   uncertainty: new Set(CONTROLLER_PROOF_KINDS),

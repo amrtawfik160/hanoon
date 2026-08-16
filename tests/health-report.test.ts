@@ -203,3 +203,31 @@ it("reports durable admissions, live lanes, queue age, and held resource kinds s
   });
   expect(invalid.problems).toContain("concurrency configuration is invalid");
 });
+
+it("names a paused project, because otherwise the jam it causes has no visible cause", () => {
+  // The live fault: five queued jobs, five free slots, nothing held, none
+  // admitted. The brake was the whole explanation and the report never said so,
+  // so the agent reported a broken pipeline for five and a half hours.
+  const { db, store } = fixture();
+  store.pauseProjectAdmission({
+    projectId: "proj_paused",
+    reason: "the same failure repeated 3 times",
+    fingerprint: "a".repeat(64),
+    now: 1_000,
+  });
+
+  const report = buildHealthReport(db, 2_000, 5, EMPTY_LANES);
+
+  expect(report.autonomy.pausedProjects).toEqual([
+    { projectId: "proj_paused", reason: "the same failure repeated 3 times", pausedAtMs: 1_000 },
+  ]);
+  expect(report.problems.join(" ")).toContain("paused by the failure brake");
+  expect(report.problems.join(" ")).toContain("/resume");
+});
+
+it("says nothing about pauses when none is held", () => {
+  const { db } = fixture();
+  const report = buildHealthReport(db, 2_000, 5, EMPTY_LANES);
+  expect(report.autonomy.pausedProjects).toEqual([]);
+  expect(report.problems.join(" ")).not.toContain("failure brake");
+});

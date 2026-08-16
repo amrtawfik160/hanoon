@@ -526,6 +526,74 @@ const EXPECTED_CAPABILITIES = {
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
   },
+  telegram_agent_approve_merge: {
+    capability_id: "telegram_agent_approve_merge",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "high",
+    data_class: ["job_control"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["job_state", "external_mutation"],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
+  },
+  telegram_agent_resume_project: {
+    capability_id: "telegram_agent_resume_project",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "high",
+    data_class: ["job_control"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["job_state"],
+    receipt_kind: "tool_receipt",
+    result_limit: 2_000,
+  },
+  telegram_agent_add_reference: {
+    capability_id: "telegram_agent_add_reference",
+    schema_version: 1,
+    effect_class: "durable_local_write",
+    risk_class: "low",
+    data_class: ["owner_memory"],
+    reversibility: "reconcilable",
+    idempotency: "tool_receipt",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["memory_state"],
+    receipt_kind: "tool_receipt",
+    result_limit: 8_000,
+  },
+  telegram_agent_search_reference: {
+    capability_id: "telegram_agent_search_reference",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["owner_memory"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "controller_global",
+    credential_scope: { credential: "none", audience: "none" },
+    egress: ["none"],
+    proof_kinds: ["retrieved_content"],
+    receipt_kind: "observation",
+    result_limit: 8_000,
+  },
 } as const satisfies Readonly<Record<ControllerToolName, ControllerCapabilityDescriptor>>;
 
 const SAFE_AUTHORITY: ControllerCapabilityAuthority = {
@@ -548,6 +616,13 @@ function authorityWith(
 }
 
 describe("controller capability manifest", () => {
+  it("keeps the public safety docs aligned with the enforced manifest size", () => {
+    const claim = `exactly ${CONTROLLER_TOOL_NAMES.length} Hanoon capabilities`;
+    for (const path of ["README.md", "SECURITY.md", "docs/architecture.md"]) {
+      expect(readFileSync(path, "utf8"), path).toContain(claim);
+    }
+  });
+
   it("does not mutate the proof vocabulary owned by controller models", () => {
     const inspection = JSON.parse(execFileSync(process.execPath, [
       "--input-type=module",
@@ -638,6 +713,10 @@ describe("controller capability manifest", () => {
       "telegram_agent_access_verify",
       "telegram_agent_answer_thread",
       "telegram_agent_send_media",
+      "telegram_agent_approve_merge",
+      "telegram_agent_resume_project",
+      "telegram_agent_add_reference",
+      "telegram_agent_search_reference",
     ]);
     expect(CONTROLLER_DATA_CLASSES).toEqual([
       "project_metadata",
@@ -653,7 +732,7 @@ describe("controller capability manifest", () => {
     ]);
   });
 
-  it("pins every descriptor field and proof order for all 28 tools", () => {
+  it("pins every descriptor field and proof order for all 30 tools", () => {
     expect(CONTROLLER_CAPABILITIES).toEqual(EXPECTED_CAPABILITIES);
     expect(Object.keys(CONTROLLER_CAPABILITIES)).toEqual([...CONTROLLER_TOOL_NAMES]);
   });

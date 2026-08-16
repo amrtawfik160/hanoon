@@ -2100,6 +2100,101 @@ UPDATE jobs SET auto_continue_escalated_at = updated_at
  WHERE state = 'blocked' AND auto_continue_escalated_at IS NULL;
 `] as const;
 
+/**
+ * One vector per memory, tagged with the model and dimension that produced it.
+ *
+ * The tag is the point. A corpus embedded by one model and queried by another
+ * yields a similarity that looks like a score and means nothing, and the
+ * reference system this follows lost its vector recall exactly that way. Recall
+ * compares only vectors whose model matches the one asking, so switching models
+ * degrades to words rather than to nonsense, and the old rows stay for a
+ * backfill instead of being silently trusted.
+ */
+export const MEMORY_EMBEDDING_MIGRATIONS = [String.raw`
+CREATE TABLE memory_embeddings (
+  memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+  model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 128),
+  dimensions INTEGER NOT NULL CHECK (dimensions BETWEEN 1 AND 8192),
+  vector BLOB NOT NULL,
+  embedded_at INTEGER NOT NULL CHECK (embedded_at >= 0)
+);
+CREATE INDEX memory_embeddings_model ON memory_embeddings (model, memory_id);
+`] as const;
+
+export const REFERENCE_DOCUMENT_MIGRATIONS = [String.raw`
+CREATE TABLE reference_documents (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+  project_id TEXT,
+  title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 256),
+  source TEXT NOT NULL CHECK (length(source) BETWEEN 1 AND 1024),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  map_json TEXT NOT NULL,
+  ingested_at INTEGER NOT NULL CHECK (ingested_at >= 0),
+  CHECK ((scope = 'project') = (project_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX reference_documents_identity
+  ON reference_documents (scope, ifnull(project_id, ''), title);
+CREATE INDEX reference_documents_scope ON reference_documents (scope, project_id);
+CREATE TABLE reference_passages (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES reference_documents(id) ON DELETE CASCADE,
+  ordinal TEXT NOT NULL,
+  section_path TEXT NOT NULL,
+  body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 8192)
+);
+CREATE INDEX reference_passages_document ON reference_passages (document_id, ordinal);
+CREATE VIRTUAL TABLE reference_passages_fts USING fts5(
+  section_path, body, content='reference_passages', content_rowid='rowid', tokenize='porter unicode61'
+);
+CREATE TRIGGER reference_passages_fts_insert AFTER INSERT ON reference_passages BEGIN
+  INSERT INTO reference_passages_fts (rowid, section_path, body)
+    VALUES (new.rowid, new.section_path, new.body);
+END;
+CREATE TRIGGER reference_passages_fts_delete AFTER DELETE ON reference_passages BEGIN
+  INSERT INTO reference_passages_fts (reference_passages_fts, rowid, section_path, body)
+    VALUES ('delete', old.rowid, old.section_path, old.body);
+END;
+CREATE TRIGGER reference_passages_fts_update AFTER UPDATE ON reference_passages BEGIN
+  INSERT INTO reference_passages_fts (reference_passages_fts, rowid, section_path, body)
+    VALUES ('delete', old.rowid, old.section_path, old.body);
+  INSERT INTO reference_passages_fts (rowid, section_path, body)
+    VALUES (new.rowid, new.section_path, new.body);
+END;
+CREATE TABLE reference_document_changes (
+  document_id TEXT NOT NULL REFERENCES reference_documents(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK (version >= 2),
+  section_path TEXT NOT NULL,
+  change TEXT NOT NULL CHECK (change IN ('added', 'removed', 'changed')),
+  recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
+  PRIMARY KEY (document_id, version, section_path)
+);
+`] as const;
+
+/**
+ * Exact per-section baselines for change reporting. Passages may combine short
+ * descendants for retrieval, so reconstructing section history from them can
+ * invent changes even when the source document is byte-for-byte identical.
+ */
+export const REFERENCE_DOCUMENT_REPAIR_MIGRATIONS = [String.raw`
+CREATE TABLE reference_section_digests (
+  document_id TEXT NOT NULL REFERENCES reference_documents(id) ON DELETE CASCADE,
+  section_path TEXT NOT NULL,
+  digest TEXT NOT NULL CHECK (length(digest) = 16),
+  PRIMARY KEY (document_id, section_path)
+);
+`] as const;
+
+/** Exact controller provenance and retry linkage for worker-thread questions. */
+export const CONTROLLER_THREAD_ROUTING_REPAIR_MIGRATIONS = [String.raw`
+ALTER TABLE thread_interactions ADD COLUMN controller_key TEXT
+  REFERENCES controller_threads(controller_key);
+ALTER TABLE thread_interactions ADD COLUMN controller_turn_id TEXT
+  REFERENCES controller_turns(id);
+CREATE INDEX thread_interactions_controller_retry
+  ON thread_interactions(audience, state, controller_key);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2165,4 +2260,8 @@ export const ALL_MIGRATIONS = [
   ...JOB_CONTINUATION_MIGRATIONS,
   ...MONITOR_STALL_MIGRATIONS,
   ...JOB_CONTINUATION_BACKFILL_MIGRATIONS,
+  ...MEMORY_EMBEDDING_MIGRATIONS,
+  ...REFERENCE_DOCUMENT_MIGRATIONS,
+  ...CONTROLLER_THREAD_ROUTING_REPAIR_MIGRATIONS,
+  ...REFERENCE_DOCUMENT_REPAIR_MIGRATIONS,
 ] as const;

@@ -288,7 +288,9 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned again when retry_job began reporting `retryOutcome`: a queued
   // retry leaves the job unchanged, so the description now tells the agent to
   // read the outcome rather than read an unchanged job as a failed retry.
-  expect(digest).toBe("0f5e560ddd7a1a65ef70cb16f5341a41173eb53317e7bdf5222e5a9958bd7d18");
+  // Re-pinned when `queued` stopped promising that admission alone guarantees
+  // execution; scheduler health can still hold an admitted retry.
+  expect(digest).toBe("26a90ac7a4c4645e48aad08b9f59b0606186af91464f665c96d753962c41c252");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -309,14 +311,14 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   });
   expect(metadata[22]).toEqual({
     name: "telegram_agent_respond",
-    description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in.",
+    description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in. What you read outside our systems, from a search or a page, is an external_reading claim: it can say what the source said, and never that a job, a check, a deployment, or anything of ours succeeded.",
     statusLabels: null,
     schema: controllerFinalizationJsonSchema,
   });
   // The renderer inserts the paragraph break, so the contract has to say so.
   expect(metadata[22].description).toMatch(/own paragraph/);
-  // 29 manifest capabilities plus the two capability metadata tools.
-  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(32);
+  // 31 manifest capabilities plus the two capability metadata tools.
+  expect(new Set(registrations.map((tool) => tool.name)).size).toBe(36);
 
   const byName = new Map(registrations.map((tool) => [tool.name, tool]));
   const parsed = (name: string, params: unknown) => {

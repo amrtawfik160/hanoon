@@ -16,6 +16,7 @@ import {
   parsePersistedMergeEvidence,
   type MemoryRecord,
   type MonitorRecord,
+  type MemoryQueryVector,
   type TelegramAgentStore,
   type JobControlKind,
 } from "../storage/store";
@@ -100,6 +101,7 @@ import {
   controllerFinalizationJsonSchema,
 } from "./finalization-contract";
 import { MAX_THREAD_ASK_CHARS } from "./thread-ask";
+import { isMergeInstruction } from "./merge-instruction";
 import {
   MAX_OUTBOUND_CAPTION,
   boundedCaption,
@@ -123,6 +125,18 @@ type ToolDependencies = {
   evidenceProjector?: ControllerEvidenceReconciler;
   threadOperations: Pick<ThreadOperationService, "request">;
   downloadImage?: (fileId: string, maxBytes: number, signal?: AbortSignal) => Promise<Uint8Array>;
+  /** Embeds a recall question. Absent, or null, leaves the search word-based. */
+  embedMemoryQuery?: (query: string) => Promise<MemoryQueryVector | null>;
+  /**
+   * Lands a merge the owner asked for in words. Absent exactly when merging is
+   * unconfigured, in which case the tool refuses rather than claiming a merge.
+   */
+  approveMergeFromOwnerInstruction?: (input: Readonly<{
+    jobId: string;
+    userId: string;
+    chatId: string;
+    instructionText: string;
+  }>) => { outcome: "accepted" | "rejected" };
   health(now: number): unknown;
   notify(): void;
   now(): number;
@@ -130,6 +144,8 @@ type ToolDependencies = {
   credentialAccess?: CredentialAccessService;
   /** Current persisted controller provider; undefined means configuration is invalid. */
   controllerProviderId?: () => string | undefined;
+  /** Configured replacement identity; empty or absent delivers the shipped one. */
+  controllerIdentity?: () => string | undefined;
 };
 
 type EvidenceIndexDescriptor = Readonly<{
@@ -822,6 +838,16 @@ async function resolveTrustedScope(
         ? globalScope()
         : exactScope([`project:${projectId}`], enabledProject(dependencies.store, projectId));
     }
+    case "telegram_agent_add_reference":
+    case "telegram_agent_search_reference": {
+      const projectId = params.projectId as string | undefined;
+      // A global reference has no project to authorize against; a project one
+      // is authorized exactly like a project memory, so one project's
+      // specification can never be read from inside another.
+      return projectId === undefined || projectId === null
+        ? globalScope()
+        : exactScope([`project:${projectId}`], enabledProject(dependencies.store, projectId));
+    }
     case "telegram_agent_thread_status":
     case "telegram_agent_read_thread":
     case "telegram_agent_send_to_thread":
@@ -900,6 +926,8 @@ async function resolveTrustedScope(
     case "telegram_agent_access_list":
     case "telegram_agent_access_status":
     case "telegram_agent_send_media":
+    case "telegram_agent_approve_merge":
+    case "telegram_agent_resume_project":
       return globalScope();
     case "telegram_agent_access_verify":
       // Existence is a domain question the service answers with a typed
@@ -941,7 +969,7 @@ const RETRY_SCHEDULING_FLAGS = ["cleaningUp"] as const;
 const RETRY_OUTCOMES = new Set([
   /** The state machine re-entered the stage during this call. */
   "resumed",
-  /** Requeued; the executor applies it when the job is next admitted. */
+  /** Requeued in admission; execution has not restarted and other scheduler conditions may still hold it. */
   "queued",
   /** Requeued, but the failure brake is holding the project, so the queue is not being served. */
   "queued_project_paused",
@@ -1404,6 +1432,20 @@ async function projectTrustedEvidence(
     }
     case "telegram_agent_recall":
       return { outcome: "observed", proofKinds: ["memory_state"], subjectRefs: refIds(domain.memories, "memory") };
+    case "telegram_agent_add_reference":
+      return {
+        outcome: domain.stored === true ? "succeeded" : "observed",
+        proofKinds: ["memory_state"],
+        subjectRefs: typeof domain.documentId === "string" ? [`reference:${domain.documentId}`] : [],
+      };
+    case "telegram_agent_search_reference":
+      // Retrieved rather than observed: this is what a document says, which is
+      // never evidence about our own systems having done anything.
+      return {
+        outcome: "observed",
+        proofKinds: ["retrieved_content"],
+        subjectRefs: refIds(domain.passages, "reference-passage"),
+      };
     case "telegram_agent_forget": {
       const forgotten = domain.forgotten === true;
       return { outcome: forgotten ? "succeeded" : "observed", proofKinds: ["memory_state"], subjectRefs: resolution.scope.entityRefs };
@@ -1482,6 +1524,23 @@ async function projectTrustedEvidence(
         outcome: after !== trustedState(resolution).beforeOverlay ? "succeeded" : "observed",
         proofKinds: ["memory_state"],
         subjectRefs: [`controller:${authorized.controller.controllerKey}`],
+      };
+    }
+    case "telegram_agent_resume_project": {
+      const resumed = domain.resumed === true;
+      return {
+        outcome: resumed ? "succeeded" : "observed",
+        proofKinds: resumed ? ["job_state"] : [],
+        subjectRefs: typeof domain.projectId === "string" ? [`project:${domain.projectId}`] : [],
+      };
+    }
+    case "telegram_agent_approve_merge": {
+      // Proof only that the merge was enqueued on the owner's instruction.
+      const merged = domain.merged === true;
+      return {
+        outcome: merged ? "succeeded" : "observed",
+        proofKinds: merged ? ["job_state", "external_mutation"] : [],
+        subjectRefs: typeof domain.jobId === "string" ? [`job:${domain.jobId}`] : [],
       };
     }
     case "telegram_agent_send_media": {
@@ -1679,7 +1738,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[3],
-    description: "Resume a recoverable Telegram Agent job: retry a failed or stuck step, continue a blocked plan or review, finish a reviewed PR when production is not configured, or pick up from review when a PR already exists. Read `retryOutcome` before answering and say which happened: `resumed` restarted the job now, `queued` restarts it when the job is next admitted, and `queued_project_paused` will not restart at all until the project's failure brake is lifted. A queued retry deliberately leaves the job unchanged, so never read an unchanged job as the retry having failed.",
+    description: "Resume a recoverable Telegram Agent job: retry a failed or stuck step, continue a blocked plan or review, finish a reviewed PR when production is not configured, or pick up from review when a PR already exists. Read `retryOutcome` before answering and say which happened: `resumed` restarted the job now, `queued` accepted the retry into admission but has not restarted it, and `queued_project_paused` will not restart at all until the project's failure brake is lifted. Other scheduler conditions can keep a retry queued, so inspect health if it stays there. A queued retry deliberately leaves the job unchanged, so never read an unchanged job as the retry having failed.",
     parameters: z.object({ jobId: z.string().min(1).max(256).optional() }).strict(),
     execute: (_params, context, resolution) => {
       authorizedController(dependencies.store, context);
@@ -1937,14 +1996,19 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       projectId: z.string().min(1).max(256).optional(),
       limit: z.number().int().min(1).max(20).default(8),
     }).strict(),
-    execute: (params, context) => {
+    execute: async (params, context) => {
       authorizedController(dependencies.store, context);
+      // Embedded first so the search reaches memories that mean the question
+      // without sharing its words. A null vector is the ordinary no-model case
+      // and simply leaves the search word-based.
+      const vector = await dependencies.embedMemoryQuery?.(params.query) ?? null;
       return {
         memories: dependencies.store.recallMemories({
           scope: params.projectId ?? OWNER_MEMORY_SCOPE,
           query: params.query,
           limit: params.limit,
           now: dependencies.now(),
+          queryVector: vector ?? undefined,
         }).map(memoryProjection),
       };
     },
@@ -2187,7 +2251,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[22],
     register: () => bb.agents.registerTool({
       name: CONTROLLER_TOOL_NAMES[22],
-      description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in.",
+      description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in. What you read outside our systems, from a search or a page, is an external_reading claim: it can say what the source said, and never that a job, a check, a deployment, or anything of ours succeeded.",
       parameters: controllerFinalizationJsonSchema,
       execute: (candidate, context) => executeControllerFinalizer(
         dependencies,
@@ -2416,6 +2480,126 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     },
   });
 
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[30],
+    description: "Land a job the owner explicitly told you to merge or land. Use it at once for an unambiguous instruction about a job waiting on approval. A generic instruction works only when exactly one job is waiting; when several are waiting, the owner must name the job. Deployment language is not merge approval. Everything the pipeline checks still runs; this replaces their tap, nothing else.",
+    experimental_statusLabels: { pending: "Landing the work", completed: "Landed" },
+    parameters: z.object({
+      jobId: z.string().min(1).max(256).describe("The job waiting on merge approval."),
+    }).strict(),
+    execute: (params, context) => {
+      const controller = authorizedController(dependencies.store, context);
+      const approve = dependencies.approveMergeFromOwnerInstruction;
+      if (!approve) return { merged: false, reason: "Merging is not configured." };
+      const owner = dependencies.store.getOwner();
+      if (!owner) return { merged: false, reason: "No paired owner." };
+
+      // The authority comes from the owner's own words, read here rather than
+      // taken from the agent's account of them. A system turn never carries it:
+      // a monitor notice quoting "merge it" must not be able to approve a merge.
+      const turn = dependencies.store.getPendingControllerTurn(controller.controllerKey);
+      if (!turn || turn.origin !== "owner" || !isMergeInstruction(turn.inputText)) {
+        return {
+          merged: false,
+          reason: "The owner has not asked for this in their message, so the approval still has to be theirs.",
+        };
+      }
+      const result = approve({
+        jobId: params.jobId,
+        userId: owner.userId,
+        chatId: owner.chatId,
+        instructionText: turn.inputText,
+      });
+      dependencies.notify();
+      return result.outcome === "accepted"
+        ? { merged: true, jobId: params.jobId }
+        : { merged: false, reason: "That job is not waiting for a merge approval right now." };
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[31],
+    description: "Lift the failure brake on a paused project so its queued work starts again. Use it the moment you find a project paused: this is yours to do, never something to ask the owner for. Refused only when the same failure has already been cleared once and come back, which is the loop the brake exists to catch and the one thing here worth their decision.",
+    experimental_statusLabels: { pending: "Starting the project again", completed: "Project taking work" },
+    parameters: z.object({
+      projectId: z.string().min(1).max(256),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const outcome = dependencies.store.clearProjectAdmissionPauseAsAgent({
+        projectId: params.projectId,
+        now: dependencies.now(),
+      });
+      if (outcome.outcome === "cleared") dependencies.notify();
+      return outcome.outcome === "cleared"
+        ? { resumed: true, projectId: params.projectId }
+        : { resumed: false, projectId: params.projectId, reason: outcome.reason };
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[32],
+    description: "File a specification the owner gave you, so the work done on that project is done against it. Give the whole document text. Sending it again under the same title replaces it and reports which sections moved: there is never a second live copy of one spec. Omit projectId only for something that genuinely applies everywhere, like a company style guide.",
+    experimental_statusLabels: { pending: "Filing the specification", completed: "Specification filed" },
+    parameters: z.object({
+      title: z.string().trim().min(1).max(256),
+      text: z.string().min(1).max(4_000_000),
+      source: z.string().trim().min(1).max(1_024),
+      projectId: z.string().min(1).max(256).optional(),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const saved = dependencies.store.saveReferenceDocument({
+        scope: params.projectId === undefined ? "global" : "project",
+        projectId: params.projectId ?? null,
+        title: params.title,
+        source: params.source,
+        markdown: params.text,
+        now: dependencies.now(),
+      });
+      return {
+        stored: true,
+        documentId: saved.document.id,
+        title: saved.document.title,
+        version: saved.document.version,
+        passages: saved.passageCount,
+        sections: saved.document.map.length,
+        changes: saved.changes,
+      };
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[33],
+    description: "Search the specifications filed for a project, and the global ones, for what they actually say. Use it before answering anything the spec governs and before planning work on that project. What comes back is what a document says, never proof that any of our own work succeeded.",
+    experimental_statusLabels: { pending: "Reading the specification", completed: "Specification read" },
+    parameters: z.object({
+      query: z.string().trim().min(1).max(512),
+      projectId: z.string().min(1).max(256).optional(),
+      // Three passages of the maximum size plus their paths sit inside this
+      // capability's 8000 character result bound; more would be truncated
+      // mid-passage, which reads as the specification saying something it does
+      // not.
+      limit: z.number().int().min(1).max(3).optional(),
+    }).strict(),
+    execute: (params, context) => {
+      authorizedController(dependencies.store, context);
+      const hits = dependencies.store.searchReferencePassages({
+        query: params.query,
+        projectId: params.projectId ?? null,
+        limit: params.limit ?? 3,
+      });
+      return {
+        passages: hits.map((passage) => ({
+          id: passage.id,
+          document: passage.documentTitle,
+          section: passage.sectionPath,
+          body: passage.body,
+        })),
+      };
+    },
+  });
+
   const registeredToolNames = pendingRegistrations.map((registration) => registration.name);
   const assertProtocolToolsProjected = (projectedToolNames: readonly string[]): void => {
     if (CONTROLLER_PROTOCOL_TOOL_IDS.some((toolName) =>
@@ -2606,7 +2790,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         return {
           tools: projectedToolNames,
           skills,
-          instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
+          instructions: composeControllerInstructions(
+          dependencies.store.getControllerOverlay(),
+          dependencies.controllerIdentity?.() ?? null,
+        ),
         };
       }
       // A migrated in-flight turn has no profile. Keep its historical surface
@@ -2616,7 +2803,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       return {
         tools: compatibilityToolNames,
         skills: [...CONTROLLER_DEFAULT_SKILLS, ...CONTROLLER_MANUAL_DISCOVERY_SKILLS],
-        instructions: composeControllerInstructions(dependencies.store.getControllerOverlay()),
+        instructions: composeControllerInstructions(
+          dependencies.store.getControllerOverlay(),
+          dependencies.controllerIdentity?.() ?? null,
+        ),
       };
     }
     const title = parseWorkerThreadTitle(context.thread.title);

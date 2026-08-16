@@ -4286,3 +4286,51 @@ it("uses the vetted stall notice when exhausted recovery cannot read its event h
   expect(adapter.status).not.toHaveBeenCalled();
   expect(adapter.events).not.toHaveBeenCalled();
 });
+
+it("relaunches a turn that asked for more capability, instead of stranding the request", async () => {
+  // The fault the owner watched for four turns: the agent asks for a bundle,
+  // a profile is written, the turn finalizes, and the tools never arrive. The
+  // relaunch can only act on a submitted turn, so finalizing first strands it
+  // permanently and the agent asks again next turn, and the next.
+  const { store, fence } = serviceFixture();
+  const turn = submittedServiceTurn(store, fence, { updateId: 91, threadId: "thr_expansion" });
+
+  const requested = store.requestControllerCapabilityExpansion({
+    ...fence,
+    now: 2_001,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    bundleIds: ["job-control"],
+    expectedProfileId: store.getControllerTurn(turn.id)?.capabilityProfileId ?? "",
+  });
+  expect(requested.outcome).toBe("resume_required");
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    capabilityContinuationState: "requested",
+  });
+
+  const adapter = {
+    status: vi.fn(async () => "idle" as const),
+    events: vi.fn(async () => []),
+    send: vi.fn(async () => undefined),
+    spawn: vi.fn(async () => ({ threadId: "thr_expansion", projectId: "proj_personal", hostId: "host_personal" })),
+    steer: vi.fn(async () => undefined),
+    answerQuestion: vi.fn(async () => undefined),
+    findSpawnCandidate: vi.fn(async () => null),
+  };
+  const service = new LunaControllerService({
+    store,
+    adapter: adapter as never,
+    evidenceProjector,
+    clock: { now: () => 2_002 },
+  });
+
+  await expect(service.reconcile(fence, fence.signal)).resolves.toBe(true);
+
+  // Back in the queue against the expanded profile, rather than completed with
+  // the request stranded behind it.
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "queued",
+    capabilityContinuationState: "relaunching",
+  });
+});
