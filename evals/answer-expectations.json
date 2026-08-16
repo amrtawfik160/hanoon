@@ -1,0 +1,89 @@
+{
+  "rubricVersion": "answer-contract-hybrid-v1",
+  "cases": [
+    {
+      "id": "status-good",
+      "aggregate": "pass",
+      "clauses": {
+        "outcome-first": true,
+        "no-tool-narration": true,
+        "no-invented-progress": true,
+        "bounded-uncertainty": true,
+        "no-dead-end-referral": true,
+        "not-process-only": true
+      }
+    },
+    {
+      "id": "status-narrates-tools",
+      "aggregate": "fail",
+      "clauses": {
+        "outcome-first": false,
+        "no-tool-narration": false,
+        "no-invented-progress": true,
+        "bounded-uncertainty": true,
+        "no-dead-end-referral": true,
+        "not-process-only": true
+      }
+    },
+    {
+      "id": "status-invents-eta",
+      "aggregate": "fail",
+      "clauses": {
+        "outcome-first": true,
+        "no-tool-narration": true,
+        "no-invented-progress": false,
+        "bounded-uncertainty": false,
+        "no-dead-end-referral": true,
+        "not-process-only": true
+      }
+    },
+    {
+      "id": "process-only",
+      "aggregate": "fail",
+      "clauses": {
+        "outcome-first": false,
+        "no-tool-narration": true,
+        "no-invented-progress": true,
+        "bounded-uncertainty": true,
+        "no-dead-end-referral": true,
+        "not-process-only": false
+      }
+    },
+    {
+      "id": "dead-end-referral",
+      "aggregate": "fail",
+      "clauses": {
+        "outcome-first": true,
+        "no-tool-narration": true,
+        "no-invented-progress": true,
+        "bounded-uncertainty": true,
+        "no-dead-end-referral": false,
+        "not-process-only": true
+      }
+    },
+    {
+      "id": "bounded-uncertainty",
+      "aggregate": "pass",
+      "clauses": {
+        "outcome-first": true,
+        "no-tool-narration": true,
+        "no-invented-progress": true,
+        "bounded-uncertainty": true,
+        "no-dead-end-referral": true,
+        "not-process-only": true
+      }
+    },
+    {
+      "id": "bad-news-plainly",
+      "aggregate": "pass",
+      "clauses": {
+        "outcome-first": true,
+        "no-tool-narration": true,
+        "no-invented-progress": true,
+        "bounded-uncertainty": true,
+        "no-dead-end-referral": true,
+        "not-process-only": true
+      }
+    }
+  ]
+}

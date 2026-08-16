@@ -188,6 +188,22 @@ describe("runValidation", () => {
     expect(typeof snapshot.completedAt).toBe("string");
   });
 
+  test("accepts committed pull-request changes when the working tree has no uncommitted changes", async () => {
+    const committedStatus = {
+      outcome: "available",
+      workspace: {
+        workingTree: { state: "committed_unmerged", hasUncommittedChanges: false },
+        checkout: { kind: "branch", branchName: "feature/telegram", headSha: remoteSha },
+      },
+    };
+    const { input } = makeValidationHarness({ statuses: [committedStatus, committedStatus] });
+
+    await expect(runValidation(input as never)).resolves.toMatchObject({
+      headSha: remoteSha,
+      validationOutcome: "pass",
+    });
+  });
+
   test.each([
     [0, "pass"],
     [1, "fail"],
@@ -278,6 +294,30 @@ describe("runValidation", () => {
     });
 
     await expect(runValidation(input as never)).rejects.toThrow(/unexpected|schema|headRefOid/i);
+  });
+
+  test.each([
+    [{ number: 18 }, /number|identity/i],
+    [{ state: "CLOSED" }, /open/i],
+    [{ isDraft: true }, /draft/i],
+    [{ baseRefName: "release" }, /base/i],
+    [{ url: "https://github.com/acme/telegram/pull/18" }, /url|identity/i],
+  ])("rejects pull-request metadata that does not match the immutable job (%o)", async (change, message) => {
+    const { input } = makeValidationHarness({ prOutput: JSON.stringify({ ...prJson, ...change }) });
+    await expect(runValidation(input as never)).rejects.toThrow(message);
+  });
+
+  test.each(["fail", "pending", "cancel"])('does not pass when a required check is in the "%s" bucket', async (bucket) => {
+    const { input } = makeValidationHarness({
+      checksOutput: JSON.stringify([{ name: "lint", bucket, state: bucket.toUpperCase(), link: null }]),
+      checksExitCode: bucket === "pending" ? 8 : 1,
+    });
+    await expect(runValidation(input as never)).resolves.toMatchObject({ validationOutcome: "fail" });
+  });
+
+  test("does not pass when a policy-required check is absent", async () => {
+    const { input } = makeValidationHarness({ checksOutput: "[]", checksExitCode: 0 });
+    await expect(runValidation(input as never)).resolves.toMatchObject({ validationOutcome: "fail" });
   });
 
   test("rejects a changing remote head between the two Git lookups", async () => {

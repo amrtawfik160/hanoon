@@ -4,7 +4,7 @@ import { resolvePluginRoot, verifySkillBundle } from "./src/agent-skills/bundle-
 
 export function activatePlugin(bb: BbPluginApi, pluginRoot: string): Promise<void> {
   verifySkillBundle(pluginRoot);
-  return createPlugin(bb);
+  return createPlugin(bb, pluginRoot);
 }
 
 export default function plugin(bb: BbPluginApi): Promise<void> {

@@ -14,7 +14,7 @@ If a credential may have been exposed, rotate it with its provider first. For a 
 
 - One Telegram user and one private chat are paired as the owner. Pairing that chat grants the holder of it operator-level control of this BB installation.
 - The plugin itself is trusted server-side code; installation is not a sandbox boundary.
-- The conversational agent runs in a hidden personal workspace with the plugin's guarded tools **and** BB's ordinary agent capabilities. It defaults to the `full` permission mode, so it may use the shell, the `bb` CLI, installed skills, and MCP servers on any connected machine without a per-action prompt. Set `auto` or `accept-edits` if you want execution approved in the BB app instead. Those prompts are answered in the BB app only: the plugin bridges the agent's *questions* to Telegram, not its permission prompts.
+- The conversational agent runs in a hidden personal workspace with the plugin's guarded tools **and** BB's ordinary agent capabilities. Fresh or unset controller permission settings resolve to `auto`; an explicitly saved `auto`, `accept-edits`, or `full` value is preserved. A permission prompt BB raises for the hidden controller is bridged into Telegram as *Allow once* / *Deny*.
 - Approval prompts raised by visible top-level worker threads are bridged to Telegram, so an owner's tap there authorizes a command or file write in that thread. This moves where the decision is made, not who may make it — the paired chat already holds operator-level control. Approvals the plugin cannot represent faithfully are reported without buttons rather than resolved by guess.
 - Enabled project policies are trusted operator input. Their validation, deployment, and canary commands execute on the selected project host.
 - BB controls provider conversations, permissions, environments, worktrees, and merge execution.
@@ -30,11 +30,33 @@ The plugin can:
 - send bounded remediation to an implementation worker;
 - request a pull-request merge after review, validation, and owner approval;
 - read and update its durable job, memory, monitor, approval, liveness, and Telegram outbox state;
-- resolve pending BB interactions on visible top-level threads from the owner's Telegram tap, including *Allow once* and *Allow all session* on a command or file-change approval.
+- resolve pending BB interactions on **visible top-level** threads from the owner's Telegram tap, including *Allow once* and *Allow all session* on a command or file-change approval;
+- resolve the **hidden controller's** own questions and permission approvals from the owner's Telegram tap. These offer exactly *Allow once* and *Deny*: there is no session-wide grant on the controller path, and a session-wide token cannot settle one.
+
+## Controller trust boundary
+
+Every owner-visible reply from the conversational agent is an accepted structured finalization bound to evidence gathered in that same turn. A claim without compatible evidence, an answer whose evidence advanced after acceptance, or a deferred promise with no live durable obligation is rejected rather than delivered. Unstructured assistant prose reaches no draft, stored answer, digest, outbox row, finalization row, or Telegram reply; BB retains its own provider transcript separately.
+
+Interaction projections are the one bounded exception, and they are not prose. When BB blocks the thread on a question or a permission prompt, the plugin must carry the provider's own wording — the prompt, the option labels, the command being approved — because that is what the owner is being asked about. Each of those fields is length-bounded and passes a single fail-closed credential and callback screen before it is stored or sent. A field that fails the screen is not redacted in place: the whole interaction is downgraded to an unanswerable notice that names no provider text at all, so a leak cannot be traded for answerability.
+
+The controller runs against an enforced manifest of exactly 28 Hanoon capabilities, and denials are decided before any effect. That manifest bounds Hanoon's own tools only. Work the provider performs natively inside BB, or through an opaque third-party tool that emits no BB interaction and no evidence boundary, is outside it: **Hanoon claims no policy over an action it never sees.**
+
+The controller permission mode defaults to `auto`; it remains an operator setting rather than mechanically enforced isolation, and instruction text is not enforcement. Explicit `accept-edits` or `full` values remain supported. The current worker-driven commit, push, and pull-request path remains protected by the existing review, exact-head, and owner-approval boundaries.
+
+An owner's tap on a controller interaction commits durably — decision, callback outcome, and acknowledgement together — before BB is told, and survives a restart. The reply itself is one durable logical outbox obligation, but Telegram delivery is **at-least-once**: an ambiguous send is retained as unknown, a retry may duplicate the Telegram message, and an attempt or an enqueue is never recorded as delivered.
 
 Merge approval is one-use, expiring, and bound to the current full pull-request head. Deployment and canary run only after the merge is confirmed and the worktree is verified at the merge commit. The plugin does not automatically run rollback.
 
-Memory is owner-visible and correctable from the chat, and credential-shaped text is refused before it can be stored or indexed. Hidden threads remain unreachable from the agent's thread tools.
+Memory is owner-visible and correctable from the chat. Credential-shaped text is refused before it can be stored or indexed, with one deliberate exception: `bb telegram-agent memory import` runs on the protected BB host under the owner's own identity and stores its entries unscreened. Nothing the agent writes uses that path — its own `remember` is still refused. Hidden threads remain unreachable from the agent's thread tools.
+
+## Credential broker trust boundary
+
+This foundation adds a second, deliberately separate trust boundary: a broker service meant to run on its own protected host or private service network, outside this plugin's process, database, and full-trust boundary. Nothing above in this document — "the plugin itself is trusted server-side code," or the controller's shell and `bb` CLI reach — applies to the broker. The broker is designed so that a compromised controller or worker identity cannot reach its administrative interface, its filesystem, or the vault service-account token, and so that a compromised plugin never receives that token or a resolved credential value.
+
+- **`credentialBrokerMode` defaults to `disabled`.** In that state every access command and doctor check fails closed, and no request reaches a broker. Moving to `isolated` requires an endpoint, an installation id, a topology receipt digest/expiry from a reviewed negative-probe report, and certificate material — none of which a fresh installation has. This repository does not include the disposable 1Password account, the protected broker host, or the live acceptance run that would make enabling it meaningful; see [Disposable live acceptance](docs/live-acceptance.md).
+- **Only two operations exist end to end:** a diagnostic health check, and a single-item vault resolve. There is no generic proxy, shell, URL fetch, or vault search/list reachable from Hanoon, and no operator CLI command to verify or enroll a credential — `bb telegram-agent access list` and `access status` only read local, secret-free metadata. A live verification can only be requested by the owner, in chat, through Hanoon's guarded tool, never from the CLI.
+- **A `vault_verified` binding proves the broker can reach the configured vault item. It does not prove the credential works for its application**, and nothing in this foundation can move a binding to `active`. Do not treat a verification reply as a login or account check.
+- **Only the broker client's private key is a BB secret plugin setting.** The 1Password service-account token is never configured in BB; it is entered directly on the protected broker host through its own OS credential prompt. See `broker/README.md` for the protected-host build, credential provisioning, enrollment, revocation, and teardown procedures.
 
 ## Credential handling
 
@@ -43,6 +65,7 @@ Memory is owner-visible and correctable from the chat, and credential-shaped tex
 - Never put credentials in project policies, commands, redaction examples, issues, logs, tests, or docs.
 - Use `outputRedactionPatterns` for project-specific sensitive output, but do not treat redaction as permission to print secrets.
 - Do not persist raw merge callback data or private provider transcripts as evidence.
+- `bb telegram-agent memory import` is the one path that stores credential-shaped text. Its entries live in plugin SQLite in plaintext, are readable by anyone who can read that database or its backups, and are recallable by the agent. It is a convenience for standing information, not a vault: prefer a real secret manager for anything whose disclosure matters, and rotate what you load if the installation is compromised.
 
 ## Operational containment
 

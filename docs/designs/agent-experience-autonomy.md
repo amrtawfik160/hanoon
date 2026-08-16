@@ -1,15 +1,19 @@
 # Agent Experience and Proven Autonomy Design
 
+Capability-routing amendment: [Adaptive Capability Pipeline Specification](adaptive-capability-pipeline.md). That specification supersedes this document's static role-to-skill mapping, skill-only receipt schema, and associated rollout and acceptance wording. The Telegram experience and live-acceptance contracts here remain authoritative where the amendment does not replace them.
+
+Implementation status (2026-08-13): the 23-skill bundle, universal profiles and receipts, least-capability controller bundles, strict guard outcomes, model trials, six recipe graphs, fake-host acceptance, bounded operator projections, and fail-closed promotion reader are implemented. The trusted disposable-live promotion collector and CLI-managed acceptance session described below are not implemented. Live recipe promotion is therefore `not run/incomplete`; a fresh installation starts every adaptive recipe in `shadow`.
+
 ## Purpose
 
-This design makes the Telegram agent easier to trust and more capable without weakening its existing admission, review, approval, merge, or production fences. It adds a self-contained, role-selected skill bundle, evidence-backed progress communication, and an executable live acceptance system.
+This design makes the Telegram agent easier to trust and more capable without weakening its existing admission, review, approval, merge, or production fences. It adds a self-contained skill bundle, evidence-backed progress communication, and an executable live acceptance system.
 
 The plugin remains the authority for durable state. Skills guide worker behavior; they do not decide whether a job may advance, merge, deploy, or claim completion.
 
 ## Goals
 
 - Ship the agent with the development workflow and quality skills it needs.
-- Load only the skills relevant to the current worker role.
+- Load only the capabilities selected for the current verified profile.
 - Make Telegram updates concise, timely, and based on durable facts.
 - Continue autonomous work while the state machine has a safe next action.
 - Pause only for an owner decision, an explicit policy boundary, or a proved blocker.
@@ -80,7 +84,9 @@ One pure resolver extends the existing `bb.agents.configure` callback. A worker 
 
 A spoofed title, unrelated thread, unknown role, or identity mismatch resolves to no tools and no skills. The hidden controller keeps its existing exact authorization and receives no development skills.
 
-### Default role matrix
+### Historical role matrix
+
+The table below records the earlier static design and is superseded by the amendment's profile selector. The implemented matrix is documented in [Architecture](../architecture.md#agent-skill-runtime); it adds the shared human-communication guidance, manual controller discovery skills, and recipe/stage-specific selections without loading every skill.
 
 | Worker role | Selected skills | Reason |
 | --- | --- | --- |
@@ -181,9 +187,9 @@ Natural-language status, cancellation, retry, and steering continue through cont
 
 ## Executable live acceptance
 
-### Acceptance session
+### Proposed acceptance session
 
-Add a CLI-managed acceptance session with durable state:
+A future slice may add a CLI-managed acceptance session with durable state:
 
 ```text
 bb telegram-agent acceptance start --profile <profile-file>
@@ -194,14 +200,14 @@ bb telegram-agent acceptance verify <run-id> --json
 
 The profile names only disposable projects, repositories, branches, production targets, and commands. The start command refuses a non-disposable profile, records a bounded evidence checklist, and sends the owner the next required Telegram action. `continue` re-reads authoritative state; it never marks a step complete from a typed assertion. `verify` reports `passed`, `failed`, or `incomplete` with proof classes kept separate.
 
-The acceptance runner coordinates owner taps and messages but does not impersonate the Telegram owner or bypass merge approval.
+The current release instead provides the manual [Disposable live acceptance](../live-acceptance.md) runbook. No acceptance-runner command is registered. A future runner must coordinate owner taps and messages without impersonating the Telegram owner or bypassing merge approval.
 
 ### Required scenarios
 
 One release acceptance run covers:
 
 1. real Telegram ingress and controller reply;
-2. role-specific skill resolution on real BB threads;
+2. profile-specific capability resolution on real BB threads;
 3. a queued cancellation, status edit, and capacity release;
 4. two independent jobs progressing concurrently;
 5. same-project serialization;
@@ -231,11 +237,7 @@ No synthetic percentage is shown for an individual running job. Aggregate rates 
 
 ## Persistence changes
 
-Two append-only tables are sufficient:
-
-### `skill_receipts`
-
-One row per attempt and selected skill, keyed by `(attempt_id, skill_id, bundle_digest)`. It stores bounded selection and outcome metadata and timestamps. Replays update no terminal receipt.
+Capability selection and outcomes use the universal profiles and append-only receipts defined by the [Adaptive Capability Pipeline Specification](adaptive-capability-pipeline.md). A read-only `skill_receipts` compatibility view preserves bounded earlier consumers; it is not a second evidence authority.
 
 ### `acceptance_runs`
 
@@ -261,7 +263,7 @@ Milestone notices reuse the existing outbox and job version. No separate notific
 - Manifest and lock-file tests verify every registered skill name, digest, license entry, and referenced file.
 - Data-driven resolver tests cover controller, every worker role, spoofed titles, wrong origins, wrong projects, wrong workspaces, stale thread ids, and unknown roles.
 - Prompt tests prove one controller instruction copy and stable role instruction composition.
-- Real SQLite tests cover skill receipt idempotency, bounds, replay, and failure persistence.
+- Real SQLite tests cover universal capability receipt idempotency, bounds, replay, compatibility views, and failure persistence.
 - Runner tests assert that existing thread titles and structural identities still map to the intended roles.
 - Telegram tests cover status ordering, valid buttons, milestone deduplication, process-only response continuation, and promise ownership.
 - Acceptance-runner tests use real migrated SQLite and fake only Telegram, provider, GitHub, and command boundaries.
@@ -274,7 +276,7 @@ The executable acceptance session is the live test. It uses the real installed p
 ## Rollout
 
 1. Bundle and role-route skills without changing job progression.
-2. Persist skill receipts and enforce guard remediation bounds.
+2. Persist universal capability profiles and receipts and enforce guard remediation bounds.
 3. Remove duplicate controller prompt composition and add response-quality continuation.
 4. Add status-card ordering and idempotent milestone notices.
 5. Add acceptance sessions and scorecards.
@@ -285,9 +287,9 @@ Each step is independently reversible before the live run. Database migrations a
 ## Acceptance criteria
 
 - The plugin installs with its skill bundle and no external skill plugin dependency.
-- Every plugin-owned thread resolves exactly the tested role skill set; unrelated threads resolve none.
+- Every plugin-owned thread resolves exactly its tested capability profile; unrelated threads resolve none.
 - The controller receives no development skills and no duplicate instruction block.
-- Implementation, review, documentation, and final-review attempts persist bounded skill receipts.
+- Implementation, review, documentation, and final-review attempts persist bounded universal capability outcomes.
 - Guard findings cannot bypass the state machine or create an unbounded remediation loop.
 - Telegram status actions always match durable state, and milestone notices are replay-safe.
 - Process narration alone cannot terminate a controller turn.

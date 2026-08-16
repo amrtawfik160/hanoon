@@ -18,13 +18,21 @@ import {
   DELIVERY_KIT,
   DELIVERY_PROVENANCE,
   DELIVERY_ROOT,
+  DISCOVERY_KIT,
+  DISCOVERY_PROVENANCE,
+  DISCOVERY_ROOT,
+  HANOON_KIT,
+  HANOON_PROVENANCE,
+  HANOON_ROOT,
   GUARD_KIT,
   GUARD_PROVENANCE,
   GUARDS_ROOT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
   REQUIRED_DELIVERY_SKILLS,
+  REQUIRED_DISCOVERY_SKILLS,
   REQUIRED_GUARD_SKILLS,
+  REQUIRED_HANOON_SKILLS,
   REQUIRED_WORKFLOW_SKILLS,
   SYNC_EXCLUDED_FILES,
   SYNC_EXCLUDED_SEGMENTS,
@@ -53,6 +61,8 @@ const skillsRoot = join(pluginRoot, dirname(WORKFLOW_ROOT));
 const workflowDestination = join(pluginRoot, WORKFLOW_ROOT);
 const guardsRoot = join(pluginRoot, GUARDS_ROOT);
 const deliveryRoot = join(pluginRoot, DELIVERY_ROOT);
+const discoveryRoot = join(pluginRoot, DISCOVERY_ROOT);
+const hanoonRoot = join(pluginRoot, HANOON_ROOT);
 const lockDestination = join(pluginRoot, LOCK_PATH);
 
 function fail(message) {
@@ -165,6 +175,8 @@ function assertDestinationSafe() {
   if (lstatIfPresent(workflowDestination)) scanTree(workflowDestination, WORKFLOW_ROOT, limits);
   if (lstatIfPresent(guardsRoot)) scanTree(guardsRoot, GUARDS_ROOT, limits);
   if (lstatIfPresent(deliveryRoot)) scanTree(deliveryRoot, DELIVERY_ROOT, limits);
+  if (lstatIfPresent(discoveryRoot)) scanTree(discoveryRoot, DISCOVERY_ROOT, limits);
+  if (lstatIfPresent(hanoonRoot)) scanTree(hanoonRoot, HANOON_ROOT, limits);
   const lock = lstatIfPresent(lockDestination);
   if (lock?.isSymbolicLink()) fail(`symbolic link is not allowed: ${LOCK_PATH}`);
   if (lock && !lock.isFile()) fail(`not a regular file: ${LOCK_PATH}`);
@@ -261,10 +273,14 @@ function buildLock(workflowRoot) {
   const workflowSkills = skillRecords(workflowRoot, WORKFLOW_ROOT, WORKFLOW_PROVENANCE);
   const guardSkills = skillRecords(guardsRoot, GUARDS_ROOT, GUARD_PROVENANCE);
   const deliverySkills = skillRecords(deliveryRoot, DELIVERY_ROOT, DELIVERY_PROVENANCE);
+  const discoverySkills = skillRecords(discoveryRoot, DISCOVERY_ROOT, DISCOVERY_PROVENANCE);
+  const hanoonSkills = skillRecords(hanoonRoot, HANOON_ROOT, HANOON_PROVENANCE);
   assertCatalog(workflowSkills, REQUIRED_WORKFLOW_SKILLS, WORKFLOW_ROOT);
   assertCatalog(guardSkills, REQUIRED_GUARD_SKILLS, GUARDS_ROOT);
   assertCatalog(deliverySkills, REQUIRED_DELIVERY_SKILLS, DELIVERY_ROOT);
-  const skills = [...workflowSkills, ...guardSkills, ...deliverySkills];
+  assertCatalog(discoverySkills, REQUIRED_DISCOVERY_SKILLS, DISCOVERY_ROOT);
+  assertCatalog(hanoonSkills, REQUIRED_HANOON_SKILLS, HANOON_ROOT);
+  const skills = [...workflowSkills, ...guardSkills, ...deliverySkills, ...discoverySkills, ...hanoonSkills];
   const ids = new Set();
   for (const skill of skills) {
     if (ids.has(skill.id)) fail(`duplicate skill name: ${skill.id}`);
@@ -274,12 +290,16 @@ function buildLock(workflowRoot) {
     { path: workflowRoot, publicRoot: WORKFLOW_ROOT },
     { path: guardsRoot, publicRoot: GUARDS_ROOT },
     { path: deliveryRoot, publicRoot: DELIVERY_ROOT },
+    { path: discoveryRoot, publicRoot: DISCOVERY_ROOT },
+    { path: hanoonRoot, publicRoot: HANOON_ROOT },
   ]);
   const lock = {
     schemaVersion: LOCK_SCHEMA_VERSION,
     workflowKit: WORKFLOW_KIT,
     guardKit: GUARD_KIT,
     deliveryKit: DELIVERY_KIT,
+    discoveryKit: DISCOVERY_KIT,
+    hanoonKit: HANOON_KIT,
     skills: skills.sort((left, right) => left.id.localeCompare(right.id)),
     files,
   };
@@ -317,9 +337,13 @@ function assertSourceBundle(source, license, sourceSkills) {
   scanTree(sourceSkills, "skills", limits, source);
   scanTree(guardsRoot, GUARDS_ROOT, limits);
   scanTree(deliveryRoot, DELIVERY_ROOT, limits);
+  scanTree(discoveryRoot, DISCOVERY_ROOT, limits);
+  scanTree(hanoonRoot, HANOON_ROOT, limits);
   assertCatalog(skillRecords(sourceSkills, WORKFLOW_ROOT, WORKFLOW_PROVENANCE, source), REQUIRED_WORKFLOW_SKILLS, WORKFLOW_ROOT);
   assertCatalog(skillRecords(guardsRoot, GUARDS_ROOT, GUARD_PROVENANCE), REQUIRED_GUARD_SKILLS, GUARDS_ROOT);
   assertCatalog(skillRecords(deliveryRoot, DELIVERY_ROOT, DELIVERY_PROVENANCE), REQUIRED_DELIVERY_SKILLS, DELIVERY_ROOT);
+  assertCatalog(skillRecords(discoveryRoot, DISCOVERY_ROOT, DISCOVERY_PROVENANCE), REQUIRED_DISCOVERY_SKILLS, DISCOVERY_ROOT);
+  assertCatalog(skillRecords(hanoonRoot, HANOON_ROOT, HANOON_PROVENANCE), REQUIRED_HANOON_SKILLS, HANOON_ROOT);
 }
 
 function replaceBundle(stage, lockContents) {
@@ -373,6 +397,8 @@ function main() {
     scanTree(stagedWorkflow, WORKFLOW_ROOT, stagedLimits);
     scanTree(guardsRoot, GUARDS_ROOT, stagedLimits);
     scanTree(deliveryRoot, DELIVERY_ROOT, stagedLimits);
+    scanTree(discoveryRoot, DISCOVERY_ROOT, stagedLimits);
+    scanTree(hanoonRoot, HANOON_ROOT, stagedLimits);
     const lockContents = buildLock(stagedWorkflow);
     assertDestinationSafe();
     replaceBundle(stage, lockContents);

@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { hashSecret } from "../crypto";
-import type { Job } from "../domain/models";
+import {
+  isResumablePermanentFailure,
+  isResumablePlanBlock,
+  isResumableReviewBlock,
+  isReviewedPrCompletionBlock,
+  isRetryableJob,
+  type Job,
+} from "../domain/models";
 import type { MergeHandler } from "../services/merge-handler";
 import {
   OWNER_MEMORY_SCOPE,
@@ -13,6 +20,7 @@ import {
 import { detectStandingInstruction } from "../controller/context";
 import { containsCredentialLikeText } from "../domain/state-machine";
 import type { HealthReport } from "../services/health-report";
+import { activationSummary } from "../services/runtime-identity";
 import {
   telegramUpdateSchema,
   type SendMessagePayload,
@@ -31,8 +39,8 @@ import {
 } from "./view";
 import { TelegramRequestError } from "./client";
 import { TelegramApiError } from "./errors";
-import { MAX_CONTROLLER_IMAGE_BYTES } from "../controller/models";
-import { CAPTIONLESS_IMAGE_PROMPT, controllerImageFromMessage } from "./image";
+import { MAX_CONTROLLER_IMAGE_BYTES, isMotionMedia } from "../controller/models";
+import { captionlessPromptFor, clipTooLargeForDownload, controllerImageFromMessage } from "./image";
 
 export type TelegramIngressTransport = {
   sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }>;
@@ -167,6 +175,15 @@ function isTypedTelegramDeliveryError(error: unknown): boolean {
   return error instanceof TelegramApiError || error instanceof TelegramRequestError;
 }
 
+/**
+ * What the ingress did with the claim on the update it was handed. An answer
+ * settles its own claim inside the answer's transaction, so the caller must not
+ * settle it a second time; everything else leaves the claim for the caller.
+ */
+export type TelegramIngressOutcome = { updateSettled: boolean };
+
+const UPDATE_STILL_CLAIMED: TelegramIngressOutcome = { updateSettled: false };
+
 export class TelegramIngress {
   private readonly store: TelegramAgentStore;
   private readonly telegram: TelegramIngressTransport;
@@ -199,23 +216,29 @@ export class TelegramIngress {
     }
   }
 
-  public async handleClaimed(update: TelegramUpdate, now: number): Promise<void> {
+  public async handleClaimed(update: TelegramUpdate, now: number): Promise<TelegramIngressOutcome> {
     if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
     const parsed = telegramUpdateSchema.safeParse(update);
-    if (!parsed.success) return;
+    if (!parsed.success) return UPDATE_STILL_CLAIMED;
     if (parsed.data.message) {
-      await this.handleMessage(parsed.data.message, parsed.data.update_id, now);
-      return;
+      // Only the answer path settles its own claim; every other message route
+      // simply falls out, which is the ordinary "caller still owns it" case.
+      return await this.handleMessage(parsed.data.message, parsed.data.update_id, now) ?? UPDATE_STILL_CLAIMED;
     }
     if (parsed.data.callback_query) {
       await this.handleCallback(parsed.data.callback_query, parsed.data.update_id, now);
     }
+    return UPDATE_STILL_CLAIMED;
   }
 
-  private async handleMessage(message: TelegramMessage, updateId: number, now: number): Promise<void> {
+  private async handleMessage(
+    message: TelegramMessage,
+    updateId: number,
+    now: number,
+  ): Promise<TelegramIngressOutcome | void> {
     const identity = privateHumanIdentity(message.from, message.chat);
     const image = controllerImageFromMessage(message);
-    const text = message.text ?? (image ? message.caption ?? CAPTIONLESS_IMAGE_PROMPT : undefined);
+    const text = message.text ?? (image ? message.caption ?? captionlessPromptFor(image) : undefined);
     if (text === undefined) return;
 
     const pairingCode = this.pairingCode(text);
@@ -243,8 +266,12 @@ export class TelegramIngress {
       this.audit("unauthorized_message", updateId, message.from, message.chat);
       return;
     }
-    if (image && image.sizeBytes !== null && image.sizeBytes > MAX_CONTROLLER_IMAGE_BYTES) {
+    if (image && image.sizeBytes !== null && !isMotionMedia(image) && image.sizeBytes > MAX_CONTROLLER_IMAGE_BYTES) {
       await this.sendPlain(identity.chatId, "That image is larger than BB's 10 MB image limit. Please resend a smaller copy.");
+      return;
+    }
+    if (image && isMotionMedia(image) && clipTooLargeForDownload(image) && !image.thumbnail) {
+      await this.sendPlain(identity.chatId, "That clip is larger than Telegram lets me download. Please send a shorter video, a GIF, or a few screenshots.");
       return;
     }
     const normalized = boundedText(text);
@@ -254,7 +281,7 @@ export class TelegramIngress {
     const command = commandMatch?.[1]?.toLowerCase();
     const commandArgument = commandMatch?.[2]?.trim() || null;
     if (command === "help") {
-      await this.sendPlain(identity.chatId, "Talk naturally. Reply to a job status message to steer that implementation, or use /status, /projects, /health, /retry, and /cancel for recovery.");
+      await this.sendPlain(identity.chatId, "Talk naturally. Reply to a job status message to steer that implementation, or use /status, /projects, /health, /approvals, /resume, /retry, and /cancel for recovery.");
       return;
     }
     if (command === "projects") {
@@ -263,6 +290,17 @@ export class TelegramIngress {
     }
     if (command === "health") {
       await this.sendPlain(identity.chatId, this.healthSummary(now));
+      return;
+    }
+    // Granting standing approval is only ever a button tap, so it cannot be
+    // produced by the agent misreading a sentence. Withdrawing it is the
+    // fail-safe direction, so it is available here by name.
+    if (command === "resume") {
+      await this.sendPlain(identity.chatId, this.handleResumeCommand(commandArgument, now));
+      return;
+    }
+    if (command === "approvals") {
+      await this.sendPlain(identity.chatId, this.handleApprovalsCommand(commandArgument, identity, now));
       return;
     }
 
@@ -274,19 +312,19 @@ export class TelegramIngress {
       const replyMessageId = message.reply_to_message?.message_id ?? null;
       if (command === "status" && commandArgument === null && replyMessageId === null) {
         const jobs = this.store.listControlJobs("status", 8);
-        await this.telegram.sendMessage(identity.chatId, renderJobStatusSummary({
+        await this.telegram.sendMessage(identity.chatId, this.withExecutorHealthWarning(renderJobStatusSummary({
           jobs: jobs.map((job) => ({ job, admission: this.store.getAdmission(job.id) })),
           total: this.store.countControlJobs("status"),
-        }));
+        }), now));
         return;
       }
       const resolution = this.resolveControlJob(command, commandArgument, replyMessageId);
       if (resolution.outcome === "choose") {
         if (command === "status") {
-          await this.telegram.sendMessage(identity.chatId, renderJobStatusSummary({
+          await this.telegram.sendMessage(identity.chatId, this.withExecutorHealthWarning(renderJobStatusSummary({
             jobs: resolution.jobs.map((job) => ({ job, admission: this.store.getAdmission(job.id) })),
             total: resolution.total,
-          }));
+          }), now));
         } else {
           await this.telegram.sendMessage(
             identity.chatId,
@@ -327,12 +365,21 @@ export class TelegramIngress {
     const controllerKey = stableControllerKey(identity.userId, identity.chatId);
     // The agent asked something and is blocked on it. A reply now is the answer,
     // not a new request to line up behind the answer it is waiting to give.
-    if (this.store.getPendingControllerQuestion(controllerKey)) {
-      const answered = this.store.answerControllerQuestionWithText({ controllerKey, text: normalized, now });
+    if (this.store.getPendingControllerInteraction(controllerKey)) {
+      const result = this.store.answerControllerInteractionTextUpdate({
+        updateId,
+        controllerKey,
+        userId: identity.userId,
+        chatId: identity.chatId,
+        text: normalized,
+        now,
+      });
+      if (result.outcome === "replay") return;
+      const answered = result.answer;
       if (answered.ok) {
         this.rememberStandingInstruction(normalized, answered.turnId, now);
         this.onWorkAvailable();
-        return;
+        return { updateSettled: true };
       }
     }
 
@@ -392,7 +439,7 @@ export class TelegramIngress {
       this.audit("malformed_callback", updateId, callback.from, callback.message.chat);
       return;
     }
-    if (action.type === "merge") {
+    if (action.type === "merge" || action.type === "merge_always") {
       if (!this.mergeHandler) {
         this.audit("invalid_callback", updateId, callback.from, callback.message.chat);
         return;
@@ -402,16 +449,36 @@ export class TelegramIngress {
         this.audit("unauthorized_callback", updateId, callback.from, callback.message.chat);
         return;
       }
+      // Resolved before the handler runs, because approving consumes the nonce
+      // and the project can no longer be recovered from it afterwards.
+      const grantProjectId = action.type === "merge_always"
+        ? this.projectForApprovalNonce(action.nonce)
+        : null;
       const result = await this.mergeHandler.handleApprovalCallback({
         callbackId: callback.id,
         nonce: action.nonce,
         userId: identity.userId,
         chatId: identity.chatId,
       });
+      // The standing grant is only recorded when this merge was actually
+      // approved: a stale button must not hand out lasting authority.
+      const granted = result.outcome === "accepted" && grantProjectId !== null;
+      if (granted) {
+        this.store.grantMergeAuthority({
+          projectId: grantProjectId,
+          userId: identity.userId,
+          chatId: identity.chatId,
+          now,
+        });
+      }
       this.enqueueCallbackAnswer(
         callback.id,
         identity.chatId,
-        result.outcome === "accepted" ? "Merge queued." : "Approval is stale or no longer valid.",
+        result.outcome !== "accepted"
+          ? "Approval is stale or no longer valid."
+          : granted
+            ? "Merge queued. I will not ask again for this project."
+            : "Merge queued.",
         now,
       );
       return;
@@ -441,29 +508,19 @@ export class TelegramIngress {
       if (answered.ok && recorded) this.onWorkAvailable();
       return;
     }
-    if (action.type === "question") {
-      const answered = this.store.answerControllerQuestion({
+    // `question` is the legacy `q:` prefix, still decodable for one release so a
+    // migrated in-flight message stays answerable. Both settle the same durable
+    // interaction: the answer, the callback record, and the acknowledgement all
+    // commit together, and the executor is nudged only once they have.
+    if (action.type === "controller_interaction" || action.type === "question") {
+      const result = this.store.answerControllerInteractionByTokenAndRecordCallback({
         token: action.token,
         userId: identity.userId,
         chatId: identity.chatId,
+        callbackId: callback.id,
         now,
       });
-      const recorded = this.store.recordCallback(
-        callback.id,
-        null,
-        "controller_question",
-        answered.ok ? "accepted" : answered.reason,
-        now,
-      );
-      if (recorded) {
-        this.enqueueCallbackAnswer(
-          callback.id,
-          identity.chatId,
-          answered.ok ? "Got it." : "That question is no longer open.",
-          now,
-        );
-      }
-      if (answered.ok && recorded) this.onWorkAvailable();
+      if (result.answer.ok && result.recorded) this.onWorkAvailable();
       return;
     }
     if (action.type === "operation") {
@@ -597,10 +654,13 @@ export class TelegramIngress {
   ): Promise<void> {
     let cancelled = job;
     if (job.cancelRequestedAt === null && !jobIsTerminal(job)) {
+      const activeWorkers = this.store.getCurrentWorkerLiveness(job.id);
       cancelled = this.store.applyJobEvent(
         job.id,
         job.version,
-        { type: "CANCEL_REQUESTED", activeWorker: this.store.getWorkerLiveness(job.id) },
+        activeWorkers === null
+          ? { type: "CANCEL_REQUESTED" }
+          : { type: "CANCEL_REQUESTED", activeWorker: activeWorkers[0] ?? null, activeWorkers },
         now,
       );
       this.onWorkAvailable();
@@ -620,10 +680,16 @@ export class TelegramIngress {
     now: number,
     callback?: TelegramCallbackQuery,
   ): Promise<void> {
-    if (job.state !== "failed") return;
-    const retried = this.store.applyJobEvent(job.id, job.version, { type: "RETRY" }, now);
-    await this.deliverJobView(retried, this.renderStatus(retried), chatId, messageId, now);
-    if (callback) await this.finishCallback(callback.id, retried.id, chatId, "retry", "accepted", now, "Retry scheduled.");
+    if (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job)) {
+      await this.reviewJob(job, chatId, messageId ?? job.statusMessageId ?? 0, now, callback);
+      return;
+    }
+    if (job.state !== "failed" && !isResumablePermanentFailure(job)) return;
+    const retryResult = this.store.retryFailedJob(job.id, job.version, now);
+    if (retryResult.outcome === "unavailable") return;
+    this.onWorkAvailable();
+    await this.deliverJobView(retryResult.job, this.renderStatus(retryResult.job), chatId, messageId, now);
+    if (callback) await this.finishCallback(callback.id, retryResult.job.id, chatId, "retry", "accepted", now, "Retry scheduled.");
   }
 
   private async reviewJob(
@@ -633,7 +699,9 @@ export class TelegramIngress {
     now: number,
     callback?: TelegramCallbackQuery,
   ): Promise<void> {
-    if (job.state !== "blocked" || job.blockedReason !== "review_limit") return;
+    if (job.state !== "blocked" ||
+      (job.blockedReason !== "review_limit" && job.blockedReason !== "plan_limit" &&
+        !isReviewedPrCompletionBlock(job))) return;
     const queued = this.store.requeueReviewAdmission(job.id, job.version, now);
     if (queued.outcome === "unavailable") return;
     const current = this.store.getJob(job.id) ?? job;
@@ -647,7 +715,13 @@ export class TelegramIngress {
         "review",
         stillCleaningUp ? "rejected" : "accepted",
         now,
-        stillCleaningUp ? "Review is still cleaning up." : "Review queued.",
+        stillCleaningUp
+          ? (isReviewedPrCompletionBlock(job)
+            ? "Finish is still cleaning up."
+            : isResumablePlanBlock(job) ? "Plan revision is still cleaning up." : "Review is still cleaning up.")
+          : (isReviewedPrCompletionBlock(job)
+            ? "Finish queued."
+            : isResumablePlanBlock(job) ? "Plan revision queued." : "Review queued."),
       );
     }
     if (!stillCleaningUp) this.onWorkAvailable();
@@ -666,7 +740,7 @@ export class TelegramIngress {
   }
 
   private controlEligible(job: Job, kind: Exclude<JobControlKind, "status">): boolean {
-    if (kind === "retry") return job.state === "failed" && job.cancelRequestedAt === null;
+    if (kind === "retry") return isRetryableJob(job);
     return !jobIsTerminal(job) && job.cancelRequestedAt === null;
   }
 
@@ -714,22 +788,138 @@ export class TelegramIngress {
 
   // Answered from durable state rather than from the agent, so it still works
   // when the agent itself is the thing that is stuck.
+  /**
+   * `/approvals` lists which projects merge and deploy without asking;
+   * `/approvals off <alias>` and `/approvals off` withdraw one or all of them.
+   */
+  private handleApprovalsCommand(
+    argument: string | null,
+    identity: { userId: string; chatId: string },
+    now: number,
+  ): string {
+    const projects = this.store.listEnabledProjectPolicies();
+    const live = projects.filter(({ policy }) => {
+      const grant = this.store.getMergeAuthority(policy.projectId);
+      return grant !== null && grant.revokedAt === null;
+    });
+
+    const offMatch = /^off(?:\s+(.+))?$/i.exec(argument ?? "");
+    if (!offMatch) {
+      if (live.length === 0) {
+        return "No project merges without asking. I will request approval every time.\n\nTap \"Merge + deploy, and always from now on\" on an approval message to change that.";
+      }
+      const names = live.map(({ policy }) => `• ${policy.alias}`).join("\n");
+      return `I merge and deploy these without asking:\n${names}\n\nSend /approvals off <name> to stop, or /approvals off for all of them.`;
+    }
+
+    const alias = offMatch[1]?.trim().toLowerCase() ?? null;
+    const targets = alias === null ? live : live.filter(({ policy }) => policy.alias === alias);
+    if (targets.length === 0) {
+      return alias === null
+        ? "Nothing to withdraw — no project merges without asking."
+        : `No standing approval for "${alias}".`;
+    }
+    const withdrawn = targets.filter(({ policy }) => this.store.revokeMergeAuthority({
+      projectId: policy.projectId,
+      reason: "the owner withdrew it",
+      now,
+      userId: identity.userId,
+      chatId: identity.chatId,
+    }));
+    return withdrawn.length === 1
+      ? `Done. I will ask you before merging ${withdrawn[0].policy.alias} again.`
+      : `Done. I will ask you before merging any of those ${withdrawn.length} projects again.`;
+  }
+
+  /**
+   * `/resume` starts work again on a project the failure brake stopped.
+   * Restarting is always the owner's call: the brake trips because something
+   * kept failing, and nothing about time passing fixes that.
+   */
+  private handleResumeCommand(argument: string | null, now: number): string {
+    const paused = this.store.listPausedProjectAdmissions();
+    if (paused.length === 0) return "Nothing is paused. All projects are taking work.";
+
+    const aliases = new Map(
+      this.store.listEnabledProjectPolicies().map(({ policy }) => [policy.projectId, policy.alias] as const),
+    );
+    const alias = argument?.trim().toLowerCase() || null;
+    // A bare /resume always lists and never restarts, including when only one
+    // project is paused. The brake tripped because something kept failing, so
+    // restarting has to be something the owner asked for by name.
+    if (alias === null) {
+      const names = paused
+        .map((entry) => `• ${aliases.get(entry.projectId) ?? entry.projectId} — ${entry.reason}`)
+        .join("\n");
+      return `These projects are paused:\n${names}\n\nSend /resume <name> to start one, or /resume all for every one of them.`;
+    }
+
+    if (alias === "all") {
+      const cleared = this.store.clearProjectAdmissionPause({ now });
+      return cleared === 1
+        ? "Done. That project is taking work again."
+        : `Done. Those ${cleared} projects are taking work again.`;
+    }
+    const target = paused.find((entry) => (aliases.get(entry.projectId) ?? entry.projectId) === alias);
+    if (!target) return `"${alias}" is not paused.`;
+    this.store.clearProjectAdmissionPause({ projectId: target.projectId, now });
+    return `Done. ${alias} is taking work again.`;
+  }
+
+  private pausedLine(): string | null {
+    const paused = this.store.listPausedProjectAdmissions();
+    if (paused.length === 0) return null;
+    const aliases = new Map(
+      this.store.listEnabledProjectPolicies().map(({ policy }) => [policy.projectId, policy.alias] as const),
+    );
+    const names = paused.map((entry) => aliases.get(entry.projectId) ?? entry.projectId).join(", ");
+    return `Paused after repeated failures: ${names} — send /resume to start again`;
+  }
+
   private healthSummary(now: number): string {
     if (!this.health) return "Health reporting is unavailable.";
     const report = this.health(now);
-    if (report.ok) {
+    const paused = this.pausedLine();
+    const activation = report.activation === null
+      ? []
+      : [`Activation: ${report.activation.ok ? "current" : "ACTIVATION MISMATCH"} (${activationSummary(report.activation)})`];
+    if (report.ok && paused === null) {
       return [
         "All good.",
+        ...activation,
         `Executor: running (generation ${report.executor.generation ?? "none"})`,
         `Queue: ${report.work.pendingEffects} job step(s), ${report.delivery.pendingOutbox} message(s) waiting`,
         `Watching: ${report.monitors.armed} monitor(s)`,
         `Memory: ${report.memory.live} kept`,
       ].join("\n");
     }
-    return [`Problems:\n${report.problems.map((problem) => `- ${problem}`).join("\n")}`,
+    return [
+      ...activation,
+      report.problems.length > 0
+        ? `Problems:\n${report.problems.map((problem) => `- ${problem}`).join("\n")}`
+        : "Running, but not everything is taking work.",
+      ...(paused === null ? [] : [paused]),
       `Executor: ${report.executor.current ? "running" : "not running"}`,
       `Queue: ${report.work.pendingEffects} job step(s), ${report.delivery.pendingOutbox} message(s) waiting`,
     ].join("\n");
+  }
+
+  private withExecutorHealthWarning(payload: SendMessagePayload, now: number): SendMessagePayload {
+    if (!this.health) return payload;
+    try {
+      const report = this.health(now);
+      if (report.executor.current) return payload;
+      const problem = report.executor.heartbeatStale
+        ? "the executor heartbeat is stale"
+        : report.problems.find((candidate) => candidate.startsWith("the executor "));
+      return {
+        ...payload,
+        text: `Executor warning: ${problem ?? "the executor is not running"}.\n\n${payload.text}`,
+      };
+    } catch {
+      // Status remains useful if the optional health probe itself is unavailable.
+      return payload;
+    }
   }
 
   private async sendProjects(chatId: string): Promise<void> {
@@ -759,6 +949,21 @@ export class TelegramIngress {
     const updated = this.store.setJobStatusMessage(job.id, messageId, job.version, now);
     this.store.enqueueOutbox(outbox, now);
     return updated;
+  }
+
+  /**
+   * The project a pending approval belongs to, or null when the nonce is
+   * unknown, already spent, or its job has no project. Never throws: a bad
+   * lookup must degrade to an ordinary merge, not lose the owner's tap.
+   */
+  private projectForApprovalNonce(nonce: string): string | null {
+    try {
+      const approval = this.store.getApproval(hashSecret(nonce));
+      if (!approval || approval.consumedAt !== null) return null;
+      return this.store.getJob(approval.jobId)?.projectId ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private audit(

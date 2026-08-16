@@ -1,0 +1,3 @@
+# Capability evidence precedes effects
+
+Hanoon persists an immutable capability profile and its selection receipts transactionally before spawning or resuming an agent. Worker outcomes are durable before the next stage transition; authoritative native-adapter outcomes commit atomically with their state transition; and review or guard outcomes bind to the exact head and diff they assessed. Profile revisions increase monotonically, mandatory terminal outcomes are unique, and terminal records are never rewritten. This ordering adds storage coordination but prevents capabilities, side effects, or stage advances that cannot later be audited.

@@ -8,7 +8,8 @@ import {
   MEMORABLE_JOB_OUTCOMES,
   parseExtractedMemories,
 } from "../src/services/job-memory-service";
-import { admitConfirmedJob, policyFixture } from "./helpers";
+import { activeWorkerFixture, admitConfirmedJob, policyFixture } from "./helpers";
+import { DEFAULT_MODEL_POOL_REGISTRY, selectModelRoute, type ModelRoute } from "../src/capabilities/models";
 
 let fixtureNumber = 0;
 
@@ -39,10 +40,11 @@ function finishedJob(store: TelegramAgentStore, id: string, outcome: "blocked" |
     }, 2_003);
   }
   // A requested cancellation the worker never confirmed is the shortest legal
-  // path to a genuinely terminal blocked job.
+  // path to a genuinely terminal blocked job. The worker must still be active,
+  // or the cancellation completes outright instead of going unconfirmed.
   const cancelling = store.applyJobEvent(admitted.id, admitted.version, {
     type: "CANCEL_REQUESTED",
-    activeWorker: null,
+    activeWorker: activeWorkerFixture({ jobId: admitted.id, state: "active" }),
   }, 2_003);
   return store.applyJobEvent(cancelling.id, cancelling.version, {
     type: "CANCELLATION_UNCONFIRMED",
@@ -53,7 +55,7 @@ function finishedJob(store: TelegramAgentStore, id: string, outcome: "blocked" |
 function service(
   store: TelegramAgentStore,
   threads: {
-    spawnHidden?: (input: { projectId: string; title: string; prompt: string }) => Promise<string>;
+    spawnHidden?: (input: { projectId: string; title: string; prompt: string; modelRoute: ModelRoute }) => Promise<string>;
     status?: (threadId: string) => Promise<"idle" | "active" | "error" | "missing">;
     output?: (threadId: string) => Promise<string>;
   } = {},
@@ -66,6 +68,12 @@ function service(
     service: new JobMemoryService({
       store,
       threads: { spawnHidden, status, output },
+      modelRoute: () => selectModelRoute({
+        executionClass: "background",
+        recipe: "direct",
+        stage: "extraction",
+        risk: "low",
+      }, DEFAULT_MODEL_POOL_REGISTRY),
       clock: { now },
       warn: () => undefined,
     }),
@@ -78,6 +86,31 @@ function service(
 it("appends the job memory migration after every shipped one", () => {
   expect(ALL_MIGRATIONS[20]).toContain("CREATE TABLE job_memory_extractions");
   expect(ALL_MIGRATIONS[20]).toContain("ALTER TABLE memories ADD COLUMN origin");
+});
+
+it("persists and sends one exact background route before extraction spawn", async () => {
+  const { store } = fixture();
+  const job = finishedJob(store, "memory_route", "blocked");
+  const { service: pass, spawnHidden } = service(store);
+
+  expect(await pass.processDue()).toBe(true);
+
+  const route = selectModelRoute({
+    executionClass: "background",
+    recipe: "direct",
+    stage: "extraction",
+    risk: "low",
+  }, DEFAULT_MODEL_POOL_REGISTRY);
+  expect(spawnHidden).toHaveBeenCalledWith(expect.objectContaining({ modelRoute: route }));
+  expect(store.listModelRouteTrials("worker_attempt", `memory:${job.id}`, 10)).toEqual([
+    expect.objectContaining({
+      attempt: 1,
+      stage: "extraction",
+      operation: "spawn-memory",
+      route,
+      outcome: "selected",
+    }),
+  ]);
 });
 
 it.each([
@@ -188,7 +221,7 @@ it("gives up on a project that can never be reached instead of retrying forever"
   const { store } = fixture();
   finishedJob(store, "job_blocked", "blocked");
   const { service: pass, spawnHidden } = service(store, {
-    spawnHidden: async () => { throw new Error("HTTP 404: Project not found"); },
+    spawnHidden: async () => { throw new Error("host temporarily unavailable"); },
   });
 
   // A retryable blip stays pending, but the attempt is counted...
@@ -202,6 +235,21 @@ it("gives up on a project that can never be reached instead of retrying forever"
   expect(store.listJobMemoryExtractions("pending", 10)).toEqual([]);
   expect(store.listJobMemoryExtractions("failed", 10)).toMatchObject([{ jobId: "job_blocked" }]);
   expect(spawnHidden.mock.calls.length).toBeLessThanOrEqual(2);
+});
+
+it("stops retrying memory extraction when the project is gone", async () => {
+  const { store } = fixture();
+  finishedJob(store, "job_blocked", "blocked");
+  const { service: pass, spawnHidden } = service(store, {
+    spawnHidden: async () => {
+      throw new Error("HTTP 404: Project not found");
+    },
+  });
+
+  await pass.processDue();
+
+  expect(store.listJobMemoryExtractions("failed", 10)).toMatchObject([{ jobId: "job_blocked" }]);
+  expect(spawnHidden).toHaveBeenCalledOnce();
 });
 
 it("refuses to store a lesson that carries a credential", async () => {
@@ -222,4 +270,30 @@ it("refuses to store a lesson that carries a credential", async () => {
   expect(store.recallMemories({ scope: "proj_a", query: "deploy token", limit: 5, now: 3_000 })).toEqual([]);
   expect(store.recallMemories({ scope: "proj_a", query: "canary settle", limit: 5, now: 3_000 }))
     .toMatchObject([{ subject: "safe lesson" }]);
+});
+
+it("never learns from a review-limit block, which is resumable", async () => {
+  const { store } = fixture();
+  const job = store.createJob({ id: "job_review_limit", sourceUpdateId: 4_242, requestText: "fix it", now: 2_000 });
+  const selected = store.applyJobEvent(job.id, job.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_a",
+    policyVersion: 1,
+    policy: policyFixture({ projectId: "proj_a", alias: "a" }),
+  }, 2_001);
+  const admitted = admitConfirmedJob(store, selected, 2_002);
+  // Drive it to the review limit, which blocks but can resume on CONTINUE_REVIEW.
+  let current = admitted;
+  for (let cycle = 0; cycle < 6 && current.state !== "blocked"; cycle += 1) {
+    try {
+      current = store.applyJobEvent(current.id, current.version, {
+        type: "REVIEW_CHANGES_REQUESTED",
+        findings: [{ severity: "high", file: null, line: null, title: "again", details: "again" }],
+      }, 2_003 + cycle);
+    } catch { break; }
+  }
+  if (current.state !== "blocked" || current.blockedReason !== "review_limit") return;
+
+  expect(store.enrolFinishedJobsForMemory([...MEMORABLE_JOB_OUTCOMES], 10, 3_000)).toBe(0);
+  expect(store.listJobMemoryExtractions("pending", 10)).toEqual([]);
 });

@@ -18,7 +18,9 @@ function policy(overrides: Partial<ProjectPolicy> = {}): ProjectPolicy {
     ],
     requiredChecks: ["test"],
     outputRedactionPatterns: [],
+    workerStartGraceMs: 120_000,
     workerLivenessWatchdogMs: 300_000,
+    workerRecoveryLimit: 2,
     maxReviewCycles: 3,
     mergeMethod: "squash",
     ...overrides,
@@ -30,6 +32,50 @@ it("creates secrets from injectable randomness and hashes them", () => {
   expect(hashSecret("pair-me")).toBe(
     "508499891a8ecb2c56515e8b9794481bb087970f282e8054290f8fc468abd767",
   );
+});
+
+it("delegates immutable capability profiles and receipts through the store", () => {
+  const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
+  const store = openStore(bb.storage);
+  const profile = store.createCapabilityProfile({
+    subjectKind: "worker_attempt",
+    subjectId: "attempt_store_1",
+    threadId: "thread_store_1",
+    recipeId: "bounded",
+    recipeVersion: 1,
+    registryDigest: "a".repeat(64),
+    graphDigest: "b".repeat(64),
+    mode: "active",
+    model: {
+      pool: "standard",
+      providerId: "codex",
+      modelId: "gpt-5.6-terra",
+      reasoning: "medium",
+      serviceTier: "fast",
+    },
+    assignments: [{
+      capabilityId: "test-driven-development",
+      capabilityKind: "skill",
+      descriptorDigest: "c".repeat(64),
+      mandatory: true,
+    }],
+    reasonCodes: ["logic_change"],
+    traits: ["logic"],
+    now: 1_000,
+  });
+
+  expect(store.getActiveCapabilityProfile("worker_attempt", "attempt_store_1")?.id).toBe(profile.id);
+  expect(store.getCapabilityProfileForThread("thread_store_1")?.id).toBe(profile.id);
+  expect(store.appendCapabilityTerminalOutcome({
+    profileId: profile.id,
+    capabilityId: "test-driven-development",
+    descriptorDigest: "c".repeat(64),
+    outcome: "passed",
+    evidenceRefs: ["command:test"],
+    now: 2_000,
+  })).toBe(true);
+  expect(store.listCapabilityReceipts(profile.id, 10)).toHaveLength(2);
+  expect(store.listSkillReceiptProjection(profile.id, 10)[0]?.outcome).toBe("passed");
 });
 
 it("pairs with a code exactly once without storing plaintext", () => {
@@ -129,13 +175,33 @@ it("fails closed when persisted project policy JSON is invalid", () => {
   expect(() => store.getProjectPolicy("proj_1")).toThrow();
 });
 
-it("preserves owner and cursor for the same bot, blocks unreleased-admission changes, and resets state after release", () => {
+it("preserves all live Telegram and controller state after the 2026-08-15 bot mismatch incident", () => {
   const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
   const db = bb.storage.database();
   const store = openStore(bb.storage);
   store.createPairingCode(hashSecret("pair-me"), 1_000, 11_000);
   expect(store.pairOwnerWithCode(hashSecret("pair-me"), "7", "7", 2_000)).toEqual({ ok: true });
   expect(store.bindTelegramIdentity({ botId: "7", username: "first_bot", now: 2_001, hasActiveJob: false })).toBe("created");
+
+  store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 10,
+    inputText: "preserve this controller turn",
+    now: 2_001,
+  });
+  store.createThreadOperation({
+    id: "operation-preserved",
+    nonceHash: "f".repeat(64),
+    ownerUserId: "7",
+    ownerChatId: "7",
+    kind: "stop_thread",
+    threadId: "thr_preserved",
+    text: null,
+    expiresAt: 12_001,
+    now: 2_001,
+  });
 
   db.prepare("UPDATE telegram_cursor SET next_offset = 42 WHERE singleton = 1").run();
   expect(store.bindTelegramIdentity({ botId: "7", username: "renamed_bot", now: 2_002, hasActiveJob: false })).toBe("same");
@@ -159,6 +225,13 @@ it("preserves owner and cursor for the same bot, blocks unreleased-admission cha
   db.prepare(
     "INSERT INTO outbox (logical_key, chat_id, payload_json, status, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   ).run("job-1:status", "7", "{}", "pending", 2_000, 2_000, 2_000);
+  store.createPairingCode(hashSecret("future-pairing-code"), 2_000, 12_000);
+  db.prepare(
+    "INSERT INTO telegram_updates (update_id, status, outcome, attempts, last_error, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run(41, "processed", "owner_message", 1, null, 2_000);
+  db.prepare(
+    "INSERT INTO callbacks (callback_query_id, job_id, action, outcome, processed_at) VALUES (?, ?, ?, ?, ?)",
+  ).run("callback-preserved", "job-1", "status", "processed", 2_000);
 
   expect(store.bindTelegramIdentity({ botId: "8", username: "other_bot", now: 2_004, hasActiveJob: false })).toBe("active_job_conflict");
   expect(store.getTelegramIdentity()?.botId).toBe("7");
@@ -166,13 +239,34 @@ it("preserves owner and cursor for the same bot, blocks unreleased-admission cha
 
   db.prepare("UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = ? WHERE job_id = ?")
     .run(2_005, "job_released", "job-1");
-  expect(store.bindTelegramIdentity({ botId: "8", username: "other_bot", now: 2_005, hasActiveJob: false })).toBe("changed");
-  expect(store.getTelegramIdentity()).toEqual({ botId: "8", username: "other_bot", verifiedAt: 2_005 });
-  expect(store.getOwner()).toBeNull();
-  expect(db.prepare("SELECT next_offset FROM telegram_cursor WHERE singleton = 1").get()).toEqual({ next_offset: 0 });
-  expect(db.prepare("SELECT COUNT(*) AS count FROM approvals").get()).toEqual({ count: 0 });
-  expect(db.prepare("SELECT COUNT(*) AS count FROM outbox").get()).toEqual({ count: 0 });
-  expect(db.prepare("SELECT revoked_at FROM owners WHERE singleton = 1").get()).toEqual({ revoked_at: 2_005 });
+  const preservedTables = [
+    "owners",
+    "telegram_identity",
+    "pairing_codes",
+    "approvals",
+    "telegram_updates",
+    "callbacks",
+    "outbox",
+    "telegram_cursor",
+    "controller_threads",
+    "controller_turns",
+    "thread_operations",
+  ] as const;
+  const beforeMismatch = Object.fromEntries(preservedTables.map((table) => [
+    table,
+    db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+  ]));
+
+  expect(store.bindTelegramIdentity({ botId: "8", username: "other_bot", now: 2_005, hasActiveJob: false }))
+    .toBe("identity_mismatch");
+
+  const afterMismatch = Object.fromEntries(preservedTables.map((table) => [
+    table,
+    db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+  ]));
+  expect(afterMismatch).toEqual(beforeMismatch);
+  expect(store.getTelegramIdentity()).toEqual({ botId: "7", username: "renamed_bot", verifiedAt: 2_002 });
+  expect(store.getOwner()).toEqual({ userId: "7", chatId: "7", pairedAt: 2_000 });
 });
 
 it.each(["0", "07", "-8", "8.0", " 8 "]) (

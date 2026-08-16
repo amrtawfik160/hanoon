@@ -5,9 +5,14 @@ import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { openStore } from "../src/storage/store";
 import {
   DELEGATION_JOIN_TIMEOUT_MS,
+  DELEGATION_SWEEP_MS,
   MonitorService,
   type MonitorThreadStatus,
 } from "../src/services/monitor-service";
+import {
+  NO_PROGRESS_STALL_MS,
+  type DelegatedThreadObservation,
+} from "../src/autonomy/thread-stall";
 
 let fixtureNumber = 0;
 
@@ -50,8 +55,8 @@ it("records members in the order they were spawned", () => {
   })).toBe(true);
 
   expect(store.getDelegation(delegation.id)?.threads).toEqual([
-    { threadId: "thr_a", projectId: "proj_a", title: "invoice spike", state: "running", summary: null, settledAt: null },
-    { threadId: "thr_b", projectId: "proj_b", title: "billing latency", state: "running", summary: null, settledAt: null },
+    { threadId: "thr_a", projectId: "proj_a", title: "invoice spike", state: "running", summary: null, settledAt: null, stallNotifiedAt: null },
+    { threadId: "thr_b", projectId: "proj_b", title: "billing latency", state: "running", summary: null, settledAt: null, stallNotifiedAt: null },
   ]);
 });
 
@@ -211,6 +216,8 @@ function twoMemberDelegation(store: ReturnType<typeof fixture>["store"]) {
   store.addDelegationThread({
     delegationId: delegation.id, threadId: "thr_b", projectId: "proj_b", title: "billing latency", now: 2_002,
   });
+  // The tool seals once every member is recorded; the join waits for it.
+  store.sealDelegation({ id: delegation.id, now: 2_003 });
   return delegation;
 }
 
@@ -301,4 +308,189 @@ it("leaves a delegation open when BB cannot be reached", async () => {
   await expect(service.processDueDelegations()).resolves.toBe(false);
 
   expect(store.getDelegation(delegation.id)).toMatchObject({ state: "open" });
+});
+
+it("does not join a fan-out that is still being published", async () => {
+  const { store } = fixture();
+  const delegation = store.createDelegation({
+    controllerKey: CONTROLLER_KEY, instruction: "compare both", now: 2_000,
+  });
+  store.addDelegationThread({
+    delegationId: delegation.id, threadId: "thr_a", projectId: "proj_a", title: "first", now: 2_001,
+  });
+  // thr_b is still being spawned: unsealed, so the join must wait even though
+  // every recorded member has settled.
+  const { service } = joinService(store, { thr_a: "idle" }, { thr_a: "done" });
+
+  await expect(service.processDueDelegations()).resolves.toBe(false);
+  expect(joinedTurn(store)).toBeUndefined();
+
+  store.addDelegationThread({
+    delegationId: delegation.id, threadId: "thr_b", projectId: "proj_b", title: "second", now: 2_002,
+  });
+  store.sealDelegation({ id: delegation.id, now: 2_003 });
+  const { service: after } = joinService(store, { thr_a: "idle", thr_b: "idle" }, { thr_a: "done", thr_b: "also done" });
+
+  await expect(after.processDueDelegations()).resolves.toBe(true);
+  expect(joinedTurn(store)?.inputText).toContain("second (thr_b)");
+});
+
+it("gives up on a delegation that never recorded any work", async () => {
+  const { store } = fixture();
+  const orphan = store.createDelegation({
+    controllerKey: CONTROLLER_KEY, instruction: "never published", now: 2_000,
+  });
+  const { service } = joinService(store, {}, {}, () => 2_000 + DELEGATION_JOIN_TIMEOUT_MS);
+
+  await service.processDueDelegations();
+
+  // Otherwise it holds one of the two slots forever and delegation dies.
+  expect(store.getDelegation(orphan.id)?.state).toBe("failed");
+  expect(store.listOpenDelegations(10)).toEqual([]);
+});
+
+it("still joins on deadline when one member can never be reached", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const status = vi.fn(async (threadId: string) => {
+    if (threadId === "thr_b") throw new Error("BB unreachable");
+    return "idle" as const;
+  });
+  const service = new MonitorService({
+    store,
+    threads: { status, output: async () => "found it" },
+    clock: { now: () => 2_000 + DELEGATION_JOIN_TIMEOUT_MS },
+    warn: () => undefined,
+  });
+
+  await expect(service.processDueDelegations()).resolves.toBe(true);
+
+  expect(joinedTurn(store)?.inputText).toContain("billing latency (thr_b): still running when the deadline passed");
+});
+
+const STALL_NOW = 2_000 + NO_PROGRESS_STALL_MS + 60_000;
+
+function stallService(
+  store: ReturnType<typeof fixture>["store"],
+  observations: Record<string, Partial<DelegatedThreadObservation> | null>,
+  now = () => STALL_NOW,
+) {
+  const observe = vi.fn(async (threadId: string) => {
+    const override = observations[threadId];
+    if (override === null) return null;
+    return {
+      status: "active",
+      runtimeStatus: "active",
+      startedAt: 2_000,
+      updatedAt: now() - 1_000,
+      hasPendingInteraction: false,
+      hostReconnectGraceExpiresAt: null,
+      ...(override ?? {}),
+    };
+  });
+  return {
+    observe,
+    service: new MonitorService({
+      store,
+      threads: { status: async () => "active" as const, output: async () => "", observe },
+      clock: { now },
+      warn: () => undefined,
+    }),
+  };
+}
+
+function stallTurns(store: ReturnType<typeof fixture>["store"]) {
+  return store.listControllerTurns(CONTROLLER_KEY, 20)
+    .filter((turn) => turn.inputText.startsWith("A thread you are following has stopped"));
+}
+
+it("reports a wedged member long before the join deadline", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const { service } = stallService(store, {
+    thr_a: { updatedAt: STALL_NOW - NO_PROGRESS_STALL_MS },
+  });
+
+  await expect(service.processDueDelegations()).resolves.toBe(true);
+
+  const reported = stallTurns(store);
+  expect(reported).toHaveLength(1);
+  expect(reported[0]?.inputText).toContain("thr_a");
+  expect(reported[0]?.inputText).toContain("compare both and tell me which is worse");
+  expect(reported[0]?.origin).toBe("system");
+  // Still open: noticing a stall must not settle a member or force the join.
+  expect(store.getDelegation(store.listOpenDelegations(1)[0]!.id)).toMatchObject({ state: "open" });
+});
+
+it("reports a wedged member once, not on every sweep", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  let now = STALL_NOW;
+  const { service } = stallService(
+    store,
+    { thr_a: { updatedAt: STALL_NOW - NO_PROGRESS_STALL_MS } },
+    () => now,
+  );
+
+  await service.processDueDelegations();
+  now += DELEGATION_SWEEP_MS * 4;
+  await service.processDueDelegations();
+
+  expect(stallTurns(store)).toHaveLength(1);
+});
+
+it("says nothing about members that are working", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const { service } = stallService(store, {});
+
+  await expect(service.processDueDelegations()).resolves.toBe(false);
+
+  expect(stallTurns(store)).toEqual([]);
+});
+
+it("keeps checking the other members when one cannot be observed", async () => {
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const failing = new MonitorService({
+    store,
+    threads: {
+      status: async () => "active" as const,
+      output: async () => "",
+      observe: async (threadId: string) => {
+        if (threadId === "thr_a") throw new Error("BB unreachable");
+        return {
+          status: "active",
+          runtimeStatus: "active",
+          startedAt: 2_000,
+          updatedAt: STALL_NOW - NO_PROGRESS_STALL_MS,
+          hasPendingInteraction: false,
+          hostReconnectGraceExpiresAt: null,
+        };
+      },
+    },
+    clock: { now: () => STALL_NOW },
+    warn: () => undefined,
+  });
+
+  await expect(failing.processDueDelegations()).resolves.toBe(true);
+
+  expect(stallTurns(store)).toHaveLength(1);
+  expect(stallTurns(store)[0]?.inputText).toContain("thr_b");
+});
+
+it("detects no stall at all on a host that cannot observe threads", async () => {
+  // The capability is optional: an older host loses detection, not the sweep.
+  const { store } = fixture();
+  twoMemberDelegation(store);
+  const service = new MonitorService({
+    store,
+    threads: { status: async () => "active" as const, output: async () => "" },
+    clock: { now: () => STALL_NOW },
+    warn: () => undefined,
+  });
+
+  await expect(service.processDueDelegations()).resolves.toBe(false);
+
+  expect(stallTurns(store)).toEqual([]);
 });

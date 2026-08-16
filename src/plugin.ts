@@ -1,7 +1,46 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { controllerExecutionProfile, extractionModel, parseGlobalConfig, systemUpkeepEnabled } from "./config";
-import { BbRunner } from "./bb/runner";
-import { resolvePrHead, runValidation } from "./bb/validation";
+import { createHash } from "node:crypto";
+import { lstat, readdir, rm, statfs } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { createSecret } from "./crypto";
+import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes";
+import { CAPABILITY_BY_ID } from "./capabilities/catalog";
+import {
+  guardRequirementBindings,
+  persistBlockedGuardSettlement,
+  persistGuardEnvelopeSettlement,
+  requiredGuardsForChangeSurface,
+  type GuardAssessmentPolicy,
+} from "./capabilities/guards";
+import {
+  backgroundCapabilityModelRoute,
+  capabilityMinimumModelPool,
+  capabilityRoutingSettings,
+  controllerCapabilityModelRoute,
+  controllerExecutionProfile,
+  controllerExecutionProfiles,
+  credentialBrokerConfigFingerprint,
+  parseGlobalConfig,
+  selfDiagnosisEnabled,
+  systemUpkeepEnabled,
+  workspaceReclaimEnabled,
+} from "./config";
+import { parseCredentialBrokerConfig, type CredentialBrokerConfigResult } from "./credentials/config";
+import { CredentialBrokerClient } from "./credentials/broker-client";
+import { CredentialAccessService } from "./credentials/service";
+import {
+  RecipePromotionService,
+} from "./capabilities/promotion";
+import { DurableRecipePromotionEvidenceReader } from "./capabilities/promotion-evidence";
+import { DEFAULT_CONTROLLER_CAPABILITY_MODEL } from "./capabilities/controller-bundles";
+import { BbRunner, environmentDiffText } from "./bb/runner";
+import {
+  environmentChangeShouldWake,
+  threadChangeShouldWake,
+  threadInteractionsChanged,
+} from "./bb/realtime-events";
+import { environmentWorktreeIsClean, resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
 import { TelegramClient, TelegramFileTooLargeError } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
@@ -12,9 +51,11 @@ import { AutonomyScheduler } from "./autonomy/scheduler";
 import { EffectRunner } from "./services/effect-runner";
 import type { EffectFence } from "./services/effect-runner";
 import { runJobExecutorService } from "./services/job-executor-service";
-import { createTask9FreshGateCollector, MergeHandler } from "./services/merge-handler";
+import { createFreshGateCollector, MergeHandler } from "./services/merge-handler";
 import type { GateInput } from "./domain/gates";
 import type { ReviewFinding } from "./domain/models";
+import { documentationRequirement } from "./domain/pipeline-graph";
+import { assessReviewGroup } from "./domain/review-lenses";
 import {
   ReviewHandler,
   ReviewInvocationStaleError,
@@ -27,6 +68,7 @@ import {
 } from "./services/review-handler";
 import { runTelegramService } from "./services/telegram-service";
 import {
+  classifyThreadRecovery,
   projectUnknownWorker,
   projectTerminalLiveness,
   projectWorkerLiveness,
@@ -34,34 +76,234 @@ import {
 } from "./services/worker-liveness";
 import { runTelegramAgentCli } from "./cli";
 import { ExecutorNudge } from "./services/executor-nudge";
-import { registerControllerTools } from "./controller/tools";
-import { BbControllerAdapter, ControllerImagePreparationError } from "./controller/bb-controller";
+import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
+import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
 import {
+  BbControllerAdapter,
+  ControllerImagePreparationError,
+  parseControllerInteractionResolution,
+} from "./controller/bb-controller";
+import { ControllerEvidenceProjector } from "./controller/evidence-projector";
+import {
+  CONTROLLER_FALLBACK_MODELS,
   CONTROLLER_MODELS,
   CONTROLLER_PERMISSION_MODES,
   CONTROLLER_REASONING_LEVELS,
   CONTROLLER_SERVICE_TIERS,
   DEFAULT_CONTROLLER_EXECUTION_PROFILE,
   EXTRACTION_MODELS,
+  controllerProviderFor,
 } from "./controller/execution-profile";
 import { LunaControllerService } from "./controller/service";
+import { ControllerInteractionService } from "./controller/interaction-service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
 import { JobLaneSnapshotProvider } from "./services/job-lane-runner";
 import { MonitorService } from "./services/monitor-service";
 import { ThreadNoticeService } from "./services/thread-notice-service";
 import { JobMemoryService } from "./services/job-memory-service";
+import { isDisposableTempName } from "./autonomy/disk-space";
+import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
+import { WorkspaceHousekeepingService } from "./services/workspace-housekeeping-service";
+import { AuditService } from "./services/audit-service";
+import { createAuditAccess } from "./services/audit-access";
+import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { installSystemMonitors } from "./services/system-monitors";
+import { ProductionHealthService } from "./services/production-health-service";
+import { RegressionWatchService } from "./services/regression-watch-service";
+import { FailureLoopService } from "./services/failure-loop-service";
+import { JobContinuationService } from "./services/job-continuation-service";
 import { buildHealthReport } from "./services/health-report";
 import { ThreadOperationService } from "./controller/operations";
 import { settlePipelineStageOutput } from "./services/pipeline-stage-runner";
+import { settleStageLedger } from "./services/stage-ledger";
 import { runProductionStage } from "./services/production-runner";
+import { CapabilityInventoryService } from "./services/capability-inventory-service";
+import {
+  captureRuntimeIdentity,
+  inspectRuntimeIdentity,
+  type ActivationHealth,
+} from "./services/runtime-identity";
+import {
+  SELF_DIAGNOSIS_SERVICE_NAME,
+  SelfDiagnosisService,
+  findSelfDiagnosisCandidates,
+  type SelfDiagnosisLedger,
+  type SelfDiagnosisLedgerState,
+  type SelfDiagnosisTarget,
+} from "./services/self-diagnosis-service";
+import {
+  buildListSelfDiagnosisPullRequestsCommand,
+  parseOpenSelfDiagnosisPullRequests,
+  publishSelfDiagnosisPullRequest,
+} from "./bb/pr-publish";
 
 function clock(): number {
   return Date.now();
 }
 
-export async function createPlugin(bb: BbPluginApi): Promise<void> {
+const SELF_DIAGNOSIS_LEDGER_KEY = "self-diagnosis:ledger:v1";
+const SELF_DIAGNOSIS_WORKER_TIMEOUT_MS = 15 * 60_000;
+
+function selfDiagnosisLedger(kv: BbPluginApi["storage"]["kv"]): SelfDiagnosisLedger {
+  return {
+    get: () => kv.get<SelfDiagnosisLedgerState>(SELF_DIAGNOSIS_LEDGER_KEY),
+    set: (state) => kv.set(SELF_DIAGNOSIS_LEDGER_KEY, state),
+  };
+}
+
+async function resolveSelfDiagnosisTarget(
+  sdk: BbPluginApi["sdk"],
+  store: TelegramAgentStore,
+  projectId: string,
+): Promise<SelfDiagnosisTarget | null> {
+  const selected = store.listEnabledProjectPolicies().find(({ policy }) => policy.projectId === projectId);
+  if (!selected || projectId.trim().length === 0) return null;
+  const projects = await sdk.projects.list({});
+  const project = projects.find((candidate) => candidate.id === projectId);
+  if (!project || project.kind !== "standard") return null;
+  const source = project.sources.find((candidate) => candidate.isDefault) ?? (
+    project.sources.length === 1 ? project.sources[0] : undefined
+  );
+  if (!source || source.hostId.trim().length === 0) return null;
+  return {
+    projectId,
+    baseBranch: selected.policy.baseBranch,
+    hostId: source.hostId,
+    cwd: source.path ?? null,
+  };
+}
+
+function selfDiagnosisDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function runSelfDiagnosisWorker(input: {
+  sdk: BbPluginApi["sdk"];
+  target: SelfDiagnosisTarget;
+  diagnosisId: string;
+  prompt: string;
+  modelRoute: ReturnType<typeof backgroundCapabilityModelRoute>;
+  signal: AbortSignal;
+}): Promise<{ diagnosis: unknown; environmentId: string; environmentStatus: unknown }> {
+  const thread = await spawnSelfDiagnosisWorker(input);
+  const environmentId = thread.environmentId;
+  if (!environmentId) throw new Error("Self-diagnosis worker has no environment");
+  await waitForSelfDiagnosisWorker({ sdk: input.sdk, threadId: thread.id, signal: input.signal });
+  return readSelfDiagnosisWorkerResult({
+    sdk: input.sdk,
+    target: input.target,
+    threadId: thread.id,
+    environmentId,
+    signal: input.signal,
+  });
+}
+
+async function spawnSelfDiagnosisWorker(input: {
+  sdk: BbPluginApi["sdk"];
+  target: SelfDiagnosisTarget;
+  diagnosisId: string;
+  prompt: string;
+  modelRoute: ReturnType<typeof backgroundCapabilityModelRoute>;
+}): Promise<Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>> {
+  return input.sdk.threads.spawn({
+    projectId: input.target.projectId,
+    title: `Self-diagnosis ${input.diagnosisId}`,
+    visibility: "hidden",
+    input: [{ type: "text", text: input.prompt, mentions: [] }],
+    environment: {
+      type: "host",
+      hostId: input.target.hostId,
+      workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: input.target.baseBranch } },
+    },
+    providerId: input.modelRoute.providerId,
+    model: input.modelRoute.modelId,
+    reasoningLevel: input.modelRoute.reasoning,
+    serviceTier: input.modelRoute.serviceTier,
+    permissionMode: "auto",
+    executionInputSources: {
+      providerId: "explicit",
+      model: "explicit",
+      reasoningLevel: "explicit",
+      serviceTier: "explicit",
+      permissionMode: "explicit",
+    },
+  });
+}
+
+async function waitForSelfDiagnosisWorker(input: {
+  sdk: BbPluginApi["sdk"];
+  threadId: string;
+  signal: AbortSignal;
+}): Promise<void> {
+  const deadline = Date.now() + SELF_DIAGNOSIS_WORKER_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (input.signal.aborted) throw input.signal.reason ?? new DOMException("Aborted", "AbortError");
+    const current = await input.sdk.threads.get({ threadId: input.threadId, signal: input.signal });
+    if (current.status === "error" || current.runtime.displayStatus === "error") {
+      throw new Error("Self-diagnosis worker ended with an error");
+    }
+    if (current.status === "idle" || current.runtime.displayStatus === "idle") {
+      return;
+    }
+    await selfDiagnosisDelay(1_000, input.signal);
+  }
+  try {
+    await input.sdk.threads.stop({ threadId: input.threadId });
+  } catch {
+    // The worker is auxiliary; a stop failure must not escape to the plugin.
+  }
+  throw new Error("Self-diagnosis worker exceeded its deadline");
+}
+
+async function readSelfDiagnosisWorkerResult(input: {
+  sdk: BbPluginApi["sdk"];
+  target: SelfDiagnosisTarget;
+  threadId: string;
+  environmentId: string;
+  signal: AbortSignal;
+}): Promise<{ diagnosis: unknown; environmentId: string; environmentStatus: unknown }> {
+  const output = await input.sdk.threads.output({ threadId: input.threadId, signal: input.signal });
+  const environmentStatus = await input.sdk.environments.status({
+    environmentId: input.environmentId,
+    mergeBaseBranch: input.target.baseBranch,
+    signal: input.signal,
+  });
+  const diff = await input.sdk.environments.diff({
+    environmentId: input.environmentId,
+    target: "all",
+    mergeBaseBranch: input.target.baseBranch,
+    signal: input.signal,
+  });
+  if (diff.outcome !== "available" || diff.diff.truncated || diff.diff.diff.trim().length === 0) {
+    throw new Error("Self-diagnosis worker produced no reviewable code change");
+  }
+  return {
+    diagnosis: output.output ?? "",
+    environmentId: input.environmentId,
+    environmentStatus,
+  };
+}
+
+function reviewLineageScopeId(jobId: string, reviewStage: string): string {
+  const digest = createHash("sha256").update(`${jobId}\0${reviewStage}`, "utf8").digest("hex");
+  return `review-lineage:${digest}`;
+}
+
+export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise<void> {
+  const runtimeIdentity = captureRuntimeIdentity(pluginRoot, clock());
   const settings = bb.settings.define({
     botToken: { type: "string", label: "Telegram bot token", secret: true },
     bbAppBaseUrl: { type: "string", label: "BB app base URL", default: "" },
@@ -78,6 +320,20 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       description: "Model for Telegram conversation turns. Claude models run on Claude Code, gpt models on Codex. Job workers remain project-controlled.",
       options: [...CONTROLLER_MODELS],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.model,
+    },
+    controllerFallbackModel1: {
+      type: "select",
+      label: "Fallback model 1",
+      description: "Tried only when the primary model fails before accepting the Telegram message.",
+      options: [...CONTROLLER_FALLBACK_MODELS],
+      default: "gpt-5.6-sol",
+    },
+    controllerFallbackModel2: {
+      type: "select",
+      label: "Fallback model 2",
+      description: "Tried after fallback 1 only when the message was still not accepted. Disabled by default.",
+      options: [...CONTROLLER_FALLBACK_MODELS],
+      default: "disabled",
     },
     controllerReasoningLevel: {
       type: "select",
@@ -114,22 +370,195 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       options: ["enabled", "disabled"],
       default: "enabled",
     },
+    workspaceReclaim: {
+      type: "boolean",
+      label: "Reclaim finished worktrees and branches",
+      description: "Off by default. When enabled, a daily sweep removes worktrees whose thread has finished and deletes branches whose work is already in the trunk. Uncommitted work is saved first, and anything it cannot prove is finished is kept and reported.",
+      default: false,
+    },
+    selfDiagnosisEnabled: {
+      type: "boolean",
+      label: "Self-diagnosis",
+      description: "Off by default. When enabled, inspect persisted controller failures out of band and propose at most one cooled-down draft pull request at a time.",
+      default: false,
+    },
+    selfDiagnosisProjectId: {
+      type: "string",
+      label: "Self-diagnosis project id",
+      description: "The enabled BB project containing this plugin repository. Enabling self-diagnosis requires a plugin reload.",
+      default: "",
+    },
+    capabilityJobGraph: {
+      type: "select",
+      label: "Capability job graph",
+      description: "Adaptive keeps unpromoted recipes in shadow. Legacy is an independent new-job kill switch.",
+      options: ["adaptive", "legacy"],
+      default: "adaptive",
+    },
+    controllerCapabilityMode: {
+      type: "select",
+      label: "Controller capabilities",
+      description: "Bundled is least-capability. All-tools is an independent new-turn kill switch.",
+      options: ["bundled", "all-tools"],
+      default: "bundled",
+    },
+    capabilityModelRouting: {
+      type: "select",
+      label: "Capability model routing",
+      description: "Adaptive uses the selected pool. Strong-only is an independent new-attempt kill switch.",
+      options: ["adaptive", "strong-only"],
+      default: "adaptive",
+    },
+    credentialBrokerMode: {
+      type: "select",
+      label: "Credential broker mode",
+      description: "Isolated enables read-only access to a protected credential broker. Disabled (default) keeps every access command and doctor check failing closed.",
+      options: ["disabled", "isolated"],
+      default: "disabled",
+    },
+    credentialBrokerEndpoint: {
+      type: "string",
+      label: "Credential broker endpoint",
+      description: "Fixed HTTPS origin of the protected broker, e.g. https://broker.internal. Ignored while the mode is disabled.",
+      default: "",
+    },
+    credentialBrokerInstallationId: {
+      type: "string",
+      label: "Credential broker installation id",
+      description: "Opaque installation id issued by the broker's protected enrollment CLI.",
+      default: "",
+    },
+    credentialBrokerTopologyReceiptDigest: {
+      type: "string",
+      label: "Credential broker topology receipt digest",
+      description: "SHA-256 of the current reviewed topology acceptance report, installed after the protected negative probes pass.",
+      default: "",
+    },
+    credentialBrokerTopologyReceiptExpiresAt: {
+      type: "string",
+      label: "Credential broker topology receipt expiry",
+      description: "Epoch-millisecond expiry from the same reviewed report, as a base-10 integer string.",
+      default: "",
+    },
+    credentialBrokerClientCertificate: {
+      type: "string",
+      label: "Credential broker client certificate",
+      description: "This installation's public mTLS client certificate (PEM).",
+      default: "",
+    },
+    credentialBrokerClientKey: {
+      type: "string",
+      label: "Credential broker client private key",
+      description: "This installation's mTLS client private key (PEM). Never logged, stored in plugin SQLite, or shown in CLI/doctor output.",
+      secret: true,
+    },
+    credentialBrokerCaCertificate: {
+      type: "string",
+      label: "Credential broker CA certificate",
+      description: "Public CA certificate (PEM) that issued the broker's server certificate.",
+      default: "",
+    },
   });
-  const store = openStore(bb.storage);
-  const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()));
+  let config = parseGlobalConfig(await settings.get());
+  const store = openStore(
+    bb.storage,
+    bb.storage.kv,
+    clock,
+    () => config.ok ? controllerCapabilityModelRoute(config.value) : DEFAULT_CONTROLLER_CAPABILITY_MODEL,
+    () => config.ok ? capabilityRoutingSettings(config.value) : {
+      jobGraph: "adaptive",
+      controllerTools: "bundled",
+    },
+  );
+  const retiredLivePollers = retireLiveWorkPollingSchedules(store, clock());
+  if (retiredLivePollers > 0) {
+    bb.log.warn(`Retired ${retiredLivePollers} controller schedule(s) that polled live work`);
+  }
+  const promotionEvidence = new DurableRecipePromotionEvidenceReader(store);
+  const recipePromotions = new RecipePromotionService({
+    store,
+    readEvidence: (recipe) => promotionEvidence.read(recipe),
+    now: clock,
+  });
+  const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()), store);
   const executorNudge = new ExecutorNudge();
   const laneSnapshots = new JobLaneSnapshotProvider();
-  let config = parseGlobalConfig(await settings.get());
-  if (!config.ok) bb.status.needsConfiguration(config.message);
 
-  settings.onChange((next) => {
-    const parsed = parseGlobalConfig(next);
-    config = parsed;
-    if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
-    executorNudge.notify();
+  const reportActivationProblem = (activation: ActivationHealth | null): void => {
+    if (activation && !activation.ok) {
+      bb.status.needsConfiguration(
+        `Plugin activation mismatch: ${activation.problems.join("; ")} (source ${activation.sourceRoot})`,
+      );
+    }
+  };
+  const runtimeHealth = (): ActivationHealth => {
+    const activation = inspectRuntimeIdentity(bb.storage.database(), runtimeIdentity);
+    reportActivationProblem(activation);
+    return activation;
+  };
+  const pluginHealth = (now: number) => {
+    const report = buildHealthReport(
+      bb.storage.database(),
+      now,
+      config.ok ? config.value.maxConcurrentJobs : null,
+      laneSnapshots.snapshot(),
+      runtimeIdentity,
+    );
+    reportActivationProblem(report.activation);
+    return report;
+  };
+  if (!config.ok) bb.status.needsConfiguration(config.message);
+  else reportActivationProblem(runtimeHealth());
+
+  let credentialConfig: CredentialBrokerConfigResult = parseCredentialBrokerConfig(await settings.get());
+  let credentialFingerprint = credentialBrokerConfigFingerprint(credentialConfig);
+  let credentialClient: CredentialBrokerClient | null = credentialConfig.state === "isolated"
+    ? new CredentialBrokerClient(credentialConfig.value)
+    : null;
+  const buildCredentialAccessService = (): CredentialAccessService => new CredentialAccessService({
+    store,
+    client: credentialClient,
+    config: () => credentialConfig,
+    // The trust-kernel manifest is validated once at module load
+    // (capability-policy.ts's validateManifest) and throws before this
+    // factory could ever run, so by the time the plugin is live that
+    // structural invariant already holds — there is no separate runtime
+    // signal to poll for here.
+    trustKernelReady: () => true,
+    controllerPermissionMode: () => config.ok
+      ? config.value.controllerPermissionMode
+      : DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
+    now: clock,
+  });
+  let credentialAccessService = buildCredentialAccessService();
+  bb.onDispose(() => {
+    // CredentialBrokerClient exposes rotate(config) but no bare close, so
+    // this can only drop the reference rather than force-close its
+    // keep-alive TLS agent.
+    credentialClient = null;
   });
 
+  const capabilityInventory = new CapabilityInventoryService({
+    store,
+    client: {
+      providers: {
+        list: (args) => bb.sdk.providers.list(args),
+        models: (args) => bb.sdk.providers.models(args),
+      },
+      plugins: { list: (args) => bb.sdk.plugins.list(args) },
+      skills: { list: (workspace) => bb.sdk.skills.list(workspace) },
+    },
+    clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
+  });
+  await capabilityInventory.refresh();
+
   const telegramForToken = (token: string): TelegramClient => new TelegramClient(token);
+  let verifiedBotToken: string | null = null;
+  const verifiedTelegramClient = (): TelegramClient => {
+    if (verifiedBotToken === null) throw new Error("Telegram bot token is not verified.");
+    return telegramForToken(verifiedBotToken);
+  };
   const telegramTransport = {
     sendMessage: (chatId: string, payload: Parameters<TelegramClient["sendMessage"]>[1]) => {
       if (!config.ok) throw new Error(config.message);
@@ -151,30 +580,83 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     pluginId: bb.pluginId,
     clock: { now: clock },
   });
-  registerControllerTools(bb, {
+  const evidenceProjector = new ControllerEvidenceProjector({
+    sdk: bb.sdk,
+    store,
+    clock: { now: clock },
+    hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
+  });
+  const toolDependencies: Parameters<typeof registerControllerTools>[1] = {
     store,
     sdk: bb.sdk,
+    evidenceProjector,
     threadOperations,
-    health: (now) => buildHealthReport(
-      bb.storage.database(),
-      now,
-      config.ok ? config.value.maxConcurrentJobs : null,
-      laneSnapshots.snapshot(),
-    ),
+    downloadImage: async (fileId, maxBytes, signal) => {
+      if (!config.ok) throw new Error(config.message);
+      return telegramForToken(config.value.botToken).downloadFile(
+        fileId,
+        maxBytes,
+        signal ?? new AbortController().signal,
+      );
+    },
+    health: pluginHealth,
     notify: () => executorNudge.notify(),
     now: clock,
+    credentialAccess: credentialAccessService,
+    controllerProviderId: () => config.ok
+      ? controllerProviderFor(controllerExecutionProfile(config.value).model)
+      : undefined,
+  };
+  registerControllerTools(bb, toolDependencies);
+
+  settings.onChange((next) => {
+    const parsed = parseGlobalConfig(next);
+    config = parsed;
+    if (!parsed.ok || parsed.value.botToken !== verifiedBotToken) {
+      verifiedBotToken = null;
+    }
+    if (!parsed.ok) bb.status.needsConfiguration(parsed.message);
+    executorNudge.notify();
+
+    const nextCredentialConfig = parseCredentialBrokerConfig(next);
+    const nextFingerprint = credentialBrokerConfigFingerprint(nextCredentialConfig);
+    if (nextFingerprint === credentialFingerprint) return;
+    credentialFingerprint = nextFingerprint;
+    credentialConfig = nextCredentialConfig;
+
+    if (credentialConfig.state === "isolated" && credentialClient) {
+      // Same broker relationship, rotated material: client identity is
+      // preserved in place (rotate() destroys and rebuilds its own agent),
+      // so the already-registered service — which reads credentialConfig
+      // live through its config() closure — keeps working unrebuilt.
+      credentialClient.rotate(credentialConfig.value);
+      return;
+    }
+
+    // Every other transition changes whether a live client exists at all:
+    // newly isolated stays pending until an explicit plugin reload rebuilds
+    // the capability manifest from scratch (design: "enabling isolated mode
+    // requires a plugin reload"), and leaving isolated drops the client.
+    // Either way `client` — captured by value, not by closure — is now
+    // stale, so the service must be rebuilt and re-published.
+    credentialClient = null;
+    credentialAccessService = buildCredentialAccessService();
+    toolDependencies.credentialAccess = credentialAccessService;
   });
 
   const terminal = new TerminalCommandRunner(bb.sdk);
+  const unpairNonceKey = createSecret(32);
   bb.cli.register({
     name: "telegram-agent",
     summary: "Pair Telegram and manage reviewed BB implementation jobs",
     commands: [
       { name: "pair", summary: "Create a one-use Telegram pairing link", usage: "bb telegram-agent pair [--json]" },
-      { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--json]" },
+      { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--confirm <nonce>] [--json]" },
       { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
-      { name: "doctor", summary: "Check Telegram, BB, host, provider, and GitHub readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
+      { name: "capability", summary: "Inspect capability evidence and control recipe rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
+      { name: "access", summary: "Inspect read-only credential broker bindings and status", usage: "bb telegram-agent access <list|status> [binding-id] [--json]" },
+      { name: "doctor", summary: "Check Telegram, BB, host, provider, GitHub, and credential broker readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
     ],
     run: (argv, context) => runTelegramAgentCli({
       store,
@@ -183,6 +665,19 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       now: clock,
       getBotToken: () => config.ok ? config.value.botToken : undefined,
       createTelegramClient: (token) => telegramForToken(token),
+      capabilityPromotions: recipePromotions,
+      capabilitySettings: () => config.ok ? capabilityRoutingSettings(config.value) : {
+        jobGraph: "adaptive",
+        controllerTools: "bundled",
+        modelRouting: "adaptive",
+      },
+      credentialAccess: credentialAccessService,
+      runtime: runtimeHealth,
+      unpairNonceKey,
+      recordOperatorAudit: async (auditEntry) => {
+        const auditKey = `operator-audit/unpair/${String(auditEntry.occurredAt).padStart(13, "0")}-${createSecret(8)}`;
+        await bb.storage.kv.set(auditKey, auditEntry);
+      },
       revokeAllApprovals: (now) => {
         const db = bb.storage.database();
         const revoke = db.transaction(() => {
@@ -198,6 +693,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         });
         return revoke();
       },
+      notify: () => executorNudge.notify(),
     }, argv, context),
   });
   const bbRunner = new BbRunner(bb.sdk);
@@ -208,10 +704,15 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   ): ReviewHandler => {
     const reviewJobMatches = (): boolean => {
       const current = store.getJob(invocation.jobId);
+      const currentQuality = current?.reviewThreadId ? store.getAttemptByThreadId(current.reviewThreadId) : null;
+      const invocationAttempt = store.getAttempt(invocation.attemptId);
       return current !== null && current.id === invocation.jobId && current.version === expectedVersion &&
         (current.state === "reviewing" || current.state === "final_reviewing") &&
         current.environmentId === invocation.environmentId && current.prHeadSha === invocation.expectedSha &&
-        current.reviewThreadId === invocation.reviewThreadId &&
+        currentQuality !== null && invocationAttempt !== null &&
+        currentQuality.jobId === current.id && currentQuality.kind === "review" && currentQuality.reviewLens === "quality" &&
+        invocationAttempt.jobId === current.id && invocationAttempt.kind === "review" &&
+        invocationAttempt.reviewStage === currentQuality.reviewStage && invocationAttempt.ordinal === currentQuality.ordinal &&
         current.implementationThreadId === invocation.implementationThreadId;
     };
     const reviewAttemptMatches = (): boolean => {
@@ -268,11 +769,10 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           assertCurrent();
           const raw = value as unknown as Record<string, unknown>;
           const workspace = (raw.workspace ?? {}) as Record<string, unknown>;
-          const workingTree = (raw.workingTree ?? workspace.workingTree ?? {}) as Record<string, unknown>;
           const checkout = (raw.checkout ?? workspace.checkout ?? {}) as Record<string, unknown>;
           return {
             available: raw.available !== false && raw.outcome !== "unavailable" && raw.outcome !== "not_applicable",
-            clean: raw.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false),
+            clean: environmentWorktreeIsClean(value),
             headSha: typeof checkout.headSha === "string" ? checkout.headSha : null,
           };
         },
@@ -348,9 +848,38 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           return claimed;
         },
       },
+      guards: {
+        settle: ({ envelope, policy }) => {
+          assertCurrent();
+          const attempt = store.getAttempt(invocation.attemptId);
+          if (!attempt?.reviewStage) throw new ReviewInvocationStaleError("guard review stage changed");
+          const assessment = persistGuardEnvelopeSettlement({
+            repository: store,
+            scopeId: reviewLineageScopeId(invocation.jobId, attempt.reviewStage),
+            envelope,
+            policy,
+            now: clock(),
+          });
+          assertCurrent();
+          return assessment;
+        },
+        block: ({ policy, reasonCode }) => {
+          assertCurrent();
+          const attempt = store.getAttempt(invocation.attemptId);
+          if (!attempt?.reviewStage) throw new ReviewInvocationStaleError("guard review stage changed");
+          persistBlockedGuardSettlement({
+            repository: store,
+            scopeId: reviewLineageScopeId(invocation.jobId, attempt.reviewStage),
+            policy,
+            reasonCode,
+            now: clock(),
+          });
+          assertCurrent();
+        },
+      },
     });
   };
-  const collectGateInput = createTask9FreshGateCollector({
+  const collectGateInput = createFreshGateCollector({
     validation: { runner: terminal, environments: bb.sdk.environments },
     runValidation: (input) => runValidation({
       runner: terminal,
@@ -419,7 +948,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           projectId: job.projectId,
           status: rawStatus.outcome === "available" || rawStatus.status === "available" ? "available" : String(rawStatus.status ?? rawStatus.outcome ?? "unavailable"),
           worktree: {
-            clean: rawStatus.clean === true || (workingTree.state === "clean" && workingTree.hasUncommittedChanges === false),
+            clean: environmentWorktreeIsClean(rawStatus),
             untrackedFiles: Array.isArray(workingTree.untrackedFiles) ? workingTree.untrackedFiles.filter((item): item is string => typeof item === "string") : [],
           },
           checkout: {
@@ -447,12 +976,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     bb: { sdk: bb.sdk },
     collectGateInput,
   });
-  const health = (now: number) => buildHealthReport(
-    bb.storage.database(),
-    now,
-    config.ok ? config.value.maxConcurrentJobs : null,
-    laneSnapshots.snapshot(),
-  );
+  const health = pluginHealth;
   const ingress = new TelegramIngress({
     store,
     telegram: telegramTransport,
@@ -460,28 +984,64 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     onWorkAvailable: () => executorNudge.notify(),
     health,
   });
+  const controllerAdapter = new BbControllerAdapter({
+    sdk: bb.sdk,
+    pluginId: bb.pluginId,
+    now: clock,
+    reserveSpawn: (input) => store.reserveControllerSpawn(input),
+    executionProfiles: () => {
+      if (!config.ok) throw new Error(config.message);
+      return controllerExecutionProfiles(config.value);
+    },
+    downloadImage: async (fileId, maxBytes, signal) => {
+      try {
+        return await verifiedTelegramClient().downloadFile(fileId, maxBytes, signal);
+      } catch (error) {
+        if (error instanceof TelegramFileTooLargeError) {
+          throw new ControllerImagePreparationError(false);
+        }
+        throw error;
+      }
+    },
+  });
+  const controllerInteractionService = new ControllerInteractionService({
+    store: {
+      isControllerInteractionDeliveryFenceCurrent: (input) =>
+        store.isControllerInteractionDeliveryFenceCurrent(input),
+      record: (input) => store.recordControllerInteraction(input),
+      markResolved: (input) => store.markControllerInteractionResolved(input),
+      answerByToken: (input) => store.answerControllerInteractionByToken(input),
+      answerWithText: (input) => store.answerControllerInteractionWithText(input),
+      getPending: (controllerKey) => store.getPendingControllerInteraction(controllerKey),
+      getAnswered: (controllerKey) => store.getAnsweredControllerInteraction(controllerKey),
+      markDelivered: (input) => store.markControllerInteractionDelivered(input),
+    },
+    clock: { now: clock },
+    interactions: {
+      get: async (threadId, interactionId, signal) => controllerAdapter.getInteraction(
+        threadId,
+        interactionId,
+        signal ?? AbortSignal.timeout(30_000),
+      ),
+      resolve: async (input, signal) => {
+        const effectiveSignal = signal ?? AbortSignal.timeout(30_000);
+        await controllerAdapter.resolveInteraction(
+          input.threadId,
+          input.interactionId,
+          parseControllerInteractionResolution(input.resolution),
+          effectiveSignal,
+        );
+        return controllerAdapter.getInteraction(input.threadId, input.interactionId, effectiveSignal);
+      },
+    },
+  });
   const controller = new LunaControllerService({
     store,
-    adapter: new BbControllerAdapter({
-      sdk: bb.sdk,
-      pluginId: bb.pluginId,
-      executionProfile: () => {
-        if (!config.ok) throw new Error(config.message);
-        return controllerExecutionProfile(config.value);
-      },
-      downloadImage: async (fileId, maxBytes, signal) => {
-        if (!config.ok) throw new Error(config.message);
-        try {
-          return await telegramForToken(config.value.botToken).downloadFile(fileId, maxBytes, signal);
-        } catch (error) {
-          if (error instanceof TelegramFileTooLargeError) {
-            throw new ControllerImagePreparationError(false);
-          }
-          throw error;
-        }
-      },
-    }),
+    evidenceProjector,
+    adapter: controllerAdapter,
+    interactionService: controllerInteractionService,
     clock: { now: clock },
+    warn: (message) => bb.log.warn(message),
   });
   const monitors = new MonitorService({
     store,
@@ -495,18 +1055,40 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         const result = await bb.sdk.threads.output({ threadId });
         return result.output ?? "";
       },
+      observe: async (threadId) => {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.deletedAt !== null || thread.archivedAt !== null) return null;
+        const interactions = await bb.sdk.threads.interactions.list({ threadId });
+        return {
+          status: thread.status,
+          runtimeStatus: thread.runtime.displayStatus,
+          startedAt: thread.createdAt,
+          updatedAt: thread.updatedAt,
+          hasPendingInteraction: interactions.some((interaction) => interaction.status === "pending"),
+          hostReconnectGraceExpiresAt: thread.runtime.hostReconnectGraceExpiresAt ?? null,
+        };
+      },
     },
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
   const jobMemory = new JobMemoryService({
     store,
+    modelRoute: () => {
+      if (!config.ok) throw new Error(config.message);
+      return backgroundCapabilityModelRoute(config.value);
+    },
     threads: {
-      spawnHidden: async ({ projectId, title, prompt }) => {
+      spawnHidden: async ({ projectId, title, prompt, modelRoute }) => {
         const hosts = await bb.sdk.hosts.list({});
         const host = hosts.find((candidate) => candidate.status === "connected");
         if (!host) throw new Error("No connected BB host can run a memory extraction");
-        const model = config.ok ? extractionModel(config.value) : null;
+        // Named rather than default: a memory extraction reads the project's
+        // real history, and BB's default branch may belong to another one.
+        const baseBranch = store.getProjectPolicy(projectId)?.policy.baseBranch.trim() ?? "";
+        if (baseBranch.length === 0) {
+          throw new Error("That project has no configured base branch for a memory extraction worktree");
+        }
         const thread = await bb.sdk.threads.spawn({
           projectId,
           title,
@@ -515,15 +1097,20 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
           environment: {
             type: "host",
             hostId: host.id,
-            workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+            workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: baseBranch } },
           },
-          // Extraction reads a repository and writes three sentences; the
-          // conversational tier's reasoning budget is wasted on it.
-          ...(model === null ? {} : {
-            model,
-            reasoningLevel: "low" as const,
-            executionInputSources: { model: "explicit" as const, reasoningLevel: "explicit" as const },
-          }),
+          providerId: modelRoute.providerId,
+          model: modelRoute.modelId,
+          reasoningLevel: modelRoute.reasoning,
+          serviceTier: modelRoute.serviceTier,
+          permissionMode: "auto",
+          executionInputSources: {
+            providerId: "explicit",
+            model: "explicit",
+            reasoningLevel: "explicit",
+            serviceTier: "explicit",
+            permissionMode: "explicit",
+          },
         });
         return thread.id;
       },
@@ -540,12 +1127,171 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
+  // Health ids share the monitor id space, which is derived from the clock and
+  // kept above real Telegram update ids.
+  let healthUpdateId = 0;
+  const productionHealth = new ProductionHealthService({
+    store,
+    commands: {
+      run: async ({ projectId, command }) => {
+        const projects = await bb.sdk.projects.list({});
+        const project = projects.find((candidate) => candidate.id === projectId);
+        const source = project?.sources.find((candidate) => candidate.isDefault) ?? project?.sources[0];
+        if (!source?.hostId) throw new Error("Project has no host to run a health check on");
+        const result = await terminal.run({
+          scope: { kind: "host_path", hostId: source.hostId, cwd: source.path ?? null },
+          title: `Telegram production health: ${command.name.slice(0, 40)}`,
+          command: command.command,
+          timeoutMs: command.timeoutMs,
+        });
+        if (result.outcome !== "exited") return { ok: false, summary: `check ${result.outcome}` };
+        return { ok: result.exitCode === 0, summary: result.output || `exit ${result.exitCode}` };
+      },
+    },
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    warn: (message) => bb.log.warn(message),
+  });
+  const regressionWatch = new RegressionWatchService({
+    store,
+    commands: {
+      run: async ({ projectId, command }) => {
+        const projects = await bb.sdk.projects.list({});
+        const project = projects.find((candidate) => candidate.id === projectId);
+        const source = project?.sources.find((candidate) => candidate.isDefault) ?? project?.sources[0];
+        if (!source?.hostId) throw new Error("Project has no host to run a scheduled check on");
+        const result = await terminal.run({
+          scope: { kind: "host_path", hostId: source.hostId, cwd: source.path ?? null },
+          title: `Telegram scheduled check: ${command.name.slice(0, 40)}`,
+          command: command.command,
+          timeoutMs: command.timeoutMs,
+        });
+        if (result.outcome !== "exited") return { ok: false, summary: `check ${result.outcome}` };
+        return { ok: result.exitCode === 0, summary: result.output || `exit ${result.exitCode}` };
+      },
+    },
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    warn: (message) => bb.log.warn(message),
+  });
+  const failureLoop = new FailureLoopService({
+    store,
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    warn: (message) => bb.log.warn(message),
+  });
+  const jobContinuation = new JobContinuationService({
+    store,
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    onWorkAvailable: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
+  const diskHousekeeping = new DiskHousekeepingService({
+    store,
+    temp: {
+      list: async () => {
+        const entries = await readdir(tmpdir(), { withFileTypes: true });
+        return Promise.all(entries.map(async (entry) => {
+          let modifiedAt: number | null = null;
+          // Only the names that could be candidates are worth a syscall. A
+          // temp directory holding a leak has hundreds of thousands of
+          // entries, and the planner rejects a foreign name before it ever
+          // looks at its age.
+          if (isDisposableTempName(entry.name)) {
+            try {
+              // lstat, not stat: a symlink's own timestamps, never its target's.
+              modifiedAt = (await lstat(join(tmpdir(), entry.name))).mtimeMs;
+            } catch {
+              // Unreadable reads as unknown age, which the planner keeps.
+            }
+          }
+          return {
+            name: entry.name,
+            isDirectory: entry.isDirectory(),
+            isSymbolicLink: entry.isSymbolicLink(),
+            modifiedAt,
+          };
+        }));
+      },
+      remove: async (name) => {
+        // Rebuilt from the temp root and the bare name the planner returned, so
+        // nothing a directory listing could contain can reach outside it.
+        await rm(join(tmpdir(), basename(name)), { recursive: true, force: false });
+      },
+      usage: async () => {
+        const stats = await statfs(tmpdir());
+        return {
+          freeBytes: Number(stats.bavail) * Number(stats.bsize),
+          totalBytes: Number(stats.blocks) * Number(stats.bsize),
+        };
+      },
+    },
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    // Deleting is upkeep the agent does unprompted, so it rides the one switch
+    // the owner already has for that rather than a knob of its own. Warnings
+    // are read-only and are never gated.
+    reclaimArmed: () => config.ok && systemUpkeepEnabled(config.value),
+    warn: (message) => bb.log.warn(message),
+  });
+  const workspaceHousekeeping = new WorkspaceHousekeepingService({
+    store,
+    workspace: createWorkspaceAccess({
+      sdk: bb.sdk as never,
+      store,
+      terminal,
+      warn: (message) => bb.log.warn(message),
+    }),
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    // Its own switch, not the general upkeep one: reclaiming a temporary
+    // directory and deleting a branch are not the same risk. Off by default.
+    reclaimArmed: () => config.ok && workspaceReclaimEnabled(config.value),
+    warn: (message) => bb.log.warn(message),
+  });
+  const audits = new AuditService({
+    store,
+    audits: createAuditAccess({ sdk: bb.sdk as never, store, terminal }),
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    // Read-only, so it rides the existing upkeep switch rather than adding one.
+    auditsArmed: () => config.ok && systemUpkeepEnabled(config.value),
+    warn: (message) => bb.log.warn(message),
+  });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
   let systemMonitorsInstalled = false;
   const systemMonitors = {
     install: () => {
+      // Turning the setting off has to retire what is already armed, or the
+      // owner keeps getting the daily sweep they just switched off.
+      if (config.ok && !systemUpkeepEnabled(config.value)) {
+        if (store.cancelSystemMonitors(clock()) > 0) systemMonitorsInstalled = false;
+        return;
+      }
       if (systemMonitorsInstalled) return;
-      if (!config.ok || !systemUpkeepEnabled(config.value)) return;
+      if (!config.ok) return;
       const installed = installSystemMonitors({
         store,
         clock: { now: clock },
@@ -589,7 +1335,6 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   });
   const presence = new TelegramPresenceCoordinator({
     store,
-    jobLanes: laneSnapshots,
     telegram: {
       sendChatAction: (chatId, action, signal) => {
         if (!config.ok) throw new Error(config.message);
@@ -614,6 +1359,10 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     ) => bbRunner.sendRemediation(job, findings, reasons),
     sendSteering: (threadId: string, text: string) => bbRunner.sendSteering(threadId, text),
     stopWorker: (worker: Parameters<BbRunner["stopWorker"]>[0]) => bbRunner.stopWorker(worker),
+    retireWorker: (resourceId: string, allowMissing: boolean) => bbRunner.retireWorker(resourceId, allowMissing),
+    prepareProgressScratchpad: (environmentId: string) => bbRunner.prepareProgressScratchpad(environmentId),
+    assertWorktreeSharesTrunk: (environmentId: string, trunk: string) =>
+      bbRunner.assertWorktreeSharesTrunk(environmentId, trunk),
     getThread: (threadId: string) => bbRunner.getThread(threadId),
     getEnvironmentSnapshot: (environmentId: string, baseBranch: string) => bbRunner.getEnvironmentSnapshot(environmentId, baseBranch),
     getPullRequestSnapshot: (environmentId: string) => bbRunner.getPullRequestSnapshot(environmentId),
@@ -623,6 +1372,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     job: NonNullable<ReturnType<typeof store.getJob>>,
     signal: AbortSignal,
     fence: EffectFence,
+    requestedResourceId?: string,
   ): Promise<void> => {
     const fenceCurrent = (): boolean => !signal.aborted && !fence.signal.aborted &&
       store.isExecutorLeaseCurrent(fence.ownerId, fence.generation, clock());
@@ -637,6 +1387,79 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       });
       if (!updated) throw new Error("executor lease was lost before reconciliation transition");
     };
+    const recoverWorker = (
+      current: NonNullable<ReturnType<TelegramAgentStore["getJob"]>>,
+      workerKind: Parameters<TelegramAgentStore["registerExecutorWorkerRecovery"]>[0]["workerKind"],
+      resourceId: string,
+      workerGeneration: number,
+      classification: Parameters<TelegramAgentStore["registerExecutorWorkerRecovery"]>[0]["classification"],
+      signature: string,
+      attempt: ReturnType<TelegramAgentStore["getLatestPipelineStageAttempt"]>,
+      retryPayload: Record<string, unknown>,
+    ): boolean => {
+      if (!current.projectId || !current.policy) return false;
+      if (workerKind === "critique" && (
+        typeof retryPayload.planAttemptId !== "string" || retryPayload.planAttemptId.length === 0
+      )) {
+        applyExecutorEvent(current.id, current.version, {
+          type: "THREAD_FAILED",
+          workerKind,
+          error: "Critique recovery requires a durable plan attempt",
+        });
+        return true;
+      }
+      const recoveryId = `recovery_${createHash("sha256")
+        .update(`${current.id}\0${resourceId}\0${String(workerGeneration)}\0${signature}`, "utf8")
+        .digest("base64url")
+        .slice(0, 28)}`;
+      const registered = store.registerExecutorWorkerRecovery({
+        id: recoveryId,
+        jobId: current.id,
+        expectedVersion: current.version,
+        projectId: current.projectId,
+        jobState: current.state,
+        workerKind,
+        resourceId,
+        workerGeneration,
+        classification,
+        signature,
+        retryLimit: current.policy.workerRecoveryLimit,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: clock(),
+      });
+      if (!registered) throw new Error("executor lease was lost before recovery registration");
+      if (registered.action === "already_recorded" && registered.record.state !== "detected") return true;
+      if (attempt?.state === "running") {
+        if (!store.failPipelineStageAttempt({
+          id: attempt.id,
+          error: `${workerKind} worker was retired before it produced evidence`,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: clock(),
+        })) throw new Error("executor lease was lost before retired attempt persistence");
+      }
+      const latest = store.getJob(current.id);
+      if (!latest || latest.state !== current.state) return true;
+      if (registered.action === "owner_required") {
+        applyExecutorEvent(latest.id, latest.version, {
+          type: "THREAD_FAILED",
+          workerKind,
+          error: `${workerKind} worker stopped unexpectedly and needs a manual retry`,
+        });
+        return true;
+      }
+      applyExecutorEvent(latest.id, latest.version, {
+        type: "WORKER_RECOVERY_REQUESTED",
+        recoveryId: registered.record.id,
+        workerKind,
+        resourceId,
+        classification,
+        signature,
+        retryPayload,
+      });
+      return true;
+    };
     if (!fenceCurrent()) return;
 
     const pipelineRole = job.state === "planning" ? "PLAN" as const
@@ -645,39 +1468,125 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       : null;
     const pipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
     const reviewStage = job.state === "reviewing" || job.state === "final_reviewing";
-    const implementationStage = ["creating_implementation", "implementing", "locating_pr", "resolving_pr_head", "remediating"].includes(job.state);
-    const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? job.reviewThreadId : implementationStage ? job.implementationThreadId : null);
+    const implementationStage = ["implementing", "remediating"].includes(job.state);
+    if (reviewStage && requestedResourceId === undefined && job.reviewThreadId) {
+      const quality = store.getAttemptByThreadId(job.reviewThreadId);
+      if (quality?.reviewStage && quality.kind === "review") {
+        const attempts = store.listReviewAttempts(job.id, quality.reviewStage, quality.ordinal)
+          .filter((attempt) => attempt.threadId !== null);
+        if (attempts.length > 0) {
+          for (const attempt of attempts) {
+            if (signal.aborted || fence.signal.aborted || attempt.threadId === null) return;
+            const current = store.getJob(job.id);
+            if (!current || current.version !== job.version || current.state !== job.state) return;
+            await reconcileJob(current, signal, fence, attempt.threadId);
+          }
+          return;
+        }
+      }
+    }
+    const qualityReviewAttempt = reviewStage && job.reviewThreadId ? store.getAttemptByThreadId(job.reviewThreadId) : null;
+    const requestedReviewAttempt = reviewStage && requestedResourceId ? store.getAttemptByThreadId(requestedResourceId) : null;
+    const requestedReviewMatches = requestedReviewAttempt !== null && qualityReviewAttempt !== null &&
+      requestedReviewAttempt.jobId === job.id && requestedReviewAttempt.kind === "review" &&
+      requestedReviewAttempt.reviewStage === qualityReviewAttempt.reviewStage &&
+      requestedReviewAttempt.ordinal === qualityReviewAttempt.ordinal;
+    if (requestedResourceId !== undefined) {
+      const requestedResourceMatches = pipelineAttempt?.threadId === requestedResourceId ||
+        (reviewStage && requestedReviewMatches) ||
+        (implementationStage && job.implementationThreadId === requestedResourceId);
+      if (!requestedResourceMatches) return;
+    }
+    const reviewResourceId = requestedReviewMatches ? requestedResourceId ?? null : job.reviewThreadId;
+    const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? reviewResourceId : implementationStage ? job.implementationThreadId : null);
     if (!resourceId) return;
+    const recoveryRetryPayload = (): Record<string, unknown> => {
+      if (pipelineRole === "CRITIQUE") {
+        return { planAttemptId: store.getLatestPipelineStageAttempt(job.id, "PLAN")?.id ?? "" };
+      }
+      if (reviewStage && qualityReviewAttempt?.reviewStage) {
+        const retireResourceIds = store
+          .listReviewAttempts(job.id, qualityReviewAttempt.reviewStage, qualityReviewAttempt.ordinal)
+          .map((attempt) => attempt.threadId)
+          .filter((threadId): threadId is string => threadId !== null && threadId !== resourceId);
+        return retireResourceIds.length > 0 ? { retireResourceIds } : {};
+      }
+      return {};
+    };
     const workerKind = pipelineRole === "PLAN" ? "plan" as const
       : pipelineRole === "CRITIQUE" ? "critique" as const
       : pipelineRole === "DOCS" ? "docs" as const
       : reviewStage ? "review" as const
       : "implementation" as const;
     const generation = workerRegistrationGeneration(job, workerKind);
+    /**
+     * Closes this attempt's stage-ledger row once its worker has stopped.
+     * `outcome` describes how the worker ended, not what the stage decided:
+     * the verdict lives in the attempt record, while this row measures what the
+     * chosen model actually consumed. Reading usage costs a provider call, so
+     * it happens once, at the end.
+     */
+    const settleStageMeasurement = async (outcome: "succeeded" | "failed"): Promise<void> => {
+      await settleStageLedger({
+        store,
+        readUsage: (threadId) => bbRunner.readThreadUsage(threadId),
+        jobId: job.id,
+        attemptId: pipelineRole
+          ? store.getLatestPipelineStageAttempt(job.id, pipelineRole)?.id
+          : store.getAttemptByThreadId(resourceId)?.id,
+        stage: workerKind,
+        threadId: resourceId,
+        outcome,
+        now: clock(),
+      });
+    };
+    const previousLiveness = store.getWorkerLivenessForResource(job.id, resourceId);
     let thread: Awaited<ReturnType<BbRunner["getThread"]>>;
     try {
       thread = await bbRunner.getThread(resourceId);
     } catch {
       if (!fenceCurrent()) return;
       const current = store.getJob(job.id);
-      if (current) projectUnknownWorker(store, current, resourceId, clock(), workerKind, generation, {
-        ownerId: fence.ownerId,
-        generation: fence.generation,
-        now: clock(),
-      });
+      if (current) {
+        const observedAt = clock();
+        projectUnknownWorker(store, current, resourceId, observedAt, workerKind, generation, {
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: observedAt,
+        });
+        const recovery = classifyThreadRecovery(current, null, previousLiveness, observedAt, workerKind);
+        if (recovery) {
+          const retryPayload = recoveryRetryPayload();
+          recoverWorker(current, workerKind, resourceId, generation, recovery.classification, recovery.signature, pipelineAttempt, retryPayload);
+        }
+      }
       return;
     }
     if (!fenceCurrent()) return;
     const current = store.getJob(job.id);
     const currentPipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
-    const currentResourceId = currentPipelineAttempt?.threadId ?? (reviewStage ? current?.reviewThreadId : current?.implementationThreadId);
+    const currentQualityAttempt = reviewStage && current?.reviewThreadId ? store.getAttemptByThreadId(current.reviewThreadId) : null;
+    const currentRequestedAttempt = reviewStage ? store.getAttemptByThreadId(resourceId) : null;
+    const currentReviewResourceMatches = currentRequestedAttempt !== null && currentQualityAttempt !== null &&
+      currentRequestedAttempt.jobId === current?.id && currentRequestedAttempt.kind === "review" &&
+      currentRequestedAttempt.reviewStage === currentQualityAttempt.reviewStage &&
+      currentRequestedAttempt.ordinal === currentQualityAttempt.ordinal;
+    const currentResourceId = currentPipelineAttempt?.threadId ??
+      (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId) : current?.implementationThreadId);
     if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
-    const projected = projectWorkerLiveness(store, current, thread, clock(), workerKind, generation, {
+    const observedAt = clock();
+    const projected = projectWorkerLiveness(store, current, thread, observedAt, workerKind, generation, {
       ownerId: fence.ownerId,
       generation: fence.generation,
-      now: clock(),
+      now: observedAt,
     });
+    const recovery = classifyThreadRecovery(current, thread, previousLiveness, observedAt, workerKind);
+    if (recovery) {
+      const retryPayload = recoveryRetryPayload();
+      recoverWorker(current, workerKind, resourceId, generation, recovery.classification, recovery.signature, currentPipelineAttempt, retryPayload);
+      return;
+    }
     const failed = thread.status === "error" || thread.runtime.displayStatus === "error";
     if (failed) {
       if (!fenceCurrent()) return;
@@ -694,14 +1603,26 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       if (latest && latest.cancelRequestedAt === null) {
         applyExecutorEvent(job.id, latest.version, { type: "THREAD_FAILED", workerKind, error: `${workerKind} worker thread failed` });
       }
+      await settleStageMeasurement("failed");
       return;
     }
     if (projected.state !== "idle") return;
+    await settleStageMeasurement("succeeded");
+    if (!fenceCurrent()) return;
 
     if (pipelineRole && currentPipelineAttempt) {
       let output: string;
+      let docsObservation: { clean: boolean; diff: string | null } | undefined;
       try {
         output = await bbRunner.getThreadOutput(resourceId);
+        if (pipelineRole === "DOCS") {
+          if (!current.environmentId || !current.policy) throw new Error("docs environment is unavailable");
+          const snapshot = await bbRunner.getEnvironmentSnapshot(current.environmentId, current.policy.baseBranch);
+          docsObservation = {
+            clean: environmentWorktreeIsClean(snapshot.status),
+            diff: environmentDiffText(snapshot.diff),
+          };
+        }
       } catch {
         if (!fenceCurrent()) return;
         if (!store.failPipelineStageAttempt({
@@ -723,6 +1644,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
         job: current,
         attempt: currentPipelineAttempt,
         output,
+        docsObservation,
         fence: { ownerId: fence.ownerId, generation: fence.generation },
         now: clock(),
       });
@@ -733,6 +1655,88 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       if (!fenceCurrent()) return;
       const latest = store.getJob(job.id);
       if (latest && (latest.state === "implementing" || latest.state === "remediating")) {
+        if (latest.routingMode !== "legacy") {
+          const attempt = store.getAttemptByThreadId(resourceId);
+          const profile = attempt
+            ? store.getLatestCapabilityProfile("worker_attempt", attempt.id)
+            : null;
+          const profileMatches = profile !== null && profile.subjectId === attempt?.id &&
+            profile.recipeId === latest.taskRecipe && profile.recipeVersion === latest.recipeVersion &&
+            profile.mode === latest.routingMode;
+          if (!attempt || !profileMatches || !attempt.handoffSha256 || !latest.environmentId || !latest.policy) {
+            if (latest.routingMode === "active") {
+              applyExecutorEvent(job.id, latest.version, {
+                type: "FAILED",
+                error: "Mandatory capability evidence is incomplete",
+              });
+              return;
+            }
+          } else {
+            let diff: string | null = null;
+            try {
+              const snapshot = await bbRunner.getEnvironmentSnapshot(latest.environmentId, latest.policy.baseBranch);
+              if (!fenceCurrent()) return;
+              diff = environmentDiffText(snapshot.diff);
+            } catch {
+              if (!fenceCurrent()) return;
+            }
+            const commandEvidence = [] as Array<{
+              commandSha256: string;
+              outcome: "pass" | "fail" | "timed_out" | "aborted";
+              terminalId?: string;
+            }>;
+            for (const validation of latest.policy.validationCommands) {
+              let terminalId: string | undefined;
+              try {
+                const result = await terminal.run({
+                  scope: { kind: "environment", environmentId: latest.environmentId },
+                  title: `Capability verification ${validation.name}`,
+                  command: validation.command,
+                  timeoutMs: validation.timeoutMs,
+                  signal,
+                  onObservation: (observation) => {
+                    terminalId = observation.id;
+                  },
+                });
+                if (!fenceCurrent()) return;
+                commandEvidence.push({
+                  commandSha256: createHash("sha256").update(validation.command, "utf8").digest("hex"),
+                  outcome: result.outcome === "exited"
+                    ? result.exitCode === 0 ? "pass" : "fail"
+                    : result.outcome,
+                  ...(terminalId ? { terminalId } : {}),
+                });
+              } catch {
+                if (!fenceCurrent()) return;
+                commandEvidence.push({
+                  commandSha256: createHash("sha256").update(validation.command, "utf8").digest("hex"),
+                  outcome: "aborted",
+                  ...(terminalId ? { terminalId } : {}),
+                });
+              }
+            }
+            const settlement = recordImplementationCapabilityOutcomes({
+              store,
+              profileId: profile.id,
+              handoffSha256: attempt.handoffSha256,
+              diff,
+              commands: commandEvidence,
+              validationPolicy: {
+                commandSha256s: latest.policy.validationCommands.map((validation) =>
+                  createHash("sha256").update(validation.command, "utf8").digest("hex")),
+              },
+              now: clock(),
+            });
+            if (!fenceCurrent()) return;
+            if (!settlement.satisfied && latest.routingMode === "active") {
+              applyExecutorEvent(job.id, latest.version, {
+                type: "FAILED",
+                error: "Mandatory capability evidence is incomplete",
+              });
+              return;
+            }
+          }
+        }
         applyExecutorEvent(job.id, latest.version, { type: "IMPLEMENTATION_IDLE" });
       }
       return;
@@ -746,6 +1750,59 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       return;
     }
     if (attempt.jobId !== current.id || attempt.kind !== "review" || attempt.headSha !== current.prHeadSha) return;
+    let guardPolicy: GuardAssessmentPolicy | undefined;
+    if (current.routingMode === "active" && attempt.reviewLens === "quality") {
+      if (!current.environmentId || !current.policy) {
+        if (!fenceCurrent()) return;
+        applyExecutorEvent(job.id, current.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+        return;
+      }
+      const profile = store.getLatestCapabilityProfile("worker_attempt", attempt.id);
+      let diff: string | null = null;
+      try {
+        const snapshot = await bbRunner.getEnvironmentSnapshot(current.environmentId, current.policy.baseBranch);
+        if (!fenceCurrent()) return;
+        diff = environmentDiffText(snapshot.diff);
+      } catch {
+        if (!fenceCurrent()) return;
+      }
+      const guardAssignments = profile?.assignments.filter((assignment) =>
+        CAPABILITY_BY_ID.get(assignment.capabilityId)?.evidence.receiptType === "guard") ?? [];
+      const requiredGuards = diff === null ? [] : [...requiredGuardsForChangeSurface(diff)];
+      const selectedGuardIds = guardAssignments.map((assignment) => assignment.capabilityId)
+        .sort((left, right) => left.localeCompare(right));
+      const profileMatches = profile !== null && profile.subjectId === attempt.id &&
+        profile.recipeId === current.taskRecipe && profile.recipeVersion === current.recipeVersion &&
+        profile.mode === current.routingMode &&
+        JSON.stringify(selectedGuardIds) === JSON.stringify(requiredGuards) &&
+        guardAssignments.every((assignment) => CAPABILITY_BY_ID.get(assignment.capabilityId)?.digest === assignment.descriptorDigest);
+      if (!profileMatches || diff === null) {
+        if (!fenceCurrent()) return;
+        applyExecutorEvent(job.id, current.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+        return;
+      }
+      if (guardAssignments.length > 0) {
+        guardPolicy = {
+          profileId: profile.id,
+          profileRevision: profile.revision,
+          reviewedHeadSha: current.prHeadSha,
+          diffDigest: createHash("sha256").update(diff, "utf8").digest("hex"),
+          selectedGuards: guardAssignments.map((assignment) => {
+            const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+            if (!descriptor) throw new Error("Selected guard disappeared before review settlement");
+            return {
+              capabilityId: assignment.capabilityId,
+              descriptorDigest: assignment.descriptorDigest,
+              mandatory: assignment.mandatory,
+              substitutes: descriptor.composition.substitutes,
+            };
+          }),
+          requirementIds: guardRequirementBindings(current.policy.requiredChecks).map((requirement) => requirement.id),
+          mustFixRuleIds: ["clean.rule-1", "docs.rule-1", "tests.rule-1"],
+          advisoryRuleIds: ["clean.rule-10", "docs.rule-10", "tests.rule-10"],
+        };
+      }
+    }
     const invocation: ReviewInvocation = {
       jobId: current.id,
       attemptId: attempt.id,
@@ -754,6 +1811,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       environmentId: current.environmentId ?? "",
       mergeBaseBranch: current.policy?.baseBranch ?? "",
       expectedSha: current.prHeadSha,
+      ...(guardPolicy === undefined ? {} : { guardPolicy }),
       signal,
     };
     if (!invocation.environmentId || !invocation.mergeBaseBranch || !fenceCurrent()) return;
@@ -768,25 +1826,71 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     if (!completion.event || !fenceCurrent()) return;
     const latest = store.getJob(invocation.jobId);
     const latestAttempt = store.getAttempt(invocation.attemptId);
+    const latestQualityAttempt = latest?.reviewThreadId ? store.getAttemptByThreadId(latest.reviewThreadId) : null;
     if (!latest || !latestAttempt || latestAttempt.jobId !== invocation.jobId ||
       latestAttempt.threadId !== invocation.reviewThreadId || latestAttempt.headSha !== invocation.expectedSha ||
+      !latestQualityAttempt || latestQualityAttempt.jobId !== invocation.jobId || latestQualityAttempt.kind !== "review" ||
+      latestQualityAttempt.reviewLens !== "quality" || latestAttempt.reviewStage !== latestQualityAttempt.reviewStage ||
+      latestAttempt.ordinal !== latestQualityAttempt.ordinal ||
       latest.id !== invocation.jobId || latest.version !== current.version ||
       (latest.state !== "reviewing" && latest.state !== "final_reviewing") ||
       latest.environmentId !== invocation.environmentId || latest.prHeadSha !== invocation.expectedSha ||
-      latest.reviewThreadId !== invocation.reviewThreadId ||
       latest.implementationThreadId !== invocation.implementationThreadId || !fenceCurrent()) return;
-    const event = completion.event;
-    if (event.type === "REVIEW_PASSED") {
-      applyExecutorEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: String(event.payload.headSha) });
-    } else if (event.type === "REVIEW_CHANGES_REQUESTED") {
+    if (!latestQualityAttempt.reviewStage) return;
+    const assessment = assessReviewGroup(
+      store.listReviewAttempts(latest.id, latestQualityAttempt.reviewStage, latestQualityAttempt.ordinal),
+      latest.deliveryMode,
+      invocation.expectedSha,
+    );
+    if (assessment.outcome === "pending") return;
+    if (assessment.outcome === "pass") {
+      if (latest.routingMode === "active") {
+        if (!latest.environmentId || !latest.policy) {
+          applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+          return;
+        }
+        let exactDiff: string | null = null;
+        try {
+          const snapshot = await bbRunner.getEnvironmentSnapshot(latest.environmentId, latest.policy.baseBranch);
+          if (!fenceCurrent()) return;
+          exactDiff = environmentDiffText(snapshot.diff);
+        } catch {
+          if (!fenceCurrent()) return;
+        }
+        if (exactDiff === null) {
+          applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+          return;
+        }
+        let documentation;
+        try {
+          documentation = documentationRequirement({
+            diff: exactDiff,
+            traits: latest.taskTraits.map((trait) => trait.id),
+            reasonCodes: latest.taskReasonCodes,
+          });
+        } catch {
+          applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+          return;
+        }
+        applyExecutorEvent(job.id, latest.version, {
+          type: "REVIEW_PASSED",
+          headSha: invocation.expectedSha,
+          documentation: {
+            required: documentation.required,
+            diffDigest: documentation.diffDigest,
+            reasons: documentation.reasons,
+          },
+        });
+      } else {
+        applyExecutorEvent(job.id, latest.version, { type: "REVIEW_PASSED", headSha: invocation.expectedSha });
+      }
+    } else if (assessment.outcome === "changes_requested") {
       applyExecutorEvent(job.id, latest.version, {
         type: "REVIEW_CHANGES_REQUESTED",
-        headSha: typeof event.payload.headSha === "string" ? event.payload.headSha : undefined,
-        summary: typeof event.payload.summary === "string" ? event.payload.summary : undefined,
-        findings: Array.isArray(event.payload.findings) ? event.payload.findings as ReviewFinding[] : undefined,
-        reasons: Array.isArray(event.payload.reasons)
-          ? event.payload.reasons.filter((reason): reason is string => typeof reason === "string")
-          : undefined,
+        headSha: invocation.expectedSha,
+        summary: assessment.summary ?? undefined,
+        findings: assessment.findings as ReviewFinding[],
+        reasons: assessment.reasons,
       });
     } else {
       applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
@@ -796,6 +1900,7 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
     store,
     fence,
     now: clock,
+    minimumModelPool: () => config.ok ? capabilityMinimumModelPool(config.value) : undefined,
     bb: bbEffectAdapter,
     terminal,
     mergeHandler,
@@ -857,9 +1962,69 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       ingress,
       getConfig: () => config,
       clock: { now: clock },
+      onTokenVerified: (token) => {
+        if (config.ok && config.value.botToken === token) verifiedBotToken = token;
+      },
       warn: (message) => bb.log.warn(message),
     }, signal),
   });
+  bb.background.service("capability-inventory", {
+    start: (signal) => capabilityInventory.run(signal),
+  });
+  if (config.ok && selfDiagnosisEnabled(config.value)) {
+    const selfDiagnosis = new SelfDiagnosisService({
+      enabled: () => config.ok && selfDiagnosisEnabled(config.value) && config.value.selfDiagnosisProjectId.trim().length > 0,
+      readCandidates: () => findSelfDiagnosisCandidates(bb.storage.database(), clock()),
+      resolveTarget: () => resolveSelfDiagnosisTarget(
+        bb.sdk,
+        store,
+        config.ok ? config.value.selfDiagnosisProjectId : "",
+      ),
+      ledger: selfDiagnosisLedger(bb.storage.kv),
+      github: {
+        listOpen: async (target) => {
+          const result = await terminal.run({
+            scope: { kind: "host_path", hostId: target.hostId, cwd: target.cwd },
+            title: "Check self-diagnosis draft pull requests",
+            command: buildListSelfDiagnosisPullRequestsCommand(),
+            timeoutMs: 60_000,
+          });
+          if (result.outcome !== "exited" || result.exitCode !== 0) return null;
+          return parseOpenSelfDiagnosisPullRequests(result.output);
+        },
+      },
+      analyze: (input) => {
+        if (!config.ok) throw new Error(config.message);
+        return runSelfDiagnosisWorker({
+          sdk: bb.sdk,
+          target: input.target,
+          diagnosisId: input.diagnosisId,
+          prompt: input.prompt,
+          modelRoute: input.modelRoute,
+          signal: input.signal,
+        });
+      },
+      publish: (input) => publishSelfDiagnosisPullRequest({
+        runner: terminal,
+        baseBranch: input.target.baseBranch,
+        candidate: input.candidate,
+        diagnosisId: input.diagnosisId,
+        diagnosis: input.diagnosis,
+        environmentId: input.environmentId,
+        environmentStatus: input.environmentStatus,
+        signal: input.signal,
+      }),
+      modelRoute: () => {
+        if (!config.ok) throw new Error(config.message);
+        return backgroundCapabilityModelRoute(config.value);
+      },
+      clock: { now: clock },
+      warn: (message) => bb.log.warn(message),
+    });
+    bb.background.service(SELF_DIAGNOSIS_SERVICE_NAME, {
+      start: (signal) => selfDiagnosis.run(signal),
+    });
+  }
   bb.background.service("job-executor", {
     start: (signal) => runJobExecutorService({
       store,
@@ -869,15 +2034,38 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       onWorkAvailable: () => executorNudge.notify(),
       clock: { now: clock },
       reconcileJob,
+      getWorkerThread: (threadId) => bbRunner.getThread(threadId),
       telegramToken: () => config.ok ? config.value.botToken : undefined,
       getTelegramClient: () => {
         if (!config.ok) throw new Error(config.message);
-        const client = telegramForToken(config.value.botToken);
+        const client = new TelegramClient(config.value.botToken, fetch, { maxAttempts: 1 });
         return {
-          sendMessage: (chatId: string, payload: Record<string, unknown>) => client.sendMessage(chatId, payload as Parameters<TelegramClient["sendMessage"]>[1]),
-          sendMessageDraft: (chatId: string, draftId: number, text: string) => client.sendMessageDraft(chatId, draftId, text),
-          editMessage: (chatId: string, messageId: number, payload: Record<string, unknown>) => client.editMessage(chatId, messageId, payload as Parameters<TelegramClient["editMessage"]>[2]),
-          answerCallback: (callbackQueryId: string, text: string) => client.answerCallback(callbackQueryId, text),
+          sendMessage: (chatId: string, payload: Record<string, unknown>, signal: AbortSignal) =>
+            client.sendMessage(chatId, payload as Parameters<TelegramClient["sendMessage"]>[1], signal),
+          sendMedia: (
+            chatId: string,
+            upload: Parameters<TelegramClient["sendMedia"]>[1],
+            caption: string | null,
+            signal: AbortSignal,
+          ) => client.sendMedia(chatId, upload, caption, signal),
+          sendMessageDraft: (chatId: string, draftId: number, text: string, signal: AbortSignal) =>
+            client.sendMessageDraft(chatId, draftId, text, signal),
+          editMessage: (chatId: string, messageId: number, payload: Record<string, unknown>, signal: AbortSignal) =>
+            client.editMessage(chatId, messageId, payload as Parameters<TelegramClient["editMessage"]>[2], signal),
+          answerCallback: (callbackQueryId: string, text: string, signal: AbortSignal) =>
+            client.answerCallback(callbackQueryId, text, signal),
+        };
+      },
+      readHostFile: async ({ hostId, path }, signal) => {
+        const file = await bb.sdk.files.read({ hostId, path, signal });
+        // Base64 is what makes this safe for binary: a still or a clip decoded
+        // as text would upload corrupted and arrive as a broken image.
+        if (file.contentEncoding !== "base64") {
+          throw new TypeError("Queued media did not read back as binary content");
+        }
+        return {
+          bytes: Uint8Array.from(Buffer.from(file.content, "base64")),
+          sizeBytes: file.sizeBytes,
         };
       },
       releaseOnShutdown: true,
@@ -887,6 +2075,13 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
       threadNotices,
       jobMemory,
       memoryCuration,
+      productionHealth,
+      regressionWatch,
+      failureLoop,
+      jobContinuation,
+      diskHousekeeping,
+      workspaceHousekeeping,
+      audits,
       systemMonitors,
       presence,
       laneSnapshots,
@@ -896,7 +2091,11 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
 
   const queueThreadReconcile = (threadId: string): void => {
     const jobQueued = store.enqueueReconcileForThread(threadId, clock());
-    if (jobQueued || store.getControllerByThreadId(threadId) !== null) executorNudge.notify();
+    if (jobQueued || store.shouldWakeForThread(threadId)) executorNudge.notify();
+  };
+  const queueEnvironmentReconcile = (environmentId: string): void => {
+    const jobQueued = store.enqueueReconcileForEnvironment(environmentId, clock());
+    if (jobQueued || store.shouldWakeForEnvironment(environmentId)) executorNudge.notify();
   };
   bb.events.on("thread.created", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.active", ({ thread }) => queueThreadReconcile(thread.id));
@@ -904,4 +2103,41 @@ export async function createPlugin(bb: BbPluginApi): Promise<void> {
   bb.events.on("thread.failed", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.archived", ({ thread }) => queueThreadReconcile(thread.id));
   bb.events.on("thread.deleted", ({ thread }) => queueThreadReconcile(thread.id));
+  // Older hosts do not expose SDK subscriptions. The event bus above remains
+  // the baseline wake-up path, so optional SDK subscriptions should not make
+  // plugin startup fail on those hosts.
+  type SdkSubscribe = NonNullable<BbPluginApi["sdk"]["subscribe"]>;
+  const sdkSubscribe = (
+    subscription: Parameters<SdkSubscribe>[0],
+  ): (() => void) | undefined => {
+    if (typeof bb.sdk.subscribe !== "function") return undefined;
+    try {
+      return bb.sdk.subscribe(subscription);
+    } catch (error) {
+      // The SDK test host exposes an explicit throwing stub for capabilities it
+      // does not implement. Treat that the same as an older host with no
+      // subscription API, while preserving real subscription failures.
+      if (error instanceof Error && /not stubbed/i.test(error.message)) return undefined;
+      throw error;
+    }
+  };
+  const unsubscribeThreadChanges = sdkSubscribe({
+    event: "thread:changed",
+    callback: (event) => {
+      if (!event.id || !threadChangeShouldWake(event.changes)) return;
+      // A question answered in BB leaves a live card on the owner's phone. That
+      // is worth one unpaced sweep; ordinary ticks keep their 15-second pacing.
+      if (threadInteractionsChanged(event.changes)) threadNotices.requestSweep();
+      queueThreadReconcile(event.id);
+    },
+  });
+  const unsubscribeEnvironmentChanges = sdkSubscribe({
+    event: "environment:changed",
+    callback: (event) => {
+      if (!event.id || !environmentChangeShouldWake(event.changes)) return;
+      queueEnvironmentReconcile(event.id);
+    },
+  });
+  if (unsubscribeThreadChanges) bb.onDispose(unsubscribeThreadChanges);
+  if (unsubscribeEnvironmentChanges) bb.onDispose(unsubscribeEnvironmentChanges);
 }

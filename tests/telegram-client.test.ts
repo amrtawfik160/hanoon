@@ -13,6 +13,61 @@ import {
 } from "./helpers";
 
 describe("Telegram Bot API client", () => {
+  it("uploads a screenshot as multipart, letting fetch own the boundary", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 55 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await expect(client.sendMedia(
+      "70",
+      { field: "photo", filename: "checkout.png", mimeType: "image/png", bytes: new Uint8Array([137, 80, 78, 71]) },
+      "the checkout page",
+    )).resolves.toEqual({ message_id: 55 });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/sendPhoto");
+    // Forcing a JSON content-type here would strip the multipart boundary and
+    // Telegram would reject the upload.
+    expect(calls[0].init?.headers).toEqual({});
+    const body = calls[0].init?.body as FormData;
+    expect(body).toBeInstanceOf(FormData);
+    expect(body.get("chat_id")).toBe("70");
+    expect(body.get("caption")).toBe("the checkout page");
+    const file = body.get("photo") as File;
+    expect(file.name).toBe("checkout.png");
+    expect(file.type).toBe("image/png");
+    expect(file.size).toBe(4);
+  });
+
+  it("uploads a recording through sendVideo and omits an absent caption", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 56 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await client.sendMedia(
+      "70",
+      { field: "video", filename: "flow.mp4", mimeType: "video/mp4", bytes: new Uint8Array([0, 0, 0, 1]) },
+      null,
+    );
+
+    expect(calls[0].url).toContain("/sendVideo");
+    const body = calls[0].init?.body as FormData;
+    expect(body.get("caption")).toBeNull();
+    expect((body.get("video") as File).name).toBe("flow.mp4");
+  });
+
   it("resolves and downloads a bounded Telegram file without returning a token-bearing URL", async () => {
     const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -155,6 +210,72 @@ describe("Telegram Bot API client", () => {
     expect(immediateSleep).toHaveBeenCalledWith(1_000, expect.any(AbortSignal));
     expect(fetchMock.calls).toHaveLength(2);
     expect(JSON.stringify(fetchMock.calls)).not.toContain("123:secret");
+  });
+
+  it("returns a 22-second retry_after without sleeping when the caller owns retries", async () => {
+    const sleep = vi.fn(immediateSleep);
+    const fetchMock = telegramFetch([
+      { ok: false, error_code: 429, description: "slow", parameters: { retry_after: 22 } },
+      { ok: true, result: { message_id: 10 } },
+    ]);
+    const client = new TelegramClient("token", fetchMock, { sleep, maxAttempts: 1 });
+
+    const error = await client.sendMessage("1", { text: "hello" }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "TelegramApiError",
+      errorCode: 429,
+      retryAfterSeconds: 22,
+    });
+    expect(fetchMock.calls).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a DNS lookup failure", { code: "EAI_AGAIN" }, "not_sent"],
+    ["a connection timeout", { code: "UND_ERR_CONNECT_TIMEOUT" }, "not_sent"],
+    ["a reset before any bytes were written", { code: "ECONNRESET", socket: { bytesWritten: 0 } }, "not_sent"],
+    ["a reset after request bytes were written", { code: "ECONNRESET", socket: { bytesWritten: 128 } }, "unknown"],
+  ] as const)("classifies %s for durable retry safety", async (_scenario, cause, expectedOutcome) => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError("fetch failed", { cause });
+    });
+    const client = new TelegramClient("token", fetchMock, { maxAttempts: 1 });
+
+    const error = await client.sendMessage("1", { text: "hello" }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "TelegramRequestError",
+      deliveryOutcome: expectedOutcome,
+    });
+  });
+
+  it("treats a malformed transient response as uncertain for a one-attempt caller", async () => {
+    const fetchMock = vi.fn(async () => new Response("not-json", { status: 502 }));
+    const client = new TelegramClient("token", fetchMock, { maxAttempts: 1 });
+
+    const error = await client.sendMessage("1", { text: "hello" }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "TelegramApiError",
+      deliveryOutcome: "unknown",
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("preserves ordinary retries after a malformed transient response", async () => {
+    immediateSleep.mockClear();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("not-json", { status: 502 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true,
+        result: { message_id: 10 },
+      }), { status: 200 }));
+    const client = new TelegramClient("token", fetchMock, { sleep: immediateSleep });
+
+    await expect(client.sendMessage("1", { text: "hello" })).resolves.toMatchObject({ message_id: 10 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(immediateSleep).toHaveBeenCalledWith(250, expect.any(AbortSignal));
   });
 
   it("allows three transient retries after the initial request", async () => {

@@ -114,16 +114,35 @@ test("rejects a corrupted locked skill before the BB host is accessed", async ()
 test("verifies the real committed bundle", () => {
   const verified = verifySkillBundle(repositoryRoot);
 
-  expect(verified.skillIds).toHaveLength(18);
+  expect(verified.skillIds).toHaveLength(26);
   expect(verified.skillIds).toEqual(expect.arrayContaining([
     "brainstorming",
     "clean-code-guard",
     "docs-guard",
+    "domain-modeling",
+    "grill-with-docs",
+    "grilling",
+    "human-friendly-coding-communication",
+    "proportional-development-workflow",
     "test-guard",
     "pr-writer",
     "writing-skills",
   ]));
   expect(verified.bundleDigest).toMatch(/^[a-f0-9]{64}$/);
+});
+
+test("rejects tampered discovery-kit provenance", () => {
+  const root = copiedBundleRoot();
+  const lockPath = join(root, "skills/skills.lock.json");
+  const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
+    discoveryKit: { revision: string };
+  };
+  lock.discoveryKit.revision = "unreviewed";
+  writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    "Skill bundle integrity error: malformed discovery-kit provenance",
+  );
 });
 
 test.each([
@@ -169,7 +188,13 @@ test.each([
   [641, true],
 ])("enforces the total bundle-entry boundary at %i entries", (limit, rejected) => {
   const root = copiedBundleRoot();
-  const roots = [join(root, "skills/workflow-kit"), join(root, "skills/guards"), join(root, "skills/delivery")];
+  const roots = [
+    join(root, "skills/workflow-kit"),
+    join(root, "skills/guards"),
+    join(root, "skills/delivery"),
+    join(root, "skills/discovery"),
+    join(root, "skills/hanoon"),
+  ];
   fillEntryLimit(roots, join(root, "skills/guards/clean-code-guard/excess"), limit);
 
   if (rejected) {

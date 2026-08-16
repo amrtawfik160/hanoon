@@ -1,11 +1,20 @@
 import type Database from "better-sqlite3";
 import {
   projectPolicySchema,
+  type DeliveryMode,
   type Job,
+  type JobOrigin,
+  type RoutingMode,
   type JobEffect,
   type JobState,
   type StoredEffect,
 } from "../domain/models";
+import { TASK_RECIPES, type TaskRecipe } from "../domain/recipes";
+import {
+  taskReasonCodesSchema,
+  taskTraitSnapshotSchema,
+} from "../capabilities/routing";
+import { containsForbiddenCallbackMaterial } from "../telegram/callback-material";
 
 type SqliteDatabase = Database.Database;
 
@@ -31,6 +40,16 @@ export type JobRow = {
   deployment_summary: string | null;
   canary_summary: string | null;
   status_message_id: number | null;
+  delivery_mode: DeliveryMode;
+  task_recipe: TaskRecipe;
+  recipe_version: number;
+  recipe_promotion_count: number;
+  routing_mode: RoutingMode;
+  task_traits_json: string;
+  task_reason_codes_json: string;
+  job_origin: JobOrigin;
+  adopted_branch: string | null;
+  adopted_head_sha: string | null;
   plan_cycle: number;
   review_cycle: number;
   review_block_at: number;
@@ -78,6 +97,7 @@ const JOB_STATES: ReadonlySet<JobState> = new Set([
   "merging",
   "deploying",
   "verifying_production",
+  "recovering_worker",
   "production_failed",
   "complete",
   "failed",
@@ -86,18 +106,21 @@ const JOB_STATES: ReadonlySet<JobState> = new Set([
   "merged",
 ]);
 const BLOCKED_REASONS: ReadonlySet<NonNullable<Job["blockedReason"]>> = new Set([
+  "plan_limit",
   "review_limit",
   "configuration",
   "cancellation_unconfirmed",
   "permanent_effect_failure",
 ]);
+const DELIVERY_MODES: ReadonlySet<DeliveryMode> = new Set(["full", "small_fix"]);
+const JOB_ORIGINS: ReadonlySet<JobOrigin> = new Set(["requested", "adopted_pr"]);
+const TASK_RECIPE_SET: ReadonlySet<TaskRecipe> = new Set(TASK_RECIPES);
+const ROUTING_MODES: ReadonlySet<RoutingMode> = new Set(["legacy", "shadow", "active"]);
 
 const MAX_RECEIPT_STRING = 512;
 export const MAX_MERGE_RESULT_JSON = 64_000;
 const MAX_EXTERNAL_URL_LENGTH = 500;
 const MAX_QUERY_DEPTH = 4;
-const RAW_MERGE_CALLBACK = /m:[A-Za-z0-9_-]{32}/;
-const ENCODED_MERGE_CALLBACK = /(?:m|%6d)%3a[A-Za-z0-9_-]{32}/i;
 const CREDENTIAL_QUERY_KEY = /^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|auth(?:orization)?|auth[_-]?(?:token|key)|session[_-]?token|private[_-]?key|credentials?|password|passwd|secret|token|key|jwt|signature|sig)$/i;
 const CREDENTIAL_QUERY_VALUE = /^(?:bearer\s+\S+|(?:sk|rk)-[A-Za-z0-9_-]{10,}|(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|password|secret|token|credential)\s*[:=]|(?:secret|password|token|credential|api[_-]?key)\b)/i;
 
@@ -121,22 +144,6 @@ function decodePercentLayers(value: string, field: string): string {
     candidate = decoded;
   }
   throw new TypeError(`${field} contains excessive percent encoding`);
-}
-
-function containsForbiddenCallbackMaterial(value: string): boolean {
-  let candidate = value;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    if (RAW_MERGE_CALLBACK.test(candidate) || ENCODED_MERGE_CALLBACK.test(candidate)) return true;
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(candidate);
-    } catch {
-      return true;
-    }
-    if (decoded === candidate) return false;
-    candidate = decoded;
-  }
-  return RAW_MERGE_CALLBACK.test(candidate) || ENCODED_MERGE_CALLBACK.test(candidate);
 }
 
 export function assertNoRawMergeCallback(value: string, field: string): void {
@@ -239,6 +246,20 @@ export function parseJobRow(row: JobRow): Job {
   if (row.blocked_reason !== null && !BLOCKED_REASONS.has(row.blocked_reason)) {
     throw new Error(`Unknown persisted blocked reason: ${row.blocked_reason}`);
   }
+  if (!DELIVERY_MODES.has(row.delivery_mode)) {
+    throw new Error(`Unknown persisted delivery mode: ${row.delivery_mode}`);
+  }
+  if (!TASK_RECIPE_SET.has(row.task_recipe)) throw new Error(`Unknown persisted task recipe: ${row.task_recipe}`);
+  if (!Number.isSafeInteger(row.recipe_version) || row.recipe_version < 1) {
+    throw new Error(`Invalid persisted recipe version: ${row.recipe_version}`);
+  }
+  if (!Number.isSafeInteger(row.recipe_promotion_count) || row.recipe_promotion_count < 0 || row.recipe_promotion_count > 2) {
+    throw new Error(`Invalid persisted recipe promotion count: ${row.recipe_promotion_count}`);
+  }
+  if (!ROUTING_MODES.has(row.routing_mode)) throw new Error(`Unknown persisted routing mode: ${row.routing_mode}`);
+  const taskTraits = taskTraitSnapshotSchema.parse(JSON.parse(row.task_traits_json));
+  const taskReasonCodes = taskReasonCodesSchema.parse(JSON.parse(row.task_reason_codes_json));
+  if (!JOB_ORIGINS.has(row.job_origin)) throw new Error(`Unknown persisted job origin: ${row.job_origin}`);
   return {
     id: row.id,
     sourceUpdateId: row.source_update_id,
@@ -263,6 +284,16 @@ export function parseJobRow(row: JobRow): Job {
     deploymentSummary: row.deployment_summary,
     canarySummary: row.canary_summary,
     statusMessageId: row.status_message_id,
+    deliveryMode: row.delivery_mode,
+    taskRecipe: row.task_recipe,
+    recipeVersion: row.recipe_version,
+    recipePromotionCount: row.recipe_promotion_count,
+    routingMode: row.routing_mode,
+    taskTraits,
+    taskReasonCodes,
+    origin: row.job_origin,
+    adoptedBranch: row.adopted_branch,
+    adoptedHeadSha: row.adopted_head_sha,
     planCycle: row.plan_cycle,
     reviewCycle: row.review_cycle,
     reviewBlockAt: row.review_block_at,
@@ -310,7 +341,9 @@ export function persistJobTransition(
          policy_version = ?, policy_json = ?, environment_id = ?,
          implementation_thread_id = ?, review_thread_id = ?, documentation_thread_id = ?, pr_number = ?,
          pr_url = ?, pr_head_sha = ?, merge_message = ?, merge_commit_sha = ?, merged_at = ?,
-         deployment_summary = ?, canary_summary = ?, status_message_id = ?, plan_cycle = ?, review_cycle = ?,
+         deployment_summary = ?, canary_summary = ?, status_message_id = ?, delivery_mode = ?,
+         task_recipe = ?, recipe_version = ?, recipe_promotion_count = ?, routing_mode = ?,
+         task_traits_json = ?, task_reason_codes_json = ?, plan_cycle = ?, review_cycle = ?,
          review_block_at = ?, cancel_requested_at = ?, blocked_reason = ?,
          last_error = ?, version = ?, updated_at = ?
        WHERE id = ? AND version = ?`,
@@ -335,6 +368,13 @@ export function persistJobTransition(
       transitionedJob.deploymentSummary,
       transitionedJob.canarySummary,
       transitionedJob.statusMessageId,
+      transitionedJob.deliveryMode,
+      transitionedJob.taskRecipe,
+      transitionedJob.recipeVersion,
+      transitionedJob.recipePromotionCount,
+      transitionedJob.routingMode,
+      JSON.stringify(transitionedJob.taskTraits),
+      JSON.stringify(transitionedJob.taskReasonCodes),
       transitionedJob.planCycle,
       transitionedJob.reviewCycle,
       transitionedJob.reviewBlockAt,
@@ -379,6 +419,8 @@ export const JOB_SELECT = `
          policy_version, policy_json, environment_id, implementation_thread_id,
          review_thread_id, documentation_thread_id, pr_number, pr_url, pr_head_sha,
          merge_message, merge_commit_sha, merged_at, deployment_summary, canary_summary, status_message_id,
+         delivery_mode, task_recipe, recipe_version, recipe_promotion_count, routing_mode,
+         task_traits_json, task_reason_codes_json, job_origin, adopted_branch, adopted_head_sha,
          plan_cycle, review_cycle, review_block_at, cancel_requested_at, blocked_reason,
          last_error, version, created_at, updated_at
     FROM jobs`;

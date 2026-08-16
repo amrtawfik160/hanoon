@@ -2,13 +2,16 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
+import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 import type { JobEffect, StoredEffect } from "../src/domain/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { EffectRunner } from "../src/services/effect-runner";
 import {
   runJobExecutorService,
+  WORKER_RECONCILE_INTERVAL_MS,
   type JobExecutorDependencies,
 } from "../src/services/job-executor-service";
+import { TelegramRequestError } from "../src/telegram/client";
 import { TelegramApiError } from "../src/telegram/errors";
 import { TelegramPresenceCoordinator } from "../src/services/telegram-presence";
 import { JobLaneSnapshotProvider } from "../src/services/job-lane-runner";
@@ -16,6 +19,7 @@ import type { WorkerLiveness } from "../src/domain/models";
 import { AutonomyRepository } from "../src/storage/autonomy-repository";
 import { AutonomyScheduler } from "../src/autonomy/scheduler";
 import { policyFixture } from "./helpers";
+import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
 let fixtureNumber = 0;
 
@@ -30,6 +34,23 @@ function fixture(): { store: TelegramAgentStore; db: Database.Database } {
     }),
     db: bb.storage.database(),
   };
+}
+
+async function runOutboxPass(
+  store: TelegramAgentStore,
+  now: number,
+  telegram: NonNullable<JobExecutorDependencies["telegram"]>,
+): Promise<void> {
+  const abort = new AbortController();
+  await runJobExecutorService({
+    store,
+    clock: { now: () => now },
+    sleep: vi.fn(async () => abort.abort()),
+    effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+    telegram,
+    jitter: () => 0,
+    releaseOnShutdown: true,
+  }, abort.signal);
 }
 
 function insertJobAndOutbox(store: TelegramAgentStore, db: Database.Database): void {
@@ -64,7 +85,9 @@ function prepareExecutorTestJob(
         },
         requiredChecks: [],
         outputRedactionPatterns: [],
+        workerStartGraceMs: 120_000,
         workerLivenessWatchdogMs: 60_000,
+        workerRecoveryLimit: 2,
         maxReviewCycles: 3,
         mergeMethod: "squash",
       },
@@ -222,7 +245,9 @@ function terminalBoundaryController(
         now,
       });
       if (!requested) throw new Error("boundary cancellation request was not persisted");
-      if (!store.applyExecutorJobEvent({
+      // With no live worker to stop there is nothing to confirm: the request
+      // already completed, and a second confirmation would be illegal.
+      if (requested.state !== "cancelled" && !store.applyExecutorJobEvent({
         jobId,
         expectedVersion: requested.version,
         event: { type: "CANCEL_CONFIRMED" },
@@ -410,6 +435,41 @@ function submitAnotherControllerTurn(
 }
 
 describe("singleton job executor", () => {
+  it("reconciles an otherwise silent admitted worker on a bounded interval", async () => {
+    const { store, db } = fixture();
+    const selected = queueProjectJob(store, "job_silent_sweep", "proj_silent_sweep", 1_000);
+    admitPreparedJobs(store, [selected], 2_000);
+    db.prepare(
+      `UPDATE jobs SET state = 'implementing', implementation_thread_id = 'thr_silent',
+         environment_id = 'env_silent' WHERE id = ?`,
+    ).run(selected.id);
+    db.prepare("UPDATE effects SET status = 'done' WHERE job_id = ?").run(selected.id);
+    let now = 2_100;
+    const waits: number[] = [];
+    let reconciliations = 0;
+    const abort = new AbortController();
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      maxConcurrentJobs: () => 1,
+      reconcileJob: async (job) => {
+        if (job.id !== selected.id) return;
+        reconciliations += 1;
+        if (reconciliations === 2) abort.abort();
+      },
+      effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+      waitForWork: async (milliseconds) => {
+        waits.push(milliseconds);
+        now += milliseconds;
+      },
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(reconciliations).toBe(2);
+    expect(waits.reduce((total, wait) => total + wait, 0)).toBe(WORKER_RECONCILE_INTERVAL_MS);
+  });
+
   it.each([1, 2])("admits only the validated cap %s and starts that many pipeline lanes", async (cap) => {
     const { store, db } = fixture();
     const selectedJobs = [
@@ -559,6 +619,60 @@ describe("singleton job executor", () => {
       firstWait.resolve();
       await execution;
       vi.useRealTimers();
+    }
+  });
+
+  it("re-adopts an expired claim before dispatching a retried job effect", async () => {
+    const { store, db } = fixture();
+    const selected = queueProjectJob(store, "job_retry_after_claim_expiry", "proj_retry_claim", 1_000);
+    admitPreparedJobs(store, [selected], 2_000);
+    settleSafeControlEffects(db, selected.id);
+    db.prepare("UPDATE effects SET next_attempt_at = ? WHERE job_id = ? AND kind = 'spawn_plan'")
+      .run(100_000, selected.id);
+
+    const firstPass = executorDeferred();
+    const retryReady = executorDeferred();
+    const abort = new AbortController();
+    const dispatched: string[] = [];
+    let now = 2_000;
+    let waitCount = 0;
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      leaseMs: 30_000,
+      maxConcurrentJobs: () => 1,
+      reconcileJob: async () => undefined,
+      effectRunnerFactory: () => ({
+        run: async (effect: StoredEffect) => {
+          dispatched.push(effect.kind);
+        },
+      }),
+      waitForWork: async () => {
+        waitCount += 1;
+        if (waitCount === 1) {
+          firstPass.resolve();
+          await retryReady.promise;
+        } else if (waitCount >= 3) {
+          abort.abort();
+        }
+      },
+    } as JobExecutorDependencies, abort.signal);
+
+    try {
+      await firstPass.promise;
+      now = 32_001;
+      db.prepare("UPDATE executor_lease SET heartbeat_at = ?, lease_expires_at = ? WHERE singleton = 1")
+        .run(now, now + 30_000);
+      db.prepare("UPDATE effects SET next_attempt_at = ? WHERE job_id = ? AND kind = 'spawn_plan'")
+        .run(now, selected.id);
+      retryReady.resolve();
+      await execution;
+
+      expect(dispatched).toEqual(["spawn_plan"]);
+    } finally {
+      abort.abort();
+      retryReady.resolve();
+      await execution;
     }
   });
 
@@ -1119,6 +1233,247 @@ describe("singleton job executor", () => {
     expect(store.acquireExecutorLease("other", 1_000, 30_000)).toEqual({ acquired: true, generation: 2 });
   });
 
+  it("persists the full Telegram retry_after without holding the outbox lease", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({ logicalKey: "notice:rate-limited", chatId: "70", payload: { text: "hello" } }, 1_000);
+    store.enqueueOutbox({ logicalKey: "notice:ready", chatId: "70", payload: { text: "real reply" } }, 1_000);
+    const delivered: string[] = [];
+    const signals: Array<AbortSignal | undefined> = [];
+    let attempts = 0;
+    const sendMessage = vi.fn(async (
+      _chatId: string,
+      payload: Record<string, unknown>,
+      signal?: AbortSignal,
+    ) => {
+      attempts += 1;
+      signals.push(signal);
+      if (attempts === 1) {
+        throw new TelegramApiError({
+          httpStatus: 429,
+          errorCode: 429,
+          description: "Too Many Requests",
+          retryAfterSeconds: 120,
+        });
+      }
+      delivered.push(String(payload.text));
+      return { message_id: 901 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("notice:rate-limited")).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: 121_000,
+    });
+    expect(store.getOutbox("notice:ready")).toMatchObject({ status: "sent", attempts: 1 });
+    expect(delivered).toEqual(["real reply"]);
+
+    await runOutboxPass(store, 120_999, telegram);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+
+    await runOutboxPass(store, 121_000, telegram);
+    expect(store.getOutbox("notice:rate-limited")).toMatchObject({ status: "sent", attempts: 2 });
+    expect(delivered).toEqual(["real reply", "hello"]);
+    expect(signals).toEqual([
+      expect.any(AbortSignal),
+      expect.any(AbortSignal),
+      expect.any(AbortSignal),
+    ]);
+  });
+
+  it("durably retries a transient request that is known not to have been sent", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({ logicalKey: "notice:dns-retry", chatId: "70", payload: { text: "hello" } }, 1_000);
+    let attempts = 0;
+    const sendMessage = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new TelegramRequestError("Telegram request failed", "not_sent");
+      return { message_id: 902 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("notice:dns-retry")).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      nextAttemptAt: 1_500,
+    });
+
+    await runOutboxPass(store, 1_499, telegram);
+    expect(sendMessage).toHaveBeenCalledOnce();
+
+    await runOutboxPass(store, 1_500, telegram);
+    expect(store.getOutbox("notice:dns-retry")).toMatchObject({ status: "sent", attempts: 2 });
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["the response was lost", new TelegramRequestError("Telegram request failed", "unknown")],
+    ["the transient response was malformed", new TelegramApiError({
+      httpStatus: 502,
+      errorCode: 502,
+      deliveryOutcome: "unknown",
+    })],
+  ])("retries an accepted new message when %s until delivery is confirmed", async (_scenario, deliveryError) => {
+    const { store, db } = fixture();
+    insertJobAndOutbox(store, db);
+    const ownerMessages: string[] = [];
+    let attempts = 0;
+    const sendMessage = vi.fn(async (_chatId: string, payload: Record<string, unknown>) => {
+      attempts += 1;
+      ownerMessages.push(String(payload.text));
+      if (attempts === 1) throw deliveryError;
+      return { message_id: 903 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("job:job_1:status")).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      leaseOwner: null,
+      nextAttemptAt: 1_500,
+    });
+
+    await runOutboxPass(store, 1_500, telegram);
+    expect(store.getOutbox("job:job_1:status")).toMatchObject({ status: "sent", attempts: 2 });
+    expect(ownerMessages).toEqual(["initial", "initial"]);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces an exhausted uncertain delivery with a vetted owner-visible warning", async () => {
+    const { store, db } = fixture();
+    insertJobAndOutbox(store, db);
+    const attemptedTexts: string[] = [];
+    const deliveredTexts: string[] = [];
+    let warningAttempts = 0;
+    const sendMessage = vi.fn(async (_chatId: string, payload: Record<string, unknown>) => {
+      const text = String(payload.text);
+      attemptedTexts.push(text);
+      if (text === "initial") throw new TelegramRequestError("Telegram request failed", "unknown");
+      warningAttempts += 1;
+      if (warningAttempts === 1) throw new TelegramRequestError("Telegram request failed", "not_sent");
+      deliveredTexts.push(text);
+      return { message_id: 904 };
+    });
+    const telegram = () => ({ sendMessage, editMessage: vi.fn(async () => undefined) });
+    let now = 1_000;
+
+    for (let attempt = 0; attempt < 21; attempt += 1) {
+      await runOutboxPass(store, now, telegram);
+      const outbox = store.getOutbox("job:job_1:status")!;
+      if (outbox.status === "sent") break;
+      now = outbox.nextAttemptAt;
+    }
+
+    const outbox = store.getOutbox("job:job_1:status");
+    expect(outbox).toMatchObject({ status: "sent", messageId: 904 });
+    expect(attemptedTexts.filter((text) => text === "initial")).toHaveLength(20);
+    expect(attemptedTexts.filter((text) => text !== "initial")).toHaveLength(2);
+    expect(deliveredTexts).toHaveLength(1);
+    expect(deliveredTexts[0]).toMatch(/couldn't confirm.*previous message.*missing or duplicated/i);
+    expect(outbox?.payload.text).toBe(deliveredTexts[0]);
+  });
+
+  it("retries an ambiguous edit against its stored Telegram message identity", async () => {
+    const { store } = fixture();
+    store.enqueueOutbox({
+      logicalKey: "notice:known-message",
+      chatId: "70",
+      messageId: 77,
+      payload: { text: "updated" },
+    }, 1_000);
+    let attempts = 0;
+    const editMessage = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new TelegramRequestError("Telegram request failed", "unknown");
+    });
+    const sendMessage = vi.fn(async () => ({ message_id: 903 }));
+    const telegram = () => ({ sendMessage, editMessage });
+
+    await runOutboxPass(store, 1_000, telegram);
+    expect(store.getOutbox("notice:known-message")).toMatchObject({
+      status: "failed",
+      nextAttemptAt: 1_500,
+    });
+
+    await runOutboxPass(store, 1_500, telegram);
+    expect(store.getOutbox("notice:known-message")).toMatchObject({ status: "sent", messageId: 77 });
+    expect(editMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("drains 25 queued messages in three bounded passes", async () => {
+    const { store } = fixture();
+    for (let index = 0; index < 25; index += 1) {
+      store.enqueueOutbox({
+        logicalKey: `notice:burst:${String(index).padStart(2, "0")}`,
+        chatId: "70",
+        payload: { text: `message ${index}` },
+      }, 1_000);
+    }
+    const abort = new AbortController();
+    let now = 1_000;
+    const sendMessage = vi.fn(async () => ({ message_id: 904 }));
+    const waitForWork = vi.fn(async () => {
+      const allSent = store.listOutbox(25).every((outbox) => outbox.status === "sent");
+      if (allSent) abort.abort();
+      else now += 1_000;
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage: vi.fn(async () => undefined) }),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledTimes(25);
+    expect(now).toBe(3_000);
+    expect(store.listOutbox(25).every((outbox) => outbox.status === "sent")).toBe(true);
+  });
+
+  it("leases each burst message immediately before its bounded network call", async () => {
+    const { store } = fixture();
+    for (let index = 0; index < 10; index += 1) {
+      store.enqueueOutbox({
+        logicalKey: `notice:fresh-lease:${index}`,
+        chatId: "70",
+        payload: { text: `message ${index}` },
+      }, 1_000);
+    }
+    const abort = new AbortController();
+    let now = 1_000;
+    const sendMessage = vi.fn(async (_chatId: string, payload: Record<string, unknown>, signal?: AbortSignal) => {
+      const current = store.listOutbox(10).find((outbox) => outbox.payload.text === payload.text);
+      expect(current).toMatchObject({
+        status: "leased",
+        leaseExpiresAt: now + 30_000,
+      });
+      expect(signal).toBeInstanceOf(AbortSignal);
+      now += 4_000;
+      expect(store.renewExecutorLease(current!.leaseOwner!, current!.leaseGeneration!, now, 30_000)).toBe(true);
+      return { message_id: 905 };
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      waitForWork: vi.fn(async () => abort.abort()),
+      telegram: () => ({ sendMessage, editMessage: vi.fn(async () => undefined) }),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledTimes(10);
+    expect(store.listOutbox(10).every((outbox) => outbox.status === "sent")).toBe(true);
+  });
+
   it("completes an expired callback answer without retrying or crashing", async () => {
     const { store } = fixture();
     store.enqueueOutbox({ logicalKey: "callback:expired", chatId: "70", payload: { text: "Done" } }, 1_000);
@@ -1179,7 +1534,53 @@ describe("singleton job executor", () => {
       }),
     }, abort.signal);
 
-    expect(sendMessage).toHaveBeenCalledWith("70", { text: "updated" });
+    expect(sendMessage).toHaveBeenCalledWith("70", { text: "updated" }, expect.any(AbortSignal));
+    expect(store.getJob(job.id)?.statusMessageId).toBe(202);
+    expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", messageId: 202 });
+  });
+
+  it("renews the row before a replacement send can consume the remaining lease", async () => {
+    const { store } = fixture();
+    const created = store.createJob({ id: "job_slow_replace", sourceUpdateId: 13, requestText: "work", now: 1_000 });
+    const job = store.setJobStatusMessage(created.id, 101, created.version, 1_001);
+    store.enqueueOutbox({
+      logicalKey: `job:${job.id}:status`,
+      chatId: "70",
+      messageId: 101,
+      payload: { text: "updated" },
+    }, 1_002);
+    const abort = new AbortController();
+    let now = 2_000;
+    const renewExecutor = (): void => {
+      const outbox = store.getOutbox(`job:${job.id}:status`)!;
+      expect(store.renewExecutorLease(outbox.leaseOwner!, outbox.leaseGeneration!, now, 30_000)).toBe(true);
+    };
+    const editMessage = vi.fn(async () => {
+      now += 15_000;
+      renewExecutor();
+      throw new TelegramApiError({
+        httpStatus: 400,
+        errorCode: 400,
+        description: "Bad Request: message to edit not found",
+        retryAfterSeconds: null,
+      });
+    });
+    const sendMessage = vi.fn(async () => {
+      now += 15_000;
+      renewExecutor();
+      abort.abort();
+      return { message_id: 202 };
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      telegram: () => ({ sendMessage, editMessage }),
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(sendMessage).toHaveBeenCalledOnce();
     expect(store.getJob(job.id)?.statusMessageId).toBe(202);
     expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", messageId: 202 });
   });
@@ -1212,8 +1613,20 @@ describe("singleton job executor", () => {
       telegram: () => ({ sendMessage: vi.fn(async () => ({ message_id: 1 })), editMessage }),
     }, abort.signal);
 
-    expect(editMessage).toHaveBeenNthCalledWith(1, "70", 303, { text: "<b>broken", parse_mode: "HTML" });
-    expect(editMessage).toHaveBeenNthCalledWith(2, "70", 303, { text: "<b>broken" });
+    expect(editMessage).toHaveBeenNthCalledWith(
+      1,
+      "70",
+      303,
+      { text: "<b>broken", parse_mode: "HTML" },
+      expect.any(AbortSignal),
+    );
+    expect(editMessage).toHaveBeenNthCalledWith(
+      2,
+      "70",
+      303,
+      { text: "<b>broken" },
+      expect.any(AbortSignal),
+    );
     expect(store.getOutbox(`job:${job.id}:status`)).toMatchObject({ status: "sent", attempts: 1 });
   });
 
@@ -1269,6 +1682,151 @@ describe("singleton job executor", () => {
     expect(waitForWork).toHaveBeenCalledWith(1_000, expect.any(AbortSignal));
   });
 
+  it("keeps heartbeating and drains unrelated work while one provider RPC never settles", async () => {
+    // Regression: on 2026-08-15 one hung provider call left the live executor
+    // heartbeat stale and all unrelated dispatch stopped until restart.
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const { db, store } = fixture();
+    const abort = new AbortController();
+    let releaseProvider!: () => void;
+    let markProviderStarted!: () => void;
+    const providerStarted = new Promise<void>((resolve) => {
+      markProviderStarted = resolve;
+    });
+    const stuckProviderCall = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const unrelatedWork = vi.fn(async () => false);
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => Date.now() },
+      controller: {
+        reconcile: vi.fn(async () => {
+          markProviderStarted();
+          await stuckProviderCall;
+          return false;
+        }),
+        processOne: vi.fn(async () => false),
+      },
+      operations: { processOne: unrelatedWork },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => Date.now() }),
+      waitForWork: async (_milliseconds, signal) => {
+        if (signal.aborted) return;
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      },
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    try {
+      await providerStarted;
+      const acquiredHeartbeat = (db.prepare(
+        "SELECT heartbeat_at FROM executor_lease WHERE singleton = 1",
+      ).get() as { heartbeat_at: number }).heartbeat_at;
+
+      await vi.advanceTimersByTimeAsync(10_001);
+
+      const renewedHeartbeat = (db.prepare(
+        "SELECT heartbeat_at FROM executor_lease WHERE singleton = 1",
+      ).get() as { heartbeat_at: number }).heartbeat_at;
+      expect(renewedHeartbeat).toBeGreaterThan(acquiredHeartbeat);
+      expect(unrelatedWork).toHaveBeenCalled();
+    } finally {
+      abort.abort();
+      releaseProvider();
+      await vi.runAllTimersAsync();
+      await execution;
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a blocked controller pass from the independent stall timer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5_000);
+    const { store } = fixture();
+    const abort = new AbortController();
+    let reconcilePasses = 0;
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => Date.now() },
+      controller: {
+        reconcile: vi.fn(async (_fence, signal) => {
+          reconcilePasses += 1;
+          if (reconcilePasses === 1) {
+            await new Promise<void>((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+            });
+          }
+          abort.abort();
+          return true;
+        }),
+        processOne: vi.fn(async () => false),
+        nextStallDeadlineMs: () => 25,
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => Date.now() }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    try {
+      await vi.advanceTimersByTimeAsync(30);
+      await execution;
+
+      expect(reconcilePasses).toBe(2);
+    } finally {
+      abort.abort();
+      await vi.runAllTimersAsync();
+      await execution;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not carry a reconciled turn's stall deadline into the next dispatch", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5_000);
+    const { store } = fixture();
+    const abort = new AbortController();
+    let oldTurnPending = true;
+    let releaseDispatch!: () => void;
+    let markDispatchStarted!: (signal: AbortSignal) => void;
+    const dispatchStarted = new Promise<AbortSignal>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const dispatch = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    const execution = runJobExecutorService({
+      store,
+      clock: { now: () => Date.now() },
+      controller: {
+        reconcile: vi.fn(async () => {
+          oldTurnPending = false;
+          return true;
+        }),
+        processOne: vi.fn(async (_fence, signal) => {
+          markDispatchStarted(signal);
+          await dispatch;
+          return true;
+        }),
+        nextStallDeadlineMs: () => oldTurnPending ? 25 : null,
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => Date.now() }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    try {
+      const processSignal = await dispatchStarted;
+      await vi.advanceTimersByTimeAsync(30);
+
+      expect(processSignal.aborted).toBe(false);
+    } finally {
+      abort.abort();
+      releaseDispatch();
+      await vi.runAllTimersAsync();
+      await execution;
+      vi.useRealTimers();
+    }
+  });
+
   it("streams a submitted controller turn through one ephemeral Telegram draft", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);
@@ -1297,7 +1855,6 @@ describe("singleton job executor", () => {
               now: 2_000,
               turnId: "controller-turn-900",
               cursor: 1,
-              text: "Luna is working live",
               phase: "responding",
             })).toBe(true);
           }
@@ -1309,8 +1866,20 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(1, "7", expect.any(Number), "");
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(2, "7", expect.any(Number), "Luna is working live");
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(
+      1,
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.connecting,
+      expect.any(AbortSignal),
+    );
+    expect(sendMessageDraft).toHaveBeenNthCalledWith(
+      2,
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.responding,
+      expect.any(AbortSignal),
+    );
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
     expect(sendMessageDraft.mock.calls[0]?.[1]).toBeGreaterThan(0);
     expect(sendMessage).not.toHaveBeenCalled();
@@ -1318,8 +1887,309 @@ describe("singleton job executor", () => {
     expect(store.getOutbox("controller:controller-turn-900:reply")).toMatchObject({
       status: "sent",
       messageId: null,
-      payload: { text: "Luna is working live" },
+      payload: { text: CONTROLLER_PHASE_TEXT.responding },
     });
+  });
+
+  it("coalesces repeated controller phase edits before they reach Telegram", async () => {
+    const { store } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 501 }));
+    const editMessage = vi.fn(async () => undefined);
+    let loop = 0;
+    let executorFence: { ownerId: string; generation: number } | null = null;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (executorFence && (loop === 1 || loop === 2)) {
+        expect(store.updateControllerStream({
+          ownerId: executorFence.ownerId,
+          generation: executorFence.generation,
+          now: 1_000 + loop * 1_000,
+          turnId,
+          cursor: loop,
+          phase: "responding",
+        })).toBe(true);
+      }
+      if (loop === 3) abort.abort();
+    });
+    const reconcile = vi.fn(async (fence: Parameters<NonNullable<JobExecutorDependencies["controller"]>["reconcile"]>[0]) => {
+      executorFence = fence;
+      return true;
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage }),
+      controller: {
+        reconcile,
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    expect(waitForWork).toHaveBeenCalledTimes(3);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(editMessage).toHaveBeenCalledOnce();
+    expect(editMessage).toHaveBeenCalledWith("7", 501, {
+      text: CONTROLLER_PHASE_TEXT.responding,
+      disable_web_page_preview: true,
+    }, expect.any(AbortSignal));
+  });
+
+  it("does not let a slow stream edit hold back the terminal reply", async () => {
+    const { store } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    let nextMessageId = 500;
+    const sendMessage = vi.fn(async () => ({ message_id: ++nextMessageId }));
+    let resolveEdit!: () => void;
+    const editMessage = vi.fn(() => new Promise<void>((resolve) => {
+      resolveEdit = resolve;
+    }));
+    let loop = 0;
+    let executorFence: { ownerId: string; generation: number } | null = null;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (loop === 1 && executorFence) {
+        expect(store.updateControllerStream({
+          ownerId: executorFence.ownerId,
+          generation: executorFence.generation,
+          now: 2_000,
+          turnId,
+          cursor: 1,
+          phase: "responding",
+        })).toBe(true);
+      }
+      if (loop === 3) abort.abort();
+    });
+    const reconcile = vi.fn(async (fence: Parameters<NonNullable<JobExecutorDependencies["controller"]>["reconcile"]>[0]) => {
+      executorFence = fence;
+      if (loop === 2) {
+        completeTurnThroughFinalization(store, {
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: 3_000,
+        }, { turnId, controllerKey: "executor-presence-controller", responseText: "Final answer" });
+      }
+      return true;
+    });
+
+    const run = runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage }),
+      controller: {
+        reconcile,
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    try {
+      const completed = await Promise.race([
+        run.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+      ]);
+      expect(completed).toBe(true);
+      expect(sendMessage).toHaveBeenCalledWith("7", {
+        text: "Final answer",
+        disable_web_page_preview: true,
+      }, expect.any(AbortSignal));
+    } finally {
+      resolveEdit();
+      await run;
+    }
+  });
+
+  it("keeps delivering a reply when Telegram presence fails", async () => {
+    const { store } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    let nextMessageId = 500;
+    const sendMessage = vi.fn(async () => ({ message_id: ++nextMessageId }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendChatAction = vi.fn(async () => {
+      throw new Error("typing unavailable");
+    });
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: { sendChatAction },
+      warn: vi.fn(),
+    });
+    let loop = 0;
+    const waitForWork = vi.fn(async () => {
+      loop += 1;
+      if (loop === 3) abort.abort();
+    });
+    const reconcile = vi.fn(async (fence: Parameters<NonNullable<JobExecutorDependencies["controller"]>["reconcile"]>[0]) => {
+      if (loop === 1) {
+        completeTurnThroughFinalization(store, {
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: 2_000,
+        }, { turnId, controllerKey: "executor-presence-controller", responseText: "Final answer" });
+      }
+      return true;
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 + loop * 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage }),
+      presence,
+      controller: {
+        reconcile,
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
+    }, abort.signal);
+
+    expect(sendChatAction).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledWith("7", {
+      text: CONTROLLER_PHASE_TEXT.connecting,
+      disable_web_page_preview: true,
+    }, expect.any(AbortSignal));
+    expect(editMessage).toHaveBeenCalledWith("7", 501, {
+      text: "Final answer",
+      disable_web_page_preview: true,
+    }, expect.any(AbortSignal));
+  });
+
+  it("derives an ephemeral draft from the phase, never a legacy raw stream_text token", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    // A pre-cutover durable stream_text carrying raw provider prose must never
+    // reach Telegram as a preview: the draft is the phase literal only.
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = ? WHERE id = ?")
+      .run("pre-cutover RAW-SECRET token", "thinking", turnId);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, _text: string) => undefined);
+    const waitForWork = vi.fn(async () => abort.abort());
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1);
+    expect(sendMessageDraft).toHaveBeenCalledWith(
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.thinking,
+      expect.any(AbortSignal),
+    );
+    expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("RAW-SECRET");
+    expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("token");
+  });
+
+  it("suppresses a pending draft send for a submitted terminal-phase turn", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    // The phase flipped to a terminal literal while a stale placeholder draft
+    // still sits in the outbox: it must be retired, never redrawn or sent.
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = ? WHERE id = ?")
+      .run("pre-cutover RAW-SECRET token", "failed", turnId);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, _text: string) => undefined);
+    const waitForWork = vi.fn(async () => abort.abort());
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork,
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessageDraft).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({
+      status: "sent",
+      messageId: null,
+    });
+  });
+
+  it("suppresses a terminal controller draft before the known-message edit path", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = 'complete' WHERE id = ?")
+      .run("pre-cutover RAW-EDIT token", turnId);
+    db.prepare("UPDATE outbox SET message_id = 808, status = 'pending' WHERE logical_key = ?")
+      .run(`controller:${turnId}:reply`);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+    const sendMessageDraft = vi.fn(async () => undefined);
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      waitForWork: vi.fn(async () => abort.abort()),
+      telegram: () => ({ sendMessage, editMessage, sendMessageDraft }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(sendMessageDraft).not.toHaveBeenCalled();
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({ status: "sent", messageId: 808 });
+  });
+
+  it("suppresses a terminal controller draft when Telegram has no draft API", async () => {
+    const { store, db } = fixture();
+    const turnId = addSubmittedControllerTurn(store);
+    db.prepare("UPDATE controller_turns SET stream_text = ?, stream_phase = 'failed' WHERE id = ?")
+      .run("pre-cutover RAW-SEND token", turnId);
+    const abort = new AbortController();
+    const sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    const editMessage = vi.fn(async () => undefined);
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 1_000 },
+      waitForWork: vi.fn(async () => abort.abort()),
+      telegram: () => ({ sendMessage, editMessage }),
+      controller: {
+        reconcile: vi.fn(async () => false),
+        processOne: vi.fn(async () => false),
+      },
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
+    }, abort.signal);
+
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({ status: "sent", messageId: null });
   });
 
   it("persists exactly one final controller message after ephemeral draft streaming", async () => {
@@ -1344,13 +2214,11 @@ describe("singleton job executor", () => {
       controller: {
         reconcile: vi.fn(async (fence) => {
           if (loop === 1) {
-            expect(store.completeControllerTurn({
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-              turnId,
-              responseText: "Final answer",
-            })).toBe(true);
+            completeTurnThroughFinalization(
+              store,
+              { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 },
+              { turnId, controllerKey: "executor-presence-controller", responseText: "Final answer" },
+            );
           }
           return true;
         }),
@@ -1360,12 +2228,17 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessageDraft).toHaveBeenCalledOnce();
-    expect(sendMessageDraft).toHaveBeenCalledWith("7", expect.any(Number), "");
+    expect(sendMessageDraft).toHaveBeenCalledWith(
+      "7",
+      expect.any(Number),
+      CONTROLLER_PHASE_TEXT.connecting,
+      expect.any(AbortSignal),
+    );
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage).toHaveBeenCalledWith("7", {
       text: "Final answer",
       disable_web_page_preview: true,
-    });
+    }, expect.any(AbortSignal));
     expect(editMessage).not.toHaveBeenCalled();
     expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({
       status: "sent",
@@ -1398,13 +2271,11 @@ describe("singleton job executor", () => {
           // The owner reads the answer and immediately asks the next question,
           // while Telegram still shows the previous 30-second preview.
           if (loop === 1) {
-            expect(store.completeControllerTurn({
-              ownerId: fence.ownerId,
-              generation: fence.generation,
-              now: 2_000,
-              turnId: firstTurnId,
-              responseText: "First answer",
-            })).toBe(true);
+            completeTurnThroughFinalization(
+              store,
+              { ownerId: fence.ownerId, generation: fence.generation, now: 2_000 },
+              { turnId: firstTurnId, controllerKey: "executor-presence-controller", responseText: "First answer" },
+            );
             submitAnotherControllerTurn(store, fence, 901, 2_000);
           }
           return true;
@@ -1449,7 +2320,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: { sendChatAction },
       warn: vi.fn(),
     });
@@ -1479,7 +2349,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: { sendChatAction: vi.fn(async () => undefined) },
       warn: vi.fn(),
     });
@@ -1497,7 +2366,7 @@ describe("singleton job executor", () => {
     expect(waitForWork).toHaveBeenCalledWith(60_000, expect.any(AbortSignal));
   });
 
-  it("stops pulsing after lease loss and resets the stale lease state", async () => {
+  it("stops pulsing after lease loss and resumes once the prior deadline passes", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);
     const abort = new AbortController();
@@ -1506,7 +2375,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: { sendChatAction },
       warn: vi.fn(),
     });
@@ -1529,6 +2397,45 @@ describe("singleton job executor", () => {
     expect(sendChatAction).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps presence throttled across rapid executor lease turnover after the 2026-08-12 incident", async () => {
+    const { store, db } = fixture();
+    addSubmittedControllerTurn(store);
+    const abort = new AbortController();
+    let now = 1_000;
+    let waits = 0;
+    const sendChatAction = vi.fn(async () => undefined);
+    const laneSnapshots = new JobLaneSnapshotProvider();
+    const presence = new TelegramPresenceCoordinator({
+      store,
+      telegram: { sendChatAction },
+      warn: vi.fn(),
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      sleep: vi.fn(async () => { throw new Error("ordinary loop sleep must not be used"); }),
+      waitForWork: vi.fn(async () => {
+        waits += 1;
+        if (waits === 1) {
+          const lease = db.prepare(
+            "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+          ).get() as { owner_id: string; generation: number };
+          expect(store.releaseExecutorLease(lease.owner_id, lease.generation, now)).toBe(true);
+          now += 1;
+          return;
+        }
+        abort.abort();
+      }),
+      presence,
+      laneSnapshots,
+      effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => now }),
+    }, abort.signal);
+
+    expect(waits).toBe(2);
+    expect(sendChatAction).toHaveBeenCalledOnce();
+  });
+
   it("stops cleanly when shutdown aborts an in-flight presence request", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);
@@ -1536,7 +2443,6 @@ describe("singleton job executor", () => {
     const laneSnapshots = new JobLaneSnapshotProvider();
     const presence = new TelegramPresenceCoordinator({
       store,
-      jobLanes: laneSnapshots,
       telegram: {
         sendChatAction: vi.fn(async (_chatId, _action, signal) => {
           abort.abort(new Error("executor stopped"));
@@ -1642,6 +2548,57 @@ describe("singleton job executor", () => {
       expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(1);
     },
   );
+
+  it("refreshes stale BB worker liveness before releasing a terminal job", async () => {
+    const { store } = fixture();
+    const jobId = "job_executor_stale_release";
+    queueExecutorBoundaryJob(store, jobId);
+    const abort = new AbortController();
+    const getWorkerThread = vi.fn(async (threadId: string) => ({
+      id: threadId,
+      status: "idle",
+      updatedAt: 20_000,
+      runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
+    }));
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 20_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      controller: terminalBoundaryController(store, jobId, 20_000, boundaryWorker(jobId, "stale", 1_000), true),
+      getWorkerThread,
+      effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(store.getWorkerLiveness(jobId)).toMatchObject({ state: "idle", observedAt: 20_000 });
+    expect(store.getAdmission(jobId)?.state).toBe("released");
+    expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(0);
+  });
+
+  it("keeps the claim and records an unknown worker when the BB refresh fails", async () => {
+    const { store } = fixture();
+    const jobId = "job_executor_stale_lookup_failure";
+    queueExecutorBoundaryJob(store, jobId);
+    const abort = new AbortController();
+    const getWorkerThread = vi.fn(async () => {
+      throw new Error("BB temporarily unavailable");
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => 20_000 },
+      sleep: vi.fn(async () => abort.abort()),
+      controller: terminalBoundaryController(store, jobId, 20_000, boundaryWorker(jobId, "stale", 1_000), true),
+      getWorkerThread,
+      effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(store.getWorkerLiveness(jobId)).toMatchObject({ state: "unknown", observedAt: 20_000 });
+    expect(store.getAdmission(jobId)?.state).toBe("draining");
+    expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(1);
+  });
 
   it("does not finalize a draining job while its sequential operation is still in memory", async () => {
     const { store } = fixture();
@@ -1768,5 +2725,46 @@ describe("singleton job executor", () => {
 
     expect(store.getAdmission(jobId)?.state).toBe("released");
     expect(store.listHeldResourceClaims(jobId, 10).filter((claim) => claim.state === "held")).toHaveLength(0);
+    // Draining a 101-deep cancellation backlog against a real SQLite store is
+    // the slowest case in this file; it needs more than the default budget
+    // without loosening the budget for every other test.
+  }, 15_000);
+});
+
+describe("controller stall deadline", () => {
+  // A wedged turn produces no provider events, so an executor that only woke
+  // for provider activity never reached the stall check: a turn sat sixteen
+  // minutes past its eight minute deadline until the plugin was restarted by
+  // hand. The loop must sleep up to the deadline, not past it.
+  it("shortens the wait to the in-flight turn's deadline and leaves it alone otherwise", async () => {
+    for (const [deadlineMs, expectShortened] of [[25, true], [null, false]] as const) {
+      const { store } = fixture();
+      const waits: number[] = [];
+      let now = 2_000;
+      const abort = new AbortController();
+
+      await runJobExecutorService({
+        store,
+        clock: { now: () => now },
+        maxConcurrentJobs: () => 1,
+        controller: {
+          processOne: async () => false,
+          reconcile: async () => false,
+          // Far shorter than any ordinary poll interval, so a wait this short
+          // can only have been bounded by the deadline.
+          nextStallDeadlineMs: () => deadlineMs,
+        },
+        effectRunnerFactory: () => ({ run: vi.fn(async () => undefined) }),
+        waitForWork: async (milliseconds) => {
+          waits.push(milliseconds);
+          now += milliseconds;
+          if (waits.length === 2) abort.abort();
+        },
+        releaseOnShutdown: true,
+      } as JobExecutorDependencies, abort.signal);
+
+      expect(waits.length).toBeGreaterThan(0);
+      expect(waits.every((wait) => wait === 25)).toBe(expectShortened);
+    }
   });
 });

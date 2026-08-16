@@ -5,7 +5,7 @@ import type { GateInput } from "../src/domain/gates";
 import type { StoredEffect } from "../src/domain/models";
 import { projectResourceKey } from "../src/autonomy/models";
 import { hashSecret } from "../src/crypto";
-import { createTask9FreshGateCollector, MergeHandler } from "../src/services/merge-handler";
+import { createFreshGateCollector, MergeHandler } from "../src/services/merge-handler";
 import type { ValidationSnapshot } from "../src/bb/validation";
 import { ApprovalService } from "../src/services/approval-service";
 import { openStore, type DurableMergeReceipt } from "../src/storage/store";
@@ -465,7 +465,7 @@ async function staleOldApprovalAndCreateNewEffect() {
 }
 
 describe("fresh Telegram merge execution", () => {
-  it("uses the concrete Task 8 validation receipt for callback and merge-handler head truth", async () => {
+  it("uses the concrete validation receipt for callback and merge-handler head truth", async () => {
     const fixture = mergeFixture();
     const gate = gateInput({
       remoteHead: {
@@ -518,7 +518,7 @@ describe("fresh Telegram merge execution", () => {
     };
     const contextGate = gate;
     const runValidation = vi.fn(async () => snapshot);
-    const collector = createTask9FreshGateCollector({
+    const collector = createFreshGateCollector({
       validation: { runner: {} as never, environments: {} as never },
       runValidation,
       getContext: async ({ receipt }) => ({

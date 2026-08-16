@@ -27,9 +27,9 @@ The full check performs TypeScript validation, the complete Vitest suite, and a 
 
 ## Answer-quality evaluation
 
-The deterministic suite proves the plumbing; it cannot tell you whether an answer reads the way the controller instructions promise. `npm run eval:answers -- --project <project-id>` grades golden answers against that contract using a BB thread as judge.
+The deterministic suite proves the plumbing; it cannot tell you whether an answer reads the way the controller instructions promise. Run the release-grade calibration with an absolute artifact path outside this repository: `npm run eval:answers -- --project <project-id> --artifact /absolute/path/outside/repository/live-answer-gate.json`. The command rejects relative paths and paths inside the repository.
 
-It is deliberately outside `npm run check`: grading costs a provider turn per case, and the suite must stay runnable offline and for free. The golden cases carry the verdict a correctly calibrated judge must reach, so the rubric is checked against known-good and known-bad answers *before* it is trusted to judge a prompt change. A disagreement with a golden case exits non-zero — a rubric that misgrades its own fixtures cannot grade anything else.
+It is deliberately outside `npm run check`: each case has six independent clause judgments, with each non-deterministic clause using its own hidden BB judge turn. Clause concurrency is one, so those turns run serially; the current seven-case corpus can consume up to 42 provider turns, and cost and elapsed time grow with the number of cases and clauses. The golden cases carry the verdict a correctly calibrated judge must reach, so the rubric is checked against known-good and known-bad answers *before* it is trusted to judge a prompt change. A disagreement with a golden case exits non-zero — a rubric that misgrades its own fixtures cannot grade anything else. `--case <id>` remains available for one-case diagnosis, but its incomplete artifact is never release-passed.
 
 ## Change boundaries
 
@@ -49,6 +49,8 @@ Add the smallest behavior-focused test that proves the change. Use the real plug
 For state-machine work, cover the exact state/event transition, idempotency, stale version, lease generation, and terminal outcome. For prompt/agent work, test required structural contracts rather than exact prose. For a production regression, keep the incident date or issue reference in the test name or a short rationale comment.
 
 Never weaken, skip, or replace a failing test with a canned production success path.
+
+A test run owns one temp root. `tests/setup/temp-root.ts` creates it and removes it when the run ends, and `tests/setup/worker-temp-root.ts` points `os.tmpdir()` at it in every test process, so fixtures that never dispose their temp directory (`createFakePluginHost` among them) cannot accumulate on disk. Create fixture directories under `os.tmpdir()` rather than a hard-coded `/tmp`, and let the run root do the cleanup. A run killed outright leaves its root behind; the next run sweeps roots older than an hour. `tests/temp-cleanup.test.ts` fails if a run leaves anything behind.
 
 ## Documentation
 

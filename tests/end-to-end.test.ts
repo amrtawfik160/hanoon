@@ -609,6 +609,13 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       now: time,
     });
     if (!controllerTurn) throw new Error("controller turn was not claimable");
+    expect(store.reserveControllerSpawn({
+      controllerKey: controllerTurn.controllerKey,
+      turnId: controllerTurn.id,
+      projectId: "proj_personal",
+      hostId: "host_personal",
+      now: time,
+    })).toBe(true);
     expect(store.markControllerSpawned({
       turnId: controllerTurn.id,
       ownerId: "controller-setup",
@@ -617,6 +624,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       projectId: "proj_personal",
       hostId: "host_personal",
       threadId: "thr_controller",
+      spawnToken: controllerTurn.id,
     })).toBe(true);
     expect(store.markControllerTurnSubmitted({
       turnId: controllerTurn.id,
@@ -928,19 +936,25 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     );
     time += 5_000;
     await runExecutorOnce(store, now, completionTelegram);
-    expect(delivered).toHaveLength(1);
+    expect(delivered).toHaveLength(2);
+    expect(delivered.some((payload) => typeof payload.text === "string" && payload.text.startsWith("Shipped “"))).toBe(true);
     expect(store.getAdmission(job.id)?.state).toBe("released");
     expect(store.listOutbox(20).some((item) => item.status === "sent")).toBe(true);
     expect(mergeCalls).toHaveLength(1);
 
     const attempts = bb.storage.database().prepare(
-      "SELECT id, ordinal, thread_id, head_sha, handoff_sha256 FROM attempts WHERE job_id = ? AND kind = 'review' ORDER BY created_at, id",
-    ).all(job.id) as Array<{ id: string; ordinal: number; thread_id: string; head_sha: string; handoff_sha256: string }>;
-    expect(attempts).toHaveLength(5);
-    expect(attempts.map((attempt) => attempt.head_sha)).toEqual([HEAD_ONE, HEAD_TWO, HEAD_TWO, HEAD_THREE, HEAD_THREE]);
-    expect(new Set(attempts.map((attempt) => attempt.thread_id)).size).toBe(5);
+      "SELECT id, ordinal, review_lens, thread_id, head_sha, handoff_sha256 FROM attempts WHERE job_id = ? AND kind = 'review' ORDER BY created_at, id",
+    ).all(job.id) as Array<{ id: string; ordinal: number; review_lens: string; thread_id: string; head_sha: string; handoff_sha256: string }>;
+    expect(attempts).toHaveLength(10);
+    expect(attempts.map((attempt) => attempt.head_sha)).toEqual([
+      HEAD_ONE, HEAD_ONE, HEAD_TWO, HEAD_TWO, HEAD_TWO,
+      HEAD_TWO, HEAD_THREE, HEAD_THREE, HEAD_THREE, HEAD_THREE,
+    ]);
+    expect(attempts.filter((attempt) => attempt.review_lens === "quality")).toHaveLength(5);
+    expect(attempts.filter((attempt) => attempt.review_lens === "risk")).toHaveLength(5);
+    expect(new Set(attempts.map((attempt) => attempt.thread_id)).size).toBe(10);
     expect(attempts.every((attempt) => /^[0-9a-f]{64}$/.test(attempt.handoff_sha256))).toBe(true);
-    expect(attachments).toHaveLength(15);
+    expect(attachments).toHaveLength(20);
     expect(attachments.map((item) => item.filename)).toEqual([
       "work-order.md",
       "work-order.md",
@@ -950,17 +964,22 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       "plan.md",
       "review-packet.json",
       "review-packet.json",
-      "work-order.md",
-      "docs-packet.json",
       "review-packet.json",
       "review-packet.json",
       "work-order.md",
       "docs-packet.json",
+      "review-packet.json",
+      "review-packet.json",
+      "review-packet.json",
+      "review-packet.json",
+      "work-order.md",
+      "docs-packet.json",
+      "review-packet.json",
       "review-packet.json",
     ]);
     expect(attachments.every((item) => item.projectId === "proj_1")).toBe(true);
     expect(attachments.every((item) => createHash("sha256").update(item.clientFile).digest("hex").length === 64)).toBe(true);
-    expect(spawns.every((spawn) => spawn.visibility === "visible")).toBe(true);
+    expect(spawns.every((spawn) => spawn.visibility === "hidden")).toBe(true);
     expect(spawns.filter((spawn) => spawn.title.includes("review")).every((spawn) => (
       spawn.parentThreadId === job.implementationThreadId &&
       (spawn.environment as { type?: string; environmentId?: string }).type === "reuse" &&
@@ -972,6 +991,10 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     expect(terminalCommands.some((command) => command.includes("./scripts/verify-production.sh"))).toBe(true);
     expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toMatchObject({ state: "completed" });
     expect(store.getLatestPipelineStageAttempt(job.id, "CANARY")).toMatchObject({ state: "completed" });
+    const effectIdentityCounts = bb.storage.database().prepare(
+      "SELECT COUNT(*) AS total, COUNT(DISTINCT idempotency_key) AS unique_count FROM effects WHERE job_id = ?",
+    ).get(job.id) as { total: number; unique_count: number };
+    expect(effectIdentityCounts.total).toBe(effectIdentityCounts.unique_count);
     expect(store.getJob(job.id)?.prHeadSha).toBe(HEAD_THREE);
     expect(store.getJob(job.id)?.state).toBe("complete");
   });

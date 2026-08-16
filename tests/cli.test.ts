@@ -6,12 +6,14 @@ import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import type { ProjectPolicy } from "../src/domain/models";
 import { activeWorkerFixture, admitConfirmedJob, policyFixture, productionPolicyFixture } from "./helpers";
+import { insertResolvedPromotionLedgerFixture } from "./promotion-evidence-fixture";
 
 let pluginNumber = 0;
 
 async function loadPlugin() {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-agent-task11-cli-${pluginNumber++}`,
+    sdk: { subscribe: () => () => undefined },
   });
   await plugin(bb);
   return { bb, harness, store: openStore(bb.storage) };
@@ -85,10 +87,250 @@ it("registers one telegram-agent CLI with complete operator command metadata", a
   });
   expect(harness.registrations.cli?.commands).toEqual(expect.arrayContaining([
     expect.objectContaining({ name: "pair" }),
+    expect.objectContaining({
+      name: "unpair",
+      usage: "bb telegram-agent unpair [--confirm <nonce>] [--json]",
+    }),
     expect.objectContaining({ name: "project" }),
     expect.objectContaining({ name: "job" }),
     expect.objectContaining({ name: "doctor" }),
+    expect.objectContaining({ name: "capability" }),
   ]));
+});
+
+it.each([["--help"], ["help"]])("prints actionable command help for %s", async (...argv) => {
+  const { harness } = await loadPlugin();
+
+  const result = await harness.behavior.runCli(argv);
+
+  expect(result.exitCode).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(result.stdout).toContain("job show <job-id>");
+  expect(result.stdout).toContain("project list");
+  expect(result.stdout).toContain("doctor [project-id]");
+  expect(result.stdout).toContain("capability status");
+});
+
+it("reports what every stage of one job ran on and what it consumed", async () => {
+  const { harness, store } = await loadPlugin();
+  store.createJob({ id: "job_spend", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+  store.recordStageExecution({
+    jobId: "job_spend",
+    attemptId: "stage:job_spend:1:spawn_docs",
+    stage: "docs",
+    attemptOrdinal: 2,
+    threadId: "thr_docs",
+    baseTier: "fast",
+    tier: "standard",
+    escalationSteps: 1,
+    source: "default",
+    providerId: "codex",
+    modelId: "gpt-5.6-terra",
+    reasoningLevel: "high",
+    serviceTier: "default",
+    now: 1_000,
+  });
+  store.settleStageExecution({
+    jobId: "job_spend",
+    attemptId: "stage:job_spend:1:spawn_docs",
+    stage: "docs",
+    outcome: "succeeded",
+    usage: {
+      inputTokens: 400,
+      cachedInputTokens: 100,
+      outputTokens: 200,
+      reasoningOutputTokens: 50,
+      totalTokens: 600,
+    },
+    now: 3_000,
+  });
+
+  const result = await harness.behavior.runCli(["job", "spend", "job_spend", "--json"]);
+
+  expect(result.exitCode).toBe(0);
+  expect(parseJson(result.stdout)).toMatchObject({
+    jobId: "job_spend",
+    attempts: 1,
+    escalatedAttempts: 1,
+    totalTokens: 600,
+    costMicroUsd: null,
+    durationMs: 2_000,
+    stages: [{
+      stage: "docs",
+      attempt: 2,
+      tier: "standard",
+      baseTier: "fast",
+      escalated: true,
+      model: "gpt-5.6-terra",
+      serviceTier: "default",
+      totalTokens: 600,
+      outcome: "succeeded",
+    }],
+  });
+});
+
+it("refuses a spend report for a job it does not have", async () => {
+  const { harness } = await loadPlugin();
+
+  const result = await harness.behavior.runCli(["job", "spend", "job_missing", "--json"]);
+
+  expect(result.exitCode).not.toBe(0);
+  expect(`${result.stdout}${result.stderr}`).toContain("Job was not found");
+});
+
+it("reports bounded capability rollout status without inventing live promotion evidence", async () => {
+  const { harness, store } = await loadPlugin();
+
+  const result = await harness.behavior.runCli(["capability", "status", "direct", "--json"]);
+
+  expect(result.exitCode).toBe(0);
+  expect(parseJson(result.stdout)).toMatchObject({
+    settings: {
+      jobGraph: "adaptive",
+      controllerTools: "bundled",
+      modelRouting: "adaptive",
+    },
+    recipes: [{
+      recipe: "direct",
+      routingMode: "shadow",
+      promotion: { status: "incomplete", ready: false },
+    }],
+  });
+  expect(store.listRecipeRolloutDecisions("direct", 10)).toEqual([]);
+  expect(result.stdout).not.toMatch(/requestText|prompt|filesystem|\/root\//u);
+});
+
+it("refuses capability promotion without durable live evidence and supports append-only rollback", async () => {
+  const { harness, store } = await loadPlugin();
+
+  const refused = await harness.behavior.runCli(["capability", "promote", "direct", "--json"]);
+  expect(refused.exitCode).toBe(1);
+  expect(parseJson(refused.stdout)).toMatchObject({
+    recipe: "direct",
+    status: "incomplete",
+    ready: false,
+  });
+  expect(store.listRecipeRolloutDecisions("direct", 10)).toEqual([]);
+
+  store.appendRecipeRolloutDecision({
+    recipe: "direct",
+    action: "promote",
+    reasonCode: "promotion_gates_passed",
+    evidenceDigest: "a".repeat(64),
+    now: 2_000,
+  });
+  const rolledBack = await harness.behavior.runCli(["capability", "rollback", "direct", "--json"]);
+  expect(rolledBack.exitCode).toBe(0);
+  expect(parseJson(rolledBack.stdout)).toMatchObject({ recipe: "direct", action: "rollback" });
+  expect(store.getLatestRecipeRolloutDecision("direct")?.action).toBe("rollback");
+});
+
+it("promotes through the production CLI only after the durable reader resolves authoritative records", async () => {
+  const { bb, harness, store } = await loadPlugin();
+  insertResolvedPromotionLedgerFixture({
+    db: bb.storage.database(),
+    store,
+    prefix: "cli-production-reader",
+  });
+
+  const promoted = await harness.behavior.runCli(["capability", "promote", "direct", "--json"]);
+
+  expect(promoted.exitCode).toBe(0);
+  expect(parseJson(promoted.stdout)).toMatchObject({
+    recipe: "direct",
+    action: "promote",
+    reasonCode: "promotion_gates_passed",
+    evidenceDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+  });
+  expect(store.getLatestRecipeRolloutDecision("direct")?.action).toBe("promote");
+});
+
+it("projects bounded inventory and receipt details without sources, subjects, or evidence payloads", async () => {
+  const { harness, store } = await loadPlugin();
+  store.replaceExternalCapabilityInventory({
+    hostScope: "primary",
+    now: 2_000,
+    items: [{
+      inventoryKey: "inventory:skill:bounded",
+      capabilityId: "external-bounded-skill",
+      capabilityKind: "skill",
+      source: "/root/private/provider/location",
+      version: "1.2.3",
+      digest: "b".repeat(64),
+      hostScope: "primary",
+      status: "inventory-only",
+      metadata: { credential: "token=should-not-print" },
+      discoveredAt: 2_000,
+    }],
+  });
+  const profile = store.createCapabilityProfile({
+    subjectKind: "worker_attempt",
+    subjectId: "attempt:private-subject",
+    threadId: "thr_private",
+    recipeId: "bounded",
+    recipeVersion: 1,
+    registryDigest: "c".repeat(64),
+    graphDigest: "d".repeat(64),
+    mode: "active",
+    model: {
+      pool: "standard",
+      providerId: "codex",
+      modelId: "gpt-5.6-terra",
+      reasoning: "high",
+      serviceTier: "fast",
+    },
+    assignments: [{
+      capabilityId: "test-driven-development",
+      capabilityKind: "skill",
+      descriptorDigest: "e".repeat(64),
+      mandatory: true,
+    }],
+    reasonCodes: ["private-reason"],
+    traits: ["private-trait"],
+    now: 2_000,
+  });
+  store.appendCapabilityTerminalOutcome({
+    profileId: profile.id,
+    capabilityId: "test-driven-development",
+    descriptorDigest: "e".repeat(64),
+    outcome: "passed",
+    evidenceRefs: ["/root/private/evidence.txt", "token=should-not-print"],
+    now: 2_001,
+  });
+
+  const inventory = await harness.behavior.runCli(["capability", "inventory", "--host", "primary", "--json"]);
+  expect(inventory.exitCode).toBe(0);
+  expect(parseJson(inventory.stdout)).toMatchObject({
+    hostScope: "primary",
+    items: [{ capabilityId: "external-bounded-skill", capabilityKind: "skill", version: "1.2.3" }],
+  });
+  expect(inventory.stdout).not.toMatch(/private|credential|should-not-print|source/u);
+
+  const receipts = await harness.behavior.runCli(["capability", "receipts", profile.id, "--json"]);
+  expect(receipts.exitCode).toBe(0);
+  expect(parseJson(receipts.stdout)).toMatchObject({
+    profile: {
+      id: profile.id,
+      revision: 1,
+      recipeId: "bounded",
+      model: {
+        pool: "standard",
+        providerId: "codex",
+        modelId: "gpt-5.6-terra",
+        reasoning: "high",
+        serviceTier: "fast",
+      },
+    },
+    receipts: expect.arrayContaining([
+      expect.objectContaining({
+        capabilityId: "test-driven-development",
+        eventType: "outcome",
+        outcome: "passed",
+        evidenceCount: 2,
+      }),
+    ]),
+  });
+  expect(receipts.stdout).not.toMatch(/private-subject|thr_private|private-reason|private-trait|evidence\.txt|should-not-print/u);
 });
 
 it("pairs through Telegram getMe and marks the one-use link sensitive and expiring", async () => {
@@ -116,17 +358,102 @@ it("pairs through Telegram getMe and marks the one-use link sensitive and expiri
   expect(store.getTelegramIdentity()).toMatchObject({ botId: "123", username: "task_bot" });
 });
 
-it("unpairs the owner and revokes approvals through the operator command", async () => {
+it("requires an identity-bound nonce before unpairing and records a content-free operator audit", async () => {
   const { bb, harness } = await loadPlugin();
   const db = bb.storage.database();
   db.prepare(
     "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', 1, NULL)",
   ).run();
+  db.prepare(
+    "INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run("job-unpair", 700, "private chat content must not enter the audit", "blocked", 1, 1);
+  db.prepare(
+    "INSERT INTO approvals (nonce_hash, job_id, head_sha, expires_at) VALUES (?, ?, ?, ?)",
+  ).run(hashSecret("approval-to-revoke"), "job-unpair", "abc123", Date.now() + 60_000);
 
-  const result = await harness.behavior.runCli(["unpair", "--json"]);
+  const ownerBefore = db.prepare("SELECT * FROM owners").all();
+  const approvalsBefore = db.prepare("SELECT * FROM approvals").all();
+  const pairingCodesBefore = db.prepare("SELECT * FROM pairing_codes").all();
+
+  const challenge = await harness.behavior.runCli(["unpair", "--json"]);
+  expect(challenge.exitCode).toBe(0);
+  const challengeOutput = parseJson(challenge.stdout);
+  expect(challengeOutput).toMatchObject({
+    confirmationRequired: true,
+    expiresInSeconds: 600,
+    sensitive: true,
+    owner: { userId: "7", chatId: "70", pairedAt: 1 },
+  });
+  expect(challengeOutput.nonce).toEqual(expect.any(String));
+  expect(db.prepare("SELECT * FROM owners").all()).toEqual(ownerBefore);
+  expect(db.prepare("SELECT * FROM approvals").all()).toEqual(approvalsBefore);
+  expect(db.prepare("SELECT * FROM pairing_codes").all()).toEqual(pairingCodesBefore);
+  expect(await bb.storage.kv.list("operator-audit/unpair/")).toEqual([]);
+
+  const nonce = String(challengeOutput.nonce);
+  const refused = await harness.behavior.runCli(["unpair", "--confirm", `${nonce}x`, "--json"]);
+  expect(refused.exitCode).toBe(1);
+  expect(openStore(bb.storage).getOwner()).toEqual({ userId: "7", chatId: "70", pairedAt: 1 });
+  expect(db.prepare("SELECT outcome FROM approvals").get()).toEqual({ outcome: null });
+
+  const result = await harness.behavior.runCli(
+    ["unpair", "--confirm", nonce, "--json"],
+    { threadId: "thr_delegated", projectId: "proj_personal" },
+  );
   expect(result.exitCode).toBe(0);
-  expect(parseJson(result.stdout)).toMatchObject({ revoked: true });
+  expect(parseJson(result.stdout)).toMatchObject({ revoked: true, approvalsRevoked: 1 });
   expect(openStore(bb.storage).getOwner()).toBeNull();
+  expect(db.prepare("SELECT outcome FROM approvals").get()).toEqual({ outcome: "revoked" });
+
+  const auditKeys = await bb.storage.kv.list("operator-audit/unpair/");
+  expect(auditKeys).toHaveLength(1);
+  const audit = await bb.storage.kv.get(auditKeys[0]!);
+  expect(audit).toEqual({
+    schemaVersion: 1,
+    operation: "unpair",
+    outcome: "confirmed",
+    occurredAt: expect.any(Number),
+    affectedTelegramIdentity: { userId: "7", chatId: "70", pairedAt: 1 },
+    operatorContext: { threadId: "thr_delegated", projectId: "proj_personal" },
+  });
+  expect(JSON.stringify(audit)).not.toContain(nonce);
+  expect(JSON.stringify(audit)).not.toContain("private chat content");
+});
+
+it("refuses an expired unpair nonce without changing owner state", async () => {
+  const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+  const { bb, harness } = await loadPlugin();
+  bb.storage.database().prepare(
+    "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', 1, NULL)",
+  ).run();
+  const challenge = parseJson((await harness.behavior.runCli(["unpair", "--json"])).stdout);
+
+  now.mockReturnValue(1_600_000);
+  const result = await harness.behavior.runCli(["unpair", "--confirm", String(challenge.nonce), "--json"]);
+
+  expect(result.exitCode).toBe(1);
+  expect(openStore(bb.storage).getOwner()).toEqual({ userId: "7", chatId: "70", pairedAt: 1 });
+  expect(await bb.storage.kv.list("operator-audit/unpair/")).toEqual([]);
+});
+
+it("refuses an unpair nonce after the paired Telegram identity changes", async () => {
+  const { bb, harness } = await loadPlugin();
+  const db = bb.storage.database();
+  db.prepare(
+    "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', 1, NULL)",
+  ).run();
+  const challenge = parseJson((await harness.behavior.runCli(["unpair", "--json"])).stdout);
+  db.prepare(
+    "UPDATE owners SET telegram_user_id = '8', telegram_chat_id = '80', paired_at = 2 WHERE singleton = 1",
+  ).run();
+
+  const result = await harness.behavior.runCli([
+    "unpair", "--confirm", String(challenge.nonce), "--json",
+  ]);
+
+  expect(result.exitCode).toBe(1);
+  expect(openStore(bb.storage).getOwner()).toEqual({ userId: "8", chatId: "80", pairedAt: 2 });
+  expect(await bb.storage.kv.list("operator-audit/unpair/")).toEqual([]);
 });
 
 it("rejects unknown, missing, duplicate, and malformed flags with exit code 2", async () => {
@@ -532,7 +859,9 @@ it("shows, retries, cancels, and rejects illegal job state transitions through t
   expect(parseJson(cancel.stdout)).toMatchObject({ id: active.id, cancelRequested: true });
   expect(store.getJob(active.id)?.cancelRequestedAt).not.toBeNull();
   const cancellationRequested = store.getJob(active.id)!;
-  store.applyJobEvent(active.id, cancellationRequested.version, { type: "CANCEL_CONFIRMED" }, 6);
+  // This job has no live worker, so the request already completed; confirming
+  // again would be illegal.
+  expect(cancellationRequested.state).toBe("cancelled");
   bb.storage.database().prepare("UPDATE jobs SET state = 'merged', cancel_requested_at = NULL WHERE id = ?").run(active.id);
 
   const illegal = await harness.behavior.runCli(["job", "retry", active.id]);
@@ -558,6 +887,7 @@ it("projects bounded admission and resource facts without lease ownership detail
   expect(projection).toMatchObject({
     id: draft.id,
     projectId: "proj_1",
+    recipe: { id: "architectural", version: 1, promotionCount: 0, routingMode: "legacy" },
     admission: {
       state: "admitted",
       queueSequence: expect.any(Number),
@@ -670,4 +1000,60 @@ it("does not leak pairing secrets through JSON, human output, errors, or logs", 
   expect(result.exitCode).toBe(0);
   expect(`${result.stdout}\n${result.stderr}`).not.toContain("do-not-print");
   expect(harness.inspection.logEntries.map((entry) => entry.message).join("\n")).not.toContain("do-not-print");
+});
+
+function stubMemoryFile(harness: Awaited<ReturnType<typeof loadPlugin>>["harness"], entries: unknown) {
+  harness.sdk.stub("files.read", async () => ({
+    path: "/operator/knowledge.json",
+    content: JSON.stringify({ entries }),
+    contentEncoding: "utf8",
+    mimeType: "application/json",
+    sizeBytes: 10,
+    modifiedAtMs: 1,
+    sha256: "a".repeat(64),
+  }));
+}
+
+it("imports an owner knowledge file the agent could not have written itself", async () => {
+  const { harness, store } = await loadPlugin();
+  stubMemoryFile(harness, [
+    { subject: "stripe key", body: "STRIPE_SECRET_KEY=sk-live-000111222333444555666" },
+    { subject: "deploy window", body: "Only weekday mornings.", kind: "preference" },
+  ]);
+
+  const result = await harness.behavior.runCli([
+    "memory", "import", "--file", "/operator/knowledge.json", "--json",
+  ]);
+
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(result.stdout)).toEqual({ imported: 2 });
+  const recalled = store.recallMemories({ scope: "owner", query: "stripe", limit: 10, now: 2 });
+  expect(recalled.map((memory) => memory.subject)).toContain("stripe key");
+});
+
+it("reads the import through the BB host rather than the local filesystem", async () => {
+  const { harness } = await loadPlugin();
+  stubMemoryFile(harness, [{ subject: "one", body: "two" }]);
+
+  await harness.behavior.runCli(["memory", "import", "--file", "/operator/knowledge.json"]);
+
+  expect(harness.inspection.sdk.callsTo("files.read")[0]?.[0]).toMatchObject({ path: "/operator/knowledge.json" });
+});
+
+it("rejects a malformed or oversized import without storing a partial file", async () => {
+  const { harness, store } = await loadPlugin();
+  for (const entries of [[], [{ subject: "no body" }], Array.from({ length: 201 }, () => ({ subject: "s", body: "b" }))]) {
+    stubMemoryFile(harness, entries);
+    const result = await harness.behavior.runCli([
+      "memory", "import", "--file", "/operator/knowledge.json", "--json",
+    ]);
+    expect(result.exitCode).toBe(1);
+  }
+  expect(store.recallMemories({ scope: "owner", limit: 10, now: 2 })).toEqual([]);
+});
+
+it("requires an absolute import path", async () => {
+  const { harness } = await loadPlugin();
+  const result = await harness.behavior.runCli(["memory", "import", "--file", "knowledge.json", "--json"]);
+  expect(result.exitCode).toBe(1);
 });

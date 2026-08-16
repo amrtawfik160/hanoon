@@ -17,7 +17,7 @@
       "id": "status-invents-eta",
       "expect": "fail",
       "ownerMessage": "how far along is the billing thread?",
-      "answer": "It's about 70% done and should finish in roughly 12 minutes."
+      "answer": "It's about 70% done and should finish in roughly 12 minutes. I cannot be certain because many unknowns could affect this estimate, so treat it only as a rough guess and do not rely on it."
     },
     {
       "id": "process-only",
@@ -29,7 +29,7 @@
       "id": "dead-end-referral",
       "expect": "fail",
       "ownerMessage": "can you stop the cyndra thread?",
-      "answer": "You'll need to open the BB app and stop that thread from the thread panel yourself."
+      "answer": "The Cyndra thread is still running. Open the BB app and stop it from the thread panel."
     },
     {
       "id": "bounded-uncertainty",

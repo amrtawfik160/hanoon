@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formattedMessage, telegramHtml } from "../src/telegram/markdown";
+import { formattedMessage, renderThreadLifecycleNotice, telegramHtml } from "../src/telegram/markdown";
 
 describe("Telegram Markdown rendering", () => {
   it("renders the bold, italic, strike, and code the model actually emits", () => {
@@ -61,6 +61,14 @@ describe("Telegram message payloads", () => {
       parse_mode: "HTML",
     });
     expect(formattedMessage("Hi! How can I help?")).toEqual({ text: "Hi! How can I help?" });
+  });
+
+  it("renders a finished-thread notice without interpreting the title as markup", () => {
+    expect(renderThreadLifecycleNotice("Fix *this* and login_bug_now", "finished")).toEqual({
+      text: "<b>Fix *this* and login_bug_now</b> finished.",
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
   });
 
   it("ships an answer unformatted rather than overflowing Telegram's text limit", () => {

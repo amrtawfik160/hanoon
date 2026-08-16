@@ -1,15 +1,30 @@
 import { describe, expect, it } from "vitest";
-import { projectControllerStream } from "../src/controller/stream";
+import { normalizeControllerEventObservation, projectControllerStream } from "../src/controller/stream";
+import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 
 describe("controller stream projection", () => {
-  it("appends only new assistant output and advances from thinking to responding", () => {
+  it("has a nonempty exact Hanoon phase map", () => {
+    expect(CONTROLLER_PHASE_TEXT).toEqual({
+      queued: "Queued…",
+      connecting: "Connecting to Hanoon…",
+      thinking: "Hanoon is thinking…",
+      using_tools: "Hanoon is checking the current state…",
+      responding: "Hanoon is preparing the answer…",
+      complete: "Hanoon finished.",
+      failed: "Hanoon could not finish safely.",
+    });
+  });
+
+  it("records assistant output as phase evidence without retaining provider prose", () => {
     const projected = projectControllerStream({
       latestSeq: 13,
       inputAccepted: true,
-      assistantDelta: "Hello world",
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
       completed: false,
-      error: null,
-      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      failure: null,
+      assistantDraft: null,
+      interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 10,
       text: "",
@@ -18,7 +33,7 @@ describe("controller stream projection", () => {
 
     expect(projected).toEqual({
       cursor: 13,
-      text: "Hello world",
+      text: "Hanoon is preparing the answer…",
       phase: "responding",
     });
   });
@@ -27,10 +42,12 @@ describe("controller stream projection", () => {
     const projected = projectControllerStream({
       latestSeq: 13,
       inputAccepted: true,
-      assistantDelta: " duplicate",
+      assistantOutputObserved: true,
+      toolActivityObserved: false,
       completed: false,
-      error: null,
-      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      failure: null,
+      assistantDraft: null,
+      interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 13,
       text: "Hello world",
@@ -44,21 +61,43 @@ describe("controller stream projection", () => {
     });
   });
 
-  it("bounds preview text on Unicode character boundaries and preserves the newest output", () => {
+  it("uses deterministic tool phase text instead of provider output", () => {
     const projected = projectControllerStream({
       latestSeq: 2,
       inputAccepted: true,
-      assistantDelta: `${"a".repeat(3_900)}🙂tail`,
+      assistantOutputObserved: false,
+      toolActivityObserved: true,
       completed: false,
-      error: null,
-      pendingQuestion: null, toolCalls: 0, commandFailures: 0, totalTokens: 0,
+      failure: null,
+      assistantDraft: null,
+      interactionReferences: [], toolCalls: 0, commandFailures: 0, totalTokens: 0,
     }, {
       cursor: 0,
       text: "",
       phase: "thinking",
     });
 
-    expect(Array.from(projected.text)).toHaveLength(3_900);
-    expect(projected.text.endsWith("🙂tail")).toBe(true);
+    expect(projected).toEqual({
+      cursor: 2,
+      text: "Hanoon is checking the current state…",
+      phase: "using_tools",
+    });
+  });
+
+  it("preserves bounded interaction references during live normalization", () => {
+    expect(normalizeControllerEventObservation({
+      latestSeq: 4,
+      inputAccepted: true,
+      assistantOutputObserved: false,
+      toolActivityObserved: false,
+      completed: false,
+      error: null,
+      interactionReferences: [{ interactionId: "interaction-1", kind: "approval", status: "pending" }],
+      toolCalls: 0,
+      commandFailures: 0,
+      totalTokens: 0,
+    })).toMatchObject({
+      interactionReferences: [{ interactionId: "interaction-1", kind: "approval", status: "pending" }],
+    });
   });
 });

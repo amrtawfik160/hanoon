@@ -15,6 +15,12 @@ export type AdmissionSelectionInput = Readonly<{
   candidates: readonly AdmissionCandidate[];
   heldProjectKeys: ReadonlySet<string>;
   availableSlots: number;
+  /**
+   * Projects whose work is on hold because the same failure kept repeating.
+   * Their queued jobs stay queued rather than being cancelled: the owner is
+   * deciding, and the work should still be there when they do.
+   */
+  pausedProjectIds?: ReadonlySet<string>;
 }>;
 
 export type SchedulerRunInput = Readonly<Omit<AdmissionAttemptInput, "jobId">>;
@@ -48,6 +54,7 @@ export function selectOldestEligibleAdmissions(
   const seenProjects = new Set<string>();
   for (const candidate of orderedCandidates) {
     if (selected.length >= input.availableSlots) break;
+    if (input.pausedProjectIds?.has(candidate.projectId)) continue;
     if (seenProjects.has(candidate.projectId)) continue;
     seenProjects.add(candidate.projectId);
     if (input.heldProjectKeys.has(projectResourceKey(candidate.projectId))) continue;
@@ -75,14 +82,35 @@ function heldProjectKeys(repository: AutonomyRepository, limit: number): Readonl
   );
 }
 
+export type PausedProjectSource = { listPausedProjectAdmissions(): { projectId: string }[] };
+
 export class AutonomyScheduler {
-  public constructor(private readonly repository: AutonomyRepository) {}
+  public constructor(
+    private readonly repository: AutonomyRepository,
+    private readonly pauses?: PausedProjectSource,
+  ) {}
+
+  /**
+   * null means the pause list could not be read. Admitting nothing for one tick
+   * is recoverable; admitting into a project that is paused because it keeps
+   * failing is not, so an unreadable list must never look like "nothing paused".
+   */
+  private pausedProjectIds(): ReadonlySet<string> | null {
+    if (!this.pauses) return new Set();
+    try {
+      return new Set(this.pauses.listPausedProjectAdmissions().map((entry) => entry.projectId));
+    } catch {
+      return null;
+    }
+  }
 
   public run(input: SchedulerRunInput): SchedulerRunResult {
     assertSchedulerInput(input);
     const occupiedCount = this.repository.countOccupiedAdmissions();
     const availableSlots = Math.max(0, input.maxConcurrentJobs - occupiedCount);
     if (availableSlots === 0) return { occupiedCount, availableSlots, admissions: [] };
+    const pausedProjectIds = this.pausedProjectIds();
+    if (pausedProjectIds === null) return { occupiedCount, availableSlots, admissions: [] };
 
     const candidateLimit = occupiedCount + availableSlots;
     const candidates = this.repository.listOldestQueuedPerProject(candidateLimit).map((admission) => ({
@@ -94,6 +122,7 @@ export class AutonomyScheduler {
       candidates,
       heldProjectKeys: heldProjectKeys(this.repository, Math.min(100, Math.max(1, candidateLimit))),
       availableSlots,
+      pausedProjectIds,
     });
     const admissions = selected.map((candidate) => this.repository.tryAdmit({ ...input, jobId: candidate.jobId }));
     return { occupiedCount, availableSlots, admissions };

@@ -22,7 +22,7 @@ export const SYSTEM_MONITORS: readonly SystemMonitorDefinition[] = Object.freeze
     // Early morning, before the owner starts, so a blocked job is known by then.
     cron: "0 7 * * *",
     instruction:
-      "Sweep for work that has stopped needing you and started needing them. Check your own health, then list jobs and look for anything blocked, failed, or sitting unchanged for a long time. Message the owner only about items that need a decision from them, one line each, newest first. If everything is moving or idle by choice, say nothing at all.",
+      "Sweep for work that has stopped needing you and started needing them. Read your scorecard and your health, then list jobs. Check `projectsHeldByFailedJobs` first: a failed job keeps its project locked until it is retried or cancelled, so every one of those is a project that can start no new work until the owner decides. Then look for anything blocked or sitting unchanged for a long time. Message the owner only about items that need a decision, one line each, worst first. If everything is moving or idle by choice, say nothing at all.",
   }),
   Object.freeze({
     systemKey: "system-memory-audit",

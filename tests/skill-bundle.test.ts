@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, test } from "vitest";
 import { ROLE_SKILLS } from "../src/agent-skills/role-resolver";
+import { CAPABILITY_CATALOG } from "../src/capabilities/catalog";
 
 const repositoryRoot = new URL("..", import.meta.url).pathname;
 const workflowIds = [
@@ -23,7 +24,22 @@ const workflowIds = [
 ] as const;
 const guardIds = ["clean-code-guard", "test-guard", "docs-guard"] as const;
 const deliveryIds = ["pr-writer"] as const;
-const allIds = [...workflowIds, ...guardIds, ...deliveryIds].sort();
+const discoveryIds = ["domain-modeling", "grill-with-docs", "grilling"] as const;
+const hanoonIds = [
+  "checking-system-logs",
+  "driving-bb",
+  "durable-boundary-audit",
+  "human-friendly-coding-communication",
+  "proportional-development-workflow",
+] as const;
+const allIds = [...workflowIds, ...guardIds, ...deliveryIds, ...discoveryIds, ...hanoonIds].sort();
+const skillRoots = [
+  "skills/workflow-kit",
+  "skills/guards",
+  "skills/delivery",
+  "skills/discovery",
+  "skills/hanoon",
+] as const;
 
 type LockFile = Readonly<{ path: string; sha256: string }>;
 type LockSkill = Readonly<{
@@ -38,6 +54,8 @@ type SkillLock = Readonly<{
   workflowKit: LockKit & Readonly<{ version: string }>;
   guardKit: LockKit;
   deliveryKit: LockKit;
+  discoveryKit: LockKit & Readonly<{ version: string; revision: string }>;
+  hanoonKit: LockKit;
   skills: readonly LockSkill[];
   files: readonly LockFile[];
 }>;
@@ -66,11 +84,11 @@ describe("committed agent skill bundle", () => {
       bb: { skills: unknown };
     };
 
-    expect(manifest.bb.skills).toEqual(["skills/workflow-kit", "skills/guards", "skills/delivery"]);
+    expect(manifest.bb.skills).toEqual(skillRoots);
   });
 
   test("contains exactly the reviewed skill catalog with bounded frontmatter names", () => {
-    const catalog = ["skills/workflow-kit", "skills/guards", "skills/delivery"].flatMap((root) =>
+    const catalog = skillRoots.flatMap((root) =>
       readdirSync(join(repositoryRoot, root), { withFileTypes: true })
         .filter((entry) => entry.isDirectory())
         .map((entry) => ({
@@ -89,7 +107,7 @@ describe("committed agent skill bundle", () => {
   test("locks every committed bundle file by SHA-256", () => {
     const lock = readLock();
     const locked = lock.files.map((file) => file.path).sort();
-    const actual = ["skills/workflow-kit", "skills/guards", "skills/delivery"]
+    const actual = skillRoots
       .flatMap((root) => recursiveFiles(join(repositoryRoot, root)))
       .sort();
 
@@ -102,11 +120,27 @@ describe("committed agent skill bundle", () => {
     }
   });
 
+  test("uses the locked skill digests in the capability catalog", () => {
+    const lock = readLock();
+    const files = new Map(lock.files.map((file) => [file.path, file.sha256]));
+    const catalogSkills = new Map(
+      CAPABILITY_CATALOG
+        .filter((descriptor) => descriptor.kind === "skill")
+        .map((descriptor) => [descriptor.id, descriptor]),
+    );
+
+    for (const skill of lock.skills) {
+      const descriptor = catalogSkills.get(skill.id);
+      expect(descriptor, `${skill.id} has a capability descriptor`).toBeDefined();
+      expect(descriptor?.sourceDigest).toBe(files.get(skill.skillPath));
+    }
+  });
+
   test("records provenance and licence for every vendored source", () => {
     const lock = readLock();
 
     expect(lock.workflowKit).toEqual({
-      version: "6.2.0",
+      version: "6.3.0",
       sourceUrl: "https://github.com/obra/superpowers",
       license: "MIT",
       licensePath: "skills/workflow-kit/LICENSE",
@@ -130,6 +164,18 @@ describe("committed agent skill bundle", () => {
       license: "Apache-2.0",
       licensePath: "skills/delivery/LICENSE",
     });
+    expect(lock.discoveryKit).toEqual({
+      version: "1.2.3",
+      revision: "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+      sourceUrl: "https://github.com/mattpocock/skills",
+      license: "MIT",
+      licensePath: "skills/discovery/LICENSE",
+    });
+    expect(lock.hanoonKit).toEqual({
+      sourceUrl: "first-party",
+      license: "first-party",
+      licensePath: "skills/hanoon/NOTICE",
+    });
     for (const id of guardIds) {
       expect(lock.skills).toContainEqual({
         id,
@@ -146,6 +192,22 @@ describe("committed agent skill bundle", () => {
         license: "Apache-2.0",
       });
     }
+    for (const id of discoveryIds) {
+      expect(lock.skills).toContainEqual({
+        id,
+        skillPath: `skills/discovery/${id}/SKILL.md`,
+        source: "https://github.com/mattpocock/skills",
+        license: "MIT",
+      });
+    }
+    for (const id of hanoonIds) {
+      expect(lock.skills).toContainEqual({
+        id,
+        skillPath: `skills/hanoon/${id}/SKILL.md`,
+        source: "first-party",
+        license: "first-party",
+      });
+    }
   });
 
   // Vendored verbatim under permissive licences, so the notices must ship too.
@@ -154,6 +216,7 @@ describe("committed agent skill bundle", () => {
       "skills/workflow-kit/LICENSE",
       "skills/guards/LICENSE",
       "skills/delivery/LICENSE",
+      "skills/discovery/LICENSE",
     ]) {
       const absolute = join(repositoryRoot, licensePath);
       expect(existsSync(absolute), `${licensePath} exists`).toBe(true);
@@ -165,7 +228,7 @@ describe("committed agent skill bundle", () => {
     const selected = Object.values(ROLE_SKILLS).flat();
     for (const id of selected) expect(allIds, `${id} is registered in the manifest`).toContain(id);
     expect(new Set(ROLE_SKILLS.implementation).size).toBe(ROLE_SKILLS.implementation.length);
-    expect(ROLE_SKILLS.planner).toEqual([]);
-    expect(ROLE_SKILLS.critic).toEqual([]);
+    expect(ROLE_SKILLS.planner).toEqual(["human-friendly-coding-communication", "docs-guard"]);
+    expect(ROLE_SKILLS.critic).toEqual(["human-friendly-coding-communication"]);
   });
 });

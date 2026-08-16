@@ -80,8 +80,8 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
   bb.storage.migrate(bb.storage.database(), [...ALL_MIGRATIONS]);
 }
 
-it("keeps the autonomy migration after the frozen legacy positions and appends images", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 8);
+it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 48);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -93,6 +93,36 @@ it("keeps the autonomy migration after the frozen legacy positions and appends i
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 5]).toContain("CREATE TABLE memory_recalls");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 6]).toContain("ADD COLUMN system_key");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 7]).toContain("CREATE TABLE controller_overlay");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 8]).toContain("token_baseline");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 9]).toContain("sealed_at");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 10]).toContain("ADD COLUMN origin");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 11]).toContain("CREATE TABLE production_health");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 12]).toContain("'CONTINUE_REVIEW', 'RETRY'");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 13]).toContain("image_kind");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 14]).toContain("delivery_mode");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 15]).toContain("CREATE TABLE worker_recoveries");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 16]).toContain("adopted_branch");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 17]).toContain("review_lens");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 18]).toContain("PRIMARY KEY(job_id, resource_id)");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 19]).toContain("CREATE TABLE capability_profiles");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 20]).toContain("ADD COLUMN task_recipe");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 21]).toContain("capability_continuation_count");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 22]).toContain("ADD COLUMN settled_at");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 23]).toContain("model_fallback_index");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 24]).toContain("CREATE TABLE controller_evidence");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 25]).toContain("CREATE TABLE controller_interactions");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 28]).toContain("CREATE TABLE credential_bindings");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 29]).toContain("steer_reservation_turn_id");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 30]).toContain("controller_supervisor_steer_attempts");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 31]).toContain("controller_interaction_quarantine");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 32]).toContain("envelope_version");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 33]).toContain("consumed_at");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 34]).toContain("input_accepted");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 35]).toContain("thread_follow_up_json");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 36]).toContain("controller_generation_quarantine");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 37]).toContain("one_open_controller_generation");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 38]).toContain("delivery_state");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 44]).toContain("CREATE TABLE stage_executions");
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {

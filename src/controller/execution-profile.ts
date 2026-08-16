@@ -8,6 +8,8 @@ export const CONTROLLER_MODELS = [
   "gpt-5.6-sol",
 ] as const;
 
+export const CONTROLLER_FALLBACK_MODELS = ["disabled", ...CONTROLLER_MODELS] as const;
+
 // Background extraction should not run on the owner's conversational tier.
 // `inherit` keeps the project default, because a model this installation's
 // providers do not offer would fail every extraction.
@@ -25,6 +27,7 @@ export const CONTROLLER_SERVICE_TIERS = ["fast", "default"] as const;
 export const CONTROLLER_PERMISSION_MODES = ["auto", "accept-edits", "full"] as const;
 
 export type ControllerModel = typeof CONTROLLER_MODELS[number];
+export type ControllerFallbackModel = typeof CONTROLLER_FALLBACK_MODELS[number];
 
 export type ControllerExecutionProfile = {
   model: ControllerModel;
@@ -51,10 +54,9 @@ export const DEFAULT_CONTROLLER_EXECUTION_PROFILE: ControllerExecutionProfile = 
   model: "claude-opus-5[1m]",
   reasoningLevel: "xhigh",
   serviceTier: "default",
-  // The owner drives this agent from Telegram and does not watch the BB app, so
-  // an approval prompt rendered there is a dead end rather than a safeguard.
-  // Merges and production still gate on a one-use Telegram approval.
-  permissionMode: "full",
+  // Fresh or unset settings use BB's automatic mode; supported approvals can
+  // reach Telegram while BB and the execution machine keep enforcing limits.
+  permissionMode: "auto",
 };
 
 type ExecutionArguments = {

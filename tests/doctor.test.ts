@@ -9,6 +9,7 @@ let pluginNumber = 0;
 async function loadPlugin() {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-agent-task11-doctor-${pluginNumber++}`,
+    sdk: { subscribe: () => () => undefined },
   });
   await plugin(bb);
   return { bb, harness, store: openStore(bb.storage) };
@@ -126,6 +127,7 @@ it("reports individual readiness rows for every Telegram, BB, host, provider, an
   expect(result.stderr).toBe("");
   const output = parseDoctor(result.stdout);
   expect(output.checks.map((check) => check.name)).toEqual(expect.arrayContaining([
+    "plugin activation",
     "token presence",
     "owner pairing",
     "enabled project",
@@ -138,6 +140,7 @@ it("reports individual readiness rows for every Telegram, BB, host, provider, an
     "gh repo view",
     "PR merge SDK availability",
   ]));
+  expect(output.checks.find((check) => check.name === "plugin activation")?.summary).toMatch(/source=.*build=.*schema=/u);
   expect(output.checks.every((check) => check.status === "pass")).toBe(true);
   expect(commands.size).toBe(2);
   expect([...commands.values()]).toEqual(expect.arrayContaining([
@@ -194,8 +197,18 @@ it("runs a project-less doctor with only global checks and keeps JSON strict", a
   expect(output.checks.map((check) => check.name)).toEqual(expect.arrayContaining([
     "token presence",
     "owner pairing",
+    "enabled projects",
   ]));
   expect(output.checks.map((check) => check.name)).not.toContain("gh repo view");
   expect(result.stderr).toBe("");
   expect(() => JSON.parse(result.stdout)).not.toThrow();
+  // The credential broker defaults to disabled and must never be the reason
+  // an otherwise-unconfigured install fails doctor differently than before
+  // this section existed (tests/credential-cli.test.ts covers the isolated,
+  // invalid, and secret-handling cases in depth).
+  expect(output.checks.find((check) => check.name === "credential broker")).toEqual({
+    name: "credential broker",
+    status: "disabled",
+    summary: "disabled",
+  });
 });

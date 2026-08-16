@@ -1,4 +1,9 @@
-import type { Job, WorkerLiveness, WorkerLivenessState } from "../domain/models";
+import type {
+  Job,
+  WorkerLiveness,
+  WorkerLivenessState,
+  WorkerRecoveryClassification,
+} from "../domain/models";
 import type { ExecutorFence, TelegramAgentStore } from "../storage/store";
 import { persistableJobStatusPayload, renderJobStatus } from "../telegram/view";
 
@@ -59,9 +64,17 @@ function watchdogMs(job: Job): number {
   return job.policy?.workerLivenessWatchdogMs ?? 300_000;
 }
 
+function startGraceMs(job: Job): number {
+  return job.policy?.workerStartGraceMs ?? 120_000;
+}
+
 function withStaleness(job: Job, state: WorkerLivenessState, sourceUpdatedAt: number, observedAt: number): WorkerLivenessState {
   if ((state === "starting" || state === "active") && observedAt - sourceUpdatedAt > watchdogMs(job)) return "stale";
   return state;
+}
+
+function threadActivityAt(thread: ThreadLike, commandActivityAt?: number): number {
+  return Math.max(thread.updatedAt, commandActivityAt ?? 0);
 }
 
 export function observeThreadWorker(
@@ -69,16 +82,18 @@ export function observeThreadWorker(
   thread: ThreadLike,
   now: number,
   generation = job.version,
+  commandActivityAt?: number,
 ): WorkerLiveness {
   const state = stateForThread(thread);
+  const sourceUpdatedAt = threadActivityAt(thread, commandActivityAt);
   return {
     jobId: job.id,
     workerKind: thread.id === job.reviewThreadId ? "review" : "implementation",
     resourceKind: "bb_thread",
     resourceId: thread.id,
     generation,
-    state: withStaleness(job, state, thread.updatedAt, now),
-    sourceUpdatedAt: thread.updatedAt,
+    state: withStaleness(job, state, sourceUpdatedAt, now),
+    sourceUpdatedAt,
     observedAt: now,
     staleNotifiedAt: null,
   };
@@ -98,10 +113,71 @@ export function observeUnknownWorker(
     resourceId,
     generation,
     state: "unknown",
-    sourceUpdatedAt: 0,
+    sourceUpdatedAt: now,
     observedAt: now,
     staleNotifiedAt: null,
   };
+}
+
+export type ThreadRecoverySignal = Readonly<{
+  classification: WorkerRecoveryClassification;
+  signature: string;
+}>;
+
+function recoverySignal(
+  workerKind: WorkerLiveness["workerKind"],
+  classification: WorkerRecoveryClassification,
+  status: string,
+): ThreadRecoverySignal {
+  const normalized = status.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 80) || "unknown";
+  return {
+    classification,
+    signature: `${classification}:${workerKind}:${normalized}`,
+  };
+}
+
+/**
+ * Classifies only provider facts that are safe to act on. Merely polling a
+ * thread is not progress, and a host reconnect remains exempt until its grace
+ * window expires. A missing lookup needs a previous missing observation so a
+ * transient API failure cannot kill useful work.
+ */
+export function classifyThreadRecovery(
+  job: Job,
+  thread: ThreadLike | null,
+  previous: WorkerLiveness | null,
+  now: number,
+  workerKind: WorkerLiveness["workerKind"] = previous?.workerKind ?? "implementation",
+): ThreadRecoverySignal | null {
+  if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
+  if (thread === null) {
+    if (!previous || previous.state !== "unknown" || previous.resourceId.length === 0) return null;
+    if (now - previous.sourceUpdatedAt <= watchdogMs(job)) return null;
+    return recoverySignal(workerKind, "missing", "lookup-missing");
+  }
+
+  const displayStatus = thread.runtime.displayStatus;
+  const reconnecting = displayStatus === "host-reconnecting" || displayStatus === "waiting-for-host";
+  if (reconnecting) {
+    const graceExpiresAt = thread.runtime.hostReconnectGraceExpiresAt;
+    if (graceExpiresAt !== null && graceExpiresAt > now) return null;
+    const firstUnknownAt = previous?.state === "unknown" && previous.resourceId === thread.id
+      ? previous.sourceUpdatedAt
+      : Math.max(0, thread.updatedAt);
+    if (now - firstUnknownAt <= watchdogMs(job)) return null;
+    return recoverySignal(workerKind, "missing", displayStatus);
+  }
+
+  const state = stateForThread(thread);
+  if (state === "failed") return recoverySignal(workerKind, "crash", `${thread.status}:${displayStatus}`);
+  const activityAt = threadActivityAt(thread);
+  if (state === "starting" && now - activityAt > startGraceMs(job)) {
+    return recoverySignal(workerKind, "never_started", `${thread.status}:${displayStatus}`);
+  }
+  if (state === "active" && now - activityAt > watchdogMs(job)) {
+    return recoverySignal(workerKind, "no_progress", `${thread.status}:${displayStatus}`);
+  }
+  return null;
 }
 
 function stateForTerminal(terminal: BbTerminalObservation): WorkerLivenessState {
@@ -134,19 +210,26 @@ export function observeTerminalWorker(
   };
 }
 
-type LivenessStore = Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
+type LivenessStore = Pick<TelegramAgentStore, "getWorkerLiveness" | "getWorkerLivenessForResource" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
   Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox" | "upsertExecutorWorkerLiveness" | "markExecutorWorkerLivenessNotified" | "enqueueExecutorStatus">>;
 
 function projectObservation(store: LivenessStore, job: Job, observed: WorkerLiveness, now: number, fence?: ExecutorFence): WorkerLiveness {
-  const current = store.getWorkerLiveness(job.id);
+  const latest = store.getWorkerLiveness(job.id);
+  const current = store.getWorkerLivenessForResource(job.id, observed.resourceId);
   const accepted =
-    current === null ||
-    observed.generation > current.generation ||
-    (observed.generation === current.generation && observed.resourceId === current.resourceId && observed.observedAt >= current.observedAt);
+    (latest === null || observed.generation >= latest.generation) &&
+    (current === null || observed.generation > current.generation ||
+      (observed.generation === current.generation && observed.observedAt >= current.observedAt));
   const persistedObservation = accepted && current !== null &&
       current.generation === observed.generation && current.resourceId === observed.resourceId &&
       (observed.state === "stale" || observed.state === "unknown")
-    ? { ...observed, staleNotifiedAt: current.staleNotifiedAt }
+    ? {
+        ...observed,
+        sourceUpdatedAt: current.state === observed.state
+          ? Math.min(current.sourceUpdatedAt, observed.sourceUpdatedAt)
+          : observed.sourceUpdatedAt,
+        staleNotifiedAt: current.staleNotifiedAt,
+      }
     : observed;
   if (accepted) {
     if (fence) {
@@ -158,20 +241,21 @@ function projectObservation(store: LivenessStore, job: Job, observed: WorkerLive
     }
   }
   if (!accepted) return observed;
-  const stored = store.getWorkerLiveness(job.id) ?? observed;
+  const stored = store.getWorkerLivenessForResource(job.id, observed.resourceId) ?? observed;
   if ((stored.state === "stale" || stored.state === "unknown") && stored.staleNotifiedAt === null) {
     const marked = fence
       ? store.markExecutorWorkerLivenessNotified?.({
         jobId: job.id,
         workerGeneration: stored.generation,
+        resourceId: stored.resourceId,
         ...fence,
       }) ?? false
-      : store.markWorkerLivenessNotified(job.id, stored.generation, now);
+      : store.markWorkerLivenessNotified(job.id, stored.generation, now, stored.resourceId);
     if (!marked) {
       if (fence) throw new Error("executor lease was lost before worker-liveness notification");
-      return store.getWorkerLiveness(job.id) ?? stored;
+      return store.getWorkerLivenessForResource(job.id, stored.resourceId) ?? stored;
     }
-    const notified = store.getWorkerLiveness(job.id) ?? { ...stored, staleNotifiedAt: now };
+    const notified = store.getWorkerLivenessForResource(job.id, stored.resourceId) ?? { ...stored, staleNotifiedAt: now };
     const owner = store.getOwner?.();
     if (owner && (store.enqueueOutbox || store.enqueueExecutorStatus)) {
       const payload = renderJobStatus(job, { workerLiveness: notified, now });
@@ -195,7 +279,7 @@ function projectObservation(store: LivenessStore, job: Job, observed: WorkerLive
 }
 
 export function projectUnknownWorker(
-  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
+  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "getWorkerLivenessForResource" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
     Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>,
   job: Job,
   resourceId: string,
@@ -208,7 +292,7 @@ export function projectUnknownWorker(
 }
 
 export function projectWorkerLiveness(
-  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
+  store: Pick<TelegramAgentStore, "getWorkerLiveness" | "getWorkerLivenessForResource" | "upsertWorkerLiveness" | "markWorkerLivenessNotified"> &
     Partial<Pick<TelegramAgentStore, "getOwner" | "enqueueOutbox">>,
   job: Job,
   thread: ThreadLike,
@@ -216,12 +300,14 @@ export function projectWorkerLiveness(
   workerKind?: WorkerLiveness["workerKind"],
   generation = job.version,
   fence?: ExecutorFence,
+  commandActivityAt?: number,
 ): WorkerLiveness {
   const observed = observeThreadWorker(
     job,
     workerKind ? { ...thread, id: thread.id } : thread,
     now,
     generation,
+    commandActivityAt,
   );
   if (workerKind) observed.workerKind = workerKind;
   return projectObservation(store, job, observed, now, fence);

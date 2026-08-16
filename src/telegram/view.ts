@@ -1,8 +1,18 @@
-import { projectPolicySchema, type Job, type ProjectPolicy, type WorkerLiveness } from "../domain/models";
+import {
+  isResumablePermanentFailure,
+  isResumablePlanBlock,
+  isResumableReviewBlock,
+  isReviewedPrCompletionBlock,
+  projectPolicySchema,
+  type Job,
+  type ProjectPolicy,
+  type WorkerLiveness,
+} from "../domain/models";
 import type { JobAdmission } from "../autonomy/models";
 import { hashSecret } from "../crypto";
 import { assertSafeExternalHttpsUrl } from "../storage/store";
 import type { ResourceWaitProjection } from "../storage/autonomy-repository";
+import { containsForbiddenCallbackMaterial } from "./callback-material";
 import type {
   InlineKeyboardButton,
   InlineKeyboardMarkup,
@@ -16,8 +26,6 @@ const MAX_CALLBACK_BYTES = 64;
 const MAX_TELEGRAM_TEXT_LENGTH = 4_096;
 const MAX_EVIDENCE_LENGTH = 3_500;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const RAW_MERGE_CALLBACK_PATTERN = /m:[A-Za-z0-9_-]{32}/;
-const ENCODED_MERGE_CALLBACK_PATTERN = /(?:m|%6d)%3a[A-Za-z0-9_-]{32}/i;
 const CREDENTIAL_ASSIGNMENT_PATTERN =
   /(^|[^A-Za-z0-9])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|auth[_-]?(?:token|key)|session[_-]?token|private[_-]?key|credentials?|password|secret|token|key)["']?\s*[:=]\s*["']?[^\s"'&;,)}\]]+/gi;
 
@@ -28,11 +36,19 @@ export type CallbackAction =
   | { type: "retry"; jobId: string }
   | { type: "review"; jobId: string }
   | { type: "merge"; nonce: string }
+  /** Approve this merge and grant a standing approval for the project. */
+  | { type: "merge_always"; nonce: string }
   | { type: "operation"; nonce: string }
-  /** One option of a question the controller thread is blocked on. */
+  /** One choice from a generic controller interaction. */
+  | { type: "controller_interaction"; token: string }
+  /** Legacy controller question callbacks remain parseable but are never emitted. */
   | { type: "question"; token: string }
   /** One choice offered for a watched thread that is waiting on the owner. */
   | { type: "thread_interaction"; token: string };
+
+/** Legacy question callbacks remain parseable for already-rendered Telegram messages. */
+export type LegacyQuestionCallbackAction = { type: "question"; token: string };
+export type ParsedCallbackAction = CallbackAction | LegacyQuestionCallbackAction;
 
 export type ReviewView = {
   verdict?: string;
@@ -76,9 +92,18 @@ export type JobStatusContext = {
   approvalExpiresAt?: number | string | Date;
   mergeNonce?: string;
   mergeNonceHash?: string;
+  /** True when this project already merges without asking. */
+  mergeAuthorityGranted?: boolean;
+  /** Why this merge is asking despite a standing approval. */
+  approvalReason?: string;
+  /** True when a standing approval merged this job without asking. */
+  autoApproved?: boolean;
   ready?: boolean;
   workerLiveness?: WorkerLiveness | null;
   resourceWait?: readonly ResourceWaitProjection[];
+  materialModelPool?: "standard" | "strong";
+  mandatoryGuardOutcome?: "passed" | "failed" | "blocked" | "missing";
+  ownerDecision?: string;
   now?: number;
 };
 
@@ -151,22 +176,6 @@ export function renderJobChoices(
     parse_mode: "HTML",
     disable_web_page_preview: true,
   };
-}
-
-function containsForbiddenCallbackMaterial(value: string): boolean {
-  let candidate = value;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    if (RAW_MERGE_CALLBACK_PATTERN.test(candidate) || ENCODED_MERGE_CALLBACK_PATTERN.test(candidate)) return true;
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(candidate);
-    } catch {
-      return true;
-    }
-    if (decoded === candidate) return false;
-    candidate = decoded;
-  }
-  return RAW_MERGE_CALLBACK_PATTERN.test(candidate) || ENCODED_MERGE_CALLBACK_PATTERN.test(candidate);
 }
 
 function sanitizePersistedValue(value: unknown): unknown {
@@ -328,13 +337,17 @@ export function encodeCallbackData(action: CallbackAction): string {
       if (!NONCE_PATTERN.test(action.nonce)) throw new TypeError("nonce is not valid callback data");
       encoded = `m:${action.nonce}`;
       break;
+    case "merge_always":
+      if (!NONCE_PATTERN.test(action.nonce)) throw new TypeError("nonce is not valid callback data");
+      encoded = `a:${action.nonce}`;
+      break;
     case "operation":
       if (!NONCE_PATTERN.test(action.nonce)) throw new TypeError("nonce is not valid callback data");
       encoded = `o:${action.nonce}`;
       break;
-    case "question":
+    case "controller_interaction":
       if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
-      encoded = `q:${action.token}`;
+      encoded = `i:${action.token}`;
       break;
     case "thread_interaction":
       if (!NONCE_PATTERN.test(action.token)) throw new TypeError("token is not valid callback data");
@@ -347,7 +360,7 @@ export function encodeCallbackData(action: CallbackAction): string {
   return encoded;
 }
 
-export function parseCallbackData(data: string): CallbackAction {
+export function parseCallbackData(data: string): ParsedCallbackAction {
   if (typeof data !== "string" || Buffer.byteLength(data, "utf8") > MAX_CALLBACK_BYTES) {
     throw new TypeError("Telegram callback data is invalid");
   }
@@ -364,10 +377,14 @@ export function parseCallbackData(data: string): CallbackAction {
   if (match) return { type: "review", jobId: match[1] };
   match = /^m:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "merge", nonce: match[1] };
+  match = /^a:([A-Za-z0-9_-]{32})$/.exec(data);
+  if (match) return { type: "merge_always", nonce: match[1] };
   match = /^o:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "operation", nonce: match[1] };
   match = /^q:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "question", token: match[1] };
+  match = /^i:([A-Za-z0-9_-]{32})$/.exec(data);
+  if (match) return { type: "controller_interaction", token: match[1] };
   match = /^w:([A-Za-z0-9_-]{32})$/.exec(data);
   if (match) return { type: "thread_interaction", token: match[1] };
   throw new TypeError("Telegram callback data is invalid");
@@ -489,6 +506,26 @@ function resultLabel(value: string | undefined): string {
   return displayText(value ?? "unknown", 80);
 }
 
+function aggregateVerification(context: JobStatusContext): string | null {
+  const outcomes = [
+    ...(context.validation ?? []).map((item) => item.outcome),
+    ...(context.checks ?? []).map((item) => item.outcome ?? item.bucket ?? "unknown"),
+  ].map((value) => value.toLowerCase());
+  if (outcomes.length === 0) return null;
+  if (outcomes.some((value) => /fail|error|block|missing/u.test(value))) return "failed";
+  if (outcomes.every((value) => /pass|success|green|skip/u.test(value))) return "passed";
+  return "incomplete";
+}
+
+function deliveryState(job: Job): string {
+  if (job.state === "complete" || job.state === "merged") return "delivered";
+  if (job.state === "awaiting_merge_approval") return "awaiting owner approval";
+  if (job.state === "cancelled") return "cancelled";
+  if (job.state === "failed" || job.state === "blocked" || job.state === "production_failed") return "blocked";
+  if (job.state === "awaiting_project" || job.state === "awaiting_confirmation") return "not started";
+  return "in progress";
+}
+
 function statusButtons(job: Job, context: JobStatusContext, ready: boolean): InlineKeyboardButton[] {
   const buttons: InlineKeyboardButton[] = [];
   const prUrl = safeHttpUrl(job.prUrl);
@@ -506,12 +543,22 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
     if (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce)) {
       const shortSha = job.prHeadSha?.slice(0, 8) ?? "approved";
       buttons.push({ text: `Merge + deploy ${shortSha}`, callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
+      if (context.mergeAuthorityGranted !== true) {
+        buttons.push({
+          text: "Merge + deploy, and always from now on",
+          callback_data: encodeCallbackData({ type: "merge_always", nonce: context.mergeNonce }),
+        });
+      }
     }
   } else if (job.state === "awaiting_confirmation" && !queuedConfirmation && !livenessBlocked) {
     buttons.push({ text: "Start", callback_data: encodeCallbackData({ type: "start", jobId: job.id }) });
-  } else if (job.state === "failed" && !livenessBlocked) {
+  } else if ((job.state === "failed" || isResumablePermanentFailure(job)) && !livenessBlocked) {
     buttons.push({ text: "Retry", callback_data: encodeCallbackData({ type: "retry", jobId: job.id }) });
-  } else if (job.state === "blocked" && !livenessBlocked) {
+  } else if (isReviewedPrCompletionBlock(job) && !livenessBlocked) {
+    buttons.push({ text: "Finish", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
+  } else if (isResumablePlanBlock(job) && !livenessBlocked) {
+    buttons.push({ text: "Revise plan", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
+  } else if (isResumableReviewBlock(job) && !livenessBlocked) {
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
   }
 
@@ -529,21 +576,47 @@ export function renderJobStatus(
   assertJobId(job.id);
   const policy = context.project ?? job.policy;
   const ready = context.ready ?? job.state === "awaiting_merge_approval";
+  // A confirmed job waiting for a slot has no button and needs nothing from the
+  // owner, so titling it "awaiting_confirmation" reads as a demand for a tap
+  // that does not exist.
+  const queuedConfirmed = job.state === "awaiting_confirmation" &&
+    context.admission?.jobId === job.id &&
+    context.admission.state === "queued";
   const title = ready
     ? "Ready to merge and deploy"
     : job.state === "production_failed"
       ? "PRODUCTION INCIDENT"
       : job.state === "complete"
-        ? "Merged, deployed, and verified"
-        : `Job ${displayText(job.state, 80)}`;
+        ? job.mergeCommitSha
+          ? "Merged, deployed, and verified"
+          : "Done — pull request ready"
+        : queuedConfirmed
+          ? "Job queued"
+          : `Job ${displayText(job.state, 80)}`;
   const lines = [
     `<b>${escapeHtml(title)}</b>`,
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,
   ];
   if (policy) lines.push(`Base: <code>${html(policy.baseBranch, 120)}</code>`);
+  lines.push(`Recipe: <code>${html(`${job.taskRecipe}@${job.recipeVersion}`, 160)}</code>`);
+  lines.push(`Stage: <code>${html(queuedConfirmed ? "queued" : job.state, 80)}</code>`);
+  if (job.recipePromotionCount > 0) {
+    lines.push(`Rigor: promoted ${job.recipePromotionCount}/2`);
+  }
+  if (context.materialModelPool) {
+    lines.push(`Model escalation: <code>${html(context.materialModelPool, 20)}</code>`);
+  }
+  lines.push(`Delivery: ${html(deliveryState(job), 80)}`);
+  if (context.autoApproved) {
+    lines.push("Merging on your standing approval — you were not asked.");
+  } else if (ready && context.approvalReason && context.mergeAuthorityGranted) {
+    lines.push(`Asking you even though this project is pre-approved: ${html(context.approvalReason, 200)}.`);
+  }
   lines.push(`Task: <code>${html(job.requestText, 500)}</code>`);
-  if (job.state === "awaiting_confirmation" && context.admission?.jobId === job.id && context.admission.state === "queued") {
-    lines.push("Queue: queued");
+  if (queuedConfirmed) {
+    lines.push("Queue: waiting for a free slot — starts on its own, nothing to approve");
+  } else if (job.state === "awaiting_confirmation") {
+    lines.push("Waiting for you to start it");
   }
   const resourceWait = (context.resourceWait ?? [])
     .filter((entry) => entry.kind === "repository_merge" || entry.kind === "production_target")
@@ -568,7 +641,9 @@ export function renderJobStatus(
   if (job.deploymentSummary) lines.push(`Deploy: ${html(job.deploymentSummary, 500)}`);
   if (job.canarySummary) lines.push(`Canary: ${html(job.canarySummary, 500)}`);
   if (job.state === "production_failed") {
-    lines.push("The merge succeeded, but production did not pass. No automatic rollback was attempted; follow the configured operator rollback procedure.");
+    lines.push(job.policy?.production?.rollbackCommand
+      ? "The merge succeeded, but production did not pass. Your rollback command was run — the Deploy or Canary line above says whether it worked."
+      : "The merge succeeded, but production did not pass. No rollback command is configured, so production is still running the new code; follow your own rollback procedure.");
   }
   if (pullRequest || context.changedFiles !== undefined || context.diffStat) {
     const changedFiles = context.diffStat?.changedFiles ?? context.changedFiles ?? pullRequest?.changedFiles;
@@ -583,14 +658,12 @@ export function renderJobStatus(
   if (job.documentationThreadId) lines.push(`Docs thread: <code>${html(job.documentationThreadId, 120)}</code>`);
   if (context.workerLiveness) {
     const worker = context.workerLiveness;
-    const now = context.now ?? worker.observedAt;
-    const ageSeconds = Math.max(0, Math.floor((now - worker.sourceUpdatedAt) / 1_000));
-    lines.push(`Worker: ${html(worker.resourceId, 120)} (<code>${html(worker.state, 40)}</code>)`);
-    lines.push(`Observation age: <code>${ageSeconds}s ago</code>`);
-    if (worker.state === "unknown") {
-      lines.push("Warning: waiting for an authoritative BB observation; no worker diagnosis is available.");
-    } else if (worker.state === "stale") {
-      lines.push("Warning: waiting for a fresh BB observation; no worker diagnosis is available.");
+    const catchingUp = worker.state === "unknown" || worker.state === "stale";
+    lines.push(`Worker: ${html(worker.workerKind, 40)} (<code>${html(catchingUp ? "checking" : worker.state, 40)}</code>)`);
+    if (catchingUp) {
+      lines.push(worker.state === "unknown"
+        ? "Warning: waiting for an authoritative BB observation; no worker diagnosis is available."
+        : "Warning: waiting for a fresh BB observation; no worker diagnosis is available.");
     }
   }
   if (context.review) {
@@ -610,7 +683,14 @@ export function renderJobStatus(
       lines.push(`• ${html(item.name, 100)}: ${html(resultLabel(item.outcome ?? item.bucket), 80)}${item.summary ? ` — ${html(item.summary, 300)}` : ""}`);
     }
   }
+  const verification = aggregateVerification(context);
+  if (verification) lines.push(`Verification: ${html(verification, 40)}`);
+  if (context.mandatoryGuardOutcome) {
+    lines.push(`Mandatory guards: ${html(context.mandatoryGuardOutcome, 40)}`);
+  }
   if (job.lastError) lines.push(`Blocker: ${html(job.lastError, 500)}`);
+  if (context.ownerDecision) lines.push(`Decision: ${html(context.ownerDecision, 300)}`);
+  if (job.planCycle > 0) lines.push(`Plan cycle: ${job.planCycle}`);
   if (job.reviewCycle > 0) lines.push(`Review cycle: ${job.reviewCycle}`);
   const expiry = formatExpiry(context.approvalExpiresAt);
   if (expiry) lines.push(`Approval expires: ${html(expiry, 100)}`);

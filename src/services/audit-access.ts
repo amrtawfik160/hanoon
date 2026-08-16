@@ -1,0 +1,219 @@
+import type { BacklogIssue } from "../autonomy/audits/bug-backlog";
+import {
+  DEBT_EXCLUDED_PREFIXES,
+  DEBT_MARKERS,
+  type DebtMarker,
+} from "../autonomy/audits/tech-debt";
+import type { DocObservation } from "../autonomy/audits/docs-staleness";
+import type { ReviewThread } from "../autonomy/audits/pr-review-findings";
+import { parseCommandJson, type CommandResult, type TerminalRunInput } from "../bb/terminal-command";
+import type { TelegramAgentStore } from "../storage/store";
+import type { AuditAccess, AuditProject } from "./audit-service";
+
+const GIT_TIMEOUT_MS = 60_000;
+
+/** Bounds one command's output so a large repository cannot flood a turn. */
+const MAX_OUTPUT_BYTES = 2_000_000;
+
+/**
+ * The shell carries the NUL as a printf escape, so the command stays text-only.
+ * printf emits the NUL-prefixed separator in output, where it cannot occur in a
+ * repository path and remains unambiguous to the document reader.
+ */
+const FILE_MARKER = "\\0FILE:";
+const FILE_SEPARATOR = `${String.fromCharCode(0)}FILE:`;
+
+/** These globs keep debt scanning on tracked source files, not prose or blobs. */
+const DEBT_SOURCE_GLOBS: readonly string[] = Object.freeze([
+  "*.c", "*.cc", "*.cpp", "*.h", "*.hpp",
+  "*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx",
+  "*.py", "*.go", "*.rs", "*.java", "*.kt", "*.kts",
+  "*.rb", "*.php", "*.swift", "*.sh", "*.bash", "*.zsh",
+  "*.vue", "*.svelte", "*.astro", "*.css", "*.scss", "*.less",
+]);
+
+const DEBT_SCAN_PATHS = [
+  ...DEBT_SOURCE_GLOBS.map((glob) => `'${glob}'`),
+  ...DEBT_EXCLUDED_PREFIXES.map((prefix) => `':(exclude)${prefix}**'`),
+].join(" ");
+
+/** gh documents these settings for non-colour, non-paged, non-interactive output. */
+const QUIET_GH_ENV = "NO_COLOR=1 CLICOLOR=0 GH_PAGER=cat PAGER=cat GH_SPINNER_DISABLED=1 GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1";
+
+function quietGh(command: string): string {
+  return `${QUIET_GH_ENV} ${command}`;
+}
+
+type CommandRunner = { run(input: TerminalRunInput): Promise<CommandResult> };
+type ProjectsApi = { list(args: Record<string, never>): Promise<readonly unknown[]> };
+type ProjectSource = { hostId: string; path: string | null; isDefault?: boolean };
+type ProjectRecord = { id: string; kind?: string; sources?: readonly ProjectSource[] };
+type HostTarget = { hostId: string; cwd: string | null };
+
+function defaultSource(project: ProjectRecord): ProjectSource | undefined {
+  const sources = project.sources ?? [];
+  return sources.find((c) => c.isDefault) ?? (sources.length === 1 ? sources[0] : undefined);
+}
+
+/**
+ * The live surfaces the audits read: git for the working tree, and `gh` for
+ * anything that lives on GitHub.
+ *
+ * Everything here is I/O. Every rule that turns these observations into a
+ * finding lives in the pure audit modules, so this stays small enough to read.
+ *
+ * The two GitHub audits degrade rather than fail loudly when `gh` is absent or
+ * unauthenticated: they throw, the runner records that audit as an error, and
+ * the message says it could not run instead of implying a clean result.
+ */
+export function createAuditAccess(input: Readonly<{
+  sdk: { projects: ProjectsApi };
+  store: Pick<TelegramAgentStore, "listEnabledProjectPolicies">;
+  terminal: CommandRunner;
+}>): AuditAccess {
+  const targets = new Map<string, HostTarget>();
+
+  const run = async (project: AuditProject, title: string, command: string): Promise<CommandResult> => {
+    const target = targets.get(project.projectId);
+    if (!target) return { outcome: "aborted" };
+    return input.terminal.run({
+      scope: { kind: "host_path", hostId: target.hostId, cwd: target.cwd },
+      title,
+      command,
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+  };
+
+  const requireOutput = async (project: AuditProject, title: string, command: string): Promise<string> => {
+    const result = await run(project, title, command);
+    if (result.outcome !== "exited") throw new Error(`${title}: ${result.outcome}`);
+    if (result.exitCode !== 0) {
+      throw new Error(`${title}: exited ${result.exitCode}`);
+    }
+    if (Buffer.byteLength(result.output, "utf8") > MAX_OUTPUT_BYTES) {
+      throw new Error(`${title}: output exceeded ${MAX_OUTPUT_BYTES} bytes`);
+    }
+    return result.output;
+  };
+
+  return {
+    async listProjects() {
+      const policies = input.store.listEnabledProjectPolicies();
+      if (policies.length === 0) return [];
+      const projects = (await input.sdk.projects.list({})) as readonly ProjectRecord[];
+      const audited: AuditProject[] = [];
+      for (const { policy } of policies) {
+        const project = projects.find((c) => c.id === policy.projectId);
+        if (!project || (project.kind !== undefined && project.kind !== "standard")) continue;
+        const source = defaultSource(project);
+        if (!source || source.hostId.trim().length === 0 || source.path === null) continue;
+        targets.set(policy.projectId, { hostId: source.hostId, cwd: source.path });
+        audited.push({ projectId: policy.projectId, label: policy.alias ?? policy.projectId });
+      }
+      return audited;
+    },
+
+    async readDocs(project) {
+      const tracked = (await requireOutput(project, "audit: tracked files", "git ls-files"))
+        .split("\n").map((l) => l.trim()).filter(Boolean);
+      const trackedPaths = new Set(tracked);
+      const markdown = tracked.filter((p) => p.endsWith(".md"));
+      if (markdown.length === 0) return { docs: [], trackedPaths };
+
+      // One command for every document: a command per file would be hundreds of
+      // round trips on a repository this size.
+      const concatenated = await requireOutput(
+        project,
+        "audit: documents",
+        `git ls-files -z '*.md' | while IFS= read -r -d '' f; do printf '${FILE_MARKER}%s\\n' "$f"; cat "$f"; printf '\\n'; done`,
+      );
+
+      const docs: DocObservation[] = [];
+      for (const chunk of concatenated.split(FILE_SEPARATOR)) {
+        if (chunk === "") continue;
+        const newline = chunk.indexOf("\n");
+        if (newline < 0) continue;
+        const path = chunk.slice(0, newline).trim();
+        if (path === "") continue;
+        docs.push({ path, text: chunk.slice(newline + 1) });
+      }
+      return { docs, trackedPaths };
+    },
+
+    async readDebtMarkers(project) {
+      const pattern = DEBT_MARKERS.join("|");
+      const grepCommand = `git grep -n -I -E '\\b(${pattern})\\b' -- ${DEBT_SCAN_PATHS}`;
+      const raw = await requireOutput(
+        project,
+        "audit: debt markers",
+        `${grepCommand}; debt_grep_exit=$?; if [ "$debt_grep_exit" -eq 1 ]; then exit 0; fi; exit "$debt_grep_exit"`,
+      );
+      const markers: DebtMarker[] = [];
+      for (const line of raw.split("\n")) {
+        // git grep -n prints path:line:text
+        const match = /^([^:]+):(\d+):(.*)$/.exec(line);
+        if (!match) continue;
+        const [, path, lineNumber, text] = match;
+        const kind = DEBT_MARKERS.find((m) => new RegExp(`\\b${m}\\b`).test(text ?? ""));
+        if (kind === undefined) continue;
+        markers.push({
+          path: path ?? "",
+          line: Number(lineNumber),
+          kind,
+          text: (text ?? "").slice(0, 200),
+        });
+      }
+      return markers;
+    },
+
+    async readBugBacklog(project) {
+      const raw = await requireOutput(
+        project,
+        "audit: bug backlog",
+        quietGh("gh issue list --label bug --state open --limit 100 --json number,title,createdAt,updatedAt"),
+      );
+      const parsed = parseCommandJson<readonly {
+        number: number; title: string; createdAt: string; updatedAt: string;
+      }[]>(raw, "audit: bug backlog");
+      return parsed.map((issue): BacklogIssue => ({
+        number: issue.number,
+        title: issue.title,
+        createdAt: Date.parse(issue.createdAt),
+        updatedAt: Date.parse(issue.updatedAt),
+      }));
+    },
+
+    async readReviewThreads(project) {
+      const raw = await requireOutput(
+        project,
+        "audit: review threads",
+        quietGh("gh pr list --state merged --limit 10 --json number,title,reviews"),
+      );
+      const parsed = parseCommandJson<readonly {
+        number: number;
+        title: string;
+        reviews?: readonly { author?: { login?: string }; body?: string; state?: string }[];
+      }[]>(raw, "audit: review threads");
+      const threads: ReviewThread[] = [];
+      for (const pr of parsed) {
+        for (const review of pr.reviews ?? []) {
+          const body = (review.body ?? "").trim();
+          // An approval with no words is not a finding, and a comment with no
+          // body is nothing to answer.
+          if (body === "" || review.state === "APPROVED") continue;
+          threads.push({
+            pr: pr.number,
+            prTitle: pr.title,
+            author: review.author?.login ?? "unknown",
+            body,
+            // The list API does not expose resolution, so a merged pull request
+            // with a change request still on it is what this reports.
+            resolved: false,
+            outdated: false,
+          });
+        }
+      }
+      return threads;
+    },
+  };
+}

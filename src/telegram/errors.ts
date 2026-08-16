@@ -7,11 +7,14 @@ export type TelegramErrorKind =
   | "retryable"
   | "permanent";
 
+export type TelegramDeliveryOutcome = "not_sent" | "unknown";
+
 export type TelegramApiErrorInput = {
   httpStatus: number | null;
   errorCode: number;
   description?: string;
   retryAfterSeconds?: number | null;
+  deliveryOutcome?: TelegramDeliveryOutcome;
   redact?: readonly string[];
 };
 
@@ -33,6 +36,7 @@ export class TelegramApiError extends Error {
   public readonly errorCode: number;
   public readonly description: string | null;
   public readonly retryAfterSeconds: number | null;
+  public readonly deliveryOutcome: TelegramDeliveryOutcome;
 
   public constructor(input: TelegramApiErrorInput) {
     const description = sanitizedDescription(input.description, input.redact ?? []);
@@ -43,6 +47,7 @@ export class TelegramApiError extends Error {
     this.errorCode = input.errorCode;
     this.description = description;
     this.retryAfterSeconds = input.retryAfterSeconds ?? null;
+    this.deliveryOutcome = input.deliveryOutcome ?? "not_sent";
   }
 }
 

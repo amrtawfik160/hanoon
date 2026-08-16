@@ -27,12 +27,20 @@ function fixture() {
   if (!lease.acquired) throw new Error("missing lease");
   const fence = { ownerId: "executor", generation: lease.generation, now: NOW };
   expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.reserveControllerSpawn({
+    controllerKey: CONTROLLER_KEY,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    now: NOW,
+  })).toBe(true);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: turn.id,
     projectId: "proj_personal",
     hostId: "host_personal",
     threadId: "thr_controller",
+    spawnToken: turn.id,
   })).toBe(true);
   expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
   return { bb, harness, store, turn, fence };
@@ -65,8 +73,14 @@ it("runs a mutating tool once per turn and replays its result afterwards", async
     callContext(),
   );
 
-  expect(replay).toBe(first);
+  const firstResult = JSON.parse(first as string);
+  const replayResult = JSON.parse(replay as string);
+  expect(replayResult.remembered).toEqual(firstResult.remembered);
+  expect(firstResult._hanoonEvidence).toMatchObject({ ref: "evidence:1", outcome: "succeeded" });
+  expect(replayResult._hanoonEvidence).toMatchObject({ ref: "evidence:2", outcome: "observed" });
   expect(store.countMemories("owner")).toBe(1);
+  expect(store.listToolReceipts(store.getPendingControllerTurn(CONTROLLER_KEY)!.id)).toHaveLength(1);
+  expect(store.listControllerEvidence(store.getPendingControllerTurn(CONTROLLER_KEY)!.id, 10)).toHaveLength(2);
 });
 
 it("treats different arguments as a different call", async () => {
@@ -133,7 +147,7 @@ it("reports an interrupted call as uncertain instead of running it twice", async
   expect(request).not.toHaveBeenCalled();
 });
 
-it("lets a failed call be attempted again", () => {
+it("retries only a failure recorded before the operation starts", () => {
   const { store, turn } = fixture();
   const key = {
     turnId: turn.id,
@@ -144,6 +158,13 @@ it("lets a failed call be attempted again", () => {
   store.failToolReceipt({ ...key, error: "BB unreachable", now: NOW + 1 });
 
   expect(store.claimToolReceipt({ ...key, controllerKey: CONTROLLER_KEY, now: NOW + 2 }))
+    .toEqual({ outcome: "interrupted" });
+
+  const safeKey = { ...key, argsSha256: "d".repeat(64) };
+  expect(store.claimToolReceipt({ ...safeKey, controllerKey: CONTROLLER_KEY, now: NOW + 3 }))
+    .toEqual({ outcome: "fresh" });
+  store.failToolReceipt({ ...safeKey, error: "authorization_failed", now: NOW + 4 });
+  expect(store.claimToolReceipt({ ...safeKey, controllerKey: CONTROLLER_KEY, now: NOW + 5 }))
     .toEqual({ outcome: "fresh" });
 });
 

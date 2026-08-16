@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { TerminalCommandRunner } from "../src/bb/terminal-command";
+import { parseCommandJson, TerminalCommandRunner } from "../src/bb/terminal-command";
 
 type TerminalSdk = {
   terminals: {
@@ -29,6 +29,19 @@ afterEach(() => {
 });
 
 describe("TerminalCommandRunner", () => {
+  test("parses JSON after terminal control sequences without changing printable content", () => {
+    const title = "Issue ; [brackets] \\ escapes and } braces";
+    const output = `\u001b[?25l;?\u001b[?25h${JSON.stringify([{ title }])}`;
+
+    expect(parseCommandJson(output, "audit: bug backlog")).toEqual([{ title }]);
+  });
+
+  test("describes a missing JSON payload in terms the audit can report", () => {
+    expect(() => parseCommandJson("\u001b[?25l;? not JSON", "audit: bug backlog")).toThrow(
+      "audit: bug backlog: command output did not contain a valid JSON payload",
+    );
+  });
+
   test("captures a command result before BB removes scrollback for an exited terminal", async () => {
     let marker: string | null = null;
     let statusReads = 0;
@@ -74,6 +87,32 @@ describe("TerminalCommandRunner", () => {
       tailBytes: 65_536,
     });
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("emits a final exited observation when the result marker arrives before BB status", async () => {
+    let marker: string | null = null;
+    const observations: Array<{ status: string; exitCode?: number | null }> = [];
+    const create = vi.fn().mockImplementation(async ({ start }: { start: { command: string } }) => {
+      marker = start.command.match(/__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/)?.[0] ?? null;
+      return { id: "terminal-1" };
+    });
+    const get = vi.fn().mockResolvedValue({ status: "running", exitCode: null });
+    const output = vi.fn().mockImplementation(async () => ({
+      chunks: [{ seq: 0, dataBase64: encoded(`ok\n${marker}:0\n`) }],
+      nextSeq: 1,
+    }));
+    const runner = new TerminalCommandRunner(makeSdk({ create, get, output }) as never);
+
+    const result = await runner.run({
+      scope: { kind: "environment", environmentId: "env-1" },
+      title: "validation",
+      command: "npm test",
+      timeoutMs: 5_000,
+      onObservation: (observation) => observations.push(observation),
+    });
+
+    expect(result).toEqual({ outcome: "exited", exitCode: 0, output: "ok" });
+    expect(observations.at(-1)).toMatchObject({ id: "terminal-1", status: "exited", exitCode: 0 });
   });
 
   test.each([

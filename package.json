@@ -10,20 +10,37 @@
   "bb": {
     "name": "Telegram Agent",
     "description": "Talk to a configurable Codex controller and run reviewed BB implementation jobs from Telegram.",
-    "branding": { "icon": "Bot" },
+    "branding": {
+      "icon": "Bot"
+    },
     "server": "./server.ts",
-    "skills": ["skills/workflow-kit", "skills/guards", "skills/delivery"]
+    "skills": [
+      "skills/workflow-kit",
+      "skills/guards",
+      "skills/delivery",
+      "skills/discovery",
+      "skills/hanoon"
+    ]
   },
   "scripts": {
-    "build": "npm run skills:verify && bb plugin build",
+    "build": "npm run skills:verify && bb plugin build && npm run verify:artifact",
     "skills:sync": "node scripts/sync-workflow-skills.mjs",
     "skills:verify": "node scripts/verify-skill-bundle.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "eval:controller": "node scripts/eval-controller-outcomes.mjs",
     "eval:answers": "node scripts/eval-controller-answers.mjs",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "verify:artifact": "node scripts/verify-built-artifact.mjs",
+    "broker:build": "npm run build --workspace @hanoon/credential-broker",
+    "broker:pack": "npm run broker:build && npm pack --workspace @hanoon/credential-broker",
+    "test:credentials": "vitest run tests/credential-*.test.ts",
+    "acceptance:credential-broker": "node scripts/record-credential-broker-acceptance.mjs"
   },
+  "workspaces": [
+    "broker"
+  ],
   "devDependencies": {
     "@bb/plugin-sdk": "file:vendor/bb-plugin-sdk-0.4.1.tgz",
     "@types/better-sqlite3": "^7.6.12",
@@ -31,6 +48,7 @@
     "@types/react": "^19.0.0",
     "bb-app": "0.36.0",
     "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.5.0",
     "hono": "^4.11.9",
     "typescript": "^5.7.0",
     "vitest": "^3.2.0",

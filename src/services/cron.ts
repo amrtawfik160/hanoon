@@ -23,9 +23,13 @@ const FIELD_BOUNDS = [
   { min: 0, max: 7 }, // day of week, where 7 and 0 are both Sunday
 ] as const;
 
+const MINUTE_MS = 60_000;
+const MINUTES_PER_DAY = 24 * 60;
 // A cron that matches nothing real (30 February) must terminate rather than
-// spin, so the search is bounded at slightly over four years to cover leap days.
-const MAX_SEARCH_MINUTES = 4 * 366 * 24 * 60 + 1440;
+// spin. Non-matching dates are skipped a day at a time, so this bounds a mostly
+// day-stepped walk: nine years covers the widest real gap, the eight-year one
+// between February 29ths across a skipped century leap year.
+const MAX_SEARCH_MINUTES = 9 * 366 + 2 * MINUTES_PER_DAY;
 
 function parseField(raw: string, index: number): Set<number> | null {
   const { min, max } = FIELD_BOUNDS[index] as { min: number; max: number };
@@ -122,12 +126,26 @@ export function matchesCron(schedule: CronSchedule, at: Date): boolean {
 export function nextCronOccurrence(expression: string, after: number): number | null {
   const schedule = parseCron(expression);
   if (schedule === null || !Number.isFinite(after)) return null;
-  const cursor = new Date(after);
-  cursor.setSeconds(0, 0);
-  cursor.setMinutes(cursor.getMinutes() + 1);
+  // Epoch arithmetic only — never Date's local-component setters. During a
+  // daylight-saving fall-back an ambiguous local time resolves to the offset
+  // *before* the transition, so `setSeconds(0, 0)` rewinds the cursor by up to
+  // an hour and returns a time that has already passed. A scheduler that is
+  // handed a past due-time fires again on its very next poll, forever.
+  let cursorMs = Math.floor(after / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
   for (let step = 0; step < MAX_SEARCH_MINUTES; step += 1) {
-    if (matchesCron(schedule, cursor)) return cursor.getTime();
-    cursor.setMinutes(cursor.getMinutes() + 1);
+    const candidate = new Date(cursorMs);
+    if (matchesCron(schedule, candidate)) {
+      return cursorMs > after ? cursorMs : null;
+    }
+    // A date that cannot match is skipped a day at a time rather than a minute
+    // at a time, so an impossible expression such as `0 0 30 2 *` costs a few
+    // thousand checks instead of two million on the executor's own thread.
+    if (!matchesDay(schedule, candidate) || !schedule.month.has(candidate.getMonth() + 1)) {
+      const elapsed = candidate.getHours() * 60 + candidate.getMinutes();
+      cursorMs += (MINUTES_PER_DAY - elapsed) * MINUTE_MS;
+      continue;
+    }
+    cursorMs += MINUTE_MS;
   }
   return null;
 }

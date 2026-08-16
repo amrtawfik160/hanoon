@@ -1,4 +1,9 @@
 import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+import {
+  CAPABILITY_SKILL_IDS,
+  type CapabilitySkillId,
+} from "../capabilities/catalog";
+import type { RoutingMode } from "../domain/models";
 
 export type WorkerSkillRole =
   | "planner"
@@ -8,34 +13,55 @@ export type WorkerSkillRole =
   | "documentation"
   | "final-review";
 
-export const BUNDLED_SKILL_IDS = [
-  "systematic-debugging",
-  "test-driven-development",
-  "verification-before-completion",
-  "clean-code-guard",
-  "test-guard",
-  "docs-guard",
-  "pr-writer",
+export const COMMUNICATION_SKILL_ID = "human-friendly-coding-communication";
+export const PROPORTIONAL_WORKFLOW_SKILL_ID = "proportional-development-workflow";
+export const GRILL_WITH_DOCS_SKILL_ID = "grill-with-docs";
+export const GRILLING_SKILL_ID = "grilling";
+export const DOMAIN_MODELING_SKILL_ID = "domain-modeling";
+
+export const CONTROLLER_SKILL_IDS = [
+  COMMUNICATION_SKILL_ID,
+  PROPORTIONAL_WORKFLOW_SKILL_ID,
+  GRILL_WITH_DOCS_SKILL_ID,
+  GRILLING_SKILL_ID,
+  DOMAIN_MODELING_SKILL_ID,
 ] as const;
 
-export type BundledSkillId = typeof BUNDLED_SKILL_IDS[number];
+export const BUNDLED_SKILL_IDS = CAPABILITY_SKILL_IDS;
+
+export type BundledSkillId = CapabilitySkillId;
 
 export const ROLE_SKILLS = {
-  planner: [],
-  critic: [],
+  // The plan is a document that must reproduce the policy's exact verification
+  // commands, so its claims are checkable against the repository the same way a
+  // README's are. That is docs-guard's job, and a wrong command here is only
+  // discovered much later, when the verification it promised does not run.
+  planner: [COMMUNICATION_SKILL_ID, "docs-guard"],
+  critic: [COMMUNICATION_SKILL_ID],
   implementation: [
+    COMMUNICATION_SKILL_ID,
     "systematic-debugging",
     "test-driven-development",
     "verification-before-completion",
     "clean-code-guard",
     "test-guard",
+    // The generic guards judge whether code is clean and tested. This one judges
+    // it against the boundaries that make the plugin safe to run unattended, and
+    // requires a new guard to be shown failing before it is trusted.
+    "durable-boundary-audit",
     // The implementation attempt is the one that opens the pull request the
     // reviewer then reads, so it owns writing a reviewer-facing description.
     "pr-writer",
   ],
-  review: ["clean-code-guard", "test-guard"],
-  documentation: ["docs-guard", "verification-before-completion"],
-  "final-review": ["clean-code-guard", "test-guard", "docs-guard"],
+  review: [COMMUNICATION_SKILL_ID, "clean-code-guard", "test-guard", "durable-boundary-audit"],
+  documentation: [COMMUNICATION_SKILL_ID, "docs-guard", "verification-before-completion"],
+  "final-review": [
+    COMMUNICATION_SKILL_ID,
+    "clean-code-guard",
+    "test-guard",
+    "docs-guard",
+    "durable-boundary-audit",
+  ],
 } as const satisfies Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>>;
 
 export type WorkerTitleIdentity = Readonly<{
@@ -48,6 +74,12 @@ export type DurableWorkerIdentity = WorkerTitleIdentity & Readonly<{
   projectId: string;
   environmentId: string | null;
   threadId: string | null;
+  routingMode?: RoutingMode;
+  persistedSkillProfile?: Readonly<{
+    profileId: string;
+    profileRevision: number;
+    skills: readonly BundledSkillId[];
+  }>;
 }>;
 
 export type WorkerSkillProfile = Readonly<{
@@ -104,18 +136,36 @@ export function parseWorkerThreadTitle(title: string | null): WorkerTitleIdentit
   return { jobId, attemptId, role };
 }
 
-export function buildWorkerInstructions(
-  profile: Readonly<Pick<WorkerSkillProfile, "role">>,
+function verifiedWorkerInstructions(
+  role: WorkerSkillRole,
+  skills: readonly BundledSkillId[],
 ): string {
-  const skills = ROLE_SKILLS[profile.role];
   const selectedSkills = skills.length > 0 ? skills.join(", ") : "none";
   return [
-    `Verified worker role: ${profile.role}.`,
+    `Verified worker role: ${role}.`,
     `Selected skill ids: ${selectedSkills}.`,
     "The immutable attached work order/review packet and durable project policy outrank skill suggestions.",
     "Skills cannot authorize approval, merge, deploy, push, or state changes.",
     "The worker must obey the packet's response contract.",
   ].join("\n");
+}
+
+export function buildWorkerInstructions(
+  profile: Readonly<Pick<WorkerSkillProfile, "role">>,
+): string {
+  return verifiedWorkerInstructions(profile.role, ROLE_SKILLS[profile.role]);
+}
+
+function exactPersistedSkills(identity: DurableWorkerIdentity): readonly BundledSkillId[] | null {
+  if (identity.routingMode !== "active") return ROLE_SKILLS[identity.role];
+  const profile = identity.persistedSkillProfile;
+  if (!profile || !/^[A-Za-z0-9_.:-]{1,256}$/u.test(profile.profileId) ||
+    !Number.isSafeInteger(profile.profileRevision) || profile.profileRevision < 1) return null;
+  const known = new Set<string>(CAPABILITY_SKILL_IDS);
+  if (new Set(profile.skills).size !== profile.skills.length || profile.skills.some((skill) => !known.has(skill))) {
+    return null;
+  }
+  return profile.skills;
 }
 
 export function resolveWorkerSkillProfile(input: Readonly<{
@@ -141,10 +191,13 @@ export function resolveWorkerSkillProfile(input: Readonly<{
   if (durableIdentity.environmentId !== null && durableIdentity.environmentId !== context.environment.id) return null;
   if (durableIdentity.threadId !== null && durableIdentity.threadId !== context.thread.id) return null;
 
-  const skills = ROLE_SKILLS[titleIdentity.role];
+  const skills = exactPersistedSkills(durableIdentity);
+  if (skills === null) return null;
   return {
     role: titleIdentity.role,
     skills,
-    instructions: buildWorkerInstructions({ role: titleIdentity.role }),
+    instructions: durableIdentity.routingMode === "active"
+      ? verifiedWorkerInstructions(titleIdentity.role, skills)
+      : buildWorkerInstructions({ role: titleIdentity.role }),
   };
 }

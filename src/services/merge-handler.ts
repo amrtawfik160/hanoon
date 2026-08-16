@@ -4,7 +4,7 @@ import type { Job, JobEffect, StoredEffect } from "../domain/models";
 import {
   parseLsRemoteHead,
   PR_HEAD_COMMAND,
-  runValidation as task8RunValidation,
+  runValidation as defaultRunValidation,
   type ValidationInput,
   type ValidationSnapshot,
 } from "../bb/validation";
@@ -31,6 +31,7 @@ import {
   type ExecutorFence,
   type TelegramAgentStore,
 } from "../storage/store";
+import { shellSingleQuote } from "../bb/terminal-command";
 import type { TerminalObservation } from "../bb/terminal-command";
 import { projectTerminalLiveness, workerRegistrationGeneration } from "./worker-liveness";
 
@@ -39,10 +40,6 @@ const POST_MERGE_HEAD_COMMAND = (number: number): string =>
 const POST_MERGE_PR_COMMAND = (number: number): string =>
   `gh pr view ${String(number)} --json state,mergedAt,mergeCommit,url,number`;
 const MAX_PROVIDER_RESULT_JSON = 64_000;
-
-function shellSingleQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
 
 function postMergeBaseContentCommand(baseBranch: string, approvedHead: string, mergeCommit: string): string {
   const baseRef = `refs/remotes/origin/${baseBranch}`;
@@ -99,13 +96,13 @@ export type GateCollectionInput = {
   fence?: ExecutorFence;
 };
 
-export type Task9FreshGateContext = {
+export type FreshGateContext = {
   environment: GateInput["environment"];
   review: GateInput["review"];
   receipt: MergeReadyReceipt;
 };
 
-export type Task9FreshGateCollectorOptions = {
+export type FreshGateCollectorOptions = {
   validation: Omit<ValidationInput, "environmentId" | "job">;
   getContext: (input: {
     job: Job;
@@ -115,40 +112,40 @@ export type Task9FreshGateCollectorOptions = {
     now: number;
     approvalExpiresAt?: number;
     fence?: ExecutorFence;
-  }) => Promise<Task9FreshGateContext>;
+  }) => Promise<FreshGateContext>;
   runValidation?: (input: ValidationInput & { fence?: ExecutorFence }) => Promise<ValidationSnapshot>;
 };
 
-function remoteHeadEvidenceFromTask8(
+function remoteHeadEvidenceFromValidation(
   snapshot: ValidationSnapshot,
   prNumber: number,
 ): GateInput["remoteHead"] {
   const command = PR_HEAD_COMMAND(prNumber);
   const receipts = snapshot.commandReceipts.filter((receipt) => receipt.command === command);
   if (receipts.length !== 2) {
-    throw new TypeError("Task 8 validation must provide exactly two pull-request head reads");
+    throw new TypeError("validation must provide exactly two pull-request head reads");
   }
   const rows = receipts.map((receipt) => {
     if (receipt.outcome !== "pass" || receipt.exitCode !== 0) {
-      throw new TypeError("Task 8 validation contains a failed pull-request head read");
+      throw new TypeError("validation contains a failed pull-request head read");
     }
     const headSha = parseLsRemoteHead(receipt.output, prNumber);
     return { rows: [`${headSha}\trefs/pull/${String(prNumber)}/head`] };
   });
   if (rows[0].rows[0].split("\t")[0] !== rows[1].rows[0].split("\t")[0]) {
-    throw new TypeError("Task 8 validation pull-request head reads disagree");
+    throw new TypeError("validation pull-request head reads disagree");
   }
   return { first: rows[0], second: rows[1] };
 }
 
-export function createTask9FreshGateCollector(
-  options: Task9FreshGateCollectorOptions,
+export function createFreshGateCollector(
+  options: FreshGateCollectorOptions,
 ): (input: GateCollectionInput) => Promise<GateInput> {
-  const validate = options.runValidation ?? task8RunValidation;
+  const validate = options.runValidation ?? defaultRunValidation;
   return async (input) => {
     const { job } = input;
     if (!job.policy || !job.projectId || !job.environmentId || job.prNumber === null) {
-      throw new TypeError("Task 9 fresh validation requires a fully configured job");
+      throw new TypeError("fresh validation requires a fully configured job");
     }
     const snapshot = await validate({
       ...options.validation,
@@ -161,7 +158,7 @@ export function createTask9FreshGateCollector(
       },
       fence: input.fence,
     });
-    if (!snapshot.githubPr) throw new TypeError("Task 8 validation did not return pull-request metadata");
+    if (!snapshot.githubPr) throw new TypeError("validation did not return pull-request metadata");
     const context = await options.getContext({
       job,
       phase: input.phase,
@@ -171,7 +168,7 @@ export function createTask9FreshGateCollector(
       approvalExpiresAt: input.approvalExpiresAt,
       fence: input.fence,
     });
-    const remoteHead = remoteHeadEvidenceFromTask8(snapshot, job.prNumber);
+    const remoteHead = remoteHeadEvidenceFromValidation(snapshot, job.prNumber);
     const githubPr = snapshot.githubPr;
     return {
       now: input.now,

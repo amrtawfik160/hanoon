@@ -60,6 +60,57 @@ function stripAnsi(terminalOutput: string): string {
     .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, "");
 }
 
+const NON_JSON_CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
+
+function jsonValueEnd(text: string, start: number): number | null {
+  const expectedClosers: string[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+    } else if (character === "{") {
+      expectedClosers.push("}");
+    } else if (character === "[") {
+      expectedClosers.push("]");
+    } else if (character === "}" || character === "]") {
+      if (expectedClosers.at(-1) !== character) return null;
+      expectedClosers.pop();
+      if (expectedClosers.length === 0) return index + 1;
+    }
+  }
+  return null;
+}
+
+/**
+ * Parses JSON from terminal output without treating printable noise as control
+ * data. The terminal may leave an escape fragment before the payload, while
+ * titles and review bodies may legitimately contain brackets and punctuation.
+ */
+export function parseCommandJson<T>(terminalOutput: string, title: string): T {
+  const cleaned = stripAnsi(terminalOutput).replace(NON_JSON_CONTROL_CHARACTERS, "");
+  for (let start = 0; start < cleaned.length; start += 1) {
+    if (cleaned[start] !== "{" && cleaned[start] !== "[") continue;
+    const end = jsonValueEnd(cleaned, start);
+    if (end === null) continue;
+    try {
+      return JSON.parse(cleaned.slice(start, end)) as T;
+    } catch {
+      // A printable bracket in terminal noise is not the payload. Try the next
+      // possible JSON root without altering the payload's printable content.
+    }
+  }
+  throw new Error(`${title}: command output did not contain a valid JSON payload`);
+}
+
 function collectOutput(chunks: Array<{ seq?: number; sequence?: number; dataBase64?: string; data?: string }>): string {
   return stripAnsi(
     [...chunks]
@@ -72,7 +123,12 @@ function collectOutput(chunks: Array<{ seq?: number; sequence?: number; dataBase
   );
 }
 
-function shellSingleQuote(value: string): string {
+/**
+ * Single-quote a value for the shell. Exported because everything that builds a
+ * command out of untrusted text needs exactly this quoting, and a second copy is
+ * a second chance to get shell escaping subtly wrong.
+ */
+export function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
@@ -258,6 +314,12 @@ export class TerminalCommandRunner {
       output = appendBounded(output, outputResult.value.output);
       const commandResult = parseCommandResult(output, resultMarker);
       if (commandResult) {
+        onObservation?.({
+          id: terminalId,
+          status: "exited",
+          updatedAt: Date.now(),
+          exitCode: commandResult.exitCode,
+        });
         closeOnce();
         return { outcome: "exited", ...commandResult };
       }

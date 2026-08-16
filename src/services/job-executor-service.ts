@@ -5,16 +5,29 @@ import { AutonomyScheduler } from "../autonomy/scheduler";
 import { MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "../autonomy/models";
 import { redactError } from "../errors";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
-import { classifyTelegramError } from "../telegram/errors";
+import { classifyTelegramError, TelegramApiError } from "../telegram/errors";
+import { TelegramRequestError, TelegramResponseValidationError } from "../telegram/client";
 import { JobLaneRunner, type JobLaneKind, type JobLaneSnapshotProvider } from "./job-lane-runner";
+import {
+  projectUnknownWorker,
+  projectWorkerLiveness,
+  type BbThreadObservation,
+} from "./worker-liveness";
+import { CONTROLLER_PHASE_TEXT } from "../controller/models";
 
 type JobRecord = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
 export type JobExecutorTelegram = {
-  sendMessage(chatId: string, payload: Record<string, unknown>): Promise<{ message_id: number }>;
-  sendMessageDraft?(chatId: string, draftId: number, text: string): Promise<void>;
-  editMessage(chatId: string, messageId: number, payload: Record<string, unknown>): Promise<void>;
-  answerCallback?(callbackQueryId: string, text: string): Promise<void>;
+  sendMessage(chatId: string, payload: Record<string, unknown>, signal: AbortSignal): Promise<{ message_id: number }>;
+  sendMedia?(
+    chatId: string,
+    upload: { field: "photo" | "video"; filename: string; mimeType: string; bytes: Uint8Array },
+    caption: string | null,
+    signal: AbortSignal,
+  ): Promise<{ message_id: number }>;
+  sendMessageDraft?(chatId: string, draftId: number, text: string, signal: AbortSignal): Promise<void>;
+  editMessage(chatId: string, messageId: number, payload: Record<string, unknown>, signal: AbortSignal): Promise<void>;
+  answerCallback?(callbackQueryId: string, text: string, signal: AbortSignal): Promise<void>;
 };
 
 export type JobExecutorDependencies = {
@@ -26,7 +39,17 @@ export type JobExecutorDependencies = {
   telegram?: (token?: string) => JobExecutorTelegram;
   getTelegramClient?: (token?: string) => JobExecutorTelegram;
   telegramToken?: () => string | undefined;
-  reconcileJob?: (job: JobRecord, signal: AbortSignal, fence: EffectFence) => Promise<void>;
+  reconcileJob?: (job: JobRecord, signal: AbortSignal, fence: EffectFence, resourceId?: string) => Promise<void>;
+  /**
+   * Reads a queued picture off the machine that produced it, at delivery time
+   * rather than at enqueue time: a 20MB clip belongs on disk, not inlined into
+   * an outbox row that is rewritten on every retry.
+   */
+  readHostFile?: (
+    input: Readonly<{ hostId: string; path: string }>,
+    signal: AbortSignal,
+  ) => Promise<{ bytes: Uint8Array; sizeBytes: number }>;
+  getWorkerThread?: (threadId: string, signal: AbortSignal) => Promise<BbThreadObservation>;
   scheduler?: Pick<AutonomyScheduler, "run">;
   maxConcurrentJobs?: () => number | null;
   onWorkAvailable?: () => void;
@@ -37,6 +60,8 @@ export type JobExecutorDependencies = {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
     reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
     isStreaming?(): boolean;
+    /** Milliseconds until the in-flight turn is out of time, if one is running. */
+    nextStallDeadlineMs?(now: number): number | null;
   };
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
@@ -53,6 +78,29 @@ export type JobExecutorDependencies = {
   };
   memoryCuration?: {
     processDue(): boolean;
+  };
+  productionHealth?: {
+    processDue(): Promise<boolean>;
+  };
+  regressionWatch?: {
+    processDue(): Promise<boolean>;
+  };
+  failureLoop?: {
+    processDue(): boolean;
+  };
+  jobContinuation?: {
+    processDue(): boolean;
+  };
+  diskHousekeeping?: {
+    processDue(): Promise<boolean>;
+  };
+  workspaceHousekeeping?: {
+    due(now: number): boolean;
+    processDue(): Promise<boolean>;
+  };
+  audits?: {
+    due(now: number): boolean;
+    processDue(): Promise<boolean>;
   };
   systemMonitors?: {
     install(): void;
@@ -73,6 +121,8 @@ const IDLE_POLL_MS = 60_000;
 // wait is also the draft's frame rate: a whole second of output lands in one
 // jump. While an answer is arriving the loop runs at roughly draft speed.
 const STREAM_POLL_MS = 250;
+const OUTBOX_BURST_LIMIT = 10;
+export const WORKER_RECONCILE_INTERVAL_MS = 10_000;
 const PERMANENT_EFFECT_ERROR_NAMES = new Set([
   "TypeError",
   "SyntaxError",
@@ -131,6 +181,11 @@ function isTerminal(job: JobRecord): boolean {
   return ["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state);
 }
 
+function hasReconcileableWorker(job: JobRecord): boolean {
+  return ["planning", "critiquing", "implementing", "remediating", "reviewing", "documenting", "final_reviewing"]
+    .includes(job.state);
+}
+
 function controllerTurnId(logicalKey: string): string | null {
   const match = /^controller:(controller-turn-[^:]+):reply$/.exec(logicalKey);
   return match?.[1] ?? null;
@@ -140,6 +195,29 @@ type ReleasePassResult = Readonly<{
   didWork: boolean;
   leaseLost: boolean;
 }>;
+
+type ReleasePassInput = Readonly<{
+  store: TelegramAgentStore;
+  ownerId: string;
+  generation: number;
+  clock: { now(): number };
+  busyJobIds: ReadonlySet<string>;
+  getWorkerThread: JobExecutorDependencies["getWorkerThread"];
+  signal: AbortSignal;
+}>;
+
+type ReleaseWorkerInput = Readonly<{
+  store: TelegramAgentStore;
+  job: JobRecord;
+  worker: NonNullable<ReturnType<TelegramAgentStore["getWorkerLiveness"]>>;
+  ownerId: string;
+  generation: number;
+  clock: { now(): number };
+  getWorkerThread: NonNullable<JobExecutorDependencies["getWorkerThread"]>;
+  signal: AbortSignal;
+}>;
+
+type ReleaseStep = "worked" | "skipped" | "aborted" | "lease_lost";
 
 type LaneOperationRecord = Readonly<{
   jobId: string;
@@ -152,6 +230,14 @@ type PipelineDispatchState = {
   cursorJobId: string | null;
   laneLimit: number;
 };
+
+type ControllerStreamDelivery = Readonly<{
+  outbox: StoredOutbox;
+  telegram: JobExecutorTelegram;
+  text: string;
+  payload: Record<string, unknown>;
+  messageId: number | null;
+}>;
 
 function validConfiguredCap(rawCap: number | null | undefined): MaxConcurrentJobs | null {
   if (typeof rawCap !== "number" || !Number.isSafeInteger(rawCap) || rawCap < 1 || rawCap > MAX_CONCURRENT_JOBS) return null;
@@ -252,7 +338,10 @@ async function runWithLaneLease(input: Readonly<{
   }
 }
 
-function settleEffectFailure(
+// Exported so tests can settle a failed effect the way the executor does. A
+// bare EffectRunner.run() rejection leaves the effect 'leased'; only this
+// decides retry-with-backoff versus dead letter.
+export function settleEffectFailure(
   store: TelegramAgentStore,
   effect: StoredEffect,
   ownerId: string,
@@ -275,29 +364,91 @@ function settleEffectFailure(
   );
 }
 
-function finalizeReleaseCandidates(
-  store: TelegramAgentStore,
-  ownerId: string,
-  generation: number,
-  clock: { now(): number },
-  busyJobIds: ReadonlySet<string>,
-): ReleasePassResult {
-  let didWork = false;
-  const admissions = store.listReleaseCandidates(100);
-  for (const admission of admissions) {
-    if (busyJobIds.has(admission.jobId)) continue;
-    const fence = {
-      ownerId,
-      generation,
-      now: clock.now(),
-    };
-    assertNow(fence.now);
-    if (!store.beginDraining({ jobId: admission.jobId, ...fence })) {
-      return { didWork, leaseLost: true };
+function persistReleaseWorkerObservation(
+  input: ReleaseWorkerInput,
+  thread: BbThreadObservation | null,
+): ReleaseStep {
+  if (input.signal.aborted) return "aborted";
+  const observedAt = input.clock.now();
+  assertNow(observedAt);
+  try {
+    const fence = { ownerId: input.ownerId, generation: input.generation, now: observedAt };
+    if (thread) {
+      projectWorkerLiveness(
+        input.store, input.job, thread, observedAt,
+        input.worker.workerKind, input.worker.generation, fence,
+      );
+    } else {
+      projectUnknownWorker(
+        input.store, input.job, input.worker.resourceId, observedAt,
+        input.worker.workerKind, input.worker.generation, fence,
+      );
     }
-    const released = store.finalizeRelease({ jobId: admission.jobId, ...fence });
-    if (released === null) return { didWork, leaseLost: true };
-    didWork = true;
+  } catch (error) {
+    if (!input.store.isExecutorLeaseCurrent(input.ownerId, input.generation, observedAt)) return "lease_lost";
+    throw error;
+  }
+  return "worked";
+}
+
+async function refreshReleaseWorker(input: ReleaseWorkerInput): Promise<ReleaseStep> {
+  let thread: BbThreadObservation;
+  try {
+    thread = await input.getWorkerThread(input.worker.resourceId, input.signal);
+  } catch {
+    // BB lookup errors are opaque. Unknown is the fail-closed observation and
+    // advances observedAt so a transient outage cannot create a hot poll loop.
+    return persistReleaseWorkerObservation(input, null);
+  }
+  if (input.signal.aborted) return "aborted";
+  return persistReleaseWorkerObservation(
+    input,
+    thread.id === input.worker.resourceId ? thread : null,
+  );
+}
+
+async function finalizeReleaseCandidate(
+  input: ReleasePassInput,
+  admission: ReturnType<TelegramAgentStore["listReleaseCandidates"]>[number],
+): Promise<ReleaseStep> {
+  if (input.busyJobIds.has(admission.jobId)) return "skipped";
+  const now = input.clock.now();
+  assertNow(now);
+  if (!input.store.beginDraining({
+    jobId: admission.jobId,
+    ownerId: input.ownerId,
+    generation: input.generation,
+    now,
+  })) return "lease_lost";
+
+  const job = input.store.getJob(admission.jobId);
+  const worker = input.store.getWorkerLiveness(admission.jobId);
+  const refreshDue = job && worker && worker.resourceKind === "bb_thread" &&
+    !["idle", "failed"].includes(worker.state) && input.getWorkerThread &&
+    now - worker.observedAt >= WORKER_RECONCILE_INTERVAL_MS;
+  if (refreshDue) {
+    const refresh = await refreshReleaseWorker({ ...input, job, worker, getWorkerThread: input.getWorkerThread });
+    if (refresh === "aborted" || refresh === "lease_lost") return refresh;
+  }
+
+  const finalizedAt = input.clock.now();
+  assertNow(finalizedAt);
+  const released = input.store.finalizeRelease({
+    jobId: admission.jobId,
+    ownerId: input.ownerId,
+    generation: input.generation,
+    now: finalizedAt,
+  });
+  return released === null ? "lease_lost" : "worked";
+}
+
+async function finalizeReleaseCandidates(input: ReleasePassInput): Promise<ReleasePassResult> {
+  let didWork = false;
+  for (const admission of input.store.listReleaseCandidates(100)) {
+    const step = await finalizeReleaseCandidate(input, admission);
+    if (step === "lease_lost") return { didWork, leaseLost: true };
+    if (step === "aborted") return { didWork, leaseLost: false };
+    if (step === "worked") didWork = true;
   }
   return { didWork, leaseLost: false };
 }
@@ -317,6 +468,119 @@ function stableChatDraftId(chatId: string): number {
 function payloadText(item: StoredOutbox): string {
   const text = item.payload.text;
   return typeof text === "string" ? text : "";
+}
+
+export type QueuedMedia = Readonly<{
+  hostId: string;
+  path: string;
+  field: "photo" | "video";
+  mimeType: string;
+  filename: string;
+  maxBytes: number;
+  caption: string | null;
+}>;
+
+/**
+ * Recognises a queued picture, and refuses to half-recognise one. The payload
+ * was written by this plugin, but it has been through JSON and a database
+ * since, so every field is checked rather than assumed.
+ */
+export function readQueuedMedia(item: Pick<StoredOutbox, "payload">): QueuedMedia | null {
+  const media = item.payload.media;
+  if (typeof media !== "object" || media === null) return null;
+  const candidate = media as Record<string, unknown>;
+  const strings = ["hostId", "path", "mimeType", "filename"] as const;
+  if (strings.some((key) => typeof candidate[key] !== "string" || (candidate[key] as string).length === 0)) return null;
+  if (candidate.field !== "photo" && candidate.field !== "video") return null;
+  if (!Number.isSafeInteger(candidate.maxBytes) || (candidate.maxBytes as number) <= 0) return null;
+  if (candidate.caption !== null && typeof candidate.caption !== "string") return null;
+  return {
+    hostId: candidate.hostId as string,
+    path: candidate.path as string,
+    field: candidate.field,
+    mimeType: candidate.mimeType as string,
+    filename: candidate.filename as string,
+    maxBytes: candidate.maxBytes as number,
+    caption: (candidate.caption as string | null) ?? null,
+  };
+}
+
+/**
+ * Reads the bytes and uploads them. A file that has grown past its limit, or
+ * gone, fails the row rather than being sent truncated: an unreadable
+ * screenshot is worth retrying, and worth giving up on, but never worth
+ * delivering as something the owner might misread.
+ */
+async function deliverQueuedMedia(input: Readonly<{
+  deps: JobExecutorDependencies;
+  item: StoredOutbox;
+  media: QueuedMedia;
+  telegram: JobExecutorTelegram;
+  signal: AbortSignal;
+}>): Promise<number> {
+  const { deps, item, media, telegram, signal } = input;
+  if (!telegram.sendMedia || !deps.readHostFile) {
+    throw new TypeError("Queued media delivery is not configured");
+  }
+  const file = await deps.readHostFile({ hostId: media.hostId, path: media.path }, signal);
+  if (file.sizeBytes > media.maxBytes || file.bytes.byteLength === 0) {
+    throw new TypeError("Queued media is empty or larger than its limit");
+  }
+  const sent = await telegram.sendMedia(
+    item.chatId,
+    { field: media.field, filename: media.filename, mimeType: media.mimeType, bytes: file.bytes },
+    media.caption,
+    signal,
+  );
+  return sent.message_id;
+}
+
+function controllerDeliveryPayload(
+  item: StoredOutbox,
+  controllerTurn: NonNullable<ReturnType<TelegramAgentStore["getControllerTurn"]>> | null,
+): Record<string, unknown> {
+  if (!controllerTurn || controllerTurn.state !== "submitted") return item.payload;
+  return {
+    text: CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
+    disable_web_page_preview: true,
+  };
+}
+
+function controllerStreamRetryAt(error: unknown, now: number): number | null {
+  if (
+    !(error instanceof TelegramApiError) ||
+    error.errorCode !== 429 ||
+    error.retryAfterSeconds === null ||
+    !Number.isFinite(error.retryAfterSeconds) ||
+    error.retryAfterSeconds < 0
+  ) return null;
+  const delay = Math.ceil(error.retryAfterSeconds * 1_000);
+  if (!Number.isFinite(delay)) return Number.MAX_SAFE_INTEGER;
+  return Math.min(Number.MAX_SAFE_INTEGER, now + delay + 1_000);
+}
+
+function durableOutboxRetryAt(
+  error: unknown,
+  attempts: number,
+  now: number,
+  jitter: () => number,
+): number {
+  if (
+    error instanceof TelegramApiError &&
+    error.retryAfterSeconds !== null &&
+    Number.isFinite(error.retryAfterSeconds) &&
+    error.retryAfterSeconds >= 0
+  ) {
+    const delay = Math.ceil(error.retryAfterSeconds * 1_000);
+    return Number.isFinite(delay) ? Math.min(Number.MAX_SAFE_INTEGER, now + delay) : Number.MAX_SAFE_INTEGER;
+  }
+  return now + retryDelay(attempts, jitter);
+}
+
+function deliveryOutcomeIsAmbiguous(error: unknown): boolean {
+  return error instanceof TelegramResponseValidationError ||
+    ((error instanceof TelegramRequestError || error instanceof TelegramApiError) &&
+      error.deliveryOutcome === "unknown");
 }
 
 async function abortableHeartbeat(
@@ -350,6 +614,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
   const sleep = deps.sleep ?? defaultSleep;
   const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 251));
   let acquiredGeneration: number | null = null;
+  deps.presence?.reset();
 
   while (!signal.aborted) {
     const now = deps.clock.now();
@@ -364,7 +629,6 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       continue;
     }
     acquiredGeneration = lease.generation;
-    deps.presence?.reset();
     const workAbort = new AbortController();
     let leaseLost = false;
     let continueAcquiring = false;
@@ -388,11 +652,160 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
     deps.laneSnapshots?.attach(lanes);
     const laneOperations = new Map<string, LaneOperationRecord>();
     const adoptedJobIds = new Set<string>();
+    const nextWorkerReconcileAt = new Map<string, number>();
+    const controllerStreamInFlight = new Map<string, Promise<void>>();
+    const controllerStreamLastText = new Map<string, string>();
+    const controllerStreamMessageIds = new Map<string, number>();
+    const controllerStreamBackoffUntil = new Map<string, number>();
+    type ControllerPass = {
+      abort: AbortController;
+      stallTimer: ReturnType<typeof setTimeout> | null;
+      settled: boolean;
+      outcome: Readonly<{ didWork: boolean }> | Readonly<{ error: unknown }> | null;
+    };
+    let controllerPass: ControllerPass | null = null;
+    const wakeForControllerPass = (): void => {
+      try {
+        deps.onWorkAvailable?.();
+      } catch {
+        // A wake-up hint cannot make a completed controller pass fail.
+      }
+    };
+    const clearControllerStallTimer = (pass: ControllerPass): void => {
+      if (pass.stallTimer === null) return;
+      clearTimeout(pass.stallTimer);
+      pass.stallTimer = null;
+    };
+    const armControllerStallTimer = (pass: ControllerPass): void => {
+      clearControllerStallTimer(pass);
+      const stallDeadlineMs = deps.controller?.nextStallDeadlineMs?.(deps.clock.now()) ?? null;
+      if (stallDeadlineMs === null || !Number.isSafeInteger(stallDeadlineMs) || stallDeadlineMs <= 0) return;
+      pass.stallTimer = setTimeout(() => {
+        pass.stallTimer = null;
+        pass.abort.abort(new Error("controller stall deadline reached"));
+        wakeForControllerPass();
+      }, stallDeadlineMs);
+    };
+    const hasCurrentAdoptedClaims = (jobId: string, now: number): boolean => {
+      const claims = deps.store.listCurrentHeldResourceClaims(jobId, 100);
+      return claims.length > 0 && claims.every((claim) =>
+        claim.ownerId === ownerId &&
+        claim.generation === lease.generation &&
+        claim.leaseExpiresAt > now,
+      );
+    };
     const onWorkAbort = (): void => {
+      if (controllerPass) {
+        clearControllerStallTimer(controllerPass);
+        controllerPass.abort.abort(abortReason(workAbort.signal));
+      }
       lanes.abortAll(abortReason(workAbort.signal));
       laneOperations.clear();
     };
     workAbort.signal.addEventListener("abort", onWorkAbort, { once: true });
+    const settleControllerStream = (
+      outbox: StoredOutbox,
+      text: string,
+      messageId: number | null,
+      error?: unknown,
+    ): void => {
+      try {
+        const now = deps.clock.now();
+        assertNow(now);
+        const retryAt = controllerStreamRetryAt(error, now);
+        if (retryAt !== null) {
+          controllerStreamBackoffUntil.set(
+            outbox.logicalKey,
+            Math.max(controllerStreamBackoffUntil.get(outbox.logicalKey) ?? 0, retryAt),
+          );
+        } else if (error === undefined) {
+          controllerStreamBackoffUntil.delete(outbox.logicalKey);
+        }
+        const current = deps.store.getOutbox(outbox.logicalKey);
+        if (!current) return;
+        if (current.status === "leased" && payloadText(current) !== text) {
+          deps.store.failOutbox(
+            outbox.logicalKey,
+            ownerId,
+            lease.generation,
+            "controller stream update superseded",
+            retryAt ?? now,
+            now,
+          );
+        } else if (current.status === "leased" && retryAt !== null) {
+          deps.store.failOutbox(
+            outbox.logicalKey,
+            ownerId,
+            lease.generation,
+            safeFailure(error),
+            retryAt,
+            now,
+          );
+        } else if (current.status === "leased" && payloadText(current) === text) {
+          // A cosmetic failure other than a server-directed rate limit is
+          // dropped. The reply path must not inherit preview delivery errors.
+          deps.store.completeOutbox(outbox.logicalKey, ownerId, lease.generation, messageId, now);
+        }
+      } catch {
+        // A stream update is cosmetic and must fail open, including when its
+        // lease has already moved on to the terminal reply.
+      }
+      try {
+        deps.onWorkAvailable?.();
+      } catch {
+        // Wake-up hooks are cosmetic from the stream's point of view too.
+      }
+    };
+    const startControllerStream = (delivery: ControllerStreamDelivery): void => {
+      const streamRequest = (async (): Promise<void> => {
+        let deliveredMessageId = delivery.messageId;
+        try {
+          if (delivery.messageId === null && delivery.telegram.sendMessageDraft) {
+            // The draft is an ephemeral phase indicator, not the durable
+            // answer. It must never hold the executor while Telegram is slow.
+            await delivery.telegram.sendMessageDraft(
+              delivery.outbox.chatId,
+              stableChatDraftId(delivery.outbox.chatId),
+              delivery.text,
+              workAbort.signal,
+            );
+          } else if (delivery.messageId !== null) {
+            await delivery.telegram.editMessage(
+              delivery.outbox.chatId,
+              delivery.messageId,
+              delivery.payload,
+              workAbort.signal,
+            );
+          } else {
+            deliveredMessageId = (await delivery.telegram.sendMessage(
+              delivery.outbox.chatId,
+              delivery.payload,
+              workAbort.signal,
+            )).message_id;
+          }
+          if (deliveredMessageId !== null) {
+            controllerStreamMessageIds.set(delivery.outbox.logicalKey, deliveredMessageId);
+          }
+          controllerStreamLastText.set(delivery.outbox.logicalKey, delivery.text);
+          settleControllerStream(delivery.outbox, delivery.text, deliveredMessageId);
+        } catch (error) {
+          settleControllerStream(delivery.outbox, delivery.text, deliveredMessageId, error);
+        }
+      })();
+      controllerStreamInFlight.set(delivery.outbox.logicalKey, streamRequest);
+      void streamRequest.then(
+        () => {
+          if (controllerStreamInFlight.get(delivery.outbox.logicalKey) === streamRequest) {
+            controllerStreamInFlight.delete(delivery.outbox.logicalKey);
+          }
+        },
+        () => {
+          if (controllerStreamInFlight.get(delivery.outbox.logicalKey) === streamRequest) {
+            controllerStreamInFlight.delete(delivery.outbox.logicalKey);
+          }
+        },
+      );
+    };
     const heartbeat = abortableHeartbeat(
       deps.store,
       ownerId,
@@ -402,6 +815,58 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       leaseMs,
       loseLease,
     );
+    const takeControllerPassOutcome = (): boolean | null => {
+      if (!controllerPass?.settled) return null;
+      const completed = controllerPass;
+      controllerPass = null;
+      clearControllerStallTimer(completed);
+      if (completed.outcome && "error" in completed.outcome) {
+        if (completed.abort.signal.aborted) return false;
+        throw completed.outcome.error;
+      }
+      return completed.outcome?.didWork ?? false;
+    };
+    const startControllerPass = (): void => {
+      if (!deps.controller || controllerPass !== null) return;
+      const abort = new AbortController();
+      const passSignal = AbortSignal.any([workAbort.signal, abort.signal]);
+      const pass: ControllerPass = {
+        abort,
+        stallTimer: null,
+        settled: false,
+        outcome: null,
+      };
+      controllerPass = pass;
+      const fence = { ownerId, generation: lease.generation, signal: passSignal };
+      const running = (async (): Promise<boolean> => {
+        let reconciled: boolean;
+        armControllerStallTimer(pass);
+        try {
+          reconciled = await deps.controller!.reconcile(fence, passSignal);
+        } finally {
+          clearControllerStallTimer(pass);
+        }
+        if (passSignal.aborted) return reconciled;
+        armControllerStallTimer(pass);
+        try {
+          return await deps.controller!.processOne(fence, passSignal) || reconciled;
+        } finally {
+          clearControllerStallTimer(pass);
+        }
+      })();
+      void running.then(
+        (didWork) => {
+          pass.outcome = { didWork };
+          pass.settled = true;
+          clearControllerStallTimer(pass);
+        },
+        (error) => {
+          pass.outcome = { error };
+          pass.settled = true;
+          clearControllerStallTimer(pass);
+        },
+      );
+    };
     try {
       while (!signal.aborted && !workAbort.signal.aborted) {
         const currentNow = deps.clock.now();
@@ -427,6 +892,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             if (completion.outcome === "fulfilled") {
               if (operation.effect === null) {
                 adoptedJobIds.add(operation.jobId);
+                nextWorkerReconcileAt.set(operation.jobId, now + WORKER_RECONCILE_INTERVAL_MS);
               } else if (!deps.store.completeEffect(operation.effect.idempotencyKey, ownerId, lease.generation, now)) {
                 loseLease();
               }
@@ -453,16 +919,21 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           for (let microtask = 0; microtask < 20; microtask += 1) await Promise.resolve();
         };
         collectCompletions();
+        const priorControllerOutcome = takeControllerPassOutcome();
+        if (priorControllerOutcome !== null) didWork = priorControllerOutcome || didWork;
         if (continueAcquiring || workAbort.signal.aborted) {
           if (leaseLost) continueAcquiring = true;
           break;
         }
 
         const effectFence = { ownerId, generation: lease.generation, signal: workAbort.signal };
-        if (deps.controller) {
-          didWork = await deps.controller.reconcile(effectFence, workAbort.signal) || didWork;
-          didWork = await deps.controller.processOne(effectFence, workAbort.signal) || didWork;
+        if (deps.controller && controllerPass === null) {
+          startControllerPass();
+          await settleLaneMicrotasks();
+          const immediateControllerOutcome = takeControllerPassOutcome();
+          if (immediateControllerOutcome !== null) didWork = immediateControllerOutcome || didWork;
         }
+        if (controllerPass !== null) didWork = true;
         if (deps.operations) {
           didWork = await deps.operations.processOne(effectFence, workAbort.signal) || didWork;
         }
@@ -478,6 +949,37 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
         if (deps.memoryCuration) {
           didWork = deps.memoryCuration.processDue() || didWork;
+        }
+        if (deps.productionHealth) {
+          didWork = await deps.productionHealth.processDue() || didWork;
+        }
+        if (deps.regressionWatch) {
+          didWork = await deps.regressionWatch.processDue() || didWork;
+        }
+        // Scanned before the scheduler runs, so a project that just tripped the
+        // brake does not get one more job admitted into the same failure.
+        if (deps.failureLoop) {
+          didWork = deps.failureLoop.processDue() || didWork;
+        }
+        // After the failure brake and before the scheduler: a project that just
+        // tripped the brake must not have its blocked jobs pushed back in, and
+        // anything this does requeue should be admitted on this same tick.
+        if (deps.jobContinuation) {
+          didWork = deps.jobContinuation.processDue() || didWork;
+        }
+        // Runs when something has already gone wrong elsewhere, so it is paced
+        // daily inside itself and never allowed to fail the tick.
+        if (deps.diskHousekeeping) {
+          didWork = await deps.diskHousekeeping.processDue() || didWork;
+        }
+        // Daily, so the due check is synchronous: a tick that owes nothing must
+        // not yield, or it hands in-flight work a turn it would not have had.
+        if (deps.workspaceHousekeeping?.due(deps.clock.now())) {
+          didWork = await deps.workspaceHousekeeping.processDue() || didWork;
+        }
+        // Read-only daily checks, gated the same way and paced inside themselves.
+        if (deps.audits?.due(deps.clock.now())) {
+          didWork = await deps.audits.processDue() || didWork;
         }
         // Idempotent, and deliberately not a one-shot at activation: pairing
         // can happen long after the executor starts.
@@ -609,6 +1111,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             kind: "pipeline",
             effect: null,
           });
+          if (started) nextWorkerReconcileAt.set(job.id, deps.clock.now() + WORKER_RECONCILE_INTERVAL_MS);
           return started;
         };
 
@@ -645,6 +1148,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           if (lanes.hasJob(admission.jobId)) continue;
           const job = deps.store.getJob(admission.jobId);
           if (!job) continue;
+          const claimNow = deps.clock.now();
+          assertNow(claimNow);
+          if (adoptedJobIds.has(job.id) && !hasCurrentAdoptedClaims(job.id, claimNow)) {
+            adoptedJobIds.delete(job.id);
+          }
           if (!adoptedJobIds.has(job.id)) {
             if (deps.reconcileJob) {
               if (startReconciliationLane(job, true)) {
@@ -663,7 +1171,16 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             now: deps.clock.now(),
             leaseMs,
           });
-          if (!effect) continue;
+          if (!effect) {
+            const dueAt = nextWorkerReconcileAt.get(job.id);
+            if (deps.reconcileJob && hasReconcileableWorker(job) && dueAt !== undefined && claimNow >= dueAt) {
+              if (startReconciliationLane(job, true)) {
+                pipelineState.cursorJobId = job.id;
+                didWork = true;
+              }
+            }
+            continue;
+          }
           if (!startEffectLane(effect, "pipeline")) {
             if (!workAbort.signal.aborted) loseLease();
             break;
@@ -695,25 +1212,40 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           break;
         }
 
-        const releasePass = finalizeReleaseCandidates(
-          deps.store,
+        const releasePass = await finalizeReleaseCandidates({
+          store: deps.store,
           ownerId,
-          lease.generation,
-          deps.clock,
-          new Set(lanes.snapshot().busyJobIds),
-        );
+          generation: lease.generation,
+          clock: deps.clock,
+          busyJobIds: new Set(lanes.snapshot().busyJobIds),
+          getWorkerThread: deps.getWorkerThread,
+          signal: workAbort.signal,
+        });
         didWork = releasePass.didWork || didWork;
         if (releasePass.leaseLost) {
           continueAcquiring = true;
           break;
         }
 
-        const outbox = deps.store.leaseOutbox(ownerId, lease.generation, deps.clock.now(), 10, leaseMs);
-        for (const item of outbox) {
+        for (let outboxIndex = 0; outboxIndex < OUTBOX_BURST_LIMIT; outboxIndex += 1) {
           if (workAbort.signal.aborted || !deps.store.isExecutorLeaseCurrent(ownerId, lease.generation, deps.clock.now())) {
             continueAcquiring = true;
             break;
           }
+          const item = deps.store.leaseOutbox(ownerId, lease.generation, deps.clock.now(), 1, leaseMs)[0];
+          if (!item) break;
+          let attemptedNewMessage = false;
+          const renewOutboxForRecovery = (): boolean => {
+            const now = deps.clock.now();
+            assertNow(now);
+            return deps.store.renewOutboxLease({
+              logicalKey: item.logicalKey,
+              ownerId,
+              generation: lease.generation,
+              now,
+              leaseMs,
+            });
+          };
           didWork = true;
           try {
             const token = deps.telegramToken?.();
@@ -723,26 +1255,108 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             const job = jobId ? deps.store.getJob(jobId) : null;
             const knownMessageId = item.messageId ?? job?.statusMessageId ?? null;
             let deliveredMessageId = knownMessageId;
+            // A queued picture takes none of the text transports below: no
+            // draft, no edit, no reply markup. Handled first so the rest of the
+            // loop keeps reasoning about text only.
+            const media = readQueuedMedia(item);
+            if (media !== null) {
+              deliveredMessageId = await deliverQueuedMedia({
+                deps,
+                item,
+                media,
+                telegram,
+                signal: workAbort.signal,
+              });
+              if (!deps.store.completeOutbox(item.logicalKey, ownerId, lease.generation, deliveredMessageId, deps.clock.now())) {
+                continueAcquiring = true;
+                break;
+              }
+              continue;
+            }
             const callback = callbackId(item.logicalKey);
             const turnId = controllerTurnId(item.logicalKey);
             const controllerTurn = turnId ? deps.store.getControllerTurn(turnId) : null;
-            if (callback && telegram.answerCallback) {
-              await telegram.answerCallback(callback, payloadText(item));
+            const deliveryPayload = controllerDeliveryPayload(item, controllerTurn);
+            const terminalControllerDraft = turnId !== null &&
+              controllerTurn?.state === "submitted" &&
+              (controllerTurn.streamPhase === "complete" || controllerTurn.streamPhase === "failed");
+            const controllerStreamText = turnId !== null &&
+              controllerTurn?.state === "submitted" &&
+              !terminalControllerDraft
+              ? CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase]
+              : null;
+            if (terminalControllerDraft) {
+              // Suppress terminal placeholders before choosing draft, edit, or
+              // ordinary-send transport. A pre-cutover row can already carry a
+              // message id, and some Telegram clients do not expose drafts;
+              // neither case may turn stale stream payload into owner-visible
+              // text beside the real terminal writer's message.
+              deliveredMessageId = knownMessageId;
+            } else if (controllerStreamText !== null) {
+              const streamMessageId = knownMessageId ?? controllerStreamMessageIds.get(item.logicalKey) ?? null;
+              if (controllerStreamLastText.get(item.logicalKey) === controllerStreamText) {
+                settleControllerStream(item, controllerStreamText, streamMessageId);
+                continue;
+              }
+              if (controllerStreamInFlight.has(item.logicalKey)) {
+                // Leave the newest durable row leased until the earlier
+                // cosmetic request settles; its completion handler will
+                // requeue it if the phase changed in the meantime.
+                continue;
+              }
+              const now = deps.clock.now();
+              assertNow(now);
+              const backoffUntil = controllerStreamBackoffUntil.get(item.logicalKey) ?? 0;
+              if (backoffUntil > now) {
+                try {
+                  deps.store.failOutbox(
+                    item.logicalKey,
+                    ownerId,
+                    lease.generation,
+                    "controller stream rate limit",
+                    backoffUntil,
+                    now,
+                  );
+                } catch {
+                  // A cosmetic backoff must not affect the real reply path.
+                }
+                continue;
+              }
+              controllerStreamBackoffUntil.delete(item.logicalKey);
+              startControllerStream({
+                outbox: item,
+                telegram,
+                text: controllerStreamText,
+                payload: deliveryPayload,
+                messageId: streamMessageId,
+              });
+              continue;
+            } else if (callback && telegram.answerCallback) {
+              await telegram.answerCallback(callback, payloadText(item), workAbort.signal);
             } else if (
               turnId !== null &&
               controllerTurn?.state === "submitted" &&
               knownMessageId === null &&
               telegram.sendMessageDraft
             ) {
+              // The draft is derived from the durable stream phase, never from
+              // a persisted raw stream_text, so provider prose can never reach
+              // Telegram as a preview.
               await telegram.sendMessageDraft(
                 item.chatId,
                 stableChatDraftId(item.chatId),
-                controllerTurn.streamText,
+                CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
+                workAbort.signal,
               );
             } else if (knownMessageId !== null) {
-              await telegram.editMessage(item.chatId, knownMessageId, item.payload);
+              await telegram.editMessage(item.chatId, knownMessageId, deliveryPayload, workAbort.signal);
             } else {
-              deliveredMessageId = (await telegram.sendMessage(item.chatId, item.payload)).message_id;
+              attemptedNewMessage = true;
+              deliveredMessageId = (await telegram.sendMessage(
+                item.chatId,
+                deliveryPayload,
+                workAbort.signal,
+              )).message_id;
             }
             if (jobId && deliveredMessageId !== null && job?.statusMessageId === null && typeof deps.store.completeStatusOutbox === "function") {
               const atomicallyCompleted = deps.store.completeStatusOutbox(
@@ -765,7 +1379,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               }
             }
           } catch (error) {
-            if (workAbort.signal.aborted || !deps.store.isExecutorLeaseCurrent(ownerId, lease.generation, deps.clock.now())) {
+            const initialDeliveryIsAmbiguous = attemptedNewMessage && deliveryOutcomeIsAmbiguous(error);
+            if (
+              !deps.store.isExecutorLeaseCurrent(ownerId, lease.generation, deps.clock.now()) ||
+              (workAbort.signal.aborted && !initialDeliveryIsAmbiguous)
+            ) {
               continueAcquiring = true;
               break;
             }
@@ -786,8 +1404,13 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             }
 
             if (classification === "edit_unavailable" && telegram && jobId && job) {
+              if (!renewOutboxForRecovery()) {
+                continueAcquiring = true;
+                break;
+              }
               try {
-                const replacement = await telegram.sendMessage(item.chatId, item.payload);
+                attemptedNewMessage = true;
+                const replacement = await telegram.sendMessage(item.chatId, item.payload, workAbort.signal);
                 const replaced = deps.store.replaceStatusOutboxMessage(
                   item.logicalKey,
                   ownerId,
@@ -809,16 +1432,29 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             }
 
             if (classification === "bad_entities" && telegram && Object.hasOwn(item.payload, "parse_mode")) {
+              if (!renewOutboxForRecovery()) {
+                continueAcquiring = true;
+                break;
+              }
               const { parse_mode: _parseMode, ...plainPayload } = item.payload;
               try {
                 let deliveredMessageId = knownMessageId;
                 const callback = callbackId(item.logicalKey);
                 if (callback && telegram.answerCallback) {
-                  await telegram.answerCallback(callback, payloadText({ ...item, payload: plainPayload }));
+                  await telegram.answerCallback(
+                    callback,
+                    payloadText({ ...item, payload: plainPayload }),
+                    workAbort.signal,
+                  );
                 } else if (knownMessageId !== null) {
-                  await telegram.editMessage(item.chatId, knownMessageId, plainPayload);
+                  await telegram.editMessage(item.chatId, knownMessageId, plainPayload, workAbort.signal);
                 } else {
-                  deliveredMessageId = (await telegram.sendMessage(item.chatId, plainPayload)).message_id;
+                  attemptedNewMessage = true;
+                  deliveredMessageId = (await telegram.sendMessage(
+                    item.chatId,
+                    plainPayload,
+                    workAbort.signal,
+                  )).message_id;
                 }
                 if (jobId && job && deliveredMessageId !== null && job.statusMessageId === null) {
                   const completed = deps.store.completeStatusOutbox(
@@ -847,19 +1483,46 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
               }
             }
 
-            const failure = safeFailure(deliveryError);
+            const settlementNow = deps.clock.now();
+            assertNow(settlementNow);
             let settled = false;
-            if (classification === "authentication" || classification === "permanent" || item.attempts >= 20) {
-              settled = deps.store.deadLetterOutbox(item.logicalKey, ownerId, lease.generation, failure, deps.clock.now());
+            const failure = safeFailure(deliveryError);
+            if (attemptedNewMessage && deliveryOutcomeIsAmbiguous(deliveryError)) {
+              settled = item.attempts >= 20
+                ? deps.store.replaceOutboxWithDeliveryFailureNotice({
+                    logicalKey: item.logicalKey,
+                    ownerId,
+                    generation: lease.generation,
+                    error: failure,
+                    now: settlementNow,
+                  })
+                : deps.store.failOutbox(
+                    item.logicalKey,
+                    ownerId,
+                    lease.generation,
+                    failure,
+                    durableOutboxRetryAt(deliveryError, item.attempts, settlementNow, jitter),
+                    settlementNow,
+                  );
             } else {
-              settled = deps.store.failOutbox(
-                item.logicalKey,
-                ownerId,
-                lease.generation,
-                failure,
-                deps.clock.now() + retryDelay(item.attempts, jitter),
-                deps.clock.now(),
-              );
+              if (classification === "authentication" || classification === "permanent" || item.attempts >= 20) {
+                settled = deps.store.deadLetterOutbox(
+                  item.logicalKey,
+                  ownerId,
+                  lease.generation,
+                  failure,
+                  settlementNow,
+                );
+              } else {
+                settled = deps.store.failOutbox(
+                  item.logicalKey,
+                  ownerId,
+                  lease.generation,
+                  failure,
+                  durableOutboxRetryAt(deliveryError, item.attempts, settlementNow, jitter),
+                  settlementNow,
+                );
+              }
             }
             if (!settled) {
               continueAcquiring = true;
@@ -876,22 +1539,43 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           continueAcquiring = true;
           break;
         }
-        let presenceWaitMs: number | null;
+        const controllerOutcome = takeControllerPassOutcome();
+        if (controllerOutcome !== null) didWork = controllerOutcome || didWork;
+        if (controllerPass !== null) didWork = true;
+        let presenceWaitMs: number | null = null;
         try {
           presenceWaitMs = deps.presence
             ? await deps.presence.pulse(deps.clock.now(), workAbort.signal)
             : null;
-        } catch (error) {
-          if (!workAbort.signal.aborted) throw error;
+        } catch {
+          if (!workAbort.signal.aborted) {
+            // Presence is cosmetic. A coordinator or transport regression
+            // must not prevent the executor from delivering real messages.
+            presenceWaitMs = null;
+          }
           if (leaseLost) continueAcquiring = true;
-          break;
+          if (workAbort.signal.aborted) break;
         }
         const ordinaryWaitMs = deps.controller?.isStreaming?.()
           ? STREAM_POLL_MS
           : didWork ? ACTIVE_POLL_MS : IDLE_POLL_MS;
-        const waitMs = presenceWaitMs === null
-          ? ordinaryWaitMs
-          : Math.min(ordinaryWaitMs, Math.max(1, presenceWaitMs));
+        const sweepNow = deps.clock.now();
+        const workerSweepWaitMs = [...nextWorkerReconcileAt.entries()].reduce((soonest, [jobId, dueAt]) => {
+          if (!adoptedJobIds.has(jobId) || lanes.hasJob(jobId)) return soonest;
+          const candidate = deps.store.getJob(jobId);
+          if (!candidate || !hasReconcileableWorker(candidate)) return soonest;
+          return Math.min(soonest, Math.max(1, dueAt - sweepNow));
+        }, Number.POSITIVE_INFINITY);
+        const ordinaryAndSweepWaitMs = Math.min(ordinaryWaitMs, workerSweepWaitMs);
+        // A turn's deadline is a fixed moment, so the loop sleeps up to it and
+        // not past it. Noticing a wedge must not depend on the provider
+        // producing events: a silent thread produces none, which is exactly the
+        // case the deadline exists for.
+        const deadlineWaitMs = deps.controller?.nextStallDeadlineMs?.(deps.clock.now()) ?? null;
+        const waitMs = [presenceWaitMs, deadlineWaitMs].reduce<number>(
+          (soonest, candidate) => candidate === null ? soonest : Math.min(soonest, Math.max(1, candidate)),
+          ordinaryAndSweepWaitMs,
+        );
         try {
           const busyLaneJobIds = lanes.snapshot().busyJobIds;
           const busyReleaseCandidate = !deps.waitForWork && busyLaneJobIds.some((jobId) =>
@@ -925,7 +1609,6 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       signal.removeEventListener("abort", onStop);
       workAbort.abort();
       await heartbeat;
-      deps.presence?.reset();
       deps.laneSnapshots?.detach(lanes);
       if (deps.releaseOnShutdown && !continueAcquiring && signal.aborted) {
         deps.store.releaseExecutorLease(ownerId, lease.generation, deps.clock.now());

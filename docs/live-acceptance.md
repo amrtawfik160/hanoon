@@ -23,6 +23,14 @@ Keep these proof classes separate in the final record:
 | Disposable deploy command | Exact merged checkout, production-target exclusion, command receipt, and failure classification. |
 | Disposable canary command | Post-deploy verification and the terminal `complete` decision. |
 
+## Adaptive recipe promotion status
+
+The automated fake-host suite exercises all six recipe graphs, active-mode failure and recovery, restart reconstruction, mandatory guard gating, stale approval rejection, and rollback snapshot behavior. That proof is deterministic; it is not a disposable Telegram, BB-provider, GitHub, deployment, or canary run.
+
+The production promotion reader and append-only evidence ledger are wired. It reads only the newest manifest and accepts it only when its integrity-bound artifact, job, receipt, model-trial, chronology, and safety references resolve to stored rows. The status command reports `incomplete` for missing, corrupt, duplicate, non-causal, or mismatched data, and typed envelopes alone cannot create evidence.
+
+The trusted production collector is not implemented or exposed in this release. Treat the live promotion gate as **not run/incomplete** and keep every recipe in `shadow` while following this runbook. Do not turn a passing local suite into a live receipt, insert evidence with ad hoc SQL, or enable a recipe to make this runbook easier to complete.
+
 ## Token configuration pause
 
 Before this runbook begins, the owner must perform exactly this UI action:
@@ -42,7 +50,16 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | pairing Telegram message id(s) | `<message id>` |
 | task/status/review/approval/completion message ids | `<message ids only>` |
 | controller BB thread/project/host ids | `<thread id>`, `<personal project id>`, `<host id>` |
-| controller execution tuple | `codex`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
+| controller execution tuple | `<provider selected by the model>`, `<selected model>`, `<reasoning>`, `<service tier>`, `<permission mode>` |
+| selected job recipe and routing mode | `<recipe>@<version>`, `<shadow/active>` |
+| controller/worker capability profiles | `<profile id>`, `<revision>`, `<registry digest>`, `<graph digest>` |
+| mandatory capability outcomes | `<capability id>`, `<terminal outcome>`, `<bounded evidence references>` |
+| candidate/baseline model trials | `<trial ids>`, `<provider/model/reasoning/tier>`, `<terminal outcomes>`, `<harness/budget digests>` |
+| deterministic promotion artifacts | `<category>`, `<suite id>`, `<run id>`, `<artifact digest>`, `<passed/failed>` |
+| classifier promotion artifact | `<corpus digest>`, `<run id>`, `<result digest>`, `<total/correct/unsafe downgrade>` |
+| live failure/recovery receipts | `<live run id>`, `<job id>`, `<failure receipt id>`, `<recovery receipt id>` |
+| zero-tolerance safety snapshots | `<counter>`, `<count>`, `<snapshot id>`, `<evidence digest>` |
+| promotion manifest and status | `<manifest id>`, `<recipe>`, `<incomplete/failed/passed>` |
 | controller conversation check | `<ordinary question received a natural answer and created no job>` |
 | paired owner identity | `<redacted Telegram user/chat identifiers>` |
 | configured project alias | `<alias, not a private path>` |
@@ -53,10 +70,10 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | review BB thread ids | `<thread id>` per attempt |
 | implementation environment id | `<environment id>` |
 | review environment ids | `<same environment id>` per attempt |
-| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
-| review skill-provider evidence | real thread id: `<pending>`; role: `review`; selected ids: `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
-| documentation skill-provider evidence | real thread id: `<pending>`; role: `documentation`; selected ids: `docs-guard`, `verification-before-completion`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
-| final-review skill-provider evidence | real thread id: `<pending>`; role: `final-review`; selected ids: `clean-code-guard`, `test-guard`, `docs-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| review skill-provider evidence | real thread id: `<pending>`; role: `review`; selected ids: `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| documentation skill-provider evidence | real thread id: `<pending>`; role: `documentation`; selected ids: `human-friendly-coding-communication`, `docs-guard`, `verification-before-completion`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| final-review skill-provider evidence | real thread id: `<pending>`; role: `final-review`; selected ids: `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | spawn-versus-fork proof | `<spawned=true, forked=false>` |
 | executor owner and generation | `<owner id>`, `<generation>` |
 | losing executor owner/generation result | `<not acquired or fenced>` |
@@ -135,11 +152,11 @@ Do not record raw private message text or claim-owner internals. Finish or cance
 
 ### 5. Capture implementation handoff and worker isolation
 
-Verify that the leased executor creates a visible implementation thread in a managed worktree on the disposable project's exact source host. Record the thread id, environment id, work-order filename/digest, executor owner/generation, and liveness source/state. Confirm the implementation input uses an attachment and a small handoff prompt. Prove that the thread was spawned and not forked. Confirm the hidden controller remains in its personal workspace and cannot see the implementation checkout.
+Verify that the leased executor creates a hidden implementation thread in a managed worktree on the disposable project's exact source host. Record the thread id, environment id, work-order filename/digest, executor owner/generation, and liveness source/state from bounded BB/operator projections. Confirm the implementation input uses an attachment and a small handoff prompt. Prove that the thread was spawned and not forked. Confirm the hidden controller remains in its personal workspace and cannot see the implementation checkout.
 
-#### Skill-provider observations (pending follow-up slice)
+#### Capability and skill-provider observations
 
-The deterministic `npm run skills:verify` gate proves only the committed bundle's structure, provenance, and bytes. It does not prove provider skill use. In the separately approved receipt/acceptance slice, capture one real BB thread id, the exact role, selected skill ids, the verifier's bundle digest, and the bounded provider-session outcome for each non-empty profile: `implementation`, `review`, `documentation`, and `final-review`. Keep the four evidence rows above **pending** during this slice; persistent skill receipts do not exist yet, so these observations cannot be marked passed or treated as complete live skill-use evidence.
+The deterministic `npm run skills:verify` gate proves only the committed bundle's structure, provenance, and bytes. It does not prove provider use. For each non-empty implementation, review, documentation, and final-review profile, record the real BB thread id, profile id and revision, recipe/version, exact model tuple, selected skill ids, verifier bundle digest, and every mandatory terminal outcome. Confirm the profile existed before the provider call and that the outcome receipt belongs to the same subject. A `selected` event without its required terminal outcome is incomplete. A shadow profile is observational evidence only and cannot be counted as active delivery success.
 
 ### 6. Observe the PR and bind its exact head
 
@@ -147,7 +164,7 @@ When the implementation thread is idle with a pull request, record the PR number
 
 ### 7. Run the first review and forced remediation
 
-Verify a visible spawned review child in the implementation environment, its immutable review-packet filename/digest, and its liveness source/state. Confirm it has a fresh provider conversation rather than the implementation transcript. Supply a strict JSON `changes_requested` verdict. Record the verdict and bounded finding summary. Confirm remediation is sent to the original implementation thread and that the review attempt remains bound to its original head.
+Verify a hidden spawned review child in the implementation environment, its immutable review-packet filename/digest, and its liveness source/state. Confirm it has a fresh provider conversation rather than the implementation transcript. Supply a strict JSON `changes_requested` verdict. Record the verdict and bounded finding summary. Confirm remediation is sent to the original implementation thread and that the review attempt remains bound to its original head.
 
 ### 8. Produce a new implementation head and fresh review
 
@@ -180,6 +197,101 @@ Record the final installed/running status and confirm logs contain no crash loop
 
 Also exercise one recoverable Telegram failure: an expired callback must not replay, or an uneditable status must be replaced and its new message id persisted. Record the classification and bounded recovery outcome without recording the response body.
 
+### 13. Future gate: record adaptive promotion evidence without operator assertions
+
+Run this step separately for each recipe, in the fixed order `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, then `architectural`. Use a fresh disposable active-mode job and a disclosed fixed harness and budget. Induce one recoverable provider failure, verify its terminal failed or blocked model trial, recover through a distinct passed trial on the same job, and finish the disposable job through merge. Record at least five independent candidate trials and five strong-baseline trials for the recipe.
+
+A later trusted acceptance collector—not an operator CLI argument—must derive and append one bounded evidence bundle containing:
+
+- all eight deterministic artifact categories and their digests;
+- the fixed classifier corpus/result with 100% correct and zero unsafe downgrades;
+- the active post-merge disposable job and distinct failure/recovery receipt ids;
+- candidate and baseline model-trial references under identical harness and budget digests;
+- all five zero-tolerance safety counter snapshots;
+- one manifest that references those exact stored records.
+
+The bundle write must be transactional. If any job, receipt, trial, artifact, recipe, chronology, or identity does not resolve, the write must leave no partial manifest. The current release has no such collector, so stop here and mark this gate **incomplete**; do not substitute direct database inserts.
+
+Inspect the result before any rollout decision:
+
+```bash
+bb telegram-agent capability status <recipe> --json
+```
+
+Only a future `passed` and `ready: true` result may permit `capability promote <recipe>`. After promotion, create a new matching job and prove it is `active`; the acceptance job used as evidence must not be retroactively rewritten. Exercise `capability rollback <recipe>` and prove that the in-flight active job stays pinned while a later matching job returns to `shadow`. Record both append-only decisions. Do not promote the next recipe until every earlier recipe remains active.
+
 ## Final acceptance decision
 
-Accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Until then, live provider skill-use evidence remains **pending**, not passed or complete. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the live acceptance as **not run**, not successful.
+Accept the base live run only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, canary, and promotion conclusions separate. The four role-specific capability rows must contain real thread ids, profiles, selected ids, bundle digest, exact model tuple, and mandatory terminal outcomes; deterministic bundle verification alone cannot satisfy them.
+
+A recipe promotion is a separate acceptance decision. It remains **incomplete** until step 13 has a resolved durable manifest and the status command reports `ready: true`. If the owner did not configure the token, production commands, disposable projects, or trusted collection harness needed for every case, report the affected live acceptance as **not run**, never successful. This release cannot create that manifest because the trusted collector is absent; do not approve a recipe for activation from local evidence.
+## Trust-kernel evidence sheet
+
+Score each row separately. Mocked/deterministic, live provider, Telegram, and external-system evidence stay in different classes, and an unavailable installation, provider, bot chat, interaction shape, or host attestation makes a row **incomplete** — never passed.
+
+| # | Evidence | Value |
+| --- | --- | --- |
+| 1 | accepted finalization id and its exact evidence refs | `<finalization id>`, `<evidence:N list>` |
+| 2 | live current-status evidence (source, proof kinds, subject refs) | `<bounded evidence row>` |
+| 3 | one process-only continuation with no leaked draft or answer | `<continuation count>`, `<draft text observed>` |
+| 4 | permission interaction id under the actually configured mode | `<interaction id>`, `<permission mode, explicit or default>` |
+| 5 | exact Allow-once resolution sent to BB | `<interaction id>`, `<resolution payload>` |
+| 6 | restart between tap persistence and BB resolution | `incomplete` unless a mechanically controlled window exists |
+| 7 | armed monitor obligation named by a deferred response | `<monitor id>`, `<obligation ref>` |
+| 8 | unsupported-success delivery count | `0` expected; record the observed count |
+| 9 | stale capability/fence denial before effect | `<denial code>`, `<unchanged durable state>` |
+| 10 | fixed report path/digest, harness identity, budgets, denominators, outcomes, and time/token/cost availability | `<report path>`, `<sha-256>`, `<passed/denominator per scenario>` |
+| 11 | proof that merge, deploy, credential, spend, destructive action, managed publication, and privilege/default activation were **not** exercised | `<explicit not-exercised statement per item>` |
+| 12 | runtime atomic-activity, conditional-commit, and native-isolation attestations | `unavailable / disabled` unless real host evidence exists |
+| 13 | Telegram backoff, retry, and uncertainty-report status, reported separately from the one logical outbox result | `<logical key>`, `<retry delay>`, `<exhaustion notice>` |
+
+Row 6 has no planned production fault hook for pausing exactly after tap persistence and before BB resolution, so it is **incomplete** unless a mechanically controlled window exists; the deterministic restart proof lives in `tests/controller-trust-integration.test.ts`.
+
+Row 4 may use an explicitly configured disposable `auto` profile and a harmless read-only command. If BB emits no supported interaction, mark the row incomplete. Record the actual configured permission mode and whether it was explicit.
+
+Row 12 is **disabled/unavailable** on the current runtime: the vendored BB thread, timeline, and interaction calls share no atomic activity revision and the commit API is unconditional. Because of that row, the overall live gate cannot be called passed.
+
+Row 13 records transport truth, not intent: an explicit server backoff is persisted in full, a transient failure known not to have sent is retried durably, a known-message edit reconciles by stored message id, and an uncertain brand-new send retries on its existing logical row even though that may duplicate it. If uncertainty exhausts the retry budget, the row must deliver the store-mapped warning instead of disappearing silently. Never record an attempt or an enqueue as a delivery.
+
+Never exercise a live merge, deploy, credential change, spend, destructive action, ref mutation, or managed publication for this acceptance run.
+
+## Final acceptance decision
+
+Accept only when both evidence sheets are complete. The trust-kernel sheet above is scored separately, and because row 12's runtime attestations are unavailable on this runtime, **the overall live gate cannot be called passed** however well the rest scores. Beyond that, accept only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, and canary conclusions separate. The four role-specific skill-provider rows must contain real thread ids, roles, selected ids, a bundle digest, and provider-session outcomes from the later receipt slice; the deterministic gate alone cannot satisfy them. Until then, live provider skill-use evidence remains **pending**, not passed or complete. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the live acceptance as **not run**, not successful.
+
+## Credential broker evidence sheet
+
+The credential broker foundation (see [Configuration](configuration.md#credential-broker-foundation) and [Operations](operations.md#credential-broker)) has its own versioned acceptance contract, separate from the two sheets above: a fixed case catalog in `evals/credential-broker-cases.json`, a schema and aggregation rule in `src/eval/credential-broker-acceptance.ts`, and a secret-free recorder/validator at `scripts/record-credential-broker-acceptance.mjs`. **This repository defines that contract; it does not run it.** `credentialBrokerMode` remains `disabled`, no case in the catalog has been executed against a real broker, provider, or protected host, and this foundation cannot be exercised live until a disposable 1Password account and a protected broker host exist. Treat every case below as **not run** until that live pass completes and this section is updated with its result.
+
+The catalog fixes four case categories — `deterministic` and `contract` (covered by the focused `credential-*.test.ts` suite runnable with `npm run test:credentials`), `live`, and `red_state` — and every case in it is mandatory. The 14 mandatory live ids and 8 mandatory red-state ids are:
+
+```text
+live-broker-noninteractive-start           live-admin-interface-unreachable
+live-service-account-single-vault-scope    live-bb-admin-negative-probes
+live-exact-binding-valid                   live-topology-reattest
+live-out-of-scope-item-denied              live-disposable-teardown
+live-missing-field-invalid                 red-secret-log-canary
+live-revoked-service-token-closed          red-unknown-protocol-field
+live-broker-restart-receipt-replay         red-stale-binding-generation
+live-hanoon-restart-no-credential-transfer red-redirect-endpoint
+live-secret-canary-zero-findings           red-unsafe-topology
+live-doctor-all-gates                      red-expired-topology-receipt
+                                            red-audit-persistence-failure
+                                            red-idempotency-digest-change
+```
+
+Each red-state case names, in the catalog, the exact other case whose fail-closed guarantee it adversarially proves. The overall report status the recorder computes is `passed` only when every mandatory case is recorded `passed` and cleaned — closed out with `cleanupStatus: "complete"` whenever it touched a disposable resource — **and** every red-state case that another case depends on is itself `passed` and cleaned. A case that is missing, `failed`, still `incomplete`, or whose required red-state counterpart is unmet leaves the aggregate `incomplete` or `failed`, never `passed`; the recorder recomputes this from the recorded cases every time, so a hand-edited `"status": "passed"` in the report file is rejected rather than trusted. Evidence references in the report are opaque ids and paths only — never a secret, a `op://` vault reference, PEM material, or a token — and the schema refuses any value shaped like one.
+
+The report itself is not part of this repository: it is generated outside Git, under `$BB_THREAD_STORAGE` or another path the operator explicitly confirms is protected.
+
+```bash
+npm run acceptance:credential-broker -- init --output "$BB_THREAD_STORAGE/credential-broker-acceptance-v1.json"
+npm run acceptance:credential-broker -- record --input "$BB_THREAD_STORAGE/credential-broker-acceptance-v1.json" \
+  --case <case-id> --status <passed|failed|incomplete> --cleanup <not_applicable|pending|complete> \
+  --procedure-revision <n> --started-at <epoch-ms> --completed-at <epoch-ms> \
+  --actor <who> --reviewer <who> --actual-result <stable-label> \
+  --evidence <opaque-ref> --resource <disposable-resource-id>
+npm run acceptance:credential-broker -- validate --input "$BB_THREAD_STORAGE/credential-broker-acceptance-v1.json"
+```
+
+`init` writes one `incomplete` entry per catalog case and exits `0`; running `validate` against that untouched file exits nonzero with status `incomplete` by design, since nothing has been proven yet. `record` re-validates the whole report before writing and refuses a write that would make it invalid — for example a `passed` case with no cleanup, no evidence, or a secret-shaped value — so the file on disk can never silently drift into a false `passed`. Do not call this "100% real" testing until `validate` exits `0`: that specific claim means every mandatory case in the catalog is `passed` and cleaned, its evidence reference exists, and no red-state proof was skipped — not that every website, credential type, or future provider works.

@@ -104,7 +104,7 @@ describe("Telegram ingress service", () => {
       serviceDeps(
         store,
         client,
-        { handleClaimed: vi.fn() },
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
         () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
@@ -129,6 +129,7 @@ describe("Telegram ingress service", () => {
       handleClaimed: vi.fn(async (update: TelegramUpdate) => {
         seen.push(update.update_id);
         expect(store.getNextTelegramOffset()).toBe(update.update_id === 10 ? 0 : update.update_id);
+        return { updateSettled: false };
       }),
     };
     const promise = runTelegramService(
@@ -238,6 +239,7 @@ describe("Telegram ingress service", () => {
       handleClaimed: vi.fn(async (update: TelegramUpdate) => {
         seen.push(update.update_id);
         if (update.update_id === 10) throw new Error("Telegram API 400");
+        return { updateSettled: false };
       }),
     };
 
@@ -269,6 +271,7 @@ describe("Telegram ingress service", () => {
     const ingress = {
       handleClaimed: vi.fn(async (update: TelegramUpdate) => {
         if (update.update_id === 10) throw new Error("Telegram API 400");
+        return { updateSettled: false };
       }),
     };
 
@@ -308,7 +311,7 @@ describe("Telegram ingress service", () => {
 
     const promise = runTelegramService(
       {
-        ...serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+        ...serviceDeps(store, client, { handleClaimed: vi.fn(async () => ({ updateSettled: false })) }, () => ({
           ok: true,
           value: { botToken: "123:secret" },
         })),
@@ -324,25 +327,135 @@ describe("Telegram ingress service", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("binds identity once per token and stops on a polling conflict", async () => {
+  it("supersedes an orphaned activation before its replacement starts polling", async () => {
+    const { store } = storeFixture();
+    const firstAbort = new AbortController();
+    const replacementAbort = new AbortController();
+    let activation = 0;
+    let activePolls = 0;
+    let maximumActivePolls = 0;
+    let markFirstPollStarted: () => void = () => undefined;
+    const firstPollStarted = new Promise<void>((resolve) => {
+      markFirstPollStarted = resolve;
+    });
+    const client = vi.fn(() => {
+      activation += 1;
+      const currentActivation = activation;
+      return {
+        getMe: vi.fn(async () => ({ id: 123, username: "bot" })),
+        getUpdates: vi.fn(async (_offset: number, _timeoutSeconds: number, signal: AbortSignal) => {
+          activePolls += 1;
+          maximumActivePolls = Math.max(maximumActivePolls, activePolls);
+          if (currentActivation === 1) {
+            markFirstPollStarted();
+            await new Promise<void>((_resolve, reject) => {
+              signal.addEventListener("abort", () => {
+                activePolls -= 1;
+                reject(signal.reason);
+              }, { once: true });
+            });
+            return [];
+          }
+          firstAbort.abort();
+          replacementAbort.abort();
+          activePolls -= 1;
+          return [];
+        }),
+      };
+    }) as TelegramServiceDeps["client"];
+    const deps = serviceDeps(
+      store,
+      client,
+      { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
+      () => ({ ok: true, value: { botToken: "123:secret" } }),
+    );
+
+    const first = runTelegramService(deps, firstAbort.signal);
+    await firstPollStarted;
+    const replacement = runTelegramService(deps, replacementAbort.signal);
+    await Promise.all([first, replacement]);
+
+    expect(maximumActivePolls).toBe(1);
+  });
+
+  it("binds identity once per token and keeps polling through a transient conflict", async () => {
     const { store } = storeFixture();
     const abort = new AbortController();
     const client = realClientFactory([
       { ok: true, result: { id: 123, username: "bot" } },
       { ok: false, error_code: 409, description: "Conflict" },
-    ]);
+      { ok: true, result: [{ update_id: 10 }] },
+      { ok: true, result: [] },
+    ], (pollNumber) => {
+      if (pollNumber === 3) abort.abort();
+    });
+
+    await runTelegramService(
+      serviceDeps(
+        store,
+        client,
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
+        () => ({ ok: true, value: { botToken: "123:secret" } }),
+      ),
+      abort.signal,
+    );
+
+    expect(store.getTelegramIdentity()).toMatchObject({ botId: "123", username: "bot" });
+    expect(store.getNextTelegramOffset()).toBe(11);
+  });
+
+  it("enters needs-configuration without polling or changing state when the bot identity differs", async () => {
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const getUpdates = vi.fn(async () => {
+      abort.abort();
+      return [];
+    });
+    const client = vi.fn(() => ({
+      getMe: vi.fn(async () => ({ id: 456, username: "other_bot" })),
+      getUpdates,
+    })) as TelegramServiceDeps["client"];
 
     await expect(runTelegramService(
       serviceDeps(
         store,
         client,
-        { handleClaimed: vi.fn() },
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
+        () => ({ ok: true, value: { botToken: "456:secret" } }),
+      ),
+      abort.signal,
+    )).rejects.toMatchObject({
+      name: "NeedsConfigurationError",
+      message: expect.stringMatching(/identity mismatch.*stored.*bot.*123.*configured.*other_bot.*456/i),
+    });
+
+    expect(getUpdates).not.toHaveBeenCalled();
+    expect(store.getTelegramIdentity()).toEqual({ botId: "123", username: "bot", verifiedAt: 1 });
+    expect(store.getOwner()).toEqual({ userId: "7", chatId: "70", pairedAt: 1 });
+  });
+
+  it("stops only once a polling conflict is sustained", async () => {
+    vi.useFakeTimers();
+    const { store } = storeFixture();
+    const abort = new AbortController();
+    const client = realClientFactory([
+      { ok: true, result: { id: 123, username: "bot" } },
+      ...Array.from({ length: 12 }, () => ({ ok: false as const, error_code: 409, description: "Conflict" })),
+    ]);
+
+    const promise = runTelegramService(
+      serviceDeps(
+        store,
+        client,
+        { handleClaimed: vi.fn(async () => ({ updateSettled: false })) },
         () => ({ ok: true, value: { botToken: "123:secret" } }),
       ),
       abort.signal,
-    )).rejects.toMatchObject({ name: "NeedsConfigurationError" });
-
-    expect(store.getTelegramIdentity()).toMatchObject({ botId: "123", username: "bot" });
+    );
+    const assertion = expect(promise).rejects.toMatchObject({ name: "NeedsConfigurationError" });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await assertion;
+    vi.useRealTimers();
   });
 
   it("redacts bot tokens from service failures", async () => {
@@ -399,7 +512,7 @@ describe("Telegram ingress service", () => {
     }) as TelegramServiceDeps["client"];
 
     const promise = runTelegramService(
-      serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+      serviceDeps(store, client, { handleClaimed: vi.fn(async () => ({ updateSettled: false })) }, () => ({
         ok: true,
         value: { botToken: token },
       })),
@@ -430,7 +543,7 @@ describe("Telegram ingress service", () => {
     })) as TelegramServiceDeps["client"];
 
     const promise = runTelegramService(
-      serviceDeps(store, client, { handleClaimed: vi.fn() }, () => ({
+      serviceDeps(store, client, { handleClaimed: vi.fn(async () => ({ updateSettled: false })) }, () => ({
         ok: true,
         value: { botToken: "123:secret" },
       })),

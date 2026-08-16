@@ -18,8 +18,16 @@ export const SKILL_ID_PATTERN = new RegExp(
 export const WORKFLOW_ROOT = "skills/workflow-kit";
 export const GUARDS_ROOT = "skills/guards";
 export const DELIVERY_ROOT = "skills/delivery";
+export const DISCOVERY_ROOT = "skills/discovery";
+export const HANOON_ROOT = "skills/hanoon";
 export const LOCK_PATH = "skills/skills.lock.json";
-export const REGISTERED_ROOTS = Object.freeze([WORKFLOW_ROOT, GUARDS_ROOT, DELIVERY_ROOT]);
+export const REGISTERED_ROOTS = Object.freeze([
+  WORKFLOW_ROOT,
+  GUARDS_ROOT,
+  DELIVERY_ROOT,
+  DISCOVERY_ROOT,
+  HANOON_ROOT,
+]);
 
 const workflowSkillIds = [
   "brainstorming",
@@ -39,9 +47,17 @@ const workflowSkillIds = [
 ];
 const guardSkillIds = ["clean-code-guard", "docs-guard", "test-guard"];
 const deliverySkillIds = ["pr-writer"];
+const discoverySkillIds = ["domain-modeling", "grill-with-docs", "grilling"];
+const hanoonSkillIds = [
+  "checking-system-logs",
+  "driving-bb",
+  "durable-boundary-audit",
+  "human-friendly-coding-communication",
+  "proportional-development-workflow",
+];
 
 export const WORKFLOW_KIT = Object.freeze({
-  version: "6.2.0",
+  version: "6.3.0",
   sourceUrl: "https://github.com/obra/superpowers",
   license: "MIT",
   licensePath: `${WORKFLOW_ROOT}/LICENSE`,
@@ -63,6 +79,14 @@ export const DELIVERY_KIT = Object.freeze({
   licensePath: `${DELIVERY_ROOT}/LICENSE`,
 });
 
+export const DISCOVERY_KIT = Object.freeze({
+  version: "1.2.3",
+  revision: "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+  sourceUrl: "https://github.com/mattpocock/skills",
+  license: "MIT",
+  licensePath: `${DISCOVERY_ROOT}/LICENSE`,
+});
+
 export const WORKFLOW_PROVENANCE = Object.freeze({
   source: WORKFLOW_KIT.sourceUrl,
   license: WORKFLOW_KIT.license,
@@ -74,6 +98,21 @@ export const GUARD_PROVENANCE = Object.freeze({
 export const DELIVERY_PROVENANCE = Object.freeze({
   source: DELIVERY_KIT.sourceUrl,
   license: DELIVERY_KIT.license,
+});
+export const DISCOVERY_PROVENANCE = Object.freeze({
+  source: DISCOVERY_KIT.sourceUrl,
+  license: DISCOVERY_KIT.license,
+});
+
+// First-party Hanoon guidance, not a vendored upstream copy.
+export const HANOON_KIT = Object.freeze({
+  sourceUrl: "first-party",
+  license: "first-party",
+  licensePath: `${HANOON_ROOT}/NOTICE`,
+});
+export const HANOON_PROVENANCE = Object.freeze({
+  source: HANOON_KIT.sourceUrl,
+  license: HANOON_KIT.license,
 });
 
 export const REQUIRED_WORKFLOW_SKILLS = Object.freeze(workflowSkillIds.map((id) => Object.freeze({
@@ -94,10 +133,24 @@ export const REQUIRED_DELIVERY_SKILLS = Object.freeze(deliverySkillIds.map((id) 
   ...DELIVERY_PROVENANCE,
 })));
 
+export const REQUIRED_DISCOVERY_SKILLS = Object.freeze(discoverySkillIds.map((id) => Object.freeze({
+  id,
+  skillPath: `${DISCOVERY_ROOT}/${id}/SKILL.md`,
+  ...DISCOVERY_PROVENANCE,
+})));
+
+export const REQUIRED_HANOON_SKILLS = Object.freeze(hanoonSkillIds.map((id) => Object.freeze({
+  id,
+  skillPath: `${HANOON_ROOT}/${id}/SKILL.md`,
+  ...HANOON_PROVENANCE,
+})));
+
 export const REQUIRED_SKILLS = Object.freeze([
   ...REQUIRED_WORKFLOW_SKILLS,
   ...REQUIRED_GUARD_SKILLS,
   ...REQUIRED_DELIVERY_SKILLS,
+  ...REQUIRED_DISCOVERY_SKILLS,
+  ...REQUIRED_HANOON_SKILLS,
 ]);
 
 export const SYNC_EXCLUDED_SEGMENTS = Object.freeze([

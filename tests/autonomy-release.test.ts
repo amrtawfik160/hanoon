@@ -3,7 +3,7 @@ import type Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import type { JobEffect } from "../src/domain/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
-import { policyFixture } from "./helpers";
+import { admitConfirmedJob, policyFixture } from "./helpers";
 
 let fixtureNumber = 0;
 
@@ -261,4 +261,72 @@ describe("autonomy draining and release", () => {
       busyJobIds: [],
     }).map((effect) => effect.idempotencyKey)).toEqual([terminalStatusKey]);
   });
+});
+
+it("frees a project locked by a failed job once that job is cancelled", () => {
+  {
+    const { store, db: harnessDb } = storeFixture();
+    store.upsertProjectPolicy(policyFixture({ projectId: "proj_locked", alias: "locked" }), 1_000);
+
+    // A job fails and keeps its project claim so a retry could resume in place.
+    const first = store.createJob({ id: "job_dead", sourceUpdateId: 8_101, requestText: "first", now: 1_001 });
+    const selected = store.applyJobEvent(first.id, first.version, {
+      type: "PROJECT_SELECTED",
+      projectId: "proj_locked",
+      policyVersion: 1,
+      policy: policyFixture({ projectId: "proj_locked", alias: "locked" }),
+    }, 1_002);
+    const admitted = admitConfirmedJob(store, selected, 1_003);
+    const failed = store.applyJobEvent(admitted.id, admitted.version, {
+      type: "FAILED",
+      error: "npm run check exited 1",
+    }, 1_004);
+    // Held, deliberately: a failed job keeps its project so a retry can resume.
+    expect(store.listHeldResourceClaims(failed.id, 10).filter((c) => c.state === "held")).toHaveLength(1);
+
+    // Nothing expires that claim, so a second job on the same project is stuck.
+    const second = store.createJob({ id: "job_next", sourceUpdateId: 8_102, requestText: "second", now: 1_005 });
+    const secondSelected = store.applyJobEvent(second.id, second.version, {
+      type: "PROJECT_SELECTED",
+      projectId: "proj_locked",
+      policyVersion: 1,
+      policy: policyFixture({ projectId: "proj_locked", alias: "locked" }),
+    }, 1_006);
+    const lease = store.acquireExecutorLease("releaser", 1_007, 30_000);
+    if (!lease.acquired) throw new Error("missing lease");
+    store.queueAdmission({
+      jobId: secondSelected.id,
+      expectedVersion: secondSelected.version,
+      projectId: "proj_locked",
+      resumeEvent: "CONFIRMED",
+      now: 1_007,
+    });
+    expect(store.tryAdmit({
+      jobId: secondSelected.id, maxConcurrentJobs: 8, ownerId: "releaser",
+      generation: lease.generation, now: 1_008, leaseMs: 30_000,
+    })).toMatchObject({ outcome: "not_admitted", reason: "project_busy" });
+
+    // Cancelling the dead job is the recovery path the owner actually has.
+    // No worker left to stop, so the cancellation completes on request.
+    const cancelled = store.applyJobEvent(failed.id, failed.version, {
+      type: "CANCEL_REQUESTED", activeWorker: null,
+    }, 1_009);
+    expect(cancelled.state).toBe("cancelled");
+    // Cancelling emits render_status and revoke_approvals; release waits for
+    // those to settle, exactly as the executor drives them in production.
+    harnessDb.prepare(
+      "UPDATE effects SET status = 'done' WHERE job_id = ? AND kind IN ('render_status','revoke_approvals')",
+    ).run(failed.id);
+    for (const candidate of store.listReleaseCandidates(10)) {
+      store.finalizeRelease({
+        jobId: candidate.jobId, ownerId: "releaser", generation: lease.generation, now: 1_011,
+      });
+    }
+
+    expect(store.listHeldResourceClaims(failed.id, 10).filter((c) => c.state === "held")).toHaveLength(0);
+    expect(store.tryAdmit({
+      jobId: secondSelected.id, maxConcurrentJobs: 8, ownerId: "releaser",
+      generation: lease.generation, now: 1_012, leaseMs: 30_000,
+    })).toMatchObject({ outcome: "admitted" });
+  }
 });
