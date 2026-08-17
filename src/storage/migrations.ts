@@ -2195,6 +2195,57 @@ CREATE INDEX thread_interactions_controller_retry
   ON thread_interactions(audience, state, controller_key);
 `] as const;
 
+/** Immutable record of each failure cause that has already been cleared. */
+export const PROJECT_ADMISSION_CLEAR_HISTORY_MIGRATIONS = [String.raw`
+CREATE TABLE project_admission_pause_clear_history (
+  project_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64),
+  cleared_at INTEGER NOT NULL CHECK (cleared_at >= 0),
+  cleared_by TEXT NOT NULL CHECK (cleared_by IN ('agent', 'owner', 'legacy')),
+  PRIMARY KEY (project_id, fingerprint)
+);
+INSERT OR IGNORE INTO project_admission_pause_clear_history (
+  project_id, fingerprint, cleared_at, cleared_by
+)
+  SELECT project_id, fingerprint, cleared_at, 'legacy'
+    FROM project_admission_pauses
+   WHERE fingerprint IS NOT NULL AND cleared_at IS NOT NULL;
+`] as const;
+
+/** Durable handoff between serial Telegram intake and bounded voice work. */
+export const CONTROLLER_VOICE_INBOX_MIGRATIONS = [String.raw`
+CREATE TABLE controller_voice_inbox (
+  update_id INTEGER PRIMARY KEY REFERENCES telegram_updates(update_id),
+  controller_key TEXT NOT NULL CHECK (length(controller_key) BETWEEN 1 AND 128),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
+  telegram_user_id TEXT NOT NULL CHECK (length(telegram_user_id) BETWEEN 1 AND 32),
+  telegram_chat_id TEXT NOT NULL CHECK (length(telegram_chat_id) BETWEEN 1 AND 32),
+  file_id TEXT NOT NULL CHECK (length(file_id) BETWEEN 1 AND 512),
+  mime_type TEXT NOT NULL CHECK (length(mime_type) BETWEEN 1 AND 255),
+  file_size_bytes INTEGER CHECK (file_size_bytes IS NULL OR file_size_bytes >= 0),
+  duration_seconds INTEGER NOT NULL CHECK (duration_seconds >= 0),
+  caption TEXT CHECK (caption IS NULL OR length(caption) <= 4000),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'completed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  claim_owner TEXT,
+  claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (claim_generation >= 0),
+  claim_expires_at INTEGER,
+  outcome TEXT,
+  last_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  completed_at INTEGER,
+  CHECK (
+    (state = 'processing' AND claim_owner IS NOT NULL AND claim_expires_at IS NOT NULL) OR
+    (state <> 'processing' AND claim_owner IS NULL AND claim_expires_at IS NULL)
+  )
+);
+CREATE INDEX controller_voice_inbox_due
+  ON controller_voice_inbox(state, claim_expires_at, update_id);
+CREATE UNIQUE INDEX controller_voice_inbox_ordinal
+  ON controller_voice_inbox(controller_key, ordinal);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2264,4 +2315,6 @@ export const ALL_MIGRATIONS = [
   ...REFERENCE_DOCUMENT_MIGRATIONS,
   ...CONTROLLER_THREAD_ROUTING_REPAIR_MIGRATIONS,
   ...REFERENCE_DOCUMENT_REPAIR_MIGRATIONS,
+  ...PROJECT_ADMISSION_CLEAR_HISTORY_MIGRATIONS,
+  ...CONTROLLER_VOICE_INBOX_MIGRATIONS,
 ] as const;

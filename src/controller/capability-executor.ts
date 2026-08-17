@@ -22,7 +22,7 @@ import type {
 import type { TelegramAgentStore, ToolReceiptClaim } from "../storage/store";
 
 const MAX_SAFE_SUBJECTS = 16;
-const SAFE_SUBJECT_REF = /^(?:project|job|thread|monitor|memory|delegation|controller|credential-binding|credential-receipt):[^\s:]{1,248}$/;
+const SAFE_SUBJECT_REF = /^(?:project|job|thread|monitor|memory|delegation|controller|credential-binding|credential-receipt|reference|reference-passage):[^\s:]{1,248}$/;
 const INTERRUPTED_DOMAIN_RESULT = Object.freeze({
   outcome: "uncertain",
   detail: "An identical call was already started and its outcome is unknown. Check current state before acting again.",
@@ -247,6 +247,7 @@ export function authorizeControllerCapability(
     currentTurn: submittedTurn,
     turnFinalized: false,
     role: "controller",
+    turnOrigin: turn?.origin ?? "system",
     contextMatches: controller !== null && controller.threadId === input.context.threadId &&
       controller.projectId === input.context.projectId,
     scopeMatches: input.scope.matches,

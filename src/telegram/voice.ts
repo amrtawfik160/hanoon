@@ -7,12 +7,12 @@ import type { TelegramMessage } from "./types";
 /**
  * Telegram caps a bot download at 20 MB and a voice note is orders of magnitude
  * smaller, so this bound is about a mistaken send rather than a real note: an
- * hour-long recording is not a message and transcribing it would stall the turn
- * it arrived in.
+ * hour-long recording is not a message and would monopolize the bounded
+ * background transcription worker.
  */
 export const MAX_CONTROLLER_VOICE_BYTES = 20 * 1024 * 1024;
 
-/** Long enough for anything spoken to a phone, short enough not to hang a turn. */
+/** Long enough for a phone request, short enough to bound background work. */
 export const MAX_CONTROLLER_VOICE_SECONDS = 20 * 60;
 
 export type ControllerVoiceNote = {
@@ -66,12 +66,19 @@ export function voiceTooLargeToTranscribe(note: ControllerVoiceNote): boolean {
  * case names what to do instead, because "I can't" with no next step is a dead
  * end in a chat the owner cannot leave.
  */
-export type VoiceUnavailableReason = "too_large" | "no_service" | "empty" | "unreadable";
+export type VoiceUnavailableReason =
+  | "too_large"
+  | "transcript_too_long"
+  | "no_service"
+  | "empty"
+  | "unreadable";
 
 export function voiceUnavailableNotice(reason: VoiceUnavailableReason): string {
   switch (reason) {
     case "too_large":
       return "That recording is too long for me to transcribe. Please send a shorter one, or type it.";
+    case "transcript_too_long":
+      return "That recording transcribed to more than one message can hold. Please split the recording, or type it in shorter parts.";
     case "empty":
       return "I could not make out anything in that recording. Please try again, or type it.";
     case "unreadable":

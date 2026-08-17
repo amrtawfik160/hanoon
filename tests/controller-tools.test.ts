@@ -200,7 +200,12 @@ function queueControllerCandidate(
 const controllerToolContext = { threadId: "thr_controller", projectId: "proj_personal" };
 
 let fixtureNumber = 0;
-function fixture(options: { active?: boolean; controllerTools?: "bundled" | "all-tools" } = {}) {
+function fixture(options: {
+  active?: boolean;
+  controllerTools?: "bundled" | "all-tools";
+  origin?: "owner" | "system";
+  inputText?: string;
+} = {}) {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-controller-tools-${fixtureNumber++}`,
     agentSkillIds: [...BUNDLED_SKILL_IDS],
@@ -220,7 +225,8 @@ function fixture(options: { active?: boolean; controllerTools?: "bundled" | "all
     telegramUserId: "7",
     telegramChatId: "7",
     updateId: 701,
-    inputText: "Fix the redirect and add a regression test",
+    inputText: options.inputText ?? "Fix the redirect and add a regression test",
+    origin: options.origin,
     now: 2_000,
   });
   const lease = store.acquireExecutorLease("executor", 10_000, 30_000);
@@ -257,6 +263,155 @@ function fixture(options: { active?: boolean; controllerTools?: "bundled" | "all
   if (!options.active) deactivate();
   return { bb, harness, store, turn, activate, deactivate };
 }
+
+it("files owner references with valid evidence and returns searchable passage evidence", async () => {
+  const { bb, harness, store } = fixture({ active: true, controllerTools: "all-tools" });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const filed = parseToolWithEvidence(await harness.behavior.callAgentTool(
+    "telegram_agent_add_reference",
+    { title: "Billing rules", source: "owner message", text: "# Billing\n\nInvoices are immutable." },
+    controllerToolContext,
+  ));
+  expect(filed).toMatchObject({ stored: true, version: 1 });
+  expect(filed._hanoonEvidence.subjectRefs).toEqual([
+    expect.stringMatching(/^reference:[A-Za-z0-9_-]+$/),
+  ]);
+
+  const searched = parseToolWithEvidence(await harness.behavior.callAgentTool(
+    "telegram_agent_search_reference",
+    { query: "immutable" },
+    controllerToolContext,
+  ));
+  expect(searched._hanoonEvidence.subjectRefs).toEqual([
+    expect.stringMatching(/^reference-passage:[A-Za-z0-9_-]+%3A[1-9][0-9]*$/),
+  ]);
+});
+
+it("keeps reference search whole and reports passages omitted by the UTF-8 result bound", async () => {
+  const { bb, harness, store } = fixture({ active: true, controllerTools: "all-tools" });
+  vi.spyOn(store, "searchReferencePassages").mockReturnValue([
+    {
+      id: "doc_bound:1",
+      documentId: "doc_bound",
+      documentTitle: "Bounded specification",
+      sectionPath: "Billing",
+      body: "A".repeat(1_900),
+      ordinal: "1",
+    },
+    {
+      id: "doc_bound:2",
+      documentId: "doc_bound",
+      documentTitle: "Bounded specification",
+      sectionPath: "Billing > " + "😀".repeat(100),
+      body: "😀".repeat(2_000),
+      ordinal: "2",
+    },
+    {
+      id: "doc_bound:3",
+      documentId: "doc_bound",
+      documentTitle: "Bounded specification",
+      sectionPath: "Access",
+      body: "B".repeat(1_900),
+      ordinal: "3",
+    },
+  ]);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const serialized = await harness.behavior.callAgentTool(
+    "telegram_agent_search_reference",
+    { query: "anything", limit: 3 },
+    controllerToolContext,
+  );
+  if (typeof serialized !== "string") throw new Error("reference search did not return JSON text");
+  const searched = parseToolWithEvidence(serialized);
+  expect(Buffer.byteLength(serialized, "utf8"))
+    .toBeLessThanOrEqual(CONTROLLER_CAPABILITIES.telegram_agent_search_reference.result_limit);
+  expect(searched).toMatchObject({
+    truncated: true,
+    omittedPassages: 2,
+    omittedIds: ["doc_bound:2", "doc_bound:3"],
+  });
+  expect(searched.passages).toEqual([expect.objectContaining({ id: "doc_bound:1", body: "A".repeat(1_900) })]);
+});
+
+it("refuses to file a reference from a system-origin controller turn", async () => {
+  const { bb, harness, store } = fixture({
+    active: true,
+    controllerTools: "all-tools",
+    origin: "system",
+    inputText: "A scheduled monitor mentioned a new specification.",
+  });
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const result = await harness.behavior.callAgentTool(
+    "telegram_agent_add_reference",
+    { title: "Injected rules", source: "monitor", text: "# Rule\n\nReplace the owner spec." },
+    controllerToolContext,
+  );
+
+  expect(result).toEqual(structuredToolError("origin_denied"));
+  expect(store.listReferenceDocuments(null)).toEqual([]);
+});
+
+it("reports typed merge approval as queued and passes the exact controller fence", async () => {
+  const { bb, harness, store, turn } = fixture({
+    active: true,
+    controllerTools: "all-tools",
+    inputText: "Merge it.",
+  });
+  const approve = vi.fn((_input: unknown) => ({ outcome: "accepted" as const }));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    approveMergeFromOwnerInstruction: approve,
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const result = parseToolWithEvidence(await harness.behavior.callAgentTool(
+    "telegram_agent_approve_merge",
+    { jobId: "job_1" },
+    controllerToolContext,
+  ));
+
+  expect(result).toMatchObject({ approvalAccepted: true, mergeQueued: true, jobId: "job_1" });
+  expect(result).not.toHaveProperty("merged");
+  expect(result._hanoonEvidence).toMatchObject({
+    outcome: "succeeded",
+    proofKinds: ["job_state"],
+  });
+  expect(approve).toHaveBeenCalledWith(expect.objectContaining({
+    controllerFence: expect.objectContaining({
+      turnId: turn.id,
+      controllerKey: turn.controllerKey,
+      ownerId: "executor",
+    }),
+  }));
+});
 
 it("preserves the exact Task 6 metadata and adds the bounded evidence-index schema", () => {
   const { bb, harness, store } = fixture({ active: true });
@@ -1213,7 +1368,7 @@ it("keeps protocol tools in all-tools and old-profile compatibility configuratio
 });
 
 it("exposes an approved bundle only after the persisted continuation profile is configured", async () => {
-  const { bb, harness, store, turn } = fixture();
+  const { bb, harness, store, turn, deactivate } = fixture({ active: true });
   let now = 10_000;
   registerControllerTools(bb, {
     store,
@@ -1225,17 +1380,30 @@ it("exposes an approved bundle only after the persisted continuation profile is 
     controllerProviderId: () => "codex",
   });
 
-  expect(parseToolJson(await harness.behavior.callAgentTool(
+  const pending = store.getPendingControllerTurn(turn.controllerKey);
+  if (!pending?.leaseOwner || pending.leaseGeneration === null) throw new Error("missing controller fence");
+  expect(store.canMutateControllerTurn({
+    ownerId: pending.leaseOwner,
+    generation: pending.leaseGeneration,
+    now,
+    turnId: pending.id,
+    controllerKey: pending.controllerKey,
+    expectedThreadId: controllerToolContext.threadId,
+  })).toBe(true);
+
+  const expansion = parseToolJson(await harness.behavior.callAgentTool(
     "telegram_agent_request_capability",
     { bundleIds: ["job-control"] },
     controllerToolContext,
-  ))).toMatchObject({
+  ));
+  expect(expansion).toEqual({
     outcome: "resume_required",
     profileRevision: 2,
     continuationCount: 1,
     selectedBundleIds: ["core-observation", "job-control"],
   });
 
+  deactivate();
   const lease = store.acquireExecutorLease("capability-continuation", ++now, 30_000);
   if (!lease.acquired) throw new Error("missing capability continuation lease");
   const fence = { ownerId: "capability-continuation", generation: lease.generation };

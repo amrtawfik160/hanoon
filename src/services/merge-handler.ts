@@ -21,6 +21,7 @@ import {
   parsePersistedMergeSuccessResult,
   isCompletedReviewAttempt,
   type ApprovalIdentity,
+  type ControllerMutationFence,
   type DurableMergeReceipt,
   type MergeEffectPayload,
   type PendingMergeEffectPayload,
@@ -447,6 +448,7 @@ export class MergeHandler {
     userId: string;
     chatId: string;
     instructionText: string;
+    controllerFence: ControllerMutationFence;
   }): MergeCallbackResult {
     const now = this.clock();
     assertNow(now);
@@ -488,6 +490,7 @@ export class MergeHandler {
       },
       now,
       { userId: input.userId, chatId: input.chatId },
+      input.controllerFence,
     );
     return { outcome: accepted.ok ? "accepted" : "rejected" };
   }

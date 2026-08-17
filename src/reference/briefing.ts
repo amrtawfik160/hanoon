@@ -30,8 +30,16 @@ export function referenceBriefingFor(
 
   for (let included = documents.length; included >= 1; included -= 1) {
     const selected = documents.slice(0, included);
-    const omitted = documents.length - selected.length;
+    const omitted = documents.slice(included).map((document) => ({
+      id: document.id,
+      version: document.version,
+      title: document.title,
+      scope: document.scope,
+      map: "",
+    }));
     const shells: ReferenceBriefing[] = selected.map((document) => ({
+      id: document.id,
+      version: document.version,
       title: document.title,
       scope: document.scope,
       map: "",
@@ -41,6 +49,8 @@ export function referenceBriefingFor(
     if (mapBudget < included) continue;
     const share = Math.floor(mapBudget / included);
     const briefings = selected.map((document) => ({
+      id: document.id,
+      version: document.version,
       title: document.title,
       scope: document.scope,
       map: renderReferenceMap(document.map, share),

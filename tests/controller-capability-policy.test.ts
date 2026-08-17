@@ -539,7 +539,7 @@ const EXPECTED_CAPABILITIES = {
     project_scope: "controller_global",
     credential_scope: { credential: "none", audience: "none" },
     egress: ["none"],
-    proof_kinds: ["job_state", "external_mutation"],
+    proof_kinds: ["job_state"],
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
   },
@@ -570,6 +570,7 @@ const EXPECTED_CAPABILITIES = {
     idempotency: "tool_receipt",
     approval: "none",
     allowed_roles: ["controller"],
+    allowed_origins: ["owner"],
     project_scope: "controller_global",
     credential_scope: { credential: "none", audience: "none" },
     egress: ["none"],
@@ -602,6 +603,7 @@ const SAFE_AUTHORITY: ControllerCapabilityAuthority = {
   currentTurn: true,
   turnFinalized: false,
   role: "controller",
+  turnOrigin: "owner",
   contextMatches: true,
   scopeMatches: true,
   approval: "not_required",
@@ -746,6 +748,7 @@ describe("controller capability manifest", () => {
       expect(Object.isFrozen(descriptor)).toBe(true);
       expect(Object.isFrozen(descriptor.data_class)).toBe(true);
       expect(Object.isFrozen(descriptor.allowed_roles)).toBe(true);
+      if (descriptor.allowed_origins) expect(Object.isFrozen(descriptor.allowed_origins)).toBe(true);
       expect(Object.isFrozen(descriptor.credential_scope)).toBe(true);
       expect(Object.isFrozen(descriptor.egress)).toBe(true);
       expect(Object.isFrozen(descriptor.proof_kinds)).toBe(true);
@@ -797,6 +800,7 @@ describe("controller capability decision", () => {
       "identity_mismatch",
       "turn_missing",
       "role_denied",
+      "origin_denied",
       "scope_denied",
       "approval_invalid",
       "credential_scope_denied",
@@ -824,6 +828,13 @@ describe("controller capability decision", () => {
       .toEqual({ outcome: "denied", code: "role_denied" });
   });
 
+  it("denies a system-origin turn when the capability is owner-only", () => {
+    expect(decideControllerCapability(
+      authorityWith({ turnOrigin: "system" }),
+      EXPECTED_CAPABILITIES.telegram_agent_add_reference,
+    )).toEqual({ outcome: "denied", code: "origin_denied" });
+  });
+
   it.each(["missing", "stale"] as const)("denies %s approval", (approval) => {
     expect(decideControllerCapability(authorityWith({ approval }), descriptor))
       .toEqual({ outcome: "denied", code: "approval_invalid" });
@@ -846,6 +857,18 @@ describe("controller capability decision", () => {
   ] as const)("preserves adjacent denial precedence: %s", (_label, overrides, code) => {
     expect(decideControllerCapability(authorityWith(overrides), descriptor))
       .toEqual({ outcome: "denied", code });
+  });
+
+  it("checks role before origin and origin before scope for owner-only capabilities", () => {
+    const ownerOnly = EXPECTED_CAPABILITIES.telegram_agent_add_reference;
+    expect(decideControllerCapability(
+      authorityWith({ role: "worker", turnOrigin: "system" }),
+      ownerOnly,
+    )).toEqual({ outcome: "denied", code: "role_denied" });
+    expect(decideControllerCapability(
+      authorityWith({ turnOrigin: "system", scopeMatches: false }),
+      ownerOnly,
+    )).toEqual({ outcome: "denied", code: "origin_denied" });
   });
 
   it("allows only respond after finalization without bypassing earlier denial", () => {

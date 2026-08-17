@@ -4,9 +4,8 @@
  * The shape here follows from one fact: a 300 page product requirements
  * document does not fit in any context window, and pretending otherwise
  * produces an agent that confidently misses whole sections. So a document
- * becomes two things. A *structural map*, small enough to carry whenever the
- * document is in scope, which says what exists. And *passages*, retrieved on
- * demand, which say what it actually reads.
+ * becomes two things. A bounded *structural map* that says what exists, and
+ * *passages*, retrieved on demand, which say what it actually reads.
  *
  * Retrieval alone is not enough, because retrieval only finds what someone
  * thought to search for. The map is what lets an agent know a section on
@@ -241,6 +240,44 @@ function tinyOmission(count: number, budget: number): string {
   return "…".slice(0, budget);
 }
 
+function compactIdentity(label: string, width: number): string {
+  if (label.length <= width) return label;
+  if (width <= 0) return "";
+  if (width === 1) return "…";
+  const suffixWidth = Math.min(5, Math.max(1, Math.floor((width - 1) / 3)));
+  const prefixWidth = width - suffixWidth - 1;
+  return `${label.slice(0, prefixWidth)}…${label.slice(-suffixWidth)}`;
+}
+
+/** Fairly compresses every top-level identity instead of preserving only a prefix. */
+function renderCompactTopLevel(
+  entries: readonly ReferenceMapEntry[],
+  omitted: number,
+  budget: number,
+): string {
+  if (entries.length === 0 || budget <= 0) return "";
+  const omission = omitted > 0 ? tinyOmission(omitted, budget) : "";
+  const omissionCharacters = omission.length > 0 ? omission.length + 1 : 0;
+  const available = budget - omissionCharacters;
+  if (available <= 0) return tinyOmission(entries.length + omitted, budget);
+  const labels = entries.map((entry) =>
+    entry.path.length === 0 ? "(document preface)" : entry.path.at(-1)!);
+  const complete = labels.join("\n");
+  if (complete.length <= available) {
+    return omission.length > 0 ? `${complete}\n${omission}` : complete;
+  }
+  const separatorCharacters = entries.length - 1;
+  const labelCharacters = available - separatorCharacters;
+  if (labelCharacters < entries.length) return tinyOmission(entries.length + omitted, budget);
+  const baseWidth = Math.floor(labelCharacters / entries.length);
+  let remainder = labelCharacters % entries.length;
+  const compact = entries.map((entry, index) => {
+    const width = baseWidth + (remainder-- > 0 ? 1 : 0);
+    return compactIdentity(labels[index]!, width);
+  }).join("\n");
+  return omission.length > 0 ? `${compact}\n${omission}` : compact;
+}
+
 function renderSelection(
   selected: readonly ReferenceMapEntry[],
   omitted: number,
@@ -268,9 +305,5 @@ export function renderReferenceMap(
     if (rendered.length <= budget) return rendered;
   }
   const topLevel = entries.filter((entry) => entry.level <= 1);
-  for (let kept = topLevel.length; kept >= 0; kept -= 1) {
-    const rendered = renderSelection(topLevel.slice(0, kept), entries.length - kept);
-    if (rendered.length <= budget) return rendered;
-  }
-  return tinyOmission(entries.length, budget);
+  return renderCompactTopLevel(topLevel, entries.length - topLevel.length, budget);
 }

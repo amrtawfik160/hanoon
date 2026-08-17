@@ -45,9 +45,10 @@ scoped either to one project or to every project. It is a source to be consulted
 never an instruction to be followed.
 _Avoid_: Uploaded file, attachment, knowledge base
 
-**Structural map**: The heading tree of a reference document with a one-line
-summary per section. Small enough to be present in full whenever the document is
-in scope, so the agent always knows what exists before it knows what it says.
+**Structural map**: A bounded heading tree with each section's full path and
+character count. It keeps every top-level heading when they fit and names
+omitted structure under tighter limits, so the agent can discover what exists
+before retrieving the text.
 _Avoid_: Summary, table of contents
 
 **Passage**: One retrievable chunk of a reference document's body, carrying its
@@ -77,21 +78,27 @@ _Avoid_: Persona, character, prompt
 The owner sends a voice note instead of typing. Nothing else changes.
 
 - Ingress accepts Telegram `voice` and `audio` messages through the same durable
-  claim path as text and images. No BB session starts before the update is
-  claimed.
-- The file is downloaded with the existing client under a size cap. Our current
-  caps are 10 MB for still images and 20 MB for motion media
-  (`MAX_CONTROLLER_IMAGE_BYTES`, `MAX_CONTROLLER_VIDEO_BYTES`), and a voice note
-  sits far below either. Audio needs its own cap in the same place.
-- Transcription is `bb voice transcribe <file> --type <mime> --json`, run on the
-  executor's machine. BB owns the voice service; we own none of it and require
-  no key.
-- The transcript becomes the message text for that turn. A caption, when present,
-  is appended rather than replaced.
-- When BB has no voice service configured, the owner is told plainly, in the same
-  shape as the existing oversized-image message. Never a silent drop.
-- The audio is not kept once transcribed. The transcript is what enters the
-  durable record and the conversation digest.
+  claim path as text and images. It atomically reserves the controller message
+  order, writes a voice-inbox row, and acknowledges the Telegram update before
+  any download or transcription begins.
+- A separate background service leases voice rows and runs `bb voice transcribe
+  <file> --type <mime> --json`. Download is capped at 20 MB and transcription is
+  refused beyond 20 minutes. BB owns the voice service; we own none of it and
+  require no key.
+- Later text updates can be ingested immediately, but their controller turns
+  cannot dispatch ahead of an earlier pending voice reservation. A successful
+  transcript occupies its reserved ordinal.
+- The transcript becomes the message text for that turn. A caption, when
+  present, leads the transcript rather than being replaced by it.
+- Unavailable service, unreadable audio, silence, oversized recordings, and
+  transcripts over 4,000 UTF-16 code units produce distinct durable outbox
+  notices. A settled notice is not emitted again on replay.
+- Shutdown aborts the in-flight download or transcription and leaves the leased
+  row recoverable after expiry. A replacement worker resumes it without holding
+  the Telegram cursor or losing later updates.
+- Audio bytes are never persisted. The durable handoff retains bounded Telegram
+  file metadata and its terminal outcome; only the transcript enters the
+  controller turn and conversation digest.
 
 The transcript is the owner's message, not evidence about the world, so this
 introduces no proof kind.
@@ -106,9 +113,9 @@ to know and work against for the life of that project.
 A document that size cannot be held in context, and any design that implies
 otherwise is lying. So it is built in two layers:
 
-- The **structural map** is always available when the document is in scope. It is
-  how the agent knows a section on billing exists, and roughly what it says,
-  before reading a word of it.
+- The **structural map** is budgeted into every worker briefing when at least one
+  document identity and map can fit. It shows heading paths and character
+  counts, not summaries, and marks omitted structure under tighter limits.
 - **Passages** are retrieved on demand underneath.
 
 Retrieval alone produces an agent that misses what it was never prompted to look
@@ -175,8 +182,9 @@ leverage, planning and critique first, review second, implementation last.
 Workers are BB threads that deliberately never open the plugin database, so:
 
 - The **structural map** for the job's project is included in every stage prompt.
-  It is bounded, and when it exceeds budget it is truncated by depth so the
-  top-level shape always survives. Never tail-cut.
+  It is bounded and drops deeper sections before compressing top-level labels.
+  Every top-level identity survives when the budget can hold them; tighter
+  limits carry an explicit omission marker rather than appearing complete.
 - **Search** is a new read-only CLI, `bb telegram-agent reference search
   "<query>"` and `bb telegram-agent reference show <id>`, returning ranked
   passages with section paths and ids. Read-only, no mutation, one source of
@@ -320,9 +328,10 @@ under time pressure.
   including jobs that never touch the spec. Rendering now enforces one hard
   budget across headings, paths, character counts, instructions, and omission
   notices; field evidence should still guide future budget changes.
-- **A stalled job.** The conflict ask can leave a stage waiting indefinitely.
-  What happens after hours of no reply is unresolved and needs deciding during
-  implementation.
+- **A stalled job.** A specification conflict durably blocks the exact worker on
+  a BB owner-question interaction and resumes it after the answer, including
+  across restart. There is intentionally no timeout that guesses an answer, so
+  an owner who never responds can leave that stage waiting indefinitely.
 - **PDF reading is unproven.** The controller can be a Claude or a gpt model and
   they do not read files identically. If neither reads PDF well enough, the
   choice is a system dependency or a narrower format list, and that decision
@@ -348,11 +357,14 @@ under time pressure.
    accepted values are never silently truncated. Delivery floors are asserted
    at module load, so a future conduct edit cannot squeeze out the owner's
    working style unnoticed.
-3. **Voice notes in.** Telegram `voice` and `audio` through
-   `bb voice transcribe`, no new key and no new dependency. Unavailable service,
-   unreadable audio, silence, and size failures produce distinct owner notices;
-   shutdown cancels in-flight work without sending a stale notice. A stranger's
-   recording is never transcribed.
+3. **Voice notes in.** Telegram `voice` and `audio` are atomically handed from
+   serial intake to a leased background worker before the cursor advances.
+   `bb voice transcribe` needs no new key or dependency. Later messages are
+   ingested without waiting but cannot dispatch ahead of the reserved voice
+   ordinal. Unavailable service, unreadable audio, silence, size failures, and
+   overlong transcripts produce durable owner notices; shutdown leaves work
+   recoverable without sending a stale notice. A stranger's recording is never
+   transcribed, and audio bytes are never persisted.
 4. **Reference documents.** Parsing, branch-safe chunking and the structural map;
    full H1-H6 paths, document preambles, section character counts, and honest
    hard-budget omission notices; a

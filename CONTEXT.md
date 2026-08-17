@@ -120,7 +120,7 @@ A specification the owner gives Hanoon to consult, scoped to one project or glob
 _Avoid_: Uploaded file, attachment, knowledge base
 
 **Structural map**:
-A bounded heading tree with each section's path and one-line summary, used to show agents what a reference document contains before retrieving its body.
+A bounded heading tree with each section's full path and character count, used to show agents what a reference document contains before retrieving its body. It keeps every top-level heading when they fit; under an extreme limit it names omitted structure explicitly.
 _Avoid_: Summary, table of contents
 
 **Passage**:

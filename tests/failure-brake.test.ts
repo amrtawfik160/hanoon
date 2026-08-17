@@ -39,6 +39,40 @@ function notices(store: TelegramAgentStore) {
   return store.listControllerTurns(CONTROLLER_KEY, 20).filter((turn) => turn.origin === "system");
 }
 
+function submitControllerTurn(store: TelegramAgentStore) {
+  const lease = store.acquireExecutorLease("failure-brake-controller", NOW, 30_000);
+  if (!lease.acquired) throw new Error("controller lease was not acquired");
+  const turn = store.claimNextControllerTurn({
+    ownerId: "failure-brake-controller",
+    generation: lease.generation,
+    now: NOW,
+  });
+  if (!turn) throw new Error("controller turn was not claimed");
+  expect(store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: "failure-brake-controller",
+    generation: lease.generation,
+    now: NOW,
+    projectId: "proj_a",
+    hostId: "host_a",
+    threadId: "thr_controller",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: "failure-brake-controller",
+    generation: lease.generation,
+    now: NOW,
+  })).toBe(true);
+  return {
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    ownerId: "failure-brake-controller",
+    generation: lease.generation,
+    now: NOW,
+    expectedThreadId: "thr_controller",
+  };
+}
+
 it("does nothing when no failure is repeating", () => {
   const store = fixture();
   expect(service(store, () => NOW).processDue()).toBe(false);
@@ -168,6 +202,67 @@ it("does not re-stamp a pause that is already in force", () => {
     projectId: "proj_a", reason: "second", fingerprint: null, now: NOW + 5_000,
   })).toBe(false);
   expect(store.listPausedProjectAdmissions()[0]).toMatchObject({ reason: "first", pausedAt: NOW });
+});
+
+it("retains an agent clear so the same failure cannot be cleared twice", () => {
+  const store = fixture();
+  const fence = submitControllerTurn(store);
+  const fingerprint = failureFingerprint("proj_a", REASON);
+  store.pauseProjectAdmission({ projectId: "proj_a", reason: REASON, fingerprint, now: NOW });
+
+  expect(store.clearProjectAdmissionPauseAsAgent({ projectId: "proj_a", ...fence })).toEqual({
+    outcome: "cleared",
+  });
+  expect(store.pauseProjectAdmission({
+    projectId: "proj_a",
+    reason: REASON,
+    fingerprint,
+    now: NOW + 1,
+  })).toBe(true);
+  expect(store.clearProjectAdmissionPauseAsAgent({
+    projectId: "proj_a",
+    ...fence,
+    now: NOW + 2,
+  })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/already been cleared/i) });
+  expect(store.listPausedProjectAdmissions()).toHaveLength(1);
+});
+
+it("retains an owner clear so the same failure cannot later be cleared by the agent", () => {
+  const store = fixture();
+  const fence = submitControllerTurn(store);
+  const fingerprint = failureFingerprint("proj_a", REASON);
+  store.pauseProjectAdmission({ projectId: "proj_a", reason: REASON, fingerprint, now: NOW });
+
+  expect(store.clearProjectAdmissionPause({ projectId: "proj_a", now: NOW + 1 })).toBe(1);
+  expect(store.pauseProjectAdmission({
+    projectId: "proj_a",
+    reason: REASON,
+    fingerprint,
+    now: NOW + 2,
+  })).toBe(true);
+
+  expect(store.clearProjectAdmissionPauseAsAgent({
+    projectId: "proj_a",
+    ...fence,
+    now: NOW + 3,
+  })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/already been cleared/i) });
+  expect(store.listPausedProjectAdmissions()).toHaveLength(1);
+});
+
+it("does not clear a brake after the controller fence is lost", () => {
+  const store = fixture();
+  const fence = submitControllerTurn(store);
+  store.pauseProjectAdmission({
+    projectId: "proj_a",
+    reason: REASON,
+    fingerprint: failureFingerprint("proj_a", `${REASON}:new`),
+    now: NOW,
+  });
+  expect(store.releaseExecutorLease(fence.ownerId, fence.generation, NOW)).toBe(true);
+
+  expect(store.clearProjectAdmissionPauseAsAgent({ ...fence, projectId: "proj_a" }))
+    .toMatchObject({ outcome: "refused", reason: expect.stringMatching(/controller.*current|fence/i) });
+  expect(store.listPausedProjectAdmissions()).toHaveLength(1);
 });
 
 it("refuses to start new work on a paused project but not on the others", () => {

@@ -109,9 +109,9 @@ Two settings govern what the agent does when you have not asked it anything:
 | Setting | Options | Default | Purpose |
 | --- | --- | --- | --- |
 | Background learning model | `inherit` or any controller model | `inherit` | Model used to learn lessons from finished jobs. `inherit` leaves it to the project default, which is the only safe answer when the installation's providers are unknown; naming a cheaper model keeps background work off your conversational tier. |
-| Self-maintenance | `enabled`, `disabled` | `enabled` | Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard. |
+| Self-maintenance | `enabled`, `disabled` | `enabled` | Enables the agent's daily stale-work monitor, daily read-only repository audits, bounded deletion of old allowlisted plugin temporary directories, weekly memory audit, and weekly scorecard. |
 
-Turning self-maintenance off stops the agent installing its own monitors. It does not touch monitors you set yourself, and it does not stop the agent learning from finished jobs.
+Turning self-maintenance off retires the agent's own monitors, disables its repository audits, and prevents temporary-directory deletion. It does not touch monitors you set yourself, stop disk-pressure checks and warnings, or stop the agent learning from finished jobs. Repository audits inspect documentation staleness, debt markers, bug backlogs, and unresolved pull-request review findings through read-only Git and provider commands. Temporary cleanup is limited to old top-level entries whose names match the plugin's allowlist, and each daily pass has a deletion cap.
 
 The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
 
@@ -163,7 +163,7 @@ How the agent should behave — terser answers, always leading with the pull-req
 
 The limits that remain are the ones the owner can actually see and answer:
 
-- merging a pull request and promoting to production run through the job pipeline and need a Telegram approval: a one-use approval every time, unless the owner has granted that project a standing approval (see [Standing merge approval](#standing-merge-approval));
+- merging a pull request and promoting to production run through the job pipeline and need a Telegram approval: a one-use approval from the approval button or an unambiguous owner-origin merge instruction, unless the owner has granted that project a standing approval (see [Standing merge approval](#standing-merge-approval));
 - installing or connecting an integration, changing a credential, spending money, a destructive external action, or an irreversible external write are asked about in the chat first;
 - credential-shaped text is refused before it can be stored as a memory;
 - a permission prompt BB does raise for the hidden controller is bridged into Telegram as *Allow once* / *Deny*, so choosing `auto` or `accept-edits` no longer means waiting on a dead end.
@@ -372,13 +372,13 @@ On detecting a loop he stops admitting **new** jobs for that project, tells the 
 - other projects are unaffected;
 - the same cause is not escalated again for a week, so a fault the owner is already deciding about does not message them hourly.
 
-Restarting is always the owner's call, because nothing about time passing fixes a repeated failure. `/resume` lists what is paused, `/resume <alias>` starts one project, and `/resume all` starts every one. `/health` names any paused project.
+The controller may clear a fingerprinted cause once after investigating it. Every clear is retained in immutable history, including an owner `/resume`; if that cause trips the brake again, the controller refuses to clear it and leaves the decision to the owner. A pause without a durable fingerprint is also owner-only. `/resume` lists what is paused, `/resume <alias>` starts one project, and `/resume all` starts every one. `/health` names any paused project.
 
 If the pause list cannot be read, no work is admitted that tick — an unreadable list must never look like "nothing is paused".
 
 ## Standing merge approval
 
-By default the plugin asks for a one-use approval before every merge. The approval message also offers **Merge + deploy, and always from now on**, which approves that merge and records a standing approval for that project. Afterwards the plugin merges, deploys, and runs the canary without asking.
+By default the plugin asks for a one-use approval before every merge. The owner can give it with the approval button or by sending an unambiguous merge instruction for the waiting job. Either form only queues the guarded merge pipeline; it does not mean the provider merge has already landed. The approval message also offers **Merge + deploy, and always from now on**, which approves that merge and records a standing approval for that project. Afterwards the plugin merges, deploys, and runs the canary without asking.
 
 A standing approval replaces the owner's signature only. Every check that produced the merge candidate still runs, and the plugin falls back to asking when:
 
@@ -388,7 +388,7 @@ A standing approval replaces the owner's signature only. Every check that produc
 
 The standing approval is withdrawn automatically when production fails and the rollback either was not configured or failed — recovery is exhausted, so nothing merges unattended there again until the owner re-grants it. A rollback that succeeded is a recovery, not an incident, and the standing approval survives it.
 
-Granting is only ever a button tap, so it cannot be produced by the agent misreading a sentence. Withdrawing is available by name:
+Granting a standing approval is only ever a button tap. An owner-origin sentence can grant one-use authority for its named job, but system turns and agent-generated text cannot grant either form. Withdrawing standing approval is available by name:
 
 - `/approvals` lists the projects that merge without asking;
 - `/approvals off <alias>` withdraws one;

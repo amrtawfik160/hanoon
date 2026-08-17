@@ -69,6 +69,7 @@ import {
   type ReviewHandlerCompletion,
 } from "./services/review-handler";
 import { runTelegramService } from "./services/telegram-service";
+import { ControllerVoiceService } from "./services/controller-voice-service";
 import {
   classifyThreadRecovery,
   projectUnknownWorker,
@@ -81,6 +82,7 @@ import { ExecutorNudge } from "./services/executor-nudge";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
 import { MAX_CONTROLLER_IDENTITY } from "./controller/instructions";
 import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
+import { parseWorkerThreadTitle } from "./agent-skills/role-resolver";
 import {
   BbControllerAdapter,
   ControllerImagePreparationError,
@@ -377,7 +379,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     systemUpkeep: {
       type: "select",
       label: "Self-maintenance",
-      description: "Lets the agent run its own daily stale-work sweep, weekly memory audit, and weekly scorecard, and message you when something needs a decision. Turning this off does not touch monitors you set yourself.",
+      description: "Lets the agent run its own stale-work, memory, and scorecard monitors, daily read-only repository audits, and bounded deletion of old allowlisted temporary directories. It messages you when something needs a decision. Turning this off does not touch monitors you set yourself or suppress disk-pressure warnings.",
       options: ["enabled", "disabled"],
       default: "enabled",
     },
@@ -493,6 +495,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   });
   const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()), store);
   const executorNudge = new ExecutorNudge();
+  const voiceNudge = new ExecutorNudge();
   const laneSnapshots = new JobLaneSnapshotProvider();
 
   const reportActivationProblem = (activation: ActivationHealth | null): void => {
@@ -1006,8 +1009,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     store,
     telegram: telegramTransport,
     mergeHandler,
-    onWorkAvailable: () => executorNudge.notify(),
+    onWorkAvailable: () => {
+      executorNudge.notify();
+      voiceNudge.notify();
+    },
     health,
+  });
+  const controllerVoice = new ControllerVoiceService({
+    store,
     voice: {
       download: (fileId, maxBytes, signal) => {
         if (!config.ok) throw new Error(config.message);
@@ -1015,6 +1024,10 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       },
       transcribe: transcribeWithBb,
     },
+    clock: { now: clock },
+    onWorkAvailable: () => executorNudge.notify(),
+    waitForWork: (milliseconds, signal) => voiceNudge.wait(milliseconds, signal),
+    warn: (message) => bb.log.warn(message),
   });
   const controllerAdapter = new BbControllerAdapter({
     sdk: bb.sdk,
@@ -1340,16 +1353,44 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   const threadNotices = new ThreadNoticeService({
     store,
     threads: {
-      listWatchable: async () => {
-        const threads = await bb.sdk.threads.list({ includeHidden: false, archived: false, limit: 100 });
-        return threads
-          .filter((thread) => thread.visibility === "visible" && thread.archivedAt === null && thread.deletedAt === null)
-          .map((thread) => ({
-            id: thread.id,
-            title: thread.title ?? thread.titleFallback ?? "Untitled thread",
-            status: thread.status,
-            parentThreadId: thread.parentThreadId,
-          }));
+      listWatchable: async (offset, limit) => {
+        // The notice service paginates the filtered list, while BB paginates
+        // the complete list. Fetching one BB page per notice page would let
+        // hidden, non-worker threads shift the offset and make later worker
+        // questions disappear. Build the requested filtered slice instead.
+        const watchable: Array<{
+          id: string;
+          title: string;
+          status: string;
+          parentThreadId: string | null;
+          hasPendingInteraction: boolean;
+        }> = [];
+        const sourcePageSize = 100;
+        let sourceOffset = 0;
+        while (watchable.length < offset + limit) {
+          const page = await bb.sdk.threads.list({
+            includeHidden: true,
+            archived: false,
+            limit: sourcePageSize,
+            offset: sourceOffset,
+          });
+          for (const thread of page) {
+            if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
+            const title = thread.title ?? thread.titleFallback ?? "Untitled thread";
+            const isPipelineWorker = parseWorkerThreadTitle(title) !== null;
+            if (thread.visibility !== "visible" && !isPipelineWorker) continue;
+            watchable.push({
+              id: thread.id,
+              title,
+              status: thread.status,
+              parentThreadId: thread.parentThreadId,
+              hasPendingInteraction: thread.hasPendingInteraction,
+            });
+          }
+          if (page.length < sourcePageSize) break;
+          sourceOffset += page.length;
+        }
+        return watchable.slice(offset, offset + limit);
       },
       interactions: async (threadId) => {
         const pending = await bb.sdk.threads.interactions.list({ threadId });
@@ -1612,6 +1653,19 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId) : current?.implementationThreadId);
     if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
+    let hasPendingInteraction = false;
+    try {
+      const interactions = await bb.sdk.threads.interactions.list({ threadId: resourceId, signal });
+      hasPendingInteraction = interactions.some((interaction) => interaction.status === "pending");
+    } catch (error) {
+      if (!fenceCurrent()) return;
+      bb.log.warn(`Worker interaction state could not be read for ${resourceId}: ${String(error)}`);
+      return;
+    }
+    // A worker waiting for an owner answer is alive even when its public
+    // thread status is idle. Leave it in place for ThreadNoticeService to
+    // route the question and for the next reconciliation after the answer.
+    if (hasPendingInteraction) return;
     const observedAt = clock();
     const projected = projectWorkerLiveness(store, current, thread, observedAt, workerKind, generation, {
       ownerId: fence.ownerId,
@@ -2004,6 +2058,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       },
       warn: (message) => bb.log.warn(message),
     }, signal),
+  });
+  bb.background.service("controller-voice", {
+    start: (signal) => controllerVoice.run(signal),
   });
   bb.background.service("capability-inventory", {
     start: (signal) => capabilityInventory.run(signal),

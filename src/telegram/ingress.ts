@@ -41,21 +41,7 @@ import { TelegramRequestError } from "./client";
 import { TelegramApiError } from "./errors";
 import { MAX_CONTROLLER_IMAGE_BYTES, isMotionMedia } from "../controller/models";
 import { captionlessPromptFor, clipTooLargeForDownload, controllerImageFromMessage } from "./image";
-import { withAbortDeadline } from "../async";
-import {
-  MAX_CONTROLLER_VOICE_BYTES,
-  controllerVoiceFromMessage,
-  voiceTooLargeToTranscribe,
-  voiceUnavailableNotice,
-  type ControllerVoiceNote,
-  type VoiceTranscription,
-  type VoiceTranscriber,
-} from "./voice";
-
-/** Telegram's own file endpoint; slow enough to bound, never slow for a note. */
-const VOICE_DOWNLOAD_TIMEOUT_MS = 30_000;
-/** A transcriber that has not answered by now is not going to. */
-const VOICE_TRANSCRIBE_TIMEOUT_MS = 120_000;
+import { controllerVoiceFromMessage } from "./voice";
 
 export type TelegramIngressTransport = {
   sendMessage(chatId: string, payload: SendMessagePayload): Promise<{ message_id: number }>;
@@ -90,15 +76,6 @@ export type TelegramIngressOptions = {
   mergeHandler?: Pick<MergeHandler, "handleApprovalCallback">;
   onWorkAvailable?: () => void;
   health?: (now: number) => HealthReport;
-  /**
-   * Absent means this install cannot hear a voice note, and the owner is told
-   * so rather than left with silence. Download and transcription are separate
-   * because only the second one depends on BB having a voice service.
-   */
-  voice?: {
-    download(fileId: string, maxBytes: number, signal: AbortSignal): Promise<Uint8Array>;
-    transcribe: VoiceTranscriber;
-  };
 };
 
 const PRIVATE_ID = /^[1-9][0-9]*$/;
@@ -215,7 +192,6 @@ export class TelegramIngress {
   private readonly mergeHandler: Pick<MergeHandler, "handleApprovalCallback"> | null;
   private readonly onWorkAvailable: () => void;
   private readonly health: ((now: number) => HealthReport) | null;
-  private readonly voice: TelegramIngressOptions["voice"] | null;
 
   public constructor(options: TelegramIngressOptions);
   public constructor(store: TelegramAgentStore, telegram: TelegramIngressTransport);
@@ -230,7 +206,6 @@ export class TelegramIngress {
       this.mergeHandler = optionsOrStore.mergeHandler ?? null;
       this.onWorkAvailable = optionsOrStore.onWorkAvailable ?? (() => undefined);
       this.health = optionsOrStore.health ?? null;
-      this.voice = optionsOrStore.voice ?? null;
     } else {
       if (!telegram) throw new TypeError("Telegram ingress requires a Telegram client");
       this.store = optionsOrStore;
@@ -239,7 +214,6 @@ export class TelegramIngress {
       this.mergeHandler = null;
       this.onWorkAvailable = () => undefined;
       this.health = null;
-      this.voice = null;
     }
   }
 
@@ -254,7 +228,7 @@ export class TelegramIngress {
     if (parsed.data.message) {
       // Only the answer path settles its own claim; every other message route
       // simply falls out, which is the ordinary "caller still owns it" case.
-      return await this.handleMessage(parsed.data.message, parsed.data.update_id, now, signal) ?? UPDATE_STILL_CLAIMED;
+      return await this.handleMessage(parsed.data.message, parsed.data.update_id, now) ?? UPDATE_STILL_CLAIMED;
     }
     if (parsed.data.callback_query) {
       await this.handleCallback(parsed.data.callback_query, parsed.data.update_id, now);
@@ -266,7 +240,6 @@ export class TelegramIngress {
     message: TelegramMessage,
     updateId: number,
     now: number,
-    signal: AbortSignal,
   ): Promise<TelegramIngressOutcome | void> {
     const identity = privateHumanIdentity(message.from, message.chat);
     const image = controllerImageFromMessage(message);
@@ -310,17 +283,24 @@ export class TelegramIngress {
       await this.sendPlain(identity.chatId, "That clip is larger than Telegram lets me download. Please send a shorter video, a GIF, or a few screenshots.");
       return;
     }
-    const spoken = voiceNote === null
-      ? undefined
-      : await this.transcribeVoiceNote(voiceNote, identity.chatId, signal);
-    if (voiceNote !== null && spoken === undefined) return;
-    // A caption sent alongside a recording is the owner narrowing what they
-    // meant, so it leads rather than being replaced by the transcript.
-    const said = spoken === undefined
-      ? text
-      : message.caption
-        ? `${message.caption}\n\n${spoken}`
-        : spoken;
+    if (voiceNote !== null) {
+      const controllerKey = stableControllerKey(identity.userId, identity.chatId);
+      this.store.queueControllerVoice({
+        updateId,
+        controllerKey,
+        telegramUserId: identity.userId,
+        telegramChatId: identity.chatId,
+        fileId: voiceNote.fileId,
+        mimeType: voiceNote.mimeType,
+        sizeBytes: voiceNote.sizeBytes,
+        durationSeconds: voiceNote.durationSeconds,
+        caption: message.caption?.trim() || null,
+        now,
+      });
+      this.onWorkAvailable();
+      return { updateSettled: true };
+    }
+    const said = text;
     if (said === undefined) return;
 
     const normalized = boundedText(said);
@@ -882,8 +862,9 @@ export class TelegramIngress {
 
   /**
    * `/resume` starts work again on a project the failure brake stopped.
-   * Restarting is always the owner's call: the brake trips because something
-   * kept failing, and nothing about time passing fixes that.
+   * This is the owner's manual override. The controller has a separate bounded
+   * path that may clear one fingerprint once, but it cannot manufacture this
+   * command or use it to erase the retained clear history.
    */
   private handleResumeCommand(argument: string | null, now: number): string {
     const paused = this.store.listPausedProjectAdmissions();
@@ -983,62 +964,6 @@ export class TelegramIngress {
 
   private async sendPlain(chatId: string, text: string): Promise<void> {
     await this.telegram.sendMessage(chatId, { text, disable_web_page_preview: true });
-  }
-
-  /**
-   * The owner's words, or undefined once they have been told why there are
-   * none. Every failure here is answered in the chat: a recording that vanishes
-   * silently is worse than one that cannot be read, because the owner has no
-   * way to tell the difference between ignored and unheard.
-   */
-  private async transcribeVoiceNote(
-    note: ControllerVoiceNote,
-    chatId: string,
-    signal: AbortSignal,
-  ): Promise<string | undefined> {
-    if (signal.aborted) return undefined;
-    if (!this.voice) {
-      await this.sendPlain(chatId, voiceUnavailableNotice("no_service"));
-      return undefined;
-    }
-    if (voiceTooLargeToTranscribe(note)) {
-      await this.sendPlain(chatId, voiceUnavailableNotice("too_large"));
-      return undefined;
-    }
-    const voice = this.voice;
-    let bytes: Uint8Array;
-    try {
-      bytes = await withAbortDeadline(
-        signal,
-        VOICE_DOWNLOAD_TIMEOUT_MS,
-        (signal) => voice.download(note.fileId, MAX_CONTROLLER_VOICE_BYTES, signal),
-      );
-    } catch {
-      if (signal.aborted) return undefined;
-      await this.sendPlain(chatId, voiceUnavailableNotice("unreadable"));
-      return undefined;
-    }
-    let transcript: VoiceTranscription;
-    try {
-      transcript = await withAbortDeadline(
-        signal,
-        VOICE_TRANSCRIBE_TIMEOUT_MS,
-        (signal) => voice.transcribe({ bytes, mimeType: note.mimeType, signal }),
-      );
-    } catch {
-      if (signal.aborted) return undefined;
-      transcript = { outcome: "failed" };
-    }
-    if (transcript.outcome !== "transcribed") {
-      const reason = transcript.outcome === "unavailable"
-        ? "no_service"
-        : transcript.outcome === "empty"
-          ? "empty"
-          : "unreadable";
-      await this.sendPlain(chatId, voiceUnavailableNotice(reason));
-      return undefined;
-    }
-    return transcript.text;
   }
 
   private setStatusMessageAndOutbox(

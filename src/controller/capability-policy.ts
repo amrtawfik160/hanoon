@@ -71,6 +71,7 @@ export type ControllerCapabilityDescriptor = Readonly<{
   idempotency: "read" | "tool_receipt" | "domain_effect" | "exact_entity_reconciliation";
   approval: "none" | "bb_interaction" | "hanoon_confirmation" | "pipeline_approval";
   allowed_roles: readonly ["controller"];
+  allowed_origins?: readonly ("owner" | "system")[];
   project_scope: "controller_global" | "current_project" | "exact_entity";
   credential_scope: Readonly<{
     credential: "none" | "bb" | "telegram" | "github" | "credential_broker";
@@ -89,6 +90,9 @@ function capability(
     ...descriptor,
     data_class: Object.freeze([...descriptor.data_class]),
     allowed_roles: Object.freeze([...descriptor.allowed_roles]) as readonly ["controller"],
+    ...(descriptor.allowed_origins
+      ? { allowed_origins: Object.freeze([...descriptor.allowed_origins]) }
+      : {}),
     credential_scope: Object.freeze({ ...descriptor.credential_scope }),
     egress: Object.freeze([...descriptor.egress]),
     proof_kinds: Object.freeze([...descriptor.proof_kinds]),
@@ -651,7 +655,7 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     project_scope: "controller_global",
     credential_scope: { credential: "none", audience: "none" },
     egress: ["none"],
-    proof_kinds: ["job_state", "external_mutation"],
+    proof_kinds: ["job_state"],
     receipt_kind: "tool_receipt",
     result_limit: 2_000,
   }),
@@ -687,6 +691,7 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     idempotency: "tool_receipt",
     approval: "none",
     allowed_roles: ["controller"],
+    allowed_origins: ["owner"],
     project_scope: "controller_global",
     credential_scope: { credential: "none", audience: "none" },
     egress: ["none"],
@@ -740,6 +745,7 @@ const APPROVAL_KINDS = new Set([
   "hanoon_confirmation",
   "pipeline_approval",
 ]);
+const TURN_ORIGINS = new Set(["owner", "system"]);
 const PROJECT_SCOPES = new Set(["controller_global", "current_project", "exact_entity"]);
 const CREDENTIAL_KINDS = new Set(["none", "bb", "telegram", "github", "credential_broker"]);
 const EGRESS_KINDS = new Set(["none", "bb", "telegram", "github", "credential_broker"]);
@@ -796,10 +802,14 @@ function validateArrays(
   if (allowedRoles.length !== 1 || allowedRoles[0] !== "controller") throwInvalidCapability(capabilityId, "allowed_roles");
   if (descriptor.egress.length === 0) throwInvalidCapability(capabilityId, "egress");
   for (const dataClass of descriptor.data_class) assertKnown(capabilityId, "data_class", dataClass, DATA_CLASSES);
+  for (const origin of descriptor.allowed_origins ?? []) {
+    assertKnown(capabilityId, "allowed_origins", origin, TURN_ORIGINS);
+  }
   for (const proofKind of descriptor.proof_kinds) assertKnown(capabilityId, "proof_kinds", proofKind, PROOF_KINDS);
   for (const egress of descriptor.egress) assertKnown(capabilityId, "egress", egress, EGRESS_KINDS);
   assertUnique(capabilityId, "data_class", descriptor.data_class);
   assertUnique(capabilityId, "allowed_roles", allowedRoles);
+  assertUnique(capabilityId, "allowed_origins", descriptor.allowed_origins ?? []);
   assertUnique(capabilityId, "egress", descriptor.egress);
   assertUnique(capabilityId, "proof_kinds", descriptor.proof_kinds);
 }
@@ -873,6 +883,7 @@ export const CONTROLLER_CAPABILITY_DENIAL_CODES = Object.freeze([
   "identity_mismatch",
   "turn_missing",
   "role_denied",
+  "origin_denied",
   "scope_denied",
   "approval_invalid",
   "credential_scope_denied",
@@ -888,6 +899,7 @@ export type ControllerCapabilityAuthority = Readonly<{
   currentTurn: boolean;
   turnFinalized: boolean;
   role: "controller" | "worker" | "unknown";
+  turnOrigin: "owner" | "system";
   contextMatches: boolean;
   scopeMatches: boolean;
   approval: "not_required" | "current" | "missing" | "stale";
@@ -904,6 +916,9 @@ export function decideControllerCapability(
   if (!authority.durableController || !authority.contextMatches) return { outcome: "denied", code: "identity_mismatch" };
   if (!authority.currentTurn) return { outcome: "denied", code: "turn_missing" };
   if (!descriptor.allowed_roles.includes(authority.role as "controller")) return { outcome: "denied", code: "role_denied" };
+  if (descriptor.allowed_origins && !descriptor.allowed_origins.includes(authority.turnOrigin)) {
+    return { outcome: "denied", code: "origin_denied" };
+  }
   if (!authority.scopeMatches) return { outcome: "denied", code: "scope_denied" };
   if (authority.approval === "missing" || authority.approval === "stale") return { outcome: "denied", code: "approval_invalid" };
   if (!authority.credentialAudienceMatches) return { outcome: "denied", code: "credential_scope_denied" };

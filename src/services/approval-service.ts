@@ -7,6 +7,7 @@ import type {
   ApprovalIdentity,
   ApprovalRecord,
   ApprovalState,
+  ControllerMutationFence,
   ExecutorFence,
   TelegramAgentStore,
 } from "../storage/store";
@@ -119,6 +120,7 @@ export class ApprovalService {
     effect: JobEffect,
     now = this.clock(),
     identity?: ApprovalIdentity,
+    controllerFence?: ControllerMutationFence,
   ): ApprovalAcceptResult {
     assertNow(now);
     return this.store.acceptApprovalAndEnqueueMerge({
@@ -127,6 +129,7 @@ export class ApprovalService {
       effect,
       now,
       identity,
+      controllerFence,
     });
   }
 

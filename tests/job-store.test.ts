@@ -335,7 +335,10 @@ it("requeues a released review-limit block without a global active-job rejection
     state: "queued",
     resumeEvent: "CONTINUE_REVIEW",
   } });
-  expect(store.requeueReviewAdmission(blocked.id, selected.version, 1_300)).toEqual(requeued);
+  expect(store.requeueReviewAdmission(blocked.id, selected.version, 1_300)).toEqual({
+    ...requeued,
+    outcome: "already_queued",
+  });
   expect(store.getJob(blocked.id)?.state).toBe("blocked");
   expect(store.getJob(active.id)?.state).toBe("awaiting_project");
 });
@@ -390,7 +393,10 @@ it("requeues a released failed job and resumes it only after capacity is reacqui
     job: { state: "failed" },
     admission: { state: "queued", resumeEvent: "RETRY" },
   });
-  expect(store.retryFailedJob(failed.id, failed.version, 1_450)).toEqual(scheduled);
+  expect(store.retryFailedJob(failed.id, failed.version, 1_450)).toEqual({
+    ...scheduled,
+    outcome: "already_queued",
+  });
   const lease = store.acquireExecutorLease("retry-admitter", 1_500, 30_000);
   if (!lease.acquired) throw new Error("retry admission lease was not acquired");
   const admitted = store.tryAdmit({

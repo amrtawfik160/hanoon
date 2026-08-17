@@ -252,8 +252,8 @@ Important recovery behavior:
 - Permanent Telegram 4xx responses are dead-lettered; retryable 429/5xx failures use bounded retry accounting.
 - Restart recovery does not issue a second merge, deploy, or canary for a completed receipt.
 - A merge call with an unknown provider outcome keeps its repository and production claims held until authoritative reconciliation; capacity is not guessed free.
-- A project paused by the failure brake admits no new jobs until `/resume`; in-flight work finishes and queued jobs stay queued.
-- Every merge still requires current review/validation evidence and a Telegram approval, regardless of available capacity: the exact unexpired one-use approval, or a standing approval the owner granted that project.
+- A project paused by the failure brake admits no new jobs; in-flight work finishes and queued jobs stay queued. The controller may clear a fingerprinted cause once. A repeated cause, an un-fingerprinted pause, or any desired manual override waits for `/resume`.
+- Every merge still requires current review/validation evidence and a Telegram approval, regardless of available capacity: the exact unexpired one-use approval from a button or owner-origin merge instruction, or a standing approval the owner granted that project by button.
 
 ## Production failures
 

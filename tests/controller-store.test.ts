@@ -200,10 +200,12 @@ function expectDuplicateGenerationRepair(
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(68);
+  expect(ALL_MIGRATIONS).toHaveLength(70);
   expect(ALL_MIGRATIONS[65]).toContain("CREATE TABLE reference_documents");
   expect(ALL_MIGRATIONS[66]).toContain("thread_interactions ADD COLUMN controller_key");
   expect(ALL_MIGRATIONS[67]).toContain("CREATE TABLE reference_section_digests");
+  expect(ALL_MIGRATIONS[68]).toContain("CREATE TABLE project_admission_pause_clear_history");
+  expect(ALL_MIGRATIONS[69]).toContain("CREATE TABLE controller_voice_inbox");
   expect(ALL_MIGRATIONS[60]).toContain("CREATE TABLE stage_executions");
   expect(ALL_MIGRATIONS[42]).toContain("CREATE TABLE merge_authority");
   expect(ALL_MIGRATIONS[43]).toContain("CREATE TABLE regression_watch");
@@ -648,6 +650,37 @@ it("fences controller mutations against a stale executor generation", () => {
     threadId: "thr_stale",
   })).toBe(false);
   expect(store.getControllerForOwner("7", "7")?.threadId).toBeNull();
+});
+
+it("rolls back a controller-owned write when its exact turn fence is stale", () => {
+  const { store } = fixture();
+  const turn = store.enqueueControllerTurn(turnInput(302));
+  const fence = acquire(store);
+  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.markControllerSpawned({
+    ...fence,
+    turnId: turn.id,
+    projectId: "proj_personal",
+    hostId: "host_personal",
+    threadId: "thr_controller",
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
+  expect(store.releaseExecutorLease(fence.ownerId, fence.generation, fence.now)).toBe(true);
+
+  expect(store.runControllerMutation({
+    ...fence,
+    turnId: turn.id,
+    controllerKey: turn.controllerKey,
+    expectedThreadId: "thr_controller",
+  }, (now) => store.rememberMemory({
+    scope: "owner",
+    kind: "fact",
+    subject: "stale write",
+    body: "must roll back",
+    source: "agent",
+    now,
+  }))).toEqual({ outcome: "stale" });
+  expect(store.countMemories("owner")).toBe(0);
 });
 
 it("requeues a stale claim that never persisted dispatch intent", () => {

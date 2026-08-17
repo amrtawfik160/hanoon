@@ -171,9 +171,9 @@ export async function runTelegramService(deps: TelegramServiceDeps, signal: Abor
       if (claim === "processed") continue;
       try {
         const outcome = await deps.ingress.handleClaimed(update, deps.clock.now(), serviceSignal);
-        // Shutdown may cancel a long voice download or transcription. Leave
-        // that claim recoverable instead of acknowledging an owner message
-        // that produced neither a turn nor a notice.
+        // Shutdown can interrupt any ingress route. Leave that claim
+        // recoverable instead of acknowledging an owner message that produced
+        // neither durable work nor a durable response.
         if (serviceSignal.aborted) return;
         // An answer already settled this claim in the same commit as the answer
         // itself; completing it again would only fail on a claim it no longer holds.

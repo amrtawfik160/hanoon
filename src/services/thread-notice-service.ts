@@ -42,6 +42,8 @@ export type WatchedThread = {
   title: string;
   status: string;
   parentThreadId: string | null;
+  /** BB can leave a question open while the public status is idle. */
+  hasPendingInteraction?: boolean;
 };
 
 export type PendingThreadInteraction = {
@@ -131,7 +133,12 @@ export class ThreadNoticeService {
     for (const thread of threads) {
       // Pipeline workers already have a job status card. Announcing their
       // internal titles as "finished" is noise the owner cannot act on.
-      if (parseWorkerThreadTitle(thread.title) !== null) continue;
+      if (parseWorkerThreadTitle(thread.title) !== null) {
+        if (BLOCKABLE_STATUSES.has(thread.status) || thread.hasPendingInteraction === true) {
+          didWork = await this.checkBlocked(thread, owner.chatId) || didWork;
+        }
+        continue;
+      }
       // A sub-agent's thread is the parent's business, not the owner's; they
       // asked to hear about the work they started, not each step inside it. A
       // thread the controller started is the exception, because the controller

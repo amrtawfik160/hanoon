@@ -4,6 +4,7 @@ import { expect, it, vi } from "vitest";
 import { TelegramIngress } from "../src/telegram/ingress";
 import type { SendMessagePayload, TelegramUpdate } from "../src/telegram/types";
 import { openStore } from "../src/storage/store";
+import { ControllerVoiceService } from "../src/services/controller-voice-service";
 import {
   MAX_CONTROLLER_VOICE_SECONDS,
   controllerVoiceFromMessage,
@@ -54,7 +55,7 @@ function voiceUpdate(
 
 function fixture(options: {
   transcribe?: (input: { bytes: Uint8Array; mimeType: string; signal: AbortSignal }) => Promise<VoiceTranscription>;
-  download?: () => Promise<Uint8Array>;
+  download?: (fileId: string, maxBytes: number, signal: AbortSignal) => Promise<Uint8Array>;
   withVoiceService?: boolean;
 } = {}) {
   const { bb } = createFakePluginHost({ pluginId: `telegram-voice-${fixtureNumber++}` });
@@ -64,6 +65,7 @@ function fixture(options: {
     "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, ?, ?, ?, NULL)",
   ).run("7", "70", 1_000);
   const telegram = new FakeTelegram();
+  let now = 2_000;
   const download = vi.fn(options.download ?? (async () => new Uint8Array([1, 2, 3])));
   const transcribe = vi.fn(options.transcribe ?? (async () => ({
     outcome: "transcribed" as const,
@@ -72,12 +74,42 @@ function fixture(options: {
   const ingress = new TelegramIngress({
     store,
     telegram,
-    ...(options.withVoiceService === false ? {} : { voice: { download, transcribe } }),
+  });
+  const voice = options.withVoiceService === false ? null : { download, transcribe };
+  const voiceService = new ControllerVoiceService({
+    store,
+    voice,
+    clock: { now: () => now },
+    ownerId: `voice-worker-${fixtureNumber}`,
   });
   const turnTexts = (): string[] =>
     (db.prepare("SELECT input_text FROM controller_turns ORDER BY ordinal").all() as Array<{ input_text: string }>)
       .map((row) => row.input_text);
-  return { ingress, store, telegram, db, download, transcribe, turnTexts };
+  const noticeTexts = (): string[] => store.listOutbox(100)
+    .filter((item) => item.logicalKey.startsWith("controller-voice:"))
+    .map((item) => String(item.payload.text ?? ""));
+  const ingest = async (update: TelegramUpdate, at = now, signal?: AbortSignal) => {
+    now = at;
+    expect(store.beginTelegramUpdate(update.update_id, at)).toBe("process");
+    return ingress.handleClaimed(update, at, signal);
+  };
+  const processOne = async (signal = new AbortController().signal) => voiceService.processOne(signal);
+  const setNow = (value: number): void => { now = value; };
+  return {
+    ingress,
+    voiceService,
+    voice,
+    store,
+    telegram,
+    db,
+    download,
+    transcribe,
+    turnTexts,
+    noticeTexts,
+    ingest,
+    processOne,
+    setNow,
+  };
 }
 
 const NOTE: ControllerVoiceNote = {
@@ -136,7 +168,7 @@ it("takes only the transcript text, and nothing from malformed output", () => {
 });
 
 it("names a next step in every notice, because the owner cannot leave this chat", () => {
-  for (const reason of ["too_large", "no_service", "empty", "unreadable"] as const) {
+  for (const reason of ["too_large", "transcript_too_long", "no_service", "empty", "unreadable"] as const) {
     expect(voiceUnavailableNotice(reason)).toMatch(/type it|send it again|send a shorter|try again/i);
   }
 });
@@ -144,24 +176,54 @@ it("names a next step in every notice, because the owner cannot leave this chat"
 it("turns a voice note into the turn the owner would have typed", async () => {
   const test = fixture();
 
-  await test.ingress.handleClaimed(
+  await test.ingest(
     voiceUpdate(10, { file_id: "v1", file_unique_id: "u1", duration: 4, mime_type: "audio/ogg" }),
-    2_000,
   );
+  await test.processOne();
 
   expect(test.download).toHaveBeenCalledWith("v1", expect.any(Number), expect.any(AbortSignal));
   expect(test.transcribe).toHaveBeenCalledWith(expect.objectContaining({ mimeType: "audio/ogg" }));
   expect(test.turnTexts()).toEqual(["ship the redirect fix"]);
+  expect(test.store.getControllerVoice(10)).toMatchObject({ state: "completed", outcome: "transcribed" });
   expect(test.telegram.texts).toEqual([]);
+});
+
+it("hands a voice note off durably without downloading or transcribing in ingress", async () => {
+  const test = fixture();
+
+  await expect(test.ingest(
+    voiceUpdate(19, { file_id: "v1", file_unique_id: "u1", duration: 4, mime_type: "audio/ogg" }),
+  )).resolves.toEqual({ updateSettled: true });
+
+  expect(test.download).not.toHaveBeenCalled();
+  expect(test.transcribe).not.toHaveBeenCalled();
+  expect(test.db.prepare(
+    "SELECT update_id, state FROM controller_voice_inbox WHERE update_id = 19",
+  ).get()).toEqual({ update_id: 19, state: "pending" });
+});
+
+it("tells the owner when a valid transcript is too long for one controller turn", async () => {
+  const test = fixture({
+    transcribe: async () => ({ outcome: "transcribed", text: "x".repeat(4_001) }),
+  });
+
+  await test.ingest(
+    voiceUpdate(20, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
+  );
+  await test.processOne();
+  await expect(test.processOne()).resolves.toBe(false);
+
+  expect(test.noticeTexts()).toEqual([voiceUnavailableNotice("transcript_too_long")]);
+  expect(test.turnTexts()).toEqual([]);
 });
 
 it("lets a caption lead the transcript rather than be replaced by it", async () => {
   const test = fixture();
 
-  await test.ingress.handleClaimed(
+  await test.ingest(
     voiceUpdate(11, { file_id: "v1", file_unique_id: "u1", duration: 4 }, { caption: "about proj_1" }),
-    2_000,
   );
+  await test.processOne();
 
   expect(test.turnTexts()).toEqual(["about proj_1\n\nship the redirect fix"]);
 });
@@ -169,50 +231,54 @@ it("lets a caption lead the transcript rather than be replaced by it", async () 
 it("says so plainly when this install has no voice service, and starts nothing", async () => {
   const test = fixture({ withVoiceService: false });
 
-  await test.ingress.handleClaimed(
+  await test.ingest(
     voiceUpdate(12, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
-    2_000,
   );
+  await test.processOne();
 
-  expect(test.telegram.texts).toEqual([voiceUnavailableNotice("no_service")]);
+  expect(test.telegram.texts).toEqual([]);
+  expect(test.noticeTexts()).toEqual([voiceUnavailableNotice("no_service")]);
   expect(test.turnTexts()).toEqual([]);
 });
 
 it("distinguishes a recording it could not fetch from one it could not hear", async () => {
   const unreadable = fixture({ download: async () => { throw new Error("gateway"); } });
-  await unreadable.ingress.handleClaimed(
+  await unreadable.ingest(
     voiceUpdate(13, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
-    2_000,
   );
-  expect(unreadable.telegram.texts).toEqual([voiceUnavailableNotice("unreadable")]);
+  await unreadable.processOne();
+  expect(unreadable.noticeTexts()).toEqual([voiceUnavailableNotice("unreadable")]);
   expect(unreadable.turnTexts()).toEqual([]);
 
   const silent = fixture({ transcribe: async () => ({ outcome: "empty" }) });
-  await silent.ingress.handleClaimed(
+  await silent.ingest(
     voiceUpdate(14, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
-    2_000,
   );
-  expect(silent.telegram.texts).toEqual([voiceUnavailableNotice("empty")]);
+  await silent.processOne();
+  expect(silent.noticeTexts()).toEqual([voiceUnavailableNotice("empty")]);
   expect(silent.turnTexts()).toEqual([]);
 });
 
 it("reports the production transcriber being unavailable even though its adapter is registered", async () => {
   const test = fixture({ transcribe: async () => ({ outcome: "unavailable" }) });
 
-  await test.ingress.handleClaimed(
+  await test.ingest(
     voiceUpdate(17, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
-    2_000,
   );
+  await test.processOne();
 
-  expect(test.telegram.texts).toEqual([voiceUnavailableNotice("no_service")]);
+  expect(test.noticeTexts()).toEqual([voiceUnavailableNotice("no_service")]);
   expect(test.turnTexts()).toEqual([]);
 });
 
-it("cancels in-flight transcription with service shutdown and sends no stale notice", async () => {
+it("recovers an interrupted transcription after its durable lease expires", async () => {
   let started!: () => void;
   const transcribing = new Promise<void>((resolve) => { started = resolve; });
+  let calls = 0;
   const test = fixture({
     transcribe: async ({ signal }): Promise<VoiceTranscription> => {
+      calls += 1;
+      if (calls > 1) return { outcome: "transcribed", text: "recovered voice" };
       started();
       return await new Promise<never>((_resolve, reject) => {
         signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -221,32 +287,44 @@ it("cancels in-flight transcription with service shutdown and sends no stale not
   });
   const shutdown = new AbortController();
 
-  const pending = test.ingress.handleClaimed(
+  await test.ingest(
     voiceUpdate(18, { file_id: "v1", file_unique_id: "u1", duration: 4 }),
-    2_000,
-    shutdown.signal,
   );
+  const pending = test.processOne(shutdown.signal);
   await transcribing;
   shutdown.abort(new Error("service stopped"));
-  await expect(pending).resolves.toEqual({ updateSettled: false });
+  await expect(pending).resolves.toBe(true);
 
-  expect(test.telegram.texts).toEqual([]);
+  expect(test.store.getControllerVoice(18)).toMatchObject({ state: "processing", attempts: 1 });
+  expect(test.noticeTexts()).toEqual([]);
   expect(test.turnTexts()).toEqual([]);
+
+  test.setNow(302_001);
+  const restarted = new ControllerVoiceService({
+    store: test.store,
+    voice: test.voice,
+    clock: { now: () => 302_001 },
+    ownerId: "restarted-voice-worker",
+  });
+  await expect(restarted.processOne(new AbortController().signal)).resolves.toBe(true);
+
+  expect(test.store.getControllerVoice(18)).toMatchObject({ state: "completed", attempts: 2 });
+  expect(test.turnTexts()).toEqual(["recovered voice"]);
 });
 
 it("refuses an over-long recording before spending a download on it", async () => {
   const test = fixture();
 
-  await test.ingress.handleClaimed(
+  await test.ingest(
     voiceUpdate(15, {
       file_id: "v1",
       file_unique_id: "u1",
       duration: MAX_CONTROLLER_VOICE_SECONDS + 1,
     }),
-    2_000,
   );
+  await test.processOne();
 
-  expect(test.telegram.texts).toEqual([voiceUnavailableNotice("too_large")]);
+  expect(test.noticeTexts()).toEqual([voiceUnavailableNotice("too_large")]);
   expect(test.download).not.toHaveBeenCalled();
   expect(test.turnTexts()).toEqual([]);
 });
@@ -254,9 +332,8 @@ it("refuses an over-long recording before spending a download on it", async () =
 it("never transcribes for someone who is not the owner", async () => {
   const test = fixture();
 
-  await test.ingress.handleClaimed(
+  await test.ingest(
     voiceUpdate(16, { file_id: "v1", file_unique_id: "u1", duration: 4 }, {}, 999, 999),
-    2_000,
   );
 
   // Transcription is work and a stranger does not get it, nor a reply telling
@@ -265,4 +342,5 @@ it("never transcribes for someone who is not the owner", async () => {
   expect(test.transcribe).not.toHaveBeenCalled();
   expect(test.telegram.texts).toEqual([]);
   expect(test.turnTexts()).toEqual([]);
+  expect(test.store.getControllerVoice(16)).toBeNull();
 });

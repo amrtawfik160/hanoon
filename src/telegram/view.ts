@@ -96,7 +96,7 @@ export type JobStatusContext = {
   mergeAuthorityGranted?: boolean;
   /** Why this merge is asking despite a standing approval. */
   approvalReason?: string;
-  /** True when a standing approval merged this job without asking. */
+  /** True when standing authority advanced this job into the merge pipeline without asking. */
   autoApproved?: boolean;
   ready?: boolean;
   workerLiveness?: WorkerLiveness | null;

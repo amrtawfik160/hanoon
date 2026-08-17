@@ -1333,6 +1333,17 @@ describe("bounded text heuristics", () => {
     )).toMatchObject({ outcome: "accepted" });
   });
 
+  it.each(["The pull request merged.", "The change landed."])(
+    "requires pipeline outcome proof for merge completion wording: %s",
+    (text) => {
+      expectRejection(
+        claimFinalization({ kind: "external_mutation", outcome: "succeeded", text }),
+        contextWithEvidence(evidenceRow("evidence:1", "external_mutation", "succeeded")),
+        "proof_incompatible",
+      );
+    },
+  );
+
   it("requires production proof for a canary claim", () => {
     expectRejection(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Production canary passed." }),

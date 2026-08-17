@@ -104,7 +104,7 @@ export class JobContinuationService {
       : this.dependencies.store.requeueReviewAdmission(job.id, job.version, now).outcome;
     // A draining admission resolves itself, so waiting costs nothing and
     // counting it would spend the ladder on a sweep that was simply early.
-    if (outcome === "still_cleaning_up") return false;
+    if (outcome === "still_cleaning_up" || outcome === "already_queued") return false;
     // `unavailable` still counts. It usually means the job moved under us, and
     // then its block changes and the ladder resets anyway — but it also covers
     // a job the guarded retry will never accept, and those must reach the owner
