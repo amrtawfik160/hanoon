@@ -82,6 +82,7 @@ import { ExecutorNudge } from "./services/executor-nudge";
 import { CONTROLLER_TOOL_NAMES, registerControllerTools } from "./controller/tools";
 import { MAX_CONTROLLER_IDENTITY } from "./controller/instructions";
 import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
+import { parseWorkerThreadTitle } from "./agent-skills/role-resolver";
 import {
   BbControllerAdapter,
   ControllerImagePreparationError,
@@ -1352,16 +1353,44 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   const threadNotices = new ThreadNoticeService({
     store,
     threads: {
-      listWatchable: async () => {
-        const threads = await bb.sdk.threads.list({ includeHidden: false, archived: false, limit: 100 });
-        return threads
-          .filter((thread) => thread.visibility === "visible" && thread.archivedAt === null && thread.deletedAt === null)
-          .map((thread) => ({
-            id: thread.id,
-            title: thread.title ?? thread.titleFallback ?? "Untitled thread",
-            status: thread.status,
-            parentThreadId: thread.parentThreadId,
-          }));
+      listWatchable: async (offset, limit) => {
+        // The notice service paginates the filtered list, while BB paginates
+        // the complete list. Fetching one BB page per notice page would let
+        // hidden, non-worker threads shift the offset and make later worker
+        // questions disappear. Build the requested filtered slice instead.
+        const watchable: Array<{
+          id: string;
+          title: string;
+          status: string;
+          parentThreadId: string | null;
+          hasPendingInteraction: boolean;
+        }> = [];
+        const sourcePageSize = 100;
+        let sourceOffset = 0;
+        while (watchable.length < offset + limit) {
+          const page = await bb.sdk.threads.list({
+            includeHidden: true,
+            archived: false,
+            limit: sourcePageSize,
+            offset: sourceOffset,
+          });
+          for (const thread of page) {
+            if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
+            const title = thread.title ?? thread.titleFallback ?? "Untitled thread";
+            const isPipelineWorker = parseWorkerThreadTitle(title) !== null;
+            if (thread.visibility !== "visible" && !isPipelineWorker) continue;
+            watchable.push({
+              id: thread.id,
+              title,
+              status: thread.status,
+              parentThreadId: thread.parentThreadId,
+              hasPendingInteraction: thread.hasPendingInteraction,
+            });
+          }
+          if (page.length < sourcePageSize) break;
+          sourceOffset += page.length;
+        }
+        return watchable.slice(offset, offset + limit);
       },
       interactions: async (threadId) => {
         const pending = await bb.sdk.threads.interactions.list({ threadId });
@@ -1624,6 +1653,19 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId) : current?.implementationThreadId);
     if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
+    let hasPendingInteraction = false;
+    try {
+      const interactions = await bb.sdk.threads.interactions.list({ threadId: resourceId, signal });
+      hasPendingInteraction = interactions.some((interaction) => interaction.status === "pending");
+    } catch (error) {
+      if (!fenceCurrent()) return;
+      bb.log.warn(`Worker interaction state could not be read for ${resourceId}: ${String(error)}`);
+      return;
+    }
+    // A worker waiting for an owner answer is alive even when its public
+    // thread status is idle. Leave it in place for ThreadNoticeService to
+    // route the question and for the next reconciliation after the answer.
+    if (hasPendingInteraction) return;
     const observedAt = clock();
     const projected = projectWorkerLiveness(store, current, thread, observedAt, workerKind, generation, {
       ownerId: fence.ownerId,

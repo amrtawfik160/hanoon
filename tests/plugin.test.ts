@@ -37,7 +37,13 @@ async function loadPlugin() {
   const realtime = recordingSdkSubscribe();
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-agent-task10-plugin-${pluginNumber++}`,
-    sdk: { subscribe: realtime.subscribe },
+    sdk: {
+      subscribe: realtime.subscribe,
+      // Reconciliation reads this provider fact before acting on a worker.
+      // Keep the general plugin fixture's default equivalent to a thread with
+      // no pending question; tests that exercise a question override it.
+      threads: { interactions: { list: async () => [] } },
+    },
   });
   await plugin(bb);
   return { bb, harness, realtime };
@@ -486,6 +492,96 @@ it("reconciles an authoritative implementation idle observation into the job sta
   expect(store.getJob(job.id)?.state).not.toBe("implementing");
   run.controller.abort();
   await run.done;
+});
+
+it("leaves a worker waiting for an owner question in place during reconciliation", async () => {
+  const { bb, harness } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const now = Date.now();
+  const job = store.createJob({ id: "waitingquestionjobabcde", sourceUpdateId: 3, requestText: "work", now });
+  bb.storage.database().prepare(
+    "UPDATE jobs SET state = 'implementing', implementation_thread_id = ?, version = ?, updated_at = ? WHERE id = ?",
+  ).run("thr_waiting_question", job.version + 1, now + 1, job.id);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({
+    id: "thr_waiting_question",
+    status: "idle",
+    updatedAt: now + 2,
+  }));
+  harness.sdk.stub("threads.interactions.list", async () => [{ status: "pending" }]);
+  expect(store.enqueueReconcileForThread("thr_waiting_question", now + 3)).toBe(true);
+
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(harness.inspection.sdk.callsTo("threads.interactions.list").length).toBeGreaterThan(0));
+    expect(store.getJob(job.id)?.state).toBe("implementing");
+    expect(store.listEffectsForJob(job.id).some((effect) => effect.kind === "inspect_implementation")).toBe(false);
+  } finally {
+    run.controller.abort();
+    await run.done;
+  }
+});
+
+it("includes hidden pipeline workers in the owner notice scan without exposing other hidden threads", async () => {
+  const { bb, harness } = await loadPlugin();
+  const store = openStore(bb.storage);
+  const now = Date.now();
+  store.createPairingCode(hashSecret("notice-pair"), now, now + 60_000);
+  expect(store.pairOwnerWithCode(hashSecret("notice-pair"), "7", "7", now)).toEqual({ ok: true });
+  const worker = makeThreadResponse({
+    id: "thr_hidden_worker",
+    title: "Telegram abcdefghijklmnopqrstuv plan abcdefghijklmnopqrstuv:3:spawn_plan",
+    visibility: "hidden",
+    status: "idle",
+  });
+  const workerWithQuestion = { ...worker, hasPendingInteraction: true };
+  const unrelatedHidden = Array.from({ length: 100 }, (_, index) => makeThreadResponse({
+    id: `thr_hidden_unrelated_${index}`,
+    title: `Background ${index}`,
+    visibility: "hidden",
+    status: "active",
+  }));
+  harness.sdk.stub("threads.list", async ({ offset }: { offset?: number }) => offset === 0 ? unrelatedHidden : [workerWithQuestion]);
+  harness.sdk.stub("threads.interactions.list", async ({ threadId }: { threadId: string }) => threadId === workerWithQuestion.id
+    ? [{
+      id: "pint_hidden_worker_question",
+      status: "pending",
+      payload: {
+        kind: "user_question",
+        questions: [{
+          id: "resolution",
+          prompt: "Which specification should govern?",
+          multiSelect: false,
+          allowFreeText: true,
+          options: [{ value: "filed", label: "Filed", description: null }],
+        }],
+      },
+    }]
+    : []);
+
+  await harness.behavior.setSettings({ botToken: "123:test-token" });
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { message_id: 904 } }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(harness.inspection.sdk.callsTo("threads.interactions.list")).toEqual(
+      expect.arrayContaining([[{ threadId: workerWithQuestion.id }]]),
+    ));
+    expect(store.getOutbox("thread-interaction:pint_hidden_worker_question")?.payload.text)
+      .toContain("Which specification should govern?");
+    expect(harness.inspection.sdk.callsTo("threads.list")).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ includeHidden: true, offset: 0, limit: 100 })],
+      [expect.objectContaining({ includeHidden: true, offset: 100, limit: 100 })],
+    ]));
+    expect(harness.inspection.sdk.callsTo("threads.interactions.list")).not.toEqual(
+      expect.arrayContaining([[{ threadId: unrelatedHidden[0]!.id }]]),
+    );
+  } finally {
+    run.controller.abort();
+    await run.done;
+    vi.unstubAllGlobals();
+  }
 });
 
 it.each([

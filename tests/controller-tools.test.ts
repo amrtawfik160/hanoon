@@ -295,6 +295,60 @@ it("files owner references with valid evidence and returns searchable passage ev
   ]);
 });
 
+it("keeps reference search whole and reports passages omitted by the UTF-8 result bound", async () => {
+  const { bb, harness, store } = fixture({ active: true, controllerTools: "all-tools" });
+  vi.spyOn(store, "searchReferencePassages").mockReturnValue([
+    {
+      id: "doc_bound:1",
+      documentId: "doc_bound",
+      documentTitle: "Bounded specification",
+      sectionPath: "Billing",
+      body: "A".repeat(1_900),
+      ordinal: "1",
+    },
+    {
+      id: "doc_bound:2",
+      documentId: "doc_bound",
+      documentTitle: "Bounded specification",
+      sectionPath: "Billing > " + "😀".repeat(100),
+      body: "😀".repeat(2_000),
+      ordinal: "2",
+    },
+    {
+      id: "doc_bound:3",
+      documentId: "doc_bound",
+      documentTitle: "Bounded specification",
+      sectionPath: "Access",
+      body: "B".repeat(1_900),
+      ordinal: "3",
+    },
+  ]);
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+  });
+
+  const serialized = await harness.behavior.callAgentTool(
+    "telegram_agent_search_reference",
+    { query: "anything", limit: 3 },
+    controllerToolContext,
+  );
+  if (typeof serialized !== "string") throw new Error("reference search did not return JSON text");
+  const searched = parseToolWithEvidence(serialized);
+  expect(Buffer.byteLength(serialized, "utf8"))
+    .toBeLessThanOrEqual(CONTROLLER_CAPABILITIES.telegram_agent_search_reference.result_limit);
+  expect(searched).toMatchObject({
+    truncated: true,
+    omittedPassages: 2,
+    omittedIds: ["doc_bound:2", "doc_bound:3"],
+  });
+  expect(searched.passages).toEqual([expect.objectContaining({ id: "doc_bound:1", body: "A".repeat(1_900) })]);
+});
+
 it("refuses to file a reference from a system-origin controller turn", async () => {
   const { bb, harness, store } = fixture({
     active: true,

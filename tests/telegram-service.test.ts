@@ -253,6 +253,17 @@ describe("Telegram ingress service", () => {
       .toEqual({ status: "processing" });
   });
 
+  it("releases stale in-memory claims when the Telegram service restarts", () => {
+    const { store } = storeFixture();
+
+    expect(store.beginTelegramUpdate(10, 1_000)).toBe("process");
+    store.reconcileTelegramCursor();
+
+    // The persisted lease is five minutes. A replacement service must be able
+    // to reclaim it after that lease, even when it reuses this store instance.
+    expect(store.beginTelegramUpdate(10, 301_001)).toBe("process");
+  });
+
   it("lets the pure service persist a Start transition without any BB worker capability", async () => {
     const { store } = storeFixture();
     const draft = store.createJob({ id: "abcdefghijklmnopqrstuv", sourceUpdateId: 1, requestText: "work", now: 1_000 });

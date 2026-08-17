@@ -117,7 +117,12 @@ function prepareReviewJob(
 it("keeps simultaneous opposite review verdicts bound to their own jobs", async () => {
   const { bb, harness } = createFakePluginHost({
     pluginId: "review-concurrency-plugin",
-    sdk: { subscribe: () => () => undefined },
+    sdk: {
+      subscribe: () => () => undefined,
+      // Worker reconciliation checks for an open owner question before it
+      // treats an idle review thread as recoverable.
+      threads: { interactions: { list: async () => [] } },
+    },
   });
   await plugin(bb);
   const store = openStore(bb.storage);

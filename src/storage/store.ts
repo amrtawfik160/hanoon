@@ -14876,6 +14876,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   // Recovers a cursor left pinned by an update that failed under an earlier
   // build, so polling stops replaying a backlog it has already handled.
   public reconcileTelegramCursor(): void {
+    // Claims are process-local bookkeeping. A service restart can reuse this
+    // store object, but it cannot safely inherit a handler that no longer
+    // exists. The durable row remains the authority: an unexpired row still
+    // blocks a duplicate, and an expired row can be reclaimed normally.
+    this.claimedUpdates.clear();
     this.db.transaction(() => advanceTelegramCursor(this.db)).immediate();
   }
 

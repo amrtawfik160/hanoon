@@ -42,6 +42,8 @@ export type WatchedThread = {
   title: string;
   status: string;
   parentThreadId: string | null;
+  /** BB can leave a question open while the public status is idle. */
+  hasPendingInteraction?: boolean;
 };
 
 export type PendingThreadInteraction = {
@@ -132,7 +134,7 @@ export class ThreadNoticeService {
       // Pipeline workers already have a job status card. Announcing their
       // internal titles as "finished" is noise the owner cannot act on.
       if (parseWorkerThreadTitle(thread.title) !== null) {
-        if (BLOCKABLE_STATUSES.has(thread.status)) {
+        if (BLOCKABLE_STATUSES.has(thread.status) || thread.hasPendingInteraction === true) {
           didWork = await this.checkBlocked(thread, owner.chatId) || didWork;
         }
         continue;

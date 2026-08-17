@@ -236,6 +236,43 @@ function boundedEvidenceIndex(
   return largest;
 }
 
+// Leave room for the evidence envelope added by the capability executor. A
+// search hit is returned whole or named as omitted, never cut in the middle.
+const REFERENCE_SEARCH_RESULT_RESERVE_BYTES = 1_500;
+
+function boundedReferenceSearchResult(
+  hits: readonly {
+    id: string;
+    documentTitle: string;
+    sectionPath: string;
+    body: string;
+  }[],
+): ControllerJsonObject {
+  const projected = hits.map((passage) => ({
+    id: passage.id,
+    document: passage.documentTitle,
+    section: passage.sectionPath,
+    body: passage.body,
+  }));
+  const resultLimit = CONTROLLER_CAPABILITIES.telegram_agent_search_reference.result_limit -
+    REFERENCE_SEARCH_RESULT_RESERVE_BYTES;
+  for (let count = projected.length; count >= 0; count -= 1) {
+    const omitted = hits.slice(count);
+    const candidate: ControllerJsonObject = count === hits.length
+      ? { passages: projected.slice(0, count) }
+      : {
+        passages: projected.slice(0, count),
+        truncated: true,
+        omittedPassages: omitted.length,
+        omittedIds: omitted.map((passage) => passage.id),
+      };
+    if (Buffer.byteLength(canonicalControllerJson(candidate), "utf8") <= resultLimit) {
+      return candidate;
+    }
+  }
+  throw new Error("Reference search result metadata exceeded its UTF-8 byte limit");
+}
+
 function evidenceAuthorization(
   dependencies: ToolDependencies,
   descriptor: ControllerCapabilityDescriptor,
@@ -2674,10 +2711,9 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     parameters: z.object({
       query: z.string().trim().min(1).max(512),
       projectId: z.string().min(1).max(256).optional(),
-      // Three passages of the maximum size plus their paths sit inside this
-      // capability's 8000 character result bound; more would be truncated
-      // mid-passage, which reads as the specification saying something it does
-      // not.
+      // The executor applies a UTF-8 byte limit to the complete result,
+      // including evidence. The implementation returns whole passages and
+      // explicit omission metadata when the limit is tight.
       limit: z.number().int().min(1).max(3).optional(),
     }).strict(),
     execute: (params, context) => {
@@ -2687,14 +2723,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         projectId: params.projectId ?? null,
         limit: params.limit ?? 3,
       });
-      return {
-        passages: hits.map((passage) => ({
-          id: passage.id,
-          document: passage.documentTitle,
-          section: passage.sectionPath,
-          body: passage.body,
-        })),
-      };
+      return boundedReferenceSearchResult(hits);
     },
   });
 
