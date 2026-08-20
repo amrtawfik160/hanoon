@@ -1924,6 +1924,33 @@ export class EffectRunner {
     });
   }
 
+  /**
+   * Stops a project delivering on its own after production broke and could not
+   * be put back.
+   *
+   * Both halves matter and neither substitutes for the other. Withdrawing the
+   * merge authority clears the button-granted approval and records the durable
+   * revocation that also silences a grant the project's policy carries, because
+   * a policy file cannot hear about a withdrawal and would otherwise keep
+   * merging through the very failure that exhausted recovery.
+   *
+   * The brake is the second half: authority governs merging, and the work that
+   * would reach a merge is already being planned. Leaving admission open would
+   * mean queueing changes for a project whose production is down, and this is
+   * exactly the situation the brake exists for. It is left without a
+   * fingerprint on purpose, so the agent cannot lift it for itself — a broken
+   * production that could not be rolled back is the owner's call.
+   */
+  private withdrawUnattendedDelivery(projectId: string, reason: string): void {
+    this.dependencies.store.revokeMergeAuthority({ projectId, reason, now: this.now() });
+    this.dependencies.store.pauseProjectAdmission({
+      projectId,
+      reason,
+      fingerprint: null,
+      now: this.now(),
+    });
+  }
+
   private applyProductionResult(job: Job, phase: ProductionPhase, result: ProductionStageSnapshot): void {
     const expectedState = phase === "deploy" ? "deploying" : "verifying_production";
     const current = this.dependencies.store.getJob(job.id);
@@ -1939,13 +1966,12 @@ export class EffectRunner {
     // recovery is exhausted, and nothing should merge here unattended again
     // until the owner has looked at it.
     if (job.projectId !== null && result.rollback?.outcome !== "pass") {
-      this.dependencies.store.revokeMergeAuthority({
-        projectId: job.projectId,
-        reason: result.rollback
+      this.withdrawUnattendedDelivery(
+        job.projectId,
+        result.rollback
           ? `rollback failed after a bad ${phase}`
           : `production ${phase} failed with no rollback configured`,
-        now: this.now(),
-      });
+      );
     }
     this.applyEvent(job.id, current.version, phase === "deploy"
       ? { type: "DEPLOY_FAILED", reason: result.summary }
