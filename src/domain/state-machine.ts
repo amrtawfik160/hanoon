@@ -3,6 +3,7 @@ import {
   isResumablePlanBlock,
   isReviewedPrCompletionBlock,
   isSmallFixJob,
+  mergesWithoutProduction,
   projectPolicySchema,
   shouldResumeExistingPr,
   type Job,
@@ -128,6 +129,19 @@ function enterLocatingPr(job: Job, effects: JobEffect[]): void {
 
 function completeReviewedWork(job: Job, effects: JobEffect[]): void {
   job.state = "complete";
+  job.blockedReason = null;
+  job.lastError = null;
+  job.resumeState = null;
+  emitEffect(job, effects, "render_status");
+}
+
+/**
+ * Where a project that deploys nothing finishes: merged, with no deploy or
+ * canary left to run. Distinct from `complete`, which for every other project
+ * means the change reached production and the canary agreed.
+ */
+function completeMergedWork(job: Job, effects: JobEffect[]): void {
+  job.state = "merged";
   job.blockedReason = null;
   job.lastError = null;
   job.resumeState = null;
@@ -521,7 +535,7 @@ function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[])
       emitEffect(job, effects, "run_final_validation", { headSha: event.headSha });
       return;
     }
-    if (job.policy?.production) {
+    if (job.policy?.production || mergesWithoutProduction(job.policy)) {
       job.state = "awaiting_merge_approval";
       emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
       return;
@@ -696,7 +710,7 @@ function transitionFinalReviewing(job: Job, event: JobEvent, effects: JobEffect[
       invalidateDriftedHead(job, effects);
       return;
     }
-    if (!job.policy?.production) {
+    if (!job.policy?.production && !mergesWithoutProduction(job.policy)) {
       completeReviewedWork(job, effects);
       return;
     }
@@ -757,6 +771,13 @@ function transitionMerging(job: Job, event: JobEvent, effects: JobEffect[]): voi
       return;
     }
     if (!job.policy?.production) {
+      // The project said it deploys nothing, so the merge is the whole
+      // delivery. Reporting a production incident over equipment it never had
+      // would be a false alarm on a job that did exactly what was asked.
+      if (mergesWithoutProduction(job.policy)) {
+        completeMergedWork(job, effects);
+        return;
+      }
       enterProductionIncident(job, effects, "Merge succeeded but production deployment and canary are not configured");
       return;
     }

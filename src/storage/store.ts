@@ -14218,6 +14218,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           ? ["repository_merge", "production_target"]
           : ["repository_merge"],
       });
+      // A project that deploys nothing finishes here rather than moving on to
+      // deploy, so this is where its slot is released and its owner is told.
+      // Every other project leaves this transition still running.
+      this.markAdmissionDrainingForTerminal(transitioned.job, boundaryNow);
+      this.enqueueFinishNoteInTransaction(current, transitioned.job, boundaryNow);
       if (input.outbox) persistOutbox(this.db, input.outbox, serializeOutbox(input.outbox, boundaryNow), boundaryNow);
       persistPendingEffects(this.db, transitioned.effects, boundaryNow);
       return true;
@@ -15235,7 +15240,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   private enqueueFinishNoteInTransaction(previous: Job, completed: Job, now: number): void {
-    if (previous.state === "complete" || completed.state !== "complete") return;
+    // A project that deploys nothing finishes at `merged` and never reaches
+    // `complete`, so the owner is told there instead of not at all.
+    const delivered = completed.state === "complete" || completed.state === "merged";
+    if (!delivered || previous.state === completed.state) return;
     const text = renderJobFinishNote(completed);
     const owner = this.getOwner();
     if (text === null || owner === null) return;

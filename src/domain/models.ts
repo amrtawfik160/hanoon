@@ -378,6 +378,20 @@ export function isResumablePermanentFailure(
     && RETRYABLE_RESUME_STATES.has(job.resumeState);
 }
 
+/**
+ * Whether this project's reviewed pull request is a merge candidate even though
+ * it deploys nothing.
+ *
+ * By default a reviewed pull request with no production settings is finished
+ * work: there is nothing to deploy, so the pipeline stops at the pull request
+ * rather than merging into silence. A project that says otherwise in its policy
+ * carries it through the same approval and merge gates and ends at the merge,
+ * with no deploy or canary to run.
+ */
+export function mergesWithoutProduction(policy: ProjectPolicy | null | undefined): boolean {
+  return policy?.production === undefined && policy?.autonomy?.mergeWithoutProduction === true;
+}
+
 export function isReviewedPrCompletionBlock(
   job: Pick<Job, "state" | "blockedReason" | "lastError" | "prNumber" | "policy">,
 ): boolean {

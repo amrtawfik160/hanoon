@@ -341,6 +341,23 @@ describe("deterministic Telegram views", () => {
       expect(rendered.text).toContain("Merging on your standing approval");
     });
 
+    it("promises only a merge when the project has nothing to deploy", () => {
+      const policy = policyFixture({ alias: "cyndra" });
+      delete (policy as Partial<typeof policy>).production;
+      const rendered = renderJobStatus(jobFixture({
+        id: telegramJobId,
+        state: "awaiting_merge_approval",
+        policy,
+        prHeadSha: "a".repeat(40),
+      }), { mergeNonce });
+      const labels = (rendered.reply_markup?.inline_keyboard.flat() ?? []).map((button) => button.text);
+
+      expect(rendered.text).toContain("Ready to merge");
+      expect(rendered.text).not.toContain("Ready to merge and deploy");
+      expect(labels).toContain("Merge aaaaaaaa");
+      expect(labels).toContain("Merge, and always from now on");
+    });
+
     it("keeps the permanent-approval button out of storage along with the one-use one", () => {
       const persisted = JSON.stringify(persistableJobStatusPayload(
         renderJobStatus(approvalJob(), { mergeNonce }),

@@ -528,6 +528,9 @@ function deliveryState(job: Job): string {
 
 function statusButtons(job: Job, context: JobStatusContext, ready: boolean): InlineKeyboardButton[] {
   const buttons: InlineKeyboardButton[] = [];
+  // A project with no production settings has no deploy to offer, and a button
+  // that promises one would be asking for something that cannot happen.
+  const deploys = (context.project ?? job.policy)?.production !== undefined;
   const prUrl = safeHttpUrl(job.prUrl);
   const bbUrl = safeHttpUrl(context.bbAppBaseUrl);
   if (prUrl) buttons.push({ text: "View PR", url: prUrl });
@@ -542,10 +545,15 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
     if (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce)) {
       const shortSha = job.prHeadSha?.slice(0, 8) ?? "approved";
-      buttons.push({ text: `Merge + deploy ${shortSha}`, callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
+      buttons.push({
+        text: `${deploys ? "Merge + deploy" : "Merge"} ${shortSha}`,
+        callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }),
+      });
       if (context.mergeAuthorityGranted !== true) {
         buttons.push({
-          text: "Merge + deploy, and always from now on",
+          text: deploys
+            ? "Merge + deploy, and always from now on"
+            : "Merge, and always from now on",
           callback_data: encodeCallbackData({ type: "merge_always", nonce: context.mergeNonce }),
         });
       }
@@ -583,16 +591,20 @@ export function renderJobStatus(
     context.admission?.jobId === job.id &&
     context.admission.state === "queued";
   const title = ready
-    ? "Ready to merge and deploy"
+    ? policy?.production === undefined ? "Ready to merge" : "Ready to merge and deploy"
     : job.state === "production_failed"
       ? "PRODUCTION INCIDENT"
-      : job.state === "complete"
-        ? job.mergeCommitSha
-          ? "Merged, deployed, and verified"
-          : "Done — pull request ready"
-        : queuedConfirmed
-          ? "Job queued"
-          : `Job ${displayText(job.state, 80)}`;
+      // Says what happened and no more. This project deploys nothing, so
+      // "deployed and verified" would be a claim about a step that never ran.
+      : job.state === "merged"
+        ? "Merged, nothing to deploy"
+        : job.state === "complete"
+          ? job.mergeCommitSha
+            ? "Merged, deployed, and verified"
+            : "Done — pull request ready"
+          : queuedConfirmed
+            ? "Job queued"
+            : `Job ${displayText(job.state, 80)}`;
   const lines = [
     `<b>${escapeHtml(title)}</b>`,
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,

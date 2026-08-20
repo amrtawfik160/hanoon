@@ -33,6 +33,20 @@ describe("job finish notes", () => {
     );
   });
 
+  it("says a merge landed without claiming a deployment the project does not have", () => {
+    expect(renderJobFinishNote(jobFixture({
+      state: "merged",
+      requestText: "Tidy the release notes",
+      prNumber: 19,
+      prUrl: "https://github.com/acme/cyndra/pull/19",
+      policy: policyFixture({ production: undefined }),
+      mergeCommitSha: "c".repeat(40),
+    }))).toBe(
+      "Merged “Tidy the release notes”. This project has nothing to deploy, so that finishes it. " +
+      "PR #19: https://github.com/acme/cyndra/pull/19",
+    );
+  });
+
   it("enqueues one separate finish message when a job first completes", () => {
     const { bb } = createFakePluginHost({ pluginId: "telegram-finish-note" });
     const store = openStore(bb.storage);

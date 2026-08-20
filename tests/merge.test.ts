@@ -2,7 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type { GateInput } from "../src/domain/gates";
-import type { StoredEffect } from "../src/domain/models";
+import type { ProjectPolicy, StoredEffect } from "../src/domain/models";
 import { projectResourceKey } from "../src/autonomy/models";
 import { hashSecret } from "../src/crypto";
 import { createFreshGateCollector, MergeHandler } from "../src/services/merge-handler";
@@ -109,13 +109,14 @@ function mergeFixture(options: {
   preMergeError?: Error;
   beforePreMerge?: (db: Database.Database) => void;
   clock?: () => number;
+  policy?: ProjectPolicy;
 } = {}) {
   const { bb } = createFakePluginHost({ pluginId: "telegram-agent" });
   const db = bb.storage.database();
   const clock = options.clock ?? (() => NOW);
   const store = openStore(bb.storage, bb.storage.kv, clock);
   expect(store.acquireExecutorLease(LEASE_OWNER, NOW, 60_000)).toEqual({ acquired: true, generation: LEASE_GENERATION });
-  const policy = policyFixture({ requiredChecks: ["test"] });
+  const policy = options.policy ?? policyFixture({ requiredChecks: ["test"] });
   store.createPairingCode(hashSecret("pair"), NOW, NOW + 60_000);
   expect(store.pairOwnerWithPrivateChatCode(hashSecret("pair"), "7", "70", NOW)).toEqual({ ok: true });
   store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "merge this", now: NOW });
@@ -664,6 +665,45 @@ describe("fresh Telegram merge execution", () => {
     expect(fixture.store.listHeldResourceClaims("job_1", 10).filter((claim) => claim.state === "held" && claim.resourceKind !== "project")).toEqual([
       expect.objectContaining({ resourceKind: "production_target", state: "held" }),
     ]);
+  });
+
+  it("finishes at the merge for a project that deploys nothing and asked to merge anyway", async () => {
+    const policy = policyFixture({
+      requiredChecks: ["test"],
+      regression: { commands: [{ name: "unit", command: "npm test", timeoutMs: 600_000 }] },
+      autonomy: { unattendedMerge: false, mergeWithoutProduction: true },
+    });
+    delete (policy as Partial<typeof policy>).production;
+    const fixture = mergeFixture({ policy });
+
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    const effect = leaseMergeEffect(fixture);
+    await expect(executeLeased(fixture, effect)).resolves.toMatchObject({ outcome: "merged" });
+
+    // Merged, not a production incident, and nothing queued for equipment the
+    // project does not have.
+    expect(fixture.store.getJob("job_1")).toMatchObject({ state: "merged", lastError: null });
+    const kinds = fixture.store.listEffectsForJob("job_1").map((item) => item.kind);
+    expect(kinds).not.toContain("deploy_production");
+    expect(kinds).not.toContain("verify_production");
+    expect(fixture.store.listHeldResourceClaims("job_1", 10)
+      .filter((claim) => claim.state === "held" && claim.resourceKind === "production_target")).toEqual([]);
+    // The owner hears that it landed, without being told it shipped.
+    expect(fixture.store.getOutbox("job:job_1:finish")?.payload).toMatchObject({
+      text: "Merged “merge this”. This project has nothing to deploy, so that finishes it. "
+        + "PR #17: https://github.com/acme/cyndra/pull/17",
+    });
+  });
+
+  it("still calls a merge with no deploy configured a production incident when nobody asked for it", async () => {
+    const policy = policyFixture({ requiredChecks: ["test"] });
+    delete (policy as Partial<typeof policy>).production;
+    const fixture = mergeFixture({ policy });
+
+    await expect(acceptApproval(fixture)).resolves.toMatchObject({ outcome: "accepted" });
+    await expect(executeLeased(fixture, leaseMergeEffect(fixture))).resolves.toMatchObject({ outcome: "merged" });
+
+    expect(fixture.store.getJob("job_1")?.state).toBe("production_failed");
   });
 
   it("requires a fresh ready-gate evaluation before accepting approval", async () => {
