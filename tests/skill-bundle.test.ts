@@ -26,6 +26,7 @@ const guardIds = ["clean-code-guard", "test-guard", "docs-guard"] as const;
 const deliveryIds = ["pr-writer"] as const;
 const discoveryIds = ["domain-modeling", "grill-with-docs", "grilling"] as const;
 const hanoonIds = [
+  "blast-radius",
   "checking-system-logs",
   "driving-bb",
   "durable-boundary-audit",

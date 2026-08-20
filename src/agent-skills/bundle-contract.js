@@ -49,6 +49,7 @@ const guardSkillIds = ["clean-code-guard", "docs-guard", "test-guard"];
 const deliverySkillIds = ["pr-writer"];
 const discoverySkillIds = ["domain-modeling", "grill-with-docs", "grilling"];
 const hanoonSkillIds = [
+  "blast-radius",
   "checking-system-logs",
   "driving-bb",
   "durable-boundary-audit",
