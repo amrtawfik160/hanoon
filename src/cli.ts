@@ -953,7 +953,16 @@ function jobShow(
   const job = deps.store.getJob(jobId);
   if (!job) throw new CliOperationError("Job was not found");
   const output = safeJob(deps.store, job, deps.now());
-  return success(output, `${String(output.id)}\t${String(output.state)}\tversion=${String(output.version)}`, json);
+  // Provenance belongs on the plain line too. Someone reading a job they do not
+  // recognise is exactly who needs to be told nobody asked for it, and they are
+  // the least likely person to have passed --json.
+  const line = [
+    String(output.id),
+    String(output.state),
+    `version=${String(output.version)}`,
+    ...(job.autonomousOrigin === null ? [] : [`startedBy=${job.autonomousOrigin}`]),
+  ].join("\t");
+  return success(output, line, json);
 }
 
 /**

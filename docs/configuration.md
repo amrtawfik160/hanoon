@@ -113,6 +113,15 @@ Two settings govern what the agent does when you have not asked it anything:
 
 Turning self-maintenance off retires the agent's own monitors, disables its repository audits, and prevents temporary-directory deletion. It does not touch monitors you set yourself, stop disk-pressure checks and warnings, or stop the agent learning from finished jobs. Repository audits inspect documentation staleness, debt markers, bug backlogs, and unresolved pull-request review findings through read-only Git and provider commands. Temporary cleanup is limited to old top-level entries whose names match the plugin's allowlist, and each daily pass has a deletion cap.
 
+Two further settings govern what the agent does about its own failures. Both default to the most cautious value, and the second does nothing unless the first is on:
+
+| Setting | Options | Default | Purpose |
+| --- | --- | --- | --- |
+| Self-diagnosis | on, off | off | Inspects persisted controller failures out of band and proposes at most one cooled-down fix at a time. |
+| What a diagnosis becomes | `draft-pr`, `pipeline` | `draft-pr` | `draft-pr` pushes a branch for you to read. `pipeline` files the same fix as an ordinary reviewed job instead. |
+
+`pipeline` needs the self-diagnosis project's policy to carry an `autonomy.intake` allowance, and it shares that allowance and its finding ledger rather than adding to them: a project that said two jobs a day meant two. Without one — or when that project's failure brake is on, it already has work running, or that failure has already had its job — it falls back to a draft pull request and logs why. Filing is not merging: the job asks for its merge on exactly the same terms as every other job on that project.
+
 The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
 
 ### Giving the agent standing information
@@ -268,6 +277,9 @@ Use unmistakable placeholders and replace them with values verified for the targ
     "consensusReview": {
       "providerId": "claude-code",
       "model": "claude-opus-5[1m]"
+    },
+    "intake": {
+      "maxJobsPerDay": 1
     }
   },
   "validationCommands": [
@@ -334,6 +346,7 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `autonomy.unattendedMerge` | `true` merges this project without asking, on the same terms as the button-granted standing approval. Requires `production.rollbackCommand` when production is configured. |
 | `autonomy.mergeWithoutProduction` | `true` lets a project with no production settings merge instead of stopping at the reviewed pull request. Requires a non-empty `requiredChecks` and a configured `regression` policy. |
 | `autonomy.consensusReview` | Optional `providerId` and `model` (plus optional `reasoningLevel`, `serviceTier`, `permissionMode`) for the second-opinion review pass. Validated against the same model catalog as `stageExecution`. |
+| `autonomy.intake` | Optional. When present, this project's daily audit may start work rather than only report it. `maxJobsPerDay` is a whole number from 1 to 4. See [Work the daily audit starts](#work-the-daily-audit-starts). |
 | `validationCommands` | Up to 20 owner-authored commands. |
 | `production.targetKey` | Optional shared isolation key: 1–64 lowercase letters, numbers, `.`, `_`, or `-`, starting alphanumeric. When absent, the project id is used. |
 | `production.deployCommands` | One to 20 commands when production is configured. |
@@ -399,6 +412,16 @@ A standing approval replaces the owner's signature only. Every check that produc
 - the change needed two or more rounds of review fixes and no [second opinion](#the-second-opinion-on-a-change-that-argued-with-its-review) cleared it.
 
 The standing approval is withdrawn automatically when production fails and the rollback either was not configured or failed. Recovery is exhausted, so nothing merges unattended there again until the owner re-grants it. A rollback that succeeded is a recovery, not an incident, and the standing approval survives it.
+
+### When an unattended merge breaks production
+
+A rollback command puts production back on the last good build. It does not take the bad merge off the trunk, so the next deploy ships it again.
+
+When `healthCommands` declare a fault, and the last thing merged on that project was merged unattended within the last 48 hours, one revert job starts by itself: revert that exact commit, through validation, review, and the same merge rule as any other change. Nothing is pushed outside the pipeline, and one merge commit gets at most one automatic revert, ever.
+
+If the revert cannot start — the failure brake is on, that project already has work running, or that commit has already had its revert — the fault is reported exactly the way it always was, and the reason no revert started is logged rather than messaged. A revert job that fails feeds the failure brake like any other failing job.
+
+This is not governed by `autonomy.intake` and does not spend its allowance: production being down is not a matter of daily budget.
 
 Granting a standing approval from the chat is only ever a button tap. An owner-origin sentence can grant one-use authority for its named job, but system turns and agent-generated text cannot grant either form. Withdrawing is available by name:
 
@@ -469,6 +492,55 @@ capability model routing, where the capability router owns the model tuple and
 the pass cannot be guaranteed to run anywhere else. Those changes go to the
 owner exactly as they did before. A fresh installation has no such job, because
 adaptive recipes start in `shadow`.
+
+## Work the daily audit starts
+
+By default the daily repository audit reports what it found and stops there.
+Every finding waits on you reading the message and asking for the work.
+
+`autonomy.intake` says that this project may start some of that work itself:
+
+```json
+"autonomy": { "intake": { "maxJobsPerDay": 1 } }
+```
+
+`maxJobsPerDay` is a whole number from 1 to 4. It bounds jobs started per project
+per UTC day. Four is the ceiling because a project starting more than that
+without being asked is being run unattended rather than maintained unattended.
+
+A started job is an ordinary job. It plans, implements, is reviewed, and asks for
+its merge on exactly the terms this project already sets — a project without a
+standing approval still asks you before every merge. Starting needs no approval
+because starting is not the irreversible half.
+
+What it will start is deliberately narrow. A finding only becomes work when the
+audit can state it concretely, and they are taken in this order:
+
+1. a document naming a file the repository no longer has — one file, one
+   reference, one fix;
+2. an open bug nobody has touched past the stale window;
+3. review comments left unanswered on a merged pull request;
+4. debt markers in a file, and only when there are three or fewer of them. More
+   than that is a direction rather than a task, and stays a report.
+
+Four bounds decide whether anything actually starts, and every one is checked
+inside the transaction that creates the job:
+
+- the day's allowance for this project is not already spent;
+- the [failure brake](#failure-brake) is not holding this project;
+- this project has no job queued, admitted, or still draining — one piece of work
+  at a time, so a started job usually means the next finding waits for the next
+  day;
+- this finding has not already started a job that is still open, and did not have
+  one settle within the last fortnight.
+
+Anything unreadable starts nothing. A policy that will not load, a database that
+will not answer, an owner who is not paired: each of them means the audits report
+exactly as they always did.
+
+You are told when a job starts this way, and the job carries where it came from —
+on the status card, as `startedBy` in `bb telegram-agent job show`, and in what
+the agent itself can see. The notice is a notice, not a question.
 
 ## Per-stage model routing
 

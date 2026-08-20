@@ -334,7 +334,19 @@ A canary runs once, immediately after a deploy. Between deploys nothing looks at
 
 A project policy may declare optional `healthCommands` — cheap, read-only checks, distinct from the canary because a canary is allowed to be neither. The executor runs them on `healthIntervalMs` (fifteen minutes by default) **without a model**, so a quiet week costs nothing but the commands themselves.
 
-The agent is woken only when the answer changes. A single failure is a blip — a deploy in flight, a node restarting — so a fault is declared only after three consecutive failures, and one success clears the count. Crossing into failure wakes the agent once to investigate and tell the owner; recovery is reported once; everything in between is silence. The transition is claimed before the turn is enqueued, so a crash cannot report the same change twice, and a check that cannot be run at all is recorded as no evidence rather than as an outage.
+The agent is woken only when the answer changes. A single failure is a blip — a deploy in flight, a node restarting — so a fault is declared only after three consecutive failures, and one success clears the count. Crossing into failure wakes the agent once to investigate and tell the owner; recovery is reported once; everything in between is silence. The transition is claimed before anything acts on it, so a crash can neither report the same change twice nor act on it twice, and a check that cannot be run at all is recorded as no evidence rather than as an outage.
+
+### Undoing a merge that broke production
+
+A failed deploy or canary already runs the rollback command, which puts production back on the last good build. Nothing puts the *repository* back: the bad merge is still on the trunk, and the next deploy ships it again. Where the merge was one the agent made on its own authority, closing that gap is its own mess to clean up.
+
+So when a fault is declared, three things together decide whether a revert is the honest response: the last thing merged there was a merge, that merge was unattended, and it landed within the last 48 hours. Miss any one and the answer is what it always was — investigate and tell the owner.
+
+Each condition is load-bearing. A fault says production stopped working, not why, and most of the time the cause is not a merge at all. It must be the **latest** merge that was unattended, not merely some merge, because "an unattended merge happened at some point" is true of nearly every project that merges unattended, and acting on it would undo work the owner approved themselves.
+
+The revert is ordinary work: a pipeline job whose order is to revert that exact commit, routed at the bug recipe or above, and carried through validation, review, and the same merge rule as everything else. A revert pushed around the gates would be the one unreviewed write to the trunk in the system, made by the component that had just proved it can be wrong.
+
+One revert per merge commit, ever. The ledger is keyed on the commit rather than on the job, and the check and the insert happen inside the same transaction as the job creation, so two passes cannot both decide they are the first. A revert job that fails feeds the failure brake like any other failing job, and a second automatic attempt at the same commit is precisely the loop the brake exists to stop. Anything that prevents a start — the brake, work already running, the once-per-commit bound — falls back to investigate-and-report. The owner's message says a revert is running when one is, and is otherwise the ordinary fault report it has always been.
 
 ## Self-maintenance
 
@@ -349,6 +361,22 @@ The plugin installs monitors it owns, keyed so installation is idempotent across
 The first two are told to say nothing when nothing needs a person; upkeep that reports on quiet days trains the owner to ignore it. The scorecard is the deliberate exception, because it is a report rather than a sweep. Every figure it carries is read from committed state, so the agent can report what happened without inventing a rate the database cannot support.
 
 The same self-maintenance setting also enables two daily services outside the monitor table. A read-only repository audit checks documentation staleness, debt markers, bug backlogs, and unresolved pull-request review findings. Disk housekeeping may remove a bounded batch of old top-level temporary directories, but only when each name matches the plugin's allowlist. Disk-space checks and pressure warnings remain active when deletion is disabled.
+
+### Starting work from what the audit found
+
+The audits could always see that a document names a file that is gone, or that a bug had sat untouched for six weeks. What they could not do is anything about it, so every finding waited on the owner reading a message and typing a request.
+
+A project whose policy sets `autonomy.intake` spends a small daily allowance on what its own audit found. Nothing about the resulting job is special: it plans, implements, is reviewed, and asks for its merge on exactly the terms that project already set. Starting needs no approval because starting is not the irreversible half — merging is, and merging is governed by the [standing approval](configuration.md#standing-merge-approval) rules unchanged.
+
+Selection is deliberately narrow, because what the allowance is spent on matters more than how much of it is spent. A finding only becomes work when the audit can state it concretely, which is why intake reads structured evidence recorded beside each finding rather than parsing the sentence the digest made of it. Stale documentation references go first — one file, one reference, one fix — then stale bugs, then unanswered review comments, then debt markers. A file carrying more than three markers is a direction rather than a task and stays a report. An issue title or review excerpt is text from outside the repository, so a work order that ends up carrying credential-shaped material drops the finding entirely; the digest still reports it.
+
+Every bound is checked inside the transaction that creates the job, because a cap read outside the write it protects is a cap two passes can both clear. The allowance is read from the stored policy rather than from the caller, the failure brake and the one-job-per-project claim from the tables that own them.
+
+A durable ledger keyed on the finding — not on the job — stops the same finding starting a second job while its first is still open, and keeps it quiet for fourteen days after that job settles. Whether it settled is read from the job's own state rather than stamped on the ledger, so a job that finished during a restart is not a finding suppressed forever by a stamp nobody was alive to write.
+
+In practice a project with a daily audit starts at most one such job a day, because the one-job-per-project claim holds until that job finishes. The allowance is what the day is worth in total, so a project whose work lands quickly can reach it and one whose work runs long cannot.
+
+The job records that nobody asked for it. That provenance is set when the job is created and never rewritten — provenance a later transition could change would be worth nothing — and the status card, `job show`, and the agent's own view of the job all say so. It sits beside the existing job origin rather than extending it: origin decides how the pipeline treats the work, and this decides only who is answerable for it existing. The owner also gets a plain notice when one starts. It is a notice, not a question.
 
 ## Controller delegation
 
