@@ -78,5 +78,6 @@ export function analyseTechDebt(input: Readonly<{
       auditId: "tech-debt",
       subject: path,
       detail: `${entry.count} marker${entry.count === 1 ? "" : "s"} in ${DEBT_SCAN_SCOPE} (${[...entry.kinds].sort().join(", ")})`,
+      intake: { kind: "debt", path, markers: entry.count, kinds: [...entry.kinds].sort() },
     }));
 }

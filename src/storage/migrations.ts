@@ -2246,6 +2246,90 @@ CREATE UNIQUE INDEX controller_voice_inbox_ordinal
   ON controller_voice_inbox(controller_key, ordinal);
 `] as const;
 
+/**
+ * A consensus pass is an ordinary review attempt with its own lens and its own
+ * stage, so it is bound to an exact head and survives restart on the same
+ * durable evidence as every other lens. It is a separate stage rather than a
+ * third lens inside `final_review` precisely so it can never be mistaken for a
+ * member of a required review group.
+ */
+export const CONSENSUS_REVIEW_MIGRATIONS = [String.raw`
+ALTER TABLE attempts RENAME TO attempts_before_consensus_lens;
+CREATE TABLE attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('implementation', 'review', 'validation')),
+  review_lens TEXT CHECK (review_lens IS NULL OR review_lens IN ('quality', 'risk', 'consensus')),
+  review_stage TEXT CHECK (review_stage IS NULL OR review_stage IN ('review', 'final_review', 'consensus')),
+  ordinal INTEGER NOT NULL,
+  thread_id TEXT,
+  head_sha TEXT,
+  handoff_path TEXT,
+  handoff_sha256 TEXT,
+  result_json TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER
+);
+INSERT INTO attempts (
+  id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha,
+  handoff_path, handoff_sha256, result_json, created_at, completed_at
+) SELECT
+  id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha,
+  handoff_path, handoff_sha256, result_json, created_at, completed_at
+FROM attempts_before_consensus_lens;
+DROP TABLE attempts_before_consensus_lens;
+CREATE UNIQUE INDEX attempts_non_review_ordinal
+  ON attempts(job_id, kind, ordinal) WHERE kind <> 'review';
+CREATE UNIQUE INDEX attempts_review_lens
+  ON attempts(job_id, review_stage, ordinal, review_lens)
+  WHERE kind = 'review' AND review_lens IS NOT NULL AND review_stage IS NOT NULL;
+`] as const;
+
+/**
+ * Work the agent starts on its own needs three durable answers before it may
+ * start anything: what began this job, whether this finding has already had one,
+ * and whether this merge has already been reverted once.
+ *
+ * `autonomous_origin` sits beside `job_origin` rather than extending it. Origin
+ * decides how the pipeline treats the work; this decides only who is answerable
+ * for it existing, and a job a person asked for leaves it null forever.
+ *
+ * The two ledgers are keyed on the thing that must not repeat, not on the job
+ * that repeated it: a finding per project, and a merge commit for all time. That
+ * is what makes "once, ever" a property of the schema rather than of the code
+ * that happened to write the row.
+ */
+export const AUTONOMOUS_INTAKE_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN autonomous_origin TEXT
+  CHECK (autonomous_origin IS NULL
+         OR autonomous_origin IN ('audit_intake', 'self_diagnosis', 'crash_revert'));
+
+CREATE TABLE audit_intake_findings (
+  project_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  audit_id TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  utc_day TEXT NOT NULL CHECK (length(utc_day) = 10),
+  started_at INTEGER NOT NULL,
+  PRIMARY KEY (project_id, fingerprint)
+);
+
+CREATE INDEX audit_intake_findings_day
+  ON audit_intake_findings (project_id, utc_day);
+
+CREATE TABLE crash_revert_jobs (
+  merge_commit_sha TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  merged_job_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  started_at INTEGER NOT NULL
+);
+
+CREATE INDEX crash_revert_jobs_project
+  ON crash_revert_jobs (project_id, started_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2317,4 +2401,6 @@ export const ALL_MIGRATIONS = [
   ...REFERENCE_DOCUMENT_REPAIR_MIGRATIONS,
   ...PROJECT_ADMISSION_CLEAR_HISTORY_MIGRATIONS,
   ...CONTROLLER_VOICE_INBOX_MIGRATIONS,
+  ...CONSENSUS_REVIEW_MIGRATIONS,
+  ...AUTONOMOUS_INTAKE_MIGRATIONS,
 ] as const;

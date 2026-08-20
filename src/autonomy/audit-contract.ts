@@ -18,12 +18,30 @@
  * lie. Every cut is counted out loud.
  */
 
+/**
+ * The facts behind a finding, in a shape that survives being read by something
+ * other than a person.
+ *
+ * The digest is prose, and prose is where a work order goes to die: "12 markers"
+ * cannot be counted and "#42" cannot be looked up without parsing the sentence
+ * back apart. An audit that can state its finding as a concrete piece of work
+ * says so here; one that cannot leaves this out, and nothing downstream may
+ * guess on its behalf.
+ */
+export type AuditFindingIntake =
+  | Readonly<{ kind: "bug"; issue: number; title: string }>
+  | Readonly<{ kind: "docs"; document: string; reference: string }>
+  | Readonly<{ kind: "debt"; path: string; markers: number; kinds: readonly string[] }>
+  | Readonly<{ kind: "review"; pr: number; unanswered: number; excerpt: string }>;
+
 /** One thing an audit noticed. */
 export type AuditFinding = {
   auditId: string;
   /** What the finding is about: a file, an issue number, a branch. */
   subject: string;
   detail: string;
+  /** Present only when this finding can be stated as a concrete work order. */
+  intake?: AuditFindingIntake;
 };
 
 export type AuditResult =

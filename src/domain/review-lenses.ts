@@ -6,7 +6,14 @@ import {
   guardResultEnvelopeSchema,
 } from "../capabilities/guards";
 
-export type ReviewLens = "quality" | "risk";
+/**
+ * `quality` and `risk` are the lenses a review group requires. `consensus` is
+ * deliberately not one of them: it is a single extra pass, run after the
+ * pipeline's own reviews already passed, to stand in for the owner's look at a
+ * change that argued with its review. It never joins a required group, and
+ * `requiredReviewLenses` never returns it.
+ */
+export type ReviewLens = "quality" | "risk" | "consensus";
 
 export type ReviewLensAttemptEvidence = Readonly<{
   id: string;
@@ -31,10 +38,33 @@ type SettledLens = Readonly<{
   summary: string;
 }>;
 
-const LENS_ORDER: Readonly<Record<ReviewLens, number>> = { quality: 0, risk: 1 };
+const LENS_ORDER: Readonly<Record<ReviewLens, number>> = { quality: 0, risk: 1, consensus: 2 };
 
 export function requiredReviewLenses(deliveryMode: DeliveryMode): readonly ReviewLens[] {
   return deliveryMode === "small_fix" ? ["quality"] : ["quality", "risk"];
+}
+
+export type ConsensusAssessment = "pending" | "pass" | "not_pass";
+
+/**
+ * What one consensus pass says about the exact head it was spawned for.
+ *
+ * Deliberately strict: only a settled verdict of `pass` carrying no findings at
+ * all, for this exact head, counts. Anything else — findings of any severity, a
+ * blocked or changes-requested verdict, unreadable evidence, or evidence bound
+ * to a different head — is `not_pass`, and the owner is asked. The pass is
+ * standing in for a person's judgement, so it has to be unambiguous.
+ */
+export function assessConsensusReview(
+  attempt: ReviewLensAttemptEvidence | null,
+  expectedHeadSha: string,
+): ConsensusAssessment {
+  if (!attempt || attempt.reviewLens !== "consensus") return "pending";
+  if (attempt.headSha !== expectedHeadSha) return "not_pass";
+  const settled = parseSettledLens({ ...attempt, reviewLens: "consensus" }, expectedHeadSha);
+  if (settled === "pending") return "pending";
+  if (settled === "invalid") return "not_pass";
+  return settled.outcome === "pass" && settled.findings.length === 0 ? "pass" : "not_pass";
 }
 
 function blocked(attemptIds: string[], reason: string): ReviewGroupAssessment {

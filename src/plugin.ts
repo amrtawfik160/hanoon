@@ -23,6 +23,7 @@ import {
   credentialBrokerConfigFingerprint,
   parseGlobalConfig,
   selfDiagnosisEnabled,
+  selfDiagnosisMode,
   systemUpkeepEnabled,
   workspaceReclaimEnabled,
 } from "./config";
@@ -110,6 +111,8 @@ import { isDisposableTempName } from "./autonomy/disk-space";
 import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
 import { WorkspaceHousekeepingService } from "./services/workspace-housekeeping-service";
 import { AuditService } from "./services/audit-service";
+import { AuditIntakeService } from "./services/audit-intake-service";
+import { CrashRevertService } from "./services/crash-revert-service";
 import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
@@ -133,7 +136,9 @@ import {
 import {
   SELF_DIAGNOSIS_SERVICE_NAME,
   SelfDiagnosisService,
+  buildSelfDiagnosisWorkOrder,
   findSelfDiagnosisCandidates,
+  selfDiagnosisFingerprint,
   type SelfDiagnosisLedger,
   type SelfDiagnosisLedgerState,
   type SelfDiagnosisTarget,
@@ -400,6 +405,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       label: "Self-diagnosis project id",
       description: "The enabled BB project containing this plugin repository. Enabling self-diagnosis requires a plugin reload.",
       default: "",
+    },
+    selfDiagnosisMode: {
+      type: "select",
+      label: "What a diagnosis becomes",
+      description: "Draft PR pushes a branch for you to read. Pipeline files the fix as an ordinary reviewed job instead, and needs that project's policy to carry an audit intake allowance, whose daily cap and finding ledger it shares. Without one it falls back to a draft pull request.",
+      options: ["draft-pr", "pipeline"],
+      default: "draft-pr",
     },
     capabilityJobGraph: {
       type: "select",
@@ -734,6 +746,17 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       const current = store.getJob(invocation.jobId);
       const currentQuality = current?.reviewThreadId ? store.getAttemptByThreadId(current.reviewThreadId) : null;
       const invocationAttempt = store.getAttempt(invocation.attemptId);
+      // A consensus pass has no review group and no quality lane to agree with:
+      // it is one attempt, bound to the approved head, while the job waits for
+      // its approval. Everything else it must still match exactly.
+      if (invocationAttempt?.reviewLens === "consensus") {
+        return current !== null && current.id === invocation.jobId && current.version === expectedVersion &&
+          current.state === "awaiting_merge_approval" &&
+          current.environmentId === invocation.environmentId && current.prHeadSha === invocation.expectedSha &&
+          invocationAttempt.jobId === current.id && invocationAttempt.kind === "review" &&
+          invocationAttempt.reviewStage === "consensus" &&
+          current.implementationThreadId === invocation.implementationThreadId;
+      }
       return current !== null && current.id === invocation.jobId && current.version === expectedVersion &&
         (current.state === "reviewing" || current.state === "final_reviewing") &&
         current.environmentId === invocation.environmentId && current.prHeadSha === invocation.expectedSha &&
@@ -1175,8 +1198,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   // Health ids share the monitor id space, which is derived from the clock and
   // kept above real Telegram update ids.
   let healthUpdateId = 0;
+  const crashRevert = new CrashRevertService({
+    store,
+    onWorkAvailable: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
   const productionHealth = new ProductionHealthService({
     store,
+    autoRevert: crashRevert,
     commands: {
       run: async ({ projectId, command }) => {
         const projects = await bb.sdk.projects.list({});
@@ -1313,6 +1342,16 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     reclaimArmed: () => config.ok && workspaceReclaimEnabled(config.value),
     warn: (message) => bb.log.warn(message),
   });
+  const auditIntake = new AuditIntakeService({
+    store,
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    onWorkAvailable: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
   const audits = new AuditService({
     store,
     audits: createAuditAccess({ sdk: bb.sdk as never, store, terminal }),
@@ -1323,6 +1362,10 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
     // Read-only, so it rides the existing upkeep switch rather than adding one.
     auditsArmed: () => config.ok && systemUpkeepEnabled(config.value),
+    // Acting on a finding is the project's own choice, declared in its policy,
+    // so this is wired unconditionally: the intake service starts nothing for a
+    // project that did not ask for it.
+    onResults: (project, results, now) => auditIntake.consider(project, results, now),
     warn: (message) => bb.log.warn(message),
   });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
@@ -1547,6 +1590,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     const pipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
     const reviewStage = job.state === "reviewing" || job.state === "final_reviewing";
     const implementationStage = ["implementing", "remediating"].includes(job.state);
+    // A consensus pass runs while the job waits for its approval, so it belongs
+    // to no stage the loop already watched. Its thread is found from the same
+    // durable attempt that holds its verdict, bound to the exact approved head.
+    const consensusAttempt = job.state === "awaiting_merge_approval" && job.prHeadSha
+      ? store.getConsensusReviewAttempt(job.id, job.prHeadSha)
+      : null;
     if (reviewStage && requestedResourceId === undefined && job.reviewThreadId) {
       const quality = store.getAttemptByThreadId(job.reviewThreadId);
       if (quality?.reviewStage && quality.kind === "review") {
@@ -1572,11 +1621,15 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     if (requestedResourceId !== undefined) {
       const requestedResourceMatches = pipelineAttempt?.threadId === requestedResourceId ||
         (reviewStage && requestedReviewMatches) ||
+        (consensusAttempt !== null && consensusAttempt.threadId === requestedResourceId) ||
         (implementationStage && job.implementationThreadId === requestedResourceId);
       if (!requestedResourceMatches) return;
     }
     const reviewResourceId = requestedReviewMatches ? requestedResourceId ?? null : job.reviewThreadId;
-    const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? reviewResourceId : implementationStage ? job.implementationThreadId : null);
+    const resourceId = pipelineAttempt?.threadId
+      ?? (reviewStage ? reviewResourceId
+        : implementationStage ? job.implementationThreadId
+        : consensusAttempt?.threadId ?? null);
     if (!resourceId) return;
     const recoveryRetryPayload = (): Record<string, unknown> => {
       if (pipelineRole === "CRITIQUE") {
@@ -1594,7 +1647,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     const workerKind = pipelineRole === "PLAN" ? "plan" as const
       : pipelineRole === "CRITIQUE" ? "critique" as const
       : pipelineRole === "DOCS" ? "docs" as const
-      : reviewStage ? "review" as const
+      : reviewStage || consensusAttempt !== null ? "review" as const
       : "implementation" as const;
     const generation = workerRegistrationGeneration(job, workerKind);
     /**
@@ -1650,7 +1703,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       currentRequestedAttempt.reviewStage === currentQualityAttempt.reviewStage &&
       currentRequestedAttempt.ordinal === currentQualityAttempt.ordinal;
     const currentResourceId = currentPipelineAttempt?.threadId ??
-      (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId) : current?.implementationThreadId);
+      (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId)
+        : consensusAttempt !== null ? consensusAttempt.threadId
+        : current?.implementationThreadId);
     if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
     let hasPendingInteraction = false;
@@ -1917,6 +1972,21 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     if (!completion.event || !fenceCurrent()) return;
     const latest = store.getJob(invocation.jobId);
     const latestAttempt = store.getAttempt(invocation.attemptId);
+    // A consensus pass belongs to no review group: it runs after the group
+    // already passed, while the job waits for its approval. Its verdict is now
+    // durable on its own attempt, so the approval decision is simply made
+    // again, on the same rules, with that evidence in hand.
+    if (latestAttempt?.reviewLens === "consensus") {
+      if (!latest || latest.state !== "awaiting_merge_approval" ||
+        latestAttempt.jobId !== invocation.jobId ||
+        latestAttempt.headSha !== invocation.expectedSha ||
+        latest.prHeadSha !== invocation.expectedSha || !fenceCurrent()) return;
+      applyExecutorEvent(job.id, latest.version, {
+        type: "CONSENSUS_SETTLED",
+        headSha: invocation.expectedSha,
+      });
+      return;
+    }
     const latestQualityAttempt = latest?.reviewThreadId ? store.getAttemptByThreadId(latest.reviewThreadId) : null;
     if (!latest || !latestAttempt || latestAttempt.jobId !== invocation.jobId ||
       latestAttempt.threadId !== invocation.reviewThreadId || latestAttempt.headSha !== invocation.expectedSha ||
@@ -2111,6 +2181,26 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         environmentStatus: input.environmentStatus,
         signal: input.signal,
       }),
+      mode: () => config.ok ? selfDiagnosisMode(config.value) : "draft-pr",
+      // Filed through the audit intake path on purpose, so the project's own
+      // daily allowance and finding ledger bound this too. A second source of
+      // unattended work keeping its own count would quietly double the first.
+      filePipelineJob: (input) => {
+        const filed = auditIntake.file({
+          projectId: input.target.projectId,
+          task: buildSelfDiagnosisWorkOrder({
+            candidate: input.candidate,
+            diagnosis: input.diagnosis,
+          }),
+          auditId: "self-diagnosis",
+          subject: input.candidate.kind,
+          fingerprint: selfDiagnosisFingerprint(input.candidate.sourceId),
+          now: clock(),
+        });
+        return "refused" in filed
+          ? { outcome: "fallback", reason: filed.refused }
+          : { outcome: "filed", jobId: filed.jobId };
+      },
       modelRoute: () => {
         if (!config.ok) throw new Error(config.message);
         return backgroundCapabilityModelRoute(config.value);

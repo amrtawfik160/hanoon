@@ -45,9 +45,37 @@ The controller permission mode defaults to `auto`; it remains an operator settin
 
 An owner's tap on a controller interaction commits durably — decision, callback outcome, and acknowledgement together — before BB is told, and survives a restart. The reply itself is one durable logical outbox obligation, but Telegram delivery is **at-least-once**: an ambiguous send is retained as unknown, a retry may duplicate the Telegram message, and an attempt or an enqueue is never recorded as delivered.
 
-Merge approval is one-use, expiring, and bound to the current full pull-request head. Deployment and canary run only after the merge is confirmed and the worktree is verified at the merge commit. The plugin does not automatically run rollback.
+Merge approval is one-use, expiring, and bound to the current full pull-request head, unless the project holds a standing grant — see [Unattended merging](#unattended-merging). Deployment and canary run only after the merge is confirmed and the worktree is verified at the merge commit. A configured `rollbackCommand` is run automatically as soon as a deploy or canary command fails; with none configured, nothing is rolled back.
 
 Memory is owner-visible and correctable from the chat. Credential-shaped text is refused before it can be stored or indexed, with one deliberate exception: `bb telegram-agent memory import` runs on the protected BB host under the owner's own identity and stores its entries unscreened. Nothing the agent writes uses that path — its own `remember` is still refused. Hidden threads remain unreachable from the agent's thread tools.
+
+## Text from outside the repository
+
+A project whose policy sets `autonomy.intake` lets its daily audit start work rather than only report it. Two of the four audits build that work order out of text nobody in this installation wrote: the title of a GitHub issue (`bug-backlog`) and the body of an unresolved pull-request review comment (`pr-review-findings`). Anyone who can open an issue or leave a review comment on the configured repository can author that text.
+
+That text reaches three places: the durable job record, the Telegram status card, and the implementation worker's prompt. Treat it as an untrusted input to a model, because that is what it is.
+
+What bounds it:
+
+- **`autonomy.intake` is opt-in and absent by default.** Without it the audits report exactly as they always did and no outside text becomes a prompt this way.
+- **Each excerpt is capped at 200 characters** and the whole work order at 1,200, so no amount of outside text can become the bulk of the order.
+- **Control and invisible characters are removed** before the excerpt is carried: the C0 and C1 ranges, DEL, soft hyphen, line and paragraph separators, zero-width and bidirectional formatting marks, and the interlinear annotation characters. What the owner reads on the status card is what the worker receives.
+- **The excerpt is delimited as quotation** — `«…»`, with those two characters stripped from the content so quoted text cannot close its own quotation — and the order says in words that the quoted part is information rather than instruction.
+- **A work order carrying credential-shaped text drops the finding entirely.** It is not redacted in place; nothing is started from it. The daily digest still reports the finding to the owner.
+
+What this does **not** claim: the quoting is instruction text, and instruction text is not enforcement. A worker is a model and may still act on something it reads inside the marks. The boundaries that hold are the ones outside the prompt — the excerpt caps, the character strip, the credential refusal, and the fact that whatever the worker produces still passes deterministic validation, independent review, and the project's own merge rule before it can reach the trunk. An unattended merge additionally requires GitHub to enforce at least one required status check on the base branch, verified at `project enable`.
+
+## Unattended merging
+
+A project may merge without the owner's signature, either because they tapped **Merge + deploy, and always from now on** or because the project's policy sets `autonomy.unattendedMerge`. Both replace the owner's signature and nothing else: every review, validation, and evidence gate that produced the merge candidate still runs, and unusual jobs still stop to ask.
+
+- `bb telegram-agent project enable` refuses to store either merge grant unless the policy's base branch has branch protection or a ruleset requiring at least one status check, asked live through the authenticated `gh` CLI. A 404, an unreadable answer, and a protection requiring nothing all refuse. Protection that does not bind administrators is accepted with a warning, because the merge runs under an owner-scoped token GitHub may exempt.
+- A change that needed two or more rounds of review fixes is not waved through: it needs an independent second review of the exact head, on a provider the review stage did not use, and only an unambiguous pass merges it. That independence is enforced, not advised: a policy pinning the second opinion to the review stage's own provider is refused at `project enable` and at load, and a route that resolves back to it is treated as no route, which asks the owner.
+- A production deploy or canary that fails, and whose rollback was missing or itself failed, withdraws both grants durably and stops the project admitting new work until the owner sends `/resume`. That brake carries no failure fingerprint and replaces any fingerprinted brake already holding the project, so the agent's own one-per-cause clear path cannot lift it.
+- `autonomy.unattendedMerge` is also what lets a project revert unattended a merge that broke production, and lets the continuation sweep re-enter a merge or production stage on its own. A project whose only grant is the owner's button tap does neither. An automatic revert is never itself reverted automatically.
+- `/approvals off` withdraws a grant by name or all of them. A policy-declared grant stays silenced until the project's enabled policy snapshot is stored again.
+
+GitHub authentication, repository rules, and branch protection remain external security boundaries. Nothing here replaces them; the enable-time preflight only refuses to proceed without them.
 
 ## Credential broker trust boundary
 
