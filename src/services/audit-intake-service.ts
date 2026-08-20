@@ -42,6 +42,8 @@ export type AuditIntakeDependencies = {
 
 export type IntakeStart = Readonly<{
   jobId: string;
+  origin: "audit_intake" | "self_diagnosis";
+  /** The check that found it, or `self-diagnosis` for a diagnosed failure. */
   auditId: string;
   subject: string;
   task: string;
@@ -65,11 +67,14 @@ function startedNotice(input: Readonly<{
   alias: string;
   start: IntakeStart;
 }>): string {
+  const because = input.start.origin === "self_diagnosis"
+    ? "a failure this agent diagnosed in its own controller"
+    : "the daily check on this project found something it is configured to act on";
   return [
-    `A job just started on ${input.alias} that nobody asked for: the daily check on this project found something and it is configured to act on findings.`,
+    `A job just started on ${input.alias} that nobody asked for: ${because}.`,
     "",
     `What it is working on: ${input.start.task}`,
-    `Where it came from: the ${input.start.auditId} check, on ${input.start.subject}.`,
+    `Where it came from: ${input.start.auditId}, on ${input.start.subject}.`,
     "",
     "Tell the owner in one or two plain lines that this started and what it is for. This is a notice, not a question — do not ask them to approve anything, and do not offer to stop it unless they ask.",
   ].join("\n");
@@ -90,24 +95,12 @@ export class AuditIntakeService {
     results: readonly AuditResult[],
     now: number,
   ): readonly IntakeStart[] {
-    let alias: string;
-    let candidates: readonly IntakeWorkOrder[];
-    try {
-      const policy = this.dependencies.store.listEnabledProjectPolicies()
-        .find((record) => record.policy.projectId === project.projectId);
-      if (policy?.policy.autonomy?.intake === undefined) return [];
-      alias = policy.policy.alias;
-      candidates = intakeWorkOrders({ results });
-    } catch (error) {
-      this.dependencies.warn?.(
-        `Audit intake could not read its bounds: ${redactError(error).slice(0, 160)}`,
-      );
-      return [];
-    }
+    const alias = this.aliasWithIntake(project.projectId);
+    if (alias === null) return [];
 
     const started: IntakeStart[] = [];
-    for (const candidate of candidates) {
-      const outcome = this.start(project.projectId, candidate, now);
+    for (const candidate of intakeWorkOrders({ results })) {
+      const outcome = this.start(project.projectId, candidate, "audit_intake", undefined, now);
       if (outcome === null) break;
       if (outcome === "skipped") continue;
       started.push(outcome);
@@ -118,12 +111,56 @@ export class AuditIntakeService {
   }
 
   /**
+   * File one work order that did not come from an audit finding, under the same
+   * allowance and the same ledger.
+   *
+   * Sharing them is the point rather than a convenience: a project that said it
+   * would start two jobs a day meant two, and a second source of unattended work
+   * that kept its own count would quietly make that four.
+   */
+  public file(input: Readonly<{
+    projectId: string;
+    task: string;
+    auditId: string;
+    subject: string;
+    fingerprint: string;
+    now: number;
+  }>): IntakeStart | { refused: string } {
+    const alias = this.aliasWithIntake(input.projectId);
+    if (alias === null) return { refused: "the project has no audit intake allowance" };
+    // A diagnosis is a guess about a failure, so it goes down the bug route:
+    // reproduce first, then fix. Nothing about it is a typo or a copy change.
+    const started = this.start(input.projectId, input, "self_diagnosis", "bug", input.now);
+    if (started === null) return { refused: "the project cannot take unattended work right now" };
+    if (started === "skipped") return { refused: "this failure has already had its job" };
+    this.notify(alias, started, input.now);
+    this.dependencies.onWorkAvailable?.();
+    return started;
+  }
+
+  /** The project's alias when it accepts unattended work, and null when it does not. */
+  private aliasWithIntake(projectId: string): string | null {
+    try {
+      const record = this.dependencies.store.listEnabledProjectPolicies()
+        .find((entry) => entry.policy.projectId === projectId);
+      return record?.policy.autonomy?.intake === undefined ? null : record.policy.alias;
+    } catch (error) {
+      this.dependencies.warn?.(
+        `Audit intake could not read its bounds: ${redactError(error).slice(0, 160)}`,
+      );
+      return null;
+    }
+  }
+
+  /**
    * One work order, offered to the store. `null` ends the pass, `"skipped"`
    * moves to the next finding, and a start is a job that exists.
    */
   private start(
     projectId: string,
     candidate: IntakeWorkOrder,
+    origin: "audit_intake" | "self_diagnosis",
+    minimumRecipe: "bug" | undefined,
     now: number,
   ): IntakeStart | "skipped" | null {
     let outcome: ReturnType<TelegramAgentStore["createAutonomousJob"]>;
@@ -131,7 +168,8 @@ export class AuditIntakeService {
       outcome = this.dependencies.store.createAutonomousJob({
         projectId,
         task: candidate.task,
-        origin: "audit_intake",
+        origin,
+        ...(minimumRecipe === undefined ? {} : { minimumRecipe }),
         intake: {
           fingerprint: candidate.fingerprint,
           auditId: candidate.auditId,
@@ -148,6 +186,7 @@ export class AuditIntakeService {
     if (outcome.outcome === "created") {
       return {
         jobId: outcome.job.id,
+        origin,
         auditId: candidate.auditId,
         subject: candidate.subject,
         task: candidate.task,

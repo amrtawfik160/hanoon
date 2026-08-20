@@ -220,3 +220,57 @@ it("starts nothing at all when the durable bounds cannot be read", () => {
 
   expect(intake.consider(AUDITED, bugResults(1), NOW)).toEqual([]);
 });
+
+it("files a diagnosed failure against the same allowance the audit spends", () => {
+  const { store, database } = storeWithProject({ maxJobsPerDay: 1 });
+  const { intake, enqueueControllerTurn } = service(store);
+
+  const filed = intake.file({
+    projectId: PROJECT,
+    task: "Fix a failure this agent diagnosed in its own controller.",
+    auditId: "self-diagnosis",
+    subject: "failed_turn",
+    fingerprint: "f".repeat(32),
+    now: NOW,
+  });
+  expect(filed).toMatchObject({ origin: "self_diagnosis" });
+  if ("refused" in filed) throw new Error("the diagnosis should have been filed");
+
+  expect(store.getJob(filed.jobId)).toMatchObject({ autonomousOrigin: "self_diagnosis" });
+  // A diagnosis is a guess about a failure, so it takes the bug route.
+  expect(store.getJob(filed.jobId)?.taskRecipe).toBe("bug");
+  expect(enqueueControllerTurn.mock.calls[0]?.[0]).toMatchObject({ origin: "system" });
+
+  // The allowance was one job a day, and the diagnosis just spent it.
+  finishJob(database, filed.jobId, "merged", NOW + 1);
+  expect(intake.consider(AUDITED, bugResults(1), NOW + 2)).toEqual([]);
+});
+
+it("refuses to file a diagnosis for a project that never asked for unattended work", () => {
+  const { store } = storeWithProject();
+  const { intake } = service(store);
+
+  expect(intake.file({
+    projectId: PROJECT,
+    task: "Fix a diagnosed failure.",
+    auditId: "self-diagnosis",
+    subject: "failed_turn",
+    fingerprint: "f".repeat(32),
+    now: NOW,
+  })).toEqual({ refused: "the project has no audit intake allowance" });
+});
+
+it("refuses to file a diagnosis while the project already has work", () => {
+  const { store } = storeWithProject({ maxJobsPerDay: 4 });
+  const { intake } = service(store);
+  expect(intake.consider(AUDITED, bugResults(1), NOW)).toHaveLength(1);
+
+  expect(intake.file({
+    projectId: PROJECT,
+    task: "Fix a diagnosed failure.",
+    auditId: "self-diagnosis",
+    subject: "failed_turn",
+    fingerprint: "f".repeat(32),
+    now: NOW,
+  })).toMatchObject({ refused: expect.stringContaining("cannot take unattended work") });
+});

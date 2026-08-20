@@ -59,6 +59,10 @@ const globalConfigSchema = z.object({
     z.boolean().default(false),
   ),
   selfDiagnosisProjectId: z.string().trim().max(256).default(""),
+  // What a diagnosis becomes. `draft-pr` pushes a branch nobody reviewed and
+  // waits for a person; `pipeline` files the fix as ordinary work and lets the
+  // gates decide. Meaningful only when self-diagnosis is on at all.
+  selfDiagnosisMode: z.enum(["draft-pr", "pipeline"]).default("draft-pr"),
   capabilityJobGraph: z.enum(["adaptive", "legacy"]).default("adaptive"),
   controllerCapabilityMode: z.enum(["bundled", "all-tools"]).default("bundled"),
   capabilityModelRouting: z.enum(["adaptive", "strong-only"]).default("adaptive"),
@@ -85,6 +89,7 @@ export function parseGlobalConfig(values: {
   workspaceReclaim?: boolean | string;
   selfDiagnosisEnabled?: boolean | string;
   selfDiagnosisProjectId?: string;
+  selfDiagnosisMode?: string;
   capabilityJobGraph?: string;
   controllerCapabilityMode?: string;
   capabilityModelRouting?: string;
@@ -123,6 +128,17 @@ export function workspaceReclaimEnabled(config: GlobalConfig): boolean {
 
 export function selfDiagnosisEnabled(config: GlobalConfig): boolean {
   return config.selfDiagnosisEnabled;
+}
+
+/**
+ * A diagnosis is a guess about a failure, and the difference between the two
+ * modes is who decides whether the guess was right. The draft pull request asks
+ * a person; the pipeline asks the project's own gates. The default stays the
+ * person, because the pipeline answer requires a project that has already said
+ * how much work it will start unattended.
+ */
+export function selfDiagnosisMode(config: GlobalConfig): "draft-pr" | "pipeline" {
+  return config.selfDiagnosisMode;
 }
 
 export function controllerExecutionProfile(config: GlobalConfig): ControllerExecutionProfile {

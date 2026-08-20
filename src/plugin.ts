@@ -23,6 +23,7 @@ import {
   credentialBrokerConfigFingerprint,
   parseGlobalConfig,
   selfDiagnosisEnabled,
+  selfDiagnosisMode,
   systemUpkeepEnabled,
   workspaceReclaimEnabled,
 } from "./config";
@@ -134,7 +135,9 @@ import {
 import {
   SELF_DIAGNOSIS_SERVICE_NAME,
   SelfDiagnosisService,
+  buildSelfDiagnosisWorkOrder,
   findSelfDiagnosisCandidates,
+  selfDiagnosisFingerprint,
   type SelfDiagnosisLedger,
   type SelfDiagnosisLedgerState,
   type SelfDiagnosisTarget,
@@ -401,6 +404,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       label: "Self-diagnosis project id",
       description: "The enabled BB project containing this plugin repository. Enabling self-diagnosis requires a plugin reload.",
       default: "",
+    },
+    selfDiagnosisMode: {
+      type: "select",
+      label: "What a diagnosis becomes",
+      description: "Draft PR pushes a branch for you to read. Pipeline files the fix as an ordinary reviewed job instead, and needs that project's policy to carry an audit intake allowance, whose daily cap and finding ledger it shares. Without one it falls back to a draft pull request.",
+      options: ["draft-pr", "pipeline"],
+      default: "draft-pr",
     },
     capabilityJobGraph: {
       type: "select",
@@ -2164,6 +2174,26 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         environmentStatus: input.environmentStatus,
         signal: input.signal,
       }),
+      mode: () => config.ok ? selfDiagnosisMode(config.value) : "draft-pr",
+      // Filed through the audit intake path on purpose, so the project's own
+      // daily allowance and finding ledger bound this too. A second source of
+      // unattended work keeping its own count would quietly double the first.
+      filePipelineJob: (input) => {
+        const filed = auditIntake.file({
+          projectId: input.target.projectId,
+          task: buildSelfDiagnosisWorkOrder({
+            candidate: input.candidate,
+            diagnosis: input.diagnosis,
+          }),
+          auditId: "self-diagnosis",
+          subject: input.candidate.kind,
+          fingerprint: selfDiagnosisFingerprint(input.candidate.sourceId),
+          now: clock(),
+        });
+        return "refused" in filed
+          ? { outcome: "fallback", reason: filed.refused }
+          : { outcome: "filed", jobId: filed.jobId };
+      },
       modelRoute: () => {
         if (!config.ok) throw new Error(config.message);
         return backgroundCapabilityModelRoute(config.value);
