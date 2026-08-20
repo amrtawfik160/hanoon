@@ -1,6 +1,7 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
-import { REVERT_WINDOW_MS, decideCrashRevert } from "../src/autonomy/crash-revert";
+import { REVERT_WINDOW_MS, decideCrashRevert, type RevertPolicy } from "../src/autonomy/crash-revert";
+import type { ProjectPolicy } from "../src/domain/models";
 import { hashSecret } from "../src/crypto";
 import { CrashRevertService } from "../src/services/crash-revert-service";
 import { openStore, type CompletedMergeRecord, type TelegramAgentStore } from "../src/storage/store";
@@ -17,40 +18,88 @@ function merge(overrides: Partial<CompletedMergeRecord> = {}): CompletedMergeRec
     mergeCommitSha: MERGE_SHA,
     mergedAt: NOW - 60_000,
     unattended: true,
+    automaticRevert: false,
     ...overrides,
   };
 }
 
+/** A project whose own policy asked for unattended delivery. */
+function declared(): RevertPolicy {
+  return { enabled: true, autonomy: { unattendedMerge: true, mergeWithoutProduction: false } };
+}
+
 it("reverts only when the last merge here was one nobody was asked about", () => {
-  expect(decideCrashRevert({ merge: merge(), now: NOW }).outcome).toBe("revert");
+  expect(decideCrashRevert({ merge: merge(), policy: declared(), now: NOW }).outcome).toBe("revert");
   // The owner approved the last merge, so undoing it is their call, not this one's.
-  expect(decideCrashRevert({ merge: merge({ unattended: false }), now: NOW })).toMatchObject({
+  expect(decideCrashRevert({ merge: merge({ unattended: false }), policy: declared(), now: NOW })).toMatchObject({
     outcome: "investigate",
   });
-  expect(decideCrashRevert({ merge: null, now: NOW })).toMatchObject({ outcome: "investigate" });
+  expect(decideCrashRevert({ merge: null, policy: declared(), now: NOW })).toMatchObject({ outcome: "investigate" });
+});
+
+it("reverts nothing for a project whose policy never asked to merge unattended", () => {
+  // Starting a repository change nobody requested is what the policy opts into.
+  // A standing approval the owner tapped means only "merge this without asking".
+  for (const policy of [
+    null,
+    { enabled: true, autonomy: undefined } as RevertPolicy,
+    { enabled: true, autonomy: { unattendedMerge: false, mergeWithoutProduction: false } } as RevertPolicy,
+    { enabled: false, autonomy: { unattendedMerge: true, mergeWithoutProduction: false } } as RevertPolicy,
+  ]) {
+    expect(decideCrashRevert({ merge: merge(), policy, now: NOW })).toMatchObject({
+      outcome: "investigate",
+    });
+  }
+});
+
+it("will not revert a revert, which would put the broken merge back", () => {
+  expect(decideCrashRevert({
+    merge: merge({ automaticRevert: true }),
+    policy: declared(),
+    now: NOW,
+  })).toMatchObject({ outcome: "investigate" });
 });
 
 it("will not blame a merge that landed too long ago to be the cause", () => {
   expect(decideCrashRevert({
     merge: merge({ mergedAt: NOW - REVERT_WINDOW_MS + 1_000 }),
+    policy: declared(),
     now: NOW,
   }).outcome).toBe("revert");
   expect(decideCrashRevert({
     merge: merge({ mergedAt: NOW - REVERT_WINDOW_MS - 1_000 }),
+    policy: declared(),
     now: NOW,
   })).toMatchObject({ outcome: "investigate" });
   // A merge timestamped in the future is unreadable evidence, not fresh evidence.
-  expect(decideCrashRevert({ merge: merge({ mergedAt: NOW + 60_000 }), now: NOW })).toMatchObject({
+  expect(decideCrashRevert({ merge: merge({ mergedAt: NOW + 60_000 }), policy: declared(), now: NOW })).toMatchObject({
     outcome: "investigate",
   });
 });
 
-function fixture(): { store: TelegramAgentStore; database: ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["storage"]["database"]> } {
+/** The policy a project must carry before anything here starts by itself. */
+function unattendedPolicy(): ProjectPolicy {
+  return policyFixture({
+    projectId: PROJECT,
+    alias: "alpha",
+    enabled: true,
+    production: {
+      ...policyFixture().production!,
+      rollbackCommand: { name: "rollback", command: "./rollback.sh", timeoutMs: 60_000 },
+    },
+    autonomy: { unattendedMerge: true, mergeWithoutProduction: false },
+  });
+}
+
+function fixture(policy: ProjectPolicy = unattendedPolicy()): {
+  store: TelegramAgentStore;
+  database: ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["storage"]["database"]>;
+} {
   const { bb } = createFakePluginHost({ pluginId: `telegram-crash-revert-${fixtureNumber++}` });
   const store = openStore(bb.storage, bb.storage.kv, () => NOW);
   store.createPairingCode(hashSecret("pair"), NOW - 10_000, NOW + 10_000);
   expect(store.pairOwnerWithCode(hashSecret("pair"), "7", "7", NOW - 5_000)).toEqual({ ok: true });
-  store.upsertProjectPolicy(policyFixture({ projectId: PROJECT, alias: "alpha", enabled: true }), NOW - 3_000);
+  store.upsertProjectPolicy(policy, NOW - 3_000);
   return { store, database: bb.storage.database() };
 }
 
@@ -92,9 +141,74 @@ function hashJobId(jobId: string): number {
   return value;
 }
 
+/**
+ * A started revert job carried all the way through: reviewed, merged on the
+ * same standing grant, and out of the project's way.
+ */
+function landRevert(
+  store: TelegramAgentStore,
+  database: ReturnType<typeof fixture>["database"],
+  jobId: string,
+  sha: string,
+  mergedAt: number,
+): void {
+  database.prepare(
+    "UPDATE jobs SET state = 'merged', merge_commit_sha = ?, merged_at = ?, updated_at = ? WHERE id = ?",
+  ).run(sha, new Date(mergedAt).toISOString(), mergedAt, jobId);
+  database.prepare(
+    "UPDATE job_admissions SET state = 'released', released_at = ?, release_reason = 'test' WHERE job_id = ?",
+  ).run(mergedAt, jobId);
+  store.recordMergeAuthorityUse({ projectId: PROJECT, jobId, now: mergedAt });
+}
+
 function service(store: TelegramAgentStore) {
   return new CrashRevertService({ store, warn: () => {} });
 }
+
+it("starts nothing for a project whose only standing approval is the owner's button", () => {
+  // The button predates unattended delivery and means what it always meant:
+  // merge this reviewed job without asking. It does not start work.
+  const { store, database } = fixture(policyFixture({ projectId: PROJECT, alias: "alpha", enabled: true }));
+  store.grantMergeAuthority({ projectId: PROJECT, userId: "7", chatId: "7", now: NOW - 2_000 });
+  recordMerge({ store, database, jobId: "job_merged", sha: MERGE_SHA, mergedAt: NOW - 60_000, unattended: true });
+
+  expect(service(store).start({ projectId: PROJECT, alias: "alpha", now: NOW })).toMatchObject({
+    outcome: "investigate",
+    reason: expect.stringContaining("has not asked to merge unattended"),
+  });
+  expect(store.getCrashRevertJob(MERGE_SHA)).toBeNull();
+});
+
+it("does not revert its own revert when production breaks again", () => {
+  // Reverting a revert re-applies the merge that broke production, through the
+  // same standing grant. The chain stops at one.
+  const { store, database } = fixture();
+  recordMerge({ store, database, jobId: "job_merged", sha: MERGE_SHA, mergedAt: NOW - 60_000, unattended: true });
+  const first = service(store).start({ projectId: PROJECT, alias: "alpha", now: NOW });
+  if (first.outcome !== "started") throw new Error("the first revert should have started");
+
+  const revertSha = "e".repeat(40);
+  landRevert(store, database, first.jobId, revertSha, NOW + 60_000);
+  // The revert is the latest merge here, it was unattended, and it is well
+  // inside the window: every other condition for a second revert is met.
+  expect(store.getLatestCompletedMerge(PROJECT)).toMatchObject({
+    mergeCommitSha: revertSha,
+    unattended: true,
+    automaticRevert: true,
+  });
+
+  const second = service(store).start({
+    projectId: PROJECT,
+    alias: "alpha",
+    now: NOW + 12 * 60 * 60_000,
+  });
+
+  expect(second).toMatchObject({
+    outcome: "investigate",
+    reason: expect.stringContaining("itself an automatic revert"),
+  });
+  expect(store.getCrashRevertJob(revertSha)).toBeNull();
+});
 
 it("starts one revert job through the ordinary pipeline", () => {
   const { store, database } = fixture();

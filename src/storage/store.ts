@@ -616,6 +616,12 @@ export type CompletedMergeRecord = Readonly<{
   mergedAt: number;
   /** True when a standing grant merged it, from the append-only authority log. */
   unattended: boolean;
+  /**
+   * True when this merge is one an automatic revert produced, read from the
+   * job's own durable origin. Such a merge is never itself a revert candidate:
+   * reverting it would re-apply the change that broke production.
+   */
+  automaticRevert: boolean;
 }>;
 
 export type DelegationState = "open" | "fired" | "cancelled" | "failed";
@@ -11343,14 +11349,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * after production breaks; "an unattended merge happened at some point" is not,
    * and answering the second while sounding like the first would revert work the
    * owner merged themselves.
+   *
+   * A merge an automatic revert produced is reported as such rather than
+   * skipped over, so the caller can refuse outright instead of walking back to
+   * the merge that revert already undid.
    */
   public getLatestCompletedMerge(projectId: string): CompletedMergeRecord | null {
     assertControllerIdentifier(projectId, "projectId");
     const row = this.db.prepare(
-      `SELECT id, merge_commit_sha, merged_at FROM jobs
+      `SELECT id, merge_commit_sha, merged_at, autonomous_origin FROM jobs
         WHERE project_id = ? AND merge_commit_sha IS NOT NULL AND merged_at IS NOT NULL
         ORDER BY merged_at DESC, id DESC LIMIT 1`,
-    ).get(projectId) as { id: string; merge_commit_sha: string; merged_at: string } | undefined;
+    ).get(projectId) as
+      { id: string; merge_commit_sha: string; merged_at: string; autonomous_origin: string | null } | undefined;
     if (!row) return null;
     const mergedAt = Date.parse(row.merged_at);
     if (!Number.isFinite(mergedAt)) return null;
@@ -11363,6 +11374,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       mergeCommitSha: row.merge_commit_sha,
       mergedAt,
       unattended,
+      automaticRevert: row.autonomous_origin === "crash_revert",
     };
   }
 

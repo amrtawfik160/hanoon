@@ -1,3 +1,4 @@
+import type { ProjectPolicy } from "../domain/models";
 import type { CompletedMergeRecord } from "../storage/store";
 
 /**
@@ -8,12 +9,12 @@ import type { CompletedMergeRecord } from "../storage/store";
  * died, someone else deployed. Reverting on a fault alone would undo innocent
  * work to fix something a revert cannot fix.
  *
- * Three things together make a revert the honest response. The last thing that
- * landed here was a merge; that merge was one this agent made on its own
- * authority, with no owner looking; and it landed recently enough that "the
- * merge broke it" is a better explanation than "something else did". Miss any
- * one of them and the answer is what it has always been: investigate and tell
- * the owner.
+ * Four things together make a revert the honest response. The project's own
+ * policy asked for unattended delivery; the last thing that landed here was a
+ * merge; that merge was one this agent made on its own authority, with no owner
+ * looking; and it landed recently enough that "the merge broke it" is a better
+ * explanation than "something else did". Miss any one of them and the answer is
+ * what it has always been: investigate and tell the owner.
  *
  * The window is deliberately about the *latest* merge rather than the latest
  * unattended one. "An unattended merge happened at some point" is true of
@@ -32,13 +33,42 @@ export type RevertDecision =
   | Readonly<{ outcome: "revert"; merge: CompletedMergeRecord }>
   | Readonly<{ outcome: "investigate"; reason: string }>;
 
+/**
+ * The project's current enabled policy snapshot, or null when it has none.
+ * Only the fields this decision reads, so a caller cannot pass half of one.
+ */
+export type RevertPolicy = Pick<ProjectPolicy, "enabled" | "autonomy"> | null;
+
+/**
+ * Starting a repository change nobody asked for is a new behaviour, so it needs
+ * the new opt-in. The button-granted standing approval predates all of this and
+ * means exactly what it always did — merge this reviewed job without asking me —
+ * so a project whose only grant is that button keeps investigate-and-report.
+ */
+function declaresUnattendedMerge(policy: RevertPolicy): boolean {
+  return policy?.enabled === true && policy.autonomy?.unattendedMerge === true;
+}
+
 export function decideCrashRevert(input: Readonly<{
   merge: CompletedMergeRecord | null;
+  /** Read from storage at decision time, never from a caller's snapshot. */
+  policy: RevertPolicy;
   now: number;
 }>): RevertDecision {
+  if (!declaresUnattendedMerge(input.policy)) {
+    return { outcome: "investigate", reason: "this project's policy has not asked to merge unattended" };
+  }
   if (!input.merge) return { outcome: "investigate", reason: "nothing has been merged here" };
   if (!input.merge.unattended) {
     return { outcome: "investigate", reason: "the last merge here was one the owner approved" };
+  }
+  // Depth one, deliberately. Reverting a revert re-applies the merge that broke
+  // production in the first place, and it would land through the same standing
+  // grant — the loop this whole path exists to end rather than to feed. The
+  // answer is not "blame the merge before it" either: an automatic revert that
+  // did not fix production is exactly the moment a person should be looking.
+  if (input.merge.automaticRevert) {
+    return { outcome: "investigate", reason: "the last merge here was itself an automatic revert" };
   }
   const age = input.now - input.merge.mergedAt;
   if (age < 0 || age > REVERT_WINDOW_MS) {

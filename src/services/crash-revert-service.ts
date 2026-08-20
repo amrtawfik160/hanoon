@@ -19,12 +19,17 @@ import type { TelegramAgentStore } from "../storage/store";
  * Bounded once per merge commit for all time. A revert that itself fails feeds
  * the failure brake like any other failing job, and a second automatic attempt
  * at the same commit is exactly the loop the brake exists to stop.
+ *
+ * Bounded to projects that asked for it, too: starting a repository change
+ * nobody requested is one of the behaviours the `autonomy` block opts into, and
+ * a project whose only standing approval is the owner's button keeps the
+ * investigate-and-report it has always had.
  */
 
 export type CrashRevertDependencies = {
   store: Pick<
     TelegramAgentStore,
-    "getLatestCompletedMerge" | "createAutonomousJob" | "getCrashRevertJob"
+    "getLatestCompletedMerge" | "createAutonomousJob" | "getCrashRevertJob" | "getProjectPolicy"
   >;
   onWorkAvailable?: () => void;
   warn?: (message: string) => void;
@@ -54,6 +59,10 @@ export class CrashRevertService {
     try {
       decision = decideCrashRevert({
         merge: this.dependencies.store.getLatestCompletedMerge(input.projectId),
+        // The stored policy, read now rather than carried in: the opt-in is the
+        // owner's statement about this project, and a caller holding a snapshot
+        // of it is a caller that can be wrong about it.
+        policy: this.dependencies.store.getProjectPolicy(input.projectId)?.policy ?? null,
         now: input.now,
       });
     } catch (error) {
