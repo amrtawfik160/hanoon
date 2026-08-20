@@ -1,14 +1,11 @@
 This directory is a first-party Hanoon skill root owned by the Telegram Agent plugin.
 
 It is not a third-party vendor copy. Do not fold it under the MIT or Apache-2.0
-notices that belong to the vendored workflow, guard, and delivery roots.
+notices that belong to the vendored workflow, guard, delivery, and pstack roots.
 
 A skill here may still be adapted from a permissively licensed upstream rather
 than written from nothing. Where it is, the entry below names the upstream, the
 revision it was taken at, and its licence, and carries that licence with it.
-
-Skill: human-friendly-coding-communication
-Purpose: keep Hanoon replies clear for the owner on Telegram.
 
 Skill: proportional-development-workflow
 Purpose: choose the smallest safe development workflow without duplicating orchestration.

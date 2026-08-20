@@ -1830,7 +1830,7 @@ describe("singleton job executor", () => {
     }
   });
 
-  it("streams a submitted controller turn through one ephemeral Telegram draft", async () => {
+  it("streams a submitted controller turn without writing progress into the chat", async () => {
     const { store } = fixture();
     addSubmittedControllerTurn(store);
     const abort = new AbortController();
@@ -1868,23 +1868,12 @@ describe("singleton job executor", () => {
       effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
     }, abort.signal);
 
-    expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(
-      1,
-      "7",
-      expect.any(Number),
-      CONTROLLER_PHASE_TEXT.connecting,
-      expect.any(AbortSignal),
-    );
-    expect(sendMessageDraft).toHaveBeenNthCalledWith(
-      2,
-      "7",
-      expect.any(Number),
-      CONTROLLER_PHASE_TEXT.responding,
-      expect.any(AbortSignal),
-    );
-    expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
-    expect(sendMessageDraft.mock.calls[0]?.[1]).toBeGreaterThan(0);
+    // A streaming draft occupies the slot the owner types into: while one was
+    // held their own messages sat unsent behind it, a stop command included.
+    // Sending progress as an ordinary message instead would leave a second
+    // bubble beside the answer, so the phase stays out of the chat entirely
+    // and TelegramPresenceCoordinator types for these turn states instead.
+    expect(sendMessageDraft).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
     expect(editMessage).not.toHaveBeenCalled();
     expect(store.getOutbox("controller:controller-turn-900:reply")).toMatchObject({
@@ -1894,7 +1883,7 @@ describe("singleton job executor", () => {
     });
   });
 
-  it("coalesces repeated controller phase edits before they reach Telegram", async () => {
+  it("keeps repeated controller phase updates out of Telegram entirely", async () => {
     const { store } = fixture();
     const turnId = addSubmittedControllerTurn(store);
     const abort = new AbortController();
@@ -1936,12 +1925,10 @@ describe("singleton job executor", () => {
 
     expect(waitForWork).toHaveBeenCalledTimes(3);
     expect(reconcile).toHaveBeenCalledTimes(3);
-    expect(sendMessage).toHaveBeenCalledOnce();
-    expect(editMessage).toHaveBeenCalledOnce();
-    expect(editMessage).toHaveBeenCalledWith("7", 501, {
-      text: CONTROLLER_PHASE_TEXT.responding,
-      disable_web_page_preview: true,
-    }, expect.any(AbortSignal));
+    // Repeated phase updates cannot flood Telegram because none of them are
+    // written to the chat in the first place.
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(editMessage).not.toHaveBeenCalled();
   });
 
   it("does not let a slow stream edit hold back the terminal reply", async () => {
@@ -1950,7 +1937,9 @@ describe("singleton job executor", () => {
     const abort = new AbortController();
     let nextMessageId = 500;
     const sendMessage = vi.fn(async () => ({ message_id: ++nextMessageId }));
-    let resolveEdit!: () => void;
+    // The phase update no longer touches Telegram, so this deferred edit is
+    // only armed for the terminal path; it may never be called at all.
+    let resolveEdit: (() => void) | undefined;
     const editMessage = vi.fn(() => new Promise<void>((resolve) => {
       resolveEdit = resolve;
     }));
@@ -2006,7 +1995,7 @@ describe("singleton job executor", () => {
         disable_web_page_preview: true,
       }, expect.any(AbortSignal));
     } finally {
-      resolveEdit();
+      resolveEdit?.();
       await run;
     }
   });
@@ -2057,17 +2046,15 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendChatAction).toHaveBeenCalledOnce();
+    // Typing is the only progress signal, so a failing presence call must not
+    // cost the owner their answer.
     expect(sendMessage).toHaveBeenCalledWith("7", {
-      text: CONTROLLER_PHASE_TEXT.connecting,
-      disable_web_page_preview: true,
-    }, expect.any(AbortSignal));
-    expect(editMessage).toHaveBeenCalledWith("7", 501, {
       text: "Final answer",
       disable_web_page_preview: true,
     }, expect.any(AbortSignal));
   });
 
-  it("derives an ephemeral draft from the phase, never a legacy raw stream_text token", async () => {
+  it("derives progress text from the phase, never a legacy raw stream_text token", async () => {
     const { store, db } = fixture();
     const turnId = addSubmittedControllerTurn(store);
     // A pre-cutover durable stream_text carrying raw provider prose must never
@@ -2093,15 +2080,13 @@ describe("singleton job executor", () => {
       effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 }),
     }, abort.signal);
 
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1);
-    expect(sendMessageDraft).toHaveBeenCalledWith(
-      "7",
-      expect.any(Number),
-      CONTROLLER_PHASE_TEXT.thinking,
-      expect.any(AbortSignal),
-    );
-    expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("RAW-SECRET");
-    expect(sendMessageDraft.mock.calls[0]?.[2]).not.toContain("token");
+    expect(sendMessageDraft).not.toHaveBeenCalled();
+    const everythingSent = JSON.stringify([
+      ...sendMessage.mock.calls,
+      ...editMessage.mock.calls,
+    ]);
+    expect(everythingSent).not.toContain("RAW-SECRET");
+    expect(everythingSent).not.toContain("token");
   });
 
   it("suppresses a pending draft send for a submitted terminal-phase turn", async () => {
@@ -2195,7 +2180,7 @@ describe("singleton job executor", () => {
     expect(store.getOutbox(`controller:${turnId}:reply`)).toMatchObject({ status: "sent", messageId: null });
   });
 
-  it("persists exactly one final controller message after ephemeral draft streaming", async () => {
+  it("persists exactly one controller message across progress and the answer", async () => {
     const { store } = fixture();
     const turnId = addSubmittedControllerTurn(store);
     const abort = new AbortController();
@@ -2230,13 +2215,7 @@ describe("singleton job executor", () => {
       effectRunnerFactory: (fence) => new EffectRunner({ store, fence, now: () => 1_000 + loop * 1_000 }),
     }, abort.signal);
 
-    expect(sendMessageDraft).toHaveBeenCalledOnce();
-    expect(sendMessageDraft).toHaveBeenCalledWith(
-      "7",
-      expect.any(Number),
-      CONTROLLER_PHASE_TEXT.connecting,
-      expect.any(AbortSignal),
-    );
+    expect(sendMessageDraft).not.toHaveBeenCalled();
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage).toHaveBeenCalledWith("7", {
       text: "Final answer",
@@ -2250,7 +2229,7 @@ describe("singleton job executor", () => {
     });
   });
 
-  it("reuses one Telegram draft id per chat so a stale preview cannot linger beside the next answer", async () => {
+  it("never leaves a draft preview lingering beside the next answer", async () => {
     const { store } = fixture();
     const firstTurnId = addSubmittedControllerTurn(store);
     const abort = new AbortController();
@@ -2289,8 +2268,7 @@ describe("singleton job executor", () => {
     }, abort.signal);
 
     expect(sendMessage).toHaveBeenCalledOnce();
-    expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft.mock.calls[0]?.[1]).toBe(sendMessageDraft.mock.calls[1]?.[1]);
+    expect(sendMessageDraft).not.toHaveBeenCalled();
   });
 
   it("polls fast while a controller answer streams so the draft animates instead of jumping", async () => {

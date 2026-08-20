@@ -54,8 +54,8 @@ export const CONTROLLER_DEFAULT_SKILLS = [
   // capability id: the two ways a turn can be configured should not hand the
   // agent the same skills in two different orders.
   "driving-bb",
-  "human-friendly-coding-communication",
   "proportional-development-workflow",
+  "unslop",
 ] as const satisfies readonly CapabilitySkillId[];
 
 export const CONTROLLER_MANUAL_DISCOVERY_SKILLS = [
@@ -65,7 +65,9 @@ export const CONTROLLER_MANUAL_DISCOVERY_SKILLS = [
 ] as const satisfies readonly CapabilitySkillId[];
 
 const BUNDLE_INTENT: Readonly<Record<Exclude<ControllerToolBundleId, "core-observation">, RegExp>> = {
-  "job-control": /\b(?:start|retry|cancel|steer|adopt)\b[^\n]{0,80}\b(?:job|implementation|pull request|pr)\b|\b(?:implement|implementation)\b/iu,
+  // The conduct block already names these actions. A turn that asks for them
+  // must receive the tools, or the agent can only describe the job pipeline.
+  "job-control": /\b(?:start|retry|cancel|steer|adopt)\b[^\n]{0,80}\b(?:job|implementation|pull request|pr)\b|\b(?:implement|implementation)\b|\b(?:merge|land)\b|\bresume\b[^\n]{0,40}\b(?:project|job)\b|\b(?:fix|repair|debug)\b[^\n]{0,80}\b(?:bug|crash|regression|error|failure)\b|\b(?:add|build|create)\b[^\n]{0,80}\b(?:feature|page|flow|endpoint|api|service|system)\b|\b(?:ship|deploy|release)\b/iu,
   "thread-control": /\b(?:create|open|send|message|tell)\b[^\n]{0,60}\bthread\b|\bthread\b[^\n]{0,60}\b(?:send|message|tell)\b/iu,
   memory: /\b(?:remember|recall|forget|memory)\b/iu,
   monitoring: /\b(?:watch|monitor|schedule|cron)\b/iu,

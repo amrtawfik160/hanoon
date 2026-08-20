@@ -72,6 +72,13 @@ it("registers configurable controller execution settings with safe defaults", as
         "gpt-5.6-luna",
         "gpt-5.6-terra",
         "gpt-5.6-sol",
+        "cursor-grok-4.6-medium",
+        "gpt-5.6-sol-medium",
+        "claude-opus-5-thinking-medium",
+        "claude-fable-5-thinking-medium",
+        "composer-2.5",
+        "grok-4.6",
+        "grok-4.5",
       ],
       default: "claude-opus-5[1m]",
     },
@@ -86,6 +93,13 @@ it("registers configurable controller execution settings with safe defaults", as
         "gpt-5.6-luna",
         "gpt-5.6-terra",
         "gpt-5.6-sol",
+        "cursor-grok-4.6-medium",
+        "gpt-5.6-sol-medium",
+        "claude-opus-5-thinking-medium",
+        "claude-fable-5-thinking-medium",
+        "composer-2.5",
+        "grok-4.6",
+        "grok-4.5",
       ],
       default: "gpt-5.6-sol",
     },
@@ -100,6 +114,13 @@ it("registers configurable controller execution settings with safe defaults", as
         "gpt-5.6-luna",
         "gpt-5.6-terra",
         "gpt-5.6-sol",
+        "cursor-grok-4.6-medium",
+        "gpt-5.6-sol-medium",
+        "claude-opus-5-thinking-medium",
+        "claude-fable-5-thinking-medium",
+        "composer-2.5",
+        "grok-4.6",
+        "grok-4.5",
       ],
       default: "disabled",
     },
@@ -401,7 +422,7 @@ it("wires submitted controller turns through the leased job executor", async () 
   vi.unstubAllGlobals();
 });
 
-it("shows native Telegram draft streaming and typing while a Luna controller turn is active", async () => {
+it("shows typing, and never a draft, while a Luna controller turn is active", async () => {
   const { bb, harness } = await loadPlugin();
   await harness.behavior.setSettings({ botToken: "123:test-token" });
   const telegramMethods: string[] = [];
@@ -461,12 +482,14 @@ it("shows native Telegram draft streaming and typing while a Luna controller tur
   const run = harness.behavior.runService("job-executor");
   try {
     await vi.waitFor(() => expect(telegramMethods).toContain("sendChatAction"));
-    await vi.waitFor(() => expect(telegramMethods).toContain("sendMessageDraft"));
     await vi.waitFor(() => expect(store.getOutbox(`controller:${turn.id}:reply`)).toMatchObject({
       status: "sent",
       messageId: null,
       payload: { text: CONTROLLER_PHASE_TEXT.connecting },
     }));
+    // A streaming draft would sit in the slot the owner types into, leaving
+    // their own messages (a stop command included) unsent behind it.
+    expect(telegramMethods).not.toContain("sendMessageDraft");
   } finally {
     run.controller.abort();
     await run.done;

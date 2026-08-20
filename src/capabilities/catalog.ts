@@ -50,13 +50,14 @@ const WORKER_SKILLS = new Set([
   "docs-guard",
   "driving-bb",
   "durable-boundary-audit",
-  "human-friendly-coding-communication",
   "pr-writer",
   "proportional-development-workflow",
   "receiving-code-review",
   "systematic-debugging",
+  "technical-writing",
   "test-driven-development",
   "test-guard",
+  "unslop",
   "verification-before-completion",
   "writing-plans",
   "writing-skills",
@@ -81,22 +82,23 @@ const SKILL_DIGESTS = {
   "clean-code-guard": "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2",
   "dispatching-parallel-agents": "1968923066f3b707eb01d1992cdf4c42284c3855f70253b9cd5000ff45fca13c",
   "docs-guard": "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef",
-  "driving-bb": "d832f8f9122a9715cc28eb1a00ca87b3636cbc29be37dd12b02bd8ccdab56049",
+  "driving-bb": "97d51f26bdabb4cd2a67109644f55f26a04b56cefdbbf39d01aff05cca61d0e5",
   "domain-modeling": "152e2c97239affb12a60c5f4a7e74ab546a49ae169688c81f4e2ccc42dafa579",
   "durable-boundary-audit": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f",
   "executing-plans": "c4c3d8b628c51114cd165fb8246fe02744cd8be180032328391252e653028d9b",
   "finishing-a-development-branch": "8db5a922b242dd4e1bf824cb91c13b3e8d8e8a86d6ceaf7f0774eb9cce909d65",
   "grill-with-docs": "610d091047bcfb9db0f75c057d15538481a721111579fc5ec7f83ad9131a2165",
   grilling: "fa5c1e5ee76b1c8f1ae56101f52c9e239de75d5c578adc61227b92d10b7e52ef",
-  "human-friendly-coding-communication": "2668c7d9994003af3d8f59b412c4fbe0481ab7da5e37663b2bd49fb61fc21cbf",
   "pr-writer": "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc",
-  "proportional-development-workflow": "8783c7bdc0c15bf84540bd4dfffa2d85e8a6b3da196861bbd0c7da74e90f890c",
+  "proportional-development-workflow": "96870c75b91543cf751afa47bd9a217f99c3d5e8d27ccdada6e1dcfec3af2096",
   "receiving-code-review": "091df1629510af1b92fc4abd6f96732ebedb4cb2c0f3457e8f2740b0504a2438",
   "requesting-code-review": "d71cc01ba56d2325cf8af5f7c11837819b63ecd57de0bfdb812f7f3ff7751df8",
   "subagent-driven-development": "8dd1b8e698edec3700c6d89517dbe96febd3bacd3f6ea21c1a3569c62ea104b5",
   "systematic-debugging": "808fc5717aa88ad65efff312b11c186294d3e6ee301afb584e2f86599b137787",
+  "technical-writing": "bd0cb21034f4fe6695cfdf8cd3561026eec943f0bb6e9300bc78a2b3340865a7",
   "test-driven-development": "bf1b8216e523851a411e91d429a7c1c2a173e79d88957bc78e348218d50edd54",
   "test-guard": "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0",
+  unslop: "181883e539caec8258ec9129e3ba5f133409144a2cbf2aa361158ab94cfc3441",
   "using-git-worktrees": "8cfb86f121269e8f7f12361e6795c4f6738828340e28964c9229d365666c9edd",
   "using-superpowers": "30f2ab78e20ddc27ee7158ae8d4a2abe161c360981c7cc3548070913142d3dc3",
   "verification-before-completion": "2befe7fc55bcadaa3d97dd9e8efeb633d2561c0ebe74c5a8b17c4d9e7e4520b3",
@@ -239,6 +241,9 @@ function skillSource(id: CapabilitySkillId): { source: string; version: string }
   if (["domain-modeling", "grill-with-docs", "grilling"].includes(id)) {
     return { source: "https://github.com/mattpocock/skills", version: "1.2.3+84fdeffd" };
   }
+  if (["technical-writing", "unslop"].includes(id)) {
+    return { source: "https://github.com/cursor/plugins", version: "pstack@60c641e4" };
+  }
   return { source: "first-party", version: "1" };
 }
 
@@ -249,11 +254,18 @@ function skillRouting(id: CapabilitySkillId): Pick<DescriptorInput,
   switch (id) {
     case "proportional-development-workflow":
       return { roles: ["controller"], recipes: TASK_RECIPES, stages: ["intake"] };
-    case "human-friendly-coding-communication":
+    case "unslop":
       return {
         roles: ["controller", "planner", "implementation", "documentation"],
         recipes: TASK_RECIPES,
         stages: ["communication"],
+        forbiddenTraits: ["strict-json"],
+      };
+    case "technical-writing":
+      return {
+        roles: ["documentation"],
+        recipes: TASK_RECIPES,
+        stages: ["documentation"],
         forbiddenTraits: ["strict-json"],
       };
     case "brainstorming":

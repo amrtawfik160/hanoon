@@ -102,7 +102,7 @@ describe("least-capability worker profiles", () => {
     });
     expect(profile.skills).toEqual(["clean-code-guard", "docs-guard"]);
     expect(profile.skills).not.toContain("test-guard");
-    expect(profile.skills).not.toContain("human-friendly-coding-communication");
+    expect(profile.skills).not.toContain("unslop");
   });
 
   it("keeps the independent risk lens free of duplicate diff guards", () => {

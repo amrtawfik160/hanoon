@@ -30,16 +30,20 @@ const hanoonIds = [
   "checking-system-logs",
   "driving-bb",
   "durable-boundary-audit",
-  "human-friendly-coding-communication",
   "proportional-development-workflow",
 ] as const;
-const allIds = [...workflowIds, ...guardIds, ...deliveryIds, ...discoveryIds, ...hanoonIds].sort();
+const pstackIds = [
+  "technical-writing",
+  "unslop",
+] as const;
+const allIds = [...workflowIds, ...guardIds, ...deliveryIds, ...discoveryIds, ...hanoonIds, ...pstackIds].sort();
 const skillRoots = [
   "skills/workflow-kit",
   "skills/guards",
   "skills/delivery",
   "skills/discovery",
   "skills/hanoon",
+  "skills/pstack",
 ] as const;
 
 type LockFile = Readonly<{ path: string; sha256: string }>;
@@ -57,6 +61,7 @@ type SkillLock = Readonly<{
   deliveryKit: LockKit;
   discoveryKit: LockKit & Readonly<{ version: string; revision: string }>;
   hanoonKit: LockKit;
+  pstackKit: LockKit & Readonly<{ revision: string }>;
   skills: readonly LockSkill[];
   files: readonly LockFile[];
 }>;
@@ -177,6 +182,12 @@ describe("committed agent skill bundle", () => {
       license: "first-party",
       licensePath: "skills/hanoon/NOTICE",
     });
+    expect(lock.pstackKit).toEqual({
+      revision: "60c641e4fad674784b30abcf9f8915dea39df38d",
+      sourceUrl: "https://github.com/cursor/plugins",
+      license: "MIT",
+      licensePath: "skills/pstack/LICENSE",
+    });
     for (const id of guardIds) {
       expect(lock.skills).toContainEqual({
         id,
@@ -209,6 +220,14 @@ describe("committed agent skill bundle", () => {
         license: "first-party",
       });
     }
+    for (const id of pstackIds) {
+      expect(lock.skills).toContainEqual({
+        id,
+        skillPath: `skills/pstack/${id}/SKILL.md`,
+        source: "https://github.com/cursor/plugins",
+        license: "MIT",
+      });
+    }
   });
 
   // Vendored verbatim under permissive licences, so the notices must ship too.
@@ -218,6 +237,7 @@ describe("committed agent skill bundle", () => {
       "skills/guards/LICENSE",
       "skills/delivery/LICENSE",
       "skills/discovery/LICENSE",
+      "skills/pstack/LICENSE",
     ]) {
       const absolute = join(repositoryRoot, licensePath);
       expect(existsSync(absolute), `${licensePath} exists`).toBe(true);
@@ -229,7 +249,7 @@ describe("committed agent skill bundle", () => {
     const selected = Object.values(ROLE_SKILLS).flat();
     for (const id of selected) expect(allIds, `${id} is registered in the manifest`).toContain(id);
     expect(new Set(ROLE_SKILLS.implementation).size).toBe(ROLE_SKILLS.implementation.length);
-    expect(ROLE_SKILLS.planner).toEqual(["human-friendly-coding-communication", "docs-guard"]);
-    expect(ROLE_SKILLS.critic).toEqual(["human-friendly-coding-communication"]);
+    expect(ROLE_SKILLS.planner).toEqual(["unslop", "writing-plans", "docs-guard"]);
+    expect(ROLE_SKILLS.critic).toEqual(["unslop"]);
   });
 });

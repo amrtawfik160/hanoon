@@ -61,8 +61,8 @@ export type StageModelEntry = Readonly<{
   providerId: string;
   /** What this model is for, so the tiering can be argued about in one place. */
   purpose: string;
-  /** Only Codex honours a service tier; sending one elsewhere is an input the
-   *  provider cannot act on. */
+  /** Sending a service tier to a provider that does not honour one is an input
+   *  the provider cannot act on. */
   supportsServiceTier: boolean;
   /**
    * Published price per million tokens. Left null until the real published
@@ -72,6 +72,40 @@ export type StageModelEntry = Readonly<{
    */
   rate: StageModelRate | null;
 }>;
+
+/**
+ * Permission modes each execution provider actually accepts. Cursor, Grok, and
+ * Pi reject `auto`; sending it fails spawn before the worker starts.
+ */
+export const EXECUTION_PROVIDER_PERMISSION_MODES = Object.freeze({
+  "claude-code": Object.freeze(["accept-edits", "auto", "full"] as const satisfies readonly StagePermissionMode[]),
+  codex: Object.freeze(["accept-edits", "auto", "full"] as const satisfies readonly StagePermissionMode[]),
+  pi: Object.freeze(["full"] as const satisfies readonly StagePermissionMode[]),
+  "acp-cursor": Object.freeze(["accept-edits", "full"] as const satisfies readonly StagePermissionMode[]),
+  "acp-grok": Object.freeze(["accept-edits", "full"] as const satisfies readonly StagePermissionMode[]),
+});
+
+export type ExecutionProviderId = keyof typeof EXECUTION_PROVIDER_PERMISSION_MODES;
+
+const PERMISSION_PREFERENCE = ["accept-edits", "full", "auto"] as const satisfies readonly StagePermissionMode[];
+const UNKNOWN_PROVIDER_PERMISSION_MODES = ["accept-edits", "full"] as const satisfies readonly StagePermissionMode[];
+
+export function providerPermissionModes(providerId: string): readonly StagePermissionMode[] {
+  return Object.prototype.hasOwnProperty.call(EXECUTION_PROVIDER_PERMISSION_MODES, providerId)
+    ? EXECUTION_PROVIDER_PERMISSION_MODES[providerId as ExecutionProviderId]
+    : UNKNOWN_PROVIDER_PERMISSION_MODES;
+}
+
+export function providerHonoursPermissionMode(providerId: string, mode: StagePermissionMode): boolean {
+  return providerPermissionModes(providerId).includes(mode);
+}
+
+/** The requested mode when the provider accepts it, otherwise the safest mode it does. */
+export function compatiblePermissionMode(providerId: string, requested: StagePermissionMode): StagePermissionMode {
+  if (providerHonoursPermissionMode(providerId, requested)) return requested;
+  const supported = providerPermissionModes(providerId);
+  return PERMISSION_PREFERENCE.find((mode) => supported.includes(mode)) ?? supported[0] ?? "full";
+}
 
 /**
  * The one place a pipeline model id may be named. `validateStageModel` rejects
@@ -129,6 +163,48 @@ export const PIPELINE_MODEL_CATALOG: Readonly<Record<string, StageModelEntry>> =
     // models their project configured.
     purpose: "Cheap fast model for short spawned threads. Never a pipeline default.",
     supportsServiceTier: false,
+    rate: null,
+  }),
+  "cursor-grok-4.6-medium": Object.freeze({
+    providerId: "acp-cursor",
+    purpose: "Cursor Grok 4.6. Available as a controller or per-project stage pin.",
+    supportsServiceTier: true,
+    rate: null,
+  }),
+  "gpt-5.6-sol-medium": Object.freeze({
+    providerId: "acp-cursor",
+    purpose: "GPT-5.6 Sol through Cursor. Available as a controller or per-project stage pin.",
+    supportsServiceTier: true,
+    rate: null,
+  }),
+  "claude-opus-5-thinking-medium": Object.freeze({
+    providerId: "acp-cursor",
+    purpose: "Claude Opus 5 through Cursor. Available as a controller or per-project stage pin.",
+    supportsServiceTier: true,
+    rate: null,
+  }),
+  "claude-fable-5-thinking-medium": Object.freeze({
+    providerId: "acp-cursor",
+    purpose: "Claude Fable 5 through Cursor. Available as a controller or per-project stage pin.",
+    supportsServiceTier: true,
+    rate: null,
+  }),
+  "composer-2.5": Object.freeze({
+    providerId: "acp-cursor",
+    purpose: "Cursor Composer 2.5. Available as a controller or per-project stage pin.",
+    supportsServiceTier: true,
+    rate: null,
+  }),
+  "grok-4.6": Object.freeze({
+    providerId: "acp-grok",
+    purpose: "Grok 4.6 through Grok Build. Available as a controller or per-project stage pin.",
+    supportsServiceTier: true,
+    rate: null,
+  }),
+  "grok-4.5": Object.freeze({
+    providerId: "acp-grok",
+    purpose: "Grok 4.5 through Grok Build. Available as a controller or per-project stage pin.",
+    supportsServiceTier: true,
     rate: null,
   }),
 });
@@ -236,6 +312,7 @@ export function validateStageModel(input: {
   providerId?: string;
   model?: string;
   serviceTier?: StageServiceTier;
+  permissionMode?: StagePermissionMode;
 }): StageModelValidation {
   const entry = input.model === undefined ? null : stageModelEntry(input.model);
   if (input.model !== undefined && entry === null) {
@@ -259,6 +336,17 @@ export function validateStageModel(input: {
   }
   if (input.serviceTier === "fast" && entry !== null && !entry.supportsServiceTier) {
     return { ok: false, message: `Provider "${entry.providerId}" does not honour a fast service tier` };
+  }
+  const permissionProvider = input.providerId ?? entry?.providerId;
+  if (
+    input.permissionMode !== undefined
+    && permissionProvider !== undefined
+    && !providerHonoursPermissionMode(permissionProvider, input.permissionMode)
+  ) {
+    return {
+      ok: false,
+      message: `Provider "${permissionProvider}" does not support permission mode "${input.permissionMode}"`,
+    };
   }
   return { ok: true, entry };
 }
@@ -459,6 +547,10 @@ export function resolveStageExecution(input: ResolveStageExecutionInput): Resolv
   const entry = stageModelEntry(model);
   const providerId = overrides.providerId ?? entry?.providerId ?? route.providerId;
   const requestedServiceTier = overrides.serviceTier ?? "default";
+  const permissionMode = resolvedPermissionMode(
+    providerId,
+    overrides.permissionMode ?? fallback.permissionMode,
+  );
 
   return Object.freeze({
     stage,
@@ -472,9 +564,20 @@ export function resolveStageExecution(input: ResolveStageExecutionInput): Resolv
     reasoningLevel: overrides.reasoningLevel ?? route.reasoningLevel,
     // Fast mode stays off unless this stage opted in. Nothing inherits it.
     serviceTier: entry?.supportsServiceTier === false ? "default" : requestedServiceTier,
-    permissionMode: overrides.permissionMode ?? fallback.permissionMode,
+    permissionMode,
     source,
   });
+}
+
+function resolvedPermissionMode(
+  providerId: string,
+  requested: StagePermissionMode | undefined,
+): StagePermissionMode | undefined {
+  if (requested !== undefined) return compatiblePermissionMode(providerId, requested);
+  // Leave unset when BB's usual auto default is legal. Providers that reject
+  // auto (Cursor, Grok, Pi) must send a mode they accept, or spawn fails.
+  if (providerHonoursPermissionMode(providerId, "auto")) return undefined;
+  return compatiblePermissionMode(providerId, "auto");
 }
 
 /**
@@ -547,8 +650,7 @@ export function resolveConsensusExecution(input: Readonly<{
     serviceTier: entry?.supportsServiceTier === false ? "default" : requestedServiceTier,
     permissionMode: pinned?.permissionMode ?? review.permissionMode,
     source: pinned === undefined ? "default" as const : "stage-policy" as const,
-  });
-}
+  });}
 
 function stripUndefined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
@@ -559,15 +661,52 @@ function stripUndefined<T extends Record<string, unknown>>(value: T): T {
  * BB never substitutes a project or controller default underneath us.
  */
 export function stageExecutionSpawnArgs(resolved: ResolvedStageExecution): Record<string, unknown> {
-  const entry = stageModelEntry(resolved.model);
-  const withTier = entry === null ? true : entry.supportsServiceTier;
-  const withPermission = resolved.permissionMode !== undefined;
-  return {
+  return executionSpawnArgs({
     providerId: resolved.providerId,
     model: resolved.model,
     reasoningLevel: resolved.reasoningLevel,
-    ...(withTier ? { serviceTier: resolved.serviceTier } : {}),
-    ...(withPermission ? { permissionMode: resolved.permissionMode } : {}),
+    serviceTier: resolved.serviceTier,
+    permissionMode: resolved.permissionMode,
+  });
+}
+
+/**
+ * Spawn fields for a background or controller-owned thread that is not a
+ * pipeline stage. Permission is always sent, and `auto` is rewritten for
+ * providers that reject it.
+ */
+export function modelRouteSpawnArgs(input: {
+  providerId: string;
+  modelId: string;
+  reasoning: ReasoningLevel;
+  serviceTier: StageServiceTier;
+  permissionMode?: StagePermissionMode;
+}): Record<string, unknown> {
+  return executionSpawnArgs({
+    providerId: input.providerId,
+    model: input.modelId,
+    reasoningLevel: input.reasoning,
+    serviceTier: input.serviceTier,
+    permissionMode: compatiblePermissionMode(input.providerId, input.permissionMode ?? "auto"),
+  });
+}
+
+function executionSpawnArgs(input: {
+  providerId: string;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+  serviceTier: StageServiceTier;
+  permissionMode: StagePermissionMode | undefined;
+}): Record<string, unknown> {
+  const entry = stageModelEntry(input.model);
+  const withTier = entry === null ? true : entry.supportsServiceTier;
+  const withPermission = input.permissionMode !== undefined;
+  return {
+    providerId: input.providerId,
+    model: input.model,
+    reasoningLevel: input.reasoningLevel,
+    ...(withTier ? { serviceTier: input.serviceTier } : {}),
+    ...(withPermission ? { permissionMode: input.permissionMode } : {}),
     executionInputSources: {
       providerId: "explicit" as const,
       model: "explicit" as const,

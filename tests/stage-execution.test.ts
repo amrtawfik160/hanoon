@@ -6,6 +6,7 @@ import {
   PIPELINE_STAGES,
   costMicroUsd,
   escalatedTier,
+  modelRouteSpawnArgs,
   resolveStageExecution,
   stageCostMicroUsd,
   stageEscalationSteps,
@@ -130,6 +131,35 @@ describe("escalation on retry", () => {
       escalationSteps: 0,
     });
   });
+
+  it("gives Cursor and Grok a permission mode they accept when a stage leaves it unset", () => {
+    const cursor = resolve("implementation", {
+      stage: "implementation",
+      stageExecution: { implementation: { model: "claude-opus-5-thinking-medium" } },
+    });
+    const grok = resolve("plan", {
+      stage: "plan",
+      stageExecution: { plan: { model: "grok-4.6" } },
+    });
+    expect(cursor).toMatchObject({
+      model: "claude-opus-5-thinking-medium",
+      providerId: "acp-cursor",
+      permissionMode: "accept-edits",
+    });
+    expect(grok).toMatchObject({
+      model: "grok-4.6",
+      providerId: "acp-grok",
+      permissionMode: "accept-edits",
+    });
+    expect(stageExecutionSpawnArgs(cursor)).toMatchObject({
+      providerId: "acp-cursor",
+      permissionMode: "accept-edits",
+    });
+    expect(stageExecutionSpawnArgs(grok)).toMatchObject({
+      providerId: "acp-grok",
+      permissionMode: "accept-edits",
+    });
+  });
 });
 
 describe("stored policies keep working", () => {
@@ -212,6 +242,17 @@ describe("model ids are validated when a policy is parsed", () => {
 
   it("accepts a real model on the provider that offers it", () => {
     expect(policyWith({ canary: { providerId: "codex", model: "gpt-5.6-luna", tier: "fast" } }).success).toBe(true);
+    expect(policyWith({ plan: { providerId: "acp-cursor", model: "cursor-grok-4.6-medium" } }).success).toBe(true);
+    expect(policyWith({ review: { providerId: "acp-grok", model: "grok-4.6", permissionMode: "accept-edits" } }).success).toBe(true);
+  });
+
+  it("rejects an auto permission mode Cursor and Grok cannot honour", () => {
+    const cursor = policyWith({ plan: { model: "cursor-grok-4.6-medium", permissionMode: "auto" } });
+    const grok = policyWith({ review: { providerId: "acp-grok", model: "grok-4.6", permissionMode: "auto" } });
+    expect(cursor.success).toBe(false);
+    expect(cursor.success === false && JSON.stringify(cursor.error.issues)).toContain("does not support permission mode");
+    expect(grok.success).toBe(false);
+    expect(grok.success === false && JSON.stringify(grok.error.issues)).toContain("does not support permission mode");
   });
 });
 
@@ -229,6 +270,39 @@ describe("spawn arguments", () => {
         model: "explicit",
         reasoningLevel: "explicit",
         serviceTier: "explicit",
+        permissionMode: "explicit",
+      },
+    });
+  });
+
+  it("rewrites auto and drops an unusable service tier for a model-route spawn", () => {
+    expect(modelRouteSpawnArgs({
+      providerId: "acp-grok",
+      modelId: "grok-4.6",
+      reasoning: "xhigh",
+      serviceTier: "fast",
+    })).toMatchObject({
+      providerId: "acp-grok",
+      model: "grok-4.6",
+      reasoningLevel: "xhigh",
+      serviceTier: "fast",
+      permissionMode: "accept-edits",
+    });
+    expect(modelRouteSpawnArgs({
+      providerId: "claude-code",
+      modelId: "claude-opus-5[1m]",
+      reasoning: "high",
+      serviceTier: "fast",
+      permissionMode: "auto",
+    })).toEqual({
+      providerId: "claude-code",
+      model: "claude-opus-5[1m]",
+      reasoningLevel: "high",
+      permissionMode: "auto",
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        reasoningLevel: "explicit",
         permissionMode: "explicit",
       },
     });

@@ -19,7 +19,8 @@
       "skills/guards",
       "skills/delivery",
       "skills/discovery",
-      "skills/hanoon"
+      "skills/hanoon",
+      "skills/pstack"
     ]
   },
   "scripts": {

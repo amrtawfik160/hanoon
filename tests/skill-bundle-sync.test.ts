@@ -31,6 +31,7 @@ function syncFixture(): { root: string; source: string; sentinel: string } {
   cpSync(join(repositoryRoot, "skills/delivery"), join(root, "skills/delivery"), { recursive: true });
   cpSync(join(repositoryRoot, "skills/discovery"), join(root, "skills/discovery"), { recursive: true });
   cpSync(join(repositoryRoot, "skills/hanoon"), join(root, "skills/hanoon"), { recursive: true });
+  cpSync(join(repositoryRoot, "skills/pstack"), join(root, "skills/pstack"), { recursive: true });
   cpSync(join(repositoryRoot, "skills/workflow-kit/LICENSE"), join(source, "LICENSE"));
   for (const entry of readdirSync(join(repositoryRoot, "skills/workflow-kit"), { withFileTypes: true })) {
     if (entry.isDirectory()) {
@@ -119,6 +120,7 @@ function sourceBundleRoots(root: string, source: string): string[] {
     join(root, "skills/delivery"),
     join(root, "skills/discovery"),
     join(root, "skills/hanoon"),
+    join(root, "skills/pstack"),
   ];
 }
 

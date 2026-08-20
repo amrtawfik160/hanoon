@@ -22,7 +22,7 @@ Existing resource claims, generation fences, exact-head review, one-use owner ap
 
 The repository currently has these relevant behaviors:
 
-- The plugin manifest exposes five skill roots containing 23 pinned skills.
+- The plugin manifest exposes six skill roots containing 27 pinned skills.
 - `src/agent-skills/role-resolver.ts` assigns a static subset by controller or worker role.
 - The controller receives all 23 registered controller tools; workers receive no Hanoon tools.
 - New jobs are classified only as `small_fix` or `full`.
@@ -103,7 +103,8 @@ Unknown fields, unknown enum values, incomplete executable descriptors, digest m
 | Skill | Route | Activation |
 | --- | --- | --- |
 | `proportional-development-workflow` | worker | Controller classification of development requests |
-| `human-friendly-coding-communication` | worker | Owner-facing explanations and summaries; excluded from strict-JSON roles |
+| `unslop` | worker | Owner-facing explanations and summaries; excluded from strict-JSON roles |
+| `technical-writing` | worker | Documentation drafts; excluded from strict-JSON roles |
 | `brainstorming` | worker | Architectural discovery when no completed grilling session exists |
 | `writing-plans` | worker | Architectural planning after an approved specification |
 | `systematic-debugging` | worker | Reproducible bugs, test failures, or unexpected behavior |

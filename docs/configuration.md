@@ -68,23 +68,23 @@ The same plugin settings page controls subsequent turns in the hidden conversati
 
 | Setting | Options | Default |
 | --- | --- | --- |
-| Controller model | `claude-opus-5[1m]`, `claude-opus-4-8[1m]`, `claude-sonnet-5`, `claude-fable-5`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` | `claude-opus-5[1m]` |
+| Controller model | Claude Code: `claude-opus-5[1m]`, `claude-opus-4-8[1m]`, `claude-sonnet-5`, `claude-fable-5`. Codex: `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol`. Cursor: `cursor-grok-4.6-medium`, `gpt-5.6-sol-medium`, `claude-opus-5-thinking-medium`, `claude-fable-5-thinking-medium`, `composer-2.5`. Grok: `grok-4.6`, `grok-4.5`. | `claude-opus-5[1m]` |
 | Fallback model 1 | `disabled` or any controller model | `gpt-5.6-sol` |
 | Fallback model 2 | `disabled` or any controller model | `disabled` |
 | Controller reasoning level | `low`, `medium`, `high`, `xhigh`, `max` | `xhigh` |
 | Controller service tier | `fast`, `default` | `default` |
 | Controller permission mode | `auto`, `accept-edits`, `full` | `auto` |
-| Agent identity | Empty, or up to 244 UTF-16 code units | Shipped identity |
+| Agent identity | Empty, or up to 254 UTF-16 code units | Shipped identity |
 
-The model selects its provider: `claude-*` models run on Claude Code, `gpt-*` models on Codex. Service tier is a Codex-only input and is not sent for Claude models.
+Each model id belongs to one provider in the pipeline catalog. Prefix matching is not used: `claude-opus-5-thinking-medium` is Cursor, not Claude Code. Service tier is sent for Codex, Cursor, and Grok, and is omitted for Claude Code. Cursor and Grok reject permission mode `auto`, so a controller turn on those models sends `accept-edits` unless the setting is `full`. Exploratory and delegated child threads opened from that controller use the same provider, model, and compatible permission, so they start instead of inheriting BB's auto default.
 
-Each new Telegram message starts with the primary model. The ordered fallbacks are tried only when BB proves the preceding provider failed before accepting that message; they are never used after the model could have started tools or other effects. Disabled entries and duplicates are skipped. Fallbacks share the primary turn's reasoning, service-tier, and permission policy. The `strong-only` routing kill switch still wins and cannot be weakened by a fallback setting.
+Each new Telegram message starts with the primary model. The ordered fallbacks are tried only when BB proves the preceding provider failed before accepting that message; they are never used after the model could have started tools or other effects. Disabled entries and duplicates are skipped. Fallbacks share the primary turn's reasoning, service-tier, and requested permission. A fallback on Cursor or Grok still cannot send `auto`; spawn uses `accept-edits` unless the shared setting is `full`. The `strong-only` routing kill switch still wins and cannot be weakened by a fallback setting.
 
 Changing the model to one owned by the other provider retires the live BB conversation thread, because a thread cannot switch providers. The next message opens a replacement seeded with the recent conversation, so the change costs a pause rather than the conversation.
 
 Saved values apply when the next controller turn starts, including later turns in the existing durable conversation. They do not rewrite a running turn or an active job. BB and the execution machine may reduce a requested permission mode.
 
-Agent identity replaces only who the controller is and how it sounds. Fixed conduct and safety boundaries remain above it. The 244-unit limit is the exact delivery budget: accepted identity text is delivered whole rather than silently shortened. Leave it empty to use the shipped identity.
+Agent identity replaces only who the controller is and how it sounds. Fixed conduct and safety boundaries remain above it. The 254-unit limit is the exact delivery budget: accepted identity text is delivered whole rather than silently shortened. Leave it empty to use the shipped identity.
 
 ### Capability routing controls
 
@@ -93,7 +93,7 @@ Three independent plugin settings control only newly created routing snapshots:
 | Setting | Options | Default | Effect |
 | --- | --- | --- | --- |
 | Capability job graph | `adaptive`, `legacy` | `adaptive` | `adaptive` classifies new jobs into versioned recipes and uses each recipe's rollout decision; `legacy` pins new jobs to the established full/small-fix graph. |
-| Controller capabilities | `bundled`, `all-tools` | `bundled` | `bundled` selects the minimum controller bundle for each new turn; `all-tools` restores all admitted controller bundles for new turns. |
+| Controller capabilities | `bundled`, `all-tools` | `bundled` | `bundled` selects the minimum controller bundle for each new turn; `all-tools` restores all admitted controller bundles for new turns. The job-control bundle also matches merge, land, resume, bug-fix, feature-build, and ship/deploy/release wording so those turns receive start, steer, retry, and land tools. |
 | Capability model routing | `adaptive`, `strong-only` | `adaptive` | `adaptive` selects the declared pool; `strong-only` applies a strong-pool floor to new controller turns and worker attempts. |
 
 These are kill switches, not data migrations. They do not rewrite an in-flight job, an existing controller or worker profile, a provider trial, or a capability receipt. Recipe promotion and rollback are also new-job decisions: a promoted job keeps `active` after rollback, while the next matching job returns to `shadow` (or `legacy` when the job-graph switch says so).
@@ -703,7 +703,7 @@ Only `plan`, `critique`, `implementation`, `review`, and `docs` currently dispat
 | `model` | Must be a model that provider offers. Pinning an exact model disables escalation for that stage. |
 | `reasoningLevel` | Overrides the tier's reasoning level. |
 | `serviceTier` | `default` or `fast`. **Off unless set here.** Rejected when the stage's `model` belongs to a provider that does not honour a service tier. |
-| `permissionMode` | `auto`, `accept-edits`, or `full`. |
+| `permissionMode` | `auto`, `accept-edits`, or `full`. An explicit `auto` is rejected for Cursor, Grok, and Pi. If those providers leave the field unset, spawn uses `accept-edits` (or `full` for Pi). |
 | `maxEscalations` | `0`–`2`; how many tiers this stage may climb across retries. `0` disables escalation. Defaults to `2`, or `1` for `merge`, `deploy`, and `canary`. |
 
 An entry is the whole answer for its stage: fields it leaves out come from the tier, not from `implementation` or `review`.

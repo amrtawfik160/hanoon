@@ -28,6 +28,12 @@
     "license": "first-party",
     "licensePath": "skills/hanoon/NOTICE"
   },
+  "pstackKit": {
+    "revision": "60c641e4fad674784b30abcf9f8915dea39df38d",
+    "sourceUrl": "https://github.com/cursor/plugins",
+    "license": "MIT",
+    "licensePath": "skills/pstack/LICENSE"
+  },
   "skills": [
     {
       "id": "blast-radius",
@@ -108,12 +114,6 @@
       "license": "MIT"
     },
     {
-      "id": "human-friendly-coding-communication",
-      "skillPath": "skills/hanoon/human-friendly-coding-communication/SKILL.md",
-      "source": "first-party",
-      "license": "first-party"
-    },
-    {
       "id": "pr-writer",
       "skillPath": "skills/delivery/pr-writer/SKILL.md",
       "source": "https://github.com/getsentry/skills",
@@ -150,6 +150,12 @@
       "license": "MIT"
     },
     {
+      "id": "technical-writing",
+      "skillPath": "skills/pstack/technical-writing/SKILL.md",
+      "source": "https://github.com/cursor/plugins",
+      "license": "MIT"
+    },
+    {
       "id": "test-driven-development",
       "skillPath": "skills/workflow-kit/test-driven-development/SKILL.md",
       "source": "https://github.com/obra/superpowers",
@@ -159,6 +165,12 @@
       "id": "test-guard",
       "skillPath": "skills/guards/test-guard/SKILL.md",
       "source": "https://github.com/amElnagdy/guard-skills",
+      "license": "MIT"
+    },
+    {
+      "id": "unslop",
+      "skillPath": "skills/pstack/unslop/SKILL.md",
+      "source": "https://github.com/cursor/plugins",
       "license": "MIT"
     },
     {
@@ -339,23 +351,31 @@
     },
     {
       "path": "skills/hanoon/driving-bb/SKILL.md",
-      "sha256": "d832f8f9122a9715cc28eb1a00ca87b3636cbc29be37dd12b02bd8ccdab56049"
+      "sha256": "97d51f26bdabb4cd2a67109644f55f26a04b56cefdbbf39d01aff05cca61d0e5"
     },
     {
       "path": "skills/hanoon/durable-boundary-audit/SKILL.md",
       "sha256": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f"
     },
     {
-      "path": "skills/hanoon/human-friendly-coding-communication/SKILL.md",
-      "sha256": "2668c7d9994003af3d8f59b412c4fbe0481ab7da5e37663b2bd49fb61fc21cbf"
-    },
-    {
       "path": "skills/hanoon/NOTICE",
-      "sha256": "b2c8f64081b9b8f7f9c93fbe9b2461cbf4a7c179d7feebcd06d0e96d465b539b"
+      "sha256": "8fbf5191ba3003e33cbbfde1c107d1618db4a9a51c4a34addecf6d40304dc655"
     },
     {
       "path": "skills/hanoon/proportional-development-workflow/SKILL.md",
-      "sha256": "8783c7bdc0c15bf84540bd4dfffa2d85e8a6b3da196861bbd0c7da74e90f890c"
+      "sha256": "96870c75b91543cf751afa47bd9a217f99c3d5e8d27ccdada6e1dcfec3af2096"
+    },
+    {
+      "path": "skills/pstack/LICENSE",
+      "sha256": "bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e"
+    },
+    {
+      "path": "skills/pstack/technical-writing/SKILL.md",
+      "sha256": "bd0cb21034f4fe6695cfdf8cd3561026eec943f0bb6e9300bc78a2b3340865a7"
+    },
+    {
+      "path": "skills/pstack/unslop/SKILL.md",
+      "sha256": "181883e539caec8258ec9129e3ba5f133409144a2cbf2aa361158ab94cfc3441"
     },
     {
       "path": "skills/workflow-kit/brainstorming/scripts/frame-template.html",

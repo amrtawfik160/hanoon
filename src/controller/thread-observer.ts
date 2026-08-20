@@ -252,6 +252,12 @@ export async function createProjectThread(input: {
   baseBranch: string;
   images?: readonly ThreadImage[];
   signal: AbortSignal;
+  /**
+   * When present, the new thread uses this exact execution tuple. Cursor and
+   * Grok reject BB's usual auto default, so the controller must state a mode
+   * those providers accept instead of inheriting it.
+   */
+  execution?: Record<string, unknown>;
 }) {
   if (input.baseBranch.trim().length === 0) {
     throw new Error("A new project thread requires an explicit base branch");
@@ -266,6 +272,7 @@ export async function createProjectThread(input: {
       hostId: input.hostId,
       workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: input.baseBranch } },
     },
+    ...input.execution,
   });
   return {
     thread: {
