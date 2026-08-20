@@ -28,6 +28,7 @@ import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPol
 import { resolveConsensusExecution, type PipelineStage } from "../domain/stage-execution";
 import { assessConsensusReview, type ReviewLens } from "../domain/review-lenses";
 import { jobStageExecution } from "../domain/stage-routing";
+import { MAX_FAILURE_SUMMARY_LENGTH } from "../domain/state-machine";
 import { ApprovalService } from "./approval-service";
 import { decideAutoApproval, resolveMergeGrant, type ConsensusEvidence } from "./merge-authority";
 import { buildWorkOrder, type CapabilityWorkOrderEnvelope } from "../bb/handoffs";
@@ -1949,15 +1950,24 @@ export class EffectRunner {
    * restart than one that was running. The result is checked rather than
    * assumed: a brake that silently did not land is the whole failure this
    * guards against.
+   *
+   * It is reported rather than thrown. Production has just broken and the
+   * owner is owed that news; an exception here would take the incident report
+   * down with it, leave the job sitting in its production stage, and hand the
+   * retry a job it will walk straight past. So the caller is told, and the line
+   * goes on the incident the owner is already reading.
+   *
+   * Returns null when the brake is on, and what the owner needs to know when
+   * it is not.
    */
-  private withdrawUnattendedDelivery(projectId: string, reason: string): void {
+  private withdrawUnattendedDelivery(projectId: string, reason: string): string | null {
     this.dependencies.store.revokeMergeAuthority({ projectId, reason, now: this.now() });
     const braked = this.dependencies.store.escalateProjectAdmissionPause({
       projectId,
       reason,
       now: this.now(),
     });
-    if (!braked) throw new Error("the production incident brake did not land on this project");
+    return braked ? null : "The failure brake could not be recorded, so this project may still admit new work.";
   }
 
   private applyProductionResult(job: Job, phase: ProductionPhase, result: ProductionStageSnapshot): void {
@@ -1974,17 +1984,24 @@ export class EffectRunner {
     // merging continues. A rollback that was missing or itself failed means
     // recovery is exhausted, and nothing should merge here unattended again
     // until the owner has looked at it.
-    if (job.projectId !== null && result.rollback?.outcome !== "pass") {
-      this.withdrawUnattendedDelivery(
+    const brakeFailure = job.projectId !== null && result.rollback?.outcome !== "pass"
+      ? this.withdrawUnattendedDelivery(
         job.projectId,
         result.rollback
           ? `rollback failed after a bad ${phase}`
           : `production ${phase} failed with no rollback configured`,
-      );
-    }
+      )
+      : null;
+    // The incident lands whatever the withdrawal managed. A job left in its
+    // production stage because a brake row would not write is a job whose
+    // owner never hears that production is down, and a retry reads the same
+    // durable evidence and reports the same thing.
+    const reason = brakeFailure === null
+      ? result.summary
+      : `${brakeFailure} ${result.summary}`.slice(0, MAX_FAILURE_SUMMARY_LENGTH);
     this.applyEvent(job.id, current.version, phase === "deploy"
-      ? { type: "DEPLOY_FAILED", reason: result.summary }
-      : { type: "CANARY_FAILED", reason: result.summary });
+      ? { type: "DEPLOY_FAILED", reason }
+      : { type: "CANARY_FAILED", reason });
   }
 
   private async runProduction(effect: StoredEffect, job: Job, phase: ProductionPhase): Promise<void> {

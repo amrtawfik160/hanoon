@@ -217,6 +217,28 @@ it("takes over a brake the project was already under, rather than leaving it as 
     .toEqual(["rollback failed after a bad deploy"]);
 });
 
+it("still reports the incident when the brake itself could not be recorded", async () => {
+  // Production is down. Whatever went wrong with the brake row, the owner
+  // hears about the failure, the job reaches its incident state, and the
+  // report says the project may still be admitting work.
+  const { store, db } = storeFixture();
+  const policy = unattendedPolicy();
+  store.upsertProjectPolicy(policy, 1_000);
+  seedDeployingJob(store, db, policy);
+  seedDeployEffect(db);
+  const brakeRefused: TelegramAgentStore = Object.create(store, {
+    escalateProjectAdmissionPause: { value: () => false },
+  }) as TelegramAgentStore;
+
+  await runFailedDeploy(brakeRefused, { outcome: "fail" });
+
+  expect(store.getJob("job_1")?.state).toBe("production_failed");
+  expect(store.getJob("job_1")?.lastError).toContain("failure brake could not be recorded");
+  // What did work is still recorded: the grant is gone either way.
+  expect(store.getMergeGrantEvidence(PROJECT).revokedAt).toBe(NOW);
+  expect(policyGrantIsLive(store, policy)).toBe(false);
+});
+
 it("leaves the brake without a fingerprint, so lifting it is the owner's call", async () => {
   // The agent may clear a fingerprinted cause once after investigating it. A
   // production it could not roll back is not that kind of cause.

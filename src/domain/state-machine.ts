@@ -28,7 +28,7 @@ export class IllegalTransitionError extends Error {
 }
 
 const HEAD_SHA = /^[0-9a-f]{40}$/;
-const MAX_FAILURE_SUMMARY_LENGTH = 500;
+export const MAX_FAILURE_SUMMARY_LENGTH = 500;
 const SENSITIVE_FAILURE_PATTERNS = [
   /\bbearer\s+\S+/i,
   /\b(?:api[_-]?key|password|secret|token)\s*[:=]\s*\S+/i,

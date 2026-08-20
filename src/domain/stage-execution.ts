@@ -139,7 +139,20 @@ export type StageTierRoute = Readonly<{
   reasoningLevel: ReasoningLevel;
 }>;
 
-/** What each tier resolves to before any per-stage override. */
+/**
+ * What each tier resolves to before any per-stage override.
+ *
+ * Every tier here names the same provider, and the consensus independence
+ * check leans on that. It compares a pinned second opinion against the review
+ * stage's provider at its **base** tier, which is the provider a review attempt
+ * runs on today however far it escalates: a stage that pins an exact model
+ * never escalates, and a stage that does not pin one climbs between routes that
+ * all belong to one provider. Give any tier a different provider and that stops
+ * being true — an escalated review attempt could then land on the very provider
+ * the parse-time check cleared the pin against — so the consensus check in
+ * `resolveConsensusExecution` and in the policy schema has to be revisited
+ * before this table changes.
+ */
 export const STAGE_TIER_ROUTES: Readonly<Record<StageTier, StageTierRoute>> = Object.freeze({
   fast: Object.freeze({ providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "low" as const }),
   standard: Object.freeze({ providerId: "codex", model: "gpt-5.6-terra", reasoningLevel: "high" as const }),
