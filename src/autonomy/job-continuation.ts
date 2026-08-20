@@ -33,6 +33,15 @@ const OWNER_GATED_RESUME_STATES: ReadonlySet<Job["state"]> = new Set([
   "verifying_production",
 ]);
 
+/**
+ * Whether resuming this job would re-enter a stage the owner's authority
+ * governs. Exported so the caller only gathers merge-authority evidence for the
+ * jobs whose decision actually turns on it.
+ */
+export function resumesIntoOwnerGatedStage(job: Pick<Job, "resumeState">): boolean {
+  return job.resumeState !== null && OWNER_GATED_RESUME_STATES.has(job.resumeState);
+}
+
 export type ContinuationJob = Pick<
   Job,
   | "projectId"
@@ -80,9 +89,10 @@ export function planJobContinuation(input: {
   job: ContinuationJob;
   attempts: number;
   /**
-   * Whether this job's project may merge without being asked, resolved from the
-   * same durable evidence the approval decision uses. Absent means no, which is
-   * the answer for every project that has not opted in.
+   * Whether this job's project may re-enter a merge or production stage
+   * unattended: its current policy asks for unattended merging, that grant is
+   * live, and no brake is holding the project. Absent means no, which is the
+   * answer for every project that has not opted in.
    */
   hasLiveMergeGrant?: boolean;
 }): ContinuationDecision {
@@ -97,13 +107,12 @@ export function planJobContinuation(input: {
   if (job.cancelRequestedAt !== null) return { action: "hold" };
 
   // A background retry must never replay merge or production authority the
-  // owner has not given. Where they have, the sweep may re-enter those stages,
-  // and only by re-firing the same guarded effect the owner's own button fires:
-  // the gates, the receipts, and the auto-approval decision all run again from
-  // scratch. Nothing here can manufacture an approval, so the worst a resume
-  // can do is ask.
-  if (job.resumeState !== null && OWNER_GATED_RESUME_STATES.has(job.resumeState) &&
-    input.hasLiveMergeGrant !== true) {
+  // owner has not given. Where the project's own policy asked for unattended
+  // delivery, the sweep may re-enter those stages, and only by re-firing the
+  // same guarded effect the owner's own button fires: the gates, the receipts,
+  // and the auto-approval decision all run again from scratch. Nothing here can
+  // manufacture an approval, so the worst a resume can do is ask.
+  if (resumesIntoOwnerGatedStage(job) && input.hasLiveMergeGrant !== true) {
     return { action: "hold" };
   }
 

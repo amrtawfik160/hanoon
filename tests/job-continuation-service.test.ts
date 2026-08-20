@@ -2,6 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { MAX_AUTO_CONTINUES } from "../src/autonomy/job-continuation";
 import { JobContinuationService } from "../src/services/job-continuation-service";
+import type { MergeAuthorityGrant } from "../src/services/merge-authority";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import type { ProjectPolicy } from "../src/domain/models";
 import { policyFixture } from "./helpers";
@@ -323,13 +324,22 @@ it("does not spend another continuation attempt while the same retry is already 
 
 /**
  * A job that died in a merge-authority stage, with the project's durable grant
- * evidence supplied exactly as the store would return it.
+ * evidence, its current policy snapshot, and its brake supplied exactly as the
+ * store would return them.
  */
 function mergeStageSweep(input: {
   policy: ProjectPolicy;
-  evidence: { grant: null; revokedAt: number | null; policyStoredAt: number | null };
+  evidence: {
+    grant: MergeAuthorityGrant | null;
+    revokedAt: number | null;
+    policyStoredAt: number | null;
+  };
+  /** What `project enable` last stored. Defaults to the job's own snapshot. */
+  currentPolicy?: ProjectPolicy;
+  paused?: boolean;
 }) {
   const retryFailedJob = vi.fn(() => ({ outcome: "queued" }));
+  const current = input.currentPolicy ?? input.policy;
   const service = new JobContinuationService({
     store: {
       listContinuationCandidates: () => [{
@@ -352,6 +362,10 @@ function mergeStageSweep(input: {
         key: "failed:permanent_effect_failure:merging",
       }],
       getMergeGrantEvidence: () => input.evidence,
+      getProjectPolicy: () => ({ policy: current, version: 1 }),
+      listPausedProjectAdmissions: () => input.paused === true
+        ? [{ projectId: "proj_1", reason: "rollback failed after a bad deploy", pausedAt: 2_000 }]
+        : [],
       recordAutoContinue: vi.fn(),
       retryFailedJob,
       requeueReviewAdmission: () => ({ outcome: "unavailable" }),
@@ -365,6 +379,18 @@ function mergeStageSweep(input: {
     issueUpdateId: (now) => now,
   });
   return { service, retryFailedJob };
+}
+
+/** The standing approval the owner granted by tapping the button. */
+function buttonGrant(): MergeAuthorityGrant {
+  return {
+    projectId: "proj_1",
+    grantedAt: 1_000,
+    grantedByUserId: "7",
+    grantedByChatId: "70",
+    revokedAt: null,
+    revokedReason: null,
+  };
 }
 
 function unattendedPolicy(): ProjectPolicy {
@@ -402,6 +428,46 @@ it("leaves a dead merge effect alone once the owner has withdrawn the grant", ()
   const { service, retryFailedJob } = mergeStageSweep({
     policy: unattendedPolicy(),
     evidence: { grant: null, revokedAt: 2_000, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone for a project whose only grant is the button", () => {
+  // The button says "merge this without asking me". Driving a job back into a
+  // deploy on its own is a different thing, and the policy is where a project
+  // asks for it.
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: policyFixture(),
+    currentPolicy: policyFixture(),
+    evidence: { grant: buttonGrant(), revokedAt: null, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone while the failure brake holds the project", () => {
+  // Production broke here and could not be put back. Re-entering the stage
+  // that broke it is the last thing this project needs.
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
+    paused: true,
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone once the project stopped declaring unattended merging", () => {
+  // The job's own snapshot still carries the grant it was admitted under; what
+  // the project may do unattended now is what the current policy says.
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    currentPolicy: policyFixture(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
   });
 
   expect(service.processDue()).toBe(false);
