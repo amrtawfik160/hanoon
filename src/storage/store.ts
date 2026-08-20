@@ -6,6 +6,7 @@ import {
   isReviewedPrCompletionBlock,
   PRODUCTION_NOT_CONFIGURED,
   projectPolicySchema,
+  type AutonomousJobOrigin,
   type Job,
   type JobEffect,
   type JobEvent,
@@ -22,6 +23,7 @@ import {
   type MergeGrantEvidence,
 } from "../services/merge-authority";
 import { classifyTaskTraits } from "../capabilities/routing";
+import { INTAKE_SUPPRESSION_MS } from "../autonomy/audit-intake";
 import {
   controllerBundleIdsFromProfile,
   CONTROLLER_BUNDLE_IDS,
@@ -583,6 +585,38 @@ export type MergeAuthorityEvent = {
   reason: string | null;
   occurredAt: number;
 };
+
+/** Why a job the owner did not ask for was not started. Every one is a bound. */
+export type AutonomousJobRefusal =
+  | "project_not_enabled"
+  | "intake_not_configured"
+  | "project_paused"
+  | "open_job"
+  | "daily_cap"
+  | "finding_open"
+  | "finding_recent"
+  | "already_reverted";
+
+export type AutonomousJobOutcome =
+  | Readonly<{ outcome: "created"; job: Job }>
+  | Readonly<{ outcome: "refused"; reason: AutonomousJobRefusal }>;
+
+export type CrashRevertRecord = Readonly<{
+  mergeCommitSha: string;
+  projectId: string;
+  mergedJobId: string;
+  jobId: string;
+  startedAt: number;
+}>;
+
+export type CompletedMergeRecord = Readonly<{
+  jobId: string;
+  mergeCommitSha: string;
+  /** Epoch milliseconds, parsed from the merge receipt's own timestamp. */
+  mergedAt: number;
+  /** True when a standing grant merged it, from the append-only authority log. */
+  unattended: boolean;
+}>;
 
 export type DelegationState = "open" | "fired" | "cancelled" | "failed";
 export type DelegationThreadState = "running" | "finished" | "failed" | "missing";
@@ -1551,6 +1585,27 @@ function assertFullSha(value: string, field: string): void {
   if (typeof value !== "string" || !FULL_SHA.test(value)) {
     throw new TypeError(`${field} must be a 40-character lowercase SHA`);
   }
+}
+
+/**
+ * Above every Telegram update id and every synthetic one the system turns
+ * issue, so a job nobody sent can never take the number of a message somebody
+ * did.
+ */
+const AUTONOMOUS_SOURCE_UPDATE_BASE = 9_000_000_000_000;
+
+/** Nothing will move a job on from here, so its finding may come back later. */
+const TERMINAL_INTAKE_STATES: ReadonlySet<JobState> = new Set<JobState>([
+  "merged",
+  "complete",
+  "failed",
+  "blocked",
+  "cancelled",
+  "production_failed",
+]);
+
+function utcDayOf(now: number): string {
+  return new Date(now).toISOString().slice(0, 10);
 }
 
 function assertNonNegativeInteger(value: number, field: string): void {
@@ -3534,6 +3589,18 @@ export interface TelegramAgentStore {
   getProjectPolicy(projectId: string): ProjectPolicyRecord | null;
   getProjectPolicyByAlias(alias: string): ProjectPolicyRecord | null;
   listEnabledProjectPolicies(): ProjectPolicyRecord[];
+  createAutonomousJob(input: {
+    projectId: string;
+    task: string;
+    origin: AutonomousJobOrigin;
+    minimumRecipe?: TaskRecipe;
+    intake?: { fingerprint: string; auditId: string; subject: string };
+    revert?: { mergeCommitSha: string; mergedJobId: string };
+    now: number;
+  }): AutonomousJobOutcome;
+  countAuditIntakeJobs(projectId: string, now: number): number;
+  getCrashRevertJob(mergeCommitSha: string): CrashRevertRecord | null;
+  getLatestCompletedMerge(projectId: string): CompletedMergeRecord | null;
   createConfirmedControllerJob(input: {
     controllerThreadId: string;
     projectId: string;
@@ -11044,6 +11111,259 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       });
       return selected.job;
     }).immediate();
+  }
+
+  /**
+   * The one way work the owner did not ask for enters the pipeline.
+   *
+   * It creates exactly the job a controller-created one is — same table, same
+   * `PROJECT_SELECTED` transition, same effects, same admission queue — and
+   * differs only in what it refuses to do. Every bound is checked inside this
+   * one immediate transaction, because a cap read outside the write it protects
+   * is a cap two passes can both pass.
+   *
+   * The bounds are deliberately asked of durable state rather than of the caller:
+   * the daily allowance comes from the stored policy, the brake from the pause
+   * table, the claim from the admission queue. A caller that has gone stale, or
+   * one that simply asks twice, gets the same refusal as one that never checked.
+   */
+  public createAutonomousJob(input: {
+    projectId: string;
+    task: string;
+    origin: AutonomousJobOrigin;
+    /** Floor for the recipe, so a diagnosis or a revert cannot route as a typo. */
+    minimumRecipe?: TaskRecipe;
+    /** Present when the daily allowance and the finding ledger both apply. */
+    intake?: { fingerprint: string; auditId: string; subject: string };
+    /** Present for a revert, which is bounded once per merge commit for all time. */
+    revert?: { mergeCommitSha: string; mergedJobId: string };
+    now: number;
+  }): AutonomousJobOutcome {
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertControllerText(input.task, "task");
+    assertNonNegativeInteger(input.now, "now");
+    if (input.intake) {
+      assertControllerIdentifier(input.intake.fingerprint, "fingerprint");
+      assertControllerIdentifier(input.intake.auditId, "auditId");
+      assertControllerIdentifier(input.intake.subject, "subject");
+    }
+    if (input.revert) {
+      assertFullSha(input.revert.mergeCommitSha, "mergeCommitSha");
+      assertControllerIdentifier(input.revert.mergedJobId, "mergedJobId");
+    }
+
+    return this.db.transaction((): AutonomousJobOutcome => {
+      const policyRecord = this.getProjectPolicy(input.projectId);
+      if (!policyRecord?.policy.enabled) return { outcome: "refused", reason: "project_not_enabled" };
+
+      const utcDay = utcDayOf(input.now);
+      if (input.intake) {
+        // Read from the stored policy, never from the caller: the allowance is
+        // the owner's statement about this project, and a caller carrying a
+        // snapshot of it is a caller that can be wrong about it.
+        const allowance = policyRecord.policy.autonomy?.intake?.maxJobsPerDay;
+        if (allowance === undefined) return { outcome: "refused", reason: "intake_not_configured" };
+        const startedToday = this.db.prepare(
+          "SELECT COUNT(*) AS count FROM audit_intake_findings WHERE project_id = ? AND utc_day = ?",
+        ).get(input.projectId, utcDay) as { count: number };
+        if (!Number.isSafeInteger(startedToday.count)) throw new Error("Audit intake day count is invalid");
+        if (startedToday.count >= allowance) return { outcome: "refused", reason: "daily_cap" };
+
+        const previous = this.db.prepare(
+          `SELECT job.state AS state, job.updated_at AS updated_at
+             FROM audit_intake_findings AS ledger
+             JOIN jobs AS job ON job.id = ledger.job_id
+            WHERE ledger.project_id = ? AND ledger.fingerprint = ?`,
+        ).get(input.projectId, input.intake.fingerprint) as
+          { state: JobState; updated_at: number } | undefined;
+        if (previous) {
+          // Terminal is read from the job itself rather than stamped on the
+          // ledger, so a job that finished during a restart is not a finding
+          // suppressed forever by a stamp nobody was alive to write.
+          if (!TERMINAL_INTAKE_STATES.has(previous.state)) {
+            return { outcome: "refused", reason: "finding_open" };
+          }
+          if (input.now - previous.updated_at < INTAKE_SUPPRESSION_MS) {
+            return { outcome: "refused", reason: "finding_recent" };
+          }
+        }
+      }
+
+      if (input.revert) {
+        const reverted = this.db.prepare(
+          "SELECT 1 FROM crash_revert_jobs WHERE merge_commit_sha = ?",
+        ).get(input.revert.mergeCommitSha) !== undefined;
+        if (reverted) return { outcome: "refused", reason: "already_reverted" };
+      }
+
+      const paused = this.db.prepare(
+        "SELECT 1 FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
+      ).get(input.projectId) !== undefined;
+      if (paused) return { outcome: "refused", reason: "project_paused" };
+
+      const occupied = this.db.prepare(
+        `SELECT 1 FROM job_admissions
+          WHERE project_id = ? AND state IN ('queued', 'admitted', 'draining') LIMIT 1`,
+      ).get(input.projectId) !== undefined;
+      if (occupied) return { outcome: "refused", reason: "open_job" };
+
+      const sourceUpdateId = this.nextAutonomousSourceUpdateId();
+      const jobId = createHash("sha256")
+        .update(`autonomous-job:${input.origin}:${sourceUpdateId}`, "utf8")
+        .digest("base64url")
+        .slice(0, 22);
+      const routing = classifyTaskTraits({
+        origin: "requested",
+        text: input.task,
+        ...(input.minimumRecipe === undefined ? {} : { ownerMinimumRecipe: input.minimumRecipe }),
+      });
+      const dispatchSettings = this.capabilityDispatchSettings();
+      const routingMode = routingModeForNewAttempt(
+        routing.recipe,
+        dispatchSettings.jobGraph,
+        this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
+      );
+      this.db.prepare(
+        `INSERT INTO jobs (
+           id, source_update_id, request_text, state, delivery_mode, task_recipe,
+           recipe_version, recipe_promotion_count, routing_mode, task_traits_json,
+           task_reason_codes_json, autonomous_origin, review_cycle, review_block_at,
+           version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'awaiting_project', ?, ?, 1, 0, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
+      ).run(
+        jobId,
+        sourceUpdateId,
+        input.task,
+        routing.recipe === "direct" ? "small_fix" : "full",
+        routing.recipe,
+        routingMode,
+        JSON.stringify(routing.traits),
+        JSON.stringify(routing.reasonCodes),
+        input.origin,
+        input.now,
+        input.now,
+      );
+      const created = this.readJobById(jobId);
+      if (!created) throw new Error("Autonomous job was not stored");
+
+      const selected = transition(created, {
+        type: "PROJECT_SELECTED",
+        projectId: policyRecord.policy.projectId,
+        policyVersion: policyRecord.version,
+        policy: policyRecord.policy,
+      }, input.now);
+      persistJobTransition(this.db, jobId, created.version, selected.job);
+      persistPendingEffects(this.db, selected.effects, input.now);
+      queueAdmissionInTransaction(this.db, {
+        jobId,
+        expectedVersion: selected.job.version,
+        projectId: policyRecord.policy.projectId,
+        resumeEvent: "CONFIRMED",
+        now: input.now,
+      });
+
+      if (input.intake) {
+        this.db.prepare(
+          `INSERT INTO audit_intake_findings (
+             project_id, fingerprint, audit_id, subject, job_id, utc_day, started_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(project_id, fingerprint) DO UPDATE SET
+             audit_id = excluded.audit_id,
+             subject = excluded.subject,
+             job_id = excluded.job_id,
+             utc_day = excluded.utc_day,
+             started_at = excluded.started_at`,
+        ).run(
+          input.projectId,
+          input.intake.fingerprint,
+          input.intake.auditId,
+          input.intake.subject,
+          jobId,
+          utcDay,
+          input.now,
+        );
+      }
+      if (input.revert) {
+        this.db.prepare(
+          `INSERT INTO crash_revert_jobs (
+             merge_commit_sha, project_id, merged_job_id, job_id, started_at
+           ) VALUES (?, ?, ?, ?, ?)`,
+        ).run(input.revert.mergeCommitSha, input.projectId, input.revert.mergedJobId, jobId, input.now);
+      }
+      return { outcome: "created", job: selected.job };
+    }).immediate();
+  }
+
+  /**
+   * A job nobody sent has no Telegram update behind it, and the column that
+   * would carry one is unique. Numbering above every id in the table keeps that
+   * uniqueness without ever colliding with a real update or with another
+   * autonomous job created in the same millisecond.
+   */
+  private nextAutonomousSourceUpdateId(): number {
+    const row = this.db.prepare(
+      "SELECT COALESCE(MAX(source_update_id), 0) AS highest FROM jobs",
+    ).get() as { highest: number };
+    if (!Number.isSafeInteger(row.highest)) throw new Error("Job source update ids are invalid");
+    return Math.max(AUTONOMOUS_SOURCE_UPDATE_BASE, row.highest + 1);
+  }
+
+  /** How many jobs the audit has started for this project on one UTC day. */
+  public countAuditIntakeJobs(projectId: string, now: number): number {
+    assertControllerIdentifier(projectId, "projectId");
+    assertNonNegativeInteger(now, "now");
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM audit_intake_findings WHERE project_id = ? AND utc_day = ?",
+    ).get(projectId, utcDayOf(now)) as { count: number };
+    return Number.isSafeInteger(row.count) ? row.count : 0;
+  }
+
+  /** The auto-revert already started for this merge commit, if there was one. */
+  public getCrashRevertJob(mergeCommitSha: string): CrashRevertRecord | null {
+    assertFullSha(mergeCommitSha, "mergeCommitSha");
+    const row = this.db.prepare(
+      "SELECT * FROM crash_revert_jobs WHERE merge_commit_sha = ?",
+    ).get(mergeCommitSha) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      mergeCommitSha: String(row.merge_commit_sha),
+      projectId: String(row.project_id),
+      mergedJobId: String(row.merged_job_id),
+      jobId: String(row.job_id),
+      startedAt: Number(row.started_at),
+    };
+  }
+
+  /**
+   * This project's most recent completed merge, and whether a standing grant is
+   * what merged it.
+   *
+   * Deliberately the *latest* merge rather than the latest unattended one. "The
+   * last thing that landed here was unattended" is the question worth asking
+   * after production breaks; "an unattended merge happened at some point" is not,
+   * and answering the second while sounding like the first would revert work the
+   * owner merged themselves.
+   */
+  public getLatestCompletedMerge(projectId: string): CompletedMergeRecord | null {
+    assertControllerIdentifier(projectId, "projectId");
+    const row = this.db.prepare(
+      `SELECT id, merge_commit_sha, merged_at FROM jobs
+        WHERE project_id = ? AND merge_commit_sha IS NOT NULL AND merged_at IS NOT NULL
+        ORDER BY merged_at DESC, id DESC LIMIT 1`,
+    ).get(projectId) as { id: string; merge_commit_sha: string; merged_at: string } | undefined;
+    if (!row) return null;
+    const mergedAt = Date.parse(row.merged_at);
+    if (!Number.isFinite(mergedAt)) return null;
+    const unattended = this.db.prepare(
+      `SELECT 1 FROM merge_authority_events
+        WHERE project_id = ? AND job_id = ? AND action = 'used' LIMIT 1`,
+    ).get(projectId, row.id) !== undefined;
+    return {
+      jobId: row.id,
+      mergeCommitSha: row.merge_commit_sha,
+      mergedAt,
+      unattended,
+    };
   }
 
   public getJobBySourceUpdateId(sourceUpdateId: number): Job | null {

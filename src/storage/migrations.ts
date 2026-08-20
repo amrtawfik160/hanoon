@@ -2285,6 +2285,51 @@ CREATE UNIQUE INDEX attempts_review_lens
   WHERE kind = 'review' AND review_lens IS NOT NULL AND review_stage IS NOT NULL;
 `] as const;
 
+/**
+ * Work the agent starts on its own needs three durable answers before it may
+ * start anything: what began this job, whether this finding has already had one,
+ * and whether this merge has already been reverted once.
+ *
+ * `autonomous_origin` sits beside `job_origin` rather than extending it. Origin
+ * decides how the pipeline treats the work; this decides only who is answerable
+ * for it existing, and a job a person asked for leaves it null forever.
+ *
+ * The two ledgers are keyed on the thing that must not repeat, not on the job
+ * that repeated it: a finding per project, and a merge commit for all time. That
+ * is what makes "once, ever" a property of the schema rather than of the code
+ * that happened to write the row.
+ */
+export const AUTONOMOUS_INTAKE_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN autonomous_origin TEXT
+  CHECK (autonomous_origin IS NULL
+         OR autonomous_origin IN ('audit_intake', 'self_diagnosis', 'crash_revert'));
+
+CREATE TABLE audit_intake_findings (
+  project_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  audit_id TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  utc_day TEXT NOT NULL CHECK (length(utc_day) = 10),
+  started_at INTEGER NOT NULL,
+  PRIMARY KEY (project_id, fingerprint)
+);
+
+CREATE INDEX audit_intake_findings_day
+  ON audit_intake_findings (project_id, utc_day);
+
+CREATE TABLE crash_revert_jobs (
+  merge_commit_sha TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  merged_job_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  started_at INTEGER NOT NULL
+);
+
+CREATE INDEX crash_revert_jobs_project
+  ON crash_revert_jobs (project_id, started_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2357,4 +2402,5 @@ export const ALL_MIGRATIONS = [
   ...PROJECT_ADMISSION_CLEAR_HISTORY_MIGRATIONS,
   ...CONTROLLER_VOICE_INBOX_MIGRATIONS,
   ...CONSENSUS_REVIEW_MIGRATIONS,
+  ...AUTONOMOUS_INTAKE_MIGRATIONS,
 ] as const;

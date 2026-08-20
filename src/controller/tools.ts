@@ -649,6 +649,9 @@ function jobProjection(job: Job, admission?: { state: string } | null) {
       planCycle: job.planCycle,
       reviewCycle: job.reviewCycle,
       deliveryMode: job.deliveryMode,
+      // Null on everything a person asked for. When it is set, the agent must
+      // be able to say who started this rather than implying the owner did.
+      autonomousOrigin: job.autonomousOrigin,
       taskRecipe: job.taskRecipe,
       recipeVersion: job.recipeVersion,
       recipePromotionCount: job.recipePromotionCount,

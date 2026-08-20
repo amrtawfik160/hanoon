@@ -31,6 +31,34 @@ describe("the autonomy block is opt-in", () => {
     });
   });
 
+  it("leaves the audit allowance absent, so the audits keep only reporting", () => {
+    const parsed = projectPolicySchema.safeParse({ ...policyFixture(), autonomy: {} });
+    expect(parsed.success && parsed.data.autonomy?.intake).toBeUndefined();
+  });
+
+  it("accepts a day's allowance of one to four jobs", () => {
+    for (const maxJobsPerDay of [1, 2, 3, 4]) {
+      expect(parse({ autonomy: { unattendedMerge: false, mergeWithoutProduction: false, intake: { maxJobsPerDay } } }).success)
+        .toBe(true);
+    }
+  });
+
+  it("refuses an allowance that is not a small whole number of jobs a day", () => {
+    // A project that starts more than four pieces of work a day unasked is
+    // being run unattended rather than maintained unattended.
+    for (const maxJobsPerDay of [0, 5, 40, 1.5, Number.NaN]) {
+      expect(parse({ autonomy: { unattendedMerge: false, mergeWithoutProduction: false, intake: { maxJobsPerDay } } }).success)
+        .toBe(false);
+    }
+  });
+
+  it("refuses an allowance carrying a field it does not know", () => {
+    expect(projectPolicySchema.safeParse({
+      ...policyFixture(),
+      autonomy: { intake: { maxJobsPerDay: 2, alsoMergeThem: true } },
+    }).success).toBe(false);
+  });
+
   it("refuses a field it does not know", () => {
     const parsed = projectPolicySchema.safeParse({
       ...policyFixture(),

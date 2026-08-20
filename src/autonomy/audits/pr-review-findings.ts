@@ -53,6 +53,12 @@ export function analysePrReviewFindings(input: Readonly<{
         auditId: "pr-review-findings",
         subject: `#${pr}`,
         detail: `${threads.length} unanswered: "${excerpt(first?.body ?? "")}"${extra}`,
+        intake: {
+          kind: "review",
+          pr,
+          unanswered: threads.length,
+          excerpt: excerpt(first?.body ?? ""),
+        },
       };
     });
 }

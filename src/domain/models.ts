@@ -93,6 +93,19 @@ export const autonomyPolicySchema = z
      * of whichever provider the job's review stage did not use.
      */
     consensusReview: consensusReviewSchema.optional(),
+    /**
+     * Let the daily audit start work rather than only report it. Absent means
+     * the audit keeps reporting and nothing begins on its own.
+     *
+     * The bound is a day's worth of jobs, not a rate: an audit that found forty
+     * things must not spend a night working through them. One to four, because
+     * a project that starts more than four pieces of work a day without being
+     * asked is not being maintained unattended, it is being run unattended.
+     */
+    intake: z
+      .object({ maxJobsPerDay: z.number().int().min(1).max(4) })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -307,6 +320,23 @@ export type BlockedReason =
 
 export type DeliveryMode = "full" | "small_fix";
 export type JobOrigin = "requested" | "adopted_pr";
+
+/**
+ * What started this job when nobody asked for it.
+ *
+ * Kept apart from `JobOrigin`, which says how the work arrived and decides how
+ * the pipeline treats it. This says only who is answerable for its existence,
+ * and never changes after the job is created — provenance that a later
+ * transition could rewrite would be worth nothing.
+ */
+export type AutonomousJobOrigin = "audit_intake" | "self_diagnosis" | "crash_revert";
+
+/** One plain line for the owner, so provenance reads the same everywhere. */
+export function autonomousOriginLabel(origin: AutonomousJobOrigin): string {
+  if (origin === "audit_intake") return "started by the daily repository audit";
+  if (origin === "self_diagnosis") return "started by self-diagnosis of a failed turn";
+  return "started automatically to revert a merge that broke production";
+}
 export type RoutingMode = "legacy" | "shadow" | "active";
 
 export const PRODUCTION_NOT_CONFIGURED = "Production deployment and canary are not configured";
@@ -462,6 +492,8 @@ export interface Job {
   taskTraits: readonly import("../capabilities/routing").TaskTraitEvidence[];
   taskReasonCodes: readonly string[];
   origin: JobOrigin;
+  /** Absent on every job a person asked for. Immutable once written. */
+  autonomousOrigin: AutonomousJobOrigin | null;
   adoptedBranch: string | null;
   adoptedHeadSha: string | null;
   planCycle: number;

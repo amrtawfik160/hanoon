@@ -1,4 +1,5 @@
 import {
+  autonomousOriginLabel,
   isResumablePermanentFailure,
   isResumablePlanBlock,
   isResumableReviewBlock,
@@ -619,6 +620,12 @@ export function renderJobStatus(
     lines.push(`Model escalation: <code>${html(context.materialModelPool, 20)}</code>`);
   }
   lines.push(`Delivery: ${html(deliveryState(job), 80)}`);
+  // Whoever reads this card should never have to wonder whether they asked for
+  // this, so a job nobody asked for says so before it says anything else about
+  // what it is doing.
+  if (job.autonomousOrigin) {
+    lines.push(`Nobody asked for this job: ${html(autonomousOriginLabel(job.autonomousOrigin), 120)}.`);
+  }
   if (context.autoApproved) {
     lines.push("Merging on your standing approval — you were not asked.");
   } else if (ready && context.approvalReason && context.mergeAuthorityGranted) {

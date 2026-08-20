@@ -110,6 +110,7 @@ import { isDisposableTempName } from "./autonomy/disk-space";
 import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
 import { WorkspaceHousekeepingService } from "./services/workspace-housekeeping-service";
 import { AuditService } from "./services/audit-service";
+import { AuditIntakeService } from "./services/audit-intake-service";
 import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
@@ -1324,6 +1325,16 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     reclaimArmed: () => config.ok && workspaceReclaimEnabled(config.value),
     warn: (message) => bb.log.warn(message),
   });
+  const auditIntake = new AuditIntakeService({
+    store,
+    clock: { now: clock },
+    issueUpdateId: (now) => {
+      healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
+      return healthUpdateId;
+    },
+    onWorkAvailable: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
   const audits = new AuditService({
     store,
     audits: createAuditAccess({ sdk: bb.sdk as never, store, terminal }),
@@ -1334,6 +1345,10 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
     // Read-only, so it rides the existing upkeep switch rather than adding one.
     auditsArmed: () => config.ok && systemUpkeepEnabled(config.value),
+    // Acting on a finding is the project's own choice, declared in its policy,
+    // so this is wired unconditionally: the intake service starts nothing for a
+    // project that did not ask for it.
+    onResults: (project, results, now) => auditIntake.consider(project, results, now),
     warn: (message) => bb.log.warn(message),
   });
   const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });

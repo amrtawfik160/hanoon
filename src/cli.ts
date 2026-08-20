@@ -375,6 +375,8 @@ function safeJob(store: TelegramAgentStore, job: Job, now: number): JsonRecord {
       routingMode: job.routingMode,
     },
     projectId: job.projectId,
+    origin: job.origin,
+    autonomousOrigin: job.autonomousOrigin,
     environmentId: job.environmentId,
     implementationThreadId: job.implementationThreadId,
     reviewThreadId: job.reviewThreadId,

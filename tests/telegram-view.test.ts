@@ -667,3 +667,20 @@ describe("deterministic Telegram views", () => {
     expectWellFormedTelegramHtml(rendered.text);
   });
 });
+
+it("says plainly on the card when nobody asked for this job", () => {
+  const rendered = renderJobStatus(jobFixture({
+    id: telegramJobId,
+    state: "implementing",
+    autonomousOrigin: "audit_intake",
+  }));
+
+  expect(rendered.text).toContain("Nobody asked for this job");
+  expect(rendered.text).toContain("daily repository audit");
+});
+
+it("says nothing about provenance on a job the owner asked for", () => {
+  const rendered = renderJobStatus(jobFixture({ id: telegramJobId, state: "implementing" }));
+
+  expect(rendered.text).not.toContain("Nobody asked");
+});

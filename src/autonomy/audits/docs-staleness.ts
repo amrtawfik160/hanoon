@@ -169,6 +169,7 @@ export function analyseDocsStaleness(input: Readonly<{
         auditId: "docs-staleness",
         subject: doc.path,
         detail: `names ${reference.text}, which the repository no longer has`,
+        intake: { kind: "docs", document: doc.path, reference: reference.text },
       });
     }
   }
