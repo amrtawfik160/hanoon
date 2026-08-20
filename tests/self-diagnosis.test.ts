@@ -521,7 +521,11 @@ describe("filing a diagnosis as pipeline work", () => {
   });
 
   it("files a pipeline job instead of a draft pull request in pipeline mode", async () => {
-    const filePipelineJob = vi.fn(() => ({ outcome: "filed" as const, jobId: "job_from_diagnosis" }));
+    const filePipelineJob = vi.fn(
+      (_input: { diagnosisId: string; target: { projectId: string } }) => (
+        { outcome: "filed" as const, jobId: "job_from_diagnosis" }
+      ),
+    );
     const { service, publish, ledger } = pipelineService({
       mode: () => "pipeline",
       filePipelineJob,

@@ -112,6 +112,7 @@ import { DiskHousekeepingService } from "./services/disk-housekeeping-service";
 import { WorkspaceHousekeepingService } from "./services/workspace-housekeeping-service";
 import { AuditService } from "./services/audit-service";
 import { AuditIntakeService } from "./services/audit-intake-service";
+import { CrashRevertService } from "./services/crash-revert-service";
 import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
@@ -1197,8 +1198,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   // Health ids share the monitor id space, which is derived from the clock and
   // kept above real Telegram update ids.
   let healthUpdateId = 0;
+  const crashRevert = new CrashRevertService({
+    store,
+    onWorkAvailable: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
   const productionHealth = new ProductionHealthService({
     store,
+    autoRevert: crashRevert,
     commands: {
       run: async ({ projectId, command }) => {
         const projects = await bb.sdk.projects.list({});
