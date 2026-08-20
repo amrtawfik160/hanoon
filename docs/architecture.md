@@ -127,9 +127,9 @@ The BB manifest registers five local skill roots. Four are vendored from reviewe
 | `skills/guards` | [amElnagdy/guard-skills](https://github.com/amElnagdy/guard-skills) | MIT | `clean-code-guard`, `test-guard`, `docs-guard` |
 | `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | Apache-2.0 | `pr-writer` |
 | `skills/discovery` | [mattpocock/skills](https://github.com/mattpocock/skills), pinned `1.2.3` at revision `84fdeffd12f2ee307994d1eb6feb48173b6e0502` | MIT | `grill-with-docs`, `grilling`, `domain-modeling` |
-| `skills/hanoon` | first-party | first-party | `human-friendly-coding-communication`, `proportional-development-workflow` |
+| `skills/hanoon` | first-party; `blast-radius` is adapted from the MIT-licensed pstack skill of [cursor/plugins](https://github.com/cursor/plugins) at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | first-party | `blast-radius`, `checking-system-logs`, `driving-bb`, `durable-boundary-audit`, `human-friendly-coding-communication`, `proportional-development-workflow` |
 
-A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. All 26 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
+A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. A skill there that was adapted from a permissively licensed upstream rather than written from nothing records that upstream, its revision, and its licence in `skills/hanoon/NOTICE`, and carries the licence with it. All 27 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
 
 The existing single `bb.agents.configure` callback keeps the controller and worker boundaries separate. Its exact role-selection matrix is:
 
@@ -138,11 +138,13 @@ The existing single `bb.agents.configure` callback keeps the controller and work
 | controller | `human-friendly-coding-communication`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`; controller tools and `CONTROLLER_INSTRUCTIONS` |
 | planner | `human-friendly-coding-communication` |
 | critic | `human-friendly-coding-communication` |
-| implementation | `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
-| review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard` |
+| implementation | `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius` |
 | documentation | `human-friendly-coding-communication`, `docs-guard`, `verification-before-completion` |
-| final-review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard` |
+| final-review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
 | validation, merge, deploy, canary | none; these are deterministic stages, not skill-bearing worker roles |
+
+The guards judge the code the change contains. `blast-radius` goes only to the two roles whose verdict can carry a change to merge, because the risk they weigh is the breakage outside the diff. It tells the reviewer to prove the one fact the change is safe because of by running real code, keep proof scripts out of the worktree that both the review handler and the merge gate require clean, and state an unproven safety fact in the verdict rather than smooth it away.
 
 ### Fail-closed worker selection
 
