@@ -112,6 +112,34 @@ bb provider models <provider-id> --json
 
 Never guess a model id: ask the provider on the machine the work will run on.
 
+Cursor (`acp-cursor`) and Grok (`acp-grok`) reject `--permission-mode auto`. When you spawn one yourself, pass `accept-edits` or `full`:
+
+```bash
+bb thread spawn --project <id> --provider acp-cursor --model cursor-grok-4.6-medium \
+  --permission-mode accept-edits --prompt "..."
+bb thread spawn --project <id> --provider acp-grok --model grok-4.6 \
+  --permission-mode full --prompt "..."
+```
+
+Do not run `bb thread compact` on a Cursor thread. Cursor ACP does not expose it.
+
+If a Cursor or Grok follow-up fails with `No active ACP session`, revive that thread instead of starting over:
+
+```bash
+bb acp-session-recover now <thread-id>
+```
+
+## Guarded jobs
+
+Software changes that need review or merge belong to `telegram_agent_start_job`, not an exploratory thread. The job runs the selected recipe through implementation, checks, review, docs, and, when configured, merge and production.
+
+```bash
+bb telegram-agent job list --json
+bb telegram-agent job show <job-id> --json
+```
+
+Steer, retry, cancel, and land through the controller tools. Never merge or deploy by hand.
+
 ## When something fails
 
 Read before deciding. `bb thread show <id> --json` and `bb thread log <id>` tell
@@ -122,5 +150,5 @@ otherwise.
 ```bash
 bb thread retry <id>       # continue an interrupted turn
 bb thread stop <id>        # when it is stuck or no longer wanted
-bb thread compact <id>     # when its context is the problem
+bb thread compact <id>     # Codex, Claude Code, or Pi when context is the problem. Not Cursor.
 ```

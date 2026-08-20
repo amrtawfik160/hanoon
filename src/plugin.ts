@@ -99,6 +99,7 @@ import {
   EXTRACTION_MODELS,
   controllerProviderFor,
 } from "./controller/execution-profile";
+import { modelRouteSpawnArgs } from "./domain/stage-execution";
 import { LunaControllerService } from "./controller/service";
 import { ControllerInteractionService } from "./controller/interaction-service";
 import { TelegramPresenceCoordinator } from "./services/telegram-presence";
@@ -234,18 +235,7 @@ async function spawnSelfDiagnosisWorker(input: {
       hostId: input.target.hostId,
       workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: input.target.baseBranch } },
     },
-    providerId: input.modelRoute.providerId,
-    model: input.modelRoute.modelId,
-    reasoningLevel: input.modelRoute.reasoning,
-    serviceTier: input.modelRoute.serviceTier,
-    permissionMode: "auto",
-    executionInputSources: {
-      providerId: "explicit",
-      model: "explicit",
-      reasoningLevel: "explicit",
-      serviceTier: "explicit",
-      permissionMode: "explicit",
-    },
+    ...modelRouteSpawnArgs(input.modelRoute),
   });
 }
 
@@ -323,7 +313,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     controllerModel: {
       type: "select",
       label: "Controller model",
-      description: "Model for Telegram conversation turns. Claude models run on Claude Code, gpt models on Codex. Job workers remain project-controlled.",
+      description: "Model for Telegram conversation turns. The catalog picks the provider: Claude Code, Codex, Cursor, or Grok. Job workers remain project-controlled.",
       options: [...CONTROLLER_MODELS],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.model,
     },
@@ -351,14 +341,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     controllerServiceTier: {
       type: "select",
       label: "Controller service tier",
-      description: "Codex only. Fast prioritizes latency; default uses the provider's standard tier. Ignored by Claude models.",
+      description: "Honoured by Codex, Cursor, and Grok. Fast prioritizes latency; default uses the provider's standard tier. Not sent for Claude Code models.",
       options: [...CONTROLLER_SERVICE_TIERS],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.serviceTier,
     },
     controllerPermissionMode: {
       type: "select",
       label: "Controller permission mode",
-      description: "BB and the execution machine still enforce their permission limits.",
+      description: "BB and the execution machine still enforce their permission limits. Cursor and Grok reject auto, so those models receive accept-edits unless you choose full.",
       options: [...CONTROLLER_PERMISSION_MODES],
       default: DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
     },
@@ -625,6 +615,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     controllerProviderId: () => config.ok
       ? controllerProviderFor(controllerExecutionProfile(config.value).model)
       : undefined,
+    controllerExecution: () => config.ok ? controllerExecutionProfile(config.value) : undefined,
     // Read per resolution rather than captured, so an edited identity reaches
     // the next turn the same way an edited model does.
     controllerIdentity: () => config.ok ? config.value.controllerIdentity : undefined,
@@ -1144,18 +1135,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
             hostId: host.id,
             workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: baseBranch } },
           },
-          providerId: modelRoute.providerId,
-          model: modelRoute.modelId,
-          reasoningLevel: modelRoute.reasoning,
-          serviceTier: modelRoute.serviceTier,
-          permissionMode: "auto",
-          executionInputSources: {
-            providerId: "explicit",
-            model: "explicit",
-            reasoningLevel: "explicit",
-            serviceTier: "explicit",
-            permissionMode: "explicit",
-          },
+          ...modelRouteSpawnArgs(modelRoute),
         });
         return thread.id;
       },

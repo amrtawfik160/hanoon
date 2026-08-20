@@ -445,7 +445,8 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // read the outcome rather than read an unchanged job as a failed retry.
   // Re-pinned when `queued` stopped promising that admission alone guarantees
   // execution; scheduler health can still hold an admitted retry.
-  expect(digest).toBe("26a90ac7a4c4645e48aad08b9f59b0606186af91464f665c96d753962c41c252");
+  // Re-pinned when start_job began describing the job as the software lifecycle.
+  expect(digest).toBe("fda23e417ac4eb6b21d68fb9fb0fdf79be9fe61a347c79060d8b37f0d37555ff");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -1083,7 +1084,7 @@ it("rejects unmapped controllers and disabled projects while allowing another qu
 });
 
 it("registers the exact controller tools and keeps them off unrelated sessions", async () => {
-  const { bb, harness, store } = fixture({ active: true });
+  const { bb, harness, store } = fixture({ active: true, inputText: "what is running right now?" });
   const notify = vi.fn();
   const requestThreadOperation = vi.fn(async (input: {
     kind: "steer_thread" | "stop_thread" | "retry_thread";
@@ -1149,8 +1150,8 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   expect(new Set(selected.tools.map((tool) => tool.name))).toEqual(new Set(minimumTools));
   expect(selected.skills).toEqual([
     "driving-bb",
-    "human-friendly-coding-communication",
     "proportional-development-workflow",
+    "unslop",
   ]);
   expect(selected.instructions).toContain("You are the owner's teammate");
   const aliasTools = (await harness.behavior.resolveAgentConfiguration({
@@ -1368,7 +1369,10 @@ it("keeps protocol tools in all-tools and old-profile compatibility configuratio
 });
 
 it("exposes an approved bundle only after the persisted continuation profile is configured", async () => {
-  const { bb, harness, store, turn, deactivate } = fixture({ active: true });
+  const { bb, harness, store, turn, deactivate } = fixture({
+    active: true,
+    inputText: "what is running right now?",
+  });
   let now = 10_000;
   registerControllerTools(bb, {
     store,
@@ -1528,7 +1532,7 @@ it("routes verified implementation attempts through their exact durable effect b
   expect(firstStart).toMatchObject({
     tools: [],
     skills: [
-      "human-friendly-coding-communication",
+      "unslop",
       "systematic-debugging",
       "test-driven-development",
       "verification-before-completion",
@@ -1677,11 +1681,11 @@ it("routes review variants and pipeline stages only when their stored role and e
   store.createAttempt({ id: finalReviewId, jobId: finalReview.job.id, kind: "review", ordinal: 2, headSha: sha(), now: 2_101 });
 
   const cases = [
-    [{ jobId: review.job.id, attemptId: reviewId, role: "review" as const }, undefined, ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "durable-boundary-audit"]],
-    [{ jobId: finalReview.job.id, attemptId: finalReviewId, role: "final-review" as const }, undefined, ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit"]],
-    [{ jobId: implementation.job.id, attemptId: `stage:${planEffect.idempotencyKey}`, role: "planner" as const }, "thr_plan", ["human-friendly-coding-communication", "docs-guard"]],
-    [{ jobId: implementation.job.id, attemptId: `stage:${critiqueEffect.idempotencyKey}`, role: "critic" as const }, undefined, ["human-friendly-coding-communication"]],
-    [{ jobId: docs.job.id, attemptId: `stage:${docs.effect.idempotencyKey}`, role: "documentation" as const }, undefined, ["human-friendly-coding-communication", "docs-guard", "verification-before-completion"]],
+    [{ jobId: review.job.id, attemptId: reviewId, role: "review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "durable-boundary-audit"]],
+    [{ jobId: finalReview.job.id, attemptId: finalReviewId, role: "final-review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit"]],
+    [{ jobId: implementation.job.id, attemptId: `stage:${planEffect.idempotencyKey}`, role: "planner" as const }, "thr_plan", ["unslop", "writing-plans", "docs-guard"]],
+    [{ jobId: implementation.job.id, attemptId: `stage:${critiqueEffect.idempotencyKey}`, role: "critic" as const }, undefined, ["unslop"]],
+    [{ jobId: docs.job.id, attemptId: `stage:${docs.effect.idempotencyKey}`, role: "documentation" as const }, undefined, ["unslop", "technical-writing", "docs-guard", "verification-before-completion"]],
   ] as const;
   for (const [identity, threadId, skills] of cases) {
     const configuration = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity, threadId === undefined ? {} : {
@@ -2155,6 +2159,12 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
     health: () => ({ ok: true }),
     notify: vi.fn(),
     now: () => 10_000,
+    controllerExecution: () => ({
+      model: "grok-4.6",
+      reasoningLevel: "xhigh",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
   });
 
   const created = parseToolJson(await harness.behavior.callAgentTool(
@@ -2166,6 +2176,9 @@ it("opens and messages visible threads, and refuses hidden ones", async () => {
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
     projectId: "proj_1",
     visibility: "visible",
+    providerId: "acp-grok",
+    model: "grok-4.6",
+    permissionMode: "accept-edits",
     environment: expect.objectContaining({ type: "host", hostId: "host_cyndra" }),
   }));
 

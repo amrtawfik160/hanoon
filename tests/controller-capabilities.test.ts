@@ -57,6 +57,12 @@ it("partitions all 32 domain tools exactly once and keeps metadata and protocol 
 it.each([
   ["show job status", ["core-observation"]],
   ["start the approved implementation", ["core-observation", "job-control"]],
+  ["merge it", ["core-observation", "job-control"]],
+  ["just land it", ["core-observation", "job-control"]],
+  ["resume the paused project", ["core-observation", "job-control"]],
+  ["fix the checkout crash", ["core-observation", "job-control"]],
+  ["add a settings page", ["core-observation", "job-control"]],
+  ["ship the feature", ["core-observation", "job-control"]],
   ["create a thread and send it these constraints", ["core-observation", "thread-control"]],
   ["remember this preference", ["core-observation", "memory"]],
   ["watch that thread until it is idle", ["core-observation", "monitoring"]],
@@ -86,14 +92,14 @@ it.each(permittedBundleCombinations.map((bundleIds) => [bundleIds]))(
 it("loads manual discovery skills only for an explicit slash invocation", () => {
   expect(controllerSkillsForTurn("Help me think this through")).toEqual([
     "driving-bb",
-    "human-friendly-coding-communication",
     "proportional-development-workflow",
+    "unslop",
   ]);
   for (const command of ["/grill-with-docs", "/grilling", "/domain-modeling"]) {
     expect(controllerSkillsForTurn(`${command} design the workflow`)).toEqual([
       "driving-bb",
-      "human-friendly-coding-communication",
       "proportional-development-workflow",
+      "unslop",
       ...CONTROLLER_MANUAL_DISCOVERY_SKILLS,
     ]);
   }

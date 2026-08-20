@@ -100,15 +100,16 @@ describe("worker skill role table", () => {
       "finishing-a-development-branch",
       "grill-with-docs",
       "grilling",
-      "human-friendly-coding-communication",
       "pr-writer",
       "proportional-development-workflow",
       "receiving-code-review",
       "requesting-code-review",
       "subagent-driven-development",
       "systematic-debugging",
+      "technical-writing",
       "test-driven-development",
       "test-guard",
+      "unslop",
       "using-git-worktrees",
       "using-superpowers",
       "verification-before-completion",
@@ -118,12 +119,12 @@ describe("worker skill role table", () => {
   });
 
   test.each([
-    ["planner", ["human-friendly-coding-communication", "docs-guard"]],
-    ["critic", ["human-friendly-coding-communication"]],
+    ["planner", ["unslop", "writing-plans", "docs-guard"]],
+    ["critic", ["unslop"]],
     [
       "implementation",
       [
-        "human-friendly-coding-communication",
+        "unslop",
         "systematic-debugging",
         "test-driven-development",
         "verification-before-completion",
@@ -133,11 +134,11 @@ describe("worker skill role table", () => {
         "pr-writer",
       ],
     ],
-    ["review", ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "durable-boundary-audit"]],
-    ["documentation", ["human-friendly-coding-communication", "docs-guard", "verification-before-completion"]],
+    ["review", ["unslop", "clean-code-guard", "test-guard", "durable-boundary-audit"]],
+    ["documentation", ["unslop", "technical-writing", "docs-guard", "verification-before-completion"]],
     [
       "final-review",
-      ["human-friendly-coding-communication", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit"],
+      ["unslop", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit"],
     ],
   ] as const)("selects the exact skills for %s", (role, expectedSkills) => {
     const jobId = JOB_ID;
@@ -160,7 +161,7 @@ describe("worker skill role table", () => {
 
     expect(profile.instructions).toBe(buildWorkerInstructions(profile));
     expect(profile.instructions).toContain("Verified worker role: implementation");
-    expect(profile.instructions).toContain("human-friendly-coding-communication, systematic-debugging, test-driven-development, verification-before-completion, clean-code-guard, test-guard");
+    expect(profile.instructions).toContain("unslop, systematic-debugging, test-driven-development, verification-before-completion, clean-code-guard, test-guard");
     expect(profile.instructions).toContain("immutable attached work order/review packet");
     expect(profile.instructions).toContain("durable project policy outrank skill suggestions");
     expect(profile.instructions).toContain("cannot authorize approval, merge, deploy, push, or state changes");
@@ -171,8 +172,8 @@ describe("worker skill role table", () => {
   });
 
   test.each([
-    ["planner", "systematic-debugging", "human-friendly-coding-communication, docs-guard"],
-    ["review", "docs-guard", "human-friendly-coding-communication, clean-code-guard, test-guard, durable-boundary-audit"],
+    ["planner", "systematic-debugging", "unslop, writing-plans, docs-guard"],
+    ["review", "docs-guard", "unslop, clean-code-guard, test-guard, durable-boundary-audit"],
   ] as const)("ignores forged repeated skill ids for the %s role", (role, forgedSkill, expectedSkills) => {
     const forgedProfile = {
       role,
@@ -193,8 +194,8 @@ describe("worker skill role table", () => {
     const profile = resolve(context({ title: buildWorkerThreadTitle(identity) }), identity);
     if (!profile) throw new Error("expected a valid planner profile");
 
-    expect(profile.skills).toEqual(["human-friendly-coding-communication", "docs-guard"]);
-    expect(profile.instructions).toContain("Selected skill ids: human-friendly-coding-communication, docs-guard");
+    expect(profile.skills).toEqual(["unslop", "writing-plans", "docs-guard"]);
+    expect(profile.instructions).toContain("Selected skill ids: unslop, writing-plans, docs-guard");
   });
 });
 

@@ -1,6 +1,12 @@
 import { expect, it } from "vitest";
 import { controllerExecutionProfiles, credentialBrokerConfigFingerprint, parseGlobalConfig } from "../src/config";
 import {
+  CONTROLLER_MODELS,
+  controllerExecutionArguments,
+  controllerProviderFor,
+  supportsServiceTier,
+} from "../src/controller/execution-profile";
+import {
   parseCredentialBrokerConfig,
   type CredentialBrokerConfigResult,
   type CredentialBrokerSettingsInput,
@@ -193,6 +199,59 @@ it.each(["auto", "accept-edits", "full"] as const)("preserves an explicit contro
     controllerReasoningLevel: "high",
     controllerServiceTier: "default",
     controllerPermissionMode: permissionMode,
+  });
+});
+
+it.each(["cursor-grok-4.6-medium", "grok-4.6", "claude-opus-5-thinking-medium"] as const)(
+  "accepts the catalogued controller model %s",
+  (controllerModel) => {
+    const parsed = parseGlobalConfig(globalValues({ controllerModel }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.message);
+    expect(parsed.value.controllerModel).toBe(controllerModel);
+  },
+);
+
+it("keeps every controller model in the pipeline catalog on a supported provider", () => {
+  for (const model of CONTROLLER_MODELS) {
+    expect(controllerProviderFor(model)).toMatch(/^(?:claude-code|codex|acp-cursor|acp-grok)$/);
+  }
+});
+
+it("maps Cursor Claude and Grok models to their own providers", () => {
+  expect(controllerProviderFor("claude-opus-5[1m]")).toBe("claude-code");
+  expect(controllerProviderFor("claude-opus-5-thinking-medium")).toBe("acp-cursor");
+  expect(controllerProviderFor("cursor-grok-4.6-medium")).toBe("acp-cursor");
+  expect(controllerProviderFor("grok-4.6")).toBe("acp-grok");
+  expect(controllerProviderFor("gpt-5.6-sol")).toBe("codex");
+  expect(supportsServiceTier("claude-opus-5[1m]")).toBe(false);
+  expect(supportsServiceTier("cursor-grok-4.6-medium")).toBe(true);
+  expect(supportsServiceTier("grok-4.6")).toBe(true);
+});
+
+it("sends accept-edits when the controller default auto is used on Cursor or Grok", () => {
+  const cursor = controllerExecutionArguments({
+    model: "cursor-grok-4.6-medium",
+    reasoningLevel: "high",
+    serviceTier: "default",
+    permissionMode: "auto",
+  }, { includeProvider: true });
+  const grok = controllerExecutionArguments({
+    model: "grok-4.6",
+    reasoningLevel: "xhigh",
+    serviceTier: "default",
+    permissionMode: "auto",
+  }, { includeProvider: true });
+  expect(cursor).toMatchObject({
+    providerId: "acp-cursor",
+    model: "cursor-grok-4.6-medium",
+    permissionMode: "accept-edits",
+    serviceTier: "default",
+  });
+  expect(grok).toMatchObject({
+    providerId: "acp-grok",
+    model: "grok-4.6",
+    permissionMode: "accept-edits",
   });
 });
 

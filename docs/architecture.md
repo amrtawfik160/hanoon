@@ -119,7 +119,7 @@ This release deliberately exposes no promotion-evidence append method, CLI input
 
 ## Agent skill runtime
 
-The BB manifest registers five local skill roots. Four are vendored from reviewed permissively licensed upstreams. The fifth is first-party Hanoon guidance:
+The BB manifest registers six local skill roots. Five are vendored from reviewed permissively licensed upstreams. The sixth is first-party Hanoon guidance:
 
 | Root | Upstream | Licence | Contents |
 | --- | --- | --- | --- |
@@ -127,21 +127,22 @@ The BB manifest registers five local skill roots. Four are vendored from reviewe
 | `skills/guards` | [amElnagdy/guard-skills](https://github.com/amElnagdy/guard-skills) | MIT | `clean-code-guard`, `test-guard`, `docs-guard` |
 | `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | Apache-2.0 | `pr-writer` |
 | `skills/discovery` | [mattpocock/skills](https://github.com/mattpocock/skills), pinned `1.2.3` at revision `84fdeffd12f2ee307994d1eb6feb48173b6e0502` | MIT | `grill-with-docs`, `grilling`, `domain-modeling` |
-| `skills/hanoon` | first-party | first-party | `human-friendly-coding-communication`, `proportional-development-workflow` |
+| `skills/hanoon` | first-party | first-party | `checking-system-logs`, `driving-bb`, `durable-boundary-audit`, `proportional-development-workflow` |
+| `skills/pstack` | [cursor/plugins](https://github.com/cursor/plugins), pinned at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | MIT | `unslop`, `technical-writing` |
 
-A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. All 26 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
+A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. All 27 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
 
 The existing single `bb.agents.configure` callback keeps the controller and worker boundaries separate. Its exact role-selection matrix is:
 
 | Verified role/context | Selected skill ids |
 | --- | --- |
-| controller | `human-friendly-coding-communication`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`; controller tools and `CONTROLLER_INSTRUCTIONS` |
-| planner | `human-friendly-coding-communication` |
-| critic | `human-friendly-coding-communication` |
-| implementation | `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
-| review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard` |
-| documentation | `human-friendly-coding-communication`, `docs-guard`, `verification-before-completion` |
-| final-review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard` |
+| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`; controller tools and `CONTROLLER_INSTRUCTIONS` |
+| planner | `unslop` |
+| critic | `unslop` |
+| implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
+| review | `unslop`, `clean-code-guard`, `test-guard` |
+| documentation | `unslop`, `technical-writing`, `docs-guard`, `verification-before-completion` |
+| final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard` |
 | validation, merge, deploy, canary | none; these are deterministic stages, not skill-bearing worker roles |
 
 ### Fail-closed worker selection

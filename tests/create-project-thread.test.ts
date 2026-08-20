@@ -38,6 +38,32 @@ it("cuts a new thread's worktree from the base branch it was given", async () =>
   }));
 });
 
+it("sends the controller execution tuple so Cursor and Grok child threads can start", async () => {
+  const { spawn, args } = input({ baseBranch: "main" });
+
+  await createProjectThread({
+    ...args,
+    execution: {
+      providerId: "acp-grok",
+      model: "grok-4.6",
+      reasoningLevel: "xhigh",
+      permissionMode: "accept-edits",
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        reasoningLevel: "explicit",
+        permissionMode: "explicit",
+      },
+    },
+  });
+
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
+    providerId: "acp-grok",
+    model: "grok-4.6",
+    permissionMode: "accept-edits",
+  }));
+});
+
 it.each([[""], ["   "]])("refuses to spawn a thread with a blank base branch (%j)", async (baseBranch) => {
   const { spawn, args } = input({ baseBranch });
 

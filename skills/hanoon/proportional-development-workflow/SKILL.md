@@ -12,7 +12,7 @@ Use the smallest safe workflow. Do not duplicate interviews, brainstorming, spec
 | Situation | Workflow |
 | --- | --- |
 | Copy, styling, configuration, or a clear mechanical change | Implement directly; use neither grilling nor Superpowers planning |
-| Clear change to an existing flow | Use the Superpowers bounded path: short in-chat design, approval, inline implementation, targeted verification, one final review |
+| Clear change to an existing flow | Use the Superpowers bounded path: short in-chat design, approval, then a guarded job for implementation and review |
 | Important product behavior, terminology, or decisions are unclear | Suggest `/grill-with-docs`; never invoke it automatically |
 | New system, public contract, auth, billing, security, migration, concurrency, high-risk, multi-session, or autonomous work | Use the full Superpowers architectural workflow |
 | Reproducible bug with clear expected behavior | Use Superpowers systematic debugging; grill only if product behavior is unclear |
@@ -27,7 +27,13 @@ When the user invokes `/grill-with-docs`:
 - Keep `CONTEXT.md` to domain terminology. Create an ADR only for a difficult-to-reverse, surprising decision with a real tradeoff.
 - Summarize resolved behavior, constraints, exclusions, defaults, and verification criteria, then ask for confirmation.
 
-After confirmation, stay in the same conversation and treat it as design approval. Skip Superpowers brainstorming and do not repeat the interview. For bounded work, implement directly without a spec or plan document. For architectural work, synthesize one specification, review it once, then use Superpowers writing-plans with inline execution by default.
+After confirmation, stay in the same conversation and treat it as design approval. Skip Superpowers brainstorming and do not repeat the interview. For bounded work, start a guarded job without a spec or plan document. For architectural work, synthesize one specification, review it once, then start a guarded job so the executor owns the remaining stages.
+
+## Hand work to a guarded job
+
+Once the route is clear, start a Hanoon job for any change that needs review or merge. Do not implement that change in an exploratory thread.
+
+You own intake and, for bounded work, the short in-chat design. The job owns implementation, checks, review, docs, merge, and production. Merge and production stay on the job. Never merge or deploy by hand.
 
 ## Defaults
 

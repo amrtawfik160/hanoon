@@ -20,6 +20,7 @@ export const GUARDS_ROOT = "skills/guards";
 export const DELIVERY_ROOT = "skills/delivery";
 export const DISCOVERY_ROOT = "skills/discovery";
 export const HANOON_ROOT = "skills/hanoon";
+export const PSTACK_ROOT = "skills/pstack";
 export const LOCK_PATH = "skills/skills.lock.json";
 export const REGISTERED_ROOTS = Object.freeze([
   WORKFLOW_ROOT,
@@ -27,6 +28,7 @@ export const REGISTERED_ROOTS = Object.freeze([
   DELIVERY_ROOT,
   DISCOVERY_ROOT,
   HANOON_ROOT,
+  PSTACK_ROOT,
 ]);
 
 const workflowSkillIds = [
@@ -52,8 +54,11 @@ const hanoonSkillIds = [
   "checking-system-logs",
   "driving-bb",
   "durable-boundary-audit",
-  "human-friendly-coding-communication",
   "proportional-development-workflow",
+];
+const pstackSkillIds = [
+  "technical-writing",
+  "unslop",
 ];
 
 export const WORKFLOW_KIT = Object.freeze({
@@ -115,6 +120,18 @@ export const HANOON_PROVENANCE = Object.freeze({
   license: HANOON_KIT.license,
 });
 
+// Owner-facing voice and docs style, vendored from cursor/plugins pstack.
+export const PSTACK_KIT = Object.freeze({
+  revision: "60c641e4fad674784b30abcf9f8915dea39df38d",
+  sourceUrl: "https://github.com/cursor/plugins",
+  license: "MIT",
+  licensePath: `${PSTACK_ROOT}/LICENSE`,
+});
+export const PSTACK_PROVENANCE = Object.freeze({
+  source: PSTACK_KIT.sourceUrl,
+  license: PSTACK_KIT.license,
+});
+
 export const REQUIRED_WORKFLOW_SKILLS = Object.freeze(workflowSkillIds.map((id) => Object.freeze({
   id,
   skillPath: `${WORKFLOW_ROOT}/${id}/SKILL.md`,
@@ -145,12 +162,19 @@ export const REQUIRED_HANOON_SKILLS = Object.freeze(hanoonSkillIds.map((id) => O
   ...HANOON_PROVENANCE,
 })));
 
+export const REQUIRED_PSTACK_SKILLS = Object.freeze(pstackSkillIds.map((id) => Object.freeze({
+  id,
+  skillPath: `${PSTACK_ROOT}/${id}/SKILL.md`,
+  ...PSTACK_PROVENANCE,
+})));
+
 export const REQUIRED_SKILLS = Object.freeze([
   ...REQUIRED_WORKFLOW_SKILLS,
   ...REQUIRED_GUARD_SKILLS,
   ...REQUIRED_DELIVERY_SKILLS,
   ...REQUIRED_DISCOVERY_SKILLS,
   ...REQUIRED_HANOON_SKILLS,
+  ...REQUIRED_PSTACK_SKILLS,
 ]);
 
 export const SYNC_EXCLUDED_SEGMENTS = Object.freeze([

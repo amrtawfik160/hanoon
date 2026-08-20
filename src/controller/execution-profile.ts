@@ -1,3 +1,8 @@
+import {
+  compatiblePermissionMode,
+  stageModelEntry,
+} from "../domain/stage-execution";
+
 export const CONTROLLER_MODELS = [
   "claude-opus-5[1m]",
   "claude-opus-4-8[1m]",
@@ -6,6 +11,13 @@ export const CONTROLLER_MODELS = [
   "gpt-5.6-luna",
   "gpt-5.6-terra",
   "gpt-5.6-sol",
+  "cursor-grok-4.6-medium",
+  "gpt-5.6-sol-medium",
+  "claude-opus-5-thinking-medium",
+  "claude-fable-5-thinking-medium",
+  "composer-2.5",
+  "grok-4.6",
+  "grok-4.5",
 ] as const;
 
 export const CONTROLLER_FALLBACK_MODELS = ["disabled", ...CONTROLLER_MODELS] as const;
@@ -36,18 +48,20 @@ export type ControllerExecutionProfile = {
   permissionMode: typeof CONTROLLER_PERMISSION_MODES[number];
 };
 
-export const CONTROLLER_PROVIDERS = ["claude-code", "codex"] as const;
+export const CONTROLLER_PROVIDERS = ["claude-code", "codex", "acp-cursor", "acp-grok"] as const;
 export type ControllerProvider = typeof CONTROLLER_PROVIDERS[number];
 
 /** The provider that owns a model, so one setting picks both. */
 export function controllerProviderFor(model: string): ControllerProvider {
-  return model.startsWith("claude-") ? "claude-code" : "codex";
+  const providerId = stageModelEntry(model)?.providerId;
+  if (providerId !== undefined && (CONTROLLER_PROVIDERS as readonly string[]).includes(providerId)) {
+    return providerId as ControllerProvider;
+  }
+  throw new TypeError(`Unknown controller model "${model}"`);
 }
 
-// Only Codex exposes a service tier. Sending one to Claude Code would be an
-// execution input the provider cannot honour.
 export function supportsServiceTier(model: string): boolean {
-  return controllerProviderFor(model) === "codex";
+  return stageModelEntry(model)?.supportsServiceTier === true;
 }
 
 export const DEFAULT_CONTROLLER_EXECUTION_PROFILE: ControllerExecutionProfile = {
@@ -76,13 +90,15 @@ export function controllerExecutionArguments(
   profile: ControllerExecutionProfile,
   options: { includeProvider: boolean },
 ): ExecutionArguments {
+  const providerId = controllerProviderFor(profile.model);
   const withTier = supportsServiceTier(profile.model);
+  const permissionMode = compatiblePermissionMode(providerId, profile.permissionMode);
   return {
-    ...(options.includeProvider ? { providerId: controllerProviderFor(profile.model) } : {}),
+    ...(options.includeProvider ? { providerId } : {}),
     model: profile.model,
     reasoningLevel: profile.reasoningLevel,
     ...(withTier ? { serviceTier: profile.serviceTier } : {}),
-    permissionMode: profile.permissionMode,
+    permissionMode,
     executionInputSources: {
       ...(options.includeProvider ? { providerId: "explicit" as const } : {}),
       model: "explicit",

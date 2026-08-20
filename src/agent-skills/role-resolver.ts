@@ -13,7 +13,8 @@ export type WorkerSkillRole =
   | "documentation"
   | "final-review";
 
-export const COMMUNICATION_SKILL_ID = "human-friendly-coding-communication";
+export const COMMUNICATION_SKILL_ID = "unslop";
+export const TECHNICAL_WRITING_SKILL_ID = "technical-writing";
 export const PROPORTIONAL_WORKFLOW_SKILL_ID = "proportional-development-workflow";
 export const GRILL_WITH_DOCS_SKILL_ID = "grill-with-docs";
 export const GRILLING_SKILL_ID = "grilling";
@@ -36,7 +37,7 @@ export const ROLE_SKILLS = {
   // commands, so its claims are checkable against the repository the same way a
   // README's are. That is docs-guard's job, and a wrong command here is only
   // discovered much later, when the verification it promised does not run.
-  planner: [COMMUNICATION_SKILL_ID, "docs-guard"],
+  planner: [COMMUNICATION_SKILL_ID, "writing-plans", "docs-guard"],
   critic: [COMMUNICATION_SKILL_ID],
   implementation: [
     COMMUNICATION_SKILL_ID,
@@ -54,7 +55,7 @@ export const ROLE_SKILLS = {
     "pr-writer",
   ],
   review: [COMMUNICATION_SKILL_ID, "clean-code-guard", "test-guard", "durable-boundary-audit"],
-  documentation: [COMMUNICATION_SKILL_ID, "docs-guard", "verification-before-completion"],
+  documentation: [COMMUNICATION_SKILL_ID, TECHNICAL_WRITING_SKILL_ID, "docs-guard", "verification-before-completion"],
   "final-review": [
     COMMUNICATION_SKILL_ID,
     "clean-code-guard",

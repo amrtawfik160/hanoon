@@ -8,6 +8,7 @@ import {
   DISCOVERY_KIT,
   GUARD_KIT,
   HANOON_KIT,
+  PSTACK_KIT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
   REGISTERED_ROOTS,
@@ -33,6 +34,7 @@ const expectedKits = [
   ["deliveryKit", "delivery-kit", DELIVERY_KIT],
   ["discoveryKit", "discovery-kit", DISCOVERY_KIT],
   ["hanoonKit", "hanoon-kit", HANOON_KIT],
+  ["pstackKit", "pstack-kit", PSTACK_KIT],
 ];
 
 function integrityError(reason) {

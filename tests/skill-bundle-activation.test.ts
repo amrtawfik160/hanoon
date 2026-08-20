@@ -114,7 +114,7 @@ test("rejects a corrupted locked skill before the BB host is accessed", async ()
 test("verifies the real committed bundle", () => {
   const verified = verifySkillBundle(repositoryRoot);
 
-  expect(verified.skillIds).toHaveLength(26);
+  expect(verified.skillIds).toHaveLength(27);
   expect(verified.skillIds).toEqual(expect.arrayContaining([
     "brainstorming",
     "clean-code-guard",
@@ -122,10 +122,11 @@ test("verifies the real committed bundle", () => {
     "domain-modeling",
     "grill-with-docs",
     "grilling",
-    "human-friendly-coding-communication",
     "proportional-development-workflow",
+    "technical-writing",
     "test-guard",
     "pr-writer",
+    "unslop",
     "writing-skills",
   ]));
   expect(verified.bundleDigest).toMatch(/^[a-f0-9]{64}$/);
@@ -194,6 +195,7 @@ test.each([
     join(root, "skills/delivery"),
     join(root, "skills/discovery"),
     join(root, "skills/hanoon"),
+    join(root, "skills/pstack"),
   ];
   fillEntryLimit(roots, join(root, "skills/guards/clean-code-guard/excess"), limit);
 

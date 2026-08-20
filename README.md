@@ -89,7 +89,7 @@ Read the [architecture guide](docs/architecture.md) for diagrams, state ownershi
 
 Critique can request one replacement plan. Test or review failures return to a bounded patch/test/review cycle. Full jobs require independent quality and risk reviews; small fixes still run deterministic validation plus one quality review. Existing open pull requests can be adopted with planning and critique recorded as skipped. Invalid evidence, stale pull-request heads, exhausted limits, novel worker failures, and expired approvals block instead of silently advancing.
 
-The project policy chooses implementation/review providers and commands. The conversational agent is configured independently and defaults to Claude Opus 5 (1M) at `xhigh` reasoning. Claude and Codex models are both selectable; picking a model selects its provider. The concurrent-job cap defaults to `5`, accepts `1`–`8`, and applies to later admissions without cancelling work already admitted.
+The project policy chooses implementation/review providers and commands. The conversational agent is configured independently and defaults to Claude Opus 5 (1M) at `xhigh` reasoning. Claude Code, Codex, Cursor, and Grok models are selectable; the catalog picks the provider for each model id. The concurrent-job cap defaults to `5`, accepts `1`–`8`, and applies to later admissions without cancelling work already admitted.
 
 ### Adaptive capability routing
 
@@ -99,22 +99,22 @@ The shipped rollout is conservative: adaptive recipes default to `shadow`, where
 
 ## Bundled agent skills
 
-The plugin bundles 26 skills locally across five manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, and each root retains its own provenance and licence. Agents receive only the verified profile below.
+The plugin bundles 27 skills locally across six manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, the pstack kit to `cursor/plugins` at revision `60c641e4fad674784b30abcf9f8915dea39df38d`, and each root retains its own provenance and licence. Agents receive only the verified profile below.
 
 | Verified context | Selected skill ids |
 | --- | --- |
-| controller | `human-friendly-coding-communication`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling` |
-| planner | `human-friendly-coding-communication` |
-| critic | `human-friendly-coding-communication` |
-| implementation | `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
-| review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard` |
-| documentation | `human-friendly-coding-communication`, `docs-guard`, `verification-before-completion` |
-| final-review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard` |
+| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling` |
+| planner | `unslop` |
+| critic | `unslop` |
+| implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
+| review | `unslop`, `clean-code-guard`, `test-guard` |
+| documentation | `unslop`, `technical-writing`, `docs-guard`, `verification-before-completion` |
+| final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard` |
 | validation, merge, deploy, canary | none; these stages remain deterministic |
 
 Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1–256 characters from `[A-Za-z0-9_-]`; attempt ids are 1–264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact `attempt:` or `stage:` record must match the title's job, attempt, and role, and its originating effect must be the corresponding `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs` effect. The job project, persisted environment (when present), and persisted thread (when present) must match the current context. A null environment or thread is accepted only for the first start; a later context must match the persisted id. Any mismatch receives no tools and no skills; the hidden controller branch receives no worker skills.
 
-The bundle is checked before it can run. `npm run skills:verify` validates the five registered roots, lock schema/provenance, bounded regular files, frontmatter names, nested local Markdown resources, and every SHA-256 file digest; it emits a bounded `bundleDigest` and skill count. `npm run build` runs this check before `bb plugin build`, and plugin activation runs it before registration. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle stops build/activation. The runtime never downloads or repairs a replacement.
+The bundle is checked before it can run. `npm run skills:verify` validates the six registered roots, lock schema/provenance, bounded regular files, frontmatter names, nested local Markdown resources, and every SHA-256 file digest; it emits a bounded `bundleDigest` and skill count. `npm run build` runs this check before `bb plugin build`, and plugin activation runs it before registration. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle stops build/activation. The runtime never downloads or repairs a replacement.
 
 Only a maintainer synchronizes the pinned workflow kit from an already-reviewed local checkout. The source must be an absolute directory for the reviewed `superpowers` `6.3.0` package; synchronization is network-free and rewrites only the local bundle and lock:
 
@@ -130,7 +130,7 @@ npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
 
 ### 1. Install from a checkout
 
-Requirements: BB `0.36` or newer, npm, an authenticated GitHub CLI on each project source host, a standard BB GitHub project, access to Claude Code or Codex, and a Telegram bot from [BotFather](https://core.telegram.org/bots#botfather).
+Requirements: BB `0.36` or newer, npm, an authenticated GitHub CLI on each project source host, a standard BB GitHub project, access to at least one of Claude Code, Codex, Cursor, or Grok, and a Telegram bot from [BotFather](https://core.telegram.org/bots#botfather).
 
 ```bash
 npm ci

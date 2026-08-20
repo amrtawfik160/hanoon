@@ -54,7 +54,7 @@ it("layers the owner's wording after the fixed instructions, never before", () =
   expect(composed.startsWith(CONTROLLER_INSTRUCTIONS)).toBe(true);
   expect(composed).toContain("Always show me the PR link.");
   // A boundary stated above must not be reorderable by anything the overlay says.
-  expect(composed.indexOf("Merge and production go through")).toBeLessThan(composed.indexOf("Always show me"));
+  expect(composed.indexOf("Merge and production use the job pipeline")).toBeLessThan(composed.indexOf("Always show me"));
 });
 
 it("keeps one stable instruction sentinel before one owner overlay", () => {
@@ -261,7 +261,7 @@ it("keeps the working-style overlay once, after the fixed boundaries", () => {
   const composed = composeControllerInstructions("Lead with the PR link.");
 
   expect(composed.split("Lead with the PR link.").length - 1).toBe(1);
-  expect(composed.indexOf("Merge and production go through")).toBeLessThan(composed.indexOf("Lead with the PR link."));
+  expect(composed.indexOf("Merge and production use the job pipeline")).toBeLessThan(composed.indexOf("Lead with the PR link."));
 });
 
 it.each([
@@ -276,6 +276,7 @@ it.each([
   ["an owner decision before an irreversible external write", /an irreversible external write needs the owner's explicit decision first/],
   ["no silent integration installation", /Never promise to install or configure an integration on your own/],
   ["no claim over opaque third-party tools", /Never say Hanoon controls what an opaque third-party tool does/],
+  ["guarded jobs own the software lifecycle", /Software changes go through a guarded job/],
 ])("states the required boundary: %s", (_name, pattern) => {
   expect(CONTROLLER_INSTRUCTIONS).toMatch(pattern);
 });

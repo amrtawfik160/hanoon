@@ -458,14 +458,6 @@ async function finalizeReleaseCandidates(input: ReleasePassInput): Promise<Relea
 // clear one, so one id per turn leaves the previous turn's 30-second preview
 // standing beside its own persisted answer. One id per chat means every new
 // turn overwrites that preview instead of stacking a second copy of the reply.
-function stableChatDraftId(chatId: string): number {
-  let hash = 2_166_136_261;
-  for (let index = 0; index < chatId.length; index += 1) {
-    hash = Math.imul(hash ^ chatId.charCodeAt(index), 16_777_619);
-  }
-  return ((hash >>> 0) & 0x7fff_ffff) || 1;
-}
-
 function payloadText(item: StoredOutbox): string {
   const text = item.payload.text;
   return typeof text === "string" ? text : "";
@@ -761,28 +753,22 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
       const streamRequest = (async (): Promise<void> => {
         let deliveredMessageId = delivery.messageId;
         try {
-          if (delivery.messageId === null && delivery.telegram.sendMessageDraft) {
-            // The draft is an ephemeral phase indicator, not the durable
-            // answer. It must never hold the executor while Telegram is slow.
-            await delivery.telegram.sendMessageDraft(
-              delivery.outbox.chatId,
-              stableChatDraftId(delivery.outbox.chatId),
-              delivery.text,
-              workAbort.signal,
-            );
-          } else if (delivery.messageId !== null) {
+          // A phase placeholder is never written into the chat. It used to go
+          // out as a native streaming draft, which occupies the same slot the
+          // owner types into: while the draft was held, their own messages sat
+          // unsent behind it, a stop command included, and losing the ability
+          // to stop a running turn is far worse than losing a phase label.
+          // Sending it as an ordinary message instead is not the answer either
+          // — that leaves a second bubble beside the real reply, which this
+          // flow exists to avoid. TelegramPresenceCoordinator already types for
+          // exactly these turn states, so progress stays visible.
+          if (delivery.messageId !== null) {
             await delivery.telegram.editMessage(
               delivery.outbox.chatId,
               delivery.messageId,
               delivery.payload,
               workAbort.signal,
             );
-          } else {
-            deliveredMessageId = (await delivery.telegram.sendMessage(
-              delivery.outbox.chatId,
-              delivery.payload,
-              workAbort.signal,
-            )).message_id;
           }
           if (deliveredMessageId !== null) {
             controllerStreamMessageIds.set(delivery.outbox.logicalKey, deliveredMessageId);
@@ -1337,18 +1323,10 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
             } else if (
               turnId !== null &&
               controllerTurn?.state === "submitted" &&
-              knownMessageId === null &&
-              telegram.sendMessageDraft
+              knownMessageId === null
             ) {
-              // The draft is derived from the durable stream phase, never from
-              // a persisted raw stream_text, so provider prose can never reach
-              // Telegram as a preview.
-              await telegram.sendMessageDraft(
-                item.chatId,
-                stableChatDraftId(item.chatId),
-                CONTROLLER_PHASE_TEXT[controllerTurn.streamPhase],
-                workAbort.signal,
-              );
+              // Same reason as startControllerStream: a phase placeholder for a
+              // turn with no durable message stays out of the chat entirely.
             } else if (knownMessageId !== null) {
               await telegram.editMessage(item.chatId, knownMessageId, deliveryPayload, workAbort.signal);
             } else {

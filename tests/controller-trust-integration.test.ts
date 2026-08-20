@@ -573,8 +573,8 @@ async function assertProductionWiring(
   );
   expect(configured.skills).toEqual([
     "driving-bb",
-    "human-friendly-coding-communication",
     "proportional-development-workflow",
+    "unslop",
     ...(pendingTurn ? [] : ["grill-with-docs", "grilling", "domain-modeling"]),
   ]);
   if (configured.instructions === null) throw new Error("controller instructions were not configured");

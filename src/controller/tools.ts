@@ -25,7 +25,11 @@ import { nextCronOccurrence } from "../services/monitor-service";
 import { parseProductionStageSnapshot, productionCommandIdentity } from "../services/production-runner";
 import { validationCommandIdentity } from "../services/effect-runner";
 import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../bb/validation";
-import { CONTROLLER_PROVIDERS } from "./execution-profile";
+import {
+  CONTROLLER_PROVIDERS,
+  controllerExecutionArguments,
+  type ControllerExecutionProfile,
+} from "./execution-profile";
 import { isControllerThreadTitle, parseControllerSpawnTitle } from "./bb-controller";
 import { MAX_CONTROLLER_OVERLAY, composeControllerInstructions } from "./instructions";
 import {
@@ -146,6 +150,8 @@ type ToolDependencies = {
   credentialAccess?: CredentialAccessService;
   /** Current persisted controller provider; undefined means configuration is invalid. */
   controllerProviderId?: () => string | undefined;
+  /** Current controller execution tuple, used when this turn opens a child thread. */
+  controllerExecution?: () => ControllerExecutionProfile | undefined;
   /** Configured replacement identity; empty or absent delivers the shipped one. */
   controllerIdentity?: () => string | undefined;
 };
@@ -823,6 +829,13 @@ function projectBaseBranch(store: TelegramAgentStore, projectId: string): string
     );
   }
   return baseBranch;
+}
+
+function childThreadExecution(dependencies: ToolDependencies): Record<string, unknown> | undefined {
+  const profile = dependencies.controllerExecution?.();
+  return profile === undefined
+    ? undefined
+    : controllerExecutionArguments(profile, { includeProvider: true });
 }
 
 async function visibleThreadResolution(
@@ -1748,7 +1761,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[1],
-    description: "Create one guarded implementation job for an enabled project. Use path small_fix for a typo, lint, wording, or one-file change: skip critique, publish a pull request, and stop. Full jobs still plan, review, and finish at a reviewed PR when production is not configured. An exact task reuses its open job. A different task in the same project returns the open job so you can steer a follow-up into it; set separateWork only when the owner explicitly said this is independent work.",
+    description: "Create one guarded job for an enabled project. The job owns that task's software lifecycle: design when the recipe requires it, then implementation, checks, review, docs, and merge or production when those are configured. Use path small_fix for a typo, lint, wording, or one-file change: skip critique, publish a pull request, and stop. An exact task reuses its open job. A different task in the same project returns the open job so you can steer a follow-up into it; set separateWork only when the owner explicitly said this is independent work.",
     parameters: z.object({
       projectId: z.string().min(1).max(256),
       task: z.string().trim().min(1).max(4_000),
@@ -1958,6 +1971,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         baseBranch: projectBaseBranch(dependencies.store, params.projectId),
         images,
         signal: context.signal,
+        execution: childThreadExecution(dependencies),
       });
       trustedState(resolution).createdThreadId = created.thread.id;
       armFollowUpWatch(dependencies, authorized, context, created.thread.id, params.title);
@@ -2258,6 +2272,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
             prompt: task.prompt,
             baseBranch: projectBaseBranch(dependencies.store, task.projectId),
             signal: context.signal,
+            execution: childThreadExecution(dependencies),
           });
           threadId = created.thread.id;
         } catch (error) {
