@@ -298,4 +298,52 @@ describe("a second opinion before an unattended merge", () => {
       consensusReview: { providerId: "claude-code", model: "claude-opus-5[1m]" },
     })).toMatchObject({ providerId: "claude-code", model: "claude-opus-5[1m]" });
   });
+
+  it("resumes the pass it already started when the executor restarts mid-review", async () => {
+    const fixture = awaitingApproval(unattendedPolicy());
+    enqueue(fixture.db, fixture.jobId, "issue_approval", "job:2:issue_approval", { headSha: HEAD });
+    await runEffect(fixture, "job:2:issue_approval", 2_000);
+    const spawnKey = fixture.store.listEffectsForJob(fixture.jobId)
+      .find((effect) => effect.kind === "spawn_consensus_review")!.idempotencyKey;
+    await runEffect(fixture, spawnKey, 2_100, {
+      spawnConsensusReview: async () => ({ id: "thr_consensus", environmentId: "env_1" }),
+    });
+    const started = fixture.store.getConsensusReviewAttempt(fixture.jobId, HEAD);
+    expect(started?.completedAt).toBeNull();
+
+    // The executor dies with the pass still running and comes back as a fresh
+    // store over the same database file, holding nothing in memory.
+    const restarted = openStore(fixture.bb.storage, fixture.bb.storage.kv);
+    expect(restarted.getConsensusReviewAttempt(fixture.jobId, HEAD)).toMatchObject({
+      id: started!.id,
+      threadId: "thr_consensus",
+      reviewLens: "consensus",
+      completedAt: null,
+    });
+
+    // And the approval decision, made again after the restart, waits for that
+    // pass rather than starting a second one.
+    const job = restarted.getJob(fixture.jobId)!;
+    enqueue(fixture.db, fixture.jobId, "issue_approval", `job:${job.version}:issue_approval:restart`, { headSha: HEAD });
+    const claimed = restarted.leaseNextJobEffect({
+      jobId: fixture.jobId,
+      ownerId: OWNER,
+      generation: fixture.generation,
+      now: 2_200,
+      leaseMs: 60_000,
+    });
+    if (!claimed) throw new Error("no effect to lease after the restart");
+    const spawnAgain = vi.fn(async () => ({ id: "thr_consensus_2", environmentId: "env_1" }));
+    await new EffectRunner({
+      store: restarted,
+      fence: { ownerId: OWNER, generation: fixture.generation, signal: new AbortController().signal },
+      bb: { spawnConsensusReview: spawnAgain },
+      now: () => 2_200,
+    }).run(claimed);
+
+    expect(spawnAgain).not.toHaveBeenCalled();
+    expect(restarted.listEffectsForJob(fixture.jobId)
+      .filter((effect) => effect.kind === "spawn_consensus_review")).toHaveLength(1);
+    expect(restarted.getConsensusReviewAttempt(fixture.jobId, HEAD)?.id).toBe(started!.id);
+  });
 });
