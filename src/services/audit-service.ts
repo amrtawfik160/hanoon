@@ -41,6 +41,19 @@ export type AuditDependencies = {
   clock: { now(): number };
   issueUpdateId(now: number): number;
   auditsArmed(): boolean;
+  /**
+   * What one project's findings are handed to once they are known, for anything
+   * that acts on them rather than reporting them. Absent means the audits do
+   * exactly what they always did: look, and tell the owner.
+   *
+   * Given the whole sweep rather than each finding, because deciding what is
+   * worth starting is a judgement about the day, not about one line of it.
+   */
+  onResults?: (
+    project: AuditProject,
+    results: readonly AuditResult[],
+    now: number,
+  ) => void;
   warn?: (message: string) => void;
 };
 
@@ -103,6 +116,17 @@ export class AuditService {
       results.push(...projectResults);
       const digest = auditDigest({ project: project.label, results: projectResults });
       if (digest !== null && this.notify(project, digest, now)) notified = true;
+      // After the digest, and never instead of it. Whatever acts on these
+      // findings has its own bounds and its own ledger; a day the owner was
+      // told about is not a day that must also start something, and a day
+      // something started is still a day the owner was told about.
+      try {
+        this.dependencies.onResults?.(project, projectResults, now);
+      } catch (error) {
+        this.dependencies.warn?.(
+          `Audit findings could not be acted on: ${redactError(error).slice(0, 160)}`,
+        );
+      }
     }
     return { results, notified };
   }

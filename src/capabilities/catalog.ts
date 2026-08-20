@@ -43,6 +43,7 @@ export const CONTROLLER_METADATA_TOOL_IDS = [
 ] as const;
 
 const WORKER_SKILLS = new Set([
+  "blast-radius",
   "brainstorming",
   "checking-system-logs",
   "clean-code-guard",
@@ -75,6 +76,7 @@ const NATIVE_SKILLS = new Set([
 const MANUAL_SKILLS = new Set(["domain-modeling", "grill-with-docs", "grilling"]);
 
 const SKILL_DIGESTS = {
+  "blast-radius": "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d",
   brainstorming: "74edf03ea6d24ef53db48677b93558d14a979bdf052ca3f57ecdca0c66791608",
   "checking-system-logs": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245",
   "clean-code-guard": "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2",
@@ -319,6 +321,15 @@ function skillRouting(id: CapabilitySkillId): Pick<DescriptorInput,
       return {
         roles: ["review", "final-review", "documentation"], recipes: TASK_RECIPES,
         stages: ["diff-guards", "review", "task-review", "integrated-review", "documentation"],
+        evidenceRequirement: "mandatory", receiptType: "guard", evidenceStrength: "high",
+        modelPools: ["standard", "strong"],
+      };
+    // Not a diff guard: it judges what the change reaches outside the diff, so
+    // it is eligible for the review stages but never the per-file guard sweep.
+    case "blast-radius":
+      return {
+        roles: ["review", "final-review"], recipes: TASK_RECIPES,
+        stages: ["review", "task-review", "integrated-review"],
         evidenceRequirement: "mandatory", receiptType: "guard", evidenceStrength: "high",
         modelPools: ["standard", "strong"],
       };

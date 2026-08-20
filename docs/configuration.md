@@ -113,6 +113,15 @@ Two settings govern what the agent does when you have not asked it anything:
 
 Turning self-maintenance off retires the agent's own monitors, disables its repository audits, and prevents temporary-directory deletion. It does not touch monitors you set yourself, stop disk-pressure checks and warnings, or stop the agent learning from finished jobs. Repository audits inspect documentation staleness, debt markers, bug backlogs, and unresolved pull-request review findings through read-only Git and provider commands. Temporary cleanup is limited to old top-level entries whose names match the plugin's allowlist, and each daily pass has a deletion cap.
 
+Two further settings govern what the agent does about its own failures. Both default to the most cautious value, and the second does nothing unless the first is on:
+
+| Setting | Options | Default | Purpose |
+| --- | --- | --- | --- |
+| Self-diagnosis | on, off | off | Inspects persisted controller failures out of band and proposes at most one cooled-down fix at a time. |
+| What a diagnosis becomes | `draft-pr`, `pipeline` | `draft-pr` | `draft-pr` pushes a branch for you to read. `pipeline` files the same fix as an ordinary reviewed job instead. |
+
+`pipeline` needs the self-diagnosis project's policy to carry an [`autonomy.intake`](#work-the-daily-audit-starts) allowance, and it shares that allowance and its finding ledger rather than adding to them: a project that said two jobs a day meant two. Without one — or when that project's failure brake is on, it already has work running, or that failure has already had its job — it falls back to a draft pull request and logs why. Filing is not merging: the job asks for its merge on exactly the same terms as every other job on that project.
+
 The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
 
 ### Giving the agent standing information
@@ -214,7 +223,7 @@ bb telegram-agent project enable proj_7f3d2a91 --policy-json "$POLICY_JSON"
 
 The `--host` flag is valid only with an absolute `--policy-file` path and selects the BB host that owns that file. A command invoked from a BB thread can otherwise resolve the invoking environment's host.
 
-Individual flags are also supported. At minimum they require `--alias`, `--base`, and `--merge-method`:
+Individual flags are also supported. At minimum they require `--alias`, `--base`, and `--merge-method`. `--unattended-merge` sets `autonomy.unattendedMerge`; the rest of the `autonomy` block needs a policy file, because `mergeWithoutProduction` depends on a `regression` policy that only the file can express:
 
 ```bash
 bb telegram-agent project enable proj_7f3d2a91 \
@@ -231,6 +240,8 @@ bb telegram-agent project enable proj_7f3d2a91 \
 Policy files/JSON cannot be mixed with individual policy flags.
 
 For production, individual flags accept `--production-target-key shared.prod` alongside at least one `--deploy-json` and one `--canary-json`. A target key without both command groups is rejected with exit code `2`.
+
+A policy carrying `autonomy.unattendedMerge` or `autonomy.mergeWithoutProduction` is additionally checked against GitHub before it is stored, and refused with exit code `2` when the base branch is not protected. See [The check `project enable` runs against GitHub](#the-check-project-enable-runs-against-github).
 
 ## Project policy reference
 
@@ -261,6 +272,17 @@ Use unmistakable placeholders and replace them with values verified for the targ
     "plan": { "tier": "strong" },
     "docs": { "tier": "fast", "maxEscalations": 1 },
     "review": { "providerId": "codex", "model": "gpt-5.6-sol" }
+  },
+  "autonomy": {
+    "unattendedMerge": false,
+    "mergeWithoutProduction": false,
+    "consensusReview": {
+      "providerId": "claude-code",
+      "model": "claude-opus-5[1m]"
+    },
+    "intake": {
+      "maxJobsPerDay": 1
+    }
   },
   "validationCommands": [
     {
@@ -322,6 +344,7 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `baseBranch` | Non-empty and present in the selected BB source. |
 | `implementation`, `review` | Optional provider/model/reasoning/tier/permission fields. When `stageExecution` has no entry for that stage, these are what the stage runs on. |
 | `stageExecution` | Optional per-worker-kind execution table. See [Per-stage model routing](#per-stage-model-routing). |
+| `autonomy` | Optional, and absent is the default behaviour: every merge asks, a project with no production settings finishes at the reviewed pull request, and the daily audit only reports. Its four fields, their preconditions, and what `project enable` checks before accepting them are in [Unattended delivery](#unattended-delivery). |
 | `validationCommands` | Up to 20 owner-authored commands. |
 | `production.targetKey` | Optional shared isolation key: 1–64 lowercase letters, numbers, `.`, `_`, or `-`, starting alphanumeric. When absent, the project id is used. |
 | `production.deployCommands` | One to 20 commands when production is configured. |
@@ -346,7 +369,7 @@ Deploy and canary must both be present before the plugin can issue merge approva
 
 When a deploy or canary command fails and `rollbackCommand` is configured, the plugin runs it immediately, in the same stage, before reporting the failure. The rollback is deliberately not cancellable: a cancelled job must still finish reverting production. Its receipt is stored on the stage evidence alongside the failed command, and the stage outcome stays `fail` whether or not the rollback worked.
 
-Configuring a `rollbackCommand` is what makes unattended merging safe, so it is effectively required for any project given a standing approval.
+Configuring a `rollbackCommand` is what makes unattended merging safe, so it is effectively required for any project given a standing approval, and strictly required for a project whose policy sets `autonomy.unattendedMerge`.
 
 ## Scheduled checks between jobs
 
@@ -376,25 +399,274 @@ The controller may clear a fingerprinted cause once after investigating it. Ever
 
 If the pause list cannot be read, no work is admitted that tick — an unreadable list must never look like "nothing is paused".
 
-## Standing merge approval
+## Unattended delivery
+
+Nothing in this section is on by default. A project with no `autonomy` block
+behaves exactly as it always did: every merge asks, a project with no production
+settings finishes at the reviewed pull request, and the daily audit reports what
+it found and stops there. Each field below lifts one of those restrictions or
+configures how a lifted one behaves, and each carries its own preconditions.
+
+```json
+"autonomy": {
+  "unattendedMerge": false,
+  "mergeWithoutProduction": false,
+  "consensusReview": {
+    "providerId": "claude-code",
+    "model": "claude-opus-5[1m]"
+  },
+  "intake": {
+    "maxJobsPerDay": 1
+  }
+}
+```
+
+| Field | Contract |
+| --- | --- |
+| `autonomy.unattendedMerge` | `true` merges this project without asking, on the same terms as the button-granted standing approval. It is also what lets the project revert a merge that broke production and lets the continuation sweep re-enter a merge or production stage on its own. Requires `production.rollbackCommand` when production is configured, and a protected base branch. See [A grant the project policy carries](#a-grant-the-project-policy-carries). |
+| `autonomy.mergeWithoutProduction` | `true` lets a project with no production settings merge instead of stopping at the reviewed pull request. Requires a non-empty `requiredChecks`, a configured `regression` policy, and a protected base branch. See [Merging a project that deploys nothing](#merging-a-project-that-deploys-nothing). |
+| `autonomy.consensusReview` | Optional `providerId` and `model` (plus optional `reasoningLevel`, `serviceTier`, `permissionMode`) for the second-opinion review pass. Validated against the same model catalog as `stageExecution`, and refused outright when its provider is the one the review stage itself runs on. See [The second opinion](#the-second-opinion-on-a-change-that-argued-with-its-review). |
+| `autonomy.intake` | Optional. When present, this project's daily audit may start work rather than only report it. `maxJobsPerDay` is a whole number from 1 to 4. See [Work the daily audit starts](#work-the-daily-audit-starts). |
+
+Unknown fields are rejected outright. The preconditions below are checked before
+the policy is stored, not at the merge they would have governed.
+
+### What a project must have before it may merge unattended
+
+| Requirement | Applies when | Where it is enforced |
+| --- | --- | --- |
+| `production.rollbackCommand` | `autonomy.unattendedMerge` and a configured `production` | Policy schema, at `project enable` and at load |
+| Non-empty `requiredChecks` **and** a `regression` policy | `autonomy.mergeWithoutProduction` | Policy schema, at `project enable` and at load |
+| A `consensusReview` provider the review stage does not use | `autonomy.consensusReview` | Policy schema, at `project enable` and at load |
+| GitHub branch protection or a ruleset requiring at least one status check on `baseBranch` | either merge field | A live GitHub check at `project enable`; reported again by the project doctor |
+
+The reasoning behind each is in the section it belongs to. The third one is not
+about this project's configuration at all: it is the requirement that something
+other than this plugin will refuse a bad merge.
+
+### The check `project enable` runs against GitHub
+
+When a submitted policy carries `autonomy.unattendedMerge` or
+`autonomy.mergeWithoutProduction`, `bb telegram-agent project enable` asks GitHub
+about that policy's base branch through the authenticated `gh` CLI on the
+project's source host. It reads classic branch protection first, and then — only
+if that answered nothing — the rulesets GitHub reports as active on the branch.
+It is looking for one thing: at least one required status check.
+
+Anything short of that refuses the enable with exit code `2` and a message
+naming the repository, the branch, and what to configure. A missing protection,
+an error, an unreadable answer, and a protection that requires nothing all refuse
+identically — the question is whether something will stop a bad merge, and
+silence is not a yes. Nothing is stored, so the project keeps whatever policy it
+had.
+
+One case succeeds with a warning rather than refusing: protection exists and
+requires a check, but is not known to bind repository administrators. That covers
+`enforce_admins` being off, a ruleset carrying any bypass actor at all, and a
+ruleset whose own definition could not be read. The protection is real, and this
+plugin merges with an owner-scoped token that GitHub may exempt from it. The
+enable prints the warning, `--json` returns it in a `warnings` array, and
+`bb telegram-agent doctor <project-id>` keeps reporting it until it is closed.
+
+The check runs at enable time and doctor time only. The merge path itself makes
+no GitHub call to decide anything: it is fenced and deterministic, and gets its
+answers from durable evidence.
+
+### Standing merge approval
 
 By default the plugin asks for a one-use approval before every merge. The owner can give it with the approval button or by sending an unambiguous merge instruction for the waiting job. Either form only queues the guarded merge pipeline; it does not mean the provider merge has already landed. The approval message also offers **Merge + deploy, and always from now on**, which approves that merge and records a standing approval for that project. Afterwards the plugin merges, deploys, and runs the canary without asking.
 
 A standing approval replaces the owner's signature only. Every check that produced the merge candidate still runs, and the plugin falls back to asking when:
 
 - the pull-request head is not established, or the owner has asked the job to stop;
-- the project has no production configuration;
-- the change needed two or more rounds of review fixes.
+- the project has no production configuration, unless its policy sets `autonomy.mergeWithoutProduction`;
+- the change needed two or more rounds of review fixes and no [second opinion](#the-second-opinion-on-a-change-that-argued-with-its-review) cleared it.
 
-The standing approval is withdrawn automatically when production fails and the rollback either was not configured or failed — recovery is exhausted, so nothing merges unattended there again until the owner re-grants it. A rollback that succeeded is a recovery, not an incident, and the standing approval survives it.
+Granting a standing approval from the chat is only ever a button tap. An owner-origin sentence can grant one-use authority for its named job, but system turns and agent-generated text cannot grant either form.
 
-Granting a standing approval is only ever a button tap. An owner-origin sentence can grant one-use authority for its named job, but system turns and agent-generated text cannot grant either form. Withdrawing standing approval is available by name:
+Every grant, withdrawal, and unattended merge is recorded in an append-only log keyed by project.
 
-- `/approvals` lists the projects that merge without asking;
+### A grant the project policy carries
+
+`autonomy.unattendedMerge` gives a project the same standing approval without a
+tap. It is read from the job's own immutable policy snapshot, so changing a
+policy never rewrites what a running job was admitted under.
+
+A project that deploys must also configure `production.rollbackCommand` before
+this is accepted. Unattended merging with no way back is the case this exists to
+prevent, so the policy is rejected at `project enable` and at load rather than
+at the merge it would have governed.
+
+### Withdrawing a grant
+
+Withdrawal is available by name, and works for both sources:
+
+- `/approvals` lists the projects that merge without asking, and says whether each one was granted by button or set in its project policy;
 - `/approvals off <alias>` withdraws one;
 - `/approvals off` withdraws all of them.
 
-Every grant, withdrawal, and unattended merge is recorded in an append-only log keyed by project.
+There is one difference worth knowing. The plugin cannot edit your policy file,
+so withdrawing a policy-carried grant records a durable withdrawal instead. The
+policy grant stays silent until the project's enabled policy is stored again,
+which is what `bb telegram-agent project enable` does. Re-enabling the project is
+therefore what turns it back on, and the chat says so when it withdraws one.
+`project disable` also stores a snapshot, and deliberately does not count:
+turning a project off must never be what revives the authority you just withdrew.
+
+A grant is also withdrawn without being asked when production fails and the
+rollback either was not configured or failed. Recovery is exhausted, so both
+sources stop and the project stops taking new work — see
+[When an unattended merge breaks production](#when-an-unattended-merge-breaks-production).
+A rollback that succeeded is a recovery, not an incident, and changes nothing.
+
+### Merging a project that deploys nothing
+
+By default a reviewed pull request on a project with no `production` settings is
+finished work: there is nothing to deploy, so the pipeline stops at the pull
+request and the owner decides what happens next.
+
+`autonomy.mergeWithoutProduction` says the merge itself is the delivery. The
+change goes through the same approval, the same gates, the same receipts, and
+the same merge effect as every other project, and the job ends at `merged` with
+no deploy or canary to run. The status card says "Merged, nothing to deploy" and
+the buttons offer a merge rather than a merge and deploy, because there is no
+deployment to promise.
+
+Deploy and canary are what would otherwise prove a merged change works, so this
+requires the two things left that can notice a bad merge: at least one entry in
+`requiredChecks`, and a configured `regression` policy running on a timer. Both
+are checked when the policy is parsed.
+
+### The second opinion on a change that argued with its review
+
+A change that needed two or more rounds of review fixes used to go to the owner
+even on a pre-approved project, because what it needed was a person's look.
+
+One extra review now stands in for that look. It reads the exact head that is
+about to merge, runs on a provider the job's own review stage did not use, and
+only its unambiguous agreement merges the change: a verdict of pass carrying no
+findings at all. Any finding, a failed or unreadable pass, a head that moved
+underneath it, or no independent route to run it on all fall back to asking the
+owner. At most one pass runs per head, and it survives a restart on the same
+durable review evidence as every other review.
+
+`autonomy.consensusReview` pins the route. It must name a provider the review
+stage does not use, and a policy that pins the reviewer's own provider is
+refused when the policy is parsed — at `project enable` and at load — with an
+error naming both providers. Independence is what this pass is trusted for, so
+it is an enforced property of the policy rather than advice about how to write
+one. Left out, the pass runs on the strong route of whichever provider the
+review stage did not use.
+
+One case has no second opinion available at all: a job running under `active`
+capability model routing, where the capability router owns the model tuple and
+the pass cannot be guaranteed to run anywhere else. Those changes go to the
+owner exactly as they did before. A fresh installation has no such job, because
+adaptive recipes start in `shadow`.
+
+### When an unattended merge breaks production
+
+A rollback command puts production back on the last good build. It does not take
+the bad merge off the trunk, so the next deploy ships it again.
+
+This needs `autonomy.unattendedMerge` on the project's current enabled policy.
+Starting a repository change nobody asked for is one of the things that setting
+opts into; a project whose only standing approval is a **Merge + deploy, and
+always from now on** tap keeps reporting the fault and starting nothing.
+
+With that in place, when `healthCommands` declare a fault and the last thing
+merged on that project was merged unattended within the last 48 hours, one
+revert job starts by itself: revert that exact commit, through validation,
+review, and the same merge rule as any other change. Nothing is pushed outside
+the pipeline, and one merge commit gets at most one automatic revert, ever.
+
+The chain is one deep. When the last merge is itself one an automatic revert
+produced, nothing starts and nothing falls back to the merge before it: undoing
+a revert would put the change that broke production back on the trunk, and a
+revert that did not fix production is a fault you should be reading about.
+
+If the revert cannot start — the project never asked for one, the failure brake
+is on, that project already has work running, that commit has already had its
+revert, or the last merge was a revert — the fault is reported exactly the way
+it always was, and the reason no revert started is logged rather than messaged.
+A revert job that fails feeds the failure brake like any other failing job.
+
+This is not governed by `autonomy.intake` and does not spend its allowance:
+production being down is not a matter of daily budget.
+
+Separately from the revert, a deploy or canary that fails and whose
+`rollbackCommand` was missing or itself failed withdraws both merge grants and
+trips the [failure brake](#failure-brake) for that project. Recovery is
+exhausted, so nothing merges there unattended again and no new work is admitted
+until you send `/resume <alias>`. That brake carries no failure fingerprint,
+which is what makes it yours to lift rather than the agent's.
+
+### Work the daily audit starts
+
+By default the daily repository audit reports what it found and stops there.
+Every finding waits on you reading the message and asking for the work.
+
+`autonomy.intake` says that this project may start some of that work itself:
+
+```json
+"autonomy": { "intake": { "maxJobsPerDay": 1 } }
+```
+
+`maxJobsPerDay` is a whole number from 1 to 4. It bounds jobs started per project
+per UTC day. Four is the ceiling because a project starting more than that
+without being asked is being run unattended rather than maintained unattended.
+
+A started job is an ordinary job. It plans, implements, is reviewed, and asks for
+its merge on exactly the terms this project already sets — a project without a
+standing approval still asks you before every merge. Starting needs no approval
+because starting is not the irreversible half.
+
+What it will start is deliberately narrow. A finding only becomes work when the
+audit can state it concretely, and they are taken in this order:
+
+1. a document naming a file the repository no longer has — one file, one
+   reference, one fix;
+2. an open bug nobody has touched past the stale window;
+3. review comments left unanswered on a merged pull request;
+4. debt markers in a file, and only when there are three or fewer of them. More
+   than that is a direction rather than a task, and stays a report.
+
+Four bounds decide whether anything actually starts, and every one is checked
+inside the transaction that creates the job:
+
+- the day's allowance for this project is not already spent;
+- the [failure brake](#failure-brake) is not holding this project;
+- this project has no job queued, admitted, or still draining — one piece of work
+  at a time, so a started job usually means the next finding waits for the next
+  day;
+- this finding has not already started a job that is still open, and did not have
+  one settle within the last fortnight.
+
+Anything unreadable starts nothing. A policy that will not load, a database that
+will not answer, an owner who is not paired: each of them means the audits report
+exactly as they always did.
+
+You are told when a job starts this way, and the job carries where it came from —
+on the status card, as `startedBy` in `bb telegram-agent job show`, and in what
+the agent itself can see. The notice is a notice, not a question.
+
+Two of those four findings quote text nobody here wrote: an issue title, and a
+review comment. That text is capped at 200 characters, stripped of control and
+invisible characters, and marked in the work order as quotation rather than
+instruction; a work order that ends up carrying credential-shaped material drops
+the finding entirely, and the digest still reports it. [Security](../SECURITY.md#text-from-outside-the-repository)
+states what that does and does not bound.
+
+### What a diagnosed failure becomes
+
+The **Self-diagnosis** and **What a diagnosis becomes** settings in
+[Background work](#background-work) decide whether the agent inspects its own
+controller failures, and what a proposed fix turns into. `pipeline` files the fix
+through this project's `autonomy.intake` allowance and the same finding ledger
+rather than keeping its own count, because a project that said two jobs a day
+meant two. Without an allowance — or when the failure brake is on, work is
+already running, or that failure has already had its job — it falls back to a
+draft pull request and logs why.
 
 ## Per-stage model routing
 
@@ -465,6 +737,6 @@ bb telegram-agent doctor proj_7f3d2a91
 bb telegram-agent project list
 ```
 
-The global doctor checks token presence and owner pairing, and always includes the credential broker section described above. The project form additionally checks the enabled policy, deployment/canary configuration, standard Git project/source, BB defaults, provider availability, source host/path, `gh auth status`, repository access, and merge SDK availability. It exits non-zero when any required check fails.
+The global doctor checks token presence and owner pairing, and always includes the credential broker section described above. The project form additionally checks the enabled policy, deployment/canary configuration, standard Git project/source, BB defaults, provider availability, source host/path, `gh auth status`, repository access, and merge SDK availability. A project whose policy carries an `autonomy` block also gets the `autonomy:` rows described in [Operations](operations.md#autonomy-readiness). It exits non-zero when any required check fails; a `warn` row never does.
 
 Next: [Operations](operations.md) · [Architecture](architecture.md)

@@ -3,5 +3,43 @@ This directory is a first-party Hanoon skill root owned by the Telegram Agent pl
 It is not a third-party vendor copy. Do not fold it under the MIT or Apache-2.0
 notices that belong to the vendored workflow, guard, delivery, and pstack roots.
 
+A skill here may still be adapted from a permissively licensed upstream rather
+than written from nothing. Where it is, the entry below names the upstream, the
+revision it was taken at, and its licence, and carries that licence with it.
+
 Skill: proportional-development-workflow
 Purpose: choose the smallest safe development workflow without duplicating orchestration.
+
+Skill: blast-radius
+Purpose: judge what a change could break outside its diff before a review verdict
+carries it to merge.
+Derived from the blast-radius skill in the pstack skill collection of the
+cursor/plugins repository, https://github.com/cursor/plugins, at revision
+60c641e4fad674784b30abcf9f8915dea39df38d, which is MIT licensed, and adapted for
+this plugin. The adaptation drops the references to skills this bundle does not
+ship, replaces the multi-model step with this pipeline's own review lenses, adds
+the worktree hygiene rule the merge gate needs, and reframes the output as a
+structured review verdict. The upstream copyright and permission notice, which
+that licence requires be carried with the derived work, follow.
+
+MIT License
+
+Copyright (c) 2026 Lauren Tan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

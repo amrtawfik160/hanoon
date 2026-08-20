@@ -14,6 +14,7 @@ import {
 import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
 
 const EXPECTED_SKILL_ROUTES = {
+  "blast-radius": "worker",
   brainstorming: "worker",
   "checking-system-logs": "worker",
   "clean-code-guard": "worker",

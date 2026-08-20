@@ -25,6 +25,40 @@ bb plugin logs telegram-agent -n 50
 
 Use `--json` on Telegram Agent commands when another tool must consume the result.
 
+## Autonomy readiness
+
+A project whose enabled policy carries an `autonomy` block gets extra rows from
+the project doctor. They are read-only diagnostics; nothing here changes a
+policy or a repository setting.
+
+```bash
+bb telegram-agent doctor proj_7f3d2a91 --json
+```
+
+| Row | `pass` | `warn` | `fail` |
+| --- | --- | --- | --- |
+| `autonomy: branch protection` | GitHub requires at least one status check on the base branch, and the rules bind administrators | the checks exist but administrators are exempt | no protection or ruleset could be read, or none requires a check |
+| `autonomy: required checks` | the policy lists at least one `requiredChecks` entry | none listed | — |
+| `autonomy: rollback command` | `production.rollbackCommand` is configured | — | it is missing while `unattendedMerge` is on with a configured production |
+| `autonomy: production health checks` | `production.healthCommands` are configured | none configured, so a crash between deploys is not noticed and no automatic revert can start | — |
+| `autonomy: regression checks` | a `regression` policy is configured | none configured, so nothing checks the project between jobs | — |
+
+Only the first row leaves the machine. It asks GitHub through `gh` on the
+project's source host, exactly as `project enable` did before storing the policy
+— see [Configuration](configuration.md#the-check-project-enable-runs-against-github)
+— and its summary never carries an API error, a token, or an account name. The
+other four read the stored policy and nothing else.
+
+The rollback and health rows appear only for a project whose policy sets
+`unattendedMerge` and configures production. The branch-protection row reports
+`disabled` for a policy whose `autonomy` block merges nothing — an
+`intake`-only project has no merge grant for it to be about — and no GitHub call
+is made in that case.
+
+A `warn` row never changes the exit code. Each one is a gap only you can close,
+in a repository setting or a policy field, and a doctor that failed on advice
+would teach you to ignore the rows that mean the project genuinely cannot work.
+
 ## Credential broker
 
 `bb telegram-agent doctor` always includes credential readiness, whether or not the broker foundation is configured:
@@ -50,7 +84,7 @@ If the broker client's private key may have leaked, treat it as a compromised cr
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally under the six manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, `skills/hanoon`, and `skills/pstack`; operators do not install another runtime skill plugin. The catalog has 27 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+Skills are committed locally under the six manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, `skills/hanoon`, and `skills/pstack`; operators do not install another runtime skill plugin. The catalog has 28 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
 
 Run the deterministic integrity gate from the repository root:
 
@@ -114,6 +148,31 @@ bb telegram-agent job spend <job-id> --json
 `job spend` lists every stage attempt of one job with the provider, model, reasoning level, service tier, tier and any escalation, tokens, duration, and cost, so tiering can be tuned from observed numbers. Cost reads `unpriced` — a null `costMicroUsd` with `--json` — for models with no published rate entered in the catalog.
 
 `job list` returns at most 100 recent jobs; `--limit` accepts `1`–`100`. `job show` returns the bounded stored projection for exactly one job. Its safe projection includes admission state, queue sequence/age/release reason, held resource kind/key pairs, and merge-resource waits, but not raw prompts, secrets, claim owners, lease generations, or unbounded provider logs.
+
+### Work nobody asked for
+
+A job the project started for itself carries that provenance from creation, and
+it is never rewritten. `job show` prints it as `startedBy` on the plain line, and
+both commands expose it as `autonomousOrigin` in JSON — one of `audit_intake`,
+`self_diagnosis`, or `crash_revert`:
+
+```bash
+bb telegram-agent job show <job-id> --json
+bb telegram-agent job list --json
+```
+
+An automatic revert is a `crash_revert` job, and only a project whose current
+enabled policy sets `autonomy.unattendedMerge` starts one. Its work order names
+the exact merge commit it is reverting, and one merge commit gets at most one
+automatic revert ever, so a second failure on the same commit produces the
+ordinary fault report rather than another job. A `crash_revert` job's own merge
+is never reverted automatically either, and no earlier merge is reverted in its
+place: when the last thing merged is a revert, the fault is reported and nothing
+starts. Reverts do not spend the `autonomy.intake` allowance; `audit_intake` and
+`self_diagnosis` jobs share it.
+
+These are ordinary jobs in every other respect. `job retry`, `job cancel`, and
+the approval rules apply to them exactly as they do to work you asked for.
 
 In Telegram, the durable status message reports the current state, review/validation summaries, pull-request identity, liveness, approval expiry, and production outcome. On completion, a separate two-sentence finish note says what passed or shipped and includes the pull-request link. BB does not expose a reliable completion ETA, so the controller reports observed progress instead of inventing one.
 
@@ -202,6 +261,39 @@ The plugin binds the observed Telegram bot identity. Changing to a different bot
 bb telegram-agent doctor
 ```
 
+## Withdraw autonomy
+
+Nothing here needs a restart or a database edit.
+
+**Stop a project merging without you.** From the paired chat, `/approvals` lists
+the projects that merge without asking and says whether each was granted by
+button or set in its policy; `/approvals off <alias>` withdraws one and
+`/approvals off` withdraws all. A policy-carried grant has no row to clear — this
+plugin cannot edit your policy file — so the withdrawal is recorded durably
+instead, and stays in force until that project's enabled policy is stored again
+by `bb telegram-agent project enable`. `project disable` stores a snapshot too
+and deliberately does not count. To withdraw it permanently, remove
+`autonomy.unattendedMerge` from the policy file before enabling the project again.
+That setting is also what lets the project revert a merge that broke production
+and lets the continuation sweep re-enter a merge or production stage, so removing
+it stops all three.
+
+**Stop a project starting its own work.** Remove `autonomy.intake` from the
+policy and run `project enable` again. A project the failure brake is holding
+already starts nothing unattended, so pausing it is the faster stop.
+
+**Stop everything at once.** `bb telegram-agent project disable <project-id>`
+takes the project out of the enabled set entirely. Work already running finishes.
+
+The plugin also withdraws a grant by itself when a deploy or canary fails and the
+rollback was missing or itself failed. Both grant sources stop and the project's
+failure brake trips with no fingerprint, so no new work is admitted there until
+you send `/resume <alias>`. That is deliberate: a production that could not be
+rolled back is not something the agent may clear for itself. If the project was
+already braked for something else, that brake is taken over rather than left as
+it was — its reason becomes the incident and its fingerprint is dropped, so
+`/resume <alias>` is the only way back either way.
+
 ## Unpair
 
 ```bash
@@ -253,7 +345,7 @@ Important recovery behavior:
 - Restart recovery does not issue a second merge, deploy, or canary for a completed receipt.
 - A merge call with an unknown provider outcome keeps its repository and production claims held until authoritative reconciliation; capacity is not guessed free.
 - A project paused by the failure brake admits no new jobs; in-flight work finishes and queued jobs stay queued. The controller may clear a fingerprinted cause once. A repeated cause, an un-fingerprinted pause, or any desired manual override waits for `/resume`.
-- Every merge still requires current review/validation evidence and a Telegram approval, regardless of available capacity: the exact unexpired one-use approval from a button or owner-origin merge instruction, or a standing approval the owner granted that project by button.
+- Every merge still requires current review/validation evidence and an approval, regardless of available capacity: the exact unexpired one-use approval from a button or owner-origin merge instruction, or a standing grant from the owner's button tap or the project's own policy snapshot.
 
 ## Production failures
 
@@ -264,7 +356,7 @@ bb telegram-agent job show <job-id> --json
 bb plugin logs telegram-agent -n 50
 ```
 
-The plugin does not automatically retry production. It does run the policy's `rollbackCommand` when one is configured, immediately after the failing deploy or canary command and before reporting the failure; the receipt is on the stage evidence. If no rollback was configured, or the rollback itself failed, any standing merge approval for that project is withdrawn. A job reports `complete` after a successful canary, or earlier when production is not configured and the pull request has passed final review. Small-fix jobs complete only after the pull request passes configured validation and its quality review.
+The plugin does not automatically retry production. It does run the policy's `rollbackCommand` when one is configured, immediately after the failing deploy or canary command and before reporting the failure; the receipt is on the stage evidence. If no rollback was configured, or the rollback itself failed, both merge grants for that project are withdrawn — the button-granted one and any grant its policy carries — and the project's failure brake trips without a fingerprint, so it admits no new work until you send `/resume <alias>`. A rollback that succeeded is a recovery: it withdraws nothing and brakes nothing. A job reports `complete` after a successful canary, or earlier when production is not configured and the pull request has passed final review. Small-fix jobs complete only after the pull request passes configured validation and its quality review.
 
 ## Remove the plugin
 

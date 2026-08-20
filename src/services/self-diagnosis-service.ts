@@ -89,6 +89,15 @@ export type SelfDiagnosisPublishResult =
   | { outcome: "published"; number: number; url: string }
   | { outcome: "missing"; reason: string };
 
+/**
+ * What filing a diagnosis as ordinary work came back with. A fallback is not a
+ * failure: it says this installation cannot currently answer the diagnosis
+ * through the pipeline, and the draft pull request is still a good answer.
+ */
+export type SelfDiagnosisPipelineResult =
+  | { outcome: "filed"; jobId: string }
+  | { outcome: "fallback"; reason: string };
+
 export type SelfDiagnosisServiceDependencies = {
   enabled(): boolean;
   readCandidates(): SelfDiagnosisCandidate[];
@@ -114,6 +123,21 @@ export type SelfDiagnosisServiceDependencies = {
     environmentStatus: unknown;
     signal: AbortSignal;
   }): Promise<SelfDiagnosisPublishResult>;
+  /**
+   * What a diagnosis should become. Absent reads as `draft-pr`, so an
+   * installation that never heard of the choice behaves exactly as it did.
+   */
+  mode?: () => "draft-pr" | "pipeline";
+  /**
+   * Files the diagnosed failure as an ordinary pipeline job. Absent, or
+   * returning a fallback, leaves the draft pull request as the answer.
+   */
+  filePipelineJob?: (input: {
+    candidate: SelfDiagnosisCandidate;
+    diagnosisId: string;
+    diagnosis: StructuredSelfDiagnosis;
+    target: SelfDiagnosisTarget;
+  }) => SelfDiagnosisPipelineResult;
   modelRoute(): ModelRoute;
   clock: { now(): number };
   warn?: (message: string) => void;
@@ -124,7 +148,8 @@ export type SelfDiagnosisRunResult =
   | { outcome: "disabled" | "no-failure" | "cooldown" | "open-pr" | "already-attempted" }
   | { outcome: "target-unavailable" | "github-unavailable" | "failed-open"; reason: string }
   | { outcome: "failed"; reason: string }
-  | { outcome: "published"; number: number; url: string };
+  | { outcome: "published"; number: number; url: string }
+  | { outcome: "filed"; jobId: string };
 
 const structuredDiagnosisSchema = z.object({
   whatFailed: z.string().trim().min(1).max(600),
@@ -384,6 +409,36 @@ export function buildSelfDiagnosisPullRequestBody(input: {
   ].join("\n").slice(0, 2_000);
 }
 
+/**
+ * The same diagnosis, written as work rather than as a proposal.
+ *
+ * The draft pull request could afford to be a digest, because a person was
+ * going to read the branch beside it. A work order has no branch yet, so it
+ * carries what the diagnosis actually concluded — every field of which has
+ * already been normalised and refused if it looked like a credential.
+ */
+export function buildSelfDiagnosisWorkOrder(input: {
+  candidate: SelfDiagnosisCandidate;
+  diagnosis: StructuredSelfDiagnosis;
+}): string {
+  return [
+    `Fix a failure this agent diagnosed in its own controller (${input.candidate.kind}).`,
+    `What failed: ${input.diagnosis.whatFailed}`,
+    `Why it is thought to have failed: ${input.diagnosis.hypothesis}`,
+    `The proposed fix: ${input.diagnosis.candidateFix}`,
+    "Confirm the cause before changing anything, and cover it with a test that fails without the fix.",
+    "The diagnosis is a guess about a failure, not a specification: if it is wrong, say so and stop rather than making the change it describes.",
+  ].join(" ").replace(/\s+/gu, " ").trim().slice(0, 3_000);
+}
+
+/**
+ * Identifies the failure this work is for. The source id is already the ledger's
+ * own identity for one persisted failure, so the two agree by construction.
+ */
+export function selfDiagnosisFingerprint(sourceId: string): string {
+  return createHash("sha256").update(`self-diagnosis:${sourceId}`, "utf8").digest("hex").slice(0, 32);
+}
+
 function diagnosisDigestHex(diagnosis: StructuredSelfDiagnosis): string {
   return createHash("sha256")
     .update(JSON.stringify(diagnosis), "utf8")
@@ -555,6 +610,8 @@ export class SelfDiagnosisService {
     signal: AbortSignal,
   ): Promise<SelfDiagnosisRunResult> {
     if (!this.dependencies.enabled() || signal.aborted) return { outcome: "disabled" };
+    const filed = this.fileAsPipelineJob(analyzed);
+    if (filed) return filed;
     let openPullRequests: readonly SelfDiagnosisOpenPullRequest[] | null;
     try {
       openPullRequests = await this.dependencies.github.listOpen(analyzed.target);
@@ -593,6 +650,61 @@ export class SelfDiagnosisService {
     }
     await this.recordPublished(analyzed, published);
     return published;
+  }
+
+  /**
+   * The diagnosis as ordinary work, when this installation asked for that and
+   * can have it.
+   *
+   * A draft pull request is a branch nobody reviewed, pushed out of band,
+   * waiting for a person to notice it. Filing the same fix as a pipeline job
+   * puts it through validation, review, and whatever merge rule that project
+   * already lives under, which is a stronger answer wherever it is available.
+   *
+   * It is not always available: it needs the project to have said how much work
+   * it will start unattended, and it shares that allowance rather than adding
+   * to it. Returning null is what falls back, and falling back is the ordinary
+   * case rather than an error — the reason is logged and the draft pull request
+   * carries on exactly as before.
+   */
+  private fileAsPipelineJob(analyzed: AnalyzedSelfDiagnosis): SelfDiagnosisRunResult | null {
+    if ((this.dependencies.mode?.() ?? "draft-pr") !== "pipeline") return null;
+    if (!this.dependencies.filePipelineJob) {
+      this.dependencies.warn?.("Self-diagnosis cannot file pipeline work here; using a draft pull request");
+      return null;
+    }
+    let filed: SelfDiagnosisPipelineResult;
+    try {
+      filed = this.dependencies.filePipelineJob({
+        candidate: analyzed.candidate,
+        diagnosisId: analyzed.diagnosisId,
+        diagnosis: analyzed.diagnosis,
+        target: analyzed.target,
+      });
+    } catch {
+      this.dependencies.warn?.("Self-diagnosis pipeline filing failed open; using a draft pull request");
+      return null;
+    }
+    if (filed.outcome === "fallback") {
+      this.dependencies.warn?.(`Self-diagnosis used a draft pull request instead: ${filed.reason.slice(0, 160)}`);
+      return null;
+    }
+    void this.recordFiled(analyzed);
+    return { outcome: "filed", jobId: filed.jobId };
+  }
+
+  private async recordFiled(analyzed: AnalyzedSelfDiagnosis): Promise<void> {
+    try {
+      // Recorded as published because it is: the ledger's question is whether
+      // this failure has already had its one attempt, and it has.
+      await this.updateRecord(analyzed.ledgerState, analyzed.diagnosisId, {
+        outcome: "published",
+        diagnosis: analyzed.diagnosis,
+        prUrl: null,
+      });
+    } catch {
+      this.dependencies.warn?.("Self-diagnosis could not record its filed job");
+    }
   }
 
   private async recordPublished(

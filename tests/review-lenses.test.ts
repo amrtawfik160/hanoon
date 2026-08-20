@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assessReviewGroup, requiredReviewLenses } from "../src/domain/review-lenses";
+import { assessConsensusReview, assessReviewGroup, requiredReviewLenses } from "../src/domain/review-lenses";
 
 const HEAD = "a".repeat(40);
 const DIFF_DIGEST = "b".repeat(64);
@@ -151,6 +151,14 @@ describe("review lens groups", () => {
     expect(settled.reasons).toEqual(["quality: changes_requested reason"]);
   });
 
+  it("never accepts a consensus lens as a member of a required group", () => {
+    expect(requiredReviewLenses("full")).not.toContain("consensus");
+    expect(assessReviewGroup([
+      attempt("quality", result("pass")),
+      { ...attempt("quality", result("pass")), id: "attempt_consensus", reviewLens: "consensus" as const },
+    ], "small_fix", HEAD).outcome).toBe("blocked");
+  });
+
   it("blocks malformed, mismatched-head, duplicate, or blocked lens evidence", () => {
     expect(assessReviewGroup([
       attempt("quality", result("pass")),
@@ -169,5 +177,45 @@ describe("review lens groups", () => {
       attempt("quality", result("pass")),
       attempt("risk", result("blocked")),
     ], "full", HEAD).outcome).toBe("blocked");
+  });
+});
+
+describe("the consensus pass that stands in for the owner's look", () => {
+  function consensus(resultJson: string | null, headSha = HEAD) {
+    return { id: "attempt_consensus", reviewLens: "consensus" as const, headSha, resultJson };
+  }
+
+  it("is pending until it is spawned and until it settles", () => {
+    expect(assessConsensusReview(null, HEAD)).toBe("pending");
+    expect(assessConsensusReview(consensus(null), HEAD)).toBe("pending");
+  });
+
+  it("clears the merge only on a clean pass of the exact head", () => {
+    expect(assessConsensusReview(consensus(result("pass")), HEAD)).toBe("pass");
+  });
+
+  it("refuses a pass that still found something", () => {
+    const finding = {
+      severity: "low",
+      file: "src/auth.ts",
+      line: 9,
+      title: "Nit",
+      details: "A small thing a person should see.",
+    };
+    expect(assessConsensusReview(consensus(result("pass", { findings: [finding] })), HEAD)).toBe("not_pass");
+  });
+
+  it("refuses changes requested, a block, and unreadable evidence", () => {
+    expect(assessConsensusReview(consensus(result("changes_requested")), HEAD)).toBe("not_pass");
+    expect(assessConsensusReview(consensus(result("blocked")), HEAD)).toBe("not_pass");
+    expect(assessConsensusReview(consensus("not json"), HEAD)).toBe("not_pass");
+  });
+
+  it("refuses evidence about a head that has since moved", () => {
+    expect(assessConsensusReview(consensus(result("pass"), "b".repeat(40)), HEAD)).toBe("not_pass");
+  });
+
+  it("ignores an attempt that is not a consensus pass at all", () => {
+    expect(assessConsensusReview(attempt("quality", result("pass")), HEAD)).toBe("pending");
   });
 });

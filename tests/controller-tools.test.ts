@@ -1681,8 +1681,8 @@ it("routes review variants and pipeline stages only when their stored role and e
   store.createAttempt({ id: finalReviewId, jobId: finalReview.job.id, kind: "review", ordinal: 2, headSha: sha(), now: 2_101 });
 
   const cases = [
-    [{ jobId: review.job.id, attemptId: reviewId, role: "review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "durable-boundary-audit"]],
-    [{ jobId: finalReview.job.id, attemptId: finalReviewId, role: "final-review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit"]],
+    [{ jobId: review.job.id, attemptId: reviewId, role: "review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "durable-boundary-audit", "blast-radius"]],
+    [{ jobId: finalReview.job.id, attemptId: finalReviewId, role: "final-review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit", "blast-radius"]],
     [{ jobId: implementation.job.id, attemptId: `stage:${planEffect.idempotencyKey}`, role: "planner" as const }, "thr_plan", ["unslop", "writing-plans", "docs-guard"]],
     [{ jobId: implementation.job.id, attemptId: `stage:${critiqueEffect.idempotencyKey}`, role: "critic" as const }, undefined, ["unslop"]],
     [{ jobId: docs.job.id, attemptId: `stage:${docs.effect.idempotencyKey}`, role: "documentation" as const }, undefined, ["unslop", "technical-writing", "docs-guard", "verification-before-completion"]],

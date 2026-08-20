@@ -39,6 +39,17 @@ export type ProductionHealthDependencies = {
     | "enqueueControllerTurn"
   >;
   commands: HealthCommandRunner;
+  /**
+   * Offered the fault the moment it is declared, before the owner is told.
+   * Absent means the fault is reported exactly as it always was.
+   */
+  autoRevert?: {
+    start(input: { projectId: string; alias: string; now: number }): {
+      outcome: "started";
+      jobId: string;
+      mergeCommitSha: string;
+    } | { outcome: "investigate"; reason: string };
+  };
   clock: { now(): number };
   issueUpdateId(now: number): number;
   warn?: (message: string) => void;
@@ -59,9 +70,17 @@ export function healthNotice(input: {
   state: ProductionHealthRecord["state"];
   reported: string | null;
   summary: string | null;
+  /** Set when this fault started a revert of the merge that is blamed for it. */
+  revert?: { jobId: string; mergeCommitSha: string } | null;
 }): string | null {
   if (input.state === "failing" && input.reported !== "failing") {
-    return `Production looks broken on ${input.alias}, and it is not something you asked about — the health check has failed ${HEALTH_FAILURE_THRESHOLD} times in a row.\n\nWhat it reported: ${input.summary ?? "no output"}\n\nFind out what is actually wrong and tell the owner in a line or two: what is failing, since when, and what you propose. Do not start a job to fix it without asking.`;
+    const opening = `Production looks broken on ${input.alias}, and it is not something you asked about — the health check has failed ${HEALTH_FAILURE_THRESHOLD} times in a row.\n\nWhat it reported: ${input.summary ?? "no output"}`;
+    // A revert already under way changes what the owner needs to hear: not
+    // "what do you propose", but "this is what is already happening".
+    if (input.revert) {
+      return `${opening}\n\nThe last thing merged here was merged without asking you, so a job has already started to revert commit ${input.revert.mergeCommitSha.slice(0, 12)}. It goes through the normal checks and review like any other change.\n\nTell the owner in two or three plain lines: production is down, this is probably why, and the revert is already running. Say what else you find if you find anything. Do not ask them to approve the revert — it is already started — and do not start anything else without asking.`;
+    }
+    return `${opening}\n\nFind out what is actually wrong and tell the owner in a line or two: what is failing, since when, and what you propose. Do not start a job to fix it without asking.`;
   }
   if (input.state === "ok" && input.reported === "failing") {
     return `Production is healthy again on ${input.alias}. Tell the owner in one line, and say what fixed it if you know.`;
@@ -96,19 +115,36 @@ export class ProductionHealthService {
         failureThreshold: HEALTH_FAILURE_THRESHOLD,
         now,
       });
-      const notice = healthNotice({
+      if (healthNotice({
         alias: policy.alias,
         state: record.state,
         reported: record.reportedState,
         summary: record.lastSummary,
-      });
-      if (notice === null) continue;
-      // Claim the transition before enqueuing, so a crash cannot re-report it.
+      }) === null) continue;
+      // Claim the transition before anything acts on it, so a crash can neither
+      // re-report the fault nor start a second revert for it.
       if (!this.dependencies.store.recordProductionHealthReported({
         projectId: policy.projectId,
         state: record.state,
         now,
       })) continue;
+      const revert = record.state === "failing"
+        ? this.dependencies.autoRevert?.start({
+          projectId: policy.projectId,
+          alias: policy.alias,
+          now,
+        })
+        : undefined;
+      const notice = healthNotice({
+        alias: policy.alias,
+        state: record.state,
+        reported: record.reportedState,
+        summary: record.lastSummary,
+        revert: revert?.outcome === "started"
+          ? { jobId: revert.jobId, mergeCommitSha: revert.mergeCommitSha }
+          : null,
+      });
+      if (notice === null) continue;
       this.dependencies.store.enqueueControllerTurn({
         controllerKey: controller.controllerKey,
         telegramUserId: owner.userId,

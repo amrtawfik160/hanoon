@@ -9,6 +9,7 @@ import {
   isReviewedPrCompletionBlock,
   isRetryableJob,
   type Job,
+  type JobEffect,
 } from "../domain/models";
 import {
   OWNER_MEMORY_SCOPE,
@@ -512,14 +513,20 @@ const WORKER_ID_PREFIX: Readonly<Record<WorkerSkillRole, "attempt:" | "stage:">>
   documentation: "stage:",
 };
 
-const WORKER_EFFECT_KIND = {
-  implementation: "spawn_implementation",
-  review: "spawn_review",
-  "final-review": "spawn_final_review",
-  planner: "spawn_plan",
-  critic: "spawn_critique",
-  documentation: "spawn_docs",
-} as const;
+/**
+ * Which effects may own a worker thread of each role. A consensus pass is a
+ * final review by another reader: same role, same skills, same contract, so it
+ * is admitted here rather than given a role of its own. Every other check —
+ * exact attempt, job, project, environment, and thread — is unchanged.
+ */
+const WORKER_EFFECT_KINDS = {
+  implementation: ["spawn_implementation"],
+  review: ["spawn_review"],
+  "final-review": ["spawn_final_review", "spawn_consensus_review"],
+  planner: ["spawn_plan"],
+  critic: ["spawn_critique"],
+  documentation: ["spawn_docs"],
+} as const satisfies Readonly<Record<WorkerSkillRole, readonly JobEffect["kind"][]>>;
 
 function workerEffectIdempotencyKey(title: WorkerTitleIdentity): string | null {
   const prefix = WORKER_ID_PREFIX[title.role];
@@ -552,7 +559,7 @@ function durableWorkerIdentity(
   }>,
 ): DurableWorkerIdentity | null {
   const effect = store.getEffect(input.title.jobId, input.effectIdempotencyKey);
-  if (!effect || effect.kind !== WORKER_EFFECT_KIND[input.title.role]) return null;
+  if (!effect || !(WORKER_EFFECT_KINDS[input.title.role] as readonly string[]).includes(effect.kind)) return null;
   const job = store.getJob(input.title.jobId);
   if (!job || job.projectId !== input.context.project.id) return null;
   let persistedSkillProfile: DurableWorkerIdentity["persistedSkillProfile"];
@@ -648,6 +655,9 @@ function jobProjection(job: Job, admission?: { state: string } | null) {
       planCycle: job.planCycle,
       reviewCycle: job.reviewCycle,
       deliveryMode: job.deliveryMode,
+      // Null on everything a person asked for. When it is set, the agent must
+      // be able to say who started this rather than implying the owner did.
+      autonomousOrigin: job.autonomousOrigin,
       taskRecipe: job.taskRecipe,
       recipeVersion: job.recipeVersion,
       recipePromotionCount: job.recipePromotionCount,

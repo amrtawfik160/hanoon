@@ -14,7 +14,7 @@ The installed plugin and CLI namespace remain `telegram-agent`.
 - **Conversations survive failures.** A dead provider session retires a BB thread, not the conversation. The replacement resumes with what was said and what was already done.
 - **Pipeline workers recover safely.** Silent or missing workers are retired and the exact stage is retried only for failure signatures that have recovered before; unfamiliar failures still stop for you.
 - **Mutations happen once.** Every mutating tool call is receipted by turn and argument hash, so a recovered agent replays the result instead of repeating the action.
-- **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, approval is one-use and expiring unless the owner grants a project a standing approval, and GitHub repository rules still apply.
+- **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, and approval is one-use and expiring unless that project holds a standing grant — from the owner's button tap, or from its own policy. A project may only carry that grant if GitHub already requires a status check on its base branch, and repository rules still apply either way.
 - **Use BB's isolation model.** Threads isolate provider conversations and coordination; managed worktrees isolate branches, checkouts, and filesystem mutation.
 
 ## How it works
@@ -48,7 +48,8 @@ Agent sessions run out of process as BB threads and never open the plugin databa
 | Thread notices | Every top-level thread reports itself: you are told when one finishes or fails, and a thread blocked on a question or a permission prompt asks you in Telegram with buttons. A block it cannot render is still reported, so nothing waits on you in silence. |
 | Answers you can check | Every reply is an accepted structured finalization backed by evidence gathered in that same turn. Raw model prose never becomes an answer, and a claim without compatible evidence is rejected rather than sent. |
 | Steering you can see | When the agent messages a worker thread it must say, in one line, what it asked for and why. You cannot see the threads, so that line is carried back on the reply that closes the turn: an instruction given in your name is visible while it still matters, not discoverable later. |
-| Reviewed delivery | A guarded job takes a change from plan to a reviewed pull request; merging and production still ask you in Telegram when those are set up. |
+| Reviewed delivery | A guarded job takes a change from plan to a reviewed pull request; merging and production ask you in Telegram unless you have given that project a standing grant. |
+| Unattended delivery | A project's policy can let it merge without asking, start work from its own daily audit, and revert an unattended merge that broke production. All three are off unless that policy asks for them, and each has preconditions before it is accepted. |
 | Self-diagnosis | `/health` reports the executor, queued work, undelivered messages, monitors, memory, and database integrity — even when the agent is the stuck part. |
 | Bounded turns | A question that runs away is nudged once to land the answer, then stopped before it burns your budget out of sight. |
 
@@ -89,6 +90,8 @@ Read the [architecture guide](docs/architecture.md) for diagrams, state ownershi
 
 Critique can request one replacement plan. Test or review failures return to a bounded patch/test/review cycle. Full jobs require independent quality and risk reviews; small fixes still run deterministic validation plus one quality review. Existing open pull requests can be adopted with planning and critique recorded as skipped. Invalid evidence, stale pull-request heads, exhausted limits, novel worker failures, and expired approvals block instead of silently advancing.
 
+The approval stage has two ways past it. By default it waits for your tap. A project holding a standing grant passes it without asking, on exactly the same evidence, and a change that argued with its own review twice still needs a second independent review before that grant covers it. A project with no production settings finishes at the reviewed pull request unless its policy opted into merging without one, which ends the job at `merged` with nothing to deploy. See [Configuration](docs/configuration.md#unattended-delivery) for what a project must have before it may do any of that.
+
 The project policy chooses implementation/review providers and commands. The conversational agent is configured independently and defaults to Claude Opus 5 (1M) at `xhigh` reasoning. Claude Code, Codex, Cursor, and Grok models are selectable; the catalog picks the provider for each model id. The concurrent-job cap defaults to `5`, accepts `1`–`8`, and applies to later admissions without cancelling work already admitted.
 
 ### Adaptive capability routing
@@ -99,17 +102,17 @@ The shipped rollout is conservative: adaptive recipes default to `shadow`, where
 
 ## Bundled agent skills
 
-The plugin bundles 27 skills locally across six manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, the pstack kit to `cursor/plugins` at revision `60c641e4fad674784b30abcf9f8915dea39df38d`, and each root retains its own provenance and licence. Agents receive only the verified profile below.
+The plugin bundles 28 skills locally across six manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, the pstack kit to `cursor/plugins` at revision `60c641e4fad674784b30abcf9f8915dea39df38d`, and each root retains its own provenance and licence. Agents receive only the verified profile below.
 
 | Verified context | Selected skill ids |
 | --- | --- |
 | controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling` |
-| planner | `unslop` |
+| planner | `unslop`, `writing-plans`, `docs-guard` |
 | critic | `unslop` |
-| implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
-| review | `unslop`, `clean-code-guard`, `test-guard` |
+| implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius` |
 | documentation | `unslop`, `technical-writing`, `docs-guard`, `verification-before-completion` |
-| final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard` |
+| final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
 | validation, merge, deploy, canary | none; these stages remain deterministic |
 
 Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1–256 characters from `[A-Za-z0-9_-]`; attempt ids are 1–264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact `attempt:` or `stage:` record must match the title's job, attempt, and role, and its originating effect must be the corresponding `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs` effect. The job project, persisted environment (when present), and persisted thread (when present) must match the current context. A null environment or thread is accepted only for the first start; a later context must match the persisted id. Any mismatch receives no tools and no skills; the hidden controller branch receives no worker skills.
@@ -124,7 +127,11 @@ npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
 ```
 
 > [!WARNING]
-> This is a full-trust BB plugin. Fresh or unset controller permission settings resolve to `auto`; an explicitly saved `auto`, `accept-edits`, or `full` value is preserved. BB-native permission prompts raised for the hidden controller can be bridged into Telegram as *Allow once* / *Deny*. Merging a pull request and promoting to production still require a Telegram approval from the owner — one-use, or standing for a project the owner explicitly granted — and an enabled project policy may run owner-authored validation, deployment, and canary commands. Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
+> This is a full-trust BB plugin. Fresh or unset controller permission settings resolve to `auto`; an explicitly saved `auto`, `accept-edits`, or `full` value is preserved. BB-native permission prompts raised for the hidden controller can be bridged into Telegram as *Allow once* / *Deny*. An enabled project policy may run owner-authored validation, deployment, and canary commands.
+>
+> Merging a pull request and promoting to production require a Telegram approval from the owner, one-use and expiring — **unless that project holds a standing grant**. A grant comes either from the owner's own button tap or from `autonomy.unattendedMerge` in the project's policy, and both replace the owner's signature and nothing else: every review, validation, and evidence gate still runs. `bb telegram-agent project enable` refuses to store either grant unless GitHub already requires a status check on that base branch, and warns when the protection does not bind administrators. `/approvals off` withdraws a grant, and a failed production rollback withdraws it automatically and stops the project taking new work.
+>
+> Review the source and policy, keep GitHub protection enabled, and use a disposable repository for the first live run.
 
 ## Quick start
 
@@ -162,7 +169,7 @@ bb telegram-agent doctor proj_7f3d2a91
 
 The policy defines the exact GitHub repository/base branch, worker profiles, validation commands, required checks, redaction patterns, review limit, merge method, and optional deployment/canary commands. Projects that deploy to the same target can share `production.targetKey`, which serializes that target even when their repositories differ. See [Configuration](docs/configuration.md) for the complete verified schema and examples.
 
-Self-diagnosis is off by default. To enable it, set the boolean `selfDiagnosisEnabled` to `true`, set `selfDiagnosisProjectId` to the enabled project containing this checkout, and reload the plugin. It runs out of band and creates only cooled-down draft pull requests; it never merges or changes an existing pull request.
+Self-diagnosis is off by default. To enable it, set the boolean `selfDiagnosisEnabled` to `true`, set `selfDiagnosisProjectId` to the enabled project containing this checkout, and reload the plugin. It runs out of band and proposes at most one cooled-down fix at a time. `selfDiagnosisMode` decides what that fix becomes: `draft-pr` (the default) pushes a branch for you to read, and `pipeline` files it as an ordinary reviewed job instead, under the same `autonomy.intake` allowance and finding ledger as the daily audit. Neither mode merges anything or changes an existing pull request.
 
 ### 4. Talk to Hanoon
 
@@ -177,7 +184,7 @@ always deploy parknwash on weekday mornings
 /health
 ```
 
-Recovery commands remain available without the agent: `/status`, `/projects`, `/health`, `/approvals`, `/resume`, `/retry [job-id]`, `/cancel [job-id]`. `/status` lists current jobs; replying to a job status message or supplying its id selects that exact job. `/approvals` lists the projects that merge without asking, and `/approvals off [alias]` withdraws that. `/resume [alias]` restarts a project the failure brake stopped. Merging still requires a Telegram approval: one-use, or standing where the owner granted it.
+Recovery commands remain available without the agent: `/status`, `/projects`, `/health`, `/approvals`, `/resume`, `/retry [job-id]`, `/cancel [job-id]`. `/status` lists current jobs; replying to a job status message or supplying its id selects that exact job. `/approvals` lists the projects that merge without asking and says whether each was granted by button or set in its policy; `/approvals off [alias]` withdraws one, or all of them with no alias. `/resume` lists the projects the failure brake stopped and `/resume <name>` starts one, or `/resume all` starts every one. Merging still requires a Telegram approval unless that project holds a standing grant.
 
 ## Documentation
 

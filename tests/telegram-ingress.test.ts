@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { hashSecret } from "../src/crypto";
 import type { ProjectPolicy } from "../src/domain/models";
 import { buildHealthReport } from "../src/services/health-report";
+import { resolveMergeGrant } from "../src/services/merge-authority";
 import { TelegramIngress } from "../src/telegram/ingress";
 import { TelegramApiError } from "../src/telegram/errors";
 import type {
@@ -1308,4 +1309,57 @@ it("says nothing is paused when the brake has not tripped", async () => {
   await fixture.ingress.handleClaimed(messageUpdate(92, 7, 70, "/resume"), 3_000);
 
   expect(fixture.telegram.sent.at(-1)?.payload.text).toContain("Nothing is paused");
+});
+
+function policyGrantFixture() {
+  return ingressFixture({
+    owner: { userId: "7", chatId: "70" },
+    policies: [
+      policy({
+        projectId: "proj_policy",
+        alias: "policy-granted",
+        production: {
+          ...policyFixture().production!,
+          rollbackCommand: { name: "rollback", command: "./rollback.sh", timeoutMs: 60_000 },
+        },
+        autonomy: { unattendedMerge: true, mergeWithoutProduction: false },
+      }),
+      policy({ projectId: "proj_asks", alias: "asks-every-time" }),
+    ],
+  });
+}
+
+it("lists a policy-granted project alongside a granted one and says which is which", async () => {
+  const fixture = policyGrantFixture();
+  fixture.store.grantMergeAuthority({ projectId: "proj_asks", userId: "7", chatId: "70", now: 1_000 });
+
+  await fixture.ingress.handleClaimed(messageUpdate(93, 7, 70, "/approvals"), 3_000);
+
+  const reply = fixture.telegram.sent.at(-1)?.payload.text ?? "";
+  expect(reply).toContain("• policy-granted (set in its project policy)");
+  expect(reply).toContain("• asks-every-time (you granted this)");
+});
+
+it("withdraws a policy-granted project by name and says the policy still asks for it", async () => {
+  const fixture = policyGrantFixture();
+
+  await fixture.ingress.handleClaimed(messageUpdate(94, 7, 70, "/approvals off policy-granted"), 3_000);
+
+  const reply = fixture.telegram.sent.at(-1)?.payload.text ?? "";
+  expect(reply).toContain("I will ask you before merging policy-granted again");
+  expect(reply).toContain("enabling the project again turns it back on");
+  expect(resolveMergeGrant({
+    projectId: "proj_policy",
+    policy: fixture.store.getProjectPolicy("proj_policy")?.policy ?? null,
+    evidence: fixture.store.getMergeGrantEvidence("proj_policy"),
+  })).toBeNull();
+});
+
+it("leaves a project that never merges unattended off the listing", async () => {
+  const fixture = policyGrantFixture();
+
+  await fixture.ingress.handleClaimed(messageUpdate(95, 7, 70, "/approvals"), 3_000);
+
+  const reply = fixture.telegram.sent.at(-1)?.payload.text ?? "";
+  expect(reply).not.toContain("asks-every-time");
 });

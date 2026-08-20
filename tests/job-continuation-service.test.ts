@@ -2,7 +2,9 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { MAX_AUTO_CONTINUES } from "../src/autonomy/job-continuation";
 import { JobContinuationService } from "../src/services/job-continuation-service";
+import type { MergeAuthorityGrant } from "../src/services/merge-authority";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import type { ProjectPolicy } from "../src/domain/models";
 import { policyFixture } from "./helpers";
 
 let fixtureNumber = 0;
@@ -138,6 +140,7 @@ it("stops pushing and tells the owner once the ladder is spent", () => {
       requeueReviewAdmission: (id: string, version: number, now: number) =>
         store.requeueReviewAdmission(id, version, now),
       listEnabledProjectPolicies: () => store.listEnabledProjectPolicies(),
+      getMergeGrantEvidence: (projectId: string) => store.getMergeGrantEvidence(projectId),
       getOwner: () => ({ userId: "7", chatId: "70" }),
       getControllerForOwner: () => ({ controllerKey: "controller_1" }),
       enqueueControllerTurn: (input: { inputText: string }) => { told.push(input.inputText); },
@@ -188,6 +191,7 @@ it("hands over a job the guarded retry will never accept, rather than re-decidin
       retryFailedJob: () => ({ outcome: "unavailable" }),
       requeueReviewAdmission: () => ({ outcome: "unavailable" }),
       listEnabledProjectPolicies: () => store.listEnabledProjectPolicies(),
+      getMergeGrantEvidence: (projectId: string) => store.getMergeGrantEvidence(projectId),
       getOwner: () => ({ userId: "7", chatId: "70" }),
       getControllerForOwner: () => ({ controllerKey: "controller_1" }),
       enqueueControllerTurn: (input: { inputText: string }) => { told.push(input.inputText); },
@@ -315,4 +319,157 @@ it("does not spend another continuation attempt while the same retry is already 
   expect(service.processDue()).toBe(false);
   expect(recordAutoContinue).not.toHaveBeenCalled();
   expect(onWorkAvailable).not.toHaveBeenCalled();
+});
+
+
+/**
+ * A job that died in a merge-authority stage, with the project's durable grant
+ * evidence, its current policy snapshot, and its brake supplied exactly as the
+ * store would return them.
+ */
+function mergeStageSweep(input: {
+  policy: ProjectPolicy;
+  evidence: {
+    grant: MergeAuthorityGrant | null;
+    revokedAt: number | null;
+    policyStoredAt: number | null;
+  };
+  /** What `project enable` last stored. Defaults to the job's own snapshot. */
+  currentPolicy?: ProjectPolicy;
+  paused?: boolean;
+}) {
+  const retryFailedJob = vi.fn(() => ({ outcome: "queued" }));
+  const current = input.currentPolicy ?? input.policy;
+  const service = new JobContinuationService({
+    store: {
+      listContinuationCandidates: () => [{
+        job: {
+          id: "job_merge_stage",
+          version: 7,
+          projectId: "proj_1",
+          state: "failed",
+          blockedReason: "permanent_effect_failure",
+          resumeState: "merging",
+          lastError: "the merge effect ran out of retries",
+          prNumber: 4,
+          reviewCycle: 0,
+          implementationThreadId: "thr_impl",
+          cancelRequestedAt: null,
+          policy: input.policy,
+          deliveryMode: "full",
+        },
+        attempts: 0,
+        key: "failed:permanent_effect_failure:merging",
+      }],
+      getMergeGrantEvidence: () => input.evidence,
+      getProjectPolicy: () => ({ policy: current, version: 1 }),
+      listPausedProjectAdmissions: () => input.paused === true
+        ? [{ projectId: "proj_1", reason: "rollback failed after a bad deploy", pausedAt: 2_000 }]
+        : [],
+      recordAutoContinue: vi.fn(),
+      retryFailedJob,
+      requeueReviewAdmission: () => ({ outcome: "unavailable" }),
+      recordContinuationEscalation: vi.fn(),
+      listEnabledProjectPolicies: () => [],
+      getOwner: () => null,
+      getControllerForOwner: () => null,
+      enqueueControllerTurn: vi.fn(),
+    } as never,
+    clock: { now: () => 3_000_000 },
+    issueUpdateId: (now) => now,
+  });
+  return { service, retryFailedJob };
+}
+
+/** The standing approval the owner granted by tapping the button. */
+function buttonGrant(): MergeAuthorityGrant {
+  return {
+    projectId: "proj_1",
+    grantedAt: 1_000,
+    grantedByUserId: "7",
+    grantedByChatId: "70",
+    revokedAt: null,
+    revokedReason: null,
+  };
+}
+
+function unattendedPolicy(): ProjectPolicy {
+  return policyFixture({
+    production: {
+      ...policyFixture().production!,
+      rollbackCommand: { name: "rollback", command: "./rollback.sh", timeoutMs: 60_000 },
+    },
+    autonomy: { unattendedMerge: true, mergeWithoutProduction: false },
+  });
+}
+
+it("re-fires a dead merge effect for a project that merges unattended", () => {
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(true);
+  // The guarded retry, which re-runs the merge effect and every gate behind it.
+  expect(retryFailedJob).toHaveBeenCalledWith("job_merge_stage", 7, 3_000_000);
+});
+
+it("leaves a dead merge effect alone for a project that still asks first", () => {
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: policyFixture(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone once the owner has withdrawn the grant", () => {
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    evidence: { grant: null, revokedAt: 2_000, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone for a project whose only grant is the button", () => {
+  // The button says "merge this without asking me". Driving a job back into a
+  // deploy on its own is a different thing, and the policy is where a project
+  // asks for it.
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: policyFixture(),
+    currentPolicy: policyFixture(),
+    evidence: { grant: buttonGrant(), revokedAt: null, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone while the failure brake holds the project", () => {
+  // Production broke here and could not be put back. Re-entering the stage
+  // that broke it is the last thing this project needs.
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
+    paused: true,
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone once the project stopped declaring unattended merging", () => {
+  // The job's own snapshot still carries the grant it was admitted under; what
+  // the project may do unattended now is what the current policy says.
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    currentPolicy: policyFixture(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
 });

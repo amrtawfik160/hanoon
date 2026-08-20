@@ -88,6 +88,7 @@ function effectIdempotencyKey(jobId: string, version: number, effectKind: string
 describe("worker skill role table", () => {
   test("contains exactly the selected manifest skill ids", () => {
     expect(BUNDLED_SKILL_IDS).toEqual([
+      "blast-radius",
       "brainstorming",
       "checking-system-logs",
       "clean-code-guard",
@@ -134,11 +135,27 @@ describe("worker skill role table", () => {
         "pr-writer",
       ],
     ],
-    ["review", ["unslop", "clean-code-guard", "test-guard", "durable-boundary-audit"]],
+    [
+      "review",
+      [
+        "unslop",
+        "clean-code-guard",
+        "test-guard",
+        "durable-boundary-audit",
+        "blast-radius",
+      ],
+    ],
     ["documentation", ["unslop", "technical-writing", "docs-guard", "verification-before-completion"]],
     [
       "final-review",
-      ["unslop", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit"],
+      [
+        "unslop",
+        "clean-code-guard",
+        "test-guard",
+        "docs-guard",
+        "durable-boundary-audit",
+        "blast-radius",
+      ],
     ],
   ] as const)("selects the exact skills for %s", (role, expectedSkills) => {
     const jobId = JOB_ID;
@@ -173,7 +190,7 @@ describe("worker skill role table", () => {
 
   test.each([
     ["planner", "systematic-debugging", "unslop, writing-plans, docs-guard"],
-    ["review", "docs-guard", "unslop, clean-code-guard, test-guard, durable-boundary-audit"],
+    ["review", "docs-guard", "unslop, clean-code-guard, test-guard, durable-boundary-audit, blast-radius"],
   ] as const)("ignores forged repeated skill ids for the %s role", (role, forgedSkill, expectedSkills) => {
     const forgedProfile = {
       role,
@@ -184,6 +201,31 @@ describe("worker skill role table", () => {
     expect(instructions.length).toBeLessThanOrEqual(1_200);
     expect(instructions).toContain(`Selected skill ids: ${expectedSkills}.`);
     expect(instructions).not.toContain(forgedSkill);
+  });
+
+  // Only the roles whose verdict can carry a change to merge are taught to hunt
+  // for breakage outside the diff. Nothing that writes code carries it.
+  test("gives blast-radius to the review and final-review roles and to no other", () => {
+    const rolesWithBlastRadius = Object.entries(ROLE_SKILLS)
+      .filter(([, skills]) => (skills as readonly string[]).includes("blast-radius"))
+      .map(([role]) => role)
+      .sort();
+
+    expect(rolesWithBlastRadius).toEqual(["final-review", "review"]);
+  });
+
+  test.each([
+    ["review", "spawn_review"],
+    ["final-review", "spawn_final_review"],
+  ] as const)("names blast-radius in the resolved %s profile", (role, effectKind) => {
+    const attemptId = `attempt:${effectIdempotencyKey(JOB_ID, 7, effectKind)}`;
+    const identity = durableIdentity({ attemptId, role });
+    const profile = resolve(context({ title: buildWorkerThreadTitle(identity) }), identity);
+    if (!profile) throw new Error(`expected a valid ${role} profile`);
+
+    expect(profile.skills).toContain("blast-radius");
+    expect(profile.instructions).toContain("blast-radius");
+    expect(profile.instructions.length).toBeLessThanOrEqual(1_200);
   });
 
   test("always selects the communication skill for a planner", () => {

@@ -12,6 +12,7 @@ import {
   SelfDiagnosisService,
   buildSelfDiagnosisPullRequestBody,
   buildSelfDiagnosisPrompt,
+  buildSelfDiagnosisWorkOrder,
   findSelfDiagnosisCandidates,
   parseSelfDiagnosisOutput,
   type SelfDiagnosisCandidate,
@@ -450,5 +451,129 @@ describe("self-diagnosis pull-request output", () => {
       { number: 2, url: "https://github.com/example/repo/pull/2", title: "Self-diagnosis candidate fix: stalled_turn" },
     ]))).toEqual([{ number: 2, url: "https://github.com/example/repo/pull/2" }]);
     expect(parseOpenSelfDiagnosisPullRequests("not json")).toBeNull();
+  });
+});
+
+describe("filing a diagnosis as pipeline work", () => {
+  const DIAGNOSIS = {
+    whatFailed: "A submitted controller turn stopped before finalization",
+    evidence: ["state=submitted"],
+    hypothesis: "The reconciliation boundary did not observe a terminal event",
+    candidateFix: "Add a bounded reconciliation fallback and regression test",
+  };
+
+  function pipelineService(overrides: {
+    mode?: () => "draft-pr" | "pipeline";
+    filePipelineJob?: ReturnType<typeof vi.fn>;
+    publish?: ReturnType<typeof vi.fn>;
+    warn?: (message: string) => void;
+  }) {
+    const publish = overrides.publish ?? vi.fn(async () => ({
+      outcome: "published" as const,
+      number: 42,
+      url: "https://github.com/example/repo/pull/42",
+    }));
+    const ledger = memoryLedger();
+    const service = new SelfDiagnosisService({
+      enabled: () => true,
+      readCandidates: () => [candidate()],
+      resolveTarget: async () => ({
+        projectId: "proj_self",
+        baseBranch: "main",
+        hostId: "host-1",
+        cwd: "/workspace/repo",
+      }),
+      ledger,
+      github: { listOpen: async () => [] },
+      analyze: async () => ({
+        diagnosis: DIAGNOSIS,
+        environmentId: "env-1",
+        environmentStatus: { checkout: { branchName: "bb/self-diagnosis" } },
+      }),
+      publish,
+      ...(overrides.mode === undefined ? {} : { mode: overrides.mode }),
+      ...(overrides.filePipelineJob === undefined ? {} : { filePipelineJob: overrides.filePipelineJob }),
+      modelRoute: () => MODEL_ROUTE,
+      clock: { now: () => NOW },
+      idFactory: () => "diag_abc123",
+      ...(overrides.warn === undefined ? {} : { warn: overrides.warn }),
+    });
+    return { service, publish, ledger };
+  }
+
+  it("writes the diagnosis as a work order that says it is only a guess", () => {
+    const order = buildSelfDiagnosisWorkOrder({ candidate: candidate(), diagnosis: DIAGNOSIS });
+
+    expect(order).toContain(DIAGNOSIS.whatFailed);
+    expect(order).toContain(DIAGNOSIS.candidateFix);
+    // A diagnosis that turns out to be wrong must stop, not be implemented.
+    expect(order).toMatch(/if it is wrong/i);
+    expect(order).not.toContain("\n");
+  });
+
+  it("still pushes a draft pull request when nothing asked for pipeline mode", async () => {
+    const filePipelineJob = vi.fn();
+    const { service, publish } = pipelineService({ filePipelineJob });
+
+    await expect(service.runOnce()).resolves.toMatchObject({ outcome: "published" });
+    expect(filePipelineJob).not.toHaveBeenCalled();
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it("files a pipeline job instead of a draft pull request in pipeline mode", async () => {
+    const filePipelineJob = vi.fn(
+      (_input: { diagnosisId: string; target: { projectId: string } }) => (
+        { outcome: "filed" as const, jobId: "job_from_diagnosis" }
+      ),
+    );
+    const { service, publish, ledger } = pipelineService({
+      mode: () => "pipeline",
+      filePipelineJob,
+    });
+
+    await expect(service.runOnce()).resolves.toEqual({ outcome: "filed", jobId: "job_from_diagnosis" });
+    expect(publish).not.toHaveBeenCalled();
+    expect(filePipelineJob).toHaveBeenCalledOnce();
+    expect(filePipelineJob.mock.calls[0]?.[0]).toMatchObject({
+      diagnosisId: "diag_abc123",
+      target: { projectId: "proj_self" },
+    });
+    // The attempt is spent either way: this failure has had its one look.
+    expect(ledger.state()?.records[0]).toMatchObject({ outcome: "published", prUrl: null });
+  });
+
+  it("falls back to the draft pull request, saying why, when the project cannot take the work", async () => {
+    const warn = vi.fn();
+    const { service, publish } = pipelineService({
+      mode: () => "pipeline",
+      filePipelineJob: vi.fn(() => ({
+        outcome: "fallback" as const,
+        reason: "the project has no audit intake allowance",
+      })),
+      warn,
+    });
+
+    await expect(service.runOnce()).resolves.toMatchObject({ outcome: "published" });
+    expect(publish).toHaveBeenCalledOnce();
+    expect(warn.mock.calls.flat().join(" ")).toContain("no audit intake allowance");
+  });
+
+  it("falls back to the draft pull request when filing throws", async () => {
+    const { service, publish } = pipelineService({
+      mode: () => "pipeline",
+      filePipelineJob: vi.fn(() => {
+        throw new Error("database is locked");
+      }),
+    });
+
+    await expect(service.runOnce()).resolves.toMatchObject({ outcome: "published" });
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to the draft pull request when this installation cannot file at all", async () => {
+    const { service, publish } = pipelineService({ mode: () => "pipeline" });
+
+    await expect(service.runOnce()).resolves.toMatchObject({ outcome: "published" });
+    expect(publish).toHaveBeenCalledOnce();
   });
 });

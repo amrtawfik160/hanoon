@@ -1,5 +1,10 @@
 import { expect, it } from "vitest";
-import { controllerExecutionProfiles, credentialBrokerConfigFingerprint, parseGlobalConfig } from "../src/config";
+import {
+  controllerExecutionProfiles,
+  credentialBrokerConfigFingerprint,
+  parseGlobalConfig,
+  selfDiagnosisMode,
+} from "../src/config";
 import {
   CONTROLLER_MODELS,
   controllerExecutionArguments,
@@ -285,3 +290,23 @@ it.each(["0", "9", "1.5", "not-a-number", ""]) (
     expect(parseGlobalConfig(globalValues({ maxConcurrentJobs })).ok).toBe(false);
   },
 );
+
+it("leaves a diagnosis as a draft pull request unless the setting says otherwise", () => {
+  const parsed = parseGlobalConfig(globalValues());
+
+  expect(parsed.ok).toBe(true);
+  if (!parsed.ok) throw new Error(parsed.message);
+  expect(selfDiagnosisMode(parsed.value)).toBe("draft-pr");
+});
+
+it("keeps an explicit self-diagnosis mode", () => {
+  const parsed = parseGlobalConfig(globalValues({ selfDiagnosisMode: "pipeline" }));
+
+  expect(parsed.ok).toBe(true);
+  if (!parsed.ok) throw new Error(parsed.message);
+  expect(selfDiagnosisMode(parsed.value)).toBe("pipeline");
+});
+
+it("refuses a self-diagnosis mode it does not know", () => {
+  expect(parseGlobalConfig(globalValues({ selfDiagnosisMode: "merge-it" })).ok).toBe(false);
+});
