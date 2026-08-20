@@ -30,6 +30,12 @@
   },
   "skills": [
     {
+      "id": "blast-radius",
+      "skillPath": "skills/hanoon/blast-radius/SKILL.md",
+      "source": "first-party",
+      "license": "first-party"
+    },
+    {
       "id": "brainstorming",
       "skillPath": "skills/workflow-kit/brainstorming/SKILL.md",
       "source": "https://github.com/obra/superpowers",
@@ -324,6 +330,10 @@
       "sha256": "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0"
     },
     {
+      "path": "skills/hanoon/blast-radius/SKILL.md",
+      "sha256": "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d"
+    },
+    {
       "path": "skills/hanoon/checking-system-logs/SKILL.md",
       "sha256": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245"
     },
@@ -341,7 +351,7 @@
     },
     {
       "path": "skills/hanoon/NOTICE",
-      "sha256": "07d9c88346a3fbb827e7c8a010323ff4b5ed453c4d7f29d8c7859fc8a22764d6"
+      "sha256": "b2c8f64081b9b8f7f9c93fbe9b2461cbf4a7c179d7feebcd06d0e96d465b539b"
     },
     {
       "path": "skills/hanoon/proportional-development-workflow/SKILL.md",

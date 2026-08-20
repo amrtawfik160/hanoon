@@ -84,7 +84,7 @@ If the broker client's private key may have leaked, treat it as a compromised cr
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally under the five manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, and `skills/hanoon`; operators do not install another runtime skill plugin. The catalog has 26 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+Skills are committed locally under the five manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, and `skills/hanoon`; operators do not install another runtime skill plugin. The catalog has 27 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
 
 Run the deterministic integrity gate from the repository root:
 

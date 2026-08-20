@@ -53,7 +53,16 @@ export const ROLE_SKILLS = {
     // reviewer then reads, so it owns writing a reviewer-facing description.
     "pr-writer",
   ],
-  review: [COMMUNICATION_SKILL_ID, "clean-code-guard", "test-guard", "durable-boundary-audit"],
+  // The guards judge the code the change contains. This one judges what the
+  // change can break outside it, which is the risk a verdict carries when it
+  // lets the change merge unattended.
+  review: [
+    COMMUNICATION_SKILL_ID,
+    "clean-code-guard",
+    "test-guard",
+    "durable-boundary-audit",
+    "blast-radius",
+  ],
   documentation: [COMMUNICATION_SKILL_ID, "docs-guard", "verification-before-completion"],
   "final-review": [
     COMMUNICATION_SKILL_ID,
@@ -61,6 +70,7 @@ export const ROLE_SKILLS = {
     "test-guard",
     "docs-guard",
     "durable-boundary-audit",
+    "blast-radius",
   ],
 } as const satisfies Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>>;
 

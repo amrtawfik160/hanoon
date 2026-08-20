@@ -102,17 +102,17 @@ The shipped rollout is conservative: adaptive recipes default to `shadow`, where
 
 ## Bundled agent skills
 
-The plugin bundles 26 skills locally across five manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, and each root retains its own provenance and licence. Agents receive only the verified profile below.
+The plugin bundles 27 skills locally across five manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, and each root retains its own provenance and licence. Agents receive only the verified profile below.
 
 | Verified context | Selected skill ids |
 | --- | --- |
 | controller | `human-friendly-coding-communication`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling` |
 | planner | `human-friendly-coding-communication` |
 | critic | `human-friendly-coding-communication` |
-| implementation | `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer` |
-| review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard` |
+| implementation | `human-friendly-coding-communication`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius` |
 | documentation | `human-friendly-coding-communication`, `docs-guard`, `verification-before-completion` |
-| final-review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard` |
+| final-review | `human-friendly-coding-communication`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
 | validation, merge, deploy, canary | none; these stages remain deterministic |
 
 Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1–256 characters from `[A-Za-z0-9_-]`; attempt ids are 1–264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact `attempt:` or `stage:` record must match the title's job, attempt, and role, and its originating effect must be the corresponding `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs` effect. The job project, persisted environment (when present), and persisted thread (when present) must match the current context. A null environment or thread is accepted only for the first start; a later context must match the persisted id. Any mismatch receives no tools and no skills; the hidden controller branch receives no worker skills.
