@@ -7,6 +7,7 @@ import type {
 import {
   consensusReviewSchema,
   executionProfileSchema,
+  reviewStageProviderId,
   stageExecutionPolicySchema,
   type PipelineStage,
 } from "./stage-execution";
@@ -184,6 +185,26 @@ export const projectPolicySchema = z
           code: "custom",
           path: ["autonomy", "mergeWithoutProduction"],
           message: "Merging without production requires a configured regression policy",
+        });
+      }
+    }
+    // A consensus pass stands in for the owner's own look at a change that
+    // argued with its review twice. Pinning it to the provider that produced
+    // that review makes it the same reader agreeing with itself, which is not a
+    // second opinion at all — and this is the one place both routes are visible
+    // at once, so it is refused here rather than at the merge it would have
+    // waved through.
+    const consensusProvider = policy.autonomy?.consensusReview?.providerId;
+    if (consensusProvider !== undefined) {
+      const reviewProvider = reviewStageProviderId({
+        ...(policy.stageExecution === undefined ? {} : { stageExecution: policy.stageExecution }),
+        legacy: { implementation: policy.implementation, review: policy.review },
+      });
+      if (consensusProvider === reviewProvider) {
+        context.addIssue({
+          code: "custom",
+          path: ["autonomy", "consensusReview", "providerId"],
+          message: `A second-opinion review must run on a provider the review stage did not use, but autonomy.consensusReview names "${consensusProvider}" and the review stage runs on "${reviewProvider}"`,
         });
       }
     }

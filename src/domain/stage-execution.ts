@@ -465,6 +465,22 @@ export function resolveStageExecution(input: ResolveStageExecutionInput): Resolv
 }
 
 /**
+ * The provider a job's review stage runs on, resolved exactly the way the
+ * review attempt itself resolves it. The one place to ask "who already read
+ * this change", so a check against it cannot drift from what actually ran.
+ */
+export function reviewStageProviderId(input: Readonly<{
+  stageExecution?: StageExecutionPolicy;
+  legacy?: LegacyProfiles;
+}>): string {
+  return resolveStageExecution({
+    stage: "review",
+    ...(input.stageExecution === undefined ? {} : { stageExecution: input.stageExecution }),
+    ...(input.legacy === undefined ? {} : { legacy: input.legacy }),
+  }).providerId;
+}
+
+/**
  * The route one consensus review pass runs on, or null when there is no
  * independent second opinion to be had.
  *
@@ -473,6 +489,11 @@ export function resolveStageExecution(input: ResolveStageExecutionInput): Resolv
  * otherwise it is the strong route of a provider the review stage did not use.
  * Null is a real answer, and its caller asks the owner instead of re-reviewing
  * on the same model and calling that a second opinion.
+ *
+ * A pinned route is checked against the review stage's provider here as well as
+ * where the policy is parsed. The parse refuses such a policy outright, so this
+ * is the second lock on the same door: independence is the property this pass
+ * is trusted for, and it must not rest on a single check.
  */
 export function resolveConsensusExecution(input: Readonly<{
   stageExecution?: StageExecutionPolicy;
@@ -492,7 +513,10 @@ export function resolveConsensusExecution(input: Readonly<{
   });
   const pinned = input.consensusReview;
   const route = pinned === undefined ? alternateStrongRoute(review.providerId) : pinned;
-  if (route === null) return null;
+  // The same model agreeing with itself is not a second opinion. A pin that
+  // lands back on the reviewer's provider is therefore read as "no independent
+  // route", which is a case the caller already handles by asking the owner.
+  if (route === null || route.providerId === review.providerId) return null;
   const entry = stageModelEntry(route.model);
   const requestedServiceTier = pinned?.serviceTier ?? "default";
   return Object.freeze({

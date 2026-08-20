@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type { ProjectPolicy } from "../src/domain/models";
 import { projectResourceKey } from "../src/autonomy/models";
+import { resolveConsensusExecution } from "../src/domain/stage-execution";
 import { EffectRunner } from "../src/services/effect-runner";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { policyFixture } from "./helpers";
@@ -33,6 +34,7 @@ function unattendedPolicy(overrides: Partial<ProjectPolicy> = {}): ProjectPolicy
 }
 
 function awaitingApproval(policy: ProjectPolicy): {
+  bb: ReturnType<typeof createFakePluginHost>["bb"];
   store: TelegramAgentStore;
   db: Database.Database;
   jobId: string;
@@ -68,7 +70,7 @@ function awaitingApproval(policy: ProjectPolicy): {
        lease_expires_at, acquired_at, renewed_at
      ) VALUES (?, ?, 'project', 'held', ?, ?, ?, 1002, 1002)`,
   ).run(job.id, projectResourceKey(policy.projectId), OWNER, lease.generation, 10_000_000);
-  return { store, db, jobId: job.id, generation: lease.generation };
+  return { bb, store, db, jobId: job.id, generation: lease.generation };
 }
 
 function enqueue(db: Database.Database, jobId: string, kind: string, key: string, payload: unknown): void {
@@ -258,17 +260,17 @@ describe("a second opinion before an unattended merge", () => {
       .map((event) => event.action)).not.toContain("used");
   });
 
-  it("asks the owner outright when the project has no independent route to review on", async () => {
-    // Both stages pinned to the same provider: a second opinion here would be
-    // the same model agreeing with itself.
+  it("asks the owner outright when the capability router owns the model tuple", async () => {
+    // The only cause under test is `active` routing: this project has a
+    // perfectly good independent route, and the pass still cannot be promised
+    // to run anywhere the review did not.
     const policy = unattendedPolicy({
       stageExecution: { review: { providerId: "claude-code", model: "claude-opus-5[1m]" } },
-      autonomy: {
-        unattendedMerge: true,
-        mergeWithoutProduction: false,
-        consensusReview: { providerId: "claude-code", model: "claude-opus-5[1m]" },
-      },
     });
+    expect(resolveConsensusExecution({
+      stageExecution: policy.stageExecution!,
+      legacy: { implementation: policy.implementation, review: policy.review },
+    })).toMatchObject({ providerId: "codex" });
     const fixture = awaitingApproval(policy);
     fixture.db.prepare("UPDATE jobs SET routing_mode = 'active' WHERE id = ?").run(fixture.jobId);
     enqueue(fixture.db, fixture.jobId, "issue_approval", "job:2:issue_approval", { headSha: HEAD });
@@ -279,5 +281,21 @@ describe("a second opinion before an unattended merge", () => {
       .not.toContain("spawn_consensus_review");
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE job_id = ?").get(fixture.jobId))
       .toEqual({ count: 1 });
+  });
+
+  it("has no route when the pinned one lands back on the reviewer's own provider", () => {
+    // The other cause, on its own and with no routing mode in sight. A policy
+    // like this is refused where it is parsed; this is the second lock, so a
+    // route that reaches here anyway still resolves to "ask the owner".
+    expect(resolveConsensusExecution({
+      stageExecution: { review: { providerId: "claude-code", model: "claude-opus-5[1m]" } },
+      legacy: { implementation: { model: "implementation-model" }, review: { model: "review-model" } },
+      consensusReview: { providerId: "claude-code", model: "claude-opus-5[1m]" },
+    })).toBeNull();
+    // The same pin against a review stage that runs somewhere else is fine.
+    expect(resolveConsensusExecution({
+      legacy: { implementation: { model: "implementation-model" }, review: { model: "review-model" } },
+      consensusReview: { providerId: "claude-code", model: "claude-opus-5[1m]" },
+    })).toMatchObject({ providerId: "claude-code", model: "claude-opus-5[1m]" });
   });
 });
