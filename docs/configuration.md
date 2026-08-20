@@ -214,7 +214,7 @@ bb telegram-agent project enable proj_7f3d2a91 --policy-json "$POLICY_JSON"
 
 The `--host` flag is valid only with an absolute `--policy-file` path and selects the BB host that owns that file. A command invoked from a BB thread can otherwise resolve the invoking environment's host.
 
-Individual flags are also supported. At minimum they require `--alias`, `--base`, and `--merge-method`:
+Individual flags are also supported. At minimum they require `--alias`, `--base`, and `--merge-method`. `--unattended-merge` sets `autonomy.unattendedMerge`; the rest of the `autonomy` block needs a policy file, because `mergeWithoutProduction` depends on a `regression` policy that only the file can express:
 
 ```bash
 bb telegram-agent project enable proj_7f3d2a91 \
@@ -261,6 +261,14 @@ Use unmistakable placeholders and replace them with values verified for the targ
     "plan": { "tier": "strong" },
     "docs": { "tier": "fast", "maxEscalations": 1 },
     "review": { "providerId": "codex", "model": "gpt-5.6-sol" }
+  },
+  "autonomy": {
+    "unattendedMerge": false,
+    "mergeWithoutProduction": false,
+    "consensusReview": {
+      "providerId": "claude-code",
+      "model": "claude-opus-5[1m]"
+    }
   },
   "validationCommands": [
     {
@@ -322,6 +330,10 @@ Use unmistakable placeholders and replace them with values verified for the targ
 | `baseBranch` | Non-empty and present in the selected BB source. |
 | `implementation`, `review` | Optional provider/model/reasoning/tier/permission fields. When `stageExecution` has no entry for that stage, these are what the stage runs on. |
 | `stageExecution` | Optional per-worker-kind execution table. See [Per-stage model routing](#per-stage-model-routing). |
+| `autonomy` | Optional. Absent is the default behaviour: every merge asks, and a project with no production settings finishes at the reviewed pull request. See [Standing merge approval](#standing-merge-approval). |
+| `autonomy.unattendedMerge` | `true` merges this project without asking, on the same terms as the button-granted standing approval. Requires `production.rollbackCommand` when production is configured. |
+| `autonomy.mergeWithoutProduction` | `true` lets a project with no production settings merge instead of stopping at the reviewed pull request. Requires a non-empty `requiredChecks` and a configured `regression` policy. |
+| `autonomy.consensusReview` | Optional `providerId` and `model` (plus optional `reasoningLevel`, `serviceTier`, `permissionMode`) for the second-opinion review pass. Validated against the same model catalog as `stageExecution`. |
 | `validationCommands` | Up to 20 owner-authored commands. |
 | `production.targetKey` | Optional shared isolation key: 1–64 lowercase letters, numbers, `.`, `_`, or `-`, starting alphanumeric. When absent, the project id is used. |
 | `production.deployCommands` | One to 20 commands when production is configured. |
@@ -346,7 +358,7 @@ Deploy and canary must both be present before the plugin can issue merge approva
 
 When a deploy or canary command fails and `rollbackCommand` is configured, the plugin runs it immediately, in the same stage, before reporting the failure. The rollback is deliberately not cancellable: a cancelled job must still finish reverting production. Its receipt is stored on the stage evidence alongside the failed command, and the stage outcome stays `fail` whether or not the rollback worked.
 
-Configuring a `rollbackCommand` is what makes unattended merging safe, so it is effectively required for any project given a standing approval.
+Configuring a `rollbackCommand` is what makes unattended merging safe, so it is effectively required for any project given a standing approval, and strictly required for a project whose policy sets `autonomy.unattendedMerge`.
 
 ## Scheduled checks between jobs
 
@@ -383,18 +395,80 @@ By default the plugin asks for a one-use approval before every merge. The owner 
 A standing approval replaces the owner's signature only. Every check that produced the merge candidate still runs, and the plugin falls back to asking when:
 
 - the pull-request head is not established, or the owner has asked the job to stop;
-- the project has no production configuration;
-- the change needed two or more rounds of review fixes.
+- the project has no production configuration, unless its policy sets `autonomy.mergeWithoutProduction`;
+- the change needed two or more rounds of review fixes and no [second opinion](#the-second-opinion-on-a-change-that-argued-with-its-review) cleared it.
 
-The standing approval is withdrawn automatically when production fails and the rollback either was not configured or failed — recovery is exhausted, so nothing merges unattended there again until the owner re-grants it. A rollback that succeeded is a recovery, not an incident, and the standing approval survives it.
+The standing approval is withdrawn automatically when production fails and the rollback either was not configured or failed. Recovery is exhausted, so nothing merges unattended there again until the owner re-grants it. A rollback that succeeded is a recovery, not an incident, and the standing approval survives it.
 
-Granting a standing approval is only ever a button tap. An owner-origin sentence can grant one-use authority for its named job, but system turns and agent-generated text cannot grant either form. Withdrawing standing approval is available by name:
+Granting a standing approval from the chat is only ever a button tap. An owner-origin sentence can grant one-use authority for its named job, but system turns and agent-generated text cannot grant either form. Withdrawing is available by name:
 
-- `/approvals` lists the projects that merge without asking;
+- `/approvals` lists the projects that merge without asking, and says whether each one was granted by button or set in its project policy;
 - `/approvals off <alias>` withdraws one;
 - `/approvals off` withdraws all of them.
 
 Every grant, withdrawal, and unattended merge is recorded in an append-only log keyed by project.
+
+### A grant the project policy carries
+
+`autonomy.unattendedMerge` gives a project the same standing approval without a
+tap. It is read from the job's own immutable policy snapshot, so changing a
+policy never rewrites what a running job was admitted under.
+
+Withdrawing works the same way, with one difference worth knowing: the plugin
+cannot edit your policy file, so `/approvals off <alias>` records a durable
+withdrawal instead. The policy grant stays silent until the project's enabled
+policy is stored again, which is what `bb telegram-agent project enable` does.
+Re-enabling the project is therefore what turns it back on, and the chat says so
+when it withdraws one. `project disable` also stores a snapshot, and deliberately
+does not count: turning a project off must never be what revives the authority
+you just withdrew.
+
+A project that deploys must also configure `production.rollbackCommand` before
+this is accepted. Unattended merging with no way back is the case this exists to
+prevent, so the policy is rejected at `project enable` and at load rather than
+at the merge it would have governed.
+
+### Merging a project that deploys nothing
+
+By default a reviewed pull request on a project with no `production` settings is
+finished work: there is nothing to deploy, so the pipeline stops at the pull
+request and the owner decides what happens next.
+
+`autonomy.mergeWithoutProduction` says the merge itself is the delivery. The
+change goes through the same approval, the same gates, the same receipts, and
+the same merge effect as every other project, and the job ends at `merged` with
+no deploy or canary to run. The status card says "Merged, nothing to deploy" and
+the buttons offer a merge rather than a merge and deploy, because there is no
+deployment to promise.
+
+Deploy and canary are what would otherwise prove a merged change works, so this
+requires the two things left that can notice a bad merge: at least one entry in
+`requiredChecks`, and a configured `regression` policy running on a timer. Both
+are checked when the policy is parsed.
+
+### The second opinion on a change that argued with its review
+
+A change that needed two or more rounds of review fixes used to go to the owner
+even on a pre-approved project, because what it needed was a person's look.
+
+One extra review now stands in for that look. It reads the exact head that is
+about to merge, runs on a provider the job's own review stage did not use, and
+only its unambiguous agreement merges the change: a verdict of pass carrying no
+findings at all. Any finding, a failed or unreadable pass, a head that moved
+underneath it, or no independent route to run it on all fall back to asking the
+owner. At most one pass runs per head, and it survives a restart on the same
+durable review evidence as every other review.
+
+`autonomy.consensusReview` pins the route, and is used exactly as written: pin a
+provider the review stage does not use, because pinning the reviewer's own
+provider removes the independence the pass exists for. Left out, the pass runs
+on the strong route of whichever provider the review stage did not use.
+
+One case has no second opinion available at all: a job running under `active`
+capability model routing, where the capability router owns the model tuple and
+the pass cannot be guaranteed to run anywhere else. Those changes go to the
+owner exactly as they did before. A fresh installation has no such job, because
+adaptive recipes start in `shadow`.
 
 ## Per-stage model routing
 

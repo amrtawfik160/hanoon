@@ -9342,8 +9342,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       `SELECT MAX(occurred_at) AS revoked_at FROM merge_authority_events
         WHERE project_id = ? AND action = 'revoked'`,
     ).get(projectId) as { revoked_at: number | null } | undefined;
+    // Only an enabled policy counts as the owner asking again. `project
+    // disable` stores a snapshot too, and turning a project off must never be
+    // the thing that revives the merge authority they just withdrew.
     const policy = this.db.prepare(
-      "SELECT updated_at FROM project_policies WHERE project_id = ?",
+      "SELECT updated_at FROM project_policies WHERE project_id = ? AND enabled = 1",
     ).get(projectId) as { updated_at: number } | undefined;
     return {
       grant: this.getMergeAuthority(projectId),

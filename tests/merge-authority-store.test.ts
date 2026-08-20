@@ -160,6 +160,17 @@ it("stays withdrawn when the project is enabled again without the grant", () => 
   expect(liveGrant(store)).toBeNull();
 });
 
+it("does not let disabling a project revive the authority the owner withdrew", () => {
+  const store = fixture();
+  const policy = policyGrantFixture(store, NOW).policy;
+  store.revokeMergeAuthority({ projectId: PROJECT, reason: "the owner withdrew it", now: NOW + 1_000 });
+
+  store.upsertProjectPolicy({ ...policy, enabled: false }, NOW + 2_000);
+
+  expect(store.getMergeGrantEvidence(PROJECT).policyStoredAt).toBeNull();
+  expect(liveGrant(store)).toBeNull();
+});
+
 it("records nothing when a project has no authority of either kind to withdraw", () => {
   const store = fixture();
   store.upsertProjectPolicy(policyFixture({ projectId: PROJECT }), NOW);
