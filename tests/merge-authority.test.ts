@@ -207,3 +207,80 @@ describe("merging a project that deploys nothing", () => {
     })).toEqual({ outcome: "auto_approve" });
   });
 });
+
+describe("a change that argued with its own review twice", () => {
+  const twoRounds = () => job({ reviewCycle: REMEDIATION_ASK_THRESHOLD });
+  const consensus = (overrides: Partial<{
+    requested: boolean;
+    assessment: "pending" | "pass" | "not_pass";
+    routeAvailable: boolean;
+  }> = {}) => ({
+    requested: false,
+    assessment: "pending" as const,
+    routeAvailable: true,
+    ...overrides,
+  });
+
+  it("asks for a second opinion instead of asking the owner straight away", () => {
+    expect(decideAutoApproval({ job: twoRounds(), grant: grant(), consensus: consensus() }))
+      .toEqual({ outcome: "start_consensus" });
+  });
+
+  it("asks for at most one second opinion per head", () => {
+    expect(decideAutoApproval({
+      job: twoRounds(),
+      grant: grant(),
+      consensus: consensus({ requested: true }),
+    })).toEqual({ outcome: "await_consensus" });
+  });
+
+  it("merges when the second opinion passed the exact head with nothing to say", () => {
+    expect(decideAutoApproval({
+      job: twoRounds(),
+      grant: grant(),
+      consensus: consensus({ requested: true, assessment: "pass" }),
+    })).toEqual({ outcome: "auto_approve" });
+  });
+
+  it("asks the owner when the second opinion found anything at all", () => {
+    const decision = decideAutoApproval({
+      job: twoRounds(),
+      grant: grant(),
+      consensus: consensus({ requested: true, assessment: "not_pass" }),
+    });
+    expect(decision.outcome).toBe("ask_owner");
+    expect(decision).toMatchObject({ reason: expect.stringContaining("did not clear it") });
+  });
+
+  it("asks the owner when there is no independent route to review on", () => {
+    const decision = decideAutoApproval({
+      job: twoRounds(),
+      grant: grant(),
+      consensus: consensus({ routeAvailable: false }),
+    });
+    expect(decision.outcome).toBe("ask_owner");
+    expect(decision).toMatchObject({ reason: expect.stringContaining("rounds of review fixes") });
+  });
+
+  it("asks the owner when no consensus evidence was supplied at all", () => {
+    expect(decideAutoApproval({ job: twoRounds(), grant: grant() }).outcome).toBe("ask_owner");
+  });
+
+  it("never starts a second opinion for a job with no live grant", () => {
+    expect(decideAutoApproval({ job: twoRounds(), grant: null, consensus: consensus() }).outcome)
+      .toBe("ask_owner");
+  });
+
+  it("never starts a second opinion for a job the owner asked to stop", () => {
+    expect(decideAutoApproval({
+      job: job({ reviewCycle: REMEDIATION_ASK_THRESHOLD, cancelRequestedAt: 5 }),
+      grant: grant(),
+      consensus: consensus(),
+    }).outcome).toBe("ask_owner");
+  });
+
+  it("leaves an ordinary change alone: one round of fixes still merges directly", () => {
+    expect(decideAutoApproval({ job: job({ reviewCycle: 1 }), grant: grant(), consensus: consensus() }))
+      .toEqual({ outcome: "auto_approve" });
+  });
+});

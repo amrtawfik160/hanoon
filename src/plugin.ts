@@ -734,6 +734,17 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       const current = store.getJob(invocation.jobId);
       const currentQuality = current?.reviewThreadId ? store.getAttemptByThreadId(current.reviewThreadId) : null;
       const invocationAttempt = store.getAttempt(invocation.attemptId);
+      // A consensus pass has no review group and no quality lane to agree with:
+      // it is one attempt, bound to the approved head, while the job waits for
+      // its approval. Everything else it must still match exactly.
+      if (invocationAttempt?.reviewLens === "consensus") {
+        return current !== null && current.id === invocation.jobId && current.version === expectedVersion &&
+          current.state === "awaiting_merge_approval" &&
+          current.environmentId === invocation.environmentId && current.prHeadSha === invocation.expectedSha &&
+          invocationAttempt.jobId === current.id && invocationAttempt.kind === "review" &&
+          invocationAttempt.reviewStage === "consensus" &&
+          current.implementationThreadId === invocation.implementationThreadId;
+      }
       return current !== null && current.id === invocation.jobId && current.version === expectedVersion &&
         (current.state === "reviewing" || current.state === "final_reviewing") &&
         current.environmentId === invocation.environmentId && current.prHeadSha === invocation.expectedSha &&
@@ -1547,6 +1558,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     const pipelineAttempt = pipelineRole ? store.getLatestPipelineStageAttempt(job.id, pipelineRole) : null;
     const reviewStage = job.state === "reviewing" || job.state === "final_reviewing";
     const implementationStage = ["implementing", "remediating"].includes(job.state);
+    // A consensus pass runs while the job waits for its approval, so it belongs
+    // to no stage the loop already watched. Its thread is found from the same
+    // durable attempt that holds its verdict, bound to the exact approved head.
+    const consensusAttempt = job.state === "awaiting_merge_approval" && job.prHeadSha
+      ? store.getConsensusReviewAttempt(job.id, job.prHeadSha)
+      : null;
     if (reviewStage && requestedResourceId === undefined && job.reviewThreadId) {
       const quality = store.getAttemptByThreadId(job.reviewThreadId);
       if (quality?.reviewStage && quality.kind === "review") {
@@ -1572,11 +1589,15 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     if (requestedResourceId !== undefined) {
       const requestedResourceMatches = pipelineAttempt?.threadId === requestedResourceId ||
         (reviewStage && requestedReviewMatches) ||
+        (consensusAttempt !== null && consensusAttempt.threadId === requestedResourceId) ||
         (implementationStage && job.implementationThreadId === requestedResourceId);
       if (!requestedResourceMatches) return;
     }
     const reviewResourceId = requestedReviewMatches ? requestedResourceId ?? null : job.reviewThreadId;
-    const resourceId = pipelineAttempt?.threadId ?? (reviewStage ? reviewResourceId : implementationStage ? job.implementationThreadId : null);
+    const resourceId = pipelineAttempt?.threadId
+      ?? (reviewStage ? reviewResourceId
+        : implementationStage ? job.implementationThreadId
+        : consensusAttempt?.threadId ?? null);
     if (!resourceId) return;
     const recoveryRetryPayload = (): Record<string, unknown> => {
       if (pipelineRole === "CRITIQUE") {
@@ -1594,7 +1615,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     const workerKind = pipelineRole === "PLAN" ? "plan" as const
       : pipelineRole === "CRITIQUE" ? "critique" as const
       : pipelineRole === "DOCS" ? "docs" as const
-      : reviewStage ? "review" as const
+      : reviewStage || consensusAttempt !== null ? "review" as const
       : "implementation" as const;
     const generation = workerRegistrationGeneration(job, workerKind);
     /**
@@ -1650,7 +1671,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       currentRequestedAttempt.reviewStage === currentQualityAttempt.reviewStage &&
       currentRequestedAttempt.ordinal === currentQualityAttempt.ordinal;
     const currentResourceId = currentPipelineAttempt?.threadId ??
-      (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId) : current?.implementationThreadId);
+      (reviewStage ? (currentReviewResourceMatches ? resourceId : current?.reviewThreadId)
+        : consensusAttempt !== null ? consensusAttempt.threadId
+        : current?.implementationThreadId);
     if (!current || current.state !== job.state || currentResourceId !== resourceId) return;
     if (!fenceCurrent()) return;
     let hasPendingInteraction = false;
@@ -1917,6 +1940,21 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     if (!completion.event || !fenceCurrent()) return;
     const latest = store.getJob(invocation.jobId);
     const latestAttempt = store.getAttempt(invocation.attemptId);
+    // A consensus pass belongs to no review group: it runs after the group
+    // already passed, while the job waits for its approval. Its verdict is now
+    // durable on its own attempt, so the approval decision is simply made
+    // again, on the same rules, with that evidence in hand.
+    if (latestAttempt?.reviewLens === "consensus") {
+      if (!latest || latest.state !== "awaiting_merge_approval" ||
+        latestAttempt.jobId !== invocation.jobId ||
+        latestAttempt.headSha !== invocation.expectedSha ||
+        latest.prHeadSha !== invocation.expectedSha || !fenceCurrent()) return;
+      applyExecutorEvent(job.id, latest.version, {
+        type: "CONSENSUS_SETTLED",
+        headSha: invocation.expectedSha,
+      });
+      return;
+    }
     const latestQualityAttempt = latest?.reviewThreadId ? store.getAttemptByThreadId(latest.reviewThreadId) : null;
     if (!latest || !latestAttempt || latestAttempt.jobId !== invocation.jobId ||
       latestAttempt.threadId !== invocation.reviewThreadId || latestAttempt.headSha !== invocation.expectedSha ||

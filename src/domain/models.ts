@@ -491,6 +491,12 @@ export interface JobEffect {
     | "spawn_docs"
     | "run_final_validation"
     | "spawn_final_review"
+    /**
+     * One extra independent review of the exact approved head, on a provider
+     * the job's own reviewer did not use. It stands in for the owner's look at
+     * a change that argued with its review, and never for their approval.
+     */
+    | "spawn_consensus_review"
     | "issue_approval"
     | "revoke_approvals"
     | "merge_pr"
@@ -563,6 +569,10 @@ export type JobEvent =
   | { type: "DOCS_IDLE" }
   | { type: "APPROVAL_ACCEPTED"; headSha: string }
   | { type: "APPROVAL_STALE"; headSha?: string }
+  /** Start the one consensus pass this head is allowed. */
+  | { type: "CONSENSUS_REQUIRED"; headSha: string }
+  /** That pass produced durable evidence; decide the approval again. */
+  | { type: "CONSENSUS_SETTLED"; headSha: string }
   | { type: "MERGE_SUCCEEDED"; message: string; mergeCommitSha: string; mergedAt: string; baseContentVerified: boolean }
   | { type: "MERGE_FAILED"; reason?: string }
   | { type: "DEPLOY_SUCCEEDED"; summary: string }

@@ -25,10 +25,11 @@ import {
   type NativeAdapterTransitionEnvelope,
 } from "../capabilities/native-adapters";
 import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
-import type { PipelineStage } from "../domain/stage-execution";
+import { resolveConsensusExecution, type PipelineStage } from "../domain/stage-execution";
+import { assessConsensusReview, type ReviewLens } from "../domain/review-lenses";
 import { jobStageExecution } from "../domain/stage-routing";
 import { ApprovalService } from "./approval-service";
-import { decideAutoApproval, resolveMergeGrant } from "./merge-authority";
+import { decideAutoApproval, resolveMergeGrant, type ConsensusEvidence } from "./merge-authority";
 import { buildWorkOrder, type CapabilityWorkOrderEnvelope } from "../bb/handoffs";
 import { buildPlanArtifact } from "../bb/pipeline-handoffs";
 import { environmentDiffText, type BbAttempt, type EnvironmentSnapshot, type PipelineThreadAttempt } from "../bb/runner";
@@ -93,6 +94,7 @@ type BbEffectAdapter = {
   spawnImplementation?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
   spawnReview?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
   spawnFinalReview?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
+  spawnConsensusReview?(job: Job, attempt: BbAttempt): Promise<{ id: string; environmentId?: string | null }>;
   sendRemediation?(job: Job, findings: ReviewFinding[], reasons?: string[]): Promise<void>;
   sendSteering?(threadId: string, text: string): Promise<void>;
   stopWorker?(worker: string | WorkerLiveness): Promise<void>;
@@ -210,6 +212,8 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "spawn_docs": return ["documenting"];
     case "run_final_validation": return ["final_validating"];
     case "spawn_final_review": return ["final_reviewing"];
+    // The job does not move for a consensus pass: it waits exactly where it was.
+    case "spawn_consensus_review": return ["awaiting_merge_approval"];
     case "issue_approval": return ["awaiting_merge_approval"];
     case "revoke_approvals": return [];
     case "merge_pr": return ["merging"];
@@ -239,6 +243,7 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
   "spawn_docs",
   "run_final_validation",
   "spawn_final_review",
+  "spawn_consensus_review",
   "issue_approval",
   "revoke_approvals",
   "merge_pr",
@@ -895,8 +900,14 @@ export class EffectRunner {
     effect: StoredEffect,
     job: Job,
     kind: "implementation" | "review",
-    finalReview = false,
-    reviewLens: "quality" | "risk" = "quality",
+    /**
+     * Which review this is. `consensus` is spawned and titled like a final
+     * review — same role, same skills, same worker contract — but records its
+     * own stage, so it can never be read as a member of a required review
+     * group.
+     */
+    reviewStage: "review" | "final_review" | "consensus" = "review",
+    reviewLens: ReviewLens = "quality",
     reviewAttemptId?: string,
     reviewOrdinal?: number,
     extraTraits: readonly string[] = [],
@@ -916,18 +927,18 @@ export class EffectRunner {
       ordinal: attemptInput.ordinal,
       headSha: attemptInput.headSha,
       reviewLens: kind === "review" ? reviewLens : null,
-      reviewStage: kind === "review" ? (finalReview ? "final_review" : "review") : null,
+      reviewStage: kind === "review" ? reviewStage : null,
       ...this.executorFence(),
     });
     if (!attempt) throw new Error("executor lease was lost before attempt creation");
-    const titleRole = finalReview ? "final-review" : kind;
+    const titleRole = kind === "review" && reviewStage !== "review" ? "final-review" : kind;
     const capabilityStage: WorkerProfileStage = kind === "implementation"
       ? "implementation"
-      : finalReview && job.taskRecipe === "architectural"
-        ? "integrated-review"
-        : job.taskRecipe === "architectural"
+      : job.taskRecipe !== "architectural"
+        ? "review"
+        : reviewStage === "review"
           ? "task-review"
-          : "review";
+          : "integrated-review";
     const capabilityProfile = this.ensureWorkerCapabilityProfile(
       job,
       attempt.id,
@@ -989,7 +1000,10 @@ export class EffectRunner {
           candidateAttempt,
           pipelineAttemptForRunner(plan),
         )
-      : kind === "implementation" ? bb.spawnImplementation : finalReview ? bb.spawnFinalReview : bb.spawnReview;
+      : kind === "implementation" ? bb.spawnImplementation
+      : reviewStage === "consensus" ? bb.spawnConsensusReview
+      : reviewStage === "final_review" ? bb.spawnFinalReview
+      : bb.spawnReview;
     if (!spawn) throw new PermanentEffectError(`BB ${kind} runner is not configured`);
     this.assertFence();
     const created = await this.invokeModelProvider({
@@ -1346,7 +1360,7 @@ export class EffectRunner {
         effect,
         job,
         "review",
-        false,
+        "review",
         lens,
         lens === "quality" ? qualityAttemptId : `attempt:${effect.idempotencyKey}:${lens}`,
         ordinal,
@@ -1396,7 +1410,7 @@ export class EffectRunner {
         effect,
         job,
         "review",
-        true,
+        "final_review",
         lens,
         lens === "quality" ? qualityAttemptId : `attempt:${effect.idempotencyKey}:${lens}`,
         ordinal,
@@ -1428,6 +1442,69 @@ export class EffectRunner {
       threadId: created[0].threadId,
       ...this.executorFence(),
     })) throw new Error("executor lease was lost before final review-thread registration");
+  }
+
+  /**
+   * One extra review of the exact approved head, on a provider the job's own
+   * reviewer did not use. It runs while the job waits in
+   * `awaiting_merge_approval`: the job does not move, no approval exists yet,
+   * and the pass produces ordinary durable review evidence. When it settles,
+   * the approval decision is simply made again.
+   */
+  private async spawnConsensusReview(effect: StoredEffect, job: Job): Promise<void> {
+    if (job.state !== "awaiting_merge_approval" || !job.policy) return;
+    const headSha = textPayload(effect, "headSha");
+    // A head that moved under the pass makes it evidence about the wrong code.
+    if (job.prHeadSha !== headSha) return;
+    const capabilityTraits = await this.reviewCapabilityTraits(effect, job);
+    await this.adoptOrSpawn(
+      effect,
+      job,
+      "review",
+      "consensus",
+      "consensus",
+      `attempt:${effect.idempotencyKey}`,
+      this.dependencies.store.getAttempt(`attempt:${effect.idempotencyKey}`)?.ordinal
+        ?? this.dependencies.store.nextAttemptOrdinal(job.id, "review"),
+      [...capabilityTraits, "consensus-lens"],
+    );
+    // Deliberately no REVIEW_STARTED and no review-thread registration: this is
+    // not a review group, and the job's review thread still belongs to the
+    // final review that already passed.
+  }
+
+  /**
+   * What the durable evidence says about this head's consensus pass, and
+   * whether one could run at all.
+   */
+  private consensusEvidence(job: Job): ConsensusEvidence {
+    const headSha = job.prHeadSha;
+    if (!headSha || !job.policy) return { requested: false, assessment: "pending", routeAvailable: false };
+    const requested = this.dependencies.store.listEffectsForJob(job.id)
+      .some((stored) => stored.kind === "spawn_consensus_review" && stored.payload.headSha === headSha);
+    const attempt = this.dependencies.store.getConsensusReviewAttempt(job.id, headSha);
+    return {
+      requested,
+      assessment: attempt === null && !requested ? "pending" : assessConsensusReview(attempt, headSha),
+      routeAvailable: this.consensusExecution(job) !== null,
+    };
+  }
+
+  /**
+   * The route a consensus pass would run on, or null when there is no
+   * independent one. An `active`-routing job has none by definition: the
+   * capability router owns its model tuple, so a pass here could not be
+   * guaranteed to run anywhere other than where the review already did.
+   */
+  private consensusExecution(job: Job) {
+    if (!job.policy || job.routingMode === "active") return null;
+    return resolveConsensusExecution({
+      ...(job.policy.stageExecution === undefined ? {} : { stageExecution: job.policy.stageExecution }),
+      legacy: { implementation: job.policy.implementation, review: job.policy.review },
+      ...(job.policy.autonomy?.consensusReview === undefined
+        ? {}
+        : { consensusReview: job.policy.autonomy.consensusReview }),
+    });
   }
 
   private enqueueStatus(job: Job, extra: Record<string, unknown> = {}): void {
@@ -1804,7 +1881,21 @@ export class EffectRunner {
       grant: evidence?.grant ?? null,
       revokedAt: evidence?.revokedAt ?? null,
       policyStoredAt: evidence?.policyStoredAt ?? null,
+      consensus: this.consensusEvidence(job),
     });
+    // The consensus pass is running, or is about to. Neither branch approves
+    // anything and neither asks the owner: the decision is made again once the
+    // pass produces durable evidence for this exact head.
+    if (decision.outcome === "await_consensus") return;
+    if (decision.outcome === "start_consensus") {
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
+      this.applyEvent(current.id, current.version, {
+        type: "CONSENSUS_REQUIRED",
+        headSha: job.prHeadSha,
+      });
+      return;
+    }
     if (decision.outcome === "auto_approve" && job.projectId !== null) {
       // Re-read before transitioning: the job may have drifted since this
       // effect was dispatched, and merging a head the owner has since
@@ -2232,6 +2323,9 @@ export class EffectRunner {
         return;
       case "spawn_final_review":
         await this.spawnFinalReview(effect, job);
+        return;
+      case "spawn_consensus_review":
+        await this.spawnConsensusReview(effect, job);
         return;
       case "issue_approval":
         this.issueApproval(job);

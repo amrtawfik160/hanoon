@@ -26,6 +26,7 @@ import { assertSharedTrunkAncestry } from "./worktree-ancestry";
 import type { ModelRoute } from "../capabilities/models";
 import { jobStageExecution } from "../domain/stage-routing";
 import {
+  resolveConsensusExecution,
   stageExecutionSpawnArgs,
   type PipelineStage,
   type StageTokenUsage,
@@ -60,7 +61,7 @@ export type BbAttempt = {
   threadId?: string | null;
   handoffPath?: string | null;
   handoffSha256?: string | null;
-  reviewLens?: "quality" | "risk" | null;
+  reviewLens?: "quality" | "risk" | "consensus" | null;
   capabilityProfile?: CapabilityWorkOrderEnvelope;
 };
 
@@ -105,6 +106,26 @@ function stageExecutionArgs(
   capabilityRoute?: ModelRoute,
 ): Record<string, unknown> {
   return stageExecutionSpawnArgs(jobStageExecution({ job, policy, stage, attemptOrdinal, capabilityRoute }));
+}
+
+/**
+ * A consensus pass never escalates, never inherits the review stage's route,
+ * and never takes the capability router's model: its whole value is being a
+ * different reader of the same code. The executor resolves the same route
+ * before it decides a pass is possible, so an unresolvable one here means the
+ * two disagreed and the spawn must fail rather than quietly re-review on the
+ * model that already approved this change.
+ */
+function consensusExecutionArgs(policy: ProjectPolicy): Record<string, unknown> {
+  const execution = resolveConsensusExecution({
+    ...(policy.stageExecution === undefined ? {} : { stageExecution: policy.stageExecution }),
+    legacy: { implementation: policy.implementation, review: policy.review },
+    ...(policy.autonomy?.consensusReview === undefined
+      ? {}
+      : { consensusReview: policy.autonomy.consensusReview }),
+  });
+  if (execution === null) throw new Error("Consensus review has no independent route to run on");
+  return stageExecutionSpawnArgs(execution);
 }
 
 function workerExecutionArgs(
@@ -501,10 +522,20 @@ export class BbRunner {
     return this.spawnReviewRole(job, attempt, "final-review");
   }
 
+  /**
+   * The second opinion on an already-passed change. Same worker contract as a
+   * final review, on a route the job's own reviewer did not use: running it on
+   * the same model would agree with itself and prove nothing.
+   */
+  public async spawnConsensusReview(job: Job, attempt: BbAttempt): Promise<ThreadResult> {
+    return this.spawnReviewRole(job, attempt, "final-review", true);
+  }
+
   private async spawnReviewRole(
     job: Job,
     attempt: BbAttempt,
     role: "review" | "final-review",
+    consensus = false,
   ): Promise<ThreadResult> {
     const policy = selectedPolicy(job);
     const environmentId = requireEnvironmentId(job);
@@ -542,7 +573,7 @@ export class BbRunner {
         uploaded,
       ],
       environment: { type: "reuse", environmentId },
-      ...workerExecutionArgs(job, attempt, policy, "review"),
+      ...(consensus ? consensusExecutionArgs(policy) : workerExecutionArgs(job, attempt, policy, "review")),
     });
     const thread = await this.sdk.threads.spawn(request);
     attempt.threadId = thread.id;

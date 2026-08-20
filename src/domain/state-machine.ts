@@ -752,6 +752,28 @@ function transitionAwaitingMergeApproval(job: Job, event: JobEvent, effects: Job
     invalidateDriftedHead(job, effects);
     return;
   }
+  // The consensus pass runs while the job waits here. Neither event moves the
+  // job: one asks for a second opinion on this exact head, the other says that
+  // opinion is durable and the approval decision can be made again. The
+  // approval itself is still `issue_approval`'s to make, on the same rules.
+  if (event.type === "CONSENSUS_REQUIRED") {
+    assertHeadSha(event.headSha);
+    if (!headMatches(job, event.headSha)) {
+      invalidateDriftedHead(job, effects);
+      return;
+    }
+    emitEffect(job, effects, "spawn_consensus_review", { headSha: event.headSha });
+    return;
+  }
+  if (event.type === "CONSENSUS_SETTLED") {
+    assertHeadSha(event.headSha);
+    if (!headMatches(job, event.headSha)) {
+      invalidateDriftedHead(job, effects);
+      return;
+    }
+    emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
+    return;
+  }
   illegal(job, event);
 }
 

@@ -2246,6 +2246,45 @@ CREATE UNIQUE INDEX controller_voice_inbox_ordinal
   ON controller_voice_inbox(controller_key, ordinal);
 `] as const;
 
+/**
+ * A consensus pass is an ordinary review attempt with its own lens and its own
+ * stage, so it is bound to an exact head and survives restart on the same
+ * durable evidence as every other lens. It is a separate stage rather than a
+ * third lens inside `final_review` precisely so it can never be mistaken for a
+ * member of a required review group.
+ */
+export const CONSENSUS_REVIEW_MIGRATIONS = [String.raw`
+ALTER TABLE attempts RENAME TO attempts_before_consensus_lens;
+CREATE TABLE attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('implementation', 'review', 'validation')),
+  review_lens TEXT CHECK (review_lens IS NULL OR review_lens IN ('quality', 'risk', 'consensus')),
+  review_stage TEXT CHECK (review_stage IS NULL OR review_stage IN ('review', 'final_review', 'consensus')),
+  ordinal INTEGER NOT NULL,
+  thread_id TEXT,
+  head_sha TEXT,
+  handoff_path TEXT,
+  handoff_sha256 TEXT,
+  result_json TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER
+);
+INSERT INTO attempts (
+  id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha,
+  handoff_path, handoff_sha256, result_json, created_at, completed_at
+) SELECT
+  id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha,
+  handoff_path, handoff_sha256, result_json, created_at, completed_at
+FROM attempts_before_consensus_lens;
+DROP TABLE attempts_before_consensus_lens;
+CREATE UNIQUE INDEX attempts_non_review_ordinal
+  ON attempts(job_id, kind, ordinal) WHERE kind <> 'review';
+CREATE UNIQUE INDEX attempts_review_lens
+  ON attempts(job_id, review_stage, ordinal, review_lens)
+  WHERE kind = 'review' AND review_lens IS NOT NULL AND review_stage IS NOT NULL;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2317,4 +2356,5 @@ export const ALL_MIGRATIONS = [
   ...REFERENCE_DOCUMENT_REPAIR_MIGRATIONS,
   ...PROJECT_ADMISSION_CLEAR_HISTORY_MIGRATIONS,
   ...CONTROLLER_VOICE_INBOX_MIGRATIONS,
+  ...CONSENSUS_REVIEW_MIGRATIONS,
 ] as const;

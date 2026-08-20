@@ -464,6 +464,55 @@ export function resolveStageExecution(input: ResolveStageExecutionInput): Resolv
   });
 }
 
+/**
+ * The route one consensus review pass runs on, or null when there is no
+ * independent second opinion to be had.
+ *
+ * A consensus pass exists to disagree with the job's own reviewer if it can, so
+ * it must not run on that reviewer's provider. The project may pin the route;
+ * otherwise it is the strong route of a provider the review stage did not use.
+ * Null is a real answer, and its caller asks the owner instead of re-reviewing
+ * on the same model and calling that a second opinion.
+ */
+export function resolveConsensusExecution(input: Readonly<{
+  stageExecution?: StageExecutionPolicy;
+  legacy?: LegacyProfiles;
+  consensusReview?: Readonly<{
+    providerId: string;
+    model: string;
+    reasoningLevel?: ReasoningLevel;
+    serviceTier?: StageServiceTier;
+    permissionMode?: StagePermissionMode;
+  }>;
+}>): ResolvedStageExecution | null {
+  const review = resolveStageExecution({
+    stage: "review",
+    ...(input.stageExecution === undefined ? {} : { stageExecution: input.stageExecution }),
+    ...(input.legacy === undefined ? {} : { legacy: input.legacy }),
+  });
+  const pinned = input.consensusReview;
+  const route = pinned === undefined ? alternateStrongRoute(review.providerId) : pinned;
+  if (route === null) return null;
+  const entry = stageModelEntry(route.model);
+  const requestedServiceTier = pinned?.serviceTier ?? "default";
+  return Object.freeze({
+    stage: "review" as const,
+    baseTier: "strong" as const,
+    tier: "strong" as const,
+    escalationSteps: 0,
+    // A second opinion is one pass at full strength. There is no ladder to
+    // climb: a consensus pass that needed a retry falls back to the owner.
+    maxEscalations: 0,
+    modelPinned: true,
+    providerId: route.providerId,
+    model: route.model,
+    reasoningLevel: pinned?.reasoningLevel ?? STAGE_TIER_ROUTES.strong.reasoningLevel,
+    serviceTier: entry?.supportsServiceTier === false ? "default" : requestedServiceTier,
+    permissionMode: pinned?.permissionMode ?? review.permissionMode,
+    source: pinned === undefined ? "default" as const : "stage-policy" as const,
+  });
+}
+
 function stripUndefined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
 }

@@ -669,8 +669,8 @@ export type AttemptRecord = {
   id: string;
   jobId: string;
   kind: "implementation" | "review" | "validation";
-  reviewLens: "quality" | "risk" | null;
-  reviewStage: "review" | "final_review" | null;
+  reviewLens: "quality" | "risk" | "consensus" | null;
+  reviewStage: "review" | "final_review" | "consensus" | null;
   ordinal: number;
   threadId: string | null;
   headSha: string | null;
@@ -3612,6 +3612,7 @@ export interface TelegramAgentStore {
   getAttemptByThreadId(threadId: string): AttemptRecord | null;
   nextAttemptOrdinal(jobId: string, kind: AttemptRecord["kind"]): number;
   listReviewAttempts(jobId: string, reviewStage: NonNullable<AttemptRecord["reviewStage"]>, ordinal: number): AttemptRecord[];
+  getConsensusReviewAttempt(jobId: string, headSha: string): AttemptRecord | null;
   createAttempt(input: {
     id: string;
     jobId: string;
@@ -11882,12 +11883,35 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return row.max_ordinal + 1;
   }
 
+  /**
+   * The consensus pass this job holds for one exact head, if it has one.
+   *
+   * Nothing about a consensus pass lives in memory: this row is what says
+   * whether one was ever spawned for this head and what it decided, so a
+   * restart mid-pass resumes it rather than starting a second one.
+   */
+  public getConsensusReviewAttempt(jobId: string, headSha: string): AttemptRecord | null {
+    if (!jobId) throw new TypeError("consensus attempt query is invalid");
+    assertFullSha(headSha, "headSha");
+    const row = this.db.prepare(
+      `SELECT id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha,
+              handoff_path, handoff_sha256, result_json, completed_at
+         FROM attempts
+        WHERE job_id = ? AND kind = 'review' AND review_stage = 'consensus'
+          AND review_lens = 'consensus' AND head_sha = ?
+        ORDER BY ordinal DESC, id
+        LIMIT 1`,
+    ).get(jobId, headSha) as Parameters<typeof parseAttempt>[0] | undefined;
+    return row ? parseAttempt(row) : null;
+  }
+
   public listReviewAttempts(
     jobId: string,
     reviewStage: NonNullable<AttemptRecord["reviewStage"]>,
     ordinal: number,
   ): AttemptRecord[] {
-    if (!jobId || !["review", "final_review"].includes(reviewStage) || !Number.isInteger(ordinal) || ordinal < 1) {
+    if (!jobId || !["review", "final_review", "consensus"].includes(reviewStage) ||
+      !Number.isInteger(ordinal) || ordinal < 1) {
       throw new TypeError("review attempt query is invalid");
     }
     const rows = this.db.prepare(

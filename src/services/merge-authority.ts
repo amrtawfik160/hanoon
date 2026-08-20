@@ -20,7 +20,25 @@ export type MergeAuthorityGrant = Readonly<{
 
 export type AutoApprovalDecision =
   | Readonly<{ outcome: "auto_approve" }>
-  | Readonly<{ outcome: "ask_owner"; reason: string }>;
+  | Readonly<{ outcome: "ask_owner"; reason: string }>
+  /** Spawn the one consensus pass this head is allowed, then decide again. */
+  | Readonly<{ outcome: "start_consensus" }>
+  /** That pass is already running. Nothing is asked and nothing is approved. */
+  | Readonly<{ outcome: "await_consensus" }>;
+
+/**
+ * What the durable review evidence says about this head's consensus pass.
+ * Supplied by the caller for the same reason the grant is: the rule stays a
+ * pure function of what is already stored.
+ */
+export type ConsensusEvidence = Readonly<{
+  /** A pass has already been asked for on this exact head. */
+  requested: boolean;
+  /** `pending` covers both "not spawned yet" and "spawned, still working". */
+  assessment: "pending" | "pass" | "not_pass";
+  /** Whether an independent route exists at all for this project. */
+  routeAvailable: boolean;
+}>;
 
 /**
  * Where a live grant came from. The owner should always be able to tell the two
@@ -103,6 +121,11 @@ export function decideAutoApproval(input: {
   revokedAt?: number | null;
   /** When this project's current policy snapshot was stored. */
   policyStoredAt?: number | null;
+  /**
+   * The consensus pass for this exact head. Absent means none is available,
+   * which reads the same as no independent route: the owner is asked.
+   */
+  consensus?: ConsensusEvidence;
 }): AutoApprovalDecision {
   const { job, grant } = input;
   const live = resolveMergeGrant({
@@ -131,10 +154,37 @@ export function decideAutoApproval(input: {
     return { outcome: "ask_owner", reason: "the project has no production configuration" };
   }
   if (job.reviewCycle >= REMEDIATION_ASK_THRESHOLD) {
-    return {
-      outcome: "ask_owner",
-      reason: `the change needed ${job.reviewCycle} rounds of review fixes`,
-    };
+    return decideRemediatedChange(job, input.consensus);
   }
   return { outcome: "auto_approve" };
+}
+
+/**
+ * A change that argued with its own review twice is the shape a standing grant
+ * should not simply wave through. The owner's look is what it needed; a second
+ * independent review of the exact same head is what stands in for that look.
+ *
+ * It only stands in when it is unambiguous. A pass with no findings at all
+ * approves; findings, a failure, a drifted head, or no independent route to run
+ * it on all end where this used to: asking the owner.
+ */
+function decideRemediatedChange(
+  job: AuthorityJob,
+  consensus: ConsensusEvidence | undefined,
+): AutoApprovalDecision {
+  const asked: AutoApprovalDecision = {
+    outcome: "ask_owner",
+    reason: `the change needed ${job.reviewCycle} rounds of review fixes`,
+  };
+  if (!consensus?.routeAvailable) return asked;
+  if (consensus.assessment === "pass") return { outcome: "auto_approve" };
+  if (consensus.assessment === "not_pass") {
+    return {
+      outcome: "ask_owner",
+      reason: `the change needed ${job.reviewCycle} rounds of review fixes and a second review did not clear it`,
+    };
+  }
+  // At most one pass per head: once asked for, the answer is waited for rather
+  // than asked for again.
+  return consensus.requested ? { outcome: "await_consensus" } : { outcome: "start_consensus" };
 }
