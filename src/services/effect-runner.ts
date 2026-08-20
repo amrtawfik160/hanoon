@@ -1940,15 +1940,22 @@ export class EffectRunner {
    * exactly the situation the brake exists for. It is left without a
    * fingerprint on purpose, so the agent cannot lift it for itself — a broken
    * production that could not be rolled back is the owner's call.
+   *
+   * It lands over a brake that is already on, too. An ordinary failure-loop
+   * pause carries a fingerprint, and a fingerprint is the agent's own way out;
+   * a project already stopped for something smaller must not end up easier to
+   * restart than one that was running. The result is checked rather than
+   * assumed: a brake that silently did not land is the whole failure this
+   * guards against.
    */
   private withdrawUnattendedDelivery(projectId: string, reason: string): void {
     this.dependencies.store.revokeMergeAuthority({ projectId, reason, now: this.now() });
-    this.dependencies.store.pauseProjectAdmission({
+    const braked = this.dependencies.store.escalateProjectAdmissionPause({
       projectId,
       reason,
-      fingerprint: null,
       now: this.now(),
     });
+    if (!braked) throw new Error("the production incident brake did not land on this project");
   }
 
   private applyProductionResult(job: Job, phase: ProductionPhase, result: ProductionStageSnapshot): void {

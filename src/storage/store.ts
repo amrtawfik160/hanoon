@@ -3454,6 +3454,16 @@ export interface TelegramAgentStore {
     fingerprint: string | null;
     now: number;
   }): boolean;
+  /**
+   * Brakes a project for a cause only the owner may lift, whatever was already
+   * holding it. Returns whether the project is braked without a fingerprint
+   * afterwards, which is the property the caller actually needs.
+   */
+  escalateProjectAdmissionPause(input: {
+    projectId: string;
+    reason: string;
+    now: number;
+  }): boolean;
   listPausedProjectAdmissions(): { projectId: string; reason: string; pausedAt: number }[];
   clearProjectAdmissionPauseAsAgent(
     input: { projectId: string } & ControllerMutationFence,
@@ -9652,6 +9662,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     })();
   }
 
+  /**
+   * Brakes a project for one cause, and leaves a brake that is already on
+   * alone.
+   *
+   * A live pause is a decision already made about this project, and a later
+   * cause must not quietly rewrite it — least of all replace a fingerprint-less
+   * pause, which only the owner may lift, with a fingerprinted one the agent
+   * may. A cause that genuinely outranks what is holding the project uses
+   * `escalateProjectAdmissionPause` and says so.
+   */
   public pauseProjectAdmission(input: {
     projectId: string;
     reason: string;
@@ -9671,6 +9691,54 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
          cleared_at = NULL
        WHERE project_admission_pauses.cleared_at IS NOT NULL`,
     ).run(input.projectId, reason, input.fingerprint, input.now).changes === 1;
+  }
+
+  /**
+   * Brakes a project for a cause only the owner may lift, over the top of
+   * whatever was already holding it.
+   *
+   * A production that broke and could not be rolled back outranks every
+   * ordinary pause. An ordinary pause carries a failure fingerprint, and a
+   * fingerprint is exactly what lets the agent lift a brake for itself once —
+   * so leaving the earlier row in place would hand the agent a way out of the
+   * one situation the owner must see. The fingerprint is therefore cleared and
+   * the reason replaced with the incident, so the operator reads why the
+   * project is really stopped.
+   *
+   * `paused_at` is deliberately left as it was when a brake is already on: the
+   * project has not admitted work since that moment, and only the cause has
+   * changed. The clear history is append-only and untouched here, so an earlier
+   * fingerprint's one agent-clear allowance is neither spent nor granted.
+   */
+  public escalateProjectAdmissionPause(input: {
+    projectId: string;
+    reason: string;
+    now: number;
+  }): boolean {
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertNonNegativeInteger(input.now, "now");
+    const reason = assertMemoryText(input.reason, 200, "pause reason");
+    return this.db.transaction((): boolean => {
+      this.db.prepare(
+        `INSERT INTO project_admission_pauses (project_id, reason, fingerprint, paused_at, cleared_at)
+         VALUES (?, ?, NULL, ?, NULL)
+         ON CONFLICT(project_id) DO UPDATE SET
+           reason = excluded.reason,
+           fingerprint = NULL,
+           paused_at = CASE
+             WHEN project_admission_pauses.cleared_at IS NULL THEN project_admission_pauses.paused_at
+             ELSE excluded.paused_at
+           END,
+           cleared_at = NULL`,
+      ).run(input.projectId, reason, input.now);
+      // Read back rather than trust the write: the caller is asking whether
+      // this project is now stopped in a way it cannot restart itself, and that
+      // is a fact about the row, not about the statement.
+      const live = this.db.prepare(
+        "SELECT fingerprint FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
+      ).get(input.projectId) as { fingerprint: string | null } | undefined;
+      return live !== undefined && live.fingerprint === null;
+    }).immediate();
   }
 
   public listPausedProjectAdmissions(): { projectId: string; reason: string; pausedAt: number }[] {

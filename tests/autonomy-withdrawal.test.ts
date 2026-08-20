@@ -188,6 +188,35 @@ it("leaves both grants and admission alone when the rollback recovered productio
   expect(store.listPausedProjectAdmissions()).toEqual([]);
 });
 
+it("takes over a brake the project was already under, rather than leaving it as it was", async () => {
+  // The failure-loop brake carries a fingerprint, which is what lets the agent
+  // lift it once after investigating. A job admitted before that brake can
+  // still reach a deploy, and if that deploy fails with no way back, the
+  // project must not be left holding the easier of the two brakes.
+  const { store, db } = storeFixture();
+  const policy = unattendedPolicy();
+  store.upsertProjectPolicy(policy, 1_000);
+  expect(store.pauseProjectAdmission({
+    projectId: PROJECT,
+    reason: "the same failure repeated 3 times",
+    fingerprint: "f".repeat(64),
+    now: 1_001,
+  })).toBe(true);
+  seedDeployingJob(store, db, policy);
+  seedDeployEffect(db);
+
+  await runFailedDeploy(store, { outcome: "fail" });
+
+  const row = db.prepare(
+    "SELECT reason, fingerprint FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
+  ).get(PROJECT) as { reason: string; fingerprint: string | null } | undefined;
+  expect(row?.fingerprint).toBeNull();
+  expect(row?.reason).toBe("rollback failed after a bad deploy");
+  // And what the operator is shown names the incident, not the older failure.
+  expect(store.listPausedProjectAdmissions().map((pause) => pause.reason))
+    .toEqual(["rollback failed after a bad deploy"]);
+});
+
 it("leaves the brake without a fingerprint, so lifting it is the owner's call", async () => {
   // The agent may clear a fingerprinted cause once after investigating it. A
   // production it could not roll back is not that kind of cause.
