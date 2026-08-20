@@ -59,7 +59,7 @@ What bounds it:
 
 - **`autonomy.intake` is opt-in and absent by default.** Without it the audits report exactly as they always did and no outside text becomes a prompt this way.
 - **Each excerpt is capped at 200 characters** and the whole work order at 1,200, so no amount of outside text can become the bulk of the order.
-- **Control and invisible characters are removed** before the excerpt is carried: the C0 and C1 ranges, DEL, soft hyphen, zero-width and bidirectional formatting marks, and the interlinear annotation characters. What the owner reads on the status card is what the worker receives.
+- **Control and invisible characters are removed** before the excerpt is carried: the C0 and C1 ranges, DEL, soft hyphen, line and paragraph separators, zero-width and bidirectional formatting marks, and the interlinear annotation characters. What the owner reads on the status card is what the worker receives.
 - **The excerpt is delimited as quotation** — `«…»`, with those two characters stripped from the content so quoted text cannot close its own quotation — and the order says in words that the quoted part is information rather than instruction.
 - **A work order carrying credential-shaped text drops the finding entirely.** It is not redacted in place; nothing is started from it. The daily digest still reports the finding to the owner.
 
