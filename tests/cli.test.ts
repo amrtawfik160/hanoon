@@ -65,6 +65,34 @@ function stubProject(harness: { sdk: { stub: (path: string, implementation: (...
   harness.sdk.stub("projects.branches", async () => branchesFixture());
 }
 
+/**
+ * Answers the enable-time branch-protection preflight with a protected base
+ * branch. A policy that declares unattended merging cannot be stored unless
+ * GitHub already requires a status check there; tests/autonomy-preflight.test.ts
+ * owns that boundary, and this only keeps it out of the way here.
+ */
+function stubProtectedBaseBranch(harness: { sdk: { stub: (path: string, implementation: (...args: never[]) => unknown) => void } }) {
+  const outputs = new Map<string, string>();
+  let terminalNumber = 0;
+  harness.sdk.stub("terminals.create", async ({ start }: { start: { command: string } }) => {
+    const id = `cli-terminal-${++terminalNumber}`;
+    const marker = /__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/.exec(start.command)?.[0] ?? "";
+    const body = JSON.stringify({
+      required_status_checks: { strict: true, contexts: ["unit"] },
+      enforce_admins: { enabled: true },
+    });
+    outputs.set(id, `${body}\n${marker}:0\n`);
+    return { id };
+  });
+  harness.sdk.stub("terminals.get", async () => ({ status: "running", exitCode: null }));
+  harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => ({
+    chunks: [{ seq: 0, dataBase64: Buffer.from(outputs.get(terminalId) ?? "", "utf8").toString("base64") }],
+    nextSeq: 1,
+    truncated: false,
+  }));
+  harness.sdk.stub("terminals.close", async () => undefined);
+}
+
 function parseJson(stdout: string): Record<string, unknown> {
   const value: unknown = JSON.parse(stdout);
   expect(value).not.toBeNull();
@@ -645,6 +673,7 @@ it("builds and validates individual policy fields including repeatable controls 
 it("grants unattended merging from a flag only when the project can roll back", async () => {
   const { harness, store } = await loadPlugin();
   stubProject(harness);
+  stubProtectedBaseBranch(harness);
   const productionFlags = [
     "--deploy-json", JSON.stringify({ name: "deploy", command: "npm run deploy", timeoutMs: 60_000 }),
     "--canary-json", JSON.stringify({ name: "health", command: "npm run canary", timeoutMs: 60_000 }),

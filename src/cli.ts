@@ -20,6 +20,12 @@ import {
 import { MAX_REFERENCE_SEARCH_RESULTS } from "./storage/reference-repository";
 import { summariseStageSpend } from "./storage/stage-execution-repository";
 import { TerminalCommandRunner } from "./bb/terminal-command";
+import {
+  branchProtectionRemedy,
+  inspectBranchProtection,
+  terminalProtectionProbe,
+  type BranchProtectionVerdict,
+} from "./bb/github-protection";
 import { projectResourceWait } from "./storage/autonomy-repository";
 import {
   RECIPE_PROMOTION_ORDER,
@@ -81,6 +87,15 @@ type ParsedFlags = {
 type JsonRecord = Record<string, unknown>;
 
 class CliInputError extends Error {}
+
+/**
+ * A command whose arguments parsed but whose world does not permit them. It
+ * shares the argument error's exit code on purpose: from a script's point of
+ * view "you asked for something this repository is not configured for" is the
+ * same class of answer as "that flag does not exist" — the request has to
+ * change, and retrying it unchanged will fail identically.
+ */
+class CliPreconditionError extends CliInputError {}
 
 class CliOperationError extends Error {}
 
@@ -576,6 +591,87 @@ function policyFromObject(
   }
 }
 
+/** The host and checkout a `gh` command for this project can run in. */
+function sourceCommandScope(source: JsonRecord | null): Readonly<{ hostId: string; cwd: string }> | null {
+  const hostId = source?.hostId;
+  const path = source?.path;
+  if (typeof hostId !== "string" || hostId.length === 0) return null;
+  if (typeof path !== "string" || path.length === 0) return null;
+  return { hostId, cwd: path };
+}
+
+/**
+ * What GitHub enforces on this policy's base branch, or `unavailable` when
+ * there is nowhere to ask from. Every caller here treats an unreadable answer
+ * as an unprotected branch, which is the only safe reading: the question being
+ * asked is "will something other than this plugin refuse a bad merge", and
+ * silence is not a yes.
+ */
+async function baseBranchProtection(
+  deps: TelegramAgentCliDependencies,
+  input: Readonly<{
+    repository: string;
+    branch: string;
+    scope: Readonly<{ hostId: string; cwd: string }> | null;
+    signal?: AbortSignal;
+  }>,
+): Promise<BranchProtectionVerdict> {
+  if (input.scope === null) return { outcome: "unavailable" };
+  return inspectBranchProtection({
+    probe: terminalProtectionProbe({
+      run: (command) => deps.terminal.run(command),
+      hostId: input.scope.hostId,
+      cwd: input.scope.cwd,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    }),
+    repository: input.repository,
+    branch: input.branch,
+  });
+}
+
+/** Whether this policy asks to merge on its own authority. */
+function declaresMergeAutonomy(policy: ProjectPolicy): boolean {
+  return policy.autonomy?.unattendedMerge === true || policy.autonomy?.mergeWithoutProduction === true;
+}
+
+/**
+ * Refuses to store a merge grant the repository does not back.
+ *
+ * A standing grant replaces the owner's signature, and the owner is the last
+ * check that is not this plugin's own. Requiring GitHub to hold at least one
+ * required status check keeps a second, independent refusal in the path, so a
+ * bug in this codebase cannot be the only thing standing between a broken
+ * change and the trunk.
+ *
+ * Returns the warnings the operator should see on an accepted enable.
+ */
+async function assertAutonomyPreconditions(
+  deps: TelegramAgentCliDependencies,
+  policy: ProjectPolicy,
+  source: JsonRecord,
+  context: PluginCliContext,
+): Promise<string[]> {
+  if (!declaresMergeAutonomy(policy)) return [];
+  const verdict = await baseBranchProtection(deps, {
+    repository: policy.githubRepository,
+    branch: policy.baseBranch,
+    scope: sourceCommandScope(source),
+    ...(context.signal === undefined ? {} : { signal: context.signal }),
+  });
+  const remedy = branchProtectionRemedy({
+    verdict,
+    repository: policy.githubRepository,
+    branch: policy.baseBranch,
+  });
+  if (verdict.outcome !== "enforced") {
+    throw new CliPreconditionError(remedy ?? "Unattended merging requires a protected base branch");
+  }
+  // Protection exists but does not bind administrators. The merge runs under an
+  // owner-scoped token, so this is a real gap — and it is the repository's to
+  // close, not something this command can fix by refusing.
+  return remedy === null ? [] : [remedy];
+}
+
 async function enableProject(
   deps: TelegramAgentCliDependencies,
   parsed: ParsedFlags,
@@ -646,8 +742,14 @@ async function enableProject(
   const policy = hasIndividual
     ? individualPolicy(parsed, projectId, live.repository)
     : policyFromObject(inputPolicy ?? {}, projectId, live.repository);
+  const warnings = await assertAutonomyPreconditions(deps, policy, live.source, context);
   const stored = deps.store.upsertProjectPolicy(policy, deps.now());
-  return success(policySummary(stored), `Enabled ${stored.policy.alias} (${stored.policy.projectId})`, json);
+  return success(
+    { ...policySummary(stored), warnings },
+    [`Enabled ${stored.policy.alias} (${stored.policy.projectId})`, ...warnings.map((warning) => `Warning: ${warning}`)]
+      .join("\n"),
+    json,
+  );
 }
 
 async function runPair(
@@ -1051,11 +1153,19 @@ function jobCancel(
   return success(output, `Cancellation requested for ${jobId}`, json);
 }
 
+/**
+ * `warn` is for something an operator should know and nothing here can fix — a
+ * repository setting, or an optional safety net a policy left out. It never
+ * changes the exit code, because a doctor that fails on advice trains people to
+ * ignore the rows that mean the project genuinely cannot work.
+ */
 type DoctorCheck = {
   name: string;
-  status: "pass" | "fail" | "disabled";
+  status: "pass" | "warn" | "fail" | "disabled";
   summary: string;
 };
+
+const DOCTOR_SUMMARY_LIMIT = 200;
 
 function addCheck(
   checks: DoctorCheck[],
@@ -1065,6 +1175,14 @@ function addCheck(
   failSummary: string,
 ): void {
   checks.push({ name, status: passed ? "pass" : "fail", summary: passed ? passSummary : failSummary });
+}
+
+function addRow(checks: DoctorCheck[], name: string, status: DoctorCheck["status"], summary: string): void {
+  checks.push({ name, status, summary: summary.slice(0, DOCTOR_SUMMARY_LIMIT) });
+}
+
+function doctorPassed(check: DoctorCheck): boolean {
+  return check.status === "pass" || check.status === "warn" || check.status === "disabled";
 }
 
 /** Bounded, secret-free labels only — never the configured endpoint, cert, or a raw broker error. */
@@ -1098,6 +1216,91 @@ async function addCredentialChecks(deps: TelegramAgentCliDependencies, checks: D
   for (const check of status.readiness.checks) {
     addCheck(checks, CREDENTIAL_CHECK_LABELS[check.check], check.passed, "ready", "not ready");
   }
+}
+
+/**
+ * What an unattended merge on this project is currently resting on.
+ *
+ * Read-only and advisory: nothing here changes a policy or a repository. The
+ * rows exist because every one of these is a thing an operator set up once,
+ * months before the night a merge lands on it without them, and the only honest
+ * moment to notice a missing rollback command is before that night.
+ */
+async function addAutonomyChecks(
+  deps: TelegramAgentCliDependencies,
+  checks: DoctorCheck[],
+  input: Readonly<{
+    policy: ProjectPolicy;
+    repository: string | null;
+    scope: Readonly<{ hostId: string; cwd: string }> | null;
+    signal?: AbortSignal;
+  }>,
+): Promise<void> {
+  const { policy } = input;
+  if (policy.autonomy === undefined) return;
+
+  if (!declaresMergeAutonomy(policy)) {
+    addRow(checks, "autonomy: branch protection", "disabled", "no unattended merge grant");
+  } else if (input.repository === null) {
+    addRow(checks, "autonomy: branch protection", "fail", "the project's GitHub remote could not be read");
+  } else {
+    const verdict = await baseBranchProtection(deps, {
+      repository: input.repository,
+      branch: policy.baseBranch,
+      scope: input.scope,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    });
+    const branch = policy.baseBranch.slice(0, 60);
+    if (verdict.outcome === "unavailable") {
+      addRow(checks, "autonomy: branch protection", "fail", `no readable protection or ruleset on ${branch}`);
+    } else if (verdict.outcome === "no_required_checks") {
+      addRow(checks, "autonomy: branch protection", "fail", `no required status check on ${branch}`);
+    } else {
+      const found = `${verdict.requiredChecks} required check(s) via ${verdict.source}`;
+      addRow(
+        checks,
+        "autonomy: branch protection",
+        verdict.adminEnforced ? "pass" : "warn",
+        verdict.adminEnforced ? found : `${found}; admin enforcement is off`,
+      );
+    }
+  }
+
+  addRow(
+    checks,
+    "autonomy: required checks",
+    policy.requiredChecks.length > 0 ? "pass" : "warn",
+    policy.requiredChecks.length > 0 ? `${policy.requiredChecks.length} configured` : "none configured",
+  );
+
+  // A project that deploys is a project an unattended merge can break, and the
+  // rollback is the only thing that turns that into a recovery. The policy
+  // schema already refuses this combination, so a failing row here means a
+  // stored policy predates that rule or was written around it.
+  if (policy.autonomy.unattendedMerge && policy.production !== undefined) {
+    const rollback = policy.production.rollbackCommand !== undefined;
+    addRow(
+      checks,
+      "autonomy: rollback command",
+      rollback ? "pass" : "fail",
+      rollback ? "configured" : "missing; an unattended merge would have no way back",
+    );
+    const health = policy.production.healthCommands?.length ?? 0;
+    addRow(
+      checks,
+      "autonomy: production health checks",
+      health > 0 ? "pass" : "warn",
+      health > 0 ? `${health} configured` : "none configured; a crash between deploys is not noticed",
+    );
+  }
+
+  const regression = policy.regression?.commands.length ?? 0;
+  addRow(
+    checks,
+    "autonomy: regression checks",
+    regression > 0 ? "pass" : "warn",
+    regression > 0 ? `${regression} configured` : "none configured; nothing checks this project between jobs",
+  );
 }
 
 async function doctor(
@@ -1141,9 +1344,7 @@ async function doctor(
       checks.map((check) => `${check.name}: ${check.status} (${check.summary})`).join("\n"),
       json,
     );
-    return checks.every((check) => check.status === "pass" || check.status === "disabled")
-      ? output
-      : { ...output, exitCode: 1 };
+    return checks.every(doctorPassed) ? output : { ...output, exitCode: 1 };
   }
 
   const policyRecord = deps.store.getProjectPolicy(projectId);
@@ -1256,14 +1457,21 @@ async function doctor(
     "available",
     "unavailable",
   );
+  if (policyRecord) {
+    await addAutonomyChecks(deps, checks, {
+      policy: policyRecord.policy,
+      repository,
+      scope: terminalScope === null ? null : { hostId: terminalScope.hostId, cwd: terminalScope.cwd },
+      ...(context.signal === undefined ? {} : { signal: context.signal }),
+    });
+  }
 
-  const allPassed = checks.every((check) => check.status === "pass");
   const output = success(
     { checks },
     checks.map((check) => `${check.name}: ${check.status} (${check.summary})`).join("\n"),
     json,
   );
-  return allPassed ? output : { ...output, exitCode: 1 };
+  return checks.every(doctorPassed) ? output : { ...output, exitCode: 1 };
 }
 
 async function runProject(
