@@ -423,9 +423,9 @@ configures how a lifted one behaves, and each carries its own preconditions.
 
 | Field | Contract |
 | --- | --- |
-| `autonomy.unattendedMerge` | `true` merges this project without asking, on the same terms as the button-granted standing approval. Requires `production.rollbackCommand` when production is configured, and a protected base branch. See [A grant the project policy carries](#a-grant-the-project-policy-carries). |
+| `autonomy.unattendedMerge` | `true` merges this project without asking, on the same terms as the button-granted standing approval. It is also what lets the project revert a merge that broke production and lets the continuation sweep re-enter a merge or production stage on its own. Requires `production.rollbackCommand` when production is configured, and a protected base branch. See [A grant the project policy carries](#a-grant-the-project-policy-carries). |
 | `autonomy.mergeWithoutProduction` | `true` lets a project with no production settings merge instead of stopping at the reviewed pull request. Requires a non-empty `requiredChecks`, a configured `regression` policy, and a protected base branch. See [Merging a project that deploys nothing](#merging-a-project-that-deploys-nothing). |
-| `autonomy.consensusReview` | Optional `providerId` and `model` (plus optional `reasoningLevel`, `serviceTier`, `permissionMode`) for the second-opinion review pass. Validated against the same model catalog as `stageExecution`. See [The second opinion](#the-second-opinion-on-a-change-that-argued-with-its-review). |
+| `autonomy.consensusReview` | Optional `providerId` and `model` (plus optional `reasoningLevel`, `serviceTier`, `permissionMode`) for the second-opinion review pass. Validated against the same model catalog as `stageExecution`, and refused outright when its provider is the one the review stage itself runs on. See [The second opinion](#the-second-opinion-on-a-change-that-argued-with-its-review). |
 | `autonomy.intake` | Optional. When present, this project's daily audit may start work rather than only report it. `maxJobsPerDay` is a whole number from 1 to 4. See [Work the daily audit starts](#work-the-daily-audit-starts). |
 
 Unknown fields are rejected outright. The preconditions below are checked before
@@ -437,6 +437,7 @@ the policy is stored, not at the merge they would have governed.
 | --- | --- | --- |
 | `production.rollbackCommand` | `autonomy.unattendedMerge` and a configured `production` | Policy schema, at `project enable` and at load |
 | Non-empty `requiredChecks` **and** a `regression` policy | `autonomy.mergeWithoutProduction` | Policy schema, at `project enable` and at load |
+| A `consensusReview` provider the review stage does not use | `autonomy.consensusReview` | Policy schema, at `project enable` and at load |
 | GitHub branch protection or a ruleset requiring at least one status check on `baseBranch` | either merge field | A live GitHub check at `project enable`; reported again by the project doctor |
 
 The reasoning behind each is in the section it belongs to. The third one is not
@@ -549,10 +550,13 @@ underneath it, or no independent route to run it on all fall back to asking the
 owner. At most one pass runs per head, and it survives a restart on the same
 durable review evidence as every other review.
 
-`autonomy.consensusReview` pins the route, and is used exactly as written: pin a
-provider the review stage does not use, because pinning the reviewer's own
-provider removes the independence the pass exists for. Left out, the pass runs
-on the strong route of whichever provider the review stage did not use.
+`autonomy.consensusReview` pins the route. It must name a provider the review
+stage does not use, and a policy that pins the reviewer's own provider is
+refused when the policy is parsed — at `project enable` and at load — with an
+error naming both providers. Independence is what this pass is trusted for, so
+it is an enforced property of the policy rather than advice about how to write
+one. Left out, the pass runs on the strong route of whichever provider the
+review stage did not use.
 
 One case has no second opinion available at all: a job running under `active`
 capability model routing, where the capability router owns the model tuple and
@@ -565,17 +569,27 @@ adaptive recipes start in `shadow`.
 A rollback command puts production back on the last good build. It does not take
 the bad merge off the trunk, so the next deploy ships it again.
 
-When `healthCommands` declare a fault, and the last thing merged on that project
-was merged unattended within the last 48 hours, one revert job starts by itself:
-revert that exact commit, through validation, review, and the same merge rule as
-any other change. Nothing is pushed outside the pipeline, and one merge commit
-gets at most one automatic revert, ever.
+This needs `autonomy.unattendedMerge` on the project's current enabled policy.
+Starting a repository change nobody asked for is one of the things that setting
+opts into; a project whose only standing approval is a **Merge + deploy, and
+always from now on** tap keeps reporting the fault and starting nothing.
 
-If the revert cannot start — the failure brake is on, that project already has
-work running, or that commit has already had its revert — the fault is reported
-exactly the way it always was, and the reason no revert started is logged rather
-than messaged. A revert job that fails feeds the failure brake like any other
-failing job.
+With that in place, when `healthCommands` declare a fault and the last thing
+merged on that project was merged unattended within the last 48 hours, one
+revert job starts by itself: revert that exact commit, through validation,
+review, and the same merge rule as any other change. Nothing is pushed outside
+the pipeline, and one merge commit gets at most one automatic revert, ever.
+
+The chain is one deep. When the last merge is itself one an automatic revert
+produced, nothing starts and nothing falls back to the merge before it: undoing
+a revert would put the change that broke production back on the trunk, and a
+revert that did not fix production is a fault you should be reading about.
+
+If the revert cannot start — the project never asked for one, the failure brake
+is on, that project already has work running, that commit has already had its
+revert, or the last merge was a revert — the fault is reported exactly the way
+it always was, and the reason no revert started is logged rather than messaged.
+A revert job that fails feeds the failure brake like any other failing job.
 
 This is not governed by `autonomy.intake` and does not spend its allowance:
 production being down is not a matter of daily budget.

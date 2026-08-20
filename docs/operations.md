@@ -161,11 +161,15 @@ bb telegram-agent job show <job-id> --json
 bb telegram-agent job list --json
 ```
 
-An automatic revert is a `crash_revert` job. Its work order names the exact merge
-commit it is reverting, and one merge commit gets at most one automatic revert
-ever, so a second failure on the same commit produces the ordinary fault report
-rather than another job. Reverts do not spend the `autonomy.intake` allowance;
-`audit_intake` and `self_diagnosis` jobs share it.
+An automatic revert is a `crash_revert` job, and only a project whose current
+enabled policy sets `autonomy.unattendedMerge` starts one. Its work order names
+the exact merge commit it is reverting, and one merge commit gets at most one
+automatic revert ever, so a second failure on the same commit produces the
+ordinary fault report rather than another job. A `crash_revert` job's own merge
+is never reverted automatically either, and no earlier merge is reverted in its
+place: when the last thing merged is a revert, the fault is reported and nothing
+starts. Reverts do not spend the `autonomy.intake` allowance; `audit_intake` and
+`self_diagnosis` jobs share it.
 
 These are ordinary jobs in every other respect. `job retry`, `job cancel`, and
 the approval rules apply to them exactly as they do to work you asked for.
@@ -270,6 +274,9 @@ instead, and stays in force until that project's enabled policy is stored again
 by `bb telegram-agent project enable`. `project disable` stores a snapshot too
 and deliberately does not count. To withdraw it permanently, remove
 `autonomy.unattendedMerge` from the policy file before enabling the project again.
+That setting is also what lets the project revert a merge that broke production
+and lets the continuation sweep re-enter a merge or production stage, so removing
+it stops all three.
 
 **Stop a project starting its own work.** Remove `autonomy.intake` from the
 policy and run `project enable` again. A project the failure brake is holding
@@ -282,7 +289,10 @@ The plugin also withdraws a grant by itself when a deploy or canary fails and th
 rollback was missing or itself failed. Both grant sources stop and the project's
 failure brake trips with no fingerprint, so no new work is admitted there until
 you send `/resume <alias>`. That is deliberate: a production that could not be
-rolled back is not something the agent may clear for itself.
+rolled back is not something the agent may clear for itself. If the project was
+already braked for something else, that brake is taken over rather than left as
+it was — its reason becomes the incident and its fingerprint is dropped, so
+`/resume <alias>` is the only way back either way.
 
 ## Unpair
 
