@@ -35,6 +35,7 @@ const OWNER_GATED_RESUME_STATES: ReadonlySet<Job["state"]> = new Set([
 
 export type ContinuationJob = Pick<
   Job,
+  | "projectId"
   | "state"
   | "blockedReason"
   | "resumeState"
@@ -78,6 +79,12 @@ const UNRECOVERABLE_ESCALATION =
 export function planJobContinuation(input: {
   job: ContinuationJob;
   attempts: number;
+  /**
+   * Whether this job's project may merge without being asked, resolved from the
+   * same durable evidence the approval decision uses. Absent means no, which is
+   * the answer for every project that has not opted in.
+   */
+  hasLiveMergeGrant?: boolean;
 }): ContinuationDecision {
   const { job, attempts } = input;
   if (!Number.isInteger(attempts) || attempts < 0) {
@@ -89,9 +96,14 @@ export function planJobContinuation(input: {
   // here would race their intent and restart work they asked to stop.
   if (job.cancelRequestedAt !== null) return { action: "hold" };
 
-  // A background retry must never replay merge or production authority. Those
-  // stages resume only through the guarded owner-approved pipeline.
-  if (job.resumeState !== null && OWNER_GATED_RESUME_STATES.has(job.resumeState)) {
+  // A background retry must never replay merge or production authority the
+  // owner has not given. Where they have, the sweep may re-enter those stages,
+  // and only by re-firing the same guarded effect the owner's own button fires:
+  // the gates, the receipts, and the auto-approval decision all run again from
+  // scratch. Nothing here can manufacture an approval, so the worst a resume
+  // can do is ask.
+  if (job.resumeState !== null && OWNER_GATED_RESUME_STATES.has(job.resumeState) &&
+    input.hasLiveMergeGrant !== true) {
     return { action: "hold" };
   }
 

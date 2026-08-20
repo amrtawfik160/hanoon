@@ -3,6 +3,7 @@ import { expect, it, vi } from "vitest";
 import { MAX_AUTO_CONTINUES } from "../src/autonomy/job-continuation";
 import { JobContinuationService } from "../src/services/job-continuation-service";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import type { ProjectPolicy } from "../src/domain/models";
 import { policyFixture } from "./helpers";
 
 let fixtureNumber = 0;
@@ -138,6 +139,7 @@ it("stops pushing and tells the owner once the ladder is spent", () => {
       requeueReviewAdmission: (id: string, version: number, now: number) =>
         store.requeueReviewAdmission(id, version, now),
       listEnabledProjectPolicies: () => store.listEnabledProjectPolicies(),
+      getMergeGrantEvidence: (projectId: string) => store.getMergeGrantEvidence(projectId),
       getOwner: () => ({ userId: "7", chatId: "70" }),
       getControllerForOwner: () => ({ controllerKey: "controller_1" }),
       enqueueControllerTurn: (input: { inputText: string }) => { told.push(input.inputText); },
@@ -188,6 +190,7 @@ it("hands over a job the guarded retry will never accept, rather than re-decidin
       retryFailedJob: () => ({ outcome: "unavailable" }),
       requeueReviewAdmission: () => ({ outcome: "unavailable" }),
       listEnabledProjectPolicies: () => store.listEnabledProjectPolicies(),
+      getMergeGrantEvidence: (projectId: string) => store.getMergeGrantEvidence(projectId),
       getOwner: () => ({ userId: "7", chatId: "70" }),
       getControllerForOwner: () => ({ controllerKey: "controller_1" }),
       enqueueControllerTurn: (input: { inputText: string }) => { told.push(input.inputText); },
@@ -315,4 +318,92 @@ it("does not spend another continuation attempt while the same retry is already 
   expect(service.processDue()).toBe(false);
   expect(recordAutoContinue).not.toHaveBeenCalled();
   expect(onWorkAvailable).not.toHaveBeenCalled();
+});
+
+
+/**
+ * A job that died in a merge-authority stage, with the project's durable grant
+ * evidence supplied exactly as the store would return it.
+ */
+function mergeStageSweep(input: {
+  policy: ProjectPolicy;
+  evidence: { grant: null; revokedAt: number | null; policyStoredAt: number | null };
+}) {
+  const retryFailedJob = vi.fn(() => ({ outcome: "queued" }));
+  const service = new JobContinuationService({
+    store: {
+      listContinuationCandidates: () => [{
+        job: {
+          id: "job_merge_stage",
+          version: 7,
+          projectId: "proj_1",
+          state: "failed",
+          blockedReason: "permanent_effect_failure",
+          resumeState: "merging",
+          lastError: "the merge effect ran out of retries",
+          prNumber: 4,
+          reviewCycle: 0,
+          implementationThreadId: "thr_impl",
+          cancelRequestedAt: null,
+          policy: input.policy,
+          deliveryMode: "full",
+        },
+        attempts: 0,
+        key: "failed:permanent_effect_failure:merging",
+      }],
+      getMergeGrantEvidence: () => input.evidence,
+      recordAutoContinue: vi.fn(),
+      retryFailedJob,
+      requeueReviewAdmission: () => ({ outcome: "unavailable" }),
+      recordContinuationEscalation: vi.fn(),
+      listEnabledProjectPolicies: () => [],
+      getOwner: () => null,
+      getControllerForOwner: () => null,
+      enqueueControllerTurn: vi.fn(),
+    } as never,
+    clock: { now: () => 3_000_000 },
+    issueUpdateId: (now) => now,
+  });
+  return { service, retryFailedJob };
+}
+
+function unattendedPolicy(): ProjectPolicy {
+  return policyFixture({
+    production: {
+      ...policyFixture().production!,
+      rollbackCommand: { name: "rollback", command: "./rollback.sh", timeoutMs: 60_000 },
+    },
+    autonomy: { unattendedMerge: true, mergeWithoutProduction: false },
+  });
+}
+
+it("re-fires a dead merge effect for a project that merges unattended", () => {
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(true);
+  // The guarded retry, which re-runs the merge effect and every gate behind it.
+  expect(retryFailedJob).toHaveBeenCalledWith("job_merge_stage", 7, 3_000_000);
+});
+
+it("leaves a dead merge effect alone for a project that still asks first", () => {
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: policyFixture(),
+    evidence: { grant: null, revokedAt: null, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
+});
+
+it("leaves a dead merge effect alone once the owner has withdrawn the grant", () => {
+  const { service, retryFailedJob } = mergeStageSweep({
+    policy: unattendedPolicy(),
+    evidence: { grant: null, revokedAt: 2_000, policyStoredAt: 1_000 },
+  });
+
+  expect(service.processDue()).toBe(false);
+  expect(retryFailedJob).not.toHaveBeenCalled();
 });

@@ -3,6 +3,8 @@ import {
   continuationKey,
   planJobContinuation,
 } from "../autonomy/job-continuation";
+import type { Job } from "../domain/models";
+import { resolveMergeGrant } from "./merge-authority";
 import type { TelegramAgentStore } from "../storage/store";
 
 const SCAN_INTERVAL_MS = 5 * 60_000;
@@ -18,6 +20,7 @@ function legacyContinuationKey(job: {
 export type JobContinuationDependencies = {
   store: Pick<
     TelegramAgentStore,
+    | "getMergeGrantEvidence"
     | "listContinuationCandidates"
     | "recordAutoContinue"
     | "recordContinuationEscalation"
@@ -82,7 +85,11 @@ export class JobContinuationService {
       const sameLegacyWall = candidate.key === legacyKey;
       const attempts = candidate.key === key || sameLegacyWall ? candidate.attempts : 0;
       const recordKey = sameLegacyWall ? legacyKey : key;
-      const decision = planJobContinuation({ job, attempts });
+      const decision = planJobContinuation({
+        job,
+        attempts,
+        hasLiveMergeGrant: this.hasLiveMergeGrant(job),
+      });
       if (decision.action === "hold") continue;
       if (decision.action === "escalate") {
         worked = this.escalate(candidate.job, decision.reason, now) || worked;
@@ -91,6 +98,20 @@ export class JobContinuationService {
       worked = this.resume(candidate.job, decision.event, recordKey, now) || worked;
     }
     return worked;
+  }
+
+  /**
+   * Whether this job's project may merge without being asked, read from the
+   * same durable evidence the approval decision uses so the sweep and the
+   * merge cannot disagree about who authorised what.
+   */
+  private hasLiveMergeGrant(job: Pick<Job, "projectId" | "policy">): boolean {
+    if (!job.projectId) return false;
+    return resolveMergeGrant({
+      projectId: job.projectId,
+      policy: job.policy,
+      evidence: this.dependencies.store.getMergeGrantEvidence(job.projectId),
+    }) !== null;
   }
 
   private resume(
