@@ -129,8 +129,9 @@ it("stops at the project's daily allowance however many findings there were", ()
   expect(second).toHaveLength(1);
   finishJob(database, second[0]!.jobId, "merged", NOW + 3);
 
+  // Two distinct jobs and no third: the allowance was spent exactly once each.
   expect(intake.consider(AUDITED, bugResults(3), NOW + 4)).toEqual([]);
-  expect(store.countAuditIntakeJobs(PROJECT, NOW)).toBe(2);
+  expect(new Set([first[0]!.jobId, second[0]!.jobId]).size).toBe(2);
 });
 
 it("gives the allowance back on the next UTC day", () => {
@@ -156,7 +157,10 @@ it("starts nothing while the failure brake holds the project", () => {
   })).toBe(true);
 
   expect(intake.consider(AUDITED, bugResults(1), NOW)).toEqual([]);
-  expect(store.countAuditIntakeJobs(PROJECT, NOW)).toBe(0);
+  // The day's allowance was not spent on the refusal: once the owner lifts the
+  // brake, the finding can still start its work.
+  expect(store.clearProjectAdmissionPause({ projectId: PROJECT, now: NOW + 1 })).toBe(1);
+  expect(intake.consider(AUDITED, bugResults(1), NOW + 2)).toHaveLength(1);
 });
 
 it("starts nothing while the project already has work of its own", () => {

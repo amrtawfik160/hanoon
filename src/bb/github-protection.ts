@@ -162,15 +162,20 @@ export async function inspectBranchProtection(input: Readonly<{
     await readJson(input.probe, "branch rules", `repos/${input.repository}/rules/branches/${encodeURIComponent(input.branch)}`),
   );
   if (rules !== null && rules.requiredChecks.length > 0) {
-    const rulesetId = rules.rulesetIds[0];
-    const ruleset = rulesetId === undefined
-      ? null
-      : await readJson(input.probe, "ruleset", `repos/${input.repository}/rulesets/${rulesetId}`);
+    // Every ruleset governing this branch, not just the first: a branch can be
+    // covered by several, and one of them allowing a bypass is enough for this
+    // merge to go round the checks the others require.
+    const bypassChecks = await Promise.all(rules.rulesetIds.map(async (rulesetId) =>
+      parseRulesetBypass(
+        await readJson(input.probe, "ruleset", `repos/${input.repository}/rulesets/${rulesetId}`),
+      )));
     return {
       outcome: "enforced",
       source: "ruleset",
       requiredChecks: rules.requiredChecks.length,
-      adminEnforced: parseRulesetBypass(ruleset),
+      // No ruleset id at all is an answer this code cannot read, and an
+      // unreadable ruleset already parses as not binding administrators.
+      adminEnforced: bypassChecks.length > 0 && bypassChecks.every((bound) => bound),
     };
   }
 

@@ -1485,7 +1485,9 @@ export class EffectRunner {
     const attempt = this.dependencies.store.getConsensusReviewAttempt(job.id, headSha);
     return {
       requested,
-      assessment: attempt === null && !requested ? "pending" : assessConsensusReview(attempt, headSha),
+      // No attempt reads as `pending`, which covers both "not asked for yet"
+      // and "asked for and still working".
+      assessment: assessConsensusReview(attempt, headSha),
       routeAvailable: this.consensusExecution(job) !== null,
     };
   }

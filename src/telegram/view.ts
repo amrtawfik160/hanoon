@@ -527,11 +527,16 @@ function deliveryState(job: Job): string {
   return "in progress";
 }
 
-function statusButtons(job: Job, context: JobStatusContext, ready: boolean): InlineKeyboardButton[] {
+function statusButtons(
+  job: Job,
+  context: JobStatusContext,
+  policy: ProjectPolicy | null | undefined,
+  ready: boolean,
+): InlineKeyboardButton[] {
   const buttons: InlineKeyboardButton[] = [];
   // A project with no production settings has no deploy to offer, and a button
   // that promises one would be asking for something that cannot happen.
-  const deploys = (context.project ?? job.policy)?.production !== undefined;
+  const deploys = policy?.production !== undefined;
   const prUrl = safeHttpUrl(job.prUrl);
   const bbUrl = safeHttpUrl(context.bbAppBaseUrl);
   if (prUrl) buttons.push({ text: "View PR", url: prUrl });
@@ -724,7 +729,7 @@ export function renderJobStatus(
   }
   const text = truncateHtml(lines.join("\n"), MAX_TELEGRAM_TEXT_LENGTH);
 
-  const buttons = statusButtons(job, context, ready);
+  const buttons = statusButtons(job, context, policy, ready);
   const nonceHash = context.mergeNonceHash ??
     (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce) ? hashSecret(context.mergeNonce) : undefined);
   const expiresAt = approvalExpiryMillis(context.approvalExpiresAt);

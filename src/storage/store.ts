@@ -3614,7 +3614,6 @@ export interface TelegramAgentStore {
     revert?: { mergeCommitSha: string; mergedJobId: string };
     now: number;
   }): AutonomousJobOutcome;
-  countAuditIntakeJobs(projectId: string, now: number): number;
   getCrashRevertJob(mergeCommitSha: string): CrashRevertRecord | null;
   getLatestCompletedMerge(projectId: string): CompletedMergeRecord | null;
   createConfirmedControllerJob(input: {
@@ -11380,16 +11379,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).get() as { highest: number };
     if (!Number.isSafeInteger(row.highest)) throw new Error("Job source update ids are invalid");
     return Math.max(AUTONOMOUS_SOURCE_UPDATE_BASE, row.highest + 1);
-  }
-
-  /** How many jobs the audit has started for this project on one UTC day. */
-  public countAuditIntakeJobs(projectId: string, now: number): number {
-    assertControllerIdentifier(projectId, "projectId");
-    assertNonNegativeInteger(now, "now");
-    const row = this.db.prepare(
-      "SELECT COUNT(*) AS count FROM audit_intake_findings WHERE project_id = ? AND utc_day = ?",
-    ).get(projectId, utcDayOf(now)) as { count: number };
-    return Number.isSafeInteger(row.count) ? row.count : 0;
   }
 
   /** The auto-revert already started for this merge commit, if there was one. */

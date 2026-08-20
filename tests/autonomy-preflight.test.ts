@@ -298,6 +298,38 @@ it("warns when a ruleset lets someone bypass the checks it requires", async () =
   expect(result.stdout).toContain("Admin enforcement is off");
 });
 
+it("warns when the second of two rulesets on the branch allows a bypass", async () => {
+  // A branch can be governed by more than one ruleset, and one of them letting
+  // someone past is enough for this merge to go round what the others require.
+  const { harness } = await loadPlugin();
+  stubProject(harness);
+  const issued = installGhStubs(harness, ghApiFor({
+    [RULES_PATH]: {
+      exitCode: 0,
+      output: JSON.stringify([9, 11].map((rulesetId) => ({
+        type: "required_status_checks",
+        ruleset_id: rulesetId,
+        ruleset_source_type: "Repository",
+        parameters: { required_status_checks: [{ context: rulesetId === 9 ? "unit" : "lint" }] },
+      }))),
+    },
+    [RULESET_PATH]: { exitCode: 0, output: JSON.stringify({ id: 9, enforcement: "active", bypass_actors: [] }) },
+    "repos/acme/cyndra/rulesets/11": {
+      exitCode: 0,
+      output: JSON.stringify({ id: 11, enforcement: "active", bypass_actors: [{ actor_id: 5, actor_type: "Team" }] }),
+    },
+  }));
+
+  const result = await harness.behavior.runCli([
+    "project", "enable", "proj_1",
+    "--policy-json", policyJson({ unattendedMerge: true }),
+  ]);
+
+  expect(result.exitCode).toBe(0);
+  expect(issued.some((command) => command.includes("repos/acme/cyndra/rulesets/11"))).toBe(true);
+  expect(result.stdout).toContain("Admin enforcement is off");
+});
+
 function stubDoctorEnvironment(harness: Harness) {
   stubProject(harness);
   harness.sdk.stub("projects.defaultExecutionOptions", async () => ({
