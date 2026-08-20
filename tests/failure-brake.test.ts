@@ -204,6 +204,50 @@ it("does not re-stamp a pause that is already in force", () => {
   expect(store.listPausedProjectAdmissions()[0]).toMatchObject({ reason: "first", pausedAt: NOW });
 });
 
+it("takes a live brake over for a cause the agent may not lift", () => {
+  // A fingerprint is the agent's own way out of a brake. A production that
+  // could not be rolled back must not leave the project easier to restart than
+  // it already was, so the incident replaces the cause rather than being
+  // dropped because something smaller got there first.
+  const store = fixture();
+  const fence = submitControllerTurn(store);
+  const fingerprint = failureFingerprint("proj_a", REASON);
+  store.pauseProjectAdmission({ projectId: "proj_a", reason: REASON, fingerprint, now: NOW });
+
+  expect(store.escalateProjectAdmissionPause({
+    projectId: "proj_a",
+    reason: "rollback failed after a bad deploy",
+    now: NOW + 1_000,
+  })).toBe(true);
+
+  // What the operator reads is the incident; the brake has been on since the
+  // first pause rather than being re-stamped as new.
+  expect(store.listPausedProjectAdmissions()).toEqual([
+    { projectId: "proj_a", reason: "rollback failed after a bad deploy", pausedAt: NOW },
+  ]);
+  expect(store.clearProjectAdmissionPauseAsAgent({ projectId: "proj_a", ...fence, now: NOW + 2_000 }))
+    .toMatchObject({ outcome: "refused", reason: expect.stringMatching(/owner's call/i) });
+  expect(store.listPausedProjectAdmissions()).toHaveLength(1);
+});
+
+it("brakes a project the incident found running, and dates that brake from the incident", () => {
+  const store = fixture();
+
+  expect(store.escalateProjectAdmissionPause({
+    projectId: "proj_a",
+    reason: "production deploy failed with no rollback configured",
+    now: NOW + 1_000,
+  })).toBe(true);
+
+  expect(store.listPausedProjectAdmissions()).toEqual([
+    {
+      projectId: "proj_a",
+      reason: "production deploy failed with no rollback configured",
+      pausedAt: NOW + 1_000,
+    },
+  ]);
+});
+
 it("retains an agent clear so the same failure cannot be cleared twice", () => {
   const store = fixture();
   const fence = submitControllerTurn(store);

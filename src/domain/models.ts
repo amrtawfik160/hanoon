@@ -5,7 +5,9 @@ import type {
   GuardResultEnvelope,
 } from "../capabilities/guards";
 import {
+  consensusReviewSchema,
   executionProfileSchema,
+  reviewStageProviderId,
   stageExecutionPolicySchema,
   type PipelineStage,
 } from "./stage-execution";
@@ -62,6 +64,52 @@ export const regressionPolicySchema = z
   })
   .strict();
 
+/**
+ * What this project may do without the owner in the loop. Every field is
+ * opt-in and absent by default: a policy with no `autonomy` block behaves
+ * exactly as it did before this existed — every merge asks, and a project with
+ * no production settings finishes at the reviewed pull request.
+ *
+ * The cross-field rules that make these safe are enforced where the whole
+ * policy is visible, in `projectPolicySchema` below, so they fail at
+ * `project enable` and at load rather than at the merge they would have
+ * governed.
+ */
+export const autonomyPolicySchema = z
+  .object({
+    /**
+     * Merge on the project's own standing authority, on exactly the terms of an
+     * owner-granted standing approval: it replaces the owner's signature and
+     * nothing else. Every gate that produced the merge candidate still runs.
+     */
+    unattendedMerge: z.boolean().default(false),
+    /**
+     * Merge a project that deploys nothing. Without this a reviewed pull
+     * request with no production settings is finished work, not a merge
+     * candidate.
+     */
+    mergeWithoutProduction: z.boolean().default(false),
+    /**
+     * The route a consensus review pass runs on. Absent means the strong route
+     * of whichever provider the job's review stage did not use.
+     */
+    consensusReview: consensusReviewSchema.optional(),
+    /**
+     * Let the daily audit start work rather than only report it. Absent means
+     * the audit keeps reporting and nothing begins on its own.
+     *
+     * The bound is a day's worth of jobs, not a rate: an audit that found forty
+     * things must not spend a night working through them. One to four, because
+     * a project that starts more than four pieces of work a day without being
+     * asked is not being maintained unattended, it is being run unattended.
+     */
+    intake: z
+      .object({ maxJobsPerDay: z.number().int().min(1).max(4) })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 export const projectPolicySchema = z
   .object({
     projectId: z.string().startsWith("proj_"),
@@ -83,6 +131,8 @@ export const projectPolicySchema = z
      * stored with them must keep running.
      */
     stageExecution: stageExecutionPolicySchema.optional(),
+    /** Absent means today's behaviour: nothing happens without the owner. */
+    autonomy: autonomyPolicySchema.optional(),
     validationCommands: z.array(policyCommandSchema).max(20),
     production: productionPolicySchema.optional(),
     regression: regressionPolicySchema.optional(),
@@ -107,8 +157,60 @@ export const projectPolicySchema = z
         });
       }
     }
+    // A project that deploys is a project that can break production, and
+    // nobody is watching an unattended merge do it. A rollback command is the
+    // one thing that turns that from an incident into a recovery, so it is
+    // required before the owner's signature may be skipped.
+    if (policy.autonomy?.unattendedMerge && policy.production && !policy.production.rollbackCommand) {
+      context.addIssue({
+        code: "custom",
+        path: ["autonomy", "unattendedMerge"],
+        message: "Unattended merging of a project with production requires production.rollbackCommand",
+      });
+    }
+    // Merging without production removes the deploy and canary that would
+    // otherwise prove the merged change works. Required checks and a scheduled
+    // regression run are what is left to notice a bad merge, so both must exist
+    // before the pipeline may finish this way.
+    if (policy.autonomy?.mergeWithoutProduction) {
+      if (policy.requiredChecks.length === 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["autonomy", "mergeWithoutProduction"],
+          message: "Merging without production requires at least one required check",
+        });
+      }
+      if (!policy.regression) {
+        context.addIssue({
+          code: "custom",
+          path: ["autonomy", "mergeWithoutProduction"],
+          message: "Merging without production requires a configured regression policy",
+        });
+      }
+    }
+    // A consensus pass stands in for the owner's own look at a change that
+    // argued with its review twice. Pinning it to the provider that produced
+    // that review makes it the same reader agreeing with itself, which is not a
+    // second opinion at all — and this is the one place both routes are visible
+    // at once, so it is refused here rather than at the merge it would have
+    // waved through.
+    const consensusProvider = policy.autonomy?.consensusReview?.providerId;
+    if (consensusProvider !== undefined) {
+      const reviewProvider = reviewStageProviderId({
+        ...(policy.stageExecution === undefined ? {} : { stageExecution: policy.stageExecution }),
+        legacy: { implementation: policy.implementation, review: policy.review },
+      });
+      if (consensusProvider === reviewProvider) {
+        context.addIssue({
+          code: "custom",
+          path: ["autonomy", "consensusReview", "providerId"],
+          message: `A second-opinion review must run on a provider the review stage did not use, but autonomy.consensusReview names "${consensusProvider}" and the review stage runs on "${reviewProvider}"`,
+        });
+      }
+    }
   });
 
+export type AutonomyPolicy = z.infer<typeof autonomyPolicySchema>;
 export type PolicyCommand = z.infer<typeof policyCommandSchema>;
 export type ProductionPolicy = z.infer<typeof productionPolicySchema>;
 export type RegressionPolicy = z.infer<typeof regressionPolicySchema>;
@@ -239,6 +341,23 @@ export type BlockedReason =
 
 export type DeliveryMode = "full" | "small_fix";
 export type JobOrigin = "requested" | "adopted_pr";
+
+/**
+ * What started this job when nobody asked for it.
+ *
+ * Kept apart from `JobOrigin`, which says how the work arrived and decides how
+ * the pipeline treats it. This says only who is answerable for its existence,
+ * and never changes after the job is created — provenance that a later
+ * transition could rewrite would be worth nothing.
+ */
+export type AutonomousJobOrigin = "audit_intake" | "self_diagnosis" | "crash_revert";
+
+/** One plain line for the owner, so provenance reads the same everywhere. */
+export function autonomousOriginLabel(origin: AutonomousJobOrigin): string {
+  if (origin === "audit_intake") return "started by the daily repository audit";
+  if (origin === "self_diagnosis") return "started by self-diagnosis of a failed turn";
+  return "started automatically to revert a merge that broke production";
+}
 export type RoutingMode = "legacy" | "shadow" | "active";
 
 export const PRODUCTION_NOT_CONFIGURED = "Production deployment and canary are not configured";
@@ -308,6 +427,20 @@ export function isResumablePermanentFailure(
     && job.resumeState !== null
     && job.cancelRequestedAt === null
     && RETRYABLE_RESUME_STATES.has(job.resumeState);
+}
+
+/**
+ * Whether this project's reviewed pull request is a merge candidate even though
+ * it deploys nothing.
+ *
+ * By default a reviewed pull request with no production settings is finished
+ * work: there is nothing to deploy, so the pipeline stops at the pull request
+ * rather than merging into silence. A project that says otherwise in its policy
+ * carries it through the same approval and merge gates and ends at the merge,
+ * with no deploy or canary to run.
+ */
+export function mergesWithoutProduction(policy: ProjectPolicy | null | undefined): boolean {
+  return policy?.production === undefined && policy?.autonomy?.mergeWithoutProduction === true;
 }
 
 export function isReviewedPrCompletionBlock(
@@ -380,6 +513,8 @@ export interface Job {
   taskTraits: readonly import("../capabilities/routing").TaskTraitEvidence[];
   taskReasonCodes: readonly string[];
   origin: JobOrigin;
+  /** Absent on every job a person asked for. Immutable once written. */
+  autonomousOrigin: AutonomousJobOrigin | null;
   adoptedBranch: string | null;
   adoptedHeadSha: string | null;
   planCycle: number;
@@ -409,6 +544,12 @@ export interface JobEffect {
     | "spawn_docs"
     | "run_final_validation"
     | "spawn_final_review"
+    /**
+     * One extra independent review of the exact approved head, on a provider
+     * the job's own reviewer did not use. It stands in for the owner's look at
+     * a change that argued with its review, and never for their approval.
+     */
+    | "spawn_consensus_review"
     | "issue_approval"
     | "revoke_approvals"
     | "merge_pr"
@@ -481,6 +622,10 @@ export type JobEvent =
   | { type: "DOCS_IDLE" }
   | { type: "APPROVAL_ACCEPTED"; headSha: string }
   | { type: "APPROVAL_STALE"; headSha?: string }
+  /** Start the one consensus pass this head is allowed. */
+  | { type: "CONSENSUS_REQUIRED"; headSha: string }
+  /** That pass produced durable evidence; decide the approval again. */
+  | { type: "CONSENSUS_SETTLED"; headSha: string }
   | { type: "MERGE_SUCCEEDED"; message: string; mergeCommitSha: string; mergedAt: string; baseContentVerified: boolean }
   | { type: "MERGE_FAILED"; reason?: string }
   | { type: "DEPLOY_SUCCEEDED"; summary: string }

@@ -15,6 +15,7 @@ const POLICY = {
 
 function blockedJob(overrides: Partial<ContinuationJob> = {}): ContinuationJob {
   return {
+    projectId: "proj_1",
     state: "blocked",
     blockedReason: null,
     resumeState: null,
@@ -124,6 +125,50 @@ it.each([
     }),
     attempts: 0,
   })).toEqual({ action: "hold" });
+});
+
+it.each([
+  "awaiting_merge_approval",
+  "merging",
+  "deploying",
+  "verifying_production",
+] as const)("re-drives the %s stage when the project may merge unattended", (resumeState) => {
+  // Resuming re-fires that stage's own guarded effect, so the gates and the
+  // auto-approval decision run again. The sweep cannot approve anything.
+  expect(planJobContinuation({
+    job: blockedJob({
+      state: "failed",
+      blockedReason: "permanent_effect_failure",
+      resumeState,
+    }),
+    attempts: 0,
+    hasLiveMergeGrant: true,
+  })).toEqual({ action: "resume", event: "RETRY" });
+});
+
+it("holds a merge stage the owner asked to stop, grant or no grant", () => {
+  expect(planJobContinuation({
+    job: blockedJob({
+      state: "failed",
+      blockedReason: "permanent_effect_failure",
+      resumeState: "merging",
+      cancelRequestedAt: 1_700_000_000_000,
+    }),
+    attempts: 0,
+    hasLiveMergeGrant: true,
+  })).toEqual({ action: "hold" });
+});
+
+it("keeps the ladder bounded on a merge stage it is allowed to re-drive", () => {
+  expect(planJobContinuation({
+    job: blockedJob({
+      state: "failed",
+      blockedReason: "permanent_effect_failure",
+      resumeState: "merging",
+    }),
+    attempts: MAX_AUTO_CONTINUES,
+    hasLiveMergeGrant: true,
+  })).toMatchObject({ action: "escalate" });
 });
 
 it("holds any job that is not blocked", () => {

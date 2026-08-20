@@ -1,4 +1,5 @@
 import {
+  autonomousOriginLabel,
   isResumablePermanentFailure,
   isResumablePlanBlock,
   isResumableReviewBlock,
@@ -526,8 +527,16 @@ function deliveryState(job: Job): string {
   return "in progress";
 }
 
-function statusButtons(job: Job, context: JobStatusContext, ready: boolean): InlineKeyboardButton[] {
+function statusButtons(
+  job: Job,
+  context: JobStatusContext,
+  policy: ProjectPolicy | null | undefined,
+  ready: boolean,
+): InlineKeyboardButton[] {
   const buttons: InlineKeyboardButton[] = [];
+  // A project with no production settings has no deploy to offer, and a button
+  // that promises one would be asking for something that cannot happen.
+  const deploys = policy?.production !== undefined;
   const prUrl = safeHttpUrl(job.prUrl);
   const bbUrl = safeHttpUrl(context.bbAppBaseUrl);
   if (prUrl) buttons.push({ text: "View PR", url: prUrl });
@@ -542,10 +551,15 @@ function statusButtons(job: Job, context: JobStatusContext, ready: boolean): Inl
     buttons.push({ text: "Re-run Review", callback_data: encodeCallbackData({ type: "review", jobId: job.id }) });
     if (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce)) {
       const shortSha = job.prHeadSha?.slice(0, 8) ?? "approved";
-      buttons.push({ text: `Merge + deploy ${shortSha}`, callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }) });
+      buttons.push({
+        text: `${deploys ? "Merge + deploy" : "Merge"} ${shortSha}`,
+        callback_data: encodeCallbackData({ type: "merge", nonce: context.mergeNonce }),
+      });
       if (context.mergeAuthorityGranted !== true) {
         buttons.push({
-          text: "Merge + deploy, and always from now on",
+          text: deploys
+            ? "Merge + deploy, and always from now on"
+            : "Merge, and always from now on",
           callback_data: encodeCallbackData({ type: "merge_always", nonce: context.mergeNonce }),
         });
       }
@@ -583,16 +597,20 @@ export function renderJobStatus(
     context.admission?.jobId === job.id &&
     context.admission.state === "queued";
   const title = ready
-    ? "Ready to merge and deploy"
+    ? policy?.production === undefined ? "Ready to merge" : "Ready to merge and deploy"
     : job.state === "production_failed"
       ? "PRODUCTION INCIDENT"
-      : job.state === "complete"
-        ? job.mergeCommitSha
-          ? "Merged, deployed, and verified"
-          : "Done — pull request ready"
-        : queuedConfirmed
-          ? "Job queued"
-          : `Job ${displayText(job.state, 80)}`;
+      // Says what happened and no more. This project deploys nothing, so
+      // "deployed and verified" would be a claim about a step that never ran.
+      : job.state === "merged"
+        ? "Merged, nothing to deploy"
+        : job.state === "complete"
+          ? job.mergeCommitSha
+            ? "Merged, deployed, and verified"
+            : "Done — pull request ready"
+          : queuedConfirmed
+            ? "Job queued"
+            : `Job ${displayText(job.state, 80)}`;
   const lines = [
     `<b>${escapeHtml(title)}</b>`,
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,
@@ -607,6 +625,12 @@ export function renderJobStatus(
     lines.push(`Model escalation: <code>${html(context.materialModelPool, 20)}</code>`);
   }
   lines.push(`Delivery: ${html(deliveryState(job), 80)}`);
+  // Whoever reads this card should never have to wonder whether they asked for
+  // this, so a job nobody asked for says so before it says anything else about
+  // what it is doing.
+  if (job.autonomousOrigin) {
+    lines.push(`Nobody asked for this job: ${html(autonomousOriginLabel(job.autonomousOrigin), 120)}.`);
+  }
   if (context.autoApproved) {
     lines.push("Merging on your standing approval — you were not asked.");
   } else if (ready && context.approvalReason && context.mergeAuthorityGranted) {
@@ -705,7 +729,7 @@ export function renderJobStatus(
   }
   const text = truncateHtml(lines.join("\n"), MAX_TELEGRAM_TEXT_LENGTH);
 
-  const buttons = statusButtons(job, context, ready);
+  const buttons = statusButtons(job, context, policy, ready);
   const nonceHash = context.mergeNonceHash ??
     (context.mergeNonce && NONCE_PATTERN.test(context.mergeNonce) ? hashSecret(context.mergeNonce) : undefined);
   const expiresAt = approvalExpiryMillis(context.approvalExpiresAt);

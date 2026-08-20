@@ -66,6 +66,102 @@ describe("job state machine", () => {
     expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
   });
 
+  describe("a project that deploys nothing but asked to merge anyway", () => {
+    function policyWithoutProduction(mergeWithoutProduction: boolean) {
+      const policy = policyFixture({
+        regression: { commands: [{ name: "unit", command: "npm test", timeoutMs: 600_000 }] },
+        ...(mergeWithoutProduction
+          ? { autonomy: { unattendedMerge: false, mergeWithoutProduction: true } }
+          : {}),
+      });
+      delete (policy as Partial<typeof policy>).production;
+      return policy;
+    }
+
+    it("routes a passed final review to the approval stage instead of finishing there", () => {
+      const result = transition(
+        stateJob("final_reviewing", {
+          policy: policyWithoutProduction(true),
+          prHeadSha: sha(),
+          prNumber: 7,
+        }),
+        { type: "REVIEW_PASSED", headSha: sha() },
+        2_250,
+      );
+
+      expect(result.job.state).toBe("awaiting_merge_approval");
+      expect(result.effects.map((effect) => effect.kind)).toEqual(["issue_approval"]);
+    });
+
+    it("finishes at the merge, with no deploy or canary to run", () => {
+      const result = transition(
+        stateJob("merging", { policy: policyWithoutProduction(true), prHeadSha: sha(), prNumber: 7 }),
+        {
+          type: "MERGE_SUCCEEDED",
+          message: "merged",
+          mergeCommitSha: sha("d"),
+          mergedAt: "2026-08-10T18:00:00.000Z",
+          baseContentVerified: true,
+        },
+        2_251,
+      );
+
+      expect(result.job).toMatchObject({
+        state: "merged",
+        mergeCommitSha: sha("d"),
+        blockedReason: null,
+        lastError: null,
+      });
+      expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+    });
+
+    it("still reports a production incident for a project that never asked for this", () => {
+      const result = transition(
+        stateJob("merging", { policy: policyWithoutProduction(false), prHeadSha: sha(), prNumber: 7 }),
+        {
+          type: "MERGE_SUCCEEDED",
+          message: "merged",
+          mergeCommitSha: sha("d"),
+          mergedAt: "2026-08-10T18:00:00.000Z",
+          baseContentVerified: true,
+        },
+        2_252,
+      );
+
+      expect(result.job.state).toBe("production_failed");
+    });
+
+    it("keeps every other gate: a drifted head is still invalidated, not merged", () => {
+      const result = transition(
+        stateJob("final_reviewing", {
+          policy: policyWithoutProduction(true),
+          prHeadSha: sha(),
+          prNumber: 7,
+        }),
+        { type: "REVIEW_PASSED", headSha: sha("b") },
+        2_253,
+      );
+
+      expect(result.job.state).toBe("resolving_pr_head");
+    });
+
+    it("still refuses to merge content the base branch did not verify", () => {
+      const result = transition(
+        stateJob("merging", { policy: policyWithoutProduction(true), prHeadSha: sha(), prNumber: 7 }),
+        {
+          type: "MERGE_SUCCEEDED",
+          message: "merged",
+          mergeCommitSha: sha("d"),
+          mergedAt: "2026-08-10T18:00:00.000Z",
+          baseContentVerified: false,
+        },
+        2_254,
+      );
+
+      expect(result.job.state).toBe("production_failed");
+    });
+  });
+
   it("skips critique but requires validation and one review on the small-fix path", () => {
     const confirmed = transition(
       stateJob("awaiting_confirmation", { deliveryMode: "small_fix", projectId: "proj_1" }),

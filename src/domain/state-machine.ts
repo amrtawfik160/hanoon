@@ -3,6 +3,7 @@ import {
   isResumablePlanBlock,
   isReviewedPrCompletionBlock,
   isSmallFixJob,
+  mergesWithoutProduction,
   projectPolicySchema,
   shouldResumeExistingPr,
   type Job,
@@ -27,7 +28,7 @@ export class IllegalTransitionError extends Error {
 }
 
 const HEAD_SHA = /^[0-9a-f]{40}$/;
-const MAX_FAILURE_SUMMARY_LENGTH = 500;
+export const MAX_FAILURE_SUMMARY_LENGTH = 500;
 const SENSITIVE_FAILURE_PATTERNS = [
   /\bbearer\s+\S+/i,
   /\b(?:api[_-]?key|password|secret|token)\s*[:=]\s*\S+/i,
@@ -128,6 +129,19 @@ function enterLocatingPr(job: Job, effects: JobEffect[]): void {
 
 function completeReviewedWork(job: Job, effects: JobEffect[]): void {
   job.state = "complete";
+  job.blockedReason = null;
+  job.lastError = null;
+  job.resumeState = null;
+  emitEffect(job, effects, "render_status");
+}
+
+/**
+ * Where a project that deploys nothing finishes: merged, with no deploy or
+ * canary left to run. Distinct from `complete`, which for every other project
+ * means the change reached production and the canary agreed.
+ */
+function completeMergedWork(job: Job, effects: JobEffect[]): void {
+  job.state = "merged";
   job.blockedReason = null;
   job.lastError = null;
   job.resumeState = null;
@@ -521,7 +535,7 @@ function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[])
       emitEffect(job, effects, "run_final_validation", { headSha: event.headSha });
       return;
     }
-    if (job.policy?.production) {
+    if (job.policy?.production || mergesWithoutProduction(job.policy)) {
       job.state = "awaiting_merge_approval";
       emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
       return;
@@ -696,7 +710,7 @@ function transitionFinalReviewing(job: Job, event: JobEvent, effects: JobEffect[
       invalidateDriftedHead(job, effects);
       return;
     }
-    if (!job.policy?.production) {
+    if (!job.policy?.production && !mergesWithoutProduction(job.policy)) {
       completeReviewedWork(job, effects);
       return;
     }
@@ -738,6 +752,28 @@ function transitionAwaitingMergeApproval(job: Job, event: JobEvent, effects: Job
     invalidateDriftedHead(job, effects);
     return;
   }
+  // The consensus pass runs while the job waits here. Neither event moves the
+  // job: one asks for a second opinion on this exact head, the other says that
+  // opinion is durable and the approval decision can be made again. The
+  // approval itself is still `issue_approval`'s to make, on the same rules.
+  if (event.type === "CONSENSUS_REQUIRED") {
+    assertHeadSha(event.headSha);
+    if (!headMatches(job, event.headSha)) {
+      invalidateDriftedHead(job, effects);
+      return;
+    }
+    emitEffect(job, effects, "spawn_consensus_review", { headSha: event.headSha });
+    return;
+  }
+  if (event.type === "CONSENSUS_SETTLED") {
+    assertHeadSha(event.headSha);
+    if (!headMatches(job, event.headSha)) {
+      invalidateDriftedHead(job, effects);
+      return;
+    }
+    emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
+    return;
+  }
   illegal(job, event);
 }
 
@@ -757,6 +793,13 @@ function transitionMerging(job: Job, event: JobEvent, effects: JobEffect[]): voi
       return;
     }
     if (!job.policy?.production) {
+      // The project said it deploys nothing, so the merge is the whole
+      // delivery. Reporting a production incident over equipment it never had
+      // would be a false alarm on a job that did exactly what was asked.
+      if (mergesWithoutProduction(job.policy)) {
+        completeMergedWork(job, effects);
+        return;
+      }
       enterProductionIncident(job, effects, "Merge succeeded but production deployment and canary are not configured");
       return;
     }

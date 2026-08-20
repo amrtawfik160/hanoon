@@ -2,7 +2,10 @@ import {
   continuationEscalationNotice,
   continuationKey,
   planJobContinuation,
+  resumesIntoOwnerGatedStage,
 } from "../autonomy/job-continuation";
+import type { Job } from "../domain/models";
+import { resolveMergeGrant } from "./merge-authority";
 import type { TelegramAgentStore } from "../storage/store";
 
 const SCAN_INTERVAL_MS = 5 * 60_000;
@@ -18,6 +21,9 @@ function legacyContinuationKey(job: {
 export type JobContinuationDependencies = {
   store: Pick<
     TelegramAgentStore,
+    | "getMergeGrantEvidence"
+    | "getProjectPolicy"
+    | "listPausedProjectAdmissions"
     | "listContinuationCandidates"
     | "recordAutoContinue"
     | "recordContinuationEscalation"
@@ -82,7 +88,15 @@ export class JobContinuationService {
       const sameLegacyWall = candidate.key === legacyKey;
       const attempts = candidate.key === key || sameLegacyWall ? candidate.attempts : 0;
       const recordKey = sameLegacyWall ? legacyKey : key;
-      const decision = planJobContinuation({ job, attempts });
+      const decision = planJobContinuation({
+        job,
+        attempts,
+        // Only asked for the jobs whose answer turns on it, so an ordinary
+        // blocked job costs the sweep no reads about merge authority at all.
+        ...(resumesIntoOwnerGatedStage(job)
+          ? { hasLiveMergeGrant: this.mayReEnterMergeStages(job) }
+          : {}),
+      });
       if (decision.action === "hold") continue;
       if (decision.action === "escalate") {
         worked = this.escalate(candidate.job, decision.reason, now) || worked;
@@ -91,6 +105,36 @@ export class JobContinuationService {
       worked = this.resume(candidate.job, decision.event, recordKey, now) || worked;
     }
     return worked;
+  }
+
+  /**
+   * Whether this job's project may be carried back into a merge or production
+   * stage with nobody watching.
+   *
+   * Three things, and all of them: the project's current enabled policy asks
+   * for unattended merging, that grant has not been withdrawn since, and no
+   * brake is holding the project. The policy is where the opt-in has to be —
+   * driving a job back into a deploy is a new behaviour, and a standing
+   * approval the owner tapped long before it existed said only "merge this
+   * reviewed job without asking me". A braked project is one whose last work
+   * ended badly enough to stop it; re-entering its deploy is the last thing it
+   * needs.
+   */
+  private mayReEnterMergeStages(job: Pick<Job, "projectId">): boolean {
+    const projectId = job.projectId;
+    if (!projectId) return false;
+    const record = this.dependencies.store.getProjectPolicy(projectId);
+    const policy = record?.policy.enabled === true ? record.policy : null;
+    if (policy?.autonomy?.unattendedMerge !== true) return false;
+    if (this.dependencies.store.listPausedProjectAdmissions()
+      .some((pause) => pause.projectId === projectId)) return false;
+    // Resolved through the same rule the approval decision uses, so the sweep
+    // and the merge cannot disagree about who authorised what.
+    return resolveMergeGrant({
+      projectId,
+      policy,
+      evidence: this.dependencies.store.getMergeGrantEvidence(projectId),
+    }) !== null;
   }
 
   private resume(

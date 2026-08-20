@@ -141,6 +141,7 @@ describe("autonomy admission predicates", () => {
       "spawn_docs",
       "run_final_validation",
       "spawn_final_review",
+      "spawn_consensus_review",
       "issue_approval",
       "revoke_approvals",
       "merge_pr",

@@ -139,12 +139,51 @@ export type StageTierRoute = Readonly<{
   reasoningLevel: ReasoningLevel;
 }>;
 
-/** What each tier resolves to before any per-stage override. */
+/**
+ * What each tier resolves to before any per-stage override.
+ *
+ * Every tier here names the same provider, and the consensus independence
+ * check leans on that. It compares a pinned second opinion against the review
+ * stage's provider at its **base** tier, which is the provider a review attempt
+ * runs on today however far it escalates: a stage that pins an exact model
+ * never escalates, and a stage that does not pin one climbs between routes that
+ * all belong to one provider. Give any tier a different provider and that stops
+ * being true — an escalated review attempt could then land on the very provider
+ * the parse-time check cleared the pin against — so the consensus check in
+ * `resolveConsensusExecution` and in the policy schema has to be revisited
+ * before this table changes.
+ */
 export const STAGE_TIER_ROUTES: Readonly<Record<StageTier, StageTierRoute>> = Object.freeze({
   fast: Object.freeze({ providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "low" as const }),
   standard: Object.freeze({ providerId: "codex", model: "gpt-5.6-terra", reasoningLevel: "high" as const }),
   strong: Object.freeze({ providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "xhigh" as const }),
 });
+
+/**
+ * The strongest route each provider offers. A consensus pass exists to be a
+ * second opinion, so it runs on a provider the job's review stage did not use;
+ * without this table the strong tier would send it straight back to the model
+ * that already read this change. `pi` is deliberately absent: its one catalog
+ * model is the cheap model for short threads, never a pipeline reviewer.
+ */
+export const PROVIDER_STRONG_ROUTES: Readonly<Record<string, StageTierRoute>> = Object.freeze({
+  codex: Object.freeze({ providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "xhigh" as const }),
+  "claude-code": Object.freeze({
+    providerId: "claude-code",
+    model: "claude-opus-5[1m]",
+    reasoningLevel: "xhigh" as const,
+  }),
+});
+
+/**
+ * The strong route of some provider other than `providerId`, or null when the
+ * catalog offers no second opinion. Null is an answer, not a failure: the
+ * caller falls back to asking the owner rather than re-reviewing on the same
+ * model and calling that independent.
+ */
+export function alternateStrongRoute(providerId: string): StageTierRoute | null {
+  return Object.values(PROVIDER_STRONG_ROUTES).find((route) => route.providerId !== providerId) ?? null;
+}
 
 export type StageDefault = Readonly<{
   tier: StageTier;
@@ -255,6 +294,32 @@ export const stageExecutionProfileSchema = z
   });
 
 export type StageExecutionProfile = z.infer<typeof stageExecutionProfileSchema>;
+
+/**
+ * The second opinion a project may pin for a consensus review pass. Provider
+ * and model are both required, because the point of the pass is a route the
+ * job's own reviewer did not use: a tier on its own would resolve straight back
+ * to the model that already looked at this change. Validated against the same
+ * catalog as every other stage entry, so a route no provider offers fails when
+ * the policy is saved rather than when the pass is spawned.
+ */
+export const consensusReviewSchema = z
+  .object({
+    providerId: z.string().min(1),
+    model: z.string().min(1),
+    reasoningLevel: z.enum(REASONING_LEVELS).optional(),
+    serviceTier: z.enum(SERVICE_TIERS).optional(),
+    permissionMode: z.enum(PERMISSION_MODES).optional(),
+  })
+  .strict()
+  .superRefine((profile, context) => {
+    const validation = validateStageModel(profile);
+    if (!validation.ok) {
+      context.addIssue({ code: "custom", path: ["model"], message: validation.message });
+    }
+  });
+
+export type ConsensusReviewProfile = z.infer<typeof consensusReviewSchema>;
 
 export const stageExecutionPolicySchema = z
   .object({
@@ -409,6 +474,79 @@ export function resolveStageExecution(input: ResolveStageExecutionInput): Resolv
     serviceTier: entry?.supportsServiceTier === false ? "default" : requestedServiceTier,
     permissionMode: overrides.permissionMode ?? fallback.permissionMode,
     source,
+  });
+}
+
+/**
+ * The provider a job's review stage runs on, resolved exactly the way the
+ * review attempt itself resolves it. The one place to ask "who already read
+ * this change", so a check against it cannot drift from what actually ran.
+ */
+export function reviewStageProviderId(input: Readonly<{
+  stageExecution?: StageExecutionPolicy;
+  legacy?: LegacyProfiles;
+}>): string {
+  return resolveStageExecution({
+    stage: "review",
+    ...(input.stageExecution === undefined ? {} : { stageExecution: input.stageExecution }),
+    ...(input.legacy === undefined ? {} : { legacy: input.legacy }),
+  }).providerId;
+}
+
+/**
+ * The route one consensus review pass runs on, or null when there is no
+ * independent second opinion to be had.
+ *
+ * A consensus pass exists to disagree with the job's own reviewer if it can, so
+ * it must not run on that reviewer's provider. The project may pin the route;
+ * otherwise it is the strong route of a provider the review stage did not use.
+ * Null is a real answer, and its caller asks the owner instead of re-reviewing
+ * on the same model and calling that a second opinion.
+ *
+ * A pinned route is checked against the review stage's provider here as well as
+ * where the policy is parsed. The parse refuses such a policy outright, so this
+ * is the second lock on the same door: independence is the property this pass
+ * is trusted for, and it must not rest on a single check.
+ */
+export function resolveConsensusExecution(input: Readonly<{
+  stageExecution?: StageExecutionPolicy;
+  legacy?: LegacyProfiles;
+  consensusReview?: Readonly<{
+    providerId: string;
+    model: string;
+    reasoningLevel?: ReasoningLevel;
+    serviceTier?: StageServiceTier;
+    permissionMode?: StagePermissionMode;
+  }>;
+}>): ResolvedStageExecution | null {
+  const review = resolveStageExecution({
+    stage: "review",
+    ...(input.stageExecution === undefined ? {} : { stageExecution: input.stageExecution }),
+    ...(input.legacy === undefined ? {} : { legacy: input.legacy }),
+  });
+  const pinned = input.consensusReview;
+  const route = pinned === undefined ? alternateStrongRoute(review.providerId) : pinned;
+  // The same model agreeing with itself is not a second opinion. A pin that
+  // lands back on the reviewer's provider is therefore read as "no independent
+  // route", which is a case the caller already handles by asking the owner.
+  if (route === null || route.providerId === review.providerId) return null;
+  const entry = stageModelEntry(route.model);
+  const requestedServiceTier = pinned?.serviceTier ?? "default";
+  return Object.freeze({
+    stage: "review" as const,
+    baseTier: "strong" as const,
+    tier: "strong" as const,
+    escalationSteps: 0,
+    // A second opinion is one pass at full strength. There is no ladder to
+    // climb: a consensus pass that needed a retry falls back to the owner.
+    maxEscalations: 0,
+    modelPinned: true,
+    providerId: route.providerId,
+    model: route.model,
+    reasoningLevel: pinned?.reasoningLevel ?? STAGE_TIER_ROUTES.strong.reasoningLevel,
+    serviceTier: entry?.supportsServiceTier === false ? "default" : requestedServiceTier,
+    permissionMode: pinned?.permissionMode ?? review.permissionMode,
+    source: pinned === undefined ? "default" as const : "stage-policy" as const,
   });
 }
 

@@ -228,7 +228,7 @@ export function buildReviewPacket(
   policy: ProjectPolicy,
   remoteHeadSha: string,
   diff: string,
-  reviewLens: "quality" | "risk" = "quality",
+  reviewLens: "quality" | "risk" | "consensus" = "quality",
   capability?: CapabilityWorkOrderEnvelope,
   reviewStage?: "diff-guards" | "review" | "task-review" | "integrated-review",
 ): HandoffArtifact {
@@ -302,7 +302,14 @@ export function buildReviewPacket(
     guardContract,
     lensInstruction: reviewLens === "risk"
       ? "Focus independently on security, destructive actions, data integrity, concurrency, rollback, and operational failure modes."
-      : "Focus independently on correctness, maintainability, scope, regressions, and test adequacy.",
+      : reviewLens === "consensus"
+        // This pass decides whether a change that already needed two rounds of
+        // fixes merges without a person looking at it. Report anything that
+        // would make a careful reviewer stop, and report nothing else: an
+        // invented finding costs the owner a message, a missed one costs them
+        // an unreviewed merge.
+        ? "This change has already passed its own reviews and is about to merge without a human reading it. Review the whole change independently for correctness, security, data integrity, scope, regressions, and test adequacy. Report every finding that should stop this merge, and report no finding you cannot point at in the diff."
+        : "Focus independently on correctness, maintainability, scope, regressions, and test adequacy.",
     diff,
     validationPolicy: {
       commands: policy.validationCommands,

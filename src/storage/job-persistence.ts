@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   projectPolicySchema,
+  type AutonomousJobOrigin,
   type DeliveryMode,
   type Job,
   type JobOrigin,
@@ -48,6 +49,7 @@ export type JobRow = {
   task_traits_json: string;
   task_reason_codes_json: string;
   job_origin: JobOrigin;
+  autonomous_origin: AutonomousJobOrigin | null;
   adopted_branch: string | null;
   adopted_head_sha: string | null;
   plan_cycle: number;
@@ -114,6 +116,11 @@ const BLOCKED_REASONS: ReadonlySet<NonNullable<Job["blockedReason"]>> = new Set(
 ]);
 const DELIVERY_MODES: ReadonlySet<DeliveryMode> = new Set(["full", "small_fix"]);
 const JOB_ORIGINS: ReadonlySet<JobOrigin> = new Set(["requested", "adopted_pr"]);
+const AUTONOMOUS_JOB_ORIGINS: ReadonlySet<AutonomousJobOrigin> = new Set([
+  "audit_intake",
+  "self_diagnosis",
+  "crash_revert",
+]);
 const TASK_RECIPE_SET: ReadonlySet<TaskRecipe> = new Set(TASK_RECIPES);
 const ROUTING_MODES: ReadonlySet<RoutingMode> = new Set(["legacy", "shadow", "active"]);
 
@@ -260,6 +267,9 @@ export function parseJobRow(row: JobRow): Job {
   const taskTraits = taskTraitSnapshotSchema.parse(JSON.parse(row.task_traits_json));
   const taskReasonCodes = taskReasonCodesSchema.parse(JSON.parse(row.task_reason_codes_json));
   if (!JOB_ORIGINS.has(row.job_origin)) throw new Error(`Unknown persisted job origin: ${row.job_origin}`);
+  if (row.autonomous_origin !== null && !AUTONOMOUS_JOB_ORIGINS.has(row.autonomous_origin)) {
+    throw new Error(`Unknown persisted autonomous origin: ${row.autonomous_origin}`);
+  }
   return {
     id: row.id,
     sourceUpdateId: row.source_update_id,
@@ -292,6 +302,7 @@ export function parseJobRow(row: JobRow): Job {
     taskTraits,
     taskReasonCodes,
     origin: row.job_origin,
+    autonomousOrigin: row.autonomous_origin,
     adoptedBranch: row.adopted_branch,
     adoptedHeadSha: row.adopted_head_sha,
     planCycle: row.plan_cycle,
@@ -420,7 +431,8 @@ export const JOB_SELECT = `
          review_thread_id, documentation_thread_id, pr_number, pr_url, pr_head_sha,
          merge_message, merge_commit_sha, merged_at, deployment_summary, canary_summary, status_message_id,
          delivery_mode, task_recipe, recipe_version, recipe_promotion_count, routing_mode,
-         task_traits_json, task_reason_codes_json, job_origin, adopted_branch, adopted_head_sha,
+         task_traits_json, task_reason_codes_json, job_origin, autonomous_origin,
+         adopted_branch, adopted_head_sha,
          plan_cycle, review_cycle, review_block_at, cancel_requested_at, blocked_reason,
          last_error, version, created_at, updated_at
     FROM jobs`;

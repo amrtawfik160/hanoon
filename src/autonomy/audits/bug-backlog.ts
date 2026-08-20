@@ -51,5 +51,6 @@ export function analyseBugBacklog(input: Readonly<{
       auditId: "bug-backlog",
       subject: `#${issue.number}`,
       detail: `${issue.title} (untouched ${Math.floor((input.now - issue.updatedAt) / DAY_MS)} days)`,
+      intake: { kind: "bug", issue: issue.number, title: issue.title },
     }));
 }

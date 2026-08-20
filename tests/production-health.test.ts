@@ -6,6 +6,7 @@ import {
   HEALTH_FAILURE_THRESHOLD,
   ProductionHealthService,
   healthNotice,
+  type ProductionHealthDependencies,
 } from "../src/services/production-health-service";
 import { policyFixture } from "./helpers";
 
@@ -41,7 +42,12 @@ function fixture(policy = healthPolicy()) {
   return { store };
 }
 
-function service(store: TelegramAgentStore, ok: () => boolean, now: () => number) {
+function service(
+  store: TelegramAgentStore,
+  ok: () => boolean,
+  now: () => number,
+  autoRevert?: ProductionHealthDependencies["autoRevert"],
+) {
   const run = vi.fn(async () => ({ ok: ok(), summary: ok() ? "200 OK" : "guardian crashed: ReferenceError" }));
   let id = 5_000;
   return {
@@ -49,12 +55,24 @@ function service(store: TelegramAgentStore, ok: () => boolean, now: () => number
     service: new ProductionHealthService({
       store,
       commands: { run },
+      ...(autoRevert === undefined ? {} : { autoRevert }),
       clock: { now },
       issueUpdateId: () => (id += 1),
       warn: () => undefined,
     }),
   };
 }
+
+/** Drives the probe past the failure threshold so the fault is declared. */
+async function breakProduction(probe: ProductionHealthService, from: number): Promise<void> {
+  for (let tick = 0; tick < HEALTH_FAILURE_THRESHOLD; tick += 1) {
+    await probe.processDue();
+    from += INTERVAL;
+    clockAt.value = from;
+  }
+}
+
+const clockAt = { value: NOW };
 
 function notices(store: TelegramAgentStore) {
   return store.listControllerTurns(CONTROLLER_KEY, 20)
@@ -192,4 +210,71 @@ it("treats an unrunnable check as no evidence rather than an outage", async () =
 
   expect(notices(store)).toEqual([]);
   expect(store.getProductionHealth("proj_a")).toMatchObject({ state: "ok" });
+});
+
+it("tells the owner a revert is already running when one started", async () => {
+  const { store } = fixture();
+  clockAt.value = NOW;
+  const start = vi.fn((_input: { projectId: string; alias: string; now: number }) => ({
+    outcome: "started" as const,
+    jobId: "job_revert",
+    mergeCommitSha: "a".repeat(40),
+  }));
+  const { service: probe } = service(store, () => false, () => clockAt.value, { start });
+
+  await breakProduction(probe, NOW);
+
+  expect(start).toHaveBeenCalledOnce();
+  expect(start.mock.calls[0]?.[0]).toMatchObject({ projectId: "proj_a", alias: "cyndra" });
+  const [notice] = notices(store);
+  expect(notice?.inputText).toContain("revert commit aaaaaaaaaaaa");
+  expect(notice?.inputText).toContain("normal checks");
+  // The revert is already started; there is nothing here for the owner to approve.
+  expect(notice?.inputText).not.toMatch(/what you propose/i);
+});
+
+it("reports the fault the way it always did when no revert could start", async () => {
+  const { store } = fixture();
+  clockAt.value = NOW;
+  const start = vi.fn(() => ({ outcome: "investigate" as const, reason: "this project already has work running" }));
+  const { service: probe } = service(store, () => false, () => clockAt.value, { start });
+
+  await breakProduction(probe, NOW);
+
+  const [notice] = notices(store);
+  expect(notice?.inputText).toMatch(/what you propose/i);
+  expect(notice?.inputText).not.toContain("revert commit");
+});
+
+it("offers the fault to the revert only once, after the transition is claimed", async () => {
+  const { store } = fixture();
+  clockAt.value = NOW;
+  const start = vi.fn(() => ({ outcome: "investigate" as const, reason: "nothing has been merged here" }));
+  const { service: probe } = service(store, () => false, () => clockAt.value, { start });
+
+  await breakProduction(probe, NOW);
+  // Still failing on every later tick, and already reported.
+  for (let tick = 0; tick < 3; tick += 1) {
+    clockAt.value += INTERVAL;
+    await probe.processDue();
+  }
+
+  expect(start).toHaveBeenCalledOnce();
+  expect(notices(store)).toHaveLength(1);
+});
+
+it("never offers a recovery to the revert", async () => {
+  const { store } = fixture();
+  clockAt.value = NOW;
+  let healthy = false;
+  const start = vi.fn(() => ({ outcome: "investigate" as const, reason: "nothing has been merged here" }));
+  const { service: probe } = service(store, () => healthy, () => clockAt.value, { start });
+
+  await breakProduction(probe, NOW);
+  healthy = true;
+  clockAt.value += INTERVAL;
+  await probe.processDue();
+
+  expect(notices(store)).toHaveLength(2);
+  expect(start).toHaveBeenCalledOnce();
 });

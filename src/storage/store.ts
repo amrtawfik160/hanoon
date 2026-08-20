@@ -6,6 +6,7 @@ import {
   isReviewedPrCompletionBlock,
   PRODUCTION_NOT_CONFIGURED,
   projectPolicySchema,
+  type AutonomousJobOrigin,
   type Job,
   type JobEffect,
   type JobEvent,
@@ -16,8 +17,13 @@ import {
   type WorkerKind,
   type WorkerRecoveryClassification,
 } from "../domain/models";
-import type { MergeAuthorityGrant } from "../services/merge-authority";
+import {
+  resolveMergeGrant,
+  type MergeAuthorityGrant,
+  type MergeGrantEvidence,
+} from "../services/merge-authority";
 import { classifyTaskTraits } from "../capabilities/routing";
+import { INTAKE_SUPPRESSION_MS } from "../autonomy/audit-intake";
 import {
   controllerBundleIdsFromProfile,
   CONTROLLER_BUNDLE_IDS,
@@ -580,6 +586,44 @@ export type MergeAuthorityEvent = {
   occurredAt: number;
 };
 
+/** Why a job the owner did not ask for was not started. Every one is a bound. */
+export type AutonomousJobRefusal =
+  | "project_not_enabled"
+  | "intake_not_configured"
+  | "project_paused"
+  | "open_job"
+  | "daily_cap"
+  | "finding_open"
+  | "finding_recent"
+  | "already_reverted";
+
+export type AutonomousJobOutcome =
+  | Readonly<{ outcome: "created"; job: Job }>
+  | Readonly<{ outcome: "refused"; reason: AutonomousJobRefusal }>;
+
+export type CrashRevertRecord = Readonly<{
+  mergeCommitSha: string;
+  projectId: string;
+  mergedJobId: string;
+  jobId: string;
+  startedAt: number;
+}>;
+
+export type CompletedMergeRecord = Readonly<{
+  jobId: string;
+  mergeCommitSha: string;
+  /** Epoch milliseconds, parsed from the merge receipt's own timestamp. */
+  mergedAt: number;
+  /** True when a standing grant merged it, from the append-only authority log. */
+  unattended: boolean;
+  /**
+   * True when this merge is one an automatic revert produced, read from the
+   * job's own durable origin. Such a merge is never itself a revert candidate:
+   * reverting it would re-apply the change that broke production.
+   */
+  automaticRevert: boolean;
+}>;
+
 export type DelegationState = "open" | "fired" | "cancelled" | "failed";
 export type DelegationThreadState = "running" | "finished" | "failed" | "missing";
 
@@ -665,8 +709,8 @@ export type AttemptRecord = {
   id: string;
   jobId: string;
   kind: "implementation" | "review" | "validation";
-  reviewLens: "quality" | "risk" | null;
-  reviewStage: "review" | "final_review" | null;
+  reviewLens: "quality" | "risk" | "consensus" | null;
+  reviewStage: "review" | "final_review" | "consensus" | null;
   ordinal: number;
   threadId: string | null;
   headSha: string | null;
@@ -1547,6 +1591,27 @@ function assertFullSha(value: string, field: string): void {
   if (typeof value !== "string" || !FULL_SHA.test(value)) {
     throw new TypeError(`${field} must be a 40-character lowercase SHA`);
   }
+}
+
+/**
+ * Above every Telegram update id and every synthetic one the system turns
+ * issue, so a job nobody sent can never take the number of a message somebody
+ * did.
+ */
+const AUTONOMOUS_SOURCE_UPDATE_BASE = 9_000_000_000_000;
+
+/** Nothing will move a job on from here, so its finding may come back later. */
+const TERMINAL_INTAKE_STATES: ReadonlySet<JobState> = new Set<JobState>([
+  "merged",
+  "complete",
+  "failed",
+  "blocked",
+  "cancelled",
+  "production_failed",
+]);
+
+function utcDayOf(now: number): string {
+  return new Date(now).toISOString().slice(0, 10);
 }
 
 function assertNonNegativeInteger(value: number, field: string): void {
@@ -3330,6 +3395,7 @@ export interface TelegramAgentStore {
     now: number;
   }): boolean;
   getMergeAuthority(projectId: string): MergeAuthorityGrant | null;
+  getMergeGrantEvidence(projectId: string): MergeGrantEvidence;
   grantMergeAuthority(input: {
     projectId: string;
     userId: string;
@@ -3386,6 +3452,16 @@ export interface TelegramAgentStore {
     projectId: string;
     reason: string;
     fingerprint: string | null;
+    now: number;
+  }): boolean;
+  /**
+   * Brakes a project for a cause only the owner may lift, whatever was already
+   * holding it. Returns whether the project is braked without a fingerprint
+   * afterwards, which is the property the caller actually needs.
+   */
+  escalateProjectAdmissionPause(input: {
+    projectId: string;
+    reason: string;
     now: number;
   }): boolean;
   listPausedProjectAdmissions(): { projectId: string; reason: string; pausedAt: number }[];
@@ -3529,6 +3605,17 @@ export interface TelegramAgentStore {
   getProjectPolicy(projectId: string): ProjectPolicyRecord | null;
   getProjectPolicyByAlias(alias: string): ProjectPolicyRecord | null;
   listEnabledProjectPolicies(): ProjectPolicyRecord[];
+  createAutonomousJob(input: {
+    projectId: string;
+    task: string;
+    origin: AutonomousJobOrigin;
+    minimumRecipe?: TaskRecipe;
+    intake?: { fingerprint: string; auditId: string; subject: string };
+    revert?: { mergeCommitSha: string; mergedJobId: string };
+    now: number;
+  }): AutonomousJobOutcome;
+  getCrashRevertJob(mergeCommitSha: string): CrashRevertRecord | null;
+  getLatestCompletedMerge(projectId: string): CompletedMergeRecord | null;
   createConfirmedControllerJob(input: {
     controllerThreadId: string;
     projectId: string;
@@ -3607,6 +3694,7 @@ export interface TelegramAgentStore {
   getAttemptByThreadId(threadId: string): AttemptRecord | null;
   nextAttemptOrdinal(jobId: string, kind: AttemptRecord["kind"]): number;
   listReviewAttempts(jobId: string, reviewStage: NonNullable<AttemptRecord["reviewStage"]>, ordinal: number): AttemptRecord[];
+  getConsensusReviewAttempt(jobId: string, headSha: string): AttemptRecord | null;
   createAttempt(input: {
     id: string;
     jobId: string;
@@ -9324,7 +9412,39 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     })();
   }
 
-  /** Returns true only when a live grant was actually withdrawn. */
+  /**
+   * Everything durable that decides whether this project may merge unattended:
+   * the button-granted standing approval, the latest withdrawal from the
+   * append-only log, and when the project's policy snapshot was stored. Read
+   * together so a caller cannot answer the question from half of it.
+   */
+  public getMergeGrantEvidence(projectId: string): MergeGrantEvidence {
+    assertControllerIdentifier(projectId, "projectId");
+    const revocation = this.db.prepare(
+      `SELECT MAX(occurred_at) AS revoked_at FROM merge_authority_events
+        WHERE project_id = ? AND action = 'revoked'`,
+    ).get(projectId) as { revoked_at: number | null } | undefined;
+    // Only an enabled policy counts as the owner asking again. `project
+    // disable` stores a snapshot too, and turning a project off must never be
+    // the thing that revives the merge authority they just withdrew.
+    const policy = this.db.prepare(
+      "SELECT updated_at FROM project_policies WHERE project_id = ? AND enabled = 1",
+    ).get(projectId) as { updated_at: number } | undefined;
+    return {
+      grant: this.getMergeAuthority(projectId),
+      revokedAt: revocation?.revoked_at ?? null,
+      policyStoredAt: policy?.updated_at ?? null,
+    };
+  }
+
+  /**
+   * Withdraws every source of unattended merge authority this project has.
+   *
+   * Returns true only when something live was actually withdrawn. A grant the
+   * project's own policy declares has no row to clear — this cannot edit a
+   * policy file — so recording the withdrawal is what silences it, and it stays
+   * silenced until the owner enables the project again.
+   */
   public revokeMergeAuthority(input: {
     projectId: string;
     reason: string;
@@ -9336,10 +9456,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     const reason = assertMemoryText(input.reason, 200, "revocation reason");
     return this.db.transaction((): boolean => {
-      const revoked = this.db.prepare(
+      const clearedGrant = this.db.prepare(
         `UPDATE merge_authority SET revoked_at = ?, revoked_reason = ?
           WHERE project_id = ? AND revoked_at IS NULL`,
       ).run(input.now, reason, input.projectId).changes === 1;
+      const policyRecord = this.getProjectPolicy(input.projectId);
+      const silencedPolicyGrant = resolveMergeGrant({
+        projectId: input.projectId,
+        policy: policyRecord?.policy ?? null,
+        evidence: { ...this.getMergeGrantEvidence(input.projectId), grant: null },
+      })?.source === "policy";
+      const revoked = clearedGrant || silencedPolicyGrant;
       if (revoked) {
         this.appendMergeAuthorityEvent({
           projectId: input.projectId,
@@ -9534,6 +9661,16 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     })();
   }
 
+  /**
+   * Brakes a project for one cause, and leaves a brake that is already on
+   * alone.
+   *
+   * A live pause is a decision already made about this project, and a later
+   * cause must not quietly rewrite it — least of all replace a fingerprint-less
+   * pause, which only the owner may lift, with a fingerprinted one the agent
+   * may. A cause that genuinely outranks what is holding the project uses
+   * `escalateProjectAdmissionPause` and says so.
+   */
   public pauseProjectAdmission(input: {
     projectId: string;
     reason: string;
@@ -9553,6 +9690,54 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
          cleared_at = NULL
        WHERE project_admission_pauses.cleared_at IS NOT NULL`,
     ).run(input.projectId, reason, input.fingerprint, input.now).changes === 1;
+  }
+
+  /**
+   * Brakes a project for a cause only the owner may lift, over the top of
+   * whatever was already holding it.
+   *
+   * A production that broke and could not be rolled back outranks every
+   * ordinary pause. An ordinary pause carries a failure fingerprint, and a
+   * fingerprint is exactly what lets the agent lift a brake for itself once —
+   * so leaving the earlier row in place would hand the agent a way out of the
+   * one situation the owner must see. The fingerprint is therefore cleared and
+   * the reason replaced with the incident, so the operator reads why the
+   * project is really stopped.
+   *
+   * `paused_at` is deliberately left as it was when a brake is already on: the
+   * project has not admitted work since that moment, and only the cause has
+   * changed. The clear history is append-only and untouched here, so an earlier
+   * fingerprint's one agent-clear allowance is neither spent nor granted.
+   */
+  public escalateProjectAdmissionPause(input: {
+    projectId: string;
+    reason: string;
+    now: number;
+  }): boolean {
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertNonNegativeInteger(input.now, "now");
+    const reason = assertMemoryText(input.reason, 200, "pause reason");
+    return this.db.transaction((): boolean => {
+      this.db.prepare(
+        `INSERT INTO project_admission_pauses (project_id, reason, fingerprint, paused_at, cleared_at)
+         VALUES (?, ?, NULL, ?, NULL)
+         ON CONFLICT(project_id) DO UPDATE SET
+           reason = excluded.reason,
+           fingerprint = NULL,
+           paused_at = CASE
+             WHEN project_admission_pauses.cleared_at IS NULL THEN project_admission_pauses.paused_at
+             ELSE excluded.paused_at
+           END,
+           cleared_at = NULL`,
+      ).run(input.projectId, reason, input.now);
+      // Read back rather than trust the write: the caller is asking whether
+      // this project is now stopped in a way it cannot restart itself, and that
+      // is a fact about the row, not about the statement.
+      const live = this.db.prepare(
+        "SELECT fingerprint FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
+      ).get(input.projectId) as { fingerprint: string | null } | undefined;
+      return live !== undefined && live.fingerprint === null;
+    }).immediate();
   }
 
   public listPausedProjectAdmissions(): { projectId: string; reason: string; pausedAt: number }[] {
@@ -11001,6 +11186,255 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  /**
+   * The one way work the owner did not ask for enters the pipeline.
+   *
+   * It creates exactly the job a controller-created one is — same table, same
+   * `PROJECT_SELECTED` transition, same effects, same admission queue — and
+   * differs only in what it refuses to do. Every bound is checked inside this
+   * one immediate transaction, because a cap read outside the write it protects
+   * is a cap two passes can both pass.
+   *
+   * The bounds are deliberately asked of durable state rather than of the caller:
+   * the daily allowance comes from the stored policy, the brake from the pause
+   * table, the claim from the admission queue. A caller that has gone stale, or
+   * one that simply asks twice, gets the same refusal as one that never checked.
+   */
+  public createAutonomousJob(input: {
+    projectId: string;
+    task: string;
+    origin: AutonomousJobOrigin;
+    /** Floor for the recipe, so a diagnosis or a revert cannot route as a typo. */
+    minimumRecipe?: TaskRecipe;
+    /** Present when the daily allowance and the finding ledger both apply. */
+    intake?: { fingerprint: string; auditId: string; subject: string };
+    /** Present for a revert, which is bounded once per merge commit for all time. */
+    revert?: { mergeCommitSha: string; mergedJobId: string };
+    now: number;
+  }): AutonomousJobOutcome {
+    assertControllerIdentifier(input.projectId, "projectId");
+    assertControllerText(input.task, "task");
+    assertNonNegativeInteger(input.now, "now");
+    if (input.intake) {
+      assertControllerIdentifier(input.intake.fingerprint, "fingerprint");
+      assertControllerIdentifier(input.intake.auditId, "auditId");
+      assertControllerIdentifier(input.intake.subject, "subject");
+    }
+    if (input.revert) {
+      assertFullSha(input.revert.mergeCommitSha, "mergeCommitSha");
+      assertControllerIdentifier(input.revert.mergedJobId, "mergedJobId");
+    }
+
+    return this.db.transaction((): AutonomousJobOutcome => {
+      const policyRecord = this.getProjectPolicy(input.projectId);
+      if (!policyRecord?.policy.enabled) return { outcome: "refused", reason: "project_not_enabled" };
+
+      const utcDay = utcDayOf(input.now);
+      if (input.intake) {
+        // Read from the stored policy, never from the caller: the allowance is
+        // the owner's statement about this project, and a caller carrying a
+        // snapshot of it is a caller that can be wrong about it.
+        const allowance = policyRecord.policy.autonomy?.intake?.maxJobsPerDay;
+        if (allowance === undefined) return { outcome: "refused", reason: "intake_not_configured" };
+        const startedToday = this.db.prepare(
+          "SELECT COUNT(*) AS count FROM audit_intake_findings WHERE project_id = ? AND utc_day = ?",
+        ).get(input.projectId, utcDay) as { count: number };
+        if (!Number.isSafeInteger(startedToday.count)) throw new Error("Audit intake day count is invalid");
+        if (startedToday.count >= allowance) return { outcome: "refused", reason: "daily_cap" };
+
+        const previous = this.db.prepare(
+          `SELECT job.state AS state, job.updated_at AS updated_at
+             FROM audit_intake_findings AS ledger
+             JOIN jobs AS job ON job.id = ledger.job_id
+            WHERE ledger.project_id = ? AND ledger.fingerprint = ?`,
+        ).get(input.projectId, input.intake.fingerprint) as
+          { state: JobState; updated_at: number } | undefined;
+        if (previous) {
+          // Terminal is read from the job itself rather than stamped on the
+          // ledger, so a job that finished during a restart is not a finding
+          // suppressed forever by a stamp nobody was alive to write.
+          if (!TERMINAL_INTAKE_STATES.has(previous.state)) {
+            return { outcome: "refused", reason: "finding_open" };
+          }
+          if (input.now - previous.updated_at < INTAKE_SUPPRESSION_MS) {
+            return { outcome: "refused", reason: "finding_recent" };
+          }
+        }
+      }
+
+      if (input.revert) {
+        const reverted = this.db.prepare(
+          "SELECT 1 FROM crash_revert_jobs WHERE merge_commit_sha = ?",
+        ).get(input.revert.mergeCommitSha) !== undefined;
+        if (reverted) return { outcome: "refused", reason: "already_reverted" };
+      }
+
+      const paused = this.db.prepare(
+        "SELECT 1 FROM project_admission_pauses WHERE project_id = ? AND cleared_at IS NULL",
+      ).get(input.projectId) !== undefined;
+      if (paused) return { outcome: "refused", reason: "project_paused" };
+
+      const occupied = this.db.prepare(
+        `SELECT 1 FROM job_admissions
+          WHERE project_id = ? AND state IN ('queued', 'admitted', 'draining') LIMIT 1`,
+      ).get(input.projectId) !== undefined;
+      if (occupied) return { outcome: "refused", reason: "open_job" };
+
+      const sourceUpdateId = this.nextAutonomousSourceUpdateId();
+      const jobId = createHash("sha256")
+        .update(`autonomous-job:${input.origin}:${sourceUpdateId}`, "utf8")
+        .digest("base64url")
+        .slice(0, 22);
+      const routing = classifyTaskTraits({
+        origin: "requested",
+        text: input.task,
+        ...(input.minimumRecipe === undefined ? {} : { ownerMinimumRecipe: input.minimumRecipe }),
+      });
+      const dispatchSettings = this.capabilityDispatchSettings();
+      const routingMode = routingModeForNewAttempt(
+        routing.recipe,
+        dispatchSettings.jobGraph,
+        this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
+      );
+      this.db.prepare(
+        `INSERT INTO jobs (
+           id, source_update_id, request_text, state, delivery_mode, task_recipe,
+           recipe_version, recipe_promotion_count, routing_mode, task_traits_json,
+           task_reason_codes_json, autonomous_origin, review_cycle, review_block_at,
+           version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'awaiting_project', ?, ?, 1, 0, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
+      ).run(
+        jobId,
+        sourceUpdateId,
+        input.task,
+        routing.recipe === "direct" ? "small_fix" : "full",
+        routing.recipe,
+        routingMode,
+        JSON.stringify(routing.traits),
+        JSON.stringify(routing.reasonCodes),
+        input.origin,
+        input.now,
+        input.now,
+      );
+      const created = this.readJobById(jobId);
+      if (!created) throw new Error("Autonomous job was not stored");
+
+      const selected = transition(created, {
+        type: "PROJECT_SELECTED",
+        projectId: policyRecord.policy.projectId,
+        policyVersion: policyRecord.version,
+        policy: policyRecord.policy,
+      }, input.now);
+      persistJobTransition(this.db, jobId, created.version, selected.job);
+      persistPendingEffects(this.db, selected.effects, input.now);
+      queueAdmissionInTransaction(this.db, {
+        jobId,
+        expectedVersion: selected.job.version,
+        projectId: policyRecord.policy.projectId,
+        resumeEvent: "CONFIRMED",
+        now: input.now,
+      });
+
+      if (input.intake) {
+        this.db.prepare(
+          `INSERT INTO audit_intake_findings (
+             project_id, fingerprint, audit_id, subject, job_id, utc_day, started_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(project_id, fingerprint) DO UPDATE SET
+             audit_id = excluded.audit_id,
+             subject = excluded.subject,
+             job_id = excluded.job_id,
+             utc_day = excluded.utc_day,
+             started_at = excluded.started_at`,
+        ).run(
+          input.projectId,
+          input.intake.fingerprint,
+          input.intake.auditId,
+          input.intake.subject,
+          jobId,
+          utcDay,
+          input.now,
+        );
+      }
+      if (input.revert) {
+        this.db.prepare(
+          `INSERT INTO crash_revert_jobs (
+             merge_commit_sha, project_id, merged_job_id, job_id, started_at
+           ) VALUES (?, ?, ?, ?, ?)`,
+        ).run(input.revert.mergeCommitSha, input.projectId, input.revert.mergedJobId, jobId, input.now);
+      }
+      return { outcome: "created", job: selected.job };
+    }).immediate();
+  }
+
+  /**
+   * A job nobody sent has no Telegram update behind it, and the column that
+   * would carry one is unique. Numbering above every id in the table keeps that
+   * uniqueness without ever colliding with a real update or with another
+   * autonomous job created in the same millisecond.
+   */
+  private nextAutonomousSourceUpdateId(): number {
+    const row = this.db.prepare(
+      "SELECT COALESCE(MAX(source_update_id), 0) AS highest FROM jobs",
+    ).get() as { highest: number };
+    if (!Number.isSafeInteger(row.highest)) throw new Error("Job source update ids are invalid");
+    return Math.max(AUTONOMOUS_SOURCE_UPDATE_BASE, row.highest + 1);
+  }
+
+  /** The auto-revert already started for this merge commit, if there was one. */
+  public getCrashRevertJob(mergeCommitSha: string): CrashRevertRecord | null {
+    assertFullSha(mergeCommitSha, "mergeCommitSha");
+    const row = this.db.prepare(
+      "SELECT * FROM crash_revert_jobs WHERE merge_commit_sha = ?",
+    ).get(mergeCommitSha) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      mergeCommitSha: String(row.merge_commit_sha),
+      projectId: String(row.project_id),
+      mergedJobId: String(row.merged_job_id),
+      jobId: String(row.job_id),
+      startedAt: Number(row.started_at),
+    };
+  }
+
+  /**
+   * This project's most recent completed merge, and whether a standing grant is
+   * what merged it.
+   *
+   * Deliberately the *latest* merge rather than the latest unattended one. "The
+   * last thing that landed here was unattended" is the question worth asking
+   * after production breaks; "an unattended merge happened at some point" is not,
+   * and answering the second while sounding like the first would revert work the
+   * owner merged themselves.
+   *
+   * A merge an automatic revert produced is reported as such rather than
+   * skipped over, so the caller can refuse outright instead of walking back to
+   * the merge that revert already undid.
+   */
+  public getLatestCompletedMerge(projectId: string): CompletedMergeRecord | null {
+    assertControllerIdentifier(projectId, "projectId");
+    const row = this.db.prepare(
+      `SELECT id, merge_commit_sha, merged_at, autonomous_origin FROM jobs
+        WHERE project_id = ? AND merge_commit_sha IS NOT NULL AND merged_at IS NOT NULL
+        ORDER BY merged_at DESC, id DESC LIMIT 1`,
+    ).get(projectId) as
+      { id: string; merge_commit_sha: string; merged_at: string; autonomous_origin: string | null } | undefined;
+    if (!row) return null;
+    const mergedAt = Date.parse(row.merged_at);
+    if (!Number.isFinite(mergedAt)) return null;
+    const unattended = this.db.prepare(
+      `SELECT 1 FROM merge_authority_events
+        WHERE project_id = ? AND job_id = ? AND action = 'used' LIMIT 1`,
+    ).get(projectId, row.id) !== undefined;
+    return {
+      jobId: row.id,
+      mergeCommitSha: row.merge_commit_sha,
+      mergedAt,
+      unattended,
+      automaticRevert: row.autonomous_origin === "crash_revert",
+    };
+  }
+
   public getJobBySourceUpdateId(sourceUpdateId: number): Job | null {
     assertNonNegativeInteger(sourceUpdateId, "sourceUpdateId");
     return this.readJobBySourceUpdate(sourceUpdateId);
@@ -11841,12 +12275,35 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return row.max_ordinal + 1;
   }
 
+  /**
+   * The consensus pass this job holds for one exact head, if it has one.
+   *
+   * Nothing about a consensus pass lives in memory: this row is what says
+   * whether one was ever spawned for this head and what it decided, so a
+   * restart mid-pass resumes it rather than starting a second one.
+   */
+  public getConsensusReviewAttempt(jobId: string, headSha: string): AttemptRecord | null {
+    if (!jobId) throw new TypeError("consensus attempt query is invalid");
+    assertFullSha(headSha, "headSha");
+    const row = this.db.prepare(
+      `SELECT id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha,
+              handoff_path, handoff_sha256, result_json, completed_at
+         FROM attempts
+        WHERE job_id = ? AND kind = 'review' AND review_stage = 'consensus'
+          AND review_lens = 'consensus' AND head_sha = ?
+        ORDER BY ordinal DESC, id
+        LIMIT 1`,
+    ).get(jobId, headSha) as Parameters<typeof parseAttempt>[0] | undefined;
+    return row ? parseAttempt(row) : null;
+  }
+
   public listReviewAttempts(
     jobId: string,
     reviewStage: NonNullable<AttemptRecord["reviewStage"]>,
     ordinal: number,
   ): AttemptRecord[] {
-    if (!jobId || !["review", "final_review"].includes(reviewStage) || !Number.isInteger(ordinal) || ordinal < 1) {
+    if (!jobId || !["review", "final_review", "consensus"].includes(reviewStage) ||
+      !Number.isInteger(ordinal) || ordinal < 1) {
       throw new TypeError("review attempt query is invalid");
     }
     const rows = this.db.prepare(
@@ -14177,6 +14634,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           ? ["repository_merge", "production_target"]
           : ["repository_merge"],
       });
+      // A project that deploys nothing finishes here rather than moving on to
+      // deploy, so this is where its slot is released and its owner is told.
+      // Every other project leaves this transition still running.
+      this.markAdmissionDrainingForTerminal(transitioned.job, boundaryNow);
+      this.enqueueFinishNoteInTransaction(current, transitioned.job, boundaryNow);
       if (input.outbox) persistOutbox(this.db, input.outbox, serializeOutbox(input.outbox, boundaryNow), boundaryNow);
       persistPendingEffects(this.db, transitioned.effects, boundaryNow);
       return true;
@@ -15194,7 +15656,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   private enqueueFinishNoteInTransaction(previous: Job, completed: Job, now: number): void {
-    if (previous.state === "complete" || completed.state !== "complete") return;
+    // A project that deploys nothing finishes at `merged` and never reaches
+    // `complete`, so the owner is told there instead of not at all.
+    const delivered = completed.state === "complete" || completed.state === "merged";
+    if (!delivered || previous.state === completed.state) return;
     const text = renderJobFinishNote(completed);
     const owner = this.getOwner();
     if (text === null || owner === null) return;
