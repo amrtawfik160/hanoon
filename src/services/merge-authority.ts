@@ -1,4 +1,4 @@
-import type { Job } from "../domain/models";
+import type { Job, ProjectPolicy } from "../domain/models";
 
 /**
  * A standing merge grant is the owner saying "you no longer need to ask me for
@@ -23,6 +23,58 @@ export type AutoApprovalDecision =
   | Readonly<{ outcome: "ask_owner"; reason: string }>;
 
 /**
+ * Where a live grant came from. The owner should always be able to tell the two
+ * apart: one was a tap they remember, the other is a line in a policy file.
+ */
+export type MergeGrantSource = "button" | "policy";
+
+export type LiveMergeGrant = Readonly<{ source: MergeGrantSource }>;
+
+/**
+ * Everything durable that decides whether a project may merge unattended,
+ * gathered by the caller and passed in whole. Keeping it in one shape means the
+ * rule below stays a pure function of storage rather than a second reader of
+ * it, and every caller asks the same question the same way.
+ */
+export type MergeGrantEvidence = Readonly<{
+  /** The standing approval the owner granted with the button, if any. */
+  grant: MergeAuthorityGrant | null;
+  /** When this project's authority was last withdrawn, from the append-only log. */
+  revokedAt: number | null;
+  /** When this project's current policy snapshot was stored. */
+  policyStoredAt: number | null;
+}>;
+
+type GrantPolicy = Pick<ProjectPolicy, "autonomy"> | null;
+
+/**
+ * A policy grant is a standing instruction in the project's own policy, so
+ * `/approvals off` has nothing to clear: the file cannot hear about the
+ * withdrawal. The revocation therefore silences it until a newer policy
+ * snapshot is stored — which only `project enable` does, and which is the owner
+ * saying it again deliberately rather than a stale file arguing with them.
+ */
+function policyGrantIsLive(policy: GrantPolicy, evidence: MergeGrantEvidence): boolean {
+  if (policy?.autonomy?.unattendedMerge !== true) return false;
+  if (evidence.revokedAt === null) return true;
+  return evidence.policyStoredAt !== null && evidence.policyStoredAt > evidence.revokedAt;
+}
+
+/**
+ * The one place that decides whether a project may merge without being asked,
+ * and on whose authority. Fail closed: anything unresolved is no grant.
+ */
+export function resolveMergeGrant(input: {
+  projectId: string | null;
+  policy: GrantPolicy;
+  evidence: MergeGrantEvidence;
+}): LiveMergeGrant | null {
+  if (grantIsLive(input.evidence.grant, input.projectId)) return { source: "button" };
+  if (input.projectId !== null && policyGrantIsLive(input.policy, input.evidence)) return { source: "policy" };
+  return null;
+}
+
+/**
  * Two remediation rounds means the change argued with its own review twice.
  * That is exactly the shape a standing grant should not cover: routine work
  * ships itself, work that fought back gets a human look.
@@ -41,15 +93,28 @@ function grantIsLive(grant: MergeAuthorityGrant | null, projectId: string | null
 
 /**
  * The owner is asked unless every condition for unattended merging holds. The
- * caller supplies the grant; this function never reads storage, so the rule is
- * testable on its own and cannot drift from what the tests assert.
+ * caller supplies the durable evidence; this function never reads storage, so
+ * the rule is testable on its own and cannot drift from what the tests assert.
  */
 export function decideAutoApproval(input: {
   job: AuthorityJob;
   grant: MergeAuthorityGrant | null;
+  /** Latest durable revocation for this project. Absent means none was recorded. */
+  revokedAt?: number | null;
+  /** When this project's current policy snapshot was stored. */
+  policyStoredAt?: number | null;
 }): AutoApprovalDecision {
   const { job, grant } = input;
-  if (!grantIsLive(grant, job.projectId)) {
+  const live = resolveMergeGrant({
+    projectId: job.projectId,
+    policy: job.policy,
+    evidence: {
+      grant,
+      revokedAt: input.revokedAt ?? null,
+      policyStoredAt: input.policyStoredAt ?? null,
+    },
+  });
+  if (live === null) {
     return { outcome: "ask_owner", reason: "no standing approval for this project" };
   }
   if (job.cancelRequestedAt !== null) {
@@ -58,7 +123,11 @@ export function decideAutoApproval(input: {
   if (!job.prHeadSha) {
     return { outcome: "ask_owner", reason: "the pull-request head is not established" };
   }
-  if (!job.policy?.production) {
+  // A project that merges without production has said so deliberately, and its
+  // policy carried the required checks and regression run to earn it. Every
+  // other project still stops here: with nothing configured to deploy the
+  // change, an unattended merge would be shipping into silence.
+  if (!job.policy?.production && job.policy?.autonomy?.mergeWithoutProduction !== true) {
     return { outcome: "ask_owner", reason: "the project has no production configuration" };
   }
   if (job.reviewCycle >= REMEDIATION_ASK_THRESHOLD) {

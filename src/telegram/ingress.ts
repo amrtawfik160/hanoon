@@ -9,6 +9,7 @@ import {
   type Job,
 } from "../domain/models";
 import type { MergeHandler } from "../services/merge-handler";
+import { resolveMergeGrant } from "../services/merge-authority";
 import {
   OWNER_MEMORY_SCOPE,
   type OutboxInput,
@@ -826,10 +827,16 @@ export class TelegramIngress {
     identity: { userId: string; chatId: string },
     now: number,
   ): string {
-    const projects = this.store.listEnabledProjectPolicies();
-    const live = projects.filter(({ policy }) => {
-      const grant = this.store.getMergeAuthority(policy.projectId);
-      return grant !== null && grant.revokedAt === null;
+    // Authority can come from a tap the owner remembers or from a line in the
+    // project's policy, and those feel very different to withdraw. The listing
+    // says which, so nobody has to guess why a project is on it.
+    const live = this.store.listEnabledProjectPolicies().flatMap(({ policy }) => {
+      const grant = resolveMergeGrant({
+        projectId: policy.projectId,
+        policy,
+        evidence: this.store.getMergeGrantEvidence(policy.projectId),
+      });
+      return grant === null ? [] : [{ policy, source: grant.source }];
     });
 
     const offMatch = /^off(?:\s+(.+))?$/i.exec(argument ?? "");
@@ -837,7 +844,10 @@ export class TelegramIngress {
       if (live.length === 0) {
         return "No project merges without asking. I will request approval every time.\n\nTap \"Merge + deploy, and always from now on\" on an approval message to change that.";
       }
-      const names = live.map(({ policy }) => `• ${policy.alias}`).join("\n");
+      const names = live
+        .map(({ policy, source }) =>
+          `• ${policy.alias} (${source === "button" ? "you granted this" : "set in its project policy"})`)
+        .join("\n");
       return `I merge and deploy these without asking:\n${names}\n\nSend /approvals off <name> to stop, or /approvals off for all of them.`;
     }
 
@@ -845,7 +855,7 @@ export class TelegramIngress {
     const targets = alias === null ? live : live.filter(({ policy }) => policy.alias === alias);
     if (targets.length === 0) {
       return alias === null
-        ? "Nothing to withdraw — no project merges without asking."
+        ? "Nothing to withdraw. No project merges without asking."
         : `No standing approval for "${alias}".`;
     }
     const withdrawn = targets.filter(({ policy }) => this.store.revokeMergeAuthority({
@@ -855,9 +865,15 @@ export class TelegramIngress {
       userId: identity.userId,
       chatId: identity.chatId,
     }));
+    // Said outright, because the policy file still asks for unattended merging
+    // and enabling the project again is what turns it back on. An owner who is
+    // not told that finds it back on later and has no idea why.
+    const policyNote = withdrawn.some(({ source }) => source === "policy")
+      ? "\n\nTheir policy still asks for it, so enabling the project again turns it back on."
+      : "";
     return withdrawn.length === 1
-      ? `Done. I will ask you before merging ${withdrawn[0].policy.alias} again.`
-      : `Done. I will ask you before merging any of those ${withdrawn.length} projects again.`;
+      ? `Done. I will ask you before merging ${withdrawn[0].policy.alias} again.${policyNote}`
+      : `Done. I will ask you before merging any of those ${withdrawn.length} projects again.${policyNote}`;
   }
 
   /**

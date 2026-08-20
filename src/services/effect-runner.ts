@@ -28,7 +28,7 @@ import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPol
 import type { PipelineStage } from "../domain/stage-execution";
 import { jobStageExecution } from "../domain/stage-routing";
 import { ApprovalService } from "./approval-service";
-import { decideAutoApproval } from "./merge-authority";
+import { decideAutoApproval, resolveMergeGrant } from "./merge-authority";
 import { buildWorkOrder, type CapabilityWorkOrderEnvelope } from "../bb/handoffs";
 import { buildPlanArtifact } from "../bb/pipeline-handoffs";
 import { environmentDiffText, type BbAttempt, type EnvironmentSnapshot, type PipelineThreadAttempt } from "../bb/runner";
@@ -1791,8 +1791,20 @@ export class EffectRunner {
    */
   private issueApproval(job: Job): void {
     if (!job.prHeadSha) throw new PermanentEffectError("approval requires an authoritative pull-request head");
-    const grant = job.projectId === null ? null : this.dependencies.store.getMergeAuthority(job.projectId);
-    const decision = decideAutoApproval({ job, grant });
+    const evidence = job.projectId === null
+      ? null
+      : this.dependencies.store.getMergeGrantEvidence(job.projectId);
+    const liveGrant = evidence === null ? null : resolveMergeGrant({
+      projectId: job.projectId,
+      policy: job.policy,
+      evidence,
+    });
+    const decision = decideAutoApproval({
+      job,
+      grant: evidence?.grant ?? null,
+      revokedAt: evidence?.revokedAt ?? null,
+      policyStoredAt: evidence?.policyStoredAt ?? null,
+    });
     if (decision.outcome === "auto_approve" && job.projectId !== null) {
       // Re-read before transitioning: the job may have drifted since this
       // effect was dispatched, and merging a head the owner has since
@@ -1816,7 +1828,7 @@ export class EffectRunner {
     this.enqueueStatus(job, {
       mergeNonce: issued.nonce,
       approvalExpiresAt: issued.expiresAt,
-      mergeAuthorityGranted: grant !== null && grant.revokedAt === null,
+      mergeAuthorityGranted: liveGrant !== null,
       ...(decision.outcome === "ask_owner" ? { approvalReason: decision.reason } : {}),
     });
   }

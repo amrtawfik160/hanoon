@@ -16,7 +16,11 @@ import {
   type WorkerKind,
   type WorkerRecoveryClassification,
 } from "../domain/models";
-import type { MergeAuthorityGrant } from "../services/merge-authority";
+import {
+  resolveMergeGrant,
+  type MergeAuthorityGrant,
+  type MergeGrantEvidence,
+} from "../services/merge-authority";
 import { classifyTaskTraits } from "../capabilities/routing";
 import {
   controllerBundleIdsFromProfile,
@@ -3330,6 +3334,7 @@ export interface TelegramAgentStore {
     now: number;
   }): boolean;
   getMergeAuthority(projectId: string): MergeAuthorityGrant | null;
+  getMergeGrantEvidence(projectId: string): MergeGrantEvidence;
   grantMergeAuthority(input: {
     projectId: string;
     userId: string;
@@ -9324,7 +9329,36 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     })();
   }
 
-  /** Returns true only when a live grant was actually withdrawn. */
+  /**
+   * Everything durable that decides whether this project may merge unattended:
+   * the button-granted standing approval, the latest withdrawal from the
+   * append-only log, and when the project's policy snapshot was stored. Read
+   * together so a caller cannot answer the question from half of it.
+   */
+  public getMergeGrantEvidence(projectId: string): MergeGrantEvidence {
+    assertControllerIdentifier(projectId, "projectId");
+    const revocation = this.db.prepare(
+      `SELECT MAX(occurred_at) AS revoked_at FROM merge_authority_events
+        WHERE project_id = ? AND action = 'revoked'`,
+    ).get(projectId) as { revoked_at: number | null } | undefined;
+    const policy = this.db.prepare(
+      "SELECT updated_at FROM project_policies WHERE project_id = ?",
+    ).get(projectId) as { updated_at: number } | undefined;
+    return {
+      grant: this.getMergeAuthority(projectId),
+      revokedAt: revocation?.revoked_at ?? null,
+      policyStoredAt: policy?.updated_at ?? null,
+    };
+  }
+
+  /**
+   * Withdraws every source of unattended merge authority this project has.
+   *
+   * Returns true only when something live was actually withdrawn. A grant the
+   * project's own policy declares has no row to clear — this cannot edit a
+   * policy file — so recording the withdrawal is what silences it, and it stays
+   * silenced until the owner enables the project again.
+   */
   public revokeMergeAuthority(input: {
     projectId: string;
     reason: string;
@@ -9336,10 +9370,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertNonNegativeInteger(input.now, "now");
     const reason = assertMemoryText(input.reason, 200, "revocation reason");
     return this.db.transaction((): boolean => {
-      const revoked = this.db.prepare(
+      const clearedGrant = this.db.prepare(
         `UPDATE merge_authority SET revoked_at = ?, revoked_reason = ?
           WHERE project_id = ? AND revoked_at IS NULL`,
       ).run(input.now, reason, input.projectId).changes === 1;
+      const policyRecord = this.getProjectPolicy(input.projectId);
+      const silencedPolicyGrant = resolveMergeGrant({
+        projectId: input.projectId,
+        policy: policyRecord?.policy ?? null,
+        evidence: { ...this.getMergeGrantEvidence(input.projectId), grant: null },
+      })?.source === "policy";
+      const revoked = clearedGrant || silencedPolicyGrant;
       if (revoked) {
         this.appendMergeAuthorityEvent({
           projectId: input.projectId,
