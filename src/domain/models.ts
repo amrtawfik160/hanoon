@@ -5,6 +5,7 @@ import type {
   GuardResultEnvelope,
 } from "../capabilities/guards";
 import {
+  consensusReviewSchema,
   executionProfileSchema,
   stageExecutionPolicySchema,
   type PipelineStage,
@@ -62,6 +63,39 @@ export const regressionPolicySchema = z
   })
   .strict();
 
+/**
+ * What this project may do without the owner in the loop. Every field is
+ * opt-in and absent by default: a policy with no `autonomy` block behaves
+ * exactly as it did before this existed — every merge asks, and a project with
+ * no production settings finishes at the reviewed pull request.
+ *
+ * The cross-field rules that make these safe are enforced where the whole
+ * policy is visible, in `projectPolicySchema` below, so they fail at
+ * `project enable` and at load rather than at the merge they would have
+ * governed.
+ */
+export const autonomyPolicySchema = z
+  .object({
+    /**
+     * Merge on the project's own standing authority, on exactly the terms of an
+     * owner-granted standing approval: it replaces the owner's signature and
+     * nothing else. Every gate that produced the merge candidate still runs.
+     */
+    unattendedMerge: z.boolean().default(false),
+    /**
+     * Merge a project that deploys nothing. Without this a reviewed pull
+     * request with no production settings is finished work, not a merge
+     * candidate.
+     */
+    mergeWithoutProduction: z.boolean().default(false),
+    /**
+     * The route a consensus review pass runs on. Absent means the strong route
+     * of whichever provider the job's review stage did not use.
+     */
+    consensusReview: consensusReviewSchema.optional(),
+  })
+  .strict();
+
 export const projectPolicySchema = z
   .object({
     projectId: z.string().startsWith("proj_"),
@@ -83,6 +117,8 @@ export const projectPolicySchema = z
      * stored with them must keep running.
      */
     stageExecution: stageExecutionPolicySchema.optional(),
+    /** Absent means today's behaviour: nothing happens without the owner. */
+    autonomy: autonomyPolicySchema.optional(),
     validationCommands: z.array(policyCommandSchema).max(20),
     production: productionPolicySchema.optional(),
     regression: regressionPolicySchema.optional(),
@@ -107,8 +143,40 @@ export const projectPolicySchema = z
         });
       }
     }
+    // A project that deploys is a project that can break production, and
+    // nobody is watching an unattended merge do it. A rollback command is the
+    // one thing that turns that from an incident into a recovery, so it is
+    // required before the owner's signature may be skipped.
+    if (policy.autonomy?.unattendedMerge && policy.production && !policy.production.rollbackCommand) {
+      context.addIssue({
+        code: "custom",
+        path: ["autonomy", "unattendedMerge"],
+        message: "Unattended merging of a project with production requires production.rollbackCommand",
+      });
+    }
+    // Merging without production removes the deploy and canary that would
+    // otherwise prove the merged change works. Required checks and a scheduled
+    // regression run are what is left to notice a bad merge, so both must exist
+    // before the pipeline may finish this way.
+    if (policy.autonomy?.mergeWithoutProduction) {
+      if (policy.requiredChecks.length === 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["autonomy", "mergeWithoutProduction"],
+          message: "Merging without production requires at least one required check",
+        });
+      }
+      if (!policy.regression) {
+        context.addIssue({
+          code: "custom",
+          path: ["autonomy", "mergeWithoutProduction"],
+          message: "Merging without production requires a configured regression policy",
+        });
+      }
+    }
   });
 
+export type AutonomyPolicy = z.infer<typeof autonomyPolicySchema>;
 export type PolicyCommand = z.infer<typeof policyCommandSchema>;
 export type ProductionPolicy = z.infer<typeof productionPolicySchema>;
 export type RegressionPolicy = z.infer<typeof regressionPolicySchema>;

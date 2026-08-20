@@ -642,6 +642,55 @@ it("builds and validates individual policy fields including repeatable controls 
   });
 });
 
+it("grants unattended merging from a flag only when the project can roll back", async () => {
+  const { harness, store } = await loadPlugin();
+  stubProject(harness);
+  const productionFlags = [
+    "--deploy-json", JSON.stringify({ name: "deploy", command: "npm run deploy", timeoutMs: 60_000 }),
+    "--canary-json", JSON.stringify({ name: "health", command: "npm run canary", timeoutMs: 60_000 }),
+  ];
+
+  const refused = await harness.behavior.runCli([
+    "project", "enable", "proj_1",
+    "--alias", "operator-policy",
+    "--base", "main",
+    "--merge-method", "squash",
+    ...productionFlags,
+    "--unattended-merge",
+  ]);
+
+  expect(refused.exitCode).toBe(1);
+  expect(store.getProjectPolicy("proj_1")).toBeNull();
+
+  const accepted = await harness.behavior.runCli([
+    "project", "enable", "proj_1",
+    "--alias", "operator-policy",
+    "--base", "main",
+    "--merge-method", "squash",
+    ...productionFlags,
+    "--rollback-json", JSON.stringify({ name: "rollback", command: "npm run rollback", timeoutMs: 60_000 }),
+    "--unattended-merge",
+  ]);
+
+  expect(accepted.exitCode).toBe(0);
+  expect(store.getProjectPolicy("proj_1")?.policy.autonomy).toMatchObject({ unattendedMerge: true });
+});
+
+it("leaves the autonomy block absent when no flag asks for it", async () => {
+  const { harness, store } = await loadPlugin();
+  stubProject(harness);
+
+  const result = await harness.behavior.runCli([
+    "project", "enable", "proj_1",
+    "--alias", "operator-policy",
+    "--base", "main",
+    "--merge-method", "squash",
+  ]);
+
+  expect(result.exitCode).toBe(0);
+  expect(store.getProjectPolicy("proj_1")?.policy.autonomy).toBeUndefined();
+});
+
 it("rejects a production target flag without complete deploy and canary configuration", async () => {
   const { harness, store } = await loadPlugin();
   stubProject(harness);

@@ -117,6 +117,10 @@ const PROJECT_ENABLE_FLAGS: Record<string, FlagSpec> = {
   "production-target-key": { kind: "value" },
   "rollback-json": { kind: "value" },
   "convex-deploy-required": { kind: "flag" },
+  // `mergeWithoutProduction` has no flag on purpose: it requires a regression
+  // policy, which only the policy file can express, so a flag for it could
+  // never parse.
+  "unattended-merge": { kind: "flag" },
   "required-check": { kind: "value", repeatable: true },
   "redact-pattern": { kind: "value", repeatable: true },
   "worker-liveness-watchdog-ms": { kind: "value" },
@@ -540,6 +544,7 @@ function individualPolicy(
         convexDeployRequired: parsed.flags.has("convex-deploy-required"),
       },
     } : {}),
+    ...(parsed.flags.has("unattended-merge") ? { autonomy: { unattendedMerge: true } } : {}),
     requiredChecks: parsed.repeated.get("required-check") ?? [],
     outputRedactionPatterns: parsed.repeated.get("redact-pattern") ?? [],
     workerLivenessWatchdogMs: readOptionalInteger(parsed, "worker-liveness-watchdog-ms", "--worker-liveness-watchdog-ms", 60_000, 3_600_000),
@@ -591,6 +596,7 @@ async function enableProject(
     "production-target-key",
     "rollback-json",
     "convex-deploy-required",
+    "unattended-merge",
     "required-check",
     "redact-pattern",
     "worker-liveness-watchdog-ms",

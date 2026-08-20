@@ -146,6 +146,32 @@ export const STAGE_TIER_ROUTES: Readonly<Record<StageTier, StageTierRoute>> = Ob
   strong: Object.freeze({ providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "xhigh" as const }),
 });
 
+/**
+ * The strongest route each provider offers. A consensus pass exists to be a
+ * second opinion, so it runs on a provider the job's review stage did not use;
+ * without this table the strong tier would send it straight back to the model
+ * that already read this change. `pi` is deliberately absent: its one catalog
+ * model is the cheap model for short threads, never a pipeline reviewer.
+ */
+export const PROVIDER_STRONG_ROUTES: Readonly<Record<string, StageTierRoute>> = Object.freeze({
+  codex: Object.freeze({ providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "xhigh" as const }),
+  "claude-code": Object.freeze({
+    providerId: "claude-code",
+    model: "claude-opus-5[1m]",
+    reasoningLevel: "xhigh" as const,
+  }),
+});
+
+/**
+ * The strong route of some provider other than `providerId`, or null when the
+ * catalog offers no second opinion. Null is an answer, not a failure: the
+ * caller falls back to asking the owner rather than re-reviewing on the same
+ * model and calling that independent.
+ */
+export function alternateStrongRoute(providerId: string): StageTierRoute | null {
+  return Object.values(PROVIDER_STRONG_ROUTES).find((route) => route.providerId !== providerId) ?? null;
+}
+
 export type StageDefault = Readonly<{
   tier: StageTier;
   /** How many tiers this stage may climb across retries. */
@@ -255,6 +281,32 @@ export const stageExecutionProfileSchema = z
   });
 
 export type StageExecutionProfile = z.infer<typeof stageExecutionProfileSchema>;
+
+/**
+ * The second opinion a project may pin for a consensus review pass. Provider
+ * and model are both required, because the point of the pass is a route the
+ * job's own reviewer did not use: a tier on its own would resolve straight back
+ * to the model that already looked at this change. Validated against the same
+ * catalog as every other stage entry, so a route no provider offers fails when
+ * the policy is saved rather than when the pass is spawned.
+ */
+export const consensusReviewSchema = z
+  .object({
+    providerId: z.string().min(1),
+    model: z.string().min(1),
+    reasoningLevel: z.enum(REASONING_LEVELS).optional(),
+    serviceTier: z.enum(SERVICE_TIERS).optional(),
+    permissionMode: z.enum(PERMISSION_MODES).optional(),
+  })
+  .strict()
+  .superRefine((profile, context) => {
+    const validation = validateStageModel(profile);
+    if (!validation.ok) {
+      context.addIssue({ code: "custom", path: ["model"], message: validation.message });
+    }
+  });
+
+export type ConsensusReviewProfile = z.infer<typeof consensusReviewSchema>;
 
 export const stageExecutionPolicySchema = z
   .object({
