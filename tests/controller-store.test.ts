@@ -1432,9 +1432,82 @@ it("acknowledges an owner message folded into the running answer", () => {
   })).toBe("settled");
 
   expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "completed" });
-  const notice = store.getOutbox(`controller:${waiting.id}:reply`);
+  const notice = store.getOutbox(`controller:${running.id}:steer-folded`);
   expect(notice?.payload.text).toMatch(/answer i'm already writing|already writing/i);
   expect(notice?.chatId).toBe("7");
+});
+
+// Three system daily checks folded into a running answer at 09:19 and the
+// owner's phone showed "Got that" twice — acknowledging messages the owner
+// never sent. The bubble exists so an owner's own words don't look ignored;
+// a system injection owes no bubble at all.
+it("sends no folded acknowledgement for a system-origin injection", () => {
+  const { store } = fixture();
+  const { turn: running, fence } = submittedTurn(store, "thr_system_fold");
+  const waiting = store.enqueueControllerTurn({
+    ...turnInput(78_020, "Daily check on cyndra-saas:\ntech-debt: could not run"),
+    origin: "system" as const,
+  });
+  expect(store.reserveControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    expectedThreadId: "thr_system_fold",
+  })).toBe(true);
+
+  expect(store.settleControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: waiting.id,
+    controllerKey: running.controllerKey,
+    outcome: "applied",
+  })).toBe("settled");
+
+  expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "completed" });
+  const announcements = store.listOutbox(50)
+    .filter((row) => /already writing/i.test(String(row.payload.text ?? "")));
+  expect(announcements).toHaveLength(0);
+});
+
+// The outbox drains sub-second, so a duplicate check that only looks for a
+// still-undelivered acknowledgement almost never fires: the first bubble is
+// sent before the second fold settles. One acknowledgement per running
+// answer, however fast delivery is.
+it("acknowledges two owner messages folded into one answer exactly once", () => {
+  const { store } = fixture();
+  const { turn: running, fence } = submittedTurn(store, "thr_double_fold");
+  const first = store.enqueueControllerTurn(turnInput(78_030, "also check the deploy"));
+  const second = store.enqueueControllerTurn(turnInput(78_031, "and the logs too"));
+  const fold = (waitingTurnId: string) => {
+    expect(store.reserveControllerSteer({
+      ...fence,
+      runningTurnId: running.id,
+      waitingTurnId,
+      controllerKey: running.controllerKey,
+      expectedThreadId: "thr_double_fold",
+    })).toBe(true);
+    expect(store.settleControllerSteer({
+      ...fence,
+      runningTurnId: running.id,
+      waitingTurnId,
+      controllerKey: running.controllerKey,
+      outcome: "applied",
+    })).toBe("settled");
+  };
+
+  fold(first.id);
+  const leased = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
+  const announcement = leased.find((row) => /already writing/i.test(String(row.payload.text ?? "")));
+  expect(announcement).toBeDefined();
+  expect(store.completeOutbox(
+    announcement!.logicalKey, fence.ownerId, fence.generation, 900, fence.now,
+  )).toBe(true);
+
+  fold(second.id);
+  const announcements = store.listOutbox(50)
+    .filter((row) => /already writing/i.test(String(row.payload.text ?? "")));
+  expect(announcements).toHaveLength(1);
 });
 
 it("preserves an ambiguously steered owner message and inherits exact receipts", () => {

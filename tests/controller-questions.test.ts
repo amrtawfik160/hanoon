@@ -878,7 +878,7 @@ it("hands a message sent mid-answer to the thread already writing it", async () 
   expect(store.getControllerTurn(correction.id)?.state).toBe("completed");
   // The running answer still owns the reply; the correction gets no second one.
   // A folded message still draws a bubble, so the owner can see it landed.
-  expect(store.getOutbox(`controller:${correction.id}:reply`)?.payload.text)
+  expect(store.getOutbox(`controller:${running.id}:steer-folded`)?.payload.text)
     .toMatch(/already writing/i);
   expect(store.getControllerTurn(running.id)?.state).toBe("submitted");
 });
