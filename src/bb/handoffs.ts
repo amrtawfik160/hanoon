@@ -231,6 +231,12 @@ export function buildReviewPacket(
   reviewLens: "quality" | "risk" | "consensus" = "quality",
   capability?: CapabilityWorkOrderEnvelope,
   reviewStage?: "diff-guards" | "review" | "task-review" | "integrated-review",
+  /** The exact command that produced `diff`, so the reviewer verifies the
+   * digest against the same source instead of improvising a local diff. A
+   * local `<base>...HEAD` reads against whatever the worktree's base ref
+   * happens to be, and a stale one once put nine thousand of main's own
+   * lines in front of a reviewer as if this job had written them. */
+  diffSource?: string,
 ): HandoffArtifact {
   const prNumber = job.prNumber;
   if (typeof prNumber !== "number" || !Number.isInteger(prNumber) || prNumber < 1) {
@@ -299,6 +305,7 @@ export function buildReviewPacket(
     },
     capabilityProfile: capability ?? null,
     diffDigest,
+    diffSource: diffSource ?? null,
     guardContract,
     lensInstruction: reviewLens === "risk"
       ? "Focus independently on security, destructive actions, data integrity, concurrency, rollback, and operational failure modes."

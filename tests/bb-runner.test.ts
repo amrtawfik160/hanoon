@@ -335,6 +335,26 @@ it("spawns review as a hidden child in the exact implementation environment", as
   });
 });
 
+// A stale local base ref once served a reviewer nine thousand lines of main's
+// own history as this job's diff, and every review cycle demanded fixes to
+// code the job never touched until it hit its review limit. GitHub's own
+// pull-request diff reads against the true remote base, which is also exactly
+// what a merge would land.
+it("prefers the GitHub pull-request diff over the environment snapshot", async () => {
+  const { calls, runner } = runnerFixture();
+  const reviewAttempt = attempt("attempt_review_preferred");
+
+  await runner.spawnReview(selectedJob, reviewAttempt, policyFixture());
+
+  const uploaded = calls.attachments[0] as { clientFile: Uint8Array };
+  const packet = JSON.parse(new TextDecoder().decode(uploaded.clientFile)) as {
+    diff: string;
+    diffSource: string;
+  };
+  expect(packet.diff).toContain("fallback");
+  expect(packet.diffSource).toBe("gh pr diff 42");
+});
+
 it("falls back to the GitHub pull-request diff when the environment snapshot is truncated", async () => {
   const { calls, runner } = runnerFixture();
   const reviewAttempt = attempt("attempt_review_truncated");
