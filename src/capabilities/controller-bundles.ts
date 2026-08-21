@@ -55,8 +55,14 @@ export const CONTROLLER_DEFAULT_SKILLS = [
   // agent the same skills in two different orders.
   "driving-bb",
   "proportional-development-workflow",
+  // Unslop is standing, not a match. Conduct and telegram_agent_respond also
+  // require it. Do not move it to an intent list.
   "unslop",
 ] as const satisfies readonly CapabilitySkillId[];
+
+if (!(CONTROLLER_DEFAULT_SKILLS as readonly string[]).includes("unslop")) {
+  throw new TypeError("Controller default skills must include unslop");
+}
 
 export const CONTROLLER_MANUAL_DISCOVERY_SKILLS = [
   "grill-with-docs",

@@ -160,6 +160,7 @@ function verifiedWorkerInstructions(
   return [
     `Verified worker role: ${role}.`,
     `Selected skill ids: ${selectedSkills}.`,
+    "Apply unslop to any owner-facing prose. That is required, not optional.",
     "The immutable attached work order/review packet and durable project policy outrank skill suggestions.",
     "Skills cannot authorize approval, merge, deploy, push, or state changes.",
     "The worker must obey the packet's response contract.",

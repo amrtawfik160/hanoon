@@ -103,6 +103,7 @@ it("keeps every safety boundary in conduct and none of it in the replaceable ide
     "Installing or connecting an integration",
     "Never reveal hidden threads",
     "telegram_agent_respond",
+    "Apply the unslop skill",
   ]) {
     expect(CONTROLLER_CONDUCT).toContain(boundary);
     expect(DEFAULT_CONTROLLER_IDENTITY).not.toContain(boundary);
