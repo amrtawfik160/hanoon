@@ -9831,11 +9831,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  /**
+   * A failed monitor shows in the default view alongside the armed ones. It is
+   * the state that most needs acting on and the one the owner cannot see any
+   * other way: filtering it out left a dead schedule visible only behind
+   * `includeFinished`, which is the same view that carries every settled
+   * monitor ever created.
+   */
   public listMonitors(controllerKey: string, includeFinished: boolean): MonitorRecord[] {
     assertControllerKey(controllerKey);
     const rows = this.db.prepare(
       `SELECT * FROM monitors
-        WHERE controller_key = ? AND system_key IS NULL AND (? = 1 OR state = 'armed')
+        WHERE controller_key = ? AND system_key IS NULL AND (? = 1 OR state IN ('armed', 'failed'))
         ORDER BY created_at DESC LIMIT ?`,
     ).all(controllerKey, includeFinished ? 1 : 0, MAX_ARMED_MONITORS * 4) as MonitorRow[];
     return rows.map(parseMonitor);
@@ -9860,9 +9867,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   public cancelControllerMonitor(controllerKey: string, id: string, now: number): boolean {
     assertControllerKey(controllerKey);
     assertNonNegativeInteger(now, "now");
+    // Cancelling a failed monitor is how a dead schedule is cleared from the
+    // list once it has been dealt with. Without it the only way to stop seeing
+    // one was to stop being able to see it at all.
     return this.db.prepare(
       `UPDATE monitors SET state = 'cancelled', updated_at = ?
-        WHERE controller_key = ? AND id = ? AND system_key IS NULL AND state = 'armed'`,
+        WHERE controller_key = ? AND id = ? AND system_key IS NULL AND state IN ('armed', 'failed')`,
     ).run(now, controllerKey, id).changes === 1;
   }
 

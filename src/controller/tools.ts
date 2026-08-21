@@ -718,12 +718,59 @@ function monitorProjection(monitor: MonitorRecord) {
     cron: monitor.cron,
     instruction: monitor.instruction,
     state: monitor.state,
+    // Why a monitor stopped, so a dead schedule reads as dead rather than as
+    // one that has simply not come round yet.
+    lastError: monitor.lastError,
     // A thread watch carries a due time only as its settling window, which is
     // plumbing rather than a schedule. Reporting it as a next-due time would
     // read as "this fires then", which is exactly what a thread watch does not do.
     nextDueAt: monitor.kind === "schedule" ? monitor.dueAt : null,
     fireCount: monitor.fireCount,
   };
+}
+
+/**
+ * A monitor's instruction is a paragraph the agent wrote to itself, and this
+ * result has a hard byte limit. Sixty-odd of them overran it, and an overrun
+ * fails the whole call — so asking to see finished monitors, the only way to
+ * find a schedule that had died, returned nothing at all.
+ *
+ * Rows are packed newest-first within a budget, with anything still armed or
+ * failed placed first and given room for its full instruction; settled history
+ * keeps a recognisable opening. At least one row always survives, and whatever
+ * did not fit is counted rather than quietly dropped.
+ */
+const MONITOR_LIST_BUDGET_BYTES = 6_000;
+const LIVE_INSTRUCTION_CHARS = 400;
+const SETTLED_INSTRUCTION_CHARS = 120;
+
+function needsAttention(monitor: MonitorRecord): boolean {
+  return monitor.state === "armed" || monitor.state === "failed";
+}
+
+function clipInstruction(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit).trimEnd()}…`;
+}
+
+function packMonitorList(monitors: MonitorRecord[]) {
+  const ordered = [...monitors].sort((left, right) =>
+    Number(needsAttention(right)) - Number(needsAttention(left)) || right.createdAt - left.createdAt);
+  const packed: ReturnType<typeof monitorProjection>[] = [];
+  let bytes = 0;
+  for (const monitor of ordered) {
+    const row = {
+      ...monitorProjection(monitor),
+      instruction: clipInstruction(
+        monitor.instruction,
+        needsAttention(monitor) ? LIVE_INSTRUCTION_CHARS : SETTLED_INSTRUCTION_CHARS,
+      ),
+    };
+    const size = Buffer.byteLength(JSON.stringify(row), "utf8");
+    if (packed.length > 0 && bytes + size > MONITOR_LIST_BUDGET_BYTES) break;
+    packed.push(row);
+    bytes += size;
+  }
+  return { monitors: packed, omitted: ordered.length - packed.length };
 }
 
 /**
@@ -2211,11 +2258,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     parameters: z.object({ includeFinished: z.boolean().default(false) }).strict(),
     execute: (params, context) => {
       const controller = authorizedController(dependencies.store, context);
-      return {
-        monitors: dependencies.store
-          .listMonitors(controller.controllerKey, params.includeFinished)
-          .map(monitorProjection),
-      };
+      return packMonitorList(dependencies.store.listMonitors(controller.controllerKey, params.includeFinished));
     },
   });
 
