@@ -1,6 +1,7 @@
 import {
   isResumablePermanentFailure,
   isResumablePlanBlock,
+  isResumableConfigurationBlock,
   isReviewedPrCompletionBlock,
   isSmallFixJob,
   mergesWithoutProduction,
@@ -890,6 +891,17 @@ function transitionBlocked(job: Job, event: JobEvent, effects: JobEffect[]): voi
     return;
   }
   if (job.prNumber !== null) {
+    // A configuration block means the review group settled against this very
+    // head (a dirty worktree, drifted evidence). Resuming pinned to it replays
+    // that settled verdict within a reconcile pass and re-blocks. Re-resolving
+    // the head gives the job fresh validation and a fresh review group.
+    if (isResumableConfigurationBlock(job)) {
+      job.blockedReason = null;
+      job.lastError = null;
+      job.resumeState = null;
+      invalidateDriftedHead(job, effects);
+      return;
+    }
     resumeFromExistingPr(job, effects);
     return;
   }
