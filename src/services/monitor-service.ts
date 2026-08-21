@@ -75,10 +75,17 @@ const MONITOR_CLOCK_EPOCH_MS = 1_700_000_000_000;
 const CAPABILITY_NOTICE_POLICY =
   "For capability routing, notify only for a denial, material escalation, substitute use, exhausted recovery, missing mandatory evidence, or an owner decision.";
 
-function firedPrompt(monitor: MonitorRecord, reason: string): string {
-  const cleanup = monitor.kind === "schedule"
-    ? "\nThis schedule repeats. Cancel it now if its purpose is complete, obsolete, or polling live work; use a thread_idle monitor for live work instead.\n"
-    : "";
+/**
+ * `stopped` marks a schedule's final firing. The wake-up still carries the
+ * instruction, but the agent is told the schedule is over, so it reports that
+ * rather than leaving the owner waiting on a run that will never come.
+ */
+function firedPrompt(monitor: MonitorRecord, reason: string, stopped: boolean): string {
+  const cleanup = monitor.kind !== "schedule"
+    ? ""
+    : stopped
+      ? `\nThis is this schedule's last firing. Its next run time could not be worked out from \`${monitor.cron}\`, so it is now marked failed and will not fire again. Do the work below, then tell the owner the schedule stopped, and arm a fresh one if it still matters.\n`
+      : "\nThis schedule repeats. Cancel it now if its purpose is complete, obsolete, or polling live work; use a thread_idle monitor for live work instead.\n";
   return `A monitor you set has fired.\n\nMonitor id: ${monitor.id}\nMonitor kind: ${monitor.kind}\n` +
     `Why: ${reason}\nWhat you said to do: ${monitor.instruction}\n${cleanup}\n` +
     `Do it now. ${CAPABILITY_NOTICE_POLICY} Message the owner only if something needs their decision or a job finished or failed. If nothing meaningful changed, stay silent.`;
@@ -402,18 +409,24 @@ export class MonitorService {
     const nextDueAt = monitor.kind === "schedule" && monitor.cron
       ? nextCronOccurrence(monitor.cron, now)
       : null;
-    if (monitor.kind === "schedule" && nextDueAt === null) {
-      this.dependencies.store.failMonitor({ id: monitor.id, error: "Schedule could not be advanced", now });
-      return false;
-    }
+    // A schedule whose next run cannot be worked out is over — but it is over
+    // *now*, at the moment it was due. Failing it without firing swallowed the
+    // one wake-up the owner was waiting on: the work never ran, and nothing
+    // said so, so from the outside the schedule simply stopped existing. Mark
+    // it failed first, because that is what stops the replay, then still
+    // deliver its last firing.
+    const stopped = monitor.kind === "schedule" && nextDueAt === null;
     // Claiming the monitor first means a crash mid-fire cannot replay it.
-    if (!this.dependencies.store.recordMonitorFired({ id: monitor.id, nextDueAt, now })) return false;
+    const claimed = stopped
+      ? this.dependencies.store.failMonitor({ id: monitor.id, error: "Schedule could not be advanced", now })
+      : this.dependencies.store.recordMonitorFired({ id: monitor.id, nextDueAt, now });
+    if (!claimed) return false;
     this.dependencies.store.enqueueControllerTurn({
       controllerKey: monitor.controllerKey,
       telegramUserId: owner.userId,
       telegramChatId: owner.chatId,
       updateId: this.issueUpdateId(now),
-      inputText: firedPrompt(monitor, reason),
+      inputText: firedPrompt(monitor, reason, stopped),
       origin: "system",
       now,
     });
