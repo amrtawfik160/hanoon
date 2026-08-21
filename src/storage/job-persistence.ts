@@ -56,6 +56,7 @@ export type JobRow = {
   review_cycle: number;
   review_block_at: number;
   cancel_requested_at: number | null;
+  merge_pre_approved_at: number | null;
   blocked_reason: Job["blockedReason"];
   last_error: string | null;
   version: number;
@@ -309,6 +310,7 @@ export function parseJobRow(row: JobRow): Job {
     reviewCycle: row.review_cycle,
     reviewBlockAt: row.review_block_at,
     cancelRequestedAt: row.cancel_requested_at,
+    mergePreApprovedAt: row.merge_pre_approved_at,
     blockedReason: row.blocked_reason,
     lastError: row.last_error,
     version: row.version,
@@ -355,7 +357,7 @@ export function persistJobTransition(
          deployment_summary = ?, canary_summary = ?, status_message_id = ?, delivery_mode = ?,
          task_recipe = ?, recipe_version = ?, recipe_promotion_count = ?, routing_mode = ?,
          task_traits_json = ?, task_reason_codes_json = ?, plan_cycle = ?, review_cycle = ?,
-         review_block_at = ?, cancel_requested_at = ?, blocked_reason = ?,
+         review_block_at = ?, cancel_requested_at = ?, merge_pre_approved_at = ?, blocked_reason = ?,
          last_error = ?, version = ?, updated_at = ?
        WHERE id = ? AND version = ?`,
     )
@@ -390,6 +392,7 @@ export function persistJobTransition(
       transitionedJob.reviewCycle,
       transitionedJob.reviewBlockAt,
       transitionedJob.cancelRequestedAt,
+      transitionedJob.mergePreApprovedAt,
       transitionedJob.blockedReason,
       transitionedJob.lastError,
       transitionedJob.version,
@@ -433,8 +436,8 @@ export const JOB_SELECT = `
          delivery_mode, task_recipe, recipe_version, recipe_promotion_count, routing_mode,
          task_traits_json, task_reason_codes_json, job_origin, autonomous_origin,
          adopted_branch, adopted_head_sha,
-         plan_cycle, review_cycle, review_block_at, cancel_requested_at, blocked_reason,
-         last_error, version, created_at, updated_at
+         plan_cycle, review_cycle, review_block_at, cancel_requested_at, merge_pre_approved_at,
+         blocked_reason, last_error, version, created_at, updated_at
     FROM jobs`;
 
 export function readJobById(db: SqliteDatabase, jobId: string): Job | null {

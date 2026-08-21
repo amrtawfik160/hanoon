@@ -2330,6 +2330,10 @@ CREATE INDEX crash_revert_jobs_project
   ON crash_revert_jobs (project_id, started_at);
 `] as const;
 
+export const MERGE_PRE_APPROVAL_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN merge_pre_approved_at INTEGER;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2403,4 +2407,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_VOICE_INBOX_MIGRATIONS,
   ...CONSENSUS_REVIEW_MIGRATIONS,
   ...AUTONOMOUS_INTAKE_MIGRATIONS,
+  ...MERGE_PRE_APPROVAL_MIGRATIONS,
 ] as const;

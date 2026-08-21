@@ -548,3 +548,25 @@ it("keeps head receipts guarded by the pure transition before persisting validat
     "run_validation",
   ]);
 });
+
+// "you have my approval" names no job. With one live job it can only mean
+// that one; with two it approves neither; a job already finished for good
+// takes no approval at all.
+it("records an advance merge approval only where it is unambiguous", () => {
+  const { db, store } = storeFixture();
+  const only = store.createJob({ id: "job_pre_approve", sourceUpdateId: 301, requestText: "work", now: 1_000 });
+
+  expect(store.recordMergePreApproval({ namedJobId: null, now: 1_100 }))
+    .toEqual({ outcome: "recorded", jobId: only.id });
+  expect(store.getJob(only.id)?.mergePreApprovedAt).toBe(1_100);
+
+  store.createJob({ id: "job_pre_second", sourceUpdateId: 302, requestText: "more work", now: 1_200 });
+  expect(store.recordMergePreApproval({ namedJobId: null, now: 1_300 }))
+    .toEqual({ outcome: "rejected" });
+  expect(store.recordMergePreApproval({ namedJobId: "job_pre_second", now: 1_400 }))
+    .toEqual({ outcome: "recorded", jobId: "job_pre_second" });
+
+  db.prepare("UPDATE jobs SET state = 'merged' WHERE id = ?").run(only.id);
+  expect(store.recordMergePreApproval({ namedJobId: only.id, now: 1_500 }))
+    .toEqual({ outcome: "rejected" });
+});

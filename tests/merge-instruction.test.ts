@@ -22,6 +22,41 @@ it("reads a plain instruction to land the work", () => {
   }
 });
 
+// "you have my approval", answered to the agent's own request for merge
+// approval, was refused; the merge died and the turn burned its budget
+// trying to work around its own guard. A grant that names approval itself is
+// as unambiguous as the imperative.
+it("reads an explicit grant of approval", () => {
+  for (const message of [
+    "you have my approval",
+    "You have my approval.",
+    "I approve",
+    "i approve it",
+    "approved",
+    "Approved!",
+    "approval granted",
+    "please, you have my approval",
+  ]) {
+    expect(isMergeInstruction(message), message).toBe(true);
+  }
+});
+
+it("refuses approval talk that grants nothing", () => {
+  for (const message of [
+    "do I have your approval?",
+    "do you need my approval?",
+    "approved once CI passes",
+    "not approved",
+    "I approve of the plan to ask first",
+    "you would have my approval if the tests passed",
+    "go ahead",
+    "yes",
+    "sounds good",
+  ]) {
+    expect(isMergeInstruction(message), message).toBe(false);
+  }
+});
+
 it("refuses anything conditional, deferred, or hypothetical", () => {
   // A false positive merges work the owner did not ask to merge, so every one
   // of these has to fall through to the button.

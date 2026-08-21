@@ -240,7 +240,10 @@ export type ApprovalCallbackInput = {
 
 export type MergeCallbackResult =
   | { outcome: "accepted" }
-  | { outcome: "rejected" };
+  | { outcome: "rejected" }
+  /** The approval arrived before the gate and was durably recorded on the job,
+   * to be consumed the moment the approval is issued. */
+  | { outcome: "recorded"; jobId: string };
 
 export type ExecuteMergeEffectInput = {
   effect: StoredEffect;
@@ -461,6 +464,16 @@ export class MergeHandler {
     }
     const liveApprovals = this.options.store.listLiveMergeApprovals(now);
     const live = liveApprovals.find((candidate) => candidate.record.jobId === input.jobId) ?? null;
+    // No approval has been issued yet: the owner is approving in advance.
+    // Their word is recorded on the job and consumed when the gate issues, so
+    // it cannot die in an approval window the owner never saw. Ambiguity still
+    // refuses: with several live jobs, the owner must name one.
+    if (!live && liveApprovals.length === 0) {
+      return this.options.store.recordMergePreApproval({
+        namedJobId: instructionNamesJob(input.instructionText, input.jobId) ? input.jobId : null,
+        now,
+      });
+    }
     if (!live) return { outcome: "rejected" };
     const namedJobs = liveApprovals.filter((candidate) =>
       instructionNamesJob(input.instructionText, candidate.record.jobId));

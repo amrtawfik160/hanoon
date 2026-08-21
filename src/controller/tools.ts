@@ -144,7 +144,7 @@ type ToolDependencies = {
     chatId: string;
     instructionText: string;
     controllerFence: ControllerMutationFence;
-  }>) => { outcome: "accepted" | "rejected" };
+  }>) => { outcome: "accepted" | "rejected" } | { outcome: "recorded"; jobId: string };
   health(now: number): unknown;
   notify(): void;
   now(): number;
@@ -2701,6 +2701,14 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         },
       });
       dependencies.notify();
+      if (result.outcome === "recorded") {
+        return {
+          approvalAccepted: true,
+          mergeQueued: false,
+          jobId: result.jobId,
+          reason: "Approval recorded on the job. The merge queues itself the moment review clears; nothing more is needed from the owner.",
+        };
+      }
       return result.outcome === "accepted"
         ? { approvalAccepted: true, mergeQueued: true, jobId: params.jobId }
         : { approvalAccepted: false, mergeQueued: false, reason: "That job is not waiting for a merge approval right now." };

@@ -739,6 +739,7 @@ function transitionApprovalAccepted(job: Job, event: JobEvent, effects: JobEffec
     invalidateDriftedHead(job, effects);
     return;
   }
+  job.mergePreApprovedAt = null;
   job.state = "merging";
   emitEffect(job, effects, "merge_pr", { headSha: event.headSha });
 }

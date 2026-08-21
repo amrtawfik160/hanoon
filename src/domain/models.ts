@@ -539,6 +539,11 @@ export interface Job {
   reviewCycle: number;
   reviewBlockAt: number;
   cancelRequestedAt: number | null;
+  /** When the owner granted the merge in advance of the approval gate. It is
+   * the durable form of "you have my approval" said while review still runs,
+   * consumed the moment the gate issues, so the approval cannot die in a
+   * fifteen-minute window the owner never saw. */
+  mergePreApprovedAt: number | null;
   blockedReason: BlockedReason;
   lastError: string | null;
   version: number;

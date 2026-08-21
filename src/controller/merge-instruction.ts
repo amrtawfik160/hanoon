@@ -29,11 +29,24 @@ const OBJECT =
   `(?:the\\s+job\\s+${JOB_ID}|${JOB_ID}|it|this|that|them|the\\s+(?:pr|pull\\s+request|change|changes|fix|job|work|branch|thing))`;
 
 const APPROVE_LEAD =
-  "(?:(?:please|now|just)\\s+|go\\s+ahead\\s+and\\s+|(?:yes|ok(?:ay)?|sure)[,!\\s]+)*";
+  "(?:(?:please|now|just)[,!\\s]\\s*|go\\s+ahead\\s+and\\s+|(?:yes|ok(?:ay)?|sure)[,!\\s]+)*";
 const POSITIVE_PREFIX = "(?:(?:looks\\s+good|nice\\s+work|all\\s+good|approved)[.!]\\s+)?";
 
 const MERGE_INSTRUCTION = new RegExp(
   `^${POSITIVE_PREFIX}${APPROVE_LEAD}${LAND_VERB}\\s+${OBJECT}[.!]?$`,
+  "iu",
+);
+
+/**
+ * An explicit grant of approval, said instead of the imperative: "you have my
+ * approval" answered the agent's own request for one and was refused, which
+ * cost the owner the merge and the agent its turn budget. Only wording that
+ * names approval itself belongs here; "go ahead" or a bare "yes" could answer
+ * any offer at all, and a false positive merges work the owner did not
+ * approve.
+ */
+const APPROVAL_GRANT = new RegExp(
+  `^${APPROVE_LEAD}(?:you\\s+have\\s+my\\s+approval|i\\s+approve(?:\\s+${OBJECT})?|approved|approval\\s+granted)[.!]?$`,
   "iu",
 );
 
@@ -58,5 +71,5 @@ export function isMergeInstruction(text: unknown): boolean {
   const message = text.trim();
   if (message.length === 0 || message.length > 2_000) return false;
   if (NOT_NOW.some((pattern) => pattern.test(message))) return false;
-  return MERGE_INSTRUCTION.test(message);
+  return MERGE_INSTRUCTION.test(message) || APPROVAL_GRANT.test(message);
 }
