@@ -1878,6 +1878,20 @@ export class EffectRunner {
    */
   private issueApproval(job: Job): void {
     if (!job.prHeadSha) throw new PermanentEffectError("approval requires an authoritative pull-request head");
+    // The owner already granted this merge in so many words, before the gate
+    // was reached. Their word outranks the button: consuming it here is what
+    // stops an approval dying in a fifteen-minute window they never saw.
+    if (job.mergePreApprovedAt !== null) {
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
+      if (current.mergePreApprovedAt === null || current.cancelRequestedAt !== null) return;
+      const merging = this.applyEvent(current.id, current.version, {
+        type: "APPROVAL_ACCEPTED",
+        headSha: job.prHeadSha,
+      });
+      this.enqueueStatus(merging, { autoApproved: true });
+      return;
+    }
     const evidence = job.projectId === null
       ? null
       : this.dependencies.store.getMergeGrantEvidence(job.projectId);

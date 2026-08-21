@@ -347,3 +347,34 @@ describe("a second opinion before an unattended merge", () => {
     expect(restarted.getConsensusReviewAttempt(fixture.jobId, HEAD)?.id).toBe(started!.id);
   });
 });
+
+// The owner said "you have my approval" while review still ran; the approval
+// died against the gate that did not exist yet, and the reissued button later
+// expired unseen. A recorded advance approval is consumed the moment the gate
+// issues, owner's word over button, no consensus detour and no expiry window.
+describe("an approval granted before the gate", () => {
+  it("queues the merge the moment the approval would have been issued", async () => {
+    const fixture = awaitingApproval(policyFixture());
+    fixture.db.prepare("UPDATE jobs SET merge_pre_approved_at = 1500 WHERE id = ?").run(fixture.jobId);
+    enqueue(fixture.db, fixture.jobId, "issue_approval", "job:2:issue_approval", { headSha: HEAD });
+
+    await runEffect(fixture, "job:2:issue_approval", 2_000);
+
+    const job = fixture.store.getJob(fixture.jobId);
+    expect(job?.state).toBe("merging");
+    expect(job?.mergePreApprovedAt).toBeNull();
+    expect(fixture.store.listEffectsForJob(fixture.jobId).map((effect) => effect.kind))
+      .toContain("merge_pr");
+  });
+
+  it("still asks the owner when no advance approval was recorded", async () => {
+    const fixture = awaitingApproval(policyFixture());
+    enqueue(fixture.db, fixture.jobId, "issue_approval", "job:2:issue_approval", { headSha: HEAD });
+
+    await runEffect(fixture, "job:2:issue_approval", 2_000);
+
+    expect(fixture.store.getJob(fixture.jobId)?.state).toBe("awaiting_merge_approval");
+    expect(fixture.store.listEffectsForJob(fixture.jobId).map((effect) => effect.kind))
+      .not.toContain("merge_pr");
+  });
+});

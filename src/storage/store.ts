@@ -3648,6 +3648,8 @@ export interface TelegramAgentStore {
   queueAdmission(input: AdmissionWriteInput): JobAdmission;
   requeueAdmission(input: AdmissionWriteInput): JobAdmission;
   requeueReviewAdmission(jobId: string, expectedVersion: number, now: number): ReviewAdmissionResult;
+  recordMergePreApproval(input: { namedJobId: string | null; now: number }):
+    { outcome: "recorded"; jobId: string } | { outcome: "rejected" };
   retryFailedJob(jobId: string, expectedVersion: number, now: number): RetryJobResult;
   createJob(input: {
     id: string;
@@ -11868,6 +11870,37 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (error instanceof AutonomyAdmissionConflictError) return { outcome: "unavailable" };
       throw error;
     }
+  }
+
+  /**
+   * Records the owner's merge approval on a job that has not reached the
+   * approval gate yet. The words were already verified as an approval by the
+   * deterministic matcher; what this settles is *which* job they cover. A
+   * named job is taken at its word; an unnamed grant needs exactly one live
+   * job, because "you have my approval" over two candidates approves neither.
+   */
+  public recordMergePreApproval(input: { namedJobId: string | null; now: number }):
+    | { outcome: "recorded"; jobId: string }
+    | { outcome: "rejected" } {
+    assertNonNegativeInteger(input.now, "now");
+    const TERMINAL = "('cancelled', 'merged', 'complete', 'production_failed')";
+    return this.db.transaction((): { outcome: "recorded"; jobId: string } | { outcome: "rejected" } => {
+      let jobId = input.namedJobId;
+      if (jobId === null) {
+        const live = this.db.prepare(
+          `SELECT id FROM jobs
+            WHERE state NOT IN ${TERMINAL} AND cancel_requested_at IS NULL
+            ORDER BY created_at DESC LIMIT 2`,
+        ).all() as Array<{ id: string }>;
+        if (live.length !== 1) return { outcome: "rejected" };
+        jobId = live[0]!.id;
+      }
+      const updated = this.db.prepare(
+        `UPDATE jobs SET merge_pre_approved_at = ?, updated_at = ?
+          WHERE id = ? AND state NOT IN ${TERMINAL} AND cancel_requested_at IS NULL`,
+      ).run(input.now, input.now, jobId).changes === 1;
+      return updated ? { outcome: "recorded", jobId } : { outcome: "rejected" };
+    }).immediate();
   }
 
   public retryFailedJob(jobId: string, expectedVersion: number, now: number): RetryJobResult {

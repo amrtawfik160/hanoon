@@ -201,6 +201,7 @@ export function jobFixture(overrides: Partial<Job> = {}): Job {
     reviewCycle: 0,
     reviewBlockAt: 3,
     cancelRequestedAt: null,
+    mergePreApprovedAt: null,
     blockedReason: null,
     lastError: null,
     version: 1,

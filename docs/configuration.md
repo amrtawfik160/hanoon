@@ -172,7 +172,7 @@ How the agent should behave — terser answers, always leading with the pull-req
 
 The limits that remain are the ones the owner can actually see and answer:
 
-- merging a pull request and promoting to production run through the job pipeline and need a Telegram approval: a one-use approval from the approval button or an unambiguous owner-origin merge instruction, unless the owner has granted that project a standing approval (see [Standing merge approval](#standing-merge-approval));
+- merging a pull request and promoting to production run through the job pipeline and need a Telegram approval: a one-use approval from the approval button or an unambiguous owner-origin merge instruction or approval grant ("merge it", "you have my approval"), unless the owner has granted that project a standing approval (see [Standing merge approval](#standing-merge-approval)). An approval given while the job is still mid-pipeline is recorded on the job and consumed the moment the approval gate is reached, so it cannot expire in a window the owner never saw;
 - installing or connecting an integration, changing a credential, spending money, a destructive external action, or an irreversible external write are asked about in the chat first;
 - credential-shaped text is refused before it can be stored as a memory;
 - a permission prompt BB does raise for the hidden controller is bridged into Telegram as *Allow once* / *Deny*, so choosing `auto` or `accept-edits` no longer means waiting on a dead end.
