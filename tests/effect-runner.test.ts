@@ -1821,3 +1821,44 @@ describe("recovering the jobs this bug already blocked", () => {
     expect(ordinals.map((row) => row.ordinal)).toEqual([1, 2]);
   });
 });
+
+it("does not announce a located pull request while the job is still implementing", async () => {
+  const { store, db } = storeFixture();
+  const draft = store.createJob({ id: "job_pr_located_guard", sourceUpdateId: 1, requestText: "work", now: 1_000 });
+  db.prepare(
+    `UPDATE jobs SET state = 'implementing', project_id = 'proj_1', policy_version = 1, policy_json = ?,
+       implementation_thread_id = 'thr_impl', environment_id = 'env_1', version = 2 WHERE id = ?`,
+  ).run(JSON.stringify(policyFixture()), draft.id);
+
+  const lease = store.acquireExecutorLease("owner-a", 1_003, 30_000);
+  if (!lease.acquired) throw new Error("lease missing");
+  addProductionAdmissionAndClaims(db, draft.id, policyFixture(), "owner-a", lease.generation, 1_003, 31_000);
+  const effect = {
+    jobId: draft.id,
+    kind: "inspect_implementation",
+    idempotencyKey: `${draft.id}:2:inspect_implementation`,
+    payload: {},
+  } as unknown as JobEffect;
+  addPendingEffectForRecovery(db, effect);
+  const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_004, 10, 30_000)
+    .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+  if (!claimed) throw new Error("effect was not leased");
+
+  // Looking for the pull request from `implementing` is the out-of-order step
+  // that used to fail the job for good: whatever the lookup finds, the verdict
+  // is not legal from this state. A retry re-entered `implementing` and walked
+  // straight back into the same wall.
+  await new EffectRunner({
+    store,
+    fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+    bb: {
+      getEnvironmentSnapshot: async () => ({ status: { outcome: "available" } }),
+      getPullRequestSnapshot: async () => ({ outcome: "available", number: 26, url: "https://example.test/pr/26" }),
+    },
+    now: () => 1_005,
+  } as unknown as EffectRunnerDependencies).run(claimed);
+
+  const after = store.getJob(draft.id);
+  expect(after).toMatchObject({ state: "implementing", prNumber: null });
+  expect(after?.blockedReason ?? null).toBeNull();
+});

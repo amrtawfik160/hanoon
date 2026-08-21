@@ -1599,6 +1599,13 @@ export class EffectRunner {
     this.renewOperationFence(effect);
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== job.state) return;
+    // This effect is legal in two states, and only one of them can accept a
+    // pull request. While the job is still implementing, the step that moves it
+    // on is the implementation thread going idle; announcing a located PR from
+    // here is refused as out of order and fails the job for good. A retry
+    // re-enters `implementing` and runs this same effect again, so the job
+    // walks back into the identical wall every time it is retried.
+    if (current.state !== "locating_pr") return;
     if (existing) {
       this.applyEvent(
         job.id,
