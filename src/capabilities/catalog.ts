@@ -82,7 +82,7 @@ const SKILL_DIGESTS = {
   "clean-code-guard": "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2",
   "dispatching-parallel-agents": "1968923066f3b707eb01d1992cdf4c42284c3855f70253b9cd5000ff45fca13c",
   "docs-guard": "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef",
-  "driving-bb": "97d51f26bdabb4cd2a67109644f55f26a04b56cefdbbf39d01aff05cca61d0e5",
+  "driving-bb": "40d036f020e76f28bbb42d49eb63ed291cb2c56fcb0ee2d08141193842175cb9",
   "domain-modeling": "152e2c97239affb12a60c5f4a7e74ab546a49ae169688c81f4e2ccc42dafa579",
   "durable-boundary-audit": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f",
   "executing-plans": "c4c3d8b628c51114cd165fb8246fe02744cd8be180032328391252e653028d9b",

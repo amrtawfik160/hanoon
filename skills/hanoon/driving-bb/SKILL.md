@@ -89,18 +89,43 @@ Steer for a wrong direction or a hard stop. Queue for a follow-up that can wait.
 
 ## Scheduled work
 
-Monitors are yours. BB automations are for the owner's recurring work, and a
-check whose output is fully determined by code should be a script, not an agent
-run — it costs no tokens per tick and stays silent when there is nothing to say:
+Monitors are yours for work you started. BB automations are for the owner's
+recurring work. Pass `--project` on every automation command.
+
+Use a script when the output is fully determined by code: a check, a watchdog, a
+health poll. A script that exits 0 with empty stdout stays silent. Exit non-zero
+only when the check itself failed.
 
 ```bash
 bb automation create --project <id> --name "..." --cron "0 9 * * 1-5" \
-  --timezone "..." --script-file ./check.sh
-bb automation list --project <id>
+  --timezone "America/New_York" --script-file ./check.sh
 ```
 
-A script that exits 0 with empty stdout says nothing. Make it exit non-zero only
-when it genuinely failed.
+Use an agent when the run needs reasoning, a chosen model, or a multi-step fix.
+`--prompt`, `--provider`, and `--model` are required together. Do not invent a
+script to stand in for that.
+
+```bash
+bb automation create --project <id> --name "..." --cron "0 23 * * *" \
+  --timezone "Etc/UTC" --provider codex --model gpt-5.6-sol \
+  --permission-mode full --new-environment worktree --base-branch main \
+  --prompt "..."
+```
+
+`--new-environment worktree` makes each run a fresh managed worktree from
+`--base-branch`. `--permission-mode` is `accept-edits`, `auto`, or `full`. Grok
+ACP (`acp-grok`) rejects `auto`; use `full` or `accept-edits`. Reasoning level
+belongs on child `bb thread spawn` calls inside the prompt, not on
+`automation create`.
+
+`bb automation create --help` without a mode exits 1. Do not run it. After
+create, `bb automation show <id> --project <id>` and then answer. Do not keep
+listing providers, projects, or help text.
+
+```bash
+bb automation list --project <id>
+bb automation show <id> --project <id>
+```
 
 ## Machines, providers, models
 
@@ -148,7 +173,7 @@ stopped a thread themselves, that was deliberate: leave it alone unless they say
 otherwise.
 
 ```bash
-bb thread retry <id>       # continue an interrupted turn
-bb thread stop <id>        # when it is stuck or no longer wanted
-bb thread compact <id>     # Codex, Claude Code, or Pi when context is the problem. Not Cursor.
+bb provider-retry retry <id>   # continue a failed provider turn
+bb thread stop <id>            # when it is stuck or no longer wanted
+bb thread compact <id>         # Codex, Claude Code, or Pi when context is the problem. Not Cursor.
 ```

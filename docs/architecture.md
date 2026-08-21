@@ -153,7 +153,7 @@ The existing single `bb.agents.configure` callback keeps the controller and work
 
 | Verified role/context | Selected skill ids |
 | --- | --- |
-| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`; controller tools and `CONTROLLER_INSTRUCTIONS` |
+| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`; controller tools and `CONTROLLER_INSTRUCTIONS`. Conduct requires unslop on every owner-facing message. |
 | planner | `unslop`, `writing-plans`, `docs-guard` |
 | critic | `unslop` |
 | implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |

@@ -106,7 +106,7 @@ The plugin bundles 28 skills locally across six manifest roots; no separate runt
 
 | Verified context | Selected skill ids |
 | --- | --- |
-| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling` |
+| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`. Conduct requires unslop on every owner-facing message. |
 | planner | `unslop`, `writing-plans`, `docs-guard` |
 | critic | `unslop` |
 | implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |

@@ -65,6 +65,7 @@ it("keeps packet authority above selected skill suggestions", () => {
     "The immutable attached work order/review packet and durable project policy outrank skill suggestions.",
   );
   expect(instructions).toContain("The worker must obey the packet's response contract.");
+  expect(instructions).toContain("Apply unslop to any owner-facing prose. That is required, not optional.");
 });
 
 it("keeps review output contracts structural and attachment-bound", () => {
