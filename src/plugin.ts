@@ -386,8 +386,8 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
     selfDiagnosisEnabled: {
       type: "boolean",
-      label: "Self-diagnosis",
-      description: "Off by default. When enabled, inspect persisted controller failures out of band and propose at most one cooled-down draft pull request at a time.",
+      label: "Self-healing",
+      description: "Off by default. When enabled, the agent inspects its own persisted controller and job failures out of band, fixes the cause in this plugin's repository with a verified change, proposes at most one cooled-down pull request at a time, and sends you the link without asking first.",
       default: false,
     },
     selfDiagnosisProjectId: {
@@ -2216,6 +2216,21 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       },
       clock: { now: clock },
       warn: (message) => bb.log.warn(message),
+      // The enabled setting is the owner's standing permission, so the message
+      // is a report with the link, never a question. Keyed by diagnosis so a
+      // replay cannot send it twice.
+      notify: (event) => {
+        const owner = store.getOwner();
+        if (!owner) return;
+        const text = event.kind === "published"
+          ? `I found a fault in my own code, fixed it, verified the fix, and opened a pull request for review: ${event.url}`
+          : `I found a fault in my own code and filed the fix as reviewed pipeline job ${event.jobId}.`;
+        store.enqueueOutbox({
+          logicalKey: `self-diagnosis:${event.diagnosisId}`,
+          chatId: owner.chatId,
+          payload: { text, disable_web_page_preview: true },
+        }, clock());
+      },
     });
     bb.background.service(SELF_DIAGNOSIS_SERVICE_NAME, {
       start: (signal) => selfDiagnosis.run(signal),

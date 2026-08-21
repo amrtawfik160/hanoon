@@ -19,7 +19,8 @@ export type SelfDiagnosisFailureKind =
   | "failed_turn"
   | "missing_finalization"
   | "stalled_turn"
-  | "failed_thread";
+  | "failed_thread"
+  | "failed_job";
 
 export type SelfDiagnosisCandidate = {
   sourceId: string;
@@ -44,6 +45,9 @@ export type StructuredSelfDiagnosis = {
   evidence: string[];
   hypothesis: string;
   candidateFix: string;
+  /** What was run to prove the fix and what it showed. Required: a fix nobody
+   * verified is a guess, and a guess never becomes a pull request. */
+  verification: string;
 };
 
 export type SelfDiagnosisLedgerRecord = {
@@ -142,7 +146,20 @@ export type SelfDiagnosisServiceDependencies = {
   clock: { now(): number };
   warn?: (message: string) => void;
   idFactory?: () => string;
+  /**
+   * Tells the owner what self-healing just did: a published pull request with
+   * its link, or a filed pipeline job. The old draft pull request waited for a
+   * person to notice it; this is how they notice. Never a question, never a
+   * request for permission: the setting that enables the service is the
+   * permission. Absent reads as silent, so an installation that never wired a
+   * messenger behaves exactly as it did.
+   */
+  notify?: (event: SelfDiagnosisNotification) => void;
 };
+
+export type SelfDiagnosisNotification =
+  | { kind: "published"; diagnosisId: string; number: number; url: string }
+  | { kind: "filed"; diagnosisId: string; jobId: string };
 
 export type SelfDiagnosisRunResult =
   | { outcome: "disabled" | "no-failure" | "cooldown" | "open-pr" | "already-attempted" }
@@ -156,6 +173,7 @@ const structuredDiagnosisSchema = z.object({
   evidence: z.array(z.string().trim().min(1).max(300)).min(1).max(8),
   hypothesis: z.string().trim().min(1).max(800),
   candidateFix: z.string().trim().min(1).max(800),
+  verification: z.string().trim().min(1).max(300),
 }).strict();
 
 function emptyLedger(): SelfDiagnosisLedgerState {
@@ -204,7 +222,8 @@ function validLedger(value: unknown): SelfDiagnosisLedgerState {
 }
 
 function isFailureKind(value: string): value is SelfDiagnosisFailureKind {
-  return value === "failed_turn" || value === "missing_finalization" || value === "stalled_turn" || value === "failed_thread";
+  return value === "failed_turn" || value === "missing_finalization" || value === "stalled_turn" ||
+    value === "failed_thread" || value === "failed_job";
 }
 
 function safePersistedError(value: unknown): string | null {
@@ -303,6 +322,25 @@ const SELF_DIAGNOSIS_QUERY = `
           WHERE turn.controller_key = controller.controller_key
             AND turn.state = 'failed'
        )
+
+    UNION ALL
+
+    SELECT 'failed_job' AS kind,
+           job.id AS source_id,
+           NULL AS turn_id,
+           'none' AS turn_state,
+           job.state AS thread_state,
+           job.updated_at AS updated_at,
+           job.last_error AS last_error,
+           NULL AS stream_phase,
+           NULL AS accepted_finalization_id,
+           0 AS completion_continuations,
+           0 AS bb_event_seq,
+           0 AS evidence_seq,
+           0 AS tool_calls,
+           0 AS command_failures
+      FROM jobs AS job
+     WHERE job.state = 'failed' AND job.last_error IS NOT NULL
   ) AS candidates
   ORDER BY updated_at ASC, source_id ASC, kind ASC
   LIMIT @limit`;
@@ -343,15 +381,17 @@ function candidateEvidenceLines(candidate: SelfDiagnosisCandidate): string[] {
 
 export function buildSelfDiagnosisPrompt(candidate: SelfDiagnosisCandidate): string {
   const evidence = candidateEvidenceLines(candidate);
-  return `You are an out-of-band maintainer diagnosing one persisted controller failure. Work only in this repository's fresh managed worktree. Inspect the code and make the smallest candidate fix with focused tests when the cause is clear.
+  return `You are an out-of-band maintainer diagnosing one persisted failure of this agent's own machinery: a controller turn, a controller thread, or a pipeline job. Work only in this repository's fresh managed worktree. Inspect the code and make the smallest candidate fix with a focused test that fails without it, when the cause is clear.
 
-The following evidence comes from persisted controller state. It contains no owner message, Telegram identifiers, conversation transcript, or provider output:
+The following evidence comes from persisted state. It contains no owner message, Telegram identifiers, conversation transcript, or provider output:
 ${evidence.join("\n")}
 
 Do not inspect, copy, or generate chat contents, personal data, credentials, tokens, callback material, or identifiers belonging to a user. Do not commit, push, open, modify, merge, or close a pull request. Do not change controller storage or runtime behavior outside the candidate code fix.
 
+Run the repository typecheck and the focused tests for your change. The verification field reports exactly what you ran and what it showed. If your checks did not pass, or the cause stayed unclear, return nothing at all rather than an unverified fix.
+
 Return strict JSON and nothing else:
-{"whatFailed":"code-level description","evidence":["code-level evidence"],"hypothesis":"code-level cause","candidateFix":"minimal code and test change"}
+{"whatFailed":"code-level description","evidence":["code-level evidence"],"hypothesis":"code-level cause","candidateFix":"minimal code and test change","verification":"what ran and what it showed"}
 
 Every field must describe repository behavior only. Do not include raw error text when it could contain anything other than a safe failure summary.`;
 }
@@ -377,8 +417,9 @@ function normalizeStructuredDiagnosis(value: unknown): StructuredSelfDiagnosis |
     evidence: parsed.data.evidence.map((item) => item.replace(/\s+/g, " ").trim()),
     hypothesis: parsed.data.hypothesis.replace(/\s+/g, " ").trim(),
     candidateFix: parsed.data.candidateFix.replace(/\s+/g, " ").trim(),
+    verification: parsed.data.verification.replace(/\s+/g, " ").trim(),
   };
-  if ([diagnosis.whatFailed, diagnosis.hypothesis, diagnosis.candidateFix, ...diagnosis.evidence]
+  if ([diagnosis.whatFailed, diagnosis.hypothesis, diagnosis.candidateFix, diagnosis.verification, ...diagnosis.evidence]
     .some((item) => isUnsafeProviderText(item))) return null;
   return diagnosis;
 }
@@ -591,7 +632,12 @@ export class SelfDiagnosisService {
       return { outcome: "failed", reason: "analysis failed" };
     }
     if (!this.dependencies.enabled() || signal.aborted) return { outcome: "disabled" };
-    const diagnosis = normalizeStructuredDiagnosis(analysis.diagnosis);
+    // The worker returns its JSON as text; a test harness hands an object.
+    // Both are one diagnosis. The string branch is what production actually
+    // sends, and it went unparsed for as long as only harnesses were watched.
+    const diagnosis = typeof analysis.diagnosis === "string"
+      ? parseSelfDiagnosisOutput(analysis.diagnosis)
+      : normalizeStructuredDiagnosis(analysis.diagnosis);
     if (!diagnosis) {
       await this.recordFailure(claimed.ledgerState, claimed.diagnosisId, null);
       return { outcome: "failed", reason: "analysis did not return a safe structured diagnosis" };
@@ -649,6 +695,12 @@ export class SelfDiagnosisService {
       return { outcome: "failed", reason: published.reason };
     }
     await this.recordPublished(analyzed, published);
+    this.notifySafely({
+      kind: "published",
+      diagnosisId: analyzed.diagnosisId,
+      number: published.number,
+      url: published.url,
+    });
     return published;
   }
 
@@ -690,7 +742,16 @@ export class SelfDiagnosisService {
       return null;
     }
     void this.recordFiled(analyzed);
+    this.notifySafely({ kind: "filed", diagnosisId: analyzed.diagnosisId, jobId: filed.jobId });
     return { outcome: "filed", jobId: filed.jobId };
+  }
+
+  private notifySafely(event: SelfDiagnosisNotification): void {
+    try {
+      this.dependencies.notify?.(event);
+    } catch {
+      this.dependencies.warn?.("Self-diagnosis could not notify the owner");
+    }
   }
 
   private async recordFiled(analyzed: AnalyzedSelfDiagnosis): Promise<void> {
