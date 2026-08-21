@@ -421,3 +421,53 @@ it("treats an unreadable thread as no evidence of a stall", async () => {
   expect(store.listControllerTurns(CONTROLLER_KEY, 10)).toHaveLength(0);
   expect(store.listArmedMonitors(10)).toHaveLength(1);
 });
+
+it("delivers a schedule's last firing when its next run cannot be worked out", async () => {
+  const { store } = fixture();
+  // 30 February never arrives, so this schedule is due now and can never be
+  // advanced past now — the exact shape that used to die without a word.
+  const monitor = store.createMonitor({
+    controllerKey: CONTROLLER_KEY,
+    kind: "schedule",
+    cron: "0 0 30 2 *",
+    instruction: "Check the invite job and tell the owner where it got to.",
+    dueAt: NOW,
+    now: NOW,
+  });
+
+  await expect(service(store, async () => "idle").processDue()).resolves.toBe(true);
+
+  const turns = store.listControllerTurns(CONTROLLER_KEY, 10);
+  expect(turns).toHaveLength(1);
+  expect(turns[0]?.inputText).toContain("Check the invite job and tell the owner where it got to.");
+  expect(turns[0]?.inputText).toContain("last firing");
+  expect(turns[0]?.inputText).toContain("0 0 30 2 *");
+  expect(store.listMonitors(CONTROLLER_KEY, true)).toMatchObject([{
+    id: monitor.id,
+    state: "failed",
+    lastError: "Schedule could not be advanced",
+  }]);
+  // Failed is terminal: the next sweep must not deliver it a second time.
+  await expect(service(store, async () => "idle").processDue()).resolves.toBe(false);
+  expect(store.listControllerTurns(CONTROLLER_KEY, 10)).toHaveLength(1);
+});
+
+it("keeps a dead schedule in the default list until it is cleared", async () => {
+  const { store } = fixture();
+  const monitor = store.createMonitor({
+    controllerKey: CONTROLLER_KEY,
+    kind: "schedule",
+    cron: "0 0 30 2 *",
+    instruction: "Check the invite job.",
+    dueAt: NOW,
+    now: NOW,
+  });
+  await service(store, async () => "idle").processDue();
+
+  // Without this the only view holding a dead schedule was the one that also
+  // holds every settled monitor ever created.
+  expect(store.listMonitors(CONTROLLER_KEY, false)).toMatchObject([{ id: monitor.id, state: "failed" }]);
+
+  expect(store.cancelControllerMonitor(CONTROLLER_KEY, monitor.id, NOW + 1_000)).toBe(true);
+  expect(store.listMonitors(CONTROLLER_KEY, false)).toEqual([]);
+});

@@ -1225,3 +1225,34 @@ it("projects the remaining memory, monitor, health, scorecard, and style rows fr
   const sameStyle = await call("telegram_agent_set_working_style", { text: "Lead with the result." });
   expect(sameStyle._hanoonEvidence).toMatchObject({ outcome: "observed", proofKinds: ["memory_state"] });
 });
+
+it("keeps a long monitor list inside its result limit instead of failing the whole call", async () => {
+  const fixture = registeredControllerFixture();
+  // Monitor instructions are paragraphs the agent wrote to itself. Enough of
+  // them overran the result limit, and an overrun failed the call outright, so
+  // the view that would show a dead schedule was the one that never loaded.
+  const context = "Context the agent left for itself so the next turn knows what this was for. ".repeat(10);
+  for (let index = 0; index < 19; index += 1) {
+    fixture.store.createMonitor({
+      controllerKey: fixture.turn.controllerKey,
+      kind: "schedule",
+      cron: "0 9 * * 1-5",
+      instruction: `Sweep ${index}. ${context}`,
+      dueAt: 2_000 + index,
+      now: 2_000 + index,
+    });
+  }
+
+  const listed = JSON.parse(await fixture.harness.behavior.callAgentTool(
+    "telegram_agent_list_watches",
+    { includeFinished: true },
+    fixture.toolContext,
+  ) as string);
+
+  expect(listed.monitors.length).toBeGreaterThan(0);
+  // Nothing is dropped in silence: what did not fit is counted.
+  expect(listed.monitors.length + listed.omitted).toBe(19);
+  expect(listed.omitted).toBeGreaterThan(0);
+  expect(Buffer.byteLength(JSON.stringify(listed), "utf8"))
+    .toBeLessThanOrEqual(CONTROLLER_CAPABILITIES.telegram_agent_list_watches.result_limit);
+});
