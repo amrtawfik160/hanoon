@@ -1406,6 +1406,27 @@ it("atomically retires an accepted broken generation into one restart-safe recov
   });
 });
 
+// The owner said yes to "Want me to sort the conflict out and put it back
+// through review?" and the turn arrived with observation tools only, so the
+// agent promised the work and could not start it. An affirmative accepting an
+// offer must open the toolbox the offer needs.
+it("routes an affirmative reply to an offer with the full fenced toolbox", () => {
+  const { bb, store } = fixture();
+  const asked = store.enqueueControllerTurn(turnInput(79_001, "what is the progress in areliaa issue"));
+  bb.storage.database().prepare(
+    "UPDATE controller_turns SET state = 'completed', response_text = ? WHERE id = ?",
+  ).run("Want me to sort the conflict out and put it back through review?", asked.id);
+
+  const accepted = store.enqueueControllerTurn(turnInput(79_002, "yes but sent the pr link first"));
+
+  const bundles = bb.storage.database().prepare(
+    `SELECT capability_id FROM capability_receipts
+      WHERE subject_id = ? AND capability_id LIKE 'controller-bundle-%'`,
+  ).all(accepted.id).map((row) => (row as { capability_id: string }).capability_id);
+  expect(bundles).toContain("controller-bundle-job-control");
+  expect(bundles).toContain("controller-bundle-thread-control");
+});
+
 // The owner asked a real question at 1:42am, it was folded into the running
 // answer, and no bubble appeared at all. From Telegram that is identical to
 // being ignored, so a folded message has to leave something visible behind.

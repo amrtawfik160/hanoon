@@ -1,5 +1,5 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   CAPABILITY_BY_ID,
   CONTROLLER_DOMAIN_TOOL_IDS,
@@ -15,6 +15,7 @@ import {
   controllerToolsForBundles,
   selectControllerCapabilityProfile,
   selectControllerBundles,
+  selectControllerBundlesForConversation,
 } from "../src/capabilities/controller-bundles";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
@@ -69,6 +70,50 @@ it.each([
   ["delegate these independent tasks", ["core-observation", "operations"]],
 ] as const)("selects the least controller bundles for %s", (text, expected) => {
   expect(selectControllerBundles(text)).toEqual(expected);
+});
+
+// "yes but sent the pr link first" carries no intent a regex can see; the
+// intent lives in the offer it accepts, one turn back. The owner said yes to
+// "Want me to sort the conflict out and put it back through review?" and the
+// turn arrived with observation tools only, so the agent promised the work
+// and could not start it.
+describe("conversation-aware bundle selection", () => {
+  it("gives an affirmative reply to an offer the full fenced toolbox", () => {
+    expect(selectControllerBundlesForConversation(
+      "yes but sent the pr link first",
+      "Want me to sort the conflict out and put it back through review?",
+    )).toEqual([...CONTROLLER_BUNDLE_IDS]);
+  });
+
+  it("keeps a plain statement after a statement at its own bundles", () => {
+    expect(selectControllerBundlesForConversation(
+      "show job status",
+      "The pipeline finished the build stage.",
+    )).toEqual(["core-observation"]);
+  });
+
+  it("does not escalate an affirmative when nothing was offered", () => {
+    expect(selectControllerBundlesForConversation(
+      "yes that reads right",
+      "The four docs findings all point at deleted files.",
+    )).toEqual(["core-observation"]);
+  });
+
+  it("reads intent from the previous answer for a non-affirmative reference", () => {
+    expect(selectControllerBundlesForConversation(
+      "the second option",
+      "I can retry the job now, or wait for the review. Which one?",
+    )).toContain("job-control");
+  });
+
+  it("survives a previous answer longer than the classifier bound", () => {
+    const long = `${"history ".repeat(2_000)}Want me to retry the job?`;
+    expect(selectControllerBundlesForConversation("yes", long)).toEqual([...CONTROLLER_BUNDLE_IDS]);
+  });
+
+  it("matches plain selection when there is no previous answer", () => {
+    expect(selectControllerBundlesForConversation("yes do it", null)).toEqual(["core-observation"]);
+  });
 });
 
 it.each(permittedBundleCombinations.map((bundleIds) => [bundleIds]))(

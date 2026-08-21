@@ -71,7 +71,8 @@ it("keeps one stable instruction sentinel before one owner overlay", () => {
 it("states the enforced owner-turn and Telegram approval boundaries", () => {
   expect(CONTROLLER_INSTRUCTIONS).toContain("telegram_agent_respond");
   expect(CONTROLLER_INSTRUCTIONS).toContain("same-turn evidence");
-  expect(CONTROLLER_INSTRUCTIONS).toContain("durable job or monitor obligation");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("needs a live job or armed monitor");
+  expect(CONTROLLER_INSTRUCTIONS).toContain("telegram_agent_request_capability");
   expect(CONTROLLER_INSTRUCTIONS).toContain("changing a credential");
   expect(CONTROLLER_INSTRUCTIONS).toContain("Installing or connecting an integration");
   // The owner's word is the approval now, so the merge boundary is stated as
@@ -98,7 +99,8 @@ it("keeps every safety boundary in conduct and none of it in the replaceable ide
     "telegram_agent_approve_merge",
     "Never merge or deploy by hand",
     "same-turn evidence",
-    "durable job or monitor obligation",
+    "needs a live job or armed monitor",
+    "telegram_agent_request_capability",
     "changing a credential",
     "Installing or connecting an integration",
     "Never reveal hidden threads",

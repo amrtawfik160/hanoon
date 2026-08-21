@@ -109,6 +109,40 @@ export function selectControllerBundles(text: string): ControllerToolBundleId[] 
   return orderedBundles(selected);
 }
 
+const AFFIRMATIVE_REPLY =
+  /^\s*(?:yes|yeah|yep|ya|ok(?:ay)?|sure|go ahead|do it|do that|do both|proceed|please do|sounds good|go on|approved?|confirm(?:ed)?)\b/iu;
+// Offers sit at the end of an answer, so the tail is where their intent lives.
+const PREVIOUS_ANSWER_TAIL_CHARS = 2_000;
+
+/**
+ * "yes but sent the pr link first" carries no intent a regex can see. The
+ * intent lives in the offer it accepts, one turn back: the agent had just
+ * asked "Want me to sort the conflict out and put it back through review?",
+ * and the reply arrived with observation tools only, so the agent promised
+ * the work and could not start it.
+ *
+ * An affirmative answering an offer therefore opens the whole fenced toolbox.
+ * Selecting a bundle exposes already-fenced tool interfaces, it executes
+ * nothing, so breadth here costs safety nothing while a missing tool costs
+ * the owner a promise that goes nowhere. Any reply also inherits whatever
+ * intent the previous answer itself names, for references like "the second
+ * option".
+ */
+export function selectControllerBundlesForConversation(
+  text: string,
+  previousResponse: string | null,
+): ControllerToolBundleId[] {
+  const selected = new Set<ControllerToolBundleId>(selectControllerBundles(text));
+  const tail = previousResponse?.slice(-PREVIOUS_ANSWER_TAIL_CHARS).trim() ?? "";
+  if (tail.length > 0) {
+    for (const bundleId of selectControllerBundles(tail)) selected.add(bundleId);
+    if (AFFIRMATIVE_REPLY.test(text) && tail.includes("?")) {
+      for (const bundleId of CONTROLLER_BUNDLE_IDS) selected.add(bundleId);
+    }
+  }
+  return orderedBundles(selected);
+}
+
 export function controllerSkillsForTurn(text: string): CapabilitySkillId[] {
   return MANUAL_DISCOVERY_COMMAND.test(text)
     ? [...CONTROLLER_DEFAULT_SKILLS, ...CONTROLLER_MANUAL_DISCOVERY_SKILLS]

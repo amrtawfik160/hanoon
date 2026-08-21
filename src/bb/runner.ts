@@ -476,6 +476,24 @@ export class BbRunner {
     return result.output ?? "";
   }
 
+  /**
+   * The newest event sequence past `afterSeq`, or `afterSeq` when nothing new
+   * arrived. One page suffices: the liveness watchdog only asks whether the
+   * provider moved at all since the last poll, not how far.
+   */
+  public async latestThreadEventSeq(threadId: string, afterSeq: number): Promise<number> {
+    if (!threadId) throw new TypeError("threadId must not be empty");
+    if (!Number.isInteger(afterSeq) || afterSeq < 0) throw new TypeError("afterSeq must be a non-negative integer");
+    const rows = await this.sdk.threads.events.list({
+      threadId,
+      afterSeq: String(afterSeq),
+      limit: String(USAGE_EVENT_PAGE_LIMIT),
+    });
+    let latest = afterSeq;
+    for (const row of rows) latest = Math.max(latest, row.seq);
+    return latest;
+  }
+
   public async spawnDocs(job: Job, attempt: PipelineThreadAttempt): Promise<ThreadResult> {
     const policy = selectedPolicy(job);
     const project = projectId(job, policy);

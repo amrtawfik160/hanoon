@@ -29,6 +29,7 @@ import {
   CONTROLLER_BUNDLE_IDS,
   DEFAULT_CONTROLLER_CAPABILITY_MODEL,
   expandControllerCapabilityProfile,
+  selectControllerBundlesForConversation,
   selectControllerCapabilityProfile,
   type ControllerToolBundleId,
 } from "../capabilities/controller-bundles";
@@ -4641,6 +4642,8 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
 
 /** Shown when a message arrives mid-turn and is folded into the running reply. */
 const CONTROLLER_STEER_FOLDED_TEXT = "Got that, and I'm working it into the answer I'm already writing.";
+/** Recorded on a folded waiting turn in place of an answer of its own. */
+const CONTROLLER_STEER_FOLDED_RESPONSE = "(sent to the answer already in progress)";
 /** Frozen so the stored payload and the duplicate check compare byte for byte. */
 const FOLDED_ANNOUNCEMENT_PAYLOAD = Object.freeze({
   text: CONTROLLER_STEER_FOLDED_TEXT,
@@ -5526,9 +5529,21 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       !["adaptive", "legacy"].includes(dispatchSettings.jobGraph) ||
       !["bundled", "all-tools"].includes(dispatchSettings.controllerTools)
     ) throw new TypeError("Capability dispatch settings are invalid");
+    // The offer a short reply accepts lives in the previous answer, so bundle
+    // selection reads the conversation rather than the message alone. Folded
+    // placeholders are skipped: they stand in for an answer, they are not one.
+    const previousResponse = (this.db.prepare(
+      `SELECT response_text FROM controller_turns
+        WHERE controller_key = ? AND state = 'completed' AND response_text IS NOT NULL
+          AND response_text <> ?
+        ORDER BY ordinal DESC LIMIT 1`,
+    ).get(input.controllerKey, CONTROLLER_STEER_FOLDED_RESPONSE) as { response_text: string } | undefined)
+      ?.response_text ?? null;
     const capabilitySelection = selectControllerCapabilityProfile(
       input.inputText,
-      dispatchSettings.controllerTools === "all-tools" ? CONTROLLER_BUNDLE_IDS : undefined,
+      dispatchSettings.controllerTools === "all-tools"
+        ? CONTROLLER_BUNDLE_IDS
+        : selectControllerBundlesForConversation(input.inputText, previousResponse),
       this.controllerModelRoute(),
     );
 
@@ -7815,7 +7830,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     input: ControllerSteerSettlementInput,
     row: ControllerSteerSettlementRow,
   ): void {
-    const folded = "(sent to the answer already in progress)";
+    const folded = CONTROLLER_STEER_FOLDED_RESPONSE;
     const updated = this.db.prepare(
       `UPDATE controller_turns
           SET state = 'completed', response_text = ?, stream_phase = 'complete',

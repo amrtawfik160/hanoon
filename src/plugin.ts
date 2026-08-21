@@ -1469,6 +1469,31 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     getPullRequestSnapshot: (environmentId: string) => bbRunner.getPullRequestSnapshot(environmentId),
     sdk: { threads: bb.sdk.threads },
   };
+  // Last provider-event sequence seen per worker thread, with when it moved.
+  // The BB thread row does not change while a provider works a turn, so this
+  // is the only pulse that distinguishes a reviewer deep in a long diff from
+  // one that died. In-memory on purpose: a plugin restart forgets it and the
+  // watchdog window simply starts over, which forgives rather than kills.
+  const workerEventPulse = new Map<string, { seq: number; at: number }>();
+  const WORKER_EVENT_PULSE_LIMIT = 512;
+  const observeWorkerEventPulse = async (resourceId: string, now: number): Promise<number | undefined> => {
+    const previous = workerEventPulse.get(resourceId);
+    try {
+      const latestSeq = await bbRunner.latestThreadEventSeq(resourceId, previous?.seq ?? 0);
+      if (previous === undefined || latestSeq > previous.seq) {
+        if (workerEventPulse.size >= WORKER_EVENT_PULSE_LIMIT && !workerEventPulse.has(resourceId)) {
+          const oldest = workerEventPulse.keys().next().value;
+          if (oldest !== undefined) workerEventPulse.delete(oldest);
+        }
+        workerEventPulse.set(resourceId, { seq: latestSeq, at: now });
+        return now;
+      }
+      return previous.at;
+    } catch {
+      // A failed read is not evidence of death; keep whatever pulse we had.
+      return previous?.at;
+    }
+  };
   const reconcileJob = async (
     job: NonNullable<ReturnType<typeof store.getJob>>,
     signal: AbortSignal,
@@ -1702,13 +1727,16 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     // route the question and for the next reconciliation after the answer.
     if (hasPendingInteraction) return;
     const observedAt = clock();
+    const eventPulseAt = await observeWorkerEventPulse(resourceId, observedAt);
+    if (!fenceCurrent()) return;
     const projected = projectWorkerLiveness(store, current, thread, observedAt, workerKind, generation, {
       ownerId: fence.ownerId,
       generation: fence.generation,
       now: observedAt,
-    });
-    const recovery = classifyThreadRecovery(current, thread, previousLiveness, observedAt, workerKind);
+    }, eventPulseAt);
+    const recovery = classifyThreadRecovery(current, thread, previousLiveness, observedAt, workerKind, eventPulseAt);
     if (recovery) {
+      workerEventPulse.delete(resourceId);
       const retryPayload = recoveryRetryPayload();
       recoverWorker(current, workerKind, resourceId, generation, recovery.classification, recovery.signature, currentPipelineAttempt, retryPayload);
       return;
@@ -1733,6 +1761,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       return;
     }
     if (projected.state !== "idle") return;
+    workerEventPulse.delete(resourceId);
     await settleStageMeasurement("succeeded");
     if (!fenceCurrent()) return;
 
