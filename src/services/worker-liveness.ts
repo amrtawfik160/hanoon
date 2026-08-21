@@ -141,6 +141,11 @@ function recoverySignal(
  * thread is not progress, and a host reconnect remains exempt until its grace
  * window expires. A missing lookup needs a previous missing observation so a
  * transient API failure cannot kill useful work.
+ *
+ * `commandActivityAt` carries the newest provider-event time the caller has
+ * seen. The thread row's own timestamp does not move while a provider works a
+ * turn, so without this a reviewer deep in a long diff reads as dead at the
+ * watchdog and is retired mid-review.
  */
 export function classifyThreadRecovery(
   job: Job,
@@ -148,6 +153,7 @@ export function classifyThreadRecovery(
   previous: WorkerLiveness | null,
   now: number,
   workerKind: WorkerLiveness["workerKind"] = previous?.workerKind ?? "implementation",
+  commandActivityAt?: number,
 ): ThreadRecoverySignal | null {
   if (!Number.isInteger(now) || now < 0) throw new TypeError("now must be a non-negative integer");
   if (thread === null) {
@@ -170,7 +176,7 @@ export function classifyThreadRecovery(
 
   const state = stateForThread(thread);
   if (state === "failed") return recoverySignal(workerKind, "crash", `${thread.status}:${displayStatus}`);
-  const activityAt = threadActivityAt(thread);
+  const activityAt = threadActivityAt(thread, commandActivityAt);
   if (state === "starting" && now - activityAt > startGraceMs(job)) {
     return recoverySignal(workerKind, "never_started", `${thread.status}:${displayStatus}`);
   }

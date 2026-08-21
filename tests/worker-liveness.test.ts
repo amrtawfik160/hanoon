@@ -81,6 +81,20 @@ describe("worker liveness projection", () => {
     expect(value.staleNotifiedAt).toBeNull();
   });
 
+  // A codex review ran 23 minutes without the BB thread row moving once, and
+  // the watchdog retired it at five, four times over, then failed the job
+  // while a complete verdict was still on its way. Provider events are the
+  // real pulse: a thread whose event stream advanced inside the window is
+  // working, however quiet its row.
+  it("keeps a quiet-rowed worker alive while its provider events still advance", () => {
+    const job = jobFixture({ policy: policyFixture({ workerLivenessWatchdogMs: 60_000 }) });
+    const quietRow = thread({ status: "active", updatedAt: 1_000 });
+
+    expect(classifyThreadRecovery(job, quietRow, null, 61_001, "review", 45_000)).toBeNull();
+    expect(classifyThreadRecovery(job, quietRow, null, 106_001, "review", 45_000))
+      .toMatchObject({ classification: "no_progress" });
+  });
+
   it("classifies never-started and no-progress workers but honors host reconnect grace", () => {
     const job = jobFixture({
       policy: policyFixture({
