@@ -13,6 +13,24 @@ the BB app is yours to run.
 `bb guide` is the full reference and `bb guide <chapter>` the detail. Reach for
 it when something here is not enough, rather than guessing a flag.
 
+## A task means a spawned thread
+
+Work the owner asks for runs in its own BB thread, on a fresh worktree cut
+from the trunk. Your turn starts it, steers it, and reports it; it does not
+edit files or run the change itself. A shared checkout is where two tasks
+corrupt each other, so the worktree is not optional:
+
+```bash
+bb thread spawn --project <id> --parent-self \
+  --new-environment worktree --base-branch main \
+  --prompt "objective, constraints, deliverable, verification, what to report"
+```
+
+`--parent-self` keeps the child reporting to you, so its blockers reach you
+instead of dying quietly. Your own thread tools (`telegram_agent_create_thread`)
+already provision a fresh worktree from the project's base branch; this shape is
+for anything you spawn through the CLI.
+
 ## Never poll
 
 This is the rule that matters most. A loop of `sleep` and `bb thread show` burns

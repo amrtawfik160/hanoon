@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import {
   isResumablePermanentFailure,
+  isResumableConfigurationBlock,
   isReviewedPrCompletionBlock,
   PRODUCTION_NOT_CONFIGURED,
   projectPolicySchema,
@@ -11838,7 +11839,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const admission = this.autonomyRepository.getAdmission(jobId);
     if (!job || job.version !== expectedVersion || job.state !== "blocked" ||
       (job.blockedReason !== "review_limit" && job.blockedReason !== "plan_limit" &&
-        !isReviewedPrCompletionBlock(job)) || !admission) {
+        !isReviewedPrCompletionBlock(job) && !isResumableConfigurationBlock(job)) || !admission) {
       return { outcome: "unavailable" };
     }
     if (job.projectId !== admission.projectId || job.policy?.projectId !== admission.projectId) {

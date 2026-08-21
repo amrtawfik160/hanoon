@@ -368,6 +368,40 @@ it("requeues a released plan-limit block the same way as a review-limit block", 
   });
 });
 
+// A review group settled as blocked (a dirty review worktree at the wrong
+// moment) parked a real job at blocked/configuration with an open pull
+// request, and nothing could ever take it back: the transition supported
+// resuming from the PR, but no admission predicate offered it. That job sat
+// dead until a person edited the database or gave up on it.
+it("requeues a configuration-blocked job that still has an open pull request", () => {
+  const { db, store } = storeFixture();
+  const blocked = store.createJob({ id: "job_config_blocked", sourceUpdateId: 106, requestText: "config blocked", now: 1_000 });
+  const selected = store.applyJobEvent(blocked.id, blocked.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  store.queueAdmission({
+    jobId: blocked.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_050,
+  });
+  db.prepare(
+    `UPDATE jobs SET state = 'blocked', blocked_reason = 'configuration', pr_number = 42,
+       pr_url = 'https://github.com/example/repo/pull/42',
+       implementation_thread_id = 'thr_impl', review_cycle = 0 WHERE id = ?`,
+  ).run(blocked.id);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = 1_100, release_reason = 'review_blocked' WHERE job_id = ?").run(blocked.id);
+
+  expect(store.requeueReviewAdmission(blocked.id, selected.version, 1_200)).toMatchObject({
+    outcome: "queued",
+    admission: { state: "queued", resumeEvent: "CONTINUE_REVIEW" },
+  });
+});
+
 it("requeues a released failed job and resumes it only after capacity is reacquired", () => {
   const { db, store } = storeFixture();
   const draft = store.createJob({ id: "job_released_retry", sourceUpdateId: 103, requestText: "retry", now: 1_000 });
