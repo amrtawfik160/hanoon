@@ -8,6 +8,7 @@ import {
   type TelegramUpdate,
 } from "./types";
 import { TelegramApiError, type TelegramDeliveryOutcome } from "./errors";
+import { scrubOwnerDashes } from "./dashes";
 
 export { TelegramApiError } from "./errors";
 
@@ -293,7 +294,7 @@ export class TelegramClient {
   public sendMessage(chatId: string, payload: SendMessagePayload, signal?: AbortSignal): Promise<{ message_id: number }> {
     return this.request({
       method: "sendMessage",
-      payload: { ...payload, chat_id: chatId },
+      payload: { ...payload, text: scrubOwnerDashes(payload.text), chat_id: chatId },
       callerSignal: signal,
       timeoutMs: ORDINARY_REQUEST_TIMEOUT_MS,
       parseResult: parseSentMessage,
@@ -318,7 +319,9 @@ export class TelegramClient {
       method: upload.field === "photo" ? "sendPhoto" : "sendVideo",
       payload: {
         chat_id: chatId,
-        ...(caption === null || caption.length === 0 ? {} : { caption, parse_mode: "HTML" }),
+        ...(caption === null || caption.length === 0
+          ? {}
+          : { caption: scrubOwnerDashes(caption), parse_mode: "HTML" }),
       },
       upload,
       callerSignal: signal,
@@ -350,7 +353,7 @@ export class TelegramClient {
     }
     return this.request({
       method: "sendMessageDraft",
-      payload: { chat_id: chatId, draft_id: draftId, text },
+      payload: { chat_id: chatId, draft_id: draftId, text: scrubOwnerDashes(text) },
       callerSignal: signal,
       timeoutMs: 5_000,
       maxAttempts: 1,
@@ -362,7 +365,7 @@ export class TelegramClient {
     if (!Number.isInteger(messageId) || messageId < 1) throw new TypeError("messageId must be a positive integer");
     return this.request({
       method: "editMessageText",
-      payload: { ...payload, chat_id: chatId, message_id: messageId },
+      payload: { ...payload, text: scrubOwnerDashes(payload.text), chat_id: chatId, message_id: messageId },
       callerSignal: signal,
       timeoutMs: ORDINARY_REQUEST_TIMEOUT_MS,
       parseResult: () => undefined,
@@ -373,7 +376,7 @@ export class TelegramClient {
   public answerCallback(callbackQueryId: string, text: string, signal?: AbortSignal): Promise<void> {
     return this.request({
       method: "answerCallbackQuery",
-      payload: { callback_query_id: callbackQueryId, text },
+      payload: { callback_query_id: callbackQueryId, text: scrubOwnerDashes(text) },
       callerSignal: signal,
       timeoutMs: ORDINARY_REQUEST_TIMEOUT_MS,
       parseResult: () => undefined,

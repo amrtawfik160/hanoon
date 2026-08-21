@@ -425,6 +425,50 @@ describe("Telegram Bot API client", () => {
     expect(fetchMock.calls[1]?.body).toContain('"callback_query_id":"callback-1"');
   });
 
+  // The owner's standing rule bans em and en dashes in everything sent to
+  // them. Prompts ask the model nicely; the wire boundary is where it becomes
+  // true no matter which layer produced the text.
+  it("scrubs em and en dashes from every owner-facing text field", async () => {
+    const fetchMock = telegramFetch([
+      { ok: true, result: { message_id: 21 } },
+      { ok: true, result: true },
+      { ok: true, result: true },
+      { ok: true, result: true },
+    ]);
+    const client = new TelegramClient("token", fetchMock);
+
+    await client.sendMessage("70", { text: "one shape — plan files" });
+    await client.editMessage("70", 21, { text: "no result – so treat it" });
+    await client.sendMessageDraft("70", 91, "draft — partial");
+    await client.answerCallback("callback-2", "done — noted");
+
+    expect(fetchMock.calls[0]?.body).toContain('"text":"one shape, plan files"');
+    expect(fetchMock.calls[1]?.body).toContain('"text":"no result, so treat it"');
+    expect(fetchMock.calls[2]?.body).toContain('"text":"draft, partial"');
+    expect(fetchMock.calls[3]?.body).toContain('"text":"done, noted"');
+  });
+
+  it("scrubs dashes from a media caption", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 57 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const client = new TelegramClient("123:secret", fetchMock);
+
+    await client.sendMedia(
+      "70",
+      { field: "photo", filename: "shot.png", mimeType: "image/png", bytes: new Uint8Array([1]) },
+      "the checkout — before login",
+    );
+
+    const body = calls[0]?.init?.body as FormData;
+    expect(body.get("caption")).toBe("the checkout, before login");
+  });
+
   it("sends the native typing chat action with the exact Telegram payload", async () => {
     const fetchMock = telegramFetch([{ ok: true, result: true }]);
     const client = new TelegramClient("token", fetchMock);
