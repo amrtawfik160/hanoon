@@ -117,7 +117,7 @@ Two further settings govern what the agent does about its own failures. Both def
 
 | Setting | Options | Default | Purpose |
 | --- | --- | --- | --- |
-| Self-diagnosis | on, off | off | Inspects persisted controller failures out of band and proposes at most one cooled-down fix at a time. |
+| Self-healing | on, off | off | Inspects persisted controller and pipeline job failures out of band, fixes the cause with a change the worker verified, proposes at most one cooled-down fix at a time, and messages the owner the link without asking. |
 | What a diagnosis becomes | `draft-pr`, `pipeline` | `draft-pr` | `draft-pr` pushes a branch for you to read. `pipeline` files the same fix as an ordinary reviewed job instead. |
 
 `pipeline` needs the self-diagnosis project's policy to carry an [`autonomy.intake`](#work-the-daily-audit-starts) allowance, and it shares that allowance and its finding ledger rather than adding to them: a project that said two jobs a day meant two. Without one — or when that project's failure brake is on, it already has work running, or that failure has already had its job — it falls back to a draft pull request and logs why. Filing is not merging: the job asks for its merge on exactly the same terms as every other job on that project.
@@ -659,9 +659,12 @@ states what that does and does not bound.
 
 ### What a diagnosed failure becomes
 
-The **Self-diagnosis** and **What a diagnosis becomes** settings in
+The **Self-healing** and **What a diagnosis becomes** settings in
 [Background work](#background-work) decide whether the agent inspects its own
-controller failures, and what a proposed fix turns into. `pipeline` files the fix
+controller and job failures, and what a proposed fix turns into. A diagnosis
+must report what verification ran and what it showed, or it is refused before
+any pull request exists, and the owner receives the link to whatever was
+opened or filed the moment it exists. `pipeline` files the fix
 through this project's `autonomy.intake` allowance and the same finding ledger
 rather than keeping its own count, because a project that said two jobs a day
 meant two. Without an allowance — or when the failure brake is on, work is
