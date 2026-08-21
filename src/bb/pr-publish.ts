@@ -171,7 +171,7 @@ export function buildSelfDiagnosisPullRequestCommand(input: {
     '  printf \'%s\\n\' "NO_UNIQUE_CHANGES"',
     '  exit 2',
     'fi',
-    'git commit -m "fix: address self-diagnosed controller failure"',
+    'git commit -m "fix: address a self-diagnosed failure"',
     'git fetch --no-tags origin "$base"',
     'if ! git merge-base --is-ancestor "origin/$base" HEAD; then',
     '  printf \'%s\\n\' "BASE_NOT_ANCESTOR"',

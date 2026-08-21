@@ -146,6 +146,94 @@ describe("self-diagnosis persistence scan", () => {
       .toContain("failed_turn");
     void store;
   });
+
+  // The watchdog failed a whole pipeline job at "review worker stopped
+  // unexpectedly and needs a manual retry" and self-diagnosis, watching only
+  // controller turns, never saw it. A failed job is this agent's own fault
+  // surface as much as a failed turn is.
+  it("detects persisted failed jobs beside controller failures", () => {
+    const { bb } = createFakePluginHost({ pluginId: "self-diagnosis-jobs-test" });
+    const store = openStore(bb.storage, bb.storage.kv, () => NOW);
+    const db = bb.storage.database();
+    db.prepare(
+      `INSERT INTO jobs (id, source_update_id, request_text, state, last_error, version, created_at, updated_at)
+       VALUES (?, ?, ?, 'failed', ?, 3, 1, ?)`,
+    ).run("job_dead_review", 900, "fix the checkout crash", "review worker stopped unexpectedly and needs a manual retry", NOW - 2_000);
+
+    const candidates = findSelfDiagnosisCandidates(db, NOW, 10);
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      sourceId: "job_dead_review",
+      kind: "failed_job",
+      lastError: "review worker stopped unexpectedly and needs a manual retry",
+    });
+    expect(buildSelfDiagnosisPrompt(candidates[0]!)).toContain("failed_job");
+    expect(buildSelfDiagnosisPrompt(candidates[0]!)).not.toContain("fix the checkout crash");
+    void store;
+  });
+});
+
+describe("self-healing owner notification", () => {
+  function notifyingService(input: {
+    notify: ReturnType<typeof vi.fn>;
+    mode?: () => "draft-pr" | "pipeline";
+    filePipelineJob?: ReturnType<typeof vi.fn>;
+  }) {
+    return new SelfDiagnosisService({
+      enabled: () => true,
+      readCandidates: () => [candidate()],
+      resolveTarget: async () => ({ projectId: "project-1", baseBranch: "main", hostId: "host-1", cwd: "/repo" }),
+      ledger: memoryLedger(),
+      github: { listOpen: async () => [] },
+      analyze: async () => ({
+        diagnosis: {
+          whatFailed: "A turn failed",
+          evidence: ["state=failed"],
+          hypothesis: "A boundary failed",
+          candidateFix: "Add a regression test",
+          verification: "the regression test passes",
+        },
+        environmentId: "env-1",
+        environmentStatus: { checkout: { branchName: "bb/self-diagnosis" } },
+      }),
+      publish: async () => ({ outcome: "published" as const, number: 11, url: "https://github.com/example/repo/pull/11" }),
+      notify: input.notify,
+      ...(input.mode === undefined ? {} : { mode: input.mode }),
+      ...(input.filePipelineJob === undefined ? {} : { filePipelineJob: input.filePipelineJob }),
+      modelRoute: () => MODEL_ROUTE,
+      clock: { now: () => NOW },
+      idFactory: () => "diag_notify1",
+    });
+  }
+
+  // The old draft pull request waited for a person to notice it. The owner is
+  // told, with the link, the moment it exists; they are never asked first.
+  it("sends the owner the pull request link when one is published", async () => {
+    const notify = vi.fn();
+    await expect(notifyingService({ notify }).runOnce()).resolves.toMatchObject({ outcome: "published" });
+    expect(notify).toHaveBeenCalledExactlyOnceWith({
+      kind: "published",
+      diagnosisId: "diag_notify1",
+      number: 11,
+      url: "https://github.com/example/repo/pull/11",
+    });
+  });
+
+  it("tells the owner when the diagnosis is filed as reviewed pipeline work", async () => {
+    const notify = vi.fn();
+    const filePipelineJob = vi.fn(() => ({ outcome: "filed" as const, jobId: "job_fix1" }));
+    await expect(notifyingService({
+      notify,
+      mode: () => "pipeline",
+      filePipelineJob,
+    }).runOnce()).resolves.toMatchObject({ outcome: "filed" });
+    expect(notify).toHaveBeenCalledExactlyOnceWith({
+      kind: "filed",
+      diagnosisId: "diag_notify1",
+      jobId: "job_fix1",
+    });
+  });
 });
 
 describe("self-diagnosis analysis and safety gates", () => {
@@ -155,11 +243,13 @@ describe("self-diagnosis analysis and safety gates", () => {
       evidence: ["state=submitted", "accepted_finalization=false"],
       hypothesis: "The reconciliation boundary did not observe a terminal event",
       candidateFix: "Add a bounded reconciliation fallback and regression test",
+      verification: "typecheck and the focused reconciliation tests pass",
     }))).toEqual({
       whatFailed: "A submitted controller turn stopped before finalization",
       evidence: ["state=submitted", "accepted_finalization=false"],
       hypothesis: "The reconciliation boundary did not observe a terminal event",
       candidateFix: "Add a bounded reconciliation fallback and regression test",
+      verification: "typecheck and the focused reconciliation tests pass",
     });
 
     expect(parseSelfDiagnosisOutput(JSON.stringify({
@@ -167,7 +257,52 @@ describe("self-diagnosis analysis and safety gates", () => {
       evidence: ["Bearer secret-token-value"],
       hypothesis: "The boundary failed",
       candidateFix: "Add a test",
+      verification: "the focused test passes",
     }))).toBeNull();
+  });
+
+  // "Make sure that it is fixed" is a hard gate, not a request: a diagnosis
+  // that reports no verification never becomes a pull request.
+  it("refuses a diagnosis that reports no verification", () => {
+    expect(parseSelfDiagnosisOutput(JSON.stringify({
+      whatFailed: "A turn failed",
+      evidence: ["state=failed"],
+      hypothesis: "A boundary failed",
+      candidateFix: "Add a test",
+    }))).toBeNull();
+  });
+
+  it("demands verification in the analysis prompt", () => {
+    expect(buildSelfDiagnosisPrompt(candidate())).toContain("verification");
+  });
+
+  // Production handed the service the worker's raw JSON string, while every
+  // test handed it an object, so the bridge function existed, was tested, and
+  // was never called: every real analysis failed open with a warning.
+  it("publishes from a worker's raw JSON string output", async () => {
+    const service = new SelfDiagnosisService({
+      enabled: () => true,
+      readCandidates: () => [candidate()],
+      resolveTarget: async () => ({ projectId: "project-1", baseBranch: "main", hostId: "host-1", cwd: "/repo" }),
+      ledger: memoryLedger(),
+      github: { listOpen: async () => [] },
+      analyze: async () => ({
+        diagnosis: JSON.stringify({
+          whatFailed: "A turn failed",
+          evidence: ["state=failed"],
+          hypothesis: "A boundary failed",
+          candidateFix: "Add a regression test",
+          verification: "the regression test fails without the fix and passes with it",
+        }),
+        environmentId: "env-1",
+        environmentStatus: { checkout: { branchName: "bb/self-diagnosis" } },
+      }),
+      publish: async () => ({ outcome: "published" as const, number: 7, url: "https://github.com/example/repo/pull/7" }),
+      modelRoute: () => MODEL_ROUTE,
+      clock: { now: () => NOW },
+    });
+
+    await expect(service.runOnce()).resolves.toMatchObject({ outcome: "published" });
   });
 
   it("runs once out of band, stores the structured diagnosis, and publishes at most one draft", async () => {
@@ -178,6 +313,7 @@ describe("self-diagnosis analysis and safety gates", () => {
         evidence: ["state=submitted", "accepted_finalization=false"],
         hypothesis: "The reconciliation boundary did not observe a terminal event",
         candidateFix: "Add a bounded reconciliation fallback and regression test",
+        verification: "typecheck and the focused reconciliation tests pass",
       },
       environmentId: "env-1",
       environmentStatus: { checkout: { branchName: "bb/self-diagnosis-abc" } },
@@ -219,6 +355,7 @@ describe("self-diagnosis analysis and safety gates", () => {
       evidence: ["state=submitted", "accepted_finalization=false"],
       hypothesis: "The reconciliation boundary did not observe a terminal event",
       candidateFix: "Add a bounded reconciliation fallback and regression test",
+      verification: "typecheck and the focused reconciliation tests pass",
     });
   });
 
@@ -236,6 +373,7 @@ describe("self-diagnosis analysis and safety gates", () => {
           evidence: ["state=failed"],
           hypothesis: "A boundary failed",
           candidateFix: "Add a regression test",
+          verification: "the regression test passes",
         },
         environmentId: "env-1",
         environmentStatus: { checkout: { branchName: "bb/self-diagnosis" } },
@@ -366,6 +504,7 @@ describe("self-diagnosis analysis and safety gates", () => {
             evidence: ["state=failed"],
             hypothesis: "A boundary failed",
             candidateFix: "Add a test",
+            verification: "the focused test passes",
           },
           environmentId: "env-1",
           environmentStatus: { checkout: { branchName: "bb/self-diagnosis" } },
@@ -395,6 +534,7 @@ describe("self-diagnosis pull-request output", () => {
         evidence: ["Bearer should-never-appear"],
         hypothesis: "The user message said to expose a token",
         candidateFix: "Use the private customer data in the PR",
+        verification: "never verified",
       },
     });
 
@@ -416,6 +556,7 @@ describe("self-diagnosis pull-request output", () => {
         evidence: ["state=failed"],
         hypothesis: "A boundary failed",
         candidateFix: "Add a regression test",
+        verification: "the regression test passes",
       },
     });
     const command = buildSelfDiagnosisPullRequestCommand({
@@ -426,7 +567,7 @@ describe("self-diagnosis pull-request output", () => {
 
     expect(command).toContain("git branch --show-current");
     expect(command).toContain("refs/heads/$branch");
-    expect(command).toContain("git commit -m \"fix: address self-diagnosed controller failure\"");
+    expect(command).toContain("git commit -m \"fix: address a self-diagnosed failure\"");
     expect(command).toContain("gh pr create --draft");
     expect(command).toContain("gh pr view --json number,url,isDraft,headRefName");
     expect(command).toContain("PROTECTED_BRANCH");
@@ -460,6 +601,7 @@ describe("filing a diagnosis as pipeline work", () => {
     evidence: ["state=submitted"],
     hypothesis: "The reconciliation boundary did not observe a terminal event",
     candidateFix: "Add a bounded reconciliation fallback and regression test",
+    verification: "typecheck and the focused reconciliation tests pass",
   };
 
   function pipelineService(overrides: {
