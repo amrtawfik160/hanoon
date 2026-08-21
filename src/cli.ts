@@ -6,6 +6,10 @@ import type {
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { createSecret, hashSecret } from "./crypto";
 import {
+  isResumableConfigurationBlock,
+  isResumablePlanBlock,
+  isResumableReviewBlock,
+  isReviewedPrCompletionBlock,
   projectPolicySchema,
   type Job,
   type ProjectPolicy,
@@ -1122,6 +1126,26 @@ function jobRetry(
   const jobId = onePositional(parsed, "job retry");
   const current = deps.store.getJob(jobId);
   if (!current) throw new CliOperationError("Job was not found");
+  // A resumable block continues its review rather than replaying a failure.
+  // The controller tool has always routed these; the CLI threw "not
+  // retryable" at the same job, which is how a blocked review looked
+  // permanently dead from the shell.
+  if (
+    isResumablePlanBlock(current) || isResumableReviewBlock(current) ||
+    isReviewedPrCompletionBlock(current) || isResumableConfigurationBlock(current)
+  ) {
+    const queued = deps.store.requeueReviewAdmission(jobId, current.version, deps.now());
+    if (queued.outcome === "unavailable") throw new CliOperationError("Job is not retryable");
+    deps.notify?.();
+    const output = safeJob(deps.store, deps.store.getJob(jobId) ?? current, deps.now());
+    return success(
+      output,
+      queued.outcome === "still_cleaning_up"
+        ? `Review continuation queued for ${jobId}; the previous run is still cleaning up`
+        : `Review continuation queued for ${jobId}`,
+      json,
+    );
+  }
   const retryResult = deps.store.retryFailedJob(jobId, current.version, deps.now());
   if (retryResult.outcome === "unavailable") throw new CliOperationError("Job is not retryable");
   deps.notify?.();

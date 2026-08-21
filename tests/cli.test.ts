@@ -140,6 +140,40 @@ it.each([["--help"], ["help"]])("prints actionable command help for %s", async (
   expect(result.stdout).toContain("capability status");
 });
 
+// The controller tool has always resumed a blocked review; the CLI threw
+// "Job is not retryable" at the same job, which is how the Areliaa job looked
+// permanently dead from the shell.
+it("resumes a configuration-blocked job with an open PR from the CLI", async () => {
+  const { bb, harness, store } = await loadPlugin();
+  const created = store.createJob({ id: "job_cli_blocked", sourceUpdateId: 71, requestText: "blocked", now: 1_000 });
+  const selected = store.applyJobEvent(created.id, created.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_050);
+  store.queueAdmission({
+    jobId: created.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_050,
+  });
+  const db = bb.storage.database();
+  db.prepare(
+    `UPDATE jobs SET state = 'blocked', blocked_reason = 'configuration', pr_number = 42,
+       pr_url = 'https://github.com/example/repo/pull/42',
+       implementation_thread_id = 'thr_impl' WHERE id = ?`,
+  ).run(created.id);
+  db.prepare("UPDATE job_admissions SET state = 'released', released_at = 1_100, release_reason = 'review_blocked' WHERE job_id = ?").run(created.id);
+
+  const result = await harness.behavior.runCli(["job", "retry", created.id]);
+
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain("Review continuation queued for job_cli_blocked");
+  expect(store.getAdmission(created.id)).toMatchObject({ state: "queued", resumeEvent: "CONTINUE_REVIEW" });
+});
+
 it("reports what every stage of one job ran on and what it consumed", async () => {
   const { harness, store } = await loadPlugin();
   store.createJob({ id: "job_spend", sourceUpdateId: 1, requestText: "work", now: 1_000 });
