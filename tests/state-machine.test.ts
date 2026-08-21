@@ -227,6 +227,32 @@ describe("job state machine", () => {
     expect(failed.effects.map((effect) => effect.kind)).toEqual(["spawn_review"]);
   });
 
+  // The Areliaa job resumed pinned to the head its review group had settled
+  // "blocked" against, so the stale verdict replayed and re-blocked it within
+  // a second. A configuration block resumes by re-resolving the pull request
+  // head, which gives it a fresh validation and a fresh review group.
+  it("re-resolves the head when a configuration-blocked review continues", () => {
+    const resumed = transition(
+      stateJob("blocked", {
+        blockedReason: "configuration",
+        prNumber: 42,
+        prUrl: "https://github.test/pr/42",
+        prHeadSha: sha(),
+        implementationThreadId: "thr_impl",
+      }),
+      { type: "CONTINUE_REVIEW" },
+      2_244,
+    );
+    expect(resumed.job).toMatchObject({
+      state: "resolving_pr_head",
+      blockedReason: null,
+      lastError: null,
+      prHeadSha: null,
+      prNumber: 42,
+    });
+    expect(resumed.effects.map((effect) => effect.kind)).toEqual(["revoke_approvals", "resolve_pr_head"]);
+  });
+
   it("retries a permanent effect failure when the next step is already known", () => {
     const retried = transition(
       stateJob("blocked", {
