@@ -2463,10 +2463,14 @@ it("scans every returned watch for obligations while capping only subject refs",
     "telegram_agent_list_watches",
     { includeFinished: true },
     controllerToolContext,
-  ) as string) as { _hanoonEvidence: { proofKinds: string[]; subjectRefs: string[] } };
+  ) as string) as { monitors: Array<{ id: string }>; _hanoonEvidence: { proofKinds: string[]; subjectRefs: string[] } };
   expect(output._hanoonEvidence.proofKinds).toEqual(["monitor_state", "obligation"]);
-  const returnedOrder = store.listMonitors(turn.controllerKey, true).map((monitor) => monitor.id);
-  expect(returnedOrder.at(-1)).toBe(monitorIds[0]);
+  // The list packs the armed watch first and settled history newest-first, so
+  // the refs are read from the rows the tool actually returned, not from the
+  // store's raw order.
+  const returnedOrder = output.monitors.map((monitor) => monitor.id);
+  expect(returnedOrder[0]).toBe(monitorIds[0]);
+  expect(returnedOrder).toHaveLength(17);
   expect(output._hanoonEvidence.subjectRefs).toEqual(returnedOrder.slice(0, 16).map((id) => `monitor:${id}`));
 });
 

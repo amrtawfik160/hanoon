@@ -822,6 +822,7 @@ type ControllerSteerSettlementRow = Readonly<{
   controllerKey: string;
   waitingState: ControllerTurnState | null;
   waitingOrdinal: number | null;
+  waitingOrigin: string | null;
   inputText: string | null;
   telegramChatId: string;
 }>;
@@ -7771,6 +7772,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       `SELECT running.controller_key AS controllerKey,
               waiting.state AS waitingState,
               waiting.ordinal AS waitingOrdinal,
+              waiting.origin AS waitingOrigin,
               waiting.input_text AS inputText,
               controller.telegram_chat_id AS telegramChatId
          FROM controller_turns AS running
@@ -7831,13 +7833,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     });
     // The answer itself arrives folded into the reply already being written, so
     // without this the owner's message drew no bubble at all and reads in
-    // Telegram exactly like being ignored.
+    // Telegram exactly like being ignored. That debt exists only for the
+    // owner's own words: a system injection folded the same way was never a
+    // message the owner sent, and acknowledging it reads as answering nobody.
+    if (row.waitingOrigin !== "owner") return;
     //
-    // Once, though. Two messages sent seconds apart both fold into the same
-    // running answer, and keying this by the waiting turn gave each its own
-    // row: the owner got the identical sentence twice, which reads like a
-    // stutter rather than an acknowledgement. One undelivered acknowledgement
-    // already says everything a second would.
+    // Once per answer, though. Keying this by the waiting turn gave every fold
+    // its own row, and checking only for a still-undelivered duplicate assumed
+    // the outbox was slower than the settles. It isn't: it drains sub-second,
+    // so the first bubble was sent before the second fold settled and the
+    // owner got the identical sentence twice. The running turn is the one
+    // thing every fold into the same answer shares, so the row is keyed by it
+    // and its bare existence, delivered or not, is the fence. It is never
+    // re-persisted: the upsert would flip a sent row back to pending.
+    const logicalKey = `controller:${input.runningTurnId}:steer-folded`;
+    const announcementExists = this.db.prepare(
+      "SELECT 1 FROM outbox WHERE logical_key = ? LIMIT 1",
+    ).get(logicalKey) !== undefined;
+    if (announcementExists) return;
+    // A still-undelivered acknowledgement from a previous answer also says
+    // everything this one would.
     const announcementPending = this.db.prepare(
       `SELECT 1 FROM outbox
         WHERE chat_id = ? AND status IN ('pending', 'leased', 'failed')
@@ -7845,7 +7860,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).get(row.telegramChatId, foldedAnnouncementJson()) !== undefined;
     if (announcementPending) return;
     persistControllerOutbox(this.db, {
-      logicalKey: controllerReplyLogicalKey(input.waitingTurnId, null),
+      logicalKey,
       chatId: row.telegramChatId,
       payload: FOLDED_ANNOUNCEMENT_PAYLOAD,
     }, input.now);
