@@ -453,6 +453,23 @@ export function isReviewedPrCompletionBlock(
     && job.policy?.production === undefined;
 }
 
+/**
+ * A review group that settles as blocked (a dirty review worktree, evidence
+ * bound to the wrong head) parks its job at blocked/configuration. When the
+ * job still holds an open pull request, the blocked transition already knows
+ * how to resume from it; this is the admission-side voice of the same fact.
+ * Without it a transient environment condition became a permanent dead end.
+ */
+export function isResumableConfigurationBlock(
+  job: Pick<Job, "state" | "blockedReason" | "lastError" | "prNumber" | "cancelRequestedAt">,
+): boolean {
+  return job.state === "blocked"
+    && job.blockedReason === "configuration"
+    && job.lastError !== PRODUCTION_NOT_CONFIGURED
+    && job.prNumber !== null
+    && job.cancelRequestedAt === null;
+}
+
 export function shouldResumeExistingPr(
   job: Pick<Job, "prNumber" | "deliveryMode" | "resumeState">,
 ): boolean {
@@ -480,7 +497,8 @@ export function isRetryableJob(
   return isResumablePlanBlock(job)
     || isResumableReviewBlock(job)
     || isResumablePermanentFailure(job)
-    || isReviewedPrCompletionBlock(job);
+    || isReviewedPrCompletionBlock(job)
+    || isResumableConfigurationBlock(job);
 }
 
 export interface Job {

@@ -6,6 +6,7 @@ import {
   isResumablePermanentFailure,
   isResumablePlanBlock,
   isResumableReviewBlock,
+  isResumableConfigurationBlock,
   isReviewedPrCompletionBlock,
   isRetryableJob,
   type Job,
@@ -1881,7 +1882,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       if (jobResolution.outcome !== "job") return resolutionProjection(jobResolution);
       const job = jobResolution.job;
       if (job.cancelRequestedAt !== null) throw new Error("The requested job is not retryable");
-      if (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job)) {
+      if (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job) ||
+        isResumableConfigurationBlock(job)) {
         const queued = runControllerMutation(dependencies, authorized, context, (now) =>
           dependencies.store.requeueReviewAdmission(job.id, job.version, now));
         if (queued.outcome === "unavailable") throw new Error("The requested job is not retryable");

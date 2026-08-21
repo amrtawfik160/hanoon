@@ -17,6 +17,7 @@ import {
   isResumablePermanentFailure,
   isResumablePlanBlock,
   isResumableReviewBlock,
+  isResumableConfigurationBlock,
   isReviewedPrCompletionBlock,
   type Job,
   type JobEvent,
@@ -321,8 +322,9 @@ function assertJobIdentity(job: Job, input: AdmissionWriteInput): void {
 
 function assertContinuationState(job: Job, resumeEvent: AdmissionResumeEvent): void {
   if (resumeEvent === "CONTINUE_REVIEW" && !isResumablePlanBlock(job) &&
-    !isResumableReviewBlock(job) && !isReviewedPrCompletionBlock(job)) {
-    throw new AutonomyAdmissionConflictError(job.id, "review continuation requires a review-limit, plan-limit, or reviewed-PR completion block");
+    !isResumableReviewBlock(job) && !isReviewedPrCompletionBlock(job) &&
+    !isResumableConfigurationBlock(job)) {
+    throw new AutonomyAdmissionConflictError(job.id, "review continuation requires a review-limit, plan-limit, configuration, or reviewed-PR completion block");
   }
   if (resumeEvent === "RETRY" && !isResumablePermanentFailure(job) && (
     job.state !== "failed" || job.resumeState === null || job.cancelRequestedAt !== null
@@ -445,7 +447,8 @@ function currentExecutorLease(
 function resumeEventForAdmission(job: Job, resumeEvent: AdmissionResumeEvent): JobEvent | null {
   if (resumeEvent === "CONFIRMED" && job.state === "awaiting_confirmation") return { type: "CONFIRMED" };
   if (resumeEvent === "CONTINUE_REVIEW" && job.state === "blocked" &&
-    (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job))) {
+    (isResumablePlanBlock(job) || isResumableReviewBlock(job) || isReviewedPrCompletionBlock(job) ||
+      isResumableConfigurationBlock(job))) {
     return { type: "CONTINUE_REVIEW" };
   }
   if (resumeEvent === "RETRY" && (
