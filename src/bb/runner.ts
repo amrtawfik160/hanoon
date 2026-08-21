@@ -563,16 +563,18 @@ export class BbRunner {
     requirePullRequestSnapshot(job, pullRequest);
     if (job.prHeadSha === null) throw new Error("Active job has no authoritative review head SHA");
     const remoteHeadSha = job.prHeadSha;
+    const reviewDiff = await this.reviewDiff(environmentId, job, snapshot.diff);
     const artifact = buildReviewPacket(
       job,
       policy,
       remoteHeadSha,
-      await this.reviewDiff(environmentId, job, snapshot.diff),
+      reviewDiff.diff,
       attempt.reviewLens ?? "quality",
       attempt.capabilityProfile,
       job.taskRecipe === "architectural"
         ? role === "final-review" ? "integrated-review" : "task-review"
         : job.taskRecipe === "direct" ? "diff-guards" : "review",
+      reviewDiff.source,
     );
     const project = projectId(job, policy);
     const uploaded = await this.upload(project, artifact);
@@ -653,22 +655,42 @@ export class BbRunner {
     return this.sdk.environments.pullRequest({ environmentId });
   }
 
-  private async reviewDiff(environmentId: string, job: Job, snapshot: EnvironmentDiff): Promise<string> {
+  /**
+   * The diff a reviewer reads, with where it came from.
+   *
+   * GitHub's own pull-request diff is preferred whenever the job has one: it
+   * is computed against the true remote base, which is also exactly what a
+   * merge would land. The environment diff reads against the worktree's local
+   * base ref, and a stale one once served a reviewer nine thousand lines of
+   * main's own history as if this job had written them — every cycle of that
+   * review demanded out-of-scope fixes until the job hit its review limit.
+   * The local diff remains the answer for a job that has no pull request yet.
+   */
+  private async reviewDiff(
+    environmentId: string,
+    job: Job,
+    snapshot: EnvironmentDiff,
+  ): Promise<{ diff: string; source: string }> {
+    if (job.prNumber !== null) {
+      const command = `gh pr diff ${String(job.prNumber)}`;
+      try {
+        const result = await new TerminalCommandRunner(this.sdk).run({
+          scope: { kind: "environment", environmentId },
+          title: `Telegram review diff ${job.id}`,
+          command,
+          timeoutMs: 60_000,
+        });
+        if (result.outcome === "exited" && result.exitCode === 0 && result.output.trim().length > 0) {
+          return { diff: result.output, source: command };
+        }
+      } catch {
+        // GitHub being unreachable must not stop review; the environment diff
+        // below is the answer it always was, stale-base risk and all.
+      }
+    }
     const local = environmentDiffText(snapshot);
-    if (local !== null) return local;
-    if (job.prNumber === null) {
-      throw new Error("Complete environment diff is unavailable and the job has no pull request");
-    }
-    const result = await new TerminalCommandRunner(this.sdk).run({
-      scope: { kind: "environment", environmentId },
-      title: `Telegram review diff ${job.id}`,
-      command: `gh pr diff ${String(job.prNumber)}`,
-      timeoutMs: 60_000,
-    });
-    if (result.outcome === "exited" && result.exitCode === 0 && result.output.trim().length > 0) {
-      return result.output;
-    }
-    throw new Error("Complete review diff is unavailable from the environment and GitHub");
+    if (local !== null) return { diff: local, source: "environment diff against the local base branch" };
+    throw new Error("Complete review diff is unavailable from GitHub and the environment");
   }
 }
 
