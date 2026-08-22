@@ -891,6 +891,13 @@ function transitionBlocked(job: Job, event: JobEvent, effects: JobEffect[]): voi
     completeReviewedWork(job, effects);
     return;
   }
+  // Checked before the pull-request branch below, which would otherwise send
+  // every job that has one back into review. A plan-limit block recorded under
+  // the old reason is excluded: it has no implementation to patch.
+  if (job.blockedReason === "review_limit" && !isResumablePlanBlock(job)) {
+    resumeIntoPatching(job, effects);
+    return;
+  }
   if (job.prNumber !== null) {
     // A configuration block means the review group settled against this very
     // head (a dirty worktree, drifted evidence). Resuming pinned to it replays
@@ -914,16 +921,21 @@ function transitionBlocked(job: Job, event: JobEvent, effects: JobEffect[]): voi
     emitEffect(job, effects, "spawn_plan");
     return;
   }
-  if (job.blockedReason !== "review_limit") illegal(job, event);
+  illegal(job, event);
+}
+
+/**
+ * The review limit is only ever reached while asking for another patch, so the
+ * work this job still owes is a fix, not another opinion. Resuming into review
+ * asked the same question of the same commit, and a review that already
+ * requested changes at that head refuses to answer twice: the job spent every
+ * restored cycle being told a new head is required and never produced one.
+ * Resuming into remediation is what makes that head exist.
+ */
+function resumeIntoPatching(job: Job, effects: JobEffect[]): void {
   job.blockedReason = null;
   job.lastError = null;
   job.reviewBlockAt = job.reviewCycle + 3;
-  // The limit is only ever reached while asking for another patch, so the work
-  // this job still owes is a fix, not another opinion. Resuming into review
-  // asked the same question of the same commit, and a review that already
-  // requested changes at this head refuses to answer twice: the job spent
-  // every restored cycle being told a new head is required and never produced
-  // one. Resuming into remediation is what makes that head exist.
   job.state = "remediating";
   emitEffect(job, effects, "send_remediation", {
     summary: "Address the outstanding review findings that stopped this job at its review limit.",

@@ -611,6 +611,26 @@ describe("job state machine", () => {
     expect(result.job.blockedReason).toBeNull();
     expect(result.job.reviewBlockAt).toBe(6);
     expect(result.effects.map((item) => item.kind)).toEqual(["send_remediation"]);
+
+    // Every real job at this limit already has a pull request, and the branch
+    // that resumes one used to intercept first, so the patch resume never ran
+    // where it was needed.
+    const withPullRequest = transition(
+      stateJob("blocked", {
+        reviewCycle: 6,
+        reviewBlockAt: 6,
+        blockedReason: "review_limit",
+        prNumber: 42,
+        prUrl: "https://github.test/pr/42",
+        prHeadSha: sha(),
+        implementationThreadId: "thr_impl",
+      }),
+      { type: "CONTINUE_REVIEW" },
+      3_600,
+    );
+    expect(withPullRequest.job.state).toBe("remediating");
+    expect(withPullRequest.job.reviewBlockAt).toBe(9);
+    expect(withPullRequest.effects.map((item) => item.kind)).toEqual(["send_remediation"]);
     expect(() => transition(stateJob("blocked", { blockedReason: "configuration" }), { type: "CONTINUE_REVIEW" }, 3_500)).toThrow(IllegalTransitionError);
   });
 
