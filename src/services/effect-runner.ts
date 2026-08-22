@@ -1781,9 +1781,16 @@ export class EffectRunner {
   }
 
   private async sendRemediation(effect: StoredEffect, job: Job): Promise<void> {
-    const findings = Array.isArray(recordPayload(effect).findings)
+    const payloadFindings = Array.isArray(recordPayload(effect).findings)
       ? recordPayload(effect).findings as ReviewFinding[]
       : [];
+    // Hitting the review limit blocks before any remediation is sent, so the
+    // findings that stopped the job are carried only by the review attempt
+    // that produced them. Resuming with an empty list would ask the worker to
+    // fix nothing at all, so the last review's own findings are recovered here.
+    const findings = payloadFindings.length > 0
+      ? payloadFindings
+      : this.lastReviewFindings(job);
     const reasons = Array.isArray(recordPayload(effect).reasons)
       ? (recordPayload(effect).reasons as unknown[]).filter((reason): reason is string => typeof reason === "string").slice(0, 20)
       : [];
@@ -1794,6 +1801,19 @@ export class EffectRunner {
     this.renewOperationFence(effect);
     const current = this.dependencies.store.getJob(job.id);
     if (current?.state === "remediating") this.applyEvent(job.id, current.version, { type: "REMEDIATION_SENT" });
+  }
+
+  /** The findings of the review this job last heard from, or none. */
+  private lastReviewFindings(job: Job): ReviewFinding[] {
+    if (!job.reviewThreadId) return [];
+    const attempt = this.dependencies.store.getAttemptByThreadId(job.reviewThreadId);
+    if (!attempt || attempt.jobId !== job.id || !attempt.resultJson) return [];
+    try {
+      const parsed = JSON.parse(attempt.resultJson) as { findings?: unknown };
+      return Array.isArray(parsed.findings) ? parsed.findings.slice(0, 20) as ReviewFinding[] : [];
+    } catch {
+      return [];
+    }
   }
 
   private async runValidation(effect: StoredEffect, job: Job, final = false): Promise<void> {

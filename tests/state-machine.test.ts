@@ -590,7 +590,12 @@ describe("job state machine", () => {
     if (state === "blocked") expect(result.job.blockedReason).toBe("review_limit");
   });
 
-  it("continues review only from a review-limit block and advances the next block threshold", () => {
+  // The limit is only reached while asking for another patch, so what the job
+  // still owes is a fix. Resuming into review asked the same question of the
+  // same commit, and a review that already requested changes at this head
+  // refuses to answer twice: the job burned every restored cycle being told a
+  // new head is required and never produced one.
+  it("continues patching only from a review-limit block and advances the next block threshold", () => {
     const result = transition(
       stateJob("blocked", {
         reviewCycle: 3,
@@ -602,10 +607,10 @@ describe("job state machine", () => {
       3_500,
     );
 
-    expect(result.job.state).toBe("reviewing");
+    expect(result.job.state).toBe("remediating");
     expect(result.job.blockedReason).toBeNull();
     expect(result.job.reviewBlockAt).toBe(6);
-    expect(result.effects.map((item) => item.kind)).toEqual(["spawn_review"]);
+    expect(result.effects.map((item) => item.kind)).toEqual(["send_remediation"]);
     expect(() => transition(stateJob("blocked", { blockedReason: "configuration" }), { type: "CONTINUE_REVIEW" }, 3_500)).toThrow(IllegalTransitionError);
   });
 

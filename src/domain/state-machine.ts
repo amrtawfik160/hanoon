@@ -918,8 +918,18 @@ function transitionBlocked(job: Job, event: JobEvent, effects: JobEffect[]): voi
   job.blockedReason = null;
   job.lastError = null;
   job.reviewBlockAt = job.reviewCycle + 3;
-  job.state = "reviewing";
-  emitEffect(job, effects, "spawn_review", job.prHeadSha ? { headSha: job.prHeadSha } : {});
+  // The limit is only ever reached while asking for another patch, so the work
+  // this job still owes is a fix, not another opinion. Resuming into review
+  // asked the same question of the same commit, and a review that already
+  // requested changes at this head refuses to answer twice: the job spent
+  // every restored cycle being told a new head is required and never produced
+  // one. Resuming into remediation is what makes that head exist.
+  job.state = "remediating";
+  emitEffect(job, effects, "send_remediation", {
+    summary: "Address the outstanding review findings that stopped this job at its review limit.",
+    findings: [],
+    reasons: [],
+  });
 }
 
 function planBlockSummary(summary: string): string {
