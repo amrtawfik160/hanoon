@@ -1607,10 +1607,34 @@ export class EffectRunner {
     // walks back into the identical wall every time it is retried.
     if (current.state !== "locating_pr") return;
     if (existing) {
+      // A remediation pass edits the worktree and stops there: its work order
+      // forbids committing, and publishing is the executor's job. Reporting
+      // the pull request and returning left that work uncommitted, so the head
+      // never moved and the next review blocked on "a new head is required
+      // after changes were requested" — permanently. The publish command
+      // already commits, pushes, and tolerates a pull request that exists, so
+      // it runs on every pass and not only the first. When it has nothing to
+      // publish it says so, and the pull request as found is still the answer.
+      const republished = this.dependencies.terminal && job.policy
+        ? await publishImplementationPullRequest({
+          runner: this.dependencies.terminal,
+          job: current,
+          policy: job.policy,
+          environmentId: job.environmentId,
+          environmentStatus: snapshot.status,
+          signal: this.dependencies.fence.signal,
+        })
+        : null;
+      this.renewOperationFence(effect);
+      const afterRepublish = this.dependencies.store.getJob(job.id);
+      if (!afterRepublish || afterRepublish.state !== current.state) return;
+      const located = republished?.outcome === "published"
+        ? { number: republished.number, url: republished.url }
+        : existing;
       this.applyEvent(
         job.id,
-        current.version,
-        { type: "PR_LOCATED", number: existing.number, url: existing.url },
+        afterRepublish.version,
+        { type: "PR_LOCATED", number: located.number, url: located.url },
         nativeAdapter,
       );
       return;

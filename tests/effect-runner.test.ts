@@ -1862,3 +1862,63 @@ it("does not announce a located pull request while the job is still implementing
   expect(after).toMatchObject({ state: "implementing", prNumber: null });
   expect(after?.blockedReason ?? null).toBeNull();
 });
+
+// Remediation edits the worktree but never commits: the work order forbids it,
+// and the executor owns publishing. With a pull request already open, the
+// lookup reported it and returned, so the head never moved and review blocked
+// on "a new head is required after changes were requested" — forever. The
+// publish command already commits, pushes, and tolerates an existing PR, so
+// it must run on every pass, not only the first.
+it("commits and pushes remediation work when the pull request already exists", async () => {
+  const { store, db } = storeFixture();
+  const draft = store.createJob({ id: "job_remediation_head", sourceUpdateId: 1, requestText: "fix it", now: 1_000 });
+  db.prepare(
+    `UPDATE jobs SET state = 'locating_pr', project_id = 'proj_1', policy_version = 1, policy_json = ?,
+       implementation_thread_id = 'thr_impl', environment_id = 'env_1', pr_number = 42,
+       pr_url = 'https://example.test/pr/42', version = 2 WHERE id = ?`,
+  ).run(JSON.stringify(policyFixture()), draft.id);
+
+  const lease = store.acquireExecutorLease("owner-a", 1_003, 30_000);
+  if (!lease.acquired) throw new Error("lease missing");
+  addProductionAdmissionAndClaims(db, draft.id, policyFixture(), "owner-a", lease.generation, 1_003, 31_000);
+  const effect = {
+    jobId: draft.id,
+    kind: "inspect_implementation",
+    idempotencyKey: `${draft.id}:2:inspect_implementation`,
+    payload: {},
+  } as unknown as JobEffect;
+  addPendingEffectForRecovery(db, effect);
+  const claimed = leaseEffectsForTest(store, "owner-a", lease.generation, 1_004, 10, 30_000)
+    .find((candidate) => candidate.idempotencyKey === effect.idempotencyKey);
+  if (!claimed) throw new Error("effect was not leased");
+
+  const commands: string[] = [];
+  await new EffectRunner({
+    store,
+    fence: { ownerId: "owner-a", generation: lease.generation, signal: new AbortController().signal },
+    bb: {
+      getEnvironmentSnapshot: async () => ({
+        status: { outcome: "available", checkout: { kind: "branch", branchName: "bb/fix-it" } },
+      }),
+      getPullRequestSnapshot: async () => ({
+        outcome: "available",
+        pullRequest: { number: 42, url: "https://example.test/pr/42" },
+      }),
+    },
+    terminal: {
+      run: async (input: { command: string }) => {
+        commands.push(input.command);
+        return {
+          outcome: "exited",
+          exitCode: 0,
+          output: '{"number":42,"url":"https://example.test/pr/42"}',
+        };
+      },
+    },
+    now: () => 1_005,
+  } as unknown as EffectRunnerDependencies).run(claimed);
+
+  expect(commands.join("\n")).toContain("git commit");
+  expect(commands.join("\n")).toContain("git push -u origin HEAD");
+  expect(store.getJob(draft.id)?.prNumber).toBe(42);
+});
