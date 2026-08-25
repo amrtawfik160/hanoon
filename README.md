@@ -102,7 +102,9 @@ The shipped rollout is conservative: adaptive recipes default to `shadow`, where
 
 ## Bundled agent skills
 
-The plugin bundles 28 skills locally across six manifest roots; no separate runtime skill installation is required. The workflow kit is pinned to Superpowers `6.3.0`, the discovery kit to `mattpocock/skills` `1.2.3` at a reviewed commit, the pstack kit to `cursor/plugins` at revision `60c641e4fad674784b30abcf9f8915dea39df38d`, and each root retains its own provenance and licence. Agents receive only the verified profile below.
+The plugin carries a deterministic 35-skill admitted catalog. It vendors the 25 skills in the reviewed Matt Pocock plugin manifest at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76`, plus ten Hanoon, guard, delivery, writing, and communication skills. It also keeps 15 legacy-only skill ids while recipe-v1 jobs drain. Every source tree, invocation class, provenance record, license, and supporting file is locked locally. Plugin startup performs no skill download or repair.
+
+BB discovers skills one directory below each registered root, so the manifest registers the Matt Pocock `engineering` and `productivity` buckets separately. During expansion, the three promoted ids that overlap the historical discovery root stay digest-locked under an unregistered compatibility subtree. Every runtime skill id therefore has exactly one plugin source, while the promoted copies remain available for the later navigator-v1 execution slice. The final contraction removes the legacy roots only after legacy jobs drain.
 
 | Verified context | Selected skill ids |
 | --- | --- |
@@ -115,16 +117,21 @@ The plugin bundles 28 skills locally across six manifest roots; no separate runt
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
 | validation, merge, deploy, canary | none; these stages remain deterministic |
 
-Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1–256 characters from `[A-Za-z0-9_-]`; attempt ids are 1–264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact `attempt:` or `stage:` record must match the title's job, attempt, and role, and its originating effect must be the corresponding `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs` effect. The job project, persisted environment (when present), and persisted thread (when present) must match the current context. A null environment or thread is accepted only for the first start; a later context must match the persisted id. Any mismatch receives no tools and no skills; the hidden controller branch receives no worker skills.
+The legacy profiles above remain unchanged in this expansion slice. The separate admission catalog records whether each promoted skill is model-invoked or must be explicitly scheduled by the owner or workflow navigator. General worker selection rejects user-invoked skills. A skill never grants tools, credentials, merge authority, or production authority.
 
-The bundle is checked before it can run. `npm run skills:verify` validates the six registered roots, lock schema/provenance, bounded regular files, frontmatter names, nested local Markdown resources, and every SHA-256 file digest; it emits a bounded `bundleDigest` and skill count. `npm run build` runs this check before `bb plugin build`, and plugin activation runs it before registration. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle stops build/activation. The runtime never downloads or repairs a replacement.
+Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1 to 256 characters from `[A-Za-z0-9_-]`; attempt ids are 1 to 264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact attempt or stage record, effect, project, environment, thread, role, and routing mode must match. Any mismatch receives no tools and no skills.
 
-Only a maintainer synchronizes the pinned workflow kit from an already-reviewed local checkout. The source must be an absolute directory for the reviewed `superpowers` `6.3.0` package; synchronization is network-free and rewrites only the local bundle and lock:
+`npm run skills:verify` validates the registered roots, the schema 2 lock, active, legacy, and intentionally shadowed descriptors, bounded regular files, frontmatter, nested local Markdown resources, provenance, licenses, and every SHA-256 file digest. Success prints a bounded `bundleDigest`, `admittedSkillCount`, and `legacySkillCount`. Build and activation run the same verifier before plugin code can register. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle fails closed.
+
+A maintainer can refresh the promoted portfolio only from an already-reviewed clean local checkout at the pinned full revision:
 
 ```bash
-WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.3.0
-npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
+MATT_SKILLS_SOURCE=/absolute/path/to/mattpocock-skills
+MATT_SKILLS_REVISION=6654f6b60cd9d5be8b54c6fafe44346dabeb3b76
+npm run skills:sync -- --source "$MATT_SKILLS_SOURCE" --revision "$MATT_SKILLS_REVISION"
 ```
+
+The synchronizer verifies the checkout identity, manifest, package metadata, license, promoted paths, invocation metadata, and bounded source tree before atomically replacing `skills/matt-pocock` and the lock. It has no runtime role.
 
 > [!WARNING]
 > This is a full-trust BB plugin. Fresh or unset controller permission settings resolve to `auto`; an explicitly saved `auto`, `accept-edits`, or `full` value is preserved. BB-native permission prompts raised for the hidden controller can be bridged into Telegram as *Allow once* / *Deny*. An enabled project policy may run owner-authored validation, deployment, and canary commands.
@@ -210,7 +217,7 @@ hanoon/
 │   ├── storage/      # SQLite migrations and transactional store
 │   └── telegram/     # Telegram API client, ingress, errors, and bounded rendering
 ├── tests/            # Unit, integration, state-machine, and mocked end-to-end coverage
-├── skills/           # Vendored skill bundle: workflow kit, guards, and pr-writer
+├── skills/           # Pinned admitted catalog plus temporary recipe compatibility skills
 ├── evals/            # Golden answers for the opt-in response-quality check
 ├── docs/             # Public guides plus design/implementation history
 ├── server.ts         # BB plugin entry point

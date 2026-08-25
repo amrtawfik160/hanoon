@@ -12,6 +12,18 @@ import { resolvePluginRoot, verifySkillBundle } from "../src/agent-skills/bundle
 const repositoryRoot = new URL("..", import.meta.url).pathname;
 const temporaryRoots: string[] = [];
 
+type MutableSkillRecord = {
+  id: string;
+  skillPath: string;
+  sourcePath: string;
+  source: string;
+  sourceRevision: string;
+  sourceDigest: string;
+  descriptorDigest: string;
+  license: string;
+  invocationClass: "user" | "model";
+};
+
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -37,17 +49,47 @@ function updateLockedDigest(root: string, path: string): void {
 
 function updateLock(root: string, mutate: (lock: {
   files: Array<{ path: string; sha256: string }>;
-  skills: Array<{ id: string; skillPath: string; source: string; license: string }>;
+  skills: MutableSkillRecord[];
+  legacySkills: MutableSkillRecord[];
+  shadowedSkills: MutableSkillRecord[];
 }) => void): void {
   const lockPath = join(root, "skills/skills.lock.json");
   const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
     files: Array<{ path: string; sha256: string }>;
-    skills: Array<{ id: string; skillPath: string; source: string; license: string }>;
+    skills: MutableSkillRecord[];
+    legacySkills: MutableSkillRecord[];
+    shadowedSkills: MutableSkillRecord[];
   };
   mutate(lock);
   lock.files.sort((left, right) => left.path.localeCompare(right.path));
   lock.skills.sort((left, right) => left.id.localeCompare(right.id));
+  lock.legacySkills.sort((left, right) => left.id.localeCompare(right.id));
+  lock.shadowedSkills.sort((left, right) => left.id.localeCompare(right.id));
   writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+}
+
+function redigestSkillRecord(record: MutableSkillRecord): void {
+  record.descriptorDigest = createHash("sha256").update(JSON.stringify({
+    id: record.id,
+    invocationClass: record.invocationClass,
+    license: record.license,
+    skillPath: record.skillPath,
+    source: record.source,
+    sourceDigest: record.sourceDigest,
+    sourcePath: record.sourcePath,
+    sourceRevision: record.sourceRevision,
+  })).digest("hex");
+}
+
+function updateSkillDigests(root: string, path: string): void {
+  updateLockedDigest(root, path);
+  updateLock(root, (lock) => {
+    const record = [...lock.skills, ...lock.legacySkills, ...lock.shadowedSkills]
+      .find((skill) => skill.skillPath === path);
+    if (!record) throw new Error(`Missing test skill record for ${path}`);
+    record.sourceDigest = createHash("sha256").update(readFileSync(join(root, path))).digest("hex");
+    redigestSkillRecord(record);
+  });
 }
 
 function entryCount(paths: readonly string[]): number {
@@ -114,7 +156,9 @@ test("rejects a corrupted locked skill before the BB host is accessed", async ()
 test("verifies the real committed bundle", () => {
   const verified = verifySkillBundle(repositoryRoot);
 
-  expect(verified.skillIds).toHaveLength(28);
+  expect(verified.skillIds).toHaveLength(50);
+  expect(verified.admittedSkillIds).toHaveLength(35);
+  expect(verified.legacySkillIds).toHaveLength(15);
   expect(verified.skillIds).toEqual(expect.arrayContaining([
     "blast-radius",
     "brainstorming",
@@ -129,6 +173,12 @@ test("verifies the real committed bundle", () => {
     "pr-writer",
     "unslop",
     "writing-skills",
+    "ask-matt",
+    "code-review",
+    "diagnosing-bugs",
+    "implement",
+    "tdd",
+    "wayfinder",
   ]));
   expect(verified.bundleDigest).toMatch(/^[a-f0-9]{64}$/);
 });
@@ -147,6 +197,99 @@ test("rejects tampered discovery-kit provenance", () => {
   );
 });
 
+test("rejects every do-prefixed admitted skill id", () => {
+  const root = copiedBundleRoot();
+  updateLock(root, (lock) => {
+    const record = lock.skills.find((skill) => skill.id === "ask-matt");
+    if (!record) throw new Error("Missing ask-matt fixture record");
+    record.id = "do-anything";
+    redigestSkillRecord(record);
+  });
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    "Skill bundle integrity error: forbidden admitted skill id: do-anything",
+  );
+});
+
+test("rejects a changed promoted invocation class", () => {
+  const root = copiedBundleRoot();
+  updateLock(root, (lock) => {
+    const record = lock.skills.find((skill) => skill.id === "ask-matt");
+    if (!record) throw new Error("Missing ask-matt fixture record");
+    record.invocationClass = "model";
+    redigestSkillRecord(record);
+  });
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    "Skill bundle integrity error: required skill catalog differs",
+  );
+});
+
+test("rejects promoted OpenAI metadata that makes a user skill implicit", () => {
+  const root = copiedBundleRoot();
+  const metadataPath = "skills/matt-pocock/engineering/ask-matt/agents/openai.yaml";
+  const absolute = join(root, metadataPath);
+  writeFileSync(absolute, readFileSync(absolute, "utf8").replace(
+    "allow_implicit_invocation: false",
+    "allow_implicit_invocation: true",
+  ));
+  updateLockedDigest(root, metadataPath);
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    "Skill bundle integrity error: user-invoked skill ask-matt does not disable implicit invocation",
+  );
+});
+
+test("rejects a missing promoted support file", () => {
+  const root = copiedBundleRoot();
+  rmSync(join(root, "skills/matt-pocock/engineering/ask-matt/PHASE-BOUNDARIES.md"));
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    "Skill bundle integrity error: missing skills/matt-pocock/engineering/ask-matt/PHASE-BOUNDARIES.md",
+  );
+});
+
+test("rejects a locked skill beneath an unsupported Matt Pocock bucket", () => {
+  const root = copiedBundleRoot();
+  const skillPath = "skills/matt-pocock/unsupported/unreviewed/SKILL.md";
+  const contents = "---\nname: unreviewed\ndescription: fixture\n---\n";
+  mkdirSync(dirname(join(root, skillPath)), { recursive: true });
+  writeFileSync(join(root, skillPath), contents);
+  updateLock(root, (lock) => {
+    lock.files.push({ path: skillPath, sha256: createHash("sha256").update(contents).digest("hex") });
+  });
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    `Skill bundle integrity error: unsupported Matt Pocock bundle path: ${skillPath}`,
+  );
+});
+
+test("rejects a changed promoted license even when the file lock is recomputed", () => {
+  const root = copiedBundleRoot();
+  const licensePath = "skills/matt-pocock/LICENSE";
+  const absolute = join(root, licensePath);
+  writeFileSync(absolute, `${readFileSync(absolute, "utf8")}changed\n`);
+  updateLockedDigest(root, licensePath);
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    "Skill bundle integrity error: Matt Pocock license digest differs",
+  );
+});
+
+test("rejects an admitted id that collides with the legacy compatibility catalog", () => {
+  const root = copiedBundleRoot();
+  updateLock(root, (lock) => {
+    const record = lock.legacySkills.find((skill) => skill.id === "brainstorming");
+    if (!record) throw new Error("Missing brainstorming fixture record");
+    record.id = "ask-matt";
+    redigestSkillRecord(record);
+  });
+
+  expect(() => verifySkillBundle(root)).toThrow(
+    "Skill bundle integrity error: legacy skill collides with admitted id: ask-matt",
+  );
+});
+
 test.each([
   ["inline", "[escape](../../workflow-kit/LICENSE)"],
   ["reference-style", "[escape]: ../../workflow-kit/LICENSE"],
@@ -155,7 +298,7 @@ test.each([
   const skillPath = "skills/guards/clean-code-guard/SKILL.md";
   const absolutePath = join(root, skillPath);
   writeFileSync(absolutePath, `${readFileSync(absolutePath, "utf8")}\n${link}\n`);
-  updateLockedDigest(root, skillPath);
+  updateSkillDigests(root, skillPath);
 
   expect(() => verifySkillBundle(root)).toThrow(
     `Skill bundle integrity error: Markdown link escapes registered skill root: ${skillPath} -> ../../workflow-kit/LICENSE`,
@@ -195,6 +338,7 @@ test.each([
     join(root, "skills/guards"),
     join(root, "skills/delivery"),
     join(root, "skills/discovery"),
+    join(root, "skills/matt-pocock"),
     join(root, "skills/hanoon"),
     join(root, "skills/pstack"),
   ];
@@ -226,7 +370,7 @@ test.each([
     const prefix = "skills/workflow-kit/brainstorming/";
     rmSync(join(root, "skills/workflow-kit/brainstorming"), { recursive: true, force: true });
     updateLock(root, (lock) => {
-      lock.skills = lock.skills.filter((skill) => skill.id !== "brainstorming");
+      lock.legacySkills = lock.legacySkills.filter((skill) => skill.id !== "brainstorming");
       lock.files = lock.files.filter((file) => !file.path.startsWith(prefix));
     });
   }],
@@ -235,7 +379,20 @@ test.each([
     mkdirSync(dirname(join(root, skillPath)), { recursive: true });
     writeFileSync(join(root, skillPath), "---\nname: unreviewed\ndescription: fixture\n---\n");
     updateLock(root, (lock) => {
-      lock.skills.push({ id: "unreviewed", skillPath, source: "https://github.com/obra/superpowers", license: "MIT" });
+      const sourceDigest = createHash("sha256").update(readFileSync(join(root, skillPath))).digest("hex");
+      const record: MutableSkillRecord = {
+        id: "unreviewed",
+        skillPath,
+        sourcePath: skillPath,
+        source: "https://github.com/obra/superpowers",
+        sourceRevision: "6.3.0",
+        sourceDigest,
+        descriptorDigest: "",
+        license: "MIT",
+        invocationClass: "model",
+      };
+      redigestSkillRecord(record);
+      lock.legacySkills.push(record);
       lock.files.push({ path: skillPath, sha256: createHash("sha256").update(readFileSync(join(root, skillPath))).digest("hex") });
     });
   }],
@@ -249,6 +406,7 @@ test.each([
       skill.skillPath = `${newPrefix}SKILL.md`;
       skill.source = "https://github.com/obra/superpowers";
       skill.license = "MIT";
+      redigestSkillRecord(skill);
       for (const file of lock.files) {
         if (file.path.startsWith(oldPrefix)) file.path = `${newPrefix}${file.path.slice(oldPrefix.length)}`;
       }

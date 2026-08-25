@@ -42,63 +42,61 @@ export const CONTROLLER_METADATA_TOOL_IDS = [
   "telegram_agent_request_capability",
 ] as const;
 
-const WORKER_SKILLS = new Set([
-  "blast-radius",
-  "brainstorming",
-  "checking-system-logs",
-  "clean-code-guard",
-  "docs-guard",
-  "driving-bb",
-  "durable-boundary-audit",
-  "pr-writer",
-  "proportional-development-workflow",
-  "receiving-code-review",
-  "systematic-debugging",
-  "technical-writing",
-  "test-driven-development",
-  "test-guard",
-  "unslop",
-  "verification-before-completion",
-  "writing-plans",
-  "writing-skills",
-]);
+type SkillAdmissionEvidence = Readonly<{
+  sourceDigest: string;
+  bundleDescriptorDigest: string;
+  invocationClass: "user" | "model";
+}>;
 
-const NATIVE_SKILLS = new Set([
-  "dispatching-parallel-agents",
-  "executing-plans",
-  "finishing-a-development-branch",
-  "requesting-code-review",
-  "subagent-driven-development",
-  "using-git-worktrees",
-  "using-superpowers",
-]);
+const ADMITTED_SKILL_BUNDLE = {
+  "ask-matt": { sourceDigest: "b25d86fb36b1d294eeead5d7db529f86135f9671f2afcd607579a63bb2213769", bundleDescriptorDigest: "4ef913dc61cc753023e96ebc2e8d2983e89bc606a250e81d18a5d7fdc75ea8d8", invocationClass: "user" },
+  "blast-radius": { sourceDigest: "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d", bundleDescriptorDigest: "373f332324ffebb43c1961fb3cb56dc0a8627a6c54056f1d6f396fc396a4b5d5", invocationClass: "model" },
+  "checking-system-logs": { sourceDigest: "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245", bundleDescriptorDigest: "e86dafdf371e580eea02fa6792141e2bcb1611491d8f6ee6fbcd9da59d8576cc", invocationClass: "model" },
+  "clean-code-guard": { sourceDigest: "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2", bundleDescriptorDigest: "539aa4075dc5a4142705238a0c4ef35b46b09a48fa4693300c6558804fe02b6d", invocationClass: "model" },
+  "code-review": { sourceDigest: "47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50", bundleDescriptorDigest: "700ee1661d4eff3add54f10baa5202851314d17b4538db818ca1bf572921bad3", invocationClass: "model" },
+  "codebase-design": { sourceDigest: "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2", bundleDescriptorDigest: "46460be29afb7f5ebdfc8bda398ad9c21199c5074850cf8a7707ec8378c70136", invocationClass: "model" },
+  "diagnosing-bugs": { sourceDigest: "77f3cf31bc99b2f49af943222526531fcc9fc41d047626d3640e875e85af3e84", bundleDescriptorDigest: "2e9d27811a60afee0ee9951a75e459cf59489e712e1ac0832f663940184558f5", invocationClass: "model" },
+  "docs-guard": { sourceDigest: "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef", bundleDescriptorDigest: "9cb8301e495687ad40ee11e8e1ccb508a0b2c331423880eb8fbb753a517a9f06", invocationClass: "model" },
+  "domain-modeling": { sourceDigest: "327a2b50620e2fd70abc6893cd6965e76b20f8d0adb0dc2c8d5eb3845efb643e", bundleDescriptorDigest: "212f3ce6227d6e59255a7710fe818e03a80c1ba536214698730506235f3241ba", invocationClass: "model" },
+  "driving-bb": { sourceDigest: "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216", bundleDescriptorDigest: "956e67950b79a179ba0f814836a2812b12147bf76928c9ae39f6ae2b950a22bb", invocationClass: "model" },
+  "durable-boundary-audit": { sourceDigest: "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f", bundleDescriptorDigest: "39270df4fabf5032e62eecc9cd4c99425afd533ce20492b321477aca9f08cd2f", invocationClass: "model" },
+  "grill-me": { sourceDigest: "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637", bundleDescriptorDigest: "b60265b7de314625667b53857322f0a543502705a8453c0b2023bc0308bd1938", invocationClass: "user" },
+  "grill-with-docs": { sourceDigest: "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe", bundleDescriptorDigest: "3b123f6d7fb7568adddd55dbdf43d8530583774d0e439bb765fa07ac2b1c07ce", invocationClass: "user" },
+  grilling: { sourceDigest: "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2", bundleDescriptorDigest: "4f98e2ee6df7cab51bcba268d1373c521c9ccd44d150205dd44ccc2bcdbd876d", invocationClass: "model" },
+  handoff: { sourceDigest: "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25", bundleDescriptorDigest: "423c22f3804d4033a4435e629187bad38242fe76199376cc2ee039bf025753ff", invocationClass: "user" },
+  implement: { sourceDigest: "6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3", bundleDescriptorDigest: "e41da514b2c2f671bff0efc0dee773a606842c84ae1dccb6e5f82d43595a80ef", invocationClass: "user" },
+  "improve-codebase-architecture": { sourceDigest: "d1ac25511a936ff4250a48dbcefda363837d6bb9321b3cba73df99fa37270a75", bundleDescriptorDigest: "24732f0720aaa6b7dd37db3669e394722698d24ba0578098ed3990fab739ac9b", invocationClass: "user" },
+  "pr-writer": { sourceDigest: "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc", bundleDescriptorDigest: "6fe1ab2cbe47303da8a613703b3e7d49c5e7ffd03f7273d365a1584ac4e7e11f", invocationClass: "model" },
+  prototype: { sourceDigest: "714de632d116bb73f65cdb5a882db15b9369a6713b9a47c0fad827848f0bfbe3", bundleDescriptorDigest: "7bd26fbafde838442449be94facaee393a9c89fc783b7975b68fc3f468bb67ab", invocationClass: "model" },
+  research: { sourceDigest: "985569f15739c713d6784887c3d186d4ef9ac85bec5ad9c068d25bf0739928e4", bundleDescriptorDigest: "0607555f7ea8634bff956695f02c42c4f87a814dcf1761a5555833235be0e312", invocationClass: "model" },
+  "resolving-merge-conflicts": { sourceDigest: "9d8114f8ef0b31f535a265fc05c364bd8cf2e2895a830040e06c22acb11f54b0", bundleDescriptorDigest: "0d0b45ea81e64fe6eaa4e2650770d4015363c4ccf6638b76546809ed447494c8", invocationClass: "model" },
+  "setup-matt-pocock-skills": { sourceDigest: "2bcd89e97777cdb705914424e39c97d5db524c8eb4eafac8120778a07774f0ec", bundleDescriptorDigest: "be6b0e4460c175a93c2e814de91584b278f7159c51211e1121a0528e90f6d6c0", invocationClass: "user" },
+  tdd: { sourceDigest: "cb01f66bebfaa25fa1f88e6b7e769cd9fd9f35b1120b8563749820738814c927", bundleDescriptorDigest: "4cce72c6f2afef293007eecf4ec18436ee454a8a3c37e81ea860c30d0c0c566a", invocationClass: "model" },
+  teach: { sourceDigest: "a32df9dcdfc0c4fdc1c98e1ed3940c5f56b84c1aa90ff60346f32b8b53915b43", bundleDescriptorDigest: "d1cbc2515700c1370b8f74a0e7e41df053dc3299e579b90b054588daf66bd0df", invocationClass: "user" },
+  "technical-writing": { sourceDigest: "bd0cb21034f4fe6695cfdf8cd3561026eec943f0bb6e9300bc78a2b3340865a7", bundleDescriptorDigest: "9d355e8d479c993462baf65f53560ed273056346a17b69a3e5022696b4a5972f", invocationClass: "user" },
+  "test-guard": { sourceDigest: "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0", bundleDescriptorDigest: "ac83a80f2930ac5ec029cbdf8637ac7f89070c2ba44da3a40138238eee31e472", invocationClass: "model" },
+  "to-questionnaire": { sourceDigest: "b5eb929842ee0e93d867c5e906d183d350f2f2d149eaeaa86967d94d8eda1d3b", bundleDescriptorDigest: "506194622581c1bb9a46483544fe031cec39f741bbdba34e4616a427b1b3adcb", invocationClass: "user" },
+  "to-spec": { sourceDigest: "43ad9cf318e5e7d3d1fa360253a37021796dc87a0c2e595ad262661a10f85088", bundleDescriptorDigest: "5c46ca1e93c69d81889bbc364589898ba55bc5406d9c8cef4321c07157aeecb5", invocationClass: "user" },
+  "to-tickets": { sourceDigest: "5c9fba69845c2519b9b35b9af42ae5142c21f8ca15ac2123dc2722002c8058ae", bundleDescriptorDigest: "9a08bf131473369099956d3e12a00f7c2ab83442a42a7e7245d67952c6fca636", invocationClass: "user" },
+  triage: { sourceDigest: "623a2ed692bdc77d2090e2a3dea3b627dd722ad3bbaca0be83aada75292c8fc4", bundleDescriptorDigest: "4587c75023a35b9e8f48134b0782c0c4cead02dfb2f0e6225c4397a4cb797ea5", invocationClass: "user" },
+  unslop: { sourceDigest: "181883e539caec8258ec9129e3ba5f133409144a2cbf2aa361158ab94cfc3441", bundleDescriptorDigest: "6e14a9599a53f3e56bb1bc209305afb17a9ea874563be261b05c113dcc607abd", invocationClass: "model" },
+  "wait-what": { sourceDigest: "e3f44e3ccbc0e7b62f20ba70b295fc9c9f4aa3f96c77168faee1c71bacbf4215", bundleDescriptorDigest: "de05f7ead3a572428d42b2703510e9acf1c7cc3f7dcb535d271af998b45342ea", invocationClass: "user" },
+  wayfinder: { sourceDigest: "fee6e1d0c50f0e736b4ef8a599060c959afae904c9a97d82c97f049fcc3aa0f1", bundleDescriptorDigest: "9a14b2db7afa928d558b3127cbcf82da906f58b7d6cb557043798a04adfaff28", invocationClass: "user" },
+  wizard: { sourceDigest: "bdf31d48211ea559878f95a4f344aeabf8d85897488ba564382bab0b000daac1", bundleDescriptorDigest: "1723a91b0d9ffcc0b35e0996823fd17bd46925c15d13be55d8d3cd5e016ac3bf", invocationClass: "model" },
+  "writing-for-agents": { sourceDigest: "551adca942227b44192edba88acd4e8db911f0121ce58ad16944ccf6a896a74a", bundleDescriptorDigest: "68e5ea2a8427966c48f162b48e9854cebf9f967d3cc09a28e234b5a13fb237ae", invocationClass: "model" },
+} as const satisfies Readonly<Record<string, SkillAdmissionEvidence>>;
 
-const MANUAL_SKILLS = new Set(["domain-modeling", "grill-with-docs", "grilling"]);
-
-const SKILL_DIGESTS = {
-  "blast-radius": "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d",
+const LEGACY_SKILL_DIGESTS = {
   brainstorming: "74edf03ea6d24ef53db48677b93558d14a979bdf052ca3f57ecdca0c66791608",
-  "checking-system-logs": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245",
-  "clean-code-guard": "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2",
   "dispatching-parallel-agents": "1968923066f3b707eb01d1992cdf4c42284c3855f70253b9cd5000ff45fca13c",
-  "docs-guard": "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef",
-  "driving-bb": "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216",
-  "domain-modeling": "152e2c97239affb12a60c5f4a7e74ab546a49ae169688c81f4e2ccc42dafa579",
-  "durable-boundary-audit": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f",
   "executing-plans": "c4c3d8b628c51114cd165fb8246fe02744cd8be180032328391252e653028d9b",
   "finishing-a-development-branch": "8db5a922b242dd4e1bf824cb91c13b3e8d8e8a86d6ceaf7f0774eb9cce909d65",
-  "grill-with-docs": "610d091047bcfb9db0f75c057d15538481a721111579fc5ec7f83ad9131a2165",
-  grilling: "fa5c1e5ee76b1c8f1ae56101f52c9e239de75d5c578adc61227b92d10b7e52ef",
-  "pr-writer": "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc",
   "proportional-development-workflow": "96870c75b91543cf751afa47bd9a217f99c3d5e8d27ccdada6e1dcfec3af2096",
   "receiving-code-review": "091df1629510af1b92fc4abd6f96732ebedb4cb2c0f3457e8f2740b0504a2438",
   "requesting-code-review": "d71cc01ba56d2325cf8af5f7c11837819b63ecd57de0bfdb812f7f3ff7751df8",
   "subagent-driven-development": "8dd1b8e698edec3700c6d89517dbe96febd3bacd3f6ea21c1a3569c62ea104b5",
   "systematic-debugging": "808fc5717aa88ad65efff312b11c186294d3e6ee301afb584e2f86599b137787",
-  "technical-writing": "bd0cb21034f4fe6695cfdf8cd3561026eec943f0bb6e9300bc78a2b3340865a7",
   "test-driven-development": "bf1b8216e523851a411e91d429a7c1c2a173e79d88957bc78e348218d50edd54",
-  "test-guard": "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0",
-  unslop: "181883e539caec8258ec9129e3ba5f133409144a2cbf2aa361158ab94cfc3441",
   "using-git-worktrees": "8cfb86f121269e8f7f12361e6795c4f6738828340e28964c9229d365666c9edd",
   "using-superpowers": "30f2ab78e20ddc27ee7158ae8d4a2abe161c360981c7cc3548070913142d3dc3",
   "verification-before-completion": "2befe7fc55bcadaa3d97dd9e8efeb633d2561c0ebe74c5a8b17c4d9e7e4520b3",
@@ -106,10 +104,81 @@ const SKILL_DIGESTS = {
   "writing-skills": "d34db5c8aed6a4e0440132bd0613aace70a693ec7819d5637ad77481d8e10d1b",
 } as const;
 
-export type CapabilitySkillId = keyof typeof SKILL_DIGESTS;
-export const CAPABILITY_SKILL_IDS = Object.freeze(
-  Object.keys(SKILL_DIGESTS).sort((left, right) => left.localeCompare(right)),
-) as readonly CapabilitySkillId[];
+export type AdmittedCapabilitySkillId = keyof typeof ADMITTED_SKILL_BUNDLE;
+export type LegacyCapabilitySkillId = keyof typeof LEGACY_SKILL_DIGESTS;
+export type CapabilitySkillId = AdmittedCapabilitySkillId | LegacyCapabilitySkillId;
+
+export const ADMITTED_CAPABILITY_SKILL_IDS = Object.freeze(
+  Object.keys(ADMITTED_SKILL_BUNDLE).sort((left, right) => left.localeCompare(right)),
+) as readonly AdmittedCapabilitySkillId[];
+export const LEGACY_CAPABILITY_SKILL_IDS = Object.freeze(
+  Object.keys(LEGACY_SKILL_DIGESTS).sort((left, right) => left.localeCompare(right)),
+) as readonly LegacyCapabilitySkillId[];
+export const CAPABILITY_SKILL_IDS = Object.freeze([
+  ...ADMITTED_CAPABILITY_SKILL_IDS,
+  ...LEGACY_CAPABILITY_SKILL_IDS,
+].sort((left, right) => left.localeCompare(right))) as readonly CapabilitySkillId[];
+
+export type SkillInvocationRoute = "general-worker" | "navigator" | "owner";
+export const SKILL_ADMISSION_CATALOG = Object.freeze(ADMITTED_CAPABILITY_SKILL_IDS.map((id) => {
+  const { sourceDigest, bundleDescriptorDigest, invocationClass } = ADMITTED_SKILL_BUNDLE[id];
+  const selectionRoutes: readonly SkillInvocationRoute[] = invocationClass === "model"
+    ? ["general-worker", "navigator", "owner"]
+    : ["navigator", "owner"];
+  return Object.freeze({
+    id,
+    sourceDigest,
+    bundleDescriptorDigest,
+    invocationClass,
+    selectionRoutes: Object.freeze(selectionRoutes),
+  });
+}));
+const SKILL_ADMISSION_BY_ID = new Map(SKILL_ADMISSION_CATALOG.map((entry) => [entry.id, entry]));
+
+export function skillInvocationAllowed(id: string, route: SkillInvocationRoute): boolean {
+  return SKILL_ADMISSION_BY_ID.get(id as AdmittedCapabilitySkillId)?.selectionRoutes.includes(route) ?? false;
+}
+
+const RECIPE_COMPATIBILITY_SKILL_IDS = [
+  "blast-radius", "brainstorming", "checking-system-logs", "clean-code-guard",
+  "dispatching-parallel-agents", "docs-guard", "domain-modeling", "driving-bb",
+  "durable-boundary-audit", "executing-plans", "finishing-a-development-branch",
+  "grill-with-docs", "grilling", "pr-writer", "proportional-development-workflow",
+  "receiving-code-review", "requesting-code-review", "subagent-driven-development",
+  "systematic-debugging", "technical-writing", "test-driven-development", "test-guard", "unslop",
+  "using-git-worktrees", "using-superpowers", "verification-before-completion", "writing-plans",
+  "writing-skills",
+] as const satisfies readonly CapabilitySkillId[];
+
+const HISTORICAL_DISCOVERY_SKILL_DIGESTS = {
+  "domain-modeling": "152e2c97239affb12a60c5f4a7e74ab546a49ae169688c81f4e2ccc42dafa579",
+  "grill-with-docs": "610d091047bcfb9db0f75c057d15538481a721111579fc5ec7f83ad9131a2165",
+  grilling: "fa5c1e5ee76b1c8f1ae56101f52c9e239de75d5c578adc61227b92d10b7e52ef",
+} as const;
+
+const WORKER_SKILLS = new Set<string>([
+  "blast-radius", "brainstorming", "checking-system-logs", "clean-code-guard", "docs-guard",
+  "driving-bb", "durable-boundary-audit", "pr-writer", "proportional-development-workflow",
+  "receiving-code-review", "systematic-debugging", "technical-writing", "test-driven-development",
+  "test-guard", "unslop", "verification-before-completion", "writing-plans", "writing-skills",
+]);
+
+const NATIVE_SKILLS = new Set<string>([
+  "dispatching-parallel-agents", "executing-plans", "finishing-a-development-branch",
+  "requesting-code-review", "subagent-driven-development", "using-git-worktrees", "using-superpowers",
+]);
+
+const MANUAL_SKILLS = new Set<string>([
+  "domain-modeling", "grill-with-docs", "grilling",
+]);
+
+function compatibilitySkillSourceDigest(id: CapabilitySkillId): string {
+  if (id in HISTORICAL_DISCOVERY_SKILL_DIGESTS) {
+    return HISTORICAL_DISCOVERY_SKILL_DIGESTS[id as keyof typeof HISTORICAL_DISCOVERY_SKILL_DIGESTS];
+  }
+  if (id in LEGACY_SKILL_DIGESTS) return LEGACY_SKILL_DIGESTS[id as LegacyCapabilitySkillId];
+  return ADMITTED_SKILL_BUNDLE[id as AdmittedCapabilitySkillId].sourceDigest;
+}
 
 function stableDigest(identity: string): string {
   return createHash("sha256").update(identity, "utf8").digest("hex");
@@ -218,31 +287,21 @@ function descriptor(input: DescriptorInput): CapabilityDescriptor {
 }
 
 function skillSource(id: CapabilitySkillId): { source: string; version: string } {
-  if ([
-    "brainstorming",
-    "dispatching-parallel-agents",
-    "executing-plans",
-    "finishing-a-development-branch",
-    "receiving-code-review",
-    "requesting-code-review",
-    "subagent-driven-development",
-    "systematic-debugging",
-    "test-driven-development",
-    "using-git-worktrees",
-    "using-superpowers",
-    "verification-before-completion",
-    "writing-plans",
-    "writing-skills",
-  ].includes(id)) return { source: "https://github.com/obra/superpowers", version: "6.3.0" };
   if (["clean-code-guard", "docs-guard", "test-guard"].includes(id)) {
     return { source: "https://github.com/amElnagdy/guard-skills", version: "pinned" };
   }
   if (id === "pr-writer") return { source: "https://github.com/getsentry/skills", version: "pinned" };
-  if (["domain-modeling", "grill-with-docs", "grilling"].includes(id)) {
-    return { source: "https://github.com/mattpocock/skills", version: "1.2.3+84fdeffd" };
-  }
   if (["technical-writing", "unslop"].includes(id)) {
     return { source: "https://github.com/cursor/plugins", version: "pstack@60c641e4" };
+  }
+  if (id in HISTORICAL_DISCOVERY_SKILL_DIGESTS) {
+    return { source: "https://github.com/mattpocock/skills", version: "1.2.3+84fdeffd" };
+  }
+  if (["blast-radius", "checking-system-logs", "driving-bb", "durable-boundary-audit", "proportional-development-workflow"].includes(id)) {
+    return { source: "first-party", version: "1" };
+  }
+  if (id in LEGACY_SKILL_DIGESTS) {
+    return { source: "https://github.com/obra/superpowers", version: "6.3.0" };
   }
   return { source: "first-party", version: "1" };
 }
@@ -353,7 +412,7 @@ function skillRouting(id: CapabilitySkillId): Pick<DescriptorInput,
   }
 }
 
-const skillDescriptors = CAPABILITY_SKILL_IDS.map((id) => {
+const skillDescriptors = RECIPE_COMPATIBILITY_SKILL_IDS.map((id) => {
   const route: CapabilityRoute = WORKER_SKILLS.has(id)
     ? "worker"
     : NATIVE_SKILLS.has(id)
@@ -368,7 +427,7 @@ const skillDescriptors = CAPABILITY_SKILL_IDS.map((id) => {
     route,
     source: source.source,
     version: source.version,
-    sourceDigest: SKILL_DIGESTS[id],
+    sourceDigest: compatibilitySkillSourceDigest(id),
     effectClass: route === "hanoon-native" ? "orchestrate" : "none",
     dataClasses: route === "manual-only" ? ["owner-message", "repository"] : ["repository"],
     workspaces: route === "manual-only" ? ["personal", "managed-worktree"] : ["managed-worktree"],

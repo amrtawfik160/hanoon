@@ -84,7 +84,7 @@ If the broker client's private key may have leaked, treat it as a compromised cr
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally under the six manifest roots `skills/workflow-kit`, `skills/guards`, `skills/delivery`, `skills/discovery`, `skills/hanoon`, and `skills/pstack`; operators do not install another runtime skill plugin. The catalog has 28 locked local skills, but the resolver selects only the exact verified role profile described in [Architecture](architecture.md). A provider session is not evidence that a role received a skill: the later live-acceptance slice must record the real thread and provider outcome separately.
+Skills are committed locally. The expansion bundle admits 35 reviewed skill ids and keeps 15 additional legacy-only ids for recipe-v1 jobs. BB registers eight immediate roots, including the two promoted Matt Pocock buckets. Three promoted ids overlap the historical discovery catalog, so their reviewed copies stay locked under an unregistered compatibility subtree until navigator-v1 owns new jobs. Every registered runtime id has one plugin source during expansion.
 
 Run the deterministic integrity gate from the repository root:
 
@@ -92,16 +92,17 @@ Run the deterministic integrity gate from the repository root:
 npm run skills:verify
 ```
 
-The command checks the manifest roots and lock, file sizes/counts and regular-file type, complete SHA-256 coverage, frontmatter and directory names, nested local Markdown resources, and the pinned provenance and licence of every vendored root. Success prints a bounded `bundleDigest` and `skillCount`; a malformed lock, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter/resource mismatch, or digest mismatch exits non-zero. `npm run build` invokes this verifier before `bb plugin build`, and activation invokes it before plugin registration. Treat any failure as a stop: the runtime never downloads, substitutes, or repairs a bundle.
+The command checks package root order, schema 2 lock structure, active, legacy, and shadow descriptors, file bounds and regular-file type, complete SHA-256 coverage, frontmatter and directory names, invocation metadata, nested local Markdown resources, and every source license and provenance record. Success prints `bundleDigest`, `admittedSkillCount=35`, and `legacySkillCount=15`. Any malformed lock, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter mismatch, unsupported id, or digest mismatch exits nonzero. Build and activation run the same verifier before plugin registration.
 
-Only a maintainer may synchronize the pinned upstream workflow kit. Use an already-reviewed local absolute checkout of the `superpowers` package with version `6.3.0`, `LICENSE`, `skills/`, and the reviewed MIT license; the synchronizer is network-free and has no runtime role:
+Only a maintainer may synchronize the promoted portfolio. Use a clean, already-reviewed absolute checkout at the pinned revision:
 
 ```bash
-WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.3.0
-npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
+MATT_SKILLS_SOURCE=/absolute/path/to/mattpocock-skills
+MATT_SKILLS_REVISION=6654f6b60cd9d5be8b54c6fafe44346dabeb3b76
+npm run skills:sync -- --source "$MATT_SKILLS_SOURCE" --revision "$MATT_SKILLS_REVISION"
 ```
 
-Synchronization rewrites the local `skills/workflow-kit` files and `skills/skills.lock.json`. Re-run `npm run skills:verify` and review the resulting diff before any plugin reload. Do not use synchronization as an activation-time repair mechanism.
+The synchronizer verifies the Git head, checkout root, package and plugin metadata, license and manifest digests, exact promoted path list, invocation metadata, cleanliness, and tree bounds. It stages and atomically replaces only `skills/matt-pocock` and `skills/skills.lock.json`. Re-run `npm run skills:verify`, review the diff, and rebuild before reloading the plugin. Synchronization is never an activation-time repair path.
 
 ## Memory and monitors
 

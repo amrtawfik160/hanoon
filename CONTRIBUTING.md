@@ -54,7 +54,7 @@ A test run owns one temp root. `tests/setup/temp-root.ts` creates it and removes
 
 ## Documentation
 
-Public operator docs live in [`docs/`](docs/README.md). Design history lives under `docs/superpowers/` and is not the source of truth for current commands or settings.
+Public operator docs live in [`docs/`](docs/README.md). Design history lives under `docs/designs/` and is not the source of truth for current commands or settings.
 
 When behavior changes:
 

@@ -7,4 +7,6 @@ if (process.argv.length !== 2) throw new Error("Skill bundle verifier accepts no
 
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const verified = verifySkillBundle(pluginRoot);
-process.stdout.write(`bundleDigest=${verified.bundleDigest} skillCount=${verified.skillIds.length}\n`);
+process.stdout.write(
+  `bundleDigest=${verified.bundleDigest} admittedSkillCount=${verified.admittedSkillIds.length} legacySkillCount=${verified.legacySkillIds.length}\n`,
+);

@@ -3,6 +3,7 @@ import { defineConfig } from "vitest/config";
 
 const SUBPROCESS_SUITES = [
   "tests/answer-contract.test.ts",
+  "tests/bb-skill-resolution.test.ts",
   "tests/controller-outcome-eval.test.ts",
 ];
 

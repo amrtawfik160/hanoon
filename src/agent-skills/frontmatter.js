@@ -4,7 +4,7 @@ function frontmatterError(reason) {
   return new Error(`malformed frontmatter: ${reason}`);
 }
 
-export function skillFrontmatterName(contents) {
+export function skillFrontmatter(contents) {
   if (typeof contents !== "string" || !contents.startsWith("---\n") && !contents.startsWith("---\r\n")) {
     throw frontmatterError("opening delimiter is missing");
   }
@@ -27,5 +27,16 @@ export function skillFrontmatterName(contents) {
   }
   const name = fields.get("name");
   if (!name || !SKILL_ID_PATTERN.test(name)) throw new Error("missing or invalid frontmatter name");
-  return name;
+  const disabled = fields.get("disable-model-invocation");
+  if (disabled !== undefined && disabled !== "true" && disabled !== "false") {
+    throw frontmatterError("disable-model-invocation must be true or false");
+  }
+  return Object.freeze({
+    name,
+    invocationClass: disabled === "true" ? "user" : "model",
+  });
+}
+
+export function skillFrontmatterName(contents) {
+  return skillFrontmatter(contents).name;
 }
