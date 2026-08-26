@@ -1,0 +1,905 @@
+import { createHash } from "node:crypto";
+import type Database from "better-sqlite3";
+import { modelRouteSchema, type ModelRoute } from "../capabilities/models";
+import type { Job, StoredEffect } from "../domain/models";
+import {
+  type EffectRow,
+  parseStoredEffect,
+  readJobById,
+  serializeBoundedJson,
+  VersionConflictError,
+} from "../storage/job-persistence";
+import { WorkArtifactRepository } from "../work-artifacts/repository";
+import {
+  MATT_POCOCK_SKILL_REVISION,
+  MAX_NAVIGATOR_JSON_BYTES,
+  NAVIGATOR_ENGINE_REVISION,
+  NAVIGATOR_RESEARCH_STEP_CONTRACT,
+  NAVIGATOR_SKILL_CATALOG,
+  NAVIGATOR_SKILL_CATALOG_DIGEST,
+  artifactBindingSchema,
+  assertModelRouteForContract,
+  freezeNavigatorSnapshot,
+  navigatorInferenceObservationSchema,
+  navigatorProposalSchema,
+  navigatorResearchInputSchema,
+  navigatorResearchResultSchema,
+  navigatorSnapshotDigest,
+  navigatorSnapshotSchema,
+  proposalDigest,
+  type NavigatorArtifactBinding,
+  type NavigatorInferenceObservation,
+  type NavigatorProposal,
+  type NavigatorProposalDecision,
+  type NavigatorProposalRecord,
+  type NavigatorSkillAttempt,
+  type NavigatorSnapshot,
+  type NavigatorWorkflowStep,
+  type NavigatorWorkflowStepOutcome,
+} from "./models";
+
+type SqliteDatabase = Database.Database;
+
+type SnapshotRow = Readonly<{
+  id: string;
+  job_id: string;
+  job_version: number;
+  workflow_revision: number;
+  digest: string;
+  external_state_digest: string;
+  payload_json: string;
+  created_at: number;
+}>;
+
+type ProposalRow = Readonly<{
+  id: string;
+  job_id: string;
+  snapshot_id: string;
+  digest: string;
+  kind: string | null;
+  raw_json: string;
+  proposal_json: string | null;
+  observation_json: string;
+  observation_digest: string;
+  created_at: number;
+}>;
+
+type AttemptRow = Readonly<{
+  id: string;
+  job_id: string;
+  workflow_step_id: string;
+  effect_idempotency_key: string;
+  skill_id: string;
+  skill_revision: string;
+  skill_source_digest: string;
+  descriptor_digest: string;
+  step_contract_id: string;
+  step_contract_revision: number;
+  step_contract_digest: string;
+  catalog_digest: string;
+  step_input_json: string;
+  step_input_digest: string;
+  model_route_json: string;
+  artifact_bindings_json: string;
+  snapshot_digest: string;
+  job_version: number;
+  workflow_revision: number;
+  resource_kind: string | null;
+  resource_id: string | null;
+  created_at: number;
+  updated_at: number;
+}>;
+
+function assertNonNegativeInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a non-negative safe integer`);
+}
+
+function assertPositiveInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${field} must be a positive safe integer`);
+}
+
+function assertIdentifier(value: string, field: string): void {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > 256) {
+    throw new TypeError(`${field} must be a bounded non-empty string`);
+  }
+}
+
+function digestId(prefix: string, ...parts: readonly string[]): string {
+  return `${prefix}_${createHash("sha256").update(parts.join("\u0000"), "utf8").digest("base64url").slice(0, 24)}`;
+}
+
+function boundedRawJson(value: unknown): string {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    serialized = JSON.stringify({ invalid: "unserializable" });
+  }
+  if (serialized === undefined) serialized = JSON.stringify({ invalid: "undefined" });
+  if (Buffer.byteLength(serialized, "utf8") <= MAX_NAVIGATOR_JSON_BYTES) return serialized;
+  return JSON.stringify({ invalid: "oversized", digest: proposalDigest(value) });
+}
+
+function serializeNavigatorJson(value: unknown, field: string): string {
+  const json = serializeBoundedJson(value, field, MAX_NAVIGATOR_JSON_BYTES);
+  if (Buffer.byteLength(json, "utf8") > MAX_NAVIGATOR_JSON_BYTES) {
+    throw new TypeError(`${field} must be bounded JSON`);
+  }
+  return json;
+}
+
+function parseSnapshot(row: SnapshotRow): NavigatorSnapshot {
+  const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+  const snapshot = navigatorSnapshotSchema.parse({
+    snapshotId: row.id,
+    identity: {
+      jobId: row.job_id,
+      jobVersion: row.job_version,
+      workflowRevision: row.workflow_revision,
+      digest: row.digest,
+    },
+    ...payload,
+  });
+  const expectedDigest = navigatorSnapshotDigest({
+    jobId: snapshot.identity.jobId,
+    jobVersion: snapshot.identity.jobVersion,
+    workflowRevision: snapshot.identity.workflowRevision,
+    payload: {
+      engine: snapshot.engine,
+      engineRevision: snapshot.engineRevision,
+      mode: snapshot.mode,
+      ownerRequest: snapshot.ownerRequest,
+      artifactBindings: snapshot.artifactBindings,
+      skillCatalog: snapshot.skillCatalog,
+      catalogDigest: snapshot.catalogDigest,
+      externalStateDigest: snapshot.externalStateDigest,
+      evidenceRefs: snapshot.evidenceRefs,
+      createdAt: snapshot.createdAt,
+    },
+  });
+  if (snapshot.identity.digest !== expectedDigest || row.external_state_digest !== snapshot.externalStateDigest) {
+    throw new Error("navigator snapshot digest binding is invalid");
+  }
+  return freezeNavigatorSnapshot(snapshot);
+}
+
+function parseProposal(row: ProposalRow): NavigatorProposalRecord {
+  const proposal = row.proposal_json === null
+    ? null
+    : navigatorProposalSchema.parse(JSON.parse(row.proposal_json));
+  if (proposal !== null && proposalDigest(proposal) !== row.digest) {
+    throw new Error("navigator proposal digest binding is invalid");
+  }
+  const observation = navigatorInferenceObservationSchema.parse(JSON.parse(row.observation_json));
+  const observationDigest = createHash("sha256").update(JSON.stringify(observation), "utf8").digest("hex");
+  if (observationDigest !== row.observation_digest) {
+    throw new Error("navigator proposal observation digest binding is invalid");
+  }
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    snapshotId: row.snapshot_id,
+    digest: row.digest,
+    kind: proposal?.kind ?? null,
+    proposal,
+    observation,
+    observationDigest,
+    createdAt: row.created_at,
+  };
+}
+
+function parseAttempt(row: AttemptRow): NavigatorSkillAttempt {
+  const resource = row.resource_kind === null || row.resource_id === null
+    ? null
+    : { kind: "bb_thread" as const, id: row.resource_id };
+  const stepInput = navigatorResearchInputSchema.parse(JSON.parse(row.step_input_json));
+  const stepInputDigest = createHash("sha256").update(JSON.stringify(stepInput), "utf8").digest("hex");
+  if (stepInputDigest !== row.step_input_digest) throw new Error("navigator step input digest binding is invalid");
+  const artifactBindings = artifactBindingSchema.array().parse(JSON.parse(row.artifact_bindings_json));
+  if (JSON.stringify(stepInput.artifactBindings) !== JSON.stringify(artifactBindings)) {
+    throw new Error("navigator step input artifact bindings are inconsistent");
+  }
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    workflowStepId: row.workflow_step_id,
+    effectIdempotencyKey: row.effect_idempotency_key,
+    skillId: row.skill_id,
+    skillRevision: row.skill_revision,
+    skillSourceDigest: row.skill_source_digest,
+    descriptorDigest: row.descriptor_digest,
+    stepContractId: row.step_contract_id,
+    stepContractRevision: row.step_contract_revision,
+    stepContractDigest: row.step_contract_digest,
+    catalogDigest: row.catalog_digest,
+    stepInput,
+    stepInputDigest: row.step_input_digest,
+    modelRoute: modelRouteSchema.parse(JSON.parse(row.model_route_json)),
+    artifactBindings,
+    snapshotDigest: row.snapshot_digest,
+    jobVersion: row.job_version,
+    workflowRevision: row.workflow_revision,
+    resource,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function proposalReason(
+  job: Job,
+  snapshot: NavigatorSnapshot,
+  proposal: NavigatorProposal,
+  observation: NavigatorInferenceObservation,
+  artifacts: WorkArtifactRepository,
+): string | null {
+  if (job.workflowEngine !== "navigator-v1") return "workflow_engine_mismatch";
+  if (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic") return "workflow_mode_denied";
+  if (job.currentWorkflowStepId !== null) return "workflow_step_active";
+  if (job.version !== snapshot.identity.jobVersion || proposal.basedOn.jobVersion !== job.version) {
+    return "stale_job_version";
+  }
+  if (
+    job.workflowRevision !== snapshot.identity.workflowRevision ||
+    proposal.basedOn.workflowRevision !== job.workflowRevision
+  ) return "stale_workflow_revision";
+  if (
+    proposal.basedOn.jobId !== job.id ||
+    proposal.basedOn.digest !== snapshot.identity.digest
+  ) return "snapshot_digest_mismatch";
+  for (const binding of job.artifactBindings) {
+    const current = artifacts.getCurrentSnapshot(binding.artifactId);
+    if (
+      current?.id !== binding.snapshotId ||
+      current.snapshotDigest !== binding.snapshotDigest ||
+      !artifacts.isSnapshotValid(binding.snapshotId)
+    ) return "stale_artifact_snapshot";
+  }
+  if (observation.nativeToolCalls.length > 0) return "policy_native_tool_use";
+  if (observation.claimedCodeWorktreeId !== null) return "policy_claimed_code_worktree";
+  if (observation.dynamicEffectToolIds.length > 0) return "policy_dynamic_effect_tool";
+  if (observation.externalStateDigest !== snapshot.externalStateDigest) return "external_drift";
+  if (job.workflowMode === "shadow") return null;
+  if (proposal.kind !== "invoke_skill") return "unsupported_deterministic_action";
+  const catalog = NAVIGATOR_SKILL_CATALOG.find((entry) => entry.id === proposal.skillId);
+  if (
+    proposal.skillId !== NAVIGATOR_RESEARCH_STEP_CONTRACT.skillId ||
+    catalog?.admitted !== true ||
+    catalog.invocationClass !== "model" ||
+    catalog.denialReason !== null
+  ) return "capability_denied";
+  const subjects = new Set(proposal.subjectArtifactIds);
+  if (subjects.size !== proposal.subjectArtifactIds.length) return "malformed_proposal";
+  const boundIds = new Set(job.artifactBindings.map((binding) => binding.artifactId));
+  if (proposal.subjectArtifactIds.some((artifactId) => !boundIds.has(artifactId))) return "unauthorized_subject";
+  for (const artifactId of proposal.subjectArtifactIds) {
+    const artifact = artifacts.getArtifact(artifactId);
+    if (!artifact || !NAVIGATOR_RESEARCH_STEP_CONTRACT.allowedArtifactKinds.includes(artifact.kind)) {
+      return "capability_denied";
+    }
+  }
+  return null;
+}
+
+export class NavigatorRepository {
+  private readonly artifacts: WorkArtifactRepository;
+
+  public constructor(private readonly db: SqliteDatabase) {
+    this.artifacts = new WorkArtifactRepository(db);
+  }
+
+  public bindJobArtifacts(input: Readonly<{
+    jobId: string;
+    expectedVersion: number;
+    artifactBindings: readonly NavigatorArtifactBinding[];
+    now: number;
+  }>): Job {
+    assertIdentifier(input.jobId, "jobId");
+    assertPositiveInteger(input.expectedVersion, "expectedVersion");
+    assertNonNegativeInteger(input.now, "now");
+    const bindings = artifactBindingSchema.array().min(1).max(128).parse(input.artifactBindings);
+    if (new Set(bindings.map((binding) => binding.artifactId)).size !== bindings.length) {
+      throw new TypeError("navigator artifact bindings contain a duplicate artifact");
+    }
+    return this.db.transaction((): Job => {
+      const job = readJobById(this.db, input.jobId);
+      if (!job) throw new Error(`Job ${input.jobId} was not found`);
+      if (job.version !== input.expectedVersion) throw new VersionConflictError(job.id, input.expectedVersion);
+      if (
+        job.workflowEngine !== "navigator-v1" ||
+        (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic") ||
+        job.currentWorkflowStepId !== null || job.artifactBindings.length > 0
+      ) {
+        throw new TypeError("navigator job artifact bindings are already initialized or unavailable");
+      }
+      if (job.state !== "awaiting_confirmation" || job.projectId === null) {
+        throw new TypeError("navigator jobs must be initialized after project selection and before admission");
+      }
+      for (const binding of bindings) {
+        const artifact = this.artifacts.getArtifact(binding.artifactId);
+        const snapshot = this.artifacts.getSnapshot(binding.snapshotId);
+        if (
+          !artifact || artifact.projectId !== job.projectId || snapshot?.artifactId !== artifact.id ||
+          snapshot.snapshotDigest !== binding.snapshotDigest ||
+          artifact.currentSnapshotId !== snapshot.id || !this.artifacts.isSnapshotValid(snapshot.id)
+        ) throw new TypeError("navigator artifact binding is not current for the selected project");
+      }
+      const updated = this.db.prepare(
+        `UPDATE jobs
+            SET artifact_bindings_json = ?, version = version + 1, updated_at = ?
+          WHERE id = ? AND version = ? AND workflow_engine = 'navigator-v1'
+            AND workflow_mode IN ('shadow', 'deterministic') AND artifact_bindings_json = '[]'`,
+      ).run(JSON.stringify(bindings), input.now, input.jobId, input.expectedVersion);
+      if (updated.changes !== 1) throw new VersionConflictError(input.jobId, input.expectedVersion);
+      const stored = readJobById(this.db, input.jobId);
+      if (!stored) throw new Error("navigator job disappeared after initialization");
+      return stored;
+    }).immediate();
+  }
+
+  public createSnapshot(input: Readonly<{
+    jobId: string;
+    externalStateDigest: string;
+    evidenceRefs: readonly string[];
+    now: number;
+  }>): NavigatorSnapshot {
+    assertIdentifier(input.jobId, "jobId");
+    assertNonNegativeInteger(input.now, "now");
+    if (!/^[0-9a-f]{64}$/u.test(input.externalStateDigest)) {
+      throw new TypeError("externalStateDigest must be a SHA-256 digest");
+    }
+    return this.db.transaction((): NavigatorSnapshot => {
+      const job = readJobById(this.db, input.jobId);
+      if (!job) throw new Error(`Job ${input.jobId} was not found`);
+      if (job.workflowEngine !== "navigator-v1" || (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic")) {
+        throw new TypeError("job is not an executable navigator-v1 job");
+      }
+      if (job.currentWorkflowStepId !== null) throw new TypeError("job already has an active workflow step");
+      for (const binding of job.artifactBindings) {
+        const snapshot = this.artifacts.getCurrentSnapshot(binding.artifactId);
+        if (
+          snapshot?.id !== binding.snapshotId || snapshot.snapshotDigest !== binding.snapshotDigest ||
+          !this.artifacts.isSnapshotValid(binding.snapshotId)
+        ) throw new TypeError("navigator artifact snapshot is stale");
+      }
+      const payload = {
+        engine: "navigator-v1" as const,
+        engineRevision: NAVIGATOR_ENGINE_REVISION as 1,
+        mode: job.workflowMode,
+        ownerRequest: job.requestText,
+        artifactBindings: [...job.artifactBindings],
+        skillCatalog: [...NAVIGATOR_SKILL_CATALOG],
+        catalogDigest: NAVIGATOR_SKILL_CATALOG_DIGEST,
+        externalStateDigest: input.externalStateDigest,
+        evidenceRefs: [...input.evidenceRefs],
+        createdAt: input.now,
+      };
+      const digest = navigatorSnapshotDigest({
+        jobId: job.id,
+        jobVersion: job.version,
+        workflowRevision: job.workflowRevision,
+        payload,
+      });
+      const id = digestId("navsnap", job.id, digest);
+      const payloadJson = serializeNavigatorJson(payload, "navigator snapshot");
+      this.db.prepare(
+        `INSERT OR IGNORE INTO navigator_snapshots (
+           id, job_id, job_version, workflow_revision, digest, external_state_digest, payload_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        job.id,
+        job.version,
+        job.workflowRevision,
+        digest,
+        input.externalStateDigest,
+        payloadJson,
+        input.now,
+      );
+      const row = this.db.prepare("SELECT * FROM navigator_snapshots WHERE id = ?").get(id) as SnapshotRow | undefined;
+      if (!row) throw new Error("navigator snapshot was not stored");
+      return parseSnapshot(row);
+    }).immediate();
+  }
+
+  public recordProposal(input: Readonly<{
+    snapshotId: string;
+    rawProposal: unknown;
+    observation: NavigatorInferenceObservation;
+    selectModelRoute(): ModelRoute;
+    now: number;
+  }>): NavigatorProposalDecision {
+    assertIdentifier(input.snapshotId, "snapshotId");
+    assertNonNegativeInteger(input.now, "now");
+    const observation = navigatorInferenceObservationSchema.parse(input.observation);
+    const rawJson = boundedRawJson(input.rawProposal);
+    const parsed = navigatorProposalSchema.safeParse(input.rawProposal);
+    const parsedProposalJson = parsed.success ? JSON.stringify(parsed.data) : null;
+    const proposalTooLarge = parsedProposalJson !== null &&
+      Buffer.byteLength(parsedProposalJson, "utf8") > MAX_NAVIGATOR_JSON_BYTES;
+    const proposal: NavigatorProposal | null = parsed.success && !proposalTooLarge ? parsed.data : null;
+    const proposalValidationFailure = !parsed.success
+      ? "malformed_proposal"
+      : proposalTooLarge ? "oversized_proposal" : null;
+    const digest = proposalDigest(parsed.success ? parsed.data : input.rawProposal);
+    const observationJson = serializeNavigatorJson(observation, "navigator inference observation");
+    const observationDigest = createHash("sha256").update(observationJson, "utf8").digest("hex");
+    return this.db.transaction((): NavigatorProposalDecision => {
+      const snapshotRow = this.db.prepare("SELECT * FROM navigator_snapshots WHERE id = ?")
+        .get(input.snapshotId) as SnapshotRow | undefined;
+      if (!snapshotRow) throw new Error(`Navigator snapshot ${input.snapshotId} was not found`);
+      const snapshot = parseSnapshot(snapshotRow);
+      const job = readJobById(this.db, snapshot.identity.jobId);
+      if (!job) throw new Error(`Job ${snapshot.identity.jobId} was not found`);
+      const proposalId = digestId("navprop", input.snapshotId, digest);
+      const proposalJson = proposal === null ? null : parsedProposalJson;
+      this.db.prepare(
+        `INSERT OR IGNORE INTO navigator_proposals (
+           id, job_id, snapshot_id, digest, kind, raw_json, proposal_json,
+           observation_json, observation_digest, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        proposalId,
+        job.id,
+        input.snapshotId,
+        digest,
+        proposal?.kind ?? null,
+        rawJson,
+        proposalJson,
+        observationJson,
+        observationDigest,
+        input.now,
+      );
+      const storedProposal = this.getProposal(proposalId);
+      if (storedProposal?.observationDigest !== observationDigest) {
+        throw new Error("navigator proposal observation changed for the same accepted content");
+      }
+      const existingDecision = this.decisionForProposal(proposalId);
+      if (existingDecision) return existingDecision;
+      const rejection = proposalValidationFailure ?? (
+        proposal === null ? "malformed_proposal" : proposalReason(job, snapshot, proposal, observation, this.artifacts)
+      );
+      if (rejection !== null) {
+        this.insertDecision(proposalId, job.id, input.snapshotId, "rejected", rejection, input.now);
+        return this.requireDecision(proposalId);
+      }
+      if (job.workflowMode === "shadow") {
+        this.insertDecision(proposalId, job.id, input.snapshotId, "shadowed", "shadow_only", input.now);
+        return this.requireDecision(proposalId);
+      }
+      if (proposal?.kind !== "invoke_skill") throw new Error("deterministic proposal validation was inconsistent");
+      const invokeProposal = proposal;
+      const catalogEntry = NAVIGATOR_SKILL_CATALOG.find((entry) => entry.id === invokeProposal.skillId);
+      if (!catalogEntry) throw new Error("accepted skill disappeared from the navigator catalog");
+      const route = assertModelRouteForContract(input.selectModelRoute(), NAVIGATOR_RESEARCH_STEP_CONTRACT);
+      const subjectArtifactIds = new Set(invokeProposal.subjectArtifactIds);
+      const subjectArtifactBindings = job.artifactBindings.filter((binding) => subjectArtifactIds.has(binding.artifactId));
+      const stepInput = navigatorResearchInputSchema.parse({
+        kind: "navigator_research_input",
+        objective: invokeProposal.objective,
+        artifactBindings: subjectArtifactBindings,
+        evidenceRefs: invokeProposal.evidenceRefs,
+      });
+      const stepInputJson = serializeNavigatorJson(stepInput, "navigator research step input");
+      const stepInputDigest = createHash("sha256").update(stepInputJson, "utf8").digest("hex");
+      const stepId = digestId("wfstep", proposalId, digest);
+      const attemptId = digestId("navattempt", stepId, invokeProposal.skillId);
+      const effectKey = `${job.id}:navigator:${stepId}:run_skill`;
+      const contractJson = serializeNavigatorJson(NAVIGATOR_RESEARCH_STEP_CONTRACT, "navigator step contract");
+      this.db.prepare(
+        `INSERT OR IGNORE INTO workflow_step_contracts (
+           id, revision, skill_id, digest, contract_json, recorded_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.id,
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.revision,
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.skillId,
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.digest,
+        contractJson,
+        input.now,
+      );
+      const storedContract = this.db.prepare(
+        `SELECT skill_id, digest, contract_json
+           FROM workflow_step_contracts
+          WHERE id = ? AND revision = ?`,
+      ).get(
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.id,
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.revision,
+      ) as { skill_id: string; digest: string; contract_json: string } | undefined;
+      if (
+        storedContract?.skill_id !== NAVIGATOR_RESEARCH_STEP_CONTRACT.skillId ||
+        storedContract.digest !== NAVIGATOR_RESEARCH_STEP_CONTRACT.digest ||
+        storedContract.contract_json !== contractJson
+      ) {
+        throw new Error("navigator step contract revision drifted");
+      }
+      this.db.prepare(
+        `INSERT INTO workflow_steps (
+           id, job_id, proposal_id, snapshot_id, skill_id, job_version, workflow_revision, accepted_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        stepId,
+        job.id,
+        proposalId,
+        input.snapshotId,
+        invokeProposal.skillId,
+        job.version,
+        job.workflowRevision,
+        input.now,
+      );
+      const effectPayload = {
+        workflowStepId: stepId,
+        attemptId,
+        snapshotId: input.snapshotId,
+      };
+      this.db.prepare(
+        `INSERT INTO effects (
+           idempotency_key, job_id, kind, payload_json, status, attempts,
+           next_attempt_at, created_at, updated_at
+         ) VALUES (?, ?, 'run_navigator_skill', ?, 'pending', 0, ?, ?, ?)`,
+      ).run(
+        effectKey,
+        job.id,
+        serializeNavigatorJson(effectPayload, "navigator skill effect"),
+        input.now,
+        input.now,
+        input.now,
+      );
+      this.db.prepare(
+        `INSERT INTO navigator_skill_attempts (
+           id, job_id, workflow_step_id, effect_idempotency_key, skill_id, skill_revision,
+           skill_source_digest, descriptor_digest, step_contract_id, step_contract_revision,
+           step_contract_digest, catalog_digest, step_input_json, step_input_digest,
+           model_route_json, artifact_bindings_json, snapshot_digest, job_version,
+           workflow_revision, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        attemptId,
+        job.id,
+        stepId,
+        effectKey,
+        invokeProposal.skillId,
+        MATT_POCOCK_SKILL_REVISION,
+        catalogEntry.sourceDigest,
+        catalogEntry.descriptorDigest,
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.id,
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.revision,
+        NAVIGATOR_RESEARCH_STEP_CONTRACT.digest,
+        NAVIGATOR_SKILL_CATALOG_DIGEST,
+        stepInputJson,
+        stepInputDigest,
+        JSON.stringify(route),
+        JSON.stringify(subjectArtifactBindings),
+        snapshot.identity.digest,
+        job.version,
+        job.workflowRevision,
+        input.now,
+        input.now,
+      );
+      const updated = this.db.prepare(
+        `UPDATE jobs SET current_workflow_step_id = ?, version = version + 1, updated_at = ?
+          WHERE id = ? AND version = ? AND current_workflow_step_id IS NULL`,
+      ).run(stepId, input.now, job.id, job.version);
+      if (updated.changes !== 1) throw new VersionConflictError(job.id, job.version);
+      this.insertDecision(proposalId, job.id, input.snapshotId, "accepted", "accepted", input.now);
+      return this.requireDecision(proposalId);
+    }).immediate();
+  }
+
+  public getProposal(id: string): NavigatorProposalRecord | null {
+    const row = this.db.prepare("SELECT * FROM navigator_proposals WHERE id = ?").get(id) as ProposalRow | undefined;
+    return row ? parseProposal(row) : null;
+  }
+
+  public getWorkflowStep(id: string): NavigatorWorkflowStep | null {
+    const row = this.db.prepare("SELECT * FROM workflow_steps WHERE id = ?").get(id) as {
+      id: string;
+      job_id: string;
+      proposal_id: string;
+      snapshot_id: string;
+      skill_id: string;
+      job_version: number;
+      workflow_revision: number;
+      accepted_at: number;
+    } | undefined;
+    return row ? {
+      id: row.id,
+      jobId: row.job_id,
+      proposalId: row.proposal_id,
+      snapshotId: row.snapshot_id,
+      skillId: row.skill_id,
+      jobVersion: row.job_version,
+      workflowRevision: row.workflow_revision,
+      acceptedAt: row.accepted_at,
+    } : null;
+  }
+
+  public getAttempt(id: string): NavigatorSkillAttempt | null {
+    const row = this.db.prepare("SELECT * FROM navigator_skill_attempts WHERE id = ?").get(id) as AttemptRow | undefined;
+    return row ? parseAttempt(row) : null;
+  }
+
+  public getOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {
+    const row = this.db.prepare("SELECT * FROM workflow_step_outcomes WHERE workflow_step_id = ?")
+      .get(workflowStepId) as {
+        workflow_step_id: string;
+        attempt_id: string;
+        outcome: NavigatorWorkflowStepOutcome["outcome"];
+        reason_code: string;
+        summary: string;
+        artifact_evidence_json: string;
+        result_digest: string;
+        recorded_at: number;
+      } | undefined;
+    return row ? {
+      workflowStepId: row.workflow_step_id,
+      attemptId: row.attempt_id,
+      outcome: row.outcome,
+      reasonCode: row.reason_code,
+      summary: row.summary,
+      artifactEvidence: JSON.parse(row.artifact_evidence_json) as NavigatorWorkflowStepOutcome["artifactEvidence"],
+      resultDigest: row.result_digest,
+      recordedAt: row.recorded_at,
+    } : null;
+  }
+
+  public leaseSkillEffect(input: Readonly<{
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): StoredEffect | null {
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    assertPositiveInteger(input.leaseMs, "leaseMs");
+    return this.db.transaction((): StoredEffect | null => {
+      if (!this.executorLeaseCurrent(input.ownerId, input.generation, input.now)) return null;
+      const row = this.db.prepare(
+        `SELECT effect.*
+           FROM effects AS effect
+           JOIN navigator_skill_attempts AS attempt ON attempt.effect_idempotency_key = effect.idempotency_key
+           JOIN jobs AS job ON job.id = effect.job_id
+          WHERE effect.kind = 'run_navigator_skill'
+            AND job.workflow_engine = 'navigator-v1' AND job.workflow_mode = 'deterministic'
+            AND job.current_workflow_step_id = attempt.workflow_step_id
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_step_outcomes AS outcome
+               WHERE outcome.workflow_step_id = attempt.workflow_step_id
+            )
+            AND ((effect.status IN ('pending', 'failed') AND effect.next_attempt_at <= ?)
+              OR (effect.status = 'leased' AND effect.lease_expires_at <= ?))
+          ORDER BY effect.created_at, effect.idempotency_key
+          LIMIT 1`,
+      ).get(input.now, input.now) as EffectRow | undefined;
+      if (!row) return null;
+      const updated = this.db.prepare(
+        `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+             lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+          WHERE idempotency_key = ? AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+            OR (status = 'leased' AND lease_expires_at <= ?))`,
+      ).run(
+        input.ownerId,
+        input.generation,
+        input.now + input.leaseMs,
+        input.now,
+        row.idempotency_key,
+        input.now,
+        input.now,
+      );
+      if (updated.changes !== 1) return null;
+      const leased = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?")
+        .get(row.idempotency_key) as EffectRow;
+      return parseStoredEffect(leased);
+    }).immediate();
+  }
+
+  public bindAttemptResource(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    resource: { kind: "bb_thread"; id: string };
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): boolean {
+    assertIdentifier(input.attemptId, "attemptId");
+    assertIdentifier(input.effectIdempotencyKey, "effectIdempotencyKey");
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    if (input.resource.kind !== "bb_thread") throw new TypeError("navigator skill resource kind is invalid");
+    assertIdentifier(input.resource.id, "resource id");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction((): boolean => {
+      if (!this.effectLeaseCurrent(input.effectIdempotencyKey, input.ownerId, input.generation, input.now)) return false;
+      const current = this.getAttempt(input.attemptId);
+      if (!current || current.effectIdempotencyKey !== input.effectIdempotencyKey) return false;
+      if (current.resource !== null) return current.resource.kind === input.resource.kind && current.resource.id === input.resource.id;
+      return this.db.prepare(
+        `UPDATE navigator_skill_attempts SET resource_kind = 'bb_thread', resource_id = ?, updated_at = ?
+          WHERE id = ? AND effect_idempotency_key = ? AND resource_kind IS NULL AND resource_id IS NULL`,
+      ).run(input.resource.id, input.now, input.attemptId, input.effectIdempotencyKey).changes === 1;
+    }).immediate();
+  }
+
+  public settleAttempt(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    policyFailureReason?: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): NavigatorWorkflowStepOutcome | null {
+    assertIdentifier(input.attemptId, "attemptId");
+    assertIdentifier(input.effectIdempotencyKey, "effectIdempotencyKey");
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    if (input.policyFailureReason !== undefined) assertIdentifier(input.policyFailureReason, "policyFailureReason");
+    return this.db.transaction((): NavigatorWorkflowStepOutcome | null => {
+      if (!this.effectLeaseCurrent(input.effectIdempotencyKey, input.ownerId, input.generation, input.now)) return null;
+      const attempt = this.getAttempt(input.attemptId);
+      if (!attempt || attempt.effectIdempotencyKey !== input.effectIdempotencyKey || attempt.resource === null) return null;
+      const existing = this.getOutcome(attempt.workflowStepId);
+      if (existing) return existing;
+      const snapshotRow = this.db.prepare(
+        `SELECT snapshot.* FROM navigator_snapshots AS snapshot
+          JOIN workflow_steps AS step ON step.snapshot_id = snapshot.id
+         WHERE step.id = ?`,
+      ).get(attempt.workflowStepId) as SnapshotRow | undefined;
+      if (!snapshotRow) throw new Error("navigator attempt snapshot disappeared");
+      const snapshot = parseSnapshot(snapshotRow);
+      let reasonCode = input.policyFailureReason ?? "succeeded";
+      let outcome: NavigatorWorkflowStepOutcome["outcome"] = input.policyFailureReason ? "policy_failure" : "succeeded";
+      const parsedResult = navigatorResearchResultSchema.safeParse(input.result);
+      if (outcome === "succeeded" && !/^[0-9a-f]{64}$/u.test(input.observedExternalStateDigest)) {
+        outcome = "policy_failure";
+        reasonCode = "malformed_external_state_digest";
+      }
+      if (outcome === "succeeded" && input.observedExternalStateDigest !== snapshot.externalStateDigest) {
+        outcome = "policy_failure";
+        reasonCode = "external_drift";
+      }
+      if (outcome === "succeeded" && !parsedResult.success) {
+        outcome = "policy_failure";
+        reasonCode = "malformed_result";
+      }
+      if (
+        outcome === "succeeded" && parsedResult.success &&
+        Buffer.byteLength(JSON.stringify(parsedResult.data), "utf8") > NAVIGATOR_RESEARCH_STEP_CONTRACT.maximumResultBytes
+      ) {
+        outcome = "policy_failure";
+        reasonCode = "result_too_large";
+      }
+      if (outcome === "succeeded" && parsedResult.success) {
+        const evidenceByArtifact = new Map(parsedResult.data.artifactEvidence.map((entry) => [entry.artifactId, entry]));
+        const boundArtifactIds = new Set(attempt.artifactBindings.map((binding) => binding.artifactId));
+        if (
+          evidenceByArtifact.size !== parsedResult.data.artifactEvidence.length ||
+          evidenceByArtifact.size !== boundArtifactIds.size ||
+          [...evidenceByArtifact.keys()].some((artifactId) => !boundArtifactIds.has(artifactId))
+        ) {
+          outcome = "policy_failure";
+          reasonCode = "unauthorized_artifact_evidence";
+        } else {
+          for (const binding of attempt.artifactBindings) {
+            const current = this.artifacts.getCurrentSnapshot(binding.artifactId);
+            const evidence = evidenceByArtifact.get(binding.artifactId);
+            if (
+              current?.id !== binding.snapshotId || current.snapshotDigest !== binding.snapshotDigest ||
+              !this.artifacts.isSnapshotValid(binding.snapshotId) ||
+              evidence?.snapshotId !== binding.snapshotId || evidence.snapshotDigest !== binding.snapshotDigest
+            ) {
+              outcome = "policy_failure";
+              reasonCode = "stale_artifact_snapshot";
+              break;
+            }
+          }
+        }
+      }
+      const artifactEvidence = outcome === "succeeded" && parsedResult.success
+        ? parsedResult.data.artifactEvidence
+        : [];
+      const summary = outcome === "succeeded" && parsedResult.success
+        ? parsedResult.data.summary
+        : `Navigator skill result rejected: ${reasonCode}`;
+      const resultJson = serializeNavigatorJson(
+        outcome === "succeeded" && parsedResult.success ? parsedResult.data : { outcome, reasonCode },
+        "navigator skill result",
+      );
+      const resultDigest = createHash("sha256").update(resultJson, "utf8").digest("hex");
+      this.db.prepare(
+        `INSERT INTO workflow_step_outcomes (
+           workflow_step_id, attempt_id, outcome, reason_code, summary,
+           artifact_evidence_json, result_digest, recorded_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        attempt.workflowStepId,
+        attempt.id,
+        outcome,
+        reasonCode,
+        summary,
+        JSON.stringify(artifactEvidence),
+        resultDigest,
+        input.now,
+      );
+      const jobUpdate = this.db.prepare(
+        `UPDATE jobs SET current_workflow_step_id = NULL,
+             workflow_revision = workflow_revision + 1, version = version + 1, updated_at = ?
+          WHERE id = ? AND current_workflow_step_id = ?`,
+      ).run(input.now, attempt.jobId, attempt.workflowStepId);
+      if (jobUpdate.changes !== 1) throw new Error("navigator workflow step changed before settlement");
+      const effectUpdate = this.db.prepare(
+        `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
+             lease_expires_at = NULL, last_error = NULL, updated_at = ?
+          WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+            AND lease_generation = ? AND lease_expires_at > ?`,
+      ).run(input.now, input.effectIdempotencyKey, input.ownerId, input.generation, input.now);
+      if (effectUpdate.changes !== 1) throw new Error("navigator effect lease changed before settlement");
+      return this.getOutcome(attempt.workflowStepId);
+    }).immediate();
+  }
+
+  private insertDecision(
+    proposalId: string,
+    jobId: string,
+    snapshotId: string,
+    decision: NavigatorProposalDecision["decision"],
+    reasonCode: string,
+    now: number,
+  ): void {
+    this.db.prepare(
+      `INSERT INTO navigator_decisions (
+         proposal_id, job_id, snapshot_id, decision, reason_code, decided_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(proposalId, jobId, snapshotId, decision, reasonCode, now);
+  }
+
+  private decisionForProposal(proposalId: string): NavigatorProposalDecision | null {
+    const row = this.db.prepare(
+      `SELECT decision.*, step.id AS workflow_step_id, attempt.id AS attempt_id,
+              attempt.effect_idempotency_key
+         FROM navigator_decisions AS decision
+         LEFT JOIN workflow_steps AS step ON step.proposal_id = decision.proposal_id
+         LEFT JOIN navigator_skill_attempts AS attempt ON attempt.workflow_step_id = step.id
+        WHERE decision.proposal_id = ?`,
+    ).get(proposalId) as {
+      snapshot_id: string;
+      proposal_id: string;
+      decision: NavigatorProposalDecision["decision"];
+      reason_code: string;
+      workflow_step_id: string | null;
+      attempt_id: string | null;
+      effect_idempotency_key: string | null;
+    } | undefined;
+    return row ? {
+      snapshotId: row.snapshot_id,
+      proposalId: row.proposal_id,
+      decision: row.decision,
+      reasonCode: row.reason_code,
+      workflowStepId: row.workflow_step_id,
+      attemptId: row.attempt_id,
+      effectIdempotencyKey: row.effect_idempotency_key,
+    } : null;
+  }
+
+  private requireDecision(proposalId: string): NavigatorProposalDecision {
+    const decision = this.decisionForProposal(proposalId);
+    if (!decision) throw new Error("navigator decision was not stored");
+    return decision;
+  }
+
+  private executorLeaseCurrent(ownerId: string, generation: number, now: number): boolean {
+    return this.db.prepare(
+      `SELECT 1 FROM executor_lease
+        WHERE singleton = 1 AND owner_id = ? AND generation = ? AND lease_expires_at > ?`,
+    ).get(ownerId, generation, now) !== undefined;
+  }
+
+  private effectLeaseCurrent(key: string, ownerId: string, generation: number, now: number): boolean {
+    return this.executorLeaseCurrent(ownerId, generation, now) && this.db.prepare(
+      `SELECT 1 FROM effects WHERE idempotency_key = ? AND status = 'leased'
+        AND lease_owner = ? AND lease_generation = ? AND lease_expires_at > ?`,
+    ).get(key, ownerId, generation, now) !== undefined;
+  }
+}

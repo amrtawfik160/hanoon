@@ -66,6 +66,10 @@ export type JobExecutorDependencies = {
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
+  /** Deterministic navigator-v1 work only. No live job is routed here yet. */
+  navigator?: {
+    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
+  };
   monitors?: {
     processDue(): Promise<boolean>;
     processDueDelegations(): Promise<boolean>;
@@ -923,6 +927,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         if (controllerPass !== null) didWork = true;
         if (deps.operations) {
           didWork = await deps.operations.processOne(effectFence, workAbort.signal) || didWork;
+        }
+        if (deps.navigator) {
+          didWork = await deps.navigator.processOne(effectFence, workAbort.signal) || didWork;
         }
         if (deps.monitors) {
           didWork = await deps.monitors.processDue() || didWork;

@@ -75,6 +75,11 @@ it("parses every persisted job field without losing policy or nullable productio
     recipe_version: 1,
     recipe_promotion_count: 0,
     routing_mode: "shadow",
+    workflow_engine: "recipe-v1",
+    workflow_mode: "live",
+    workflow_revision: 1,
+    current_workflow_step_id: null,
+    artifact_bindings_json: "[]",
     task_traits_json: JSON.stringify([
       { id: "adopted-pr", provenance: ["origin"] },
       { id: "existing-flow", provenance: ["owner"] },
@@ -123,6 +128,11 @@ it("parses every persisted job field without losing policy or nullable productio
     recipeVersion: 1,
     recipePromotionCount: 0,
     routingMode: "shadow",
+    workflowEngine: "recipe-v1",
+    workflowMode: "live",
+    workflowRevision: 1,
+    currentWorkflowStepId: null,
+    artifactBindings: [],
     taskTraits: [
       { id: "adopted-pr", provenance: ["origin"] },
       { id: "existing-flow", provenance: ["owner"] },

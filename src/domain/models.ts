@@ -528,6 +528,12 @@ export interface Job {
   recipeVersion: number;
   recipePromotionCount: number;
   routingMode: RoutingMode;
+  /** The fixed legacy engine remains the default until navigator promotion. */
+  workflowEngine: import("../navigator/models").WorkflowEngine;
+  workflowMode: import("../navigator/models").WorkflowMode;
+  workflowRevision: number;
+  currentWorkflowStepId: string | null;
+  artifactBindings: readonly import("../navigator/models").NavigatorArtifactBinding[];
   taskTraits: readonly import("../capabilities/routing").TaskTraitEvidence[];
   taskReasonCodes: readonly string[];
   origin: JobOrigin;
@@ -581,6 +587,7 @@ export interface JobEffect {
     | "recover_worker"
     | "stop_thread"
     | "steer_implementation"
+    | "run_navigator_skill"
     | "reconcile_job";
   payload: Record<string, unknown>;
 }

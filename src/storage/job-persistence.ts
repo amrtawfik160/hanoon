@@ -15,6 +15,13 @@ import {
   taskReasonCodesSchema,
   taskTraitSnapshotSchema,
 } from "../capabilities/routing";
+import {
+  artifactBindingSchema,
+  WORKFLOW_ENGINES,
+  WORKFLOW_MODES,
+  type WorkflowEngine,
+  type WorkflowMode,
+} from "../navigator/models";
 import { containsForbiddenCallbackMaterial } from "../telegram/callback-material";
 
 type SqliteDatabase = Database.Database;
@@ -46,6 +53,11 @@ export type JobRow = {
   recipe_version: number;
   recipe_promotion_count: number;
   routing_mode: RoutingMode;
+  workflow_engine: WorkflowEngine;
+  workflow_mode: WorkflowMode;
+  workflow_revision: number;
+  current_workflow_step_id: string | null;
+  artifact_bindings_json: string;
   task_traits_json: string;
   task_reason_codes_json: string;
   job_origin: JobOrigin;
@@ -124,6 +136,8 @@ const AUTONOMOUS_JOB_ORIGINS: ReadonlySet<AutonomousJobOrigin> = new Set([
 ]);
 const TASK_RECIPE_SET: ReadonlySet<TaskRecipe> = new Set(TASK_RECIPES);
 const ROUTING_MODES: ReadonlySet<RoutingMode> = new Set(["legacy", "shadow", "active"]);
+const WORKFLOW_ENGINE_SET: ReadonlySet<string> = new Set(WORKFLOW_ENGINES);
+const WORKFLOW_MODE_SET: ReadonlySet<string> = new Set(WORKFLOW_MODES);
 
 const MAX_RECEIPT_STRING = 512;
 export const MAX_MERGE_RESULT_JSON = 64_000;
@@ -265,6 +279,19 @@ export function parseJobRow(row: JobRow): Job {
     throw new Error(`Invalid persisted recipe promotion count: ${row.recipe_promotion_count}`);
   }
   if (!ROUTING_MODES.has(row.routing_mode)) throw new Error(`Unknown persisted routing mode: ${row.routing_mode}`);
+  if (!WORKFLOW_ENGINE_SET.has(row.workflow_engine)) {
+    throw new Error(`Unknown persisted workflow engine: ${row.workflow_engine}`);
+  }
+  if (!WORKFLOW_MODE_SET.has(row.workflow_mode)) {
+    throw new Error(`Unknown persisted workflow mode: ${row.workflow_mode}`);
+  }
+  if (!Number.isSafeInteger(row.workflow_revision) || row.workflow_revision < 1) {
+    throw new Error(`Invalid persisted workflow revision: ${row.workflow_revision}`);
+  }
+  if (row.current_workflow_step_id !== null && row.current_workflow_step_id.length === 0) {
+    throw new Error("Invalid persisted current workflow step id");
+  }
+  const artifactBindings = artifactBindingSchema.array().max(128).parse(JSON.parse(row.artifact_bindings_json));
   const taskTraits = taskTraitSnapshotSchema.parse(JSON.parse(row.task_traits_json));
   const taskReasonCodes = taskReasonCodesSchema.parse(JSON.parse(row.task_reason_codes_json));
   if (!JOB_ORIGINS.has(row.job_origin)) throw new Error(`Unknown persisted job origin: ${row.job_origin}`);
@@ -300,6 +327,11 @@ export function parseJobRow(row: JobRow): Job {
     recipeVersion: row.recipe_version,
     recipePromotionCount: row.recipe_promotion_count,
     routingMode: row.routing_mode,
+    workflowEngine: row.workflow_engine,
+    workflowMode: row.workflow_mode,
+    workflowRevision: row.workflow_revision,
+    currentWorkflowStepId: row.current_workflow_step_id,
+    artifactBindings,
     taskTraits,
     taskReasonCodes,
     origin: row.job_origin,
@@ -434,6 +466,7 @@ export const JOB_SELECT = `
          review_thread_id, documentation_thread_id, pr_number, pr_url, pr_head_sha,
          merge_message, merge_commit_sha, merged_at, deployment_summary, canary_summary, status_message_id,
          delivery_mode, task_recipe, recipe_version, recipe_promotion_count, routing_mode,
+         workflow_engine, workflow_mode, workflow_revision, current_workflow_step_id, artifact_bindings_json,
          task_traits_json, task_reason_codes_json, job_origin, autonomous_origin,
          adopted_branch, adopted_head_sha,
          plan_cycle, review_cycle, review_block_at, cancel_requested_at, merge_pre_approved_at,

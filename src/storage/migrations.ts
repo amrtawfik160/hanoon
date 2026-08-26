@@ -2755,6 +2755,192 @@ BEGIN SELECT RAISE(ABORT, 'work artifact snapshot relationships violate the cano
 DROP TABLE work_artifact_relationship_canonical_guard;
 `] as const;
 
+export const NAVIGATOR_WORKFLOW_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN workflow_engine TEXT NOT NULL DEFAULT 'recipe-v1'
+  CHECK (workflow_engine IN ('recipe-v1', 'navigator-v1'));
+ALTER TABLE jobs ADD COLUMN workflow_mode TEXT NOT NULL DEFAULT 'live'
+  CHECK (workflow_mode IN ('live', 'shadow', 'deterministic'));
+ALTER TABLE jobs ADD COLUMN workflow_revision INTEGER NOT NULL DEFAULT 1
+  CHECK (workflow_revision >= 1);
+ALTER TABLE jobs ADD COLUMN current_workflow_step_id TEXT;
+ALTER TABLE jobs ADD COLUMN artifact_bindings_json TEXT NOT NULL DEFAULT '[]';
+
+CREATE TABLE navigator_snapshots (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  job_version INTEGER NOT NULL,
+  workflow_revision INTEGER NOT NULL,
+  digest TEXT NOT NULL UNIQUE,
+  external_state_digest TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(job_id, job_version, workflow_revision, digest)
+);
+CREATE TRIGGER navigator_snapshots_append_only_update
+BEFORE UPDATE ON navigator_snapshots
+BEGIN SELECT RAISE(ABORT, 'navigator snapshots are append-only'); END;
+CREATE TRIGGER navigator_snapshots_append_only_delete
+BEFORE DELETE ON navigator_snapshots
+BEGIN SELECT RAISE(ABORT, 'navigator snapshots are append-only'); END;
+
+CREATE TABLE navigator_proposals (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  snapshot_id TEXT NOT NULL REFERENCES navigator_snapshots(id),
+  digest TEXT NOT NULL,
+  kind TEXT,
+  raw_json TEXT NOT NULL,
+  proposal_json TEXT,
+  observation_json TEXT NOT NULL,
+  observation_digest TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(snapshot_id, digest)
+);
+CREATE TRIGGER navigator_proposals_append_only_update
+BEFORE UPDATE ON navigator_proposals
+BEGIN SELECT RAISE(ABORT, 'navigator proposals are append-only'); END;
+CREATE TRIGGER navigator_proposals_append_only_delete
+BEFORE DELETE ON navigator_proposals
+BEGIN SELECT RAISE(ABORT, 'navigator proposals are append-only'); END;
+
+CREATE TABLE navigator_decisions (
+  proposal_id TEXT PRIMARY KEY REFERENCES navigator_proposals(id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  snapshot_id TEXT NOT NULL REFERENCES navigator_snapshots(id),
+  decision TEXT NOT NULL CHECK (decision IN ('accepted', 'rejected', 'shadowed')),
+  reason_code TEXT NOT NULL,
+  decided_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_decisions_append_only_update
+BEFORE UPDATE ON navigator_decisions
+BEGIN SELECT RAISE(ABORT, 'navigator decisions are append-only'); END;
+CREATE TRIGGER navigator_decisions_append_only_delete
+BEFORE DELETE ON navigator_decisions
+BEGIN SELECT RAISE(ABORT, 'navigator decisions are append-only'); END;
+
+CREATE TABLE workflow_step_contracts (
+  id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  skill_id TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  contract_json TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  PRIMARY KEY(id, revision)
+);
+CREATE TRIGGER workflow_step_contracts_append_only_update
+BEFORE UPDATE ON workflow_step_contracts
+BEGIN SELECT RAISE(ABORT, 'workflow step contracts are append-only'); END;
+CREATE TRIGGER workflow_step_contracts_append_only_delete
+BEFORE DELETE ON workflow_step_contracts
+BEGIN SELECT RAISE(ABORT, 'workflow step contracts are append-only'); END;
+
+CREATE TABLE workflow_steps (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  proposal_id TEXT NOT NULL UNIQUE REFERENCES navigator_proposals(id),
+  snapshot_id TEXT NOT NULL REFERENCES navigator_snapshots(id),
+  skill_id TEXT NOT NULL,
+  job_version INTEGER NOT NULL,
+  workflow_revision INTEGER NOT NULL,
+  accepted_at INTEGER NOT NULL
+);
+CREATE TRIGGER workflow_steps_append_only_update
+BEFORE UPDATE ON workflow_steps
+BEGIN SELECT RAISE(ABORT, 'workflow steps are append-only'); END;
+CREATE TRIGGER workflow_steps_append_only_delete
+BEFORE DELETE ON workflow_steps
+BEGIN SELECT RAISE(ABORT, 'workflow steps are append-only'); END;
+
+CREATE TABLE navigator_skill_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  workflow_step_id TEXT NOT NULL UNIQUE REFERENCES workflow_steps(id),
+  effect_idempotency_key TEXT NOT NULL UNIQUE REFERENCES effects(idempotency_key),
+  skill_id TEXT NOT NULL,
+  skill_revision TEXT NOT NULL,
+  skill_source_digest TEXT NOT NULL,
+  descriptor_digest TEXT NOT NULL,
+  step_contract_id TEXT NOT NULL,
+  step_contract_revision INTEGER NOT NULL,
+  step_contract_digest TEXT NOT NULL,
+  catalog_digest TEXT NOT NULL,
+  step_input_json TEXT NOT NULL,
+  step_input_digest TEXT NOT NULL,
+  model_route_json TEXT NOT NULL,
+  artifact_bindings_json TEXT NOT NULL,
+  snapshot_digest TEXT NOT NULL,
+  job_version INTEGER NOT NULL,
+  workflow_revision INTEGER NOT NULL,
+  resource_kind TEXT CHECK (resource_kind IS NULL OR resource_kind = 'bb_thread'),
+  resource_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK ((resource_kind IS NULL) = (resource_id IS NULL)),
+  FOREIGN KEY (step_contract_id, step_contract_revision)
+    REFERENCES workflow_step_contracts(id, revision)
+);
+CREATE TRIGGER navigator_skill_attempts_immutable_identity
+BEFORE UPDATE ON navigator_skill_attempts
+WHEN NEW.id <> OLD.id
+  OR NEW.job_id <> OLD.job_id
+  OR NEW.workflow_step_id <> OLD.workflow_step_id
+  OR NEW.effect_idempotency_key <> OLD.effect_idempotency_key
+  OR NEW.skill_id <> OLD.skill_id
+  OR NEW.skill_revision <> OLD.skill_revision
+  OR NEW.skill_source_digest <> OLD.skill_source_digest
+  OR NEW.descriptor_digest <> OLD.descriptor_digest
+  OR NEW.step_contract_id <> OLD.step_contract_id
+  OR NEW.step_contract_revision <> OLD.step_contract_revision
+  OR NEW.step_contract_digest <> OLD.step_contract_digest
+  OR NEW.catalog_digest <> OLD.catalog_digest
+  OR NEW.step_input_json <> OLD.step_input_json
+  OR NEW.step_input_digest <> OLD.step_input_digest
+  OR NEW.model_route_json <> OLD.model_route_json
+  OR NEW.artifact_bindings_json <> OLD.artifact_bindings_json
+  OR NEW.snapshot_digest <> OLD.snapshot_digest
+  OR NEW.job_version <> OLD.job_version
+  OR NEW.workflow_revision <> OLD.workflow_revision
+  OR NEW.created_at <> OLD.created_at
+  OR (OLD.resource_kind IS NOT NULL AND (
+    NEW.resource_kind IS NOT OLD.resource_kind OR NEW.resource_id IS NOT OLD.resource_id
+  ))
+BEGIN SELECT RAISE(ABORT, 'navigator skill attempt identity is immutable'); END;
+CREATE TRIGGER navigator_skill_attempts_no_delete
+BEFORE DELETE ON navigator_skill_attempts
+BEGIN SELECT RAISE(ABORT, 'navigator skill attempts cannot be deleted'); END;
+
+CREATE TABLE workflow_step_outcomes (
+  workflow_step_id TEXT PRIMARY KEY REFERENCES workflow_steps(id),
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES navigator_skill_attempts(id),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'policy_failure')),
+  reason_code TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  artifact_evidence_json TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER workflow_step_outcomes_append_only_update
+BEFORE UPDATE ON workflow_step_outcomes
+BEGIN SELECT RAISE(ABORT, 'workflow step outcomes are append-only'); END;
+CREATE TRIGGER workflow_step_outcomes_append_only_delete
+BEFORE DELETE ON workflow_step_outcomes
+BEGIN SELECT RAISE(ABORT, 'workflow step outcomes are append-only'); END;
+
+CREATE TABLE workflow_step_supersessions (
+  workflow_step_id TEXT PRIMARY KEY REFERENCES workflow_steps(id),
+  superseded_by_step_id TEXT REFERENCES workflow_steps(id),
+  reason TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  CHECK (superseded_by_step_id IS NULL OR superseded_by_step_id <> workflow_step_id)
+);
+CREATE TRIGGER workflow_step_supersessions_append_only_update
+BEFORE UPDATE ON workflow_step_supersessions
+BEGIN SELECT RAISE(ABORT, 'workflow step supersessions are append-only'); END;
+CREATE TRIGGER workflow_step_supersessions_append_only_delete
+BEFORE DELETE ON workflow_step_supersessions
+BEGIN SELECT RAISE(ABORT, 'workflow step supersessions are append-only'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2832,4 +3018,5 @@ export const ALL_MIGRATIONS = [
   ...WORK_ARTIFACT_MIGRATIONS,
   ...WORK_ARTIFACT_RELATIONSHIP_IDENTITY_MIGRATIONS,
   ...WORK_ARTIFACT_RELATIONSHIP_CANONICAL_MIGRATIONS,
+  ...NAVIGATOR_WORKFLOW_MIGRATIONS,
 ] as const;
